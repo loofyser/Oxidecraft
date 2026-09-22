@@ -1,0 +1,13 @@
+# Build output
+/target
+**/*.rs.bk
+
+# Local reference material: cloned upstream repos and Mojang client jars.
+# Neither is redistributed with Oxidecraft.
+/refs/
+/vanilla/
+
+# Editor / OS noise
+*.swp
+*.swo
+.DS_Store
