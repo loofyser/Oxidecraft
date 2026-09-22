@@ -151,7 +151,7 @@ The complete set of allowed dependencies:
 | `oxide-render` | `oxide-assets` |
 | `oxide-game` | `oxide-proto-v47`, `oxide-world`, `oxide-assets`, `oxide-render` |
 | `oxide-client` | all of the above |
-| `oxide-launcher` | `oxide-assets` |
+| `oxide-launcher` | `oxide-assets`, `oxide-proto-v47` |
 
 The launcher is a separate binary target. It does not depend on the client crate; it locates
 and starts the client binary.

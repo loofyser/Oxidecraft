@@ -1529,7 +1529,7 @@ allowed() {
     "oxide-world -> oxide-proto"|"oxide-world -> oxide-proto-v47") return 0 ;;
     "oxide-render -> oxide-assets") return 0 ;;
     "oxide-game -> oxide-proto-v47"|"oxide-game -> oxide-world"|"oxide-game -> oxide-assets"|"oxide-game -> oxide-render") return 0 ;;
-    "oxide-client -> "*|"oxide-launcher -> oxide-assets") return 0 ;;
+    "oxide-client -> "*|"oxide-launcher -> oxide-assets"|"oxide-launcher -> oxide-proto-v47"|"oxide-launcher -> oxide-proto") return 0 ;;
     *) return 1 ;;
   esac
 }
