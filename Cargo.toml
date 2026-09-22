@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/oxide-proto",
+    "crates/oxide-proto-v47",
+    "crates/oxide-world",
+    "crates/oxide-assets",
+    "crates/oxide-render",
+    "crates/oxide-game",
+    "crates/oxide-launcher",
+    "crates/oxide-client",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/loofyser/Oxidecraft"
+
+[workspace.dependencies]
+oxide-proto = { path = "crates/oxide-proto" }
+oxide-proto-v47 = { path = "crates/oxide-proto-v47" }
+oxide-world = { path = "crates/oxide-world" }
+oxide-assets = { path = "crates/oxide-assets" }
+oxide-render = { path = "crates/oxide-render" }
+oxide-game = { path = "crates/oxide-game" }
+thiserror = "2"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
