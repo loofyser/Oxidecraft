@@ -471,6 +471,8 @@ Each milestone ends with a commit, a `docs/STATE.md` update, and a tag.
 | HTTP | `ureq` with `rustls` |
 | CLI parsing | `clap` |
 | Logging | `tracing`, `tracing-subscriber` |
+| Error types | `thiserror` in libraries, `anyhow` in binaries |
+| Test temp directories (dev) | `tempfile` |
 | Keyring (M7) | `keyring` |
 | Benchmarks | `criterion` |
 
