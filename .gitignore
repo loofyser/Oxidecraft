@@ -11,3 +11,6 @@
 *.swp
 *.swo
 .DS_Store
+
+# Agent scratch space (SDD ledgers, briefs, review packages)
+.superpowers/
