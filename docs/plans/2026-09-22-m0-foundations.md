@@ -361,7 +361,10 @@ fn threshold_minus_one_never_compresses() {
     let payload = vec![0x11u8; 4096];
     let mut out = Vec::new();
     write_frame(&mut out, &payload, Compression::Enabled { threshold: -1 }).expect("write");
-    let data_length = oxide_proto::varint::read_varint(&out[1..]).expect("data length");
+    // The frame length is itself a VarInt, so skip it before reading the Data Length marker.
+    let mut cursor = &out[..];
+    let _frame_len = oxide_proto::varint::read_varint(&mut cursor).expect("frame length");
+    let data_length = oxide_proto::varint::read_varint(&mut cursor).expect("data length");
     assert_eq!(data_length, 0);
 }
 ```
