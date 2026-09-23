@@ -93,8 +93,10 @@ pub struct Store {
 impl Store {
     /// Opens (creating if needed) the store under `data_dir`.
     ///
-    /// The objects tree is never reached through a symlink: a symlinked `assets` or
-    /// `assets/objects` is refused, so object paths stay inside the store.
+    /// `assets` and `assets/objects` are refused if either is a symlink, before
+    /// any directory is created, so those two paths cannot point the objects
+    /// tree out of the store. Deeper paths (a shard directory, say) are not
+    /// inspected.
     pub fn open(data_dir: PathBuf) -> Result<Self, StoreError> {
         let root = data_dir;
         for sub in ["assets", OBJECTS_SUBDIR] {
@@ -110,78 +112,57 @@ impl Store {
         Ok(Self { root })
     }
 
-    /// The final path an object with `hash` lives at.
+    /// The final path for `hash`, which is used verbatim.
     ///
-    /// The shard directory is the first two bytes of the hash; a hash shorter than
-    /// two bytes shards on itself, so this never panics. Fetch and verify reject
-    /// malformed hashes up front.
+    /// The shard directory is the first two bytes of the hash; a hash shorter
+    /// than two bytes shards on itself, so this never panics. Fetch and verify
+    /// reject malformed hashes up front and normalize the rest to lowercase
+    /// before asking for a path.
     pub fn object_path(&self, hash: &str) -> PathBuf {
         self.root.join(OBJECTS_SUBDIR).join(shard(hash)).join(hash)
     }
 
     /// Fetches an object unless already present and valid, then returns its path.
+    ///
+    /// The hash is normalized to lowercase first. A cached object whose bytes
+    /// are provably wrong is dropped and fetched again; a cached object that
+    /// merely cannot be read is left alone, and the failure is returned.
     pub fn fetch_object(
         &self,
         http: &dyn HttpClient,
         hash: &str,
         size: u64,
     ) -> Result<PathBuf, StoreError> {
-        validate_hash(hash)?;
-        let path = self.object_path(hash);
+        let hash = validate_hash(hash)?;
+        let path = self.object_path(&hash);
         if path.exists() {
-            if self.verify_object(hash, size).is_ok() {
-                return Ok(path);
+            match self.verify_object(&hash, size) {
+                Ok(()) => return Ok(path),
+                // Provably wrong, or already gone: clear the way for a fetch.
+                Err(error) if proves_corruption(&error) => remove_object(&path)?,
+                // A failure that proves nothing about the bytes (a permission
+                // problem, say) must not cost the cached object.
+                Err(error) => return Err(error),
             }
-            // Corrupted: remove and re-fetch.
-            fs::remove_file(&path).map_err(|source| StoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
         }
 
-        let url = format!("{RESOURCES_BASE_URL}/{}/{hash}", shard(hash));
+        let url = format!("{RESOURCES_BASE_URL}/{}/{hash}", shard(&hash));
         let body = http.get(&url)?;
-        if body.len() as u64 != size {
-            return Err(StoreError::SizeMismatch {
-                hash: hash.to_string(),
-                expected: size,
-                actual: body.len() as u64,
-            });
-        }
-        let actual = sha1_hex(&body);
-        if !actual.eq_ignore_ascii_case(hash) {
-            return Err(StoreError::HashMismatch {
-                expected: hash.to_string(),
-                actual,
-            });
-        }
+        verify_bytes(&body, &hash, size)?;
         write_object_atomic(&path, &body)?;
         Ok(path)
     }
 
-    /// Re-hashes an object already on disk.
+    /// Re-hashes the object already on disk; the hash is normalized to
+    /// lowercase first.
     pub fn verify_object(&self, hash: &str, size: u64) -> Result<(), StoreError> {
-        validate_hash(hash)?;
-        let path = self.object_path(hash);
+        let hash = validate_hash(hash)?;
+        let path = self.object_path(&hash);
         let bytes = fs::read(&path).map_err(|source| StoreError::Io {
             path: path.clone(),
             source,
         })?;
-        if bytes.len() as u64 != size {
-            return Err(StoreError::SizeMismatch {
-                hash: hash.to_string(),
-                expected: size,
-                actual: bytes.len() as u64,
-            });
-        }
-        let actual = sha1_hex(&bytes);
-        if !actual.eq_ignore_ascii_case(hash) {
-            return Err(StoreError::HashMismatch {
-                expected: hash.to_string(),
-                actual,
-            });
-        }
-        Ok(())
+        verify_bytes(&bytes, &hash, size)
     }
 }
 
@@ -215,11 +196,13 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], read_only: bool) -> Result<(), S
         path: path.to_path_buf(),
         source,
     })?;
+    // The mode lands before the sync so a crash cannot leave the final name
+    // pointing at a writable object.
+    apply_mode(temp.path(), read_only)?;
     temp.as_file().sync_all().map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    apply_mode(temp.path(), read_only)?;
     temp.persist(path).map_err(|error| StoreError::Io {
         path: path.to_path_buf(),
         source: error.error,
@@ -245,15 +228,61 @@ fn apply_mode(_path: &Path, _read_only: bool) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// True when `hash` is a 40 character hex string.
-fn validate_hash(hash: &str) -> Result<(), StoreError> {
+/// Normalizes `hash` to lowercase hex, rejecting anything that is not exactly
+/// forty hex characters.
+fn validate_hash(hash: &str) -> Result<String, StoreError> {
     let looks_like_sha1 = hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
     if looks_like_sha1 {
-        Ok(())
+        Ok(hash.to_ascii_lowercase())
     } else {
         Err(StoreError::BadHash {
             hash: hash.to_string(),
         })
+    }
+}
+
+/// Checks `bytes` against the expected `hash` and `size`, cheapest check first:
+/// the length, then the SHA-1. The hash has already been lowercased by
+/// [`validate_hash`].
+fn verify_bytes(bytes: &[u8], hash: &str, size: u64) -> Result<(), StoreError> {
+    if bytes.len() as u64 != size {
+        return Err(StoreError::SizeMismatch {
+            hash: hash.to_string(),
+            expected: size,
+            actual: bytes.len() as u64,
+        });
+    }
+    let actual = sha1_hex(bytes);
+    if !actual.eq_ignore_ascii_case(hash) {
+        return Err(StoreError::HashMismatch {
+            expected: hash.to_string(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// True when a verification failure proves the bytes cannot be trusted: a hash
+/// mismatch, a size mismatch, or an object that is no longer there. Any other
+/// failure (an unreadable file, say) proves nothing and must not cost the
+/// cached object.
+fn proves_corruption(error: &StoreError) -> bool {
+    match error {
+        StoreError::HashMismatch { .. } | StoreError::SizeMismatch { .. } => true,
+        StoreError::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+/// Removes a cached object, tolerating one that is already gone.
+fn remove_object(path: &Path) -> Result<(), StoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -272,4 +301,57 @@ fn shard(hash: &str) -> &str {
 /// The lowercase hex SHA-1 of `bytes`.
 fn sha1_hex(bytes: &[u8]) -> String {
     hex::encode(Sha1::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the small pieces the store's public paths build on.
+
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::{StoreError, VerifyReport, proves_corruption};
+
+    /// An IO failure of `kind` at an object path.
+    fn io_error(kind: io::ErrorKind) -> StoreError {
+        StoreError::Io {
+            path: PathBuf::from("object"),
+            source: io::Error::from(kind),
+        }
+    }
+
+    #[test]
+    fn a_verify_report_is_clean_only_when_it_lists_nothing() {
+        assert!(VerifyReport::default().is_clean());
+
+        let missing = VerifyReport {
+            missing: vec!["aa".to_string()],
+            mismatched: Vec::new(),
+        };
+        assert!(!missing.is_clean(), "a missing object is not clean");
+
+        let mismatched = VerifyReport {
+            missing: Vec::new(),
+            mismatched: vec!["bb".to_string()],
+        };
+        assert!(!mismatched.is_clean(), "a mismatched object is not clean");
+    }
+
+    #[test]
+    fn only_proven_corruption_justifies_dropping_a_cached_object() {
+        assert!(proves_corruption(&io_error(io::ErrorKind::NotFound)));
+        assert!(proves_corruption(&StoreError::HashMismatch {
+            expected: "aa".to_string(),
+            actual: "bb".to_string(),
+        }));
+        assert!(proves_corruption(&StoreError::SizeMismatch {
+            hash: "aa".to_string(),
+            expected: 3,
+            actual: 4,
+        }));
+        assert!(
+            !proves_corruption(&io_error(io::ErrorKind::PermissionDenied)),
+            "a failure that proves nothing must not cost the cached object"
+        );
+    }
 }

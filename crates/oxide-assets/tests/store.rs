@@ -254,3 +254,195 @@ fn open_refuses_a_symlinked_assets_directory() {
         "nothing may be written through the symlink"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_same_length_corruption_of_a_cached_object_fails_on_the_hash() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = b"golden bytes".to_vec();
+    let hash = sha1_hex(&body);
+    let url = format!(
+        "https://resources.download.minecraft.net/{}/{hash}",
+        &hash[..2]
+    );
+    let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+    let size = body.len() as u64;
+
+    let path = store.fetch_object(&http, &hash, size).expect("seed fetch");
+
+    // Rewrite the cached bytes without changing their length, the way bit rot
+    // or tampering would: only the hash can catch this.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("make writable");
+    std::fs::write(&path, b"rotten bytes").expect("corrupt in place");
+    assert_eq!(
+        std::fs::metadata(&path).expect("metadata").len(),
+        size,
+        "the corruption must keep the byte length identical"
+    );
+
+    let error = store
+        .verify_object(&hash, size)
+        .expect_err("a same-length corruption must fail verification");
+    assert!(
+        matches!(error, StoreError::HashMismatch { .. }),
+        "the hash check must catch it, got {error:?}"
+    );
+
+    let re_fetched = store
+        .fetch_object(&http, &hash, size)
+        .expect("re-fetch after corruption");
+    assert_eq!(std::fs::read(&re_fetched).expect("read"), body);
+    assert_eq!(
+        http.calls.borrow().len(),
+        2,
+        "the corrupted bytes must be downloaded again"
+    );
+}
+
+#[test]
+fn an_object_lives_under_its_two_hex_digit_shard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = b"layout bytes".to_vec();
+    let hash = sha1_hex(&body);
+    let url = format!(
+        "https://resources.download.minecraft.net/{}/{hash}",
+        &hash[..2]
+    );
+    let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+
+    let expected = dir
+        .path()
+        .join("assets")
+        .join("objects")
+        .join(&hash[..2])
+        .join(&hash);
+    assert_eq!(
+        store.object_path(&hash),
+        expected,
+        "the layout must be <root>/assets/objects/<first two hex>/<hash>"
+    );
+
+    let fetched = store
+        .fetch_object(&http, &hash, body.len() as u64)
+        .expect("fetch");
+    assert_eq!(
+        fetched, expected,
+        "the fetched object must land at that exact path"
+    );
+    assert!(expected.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_corrupt_read_only_cache_entry_is_removed_and_re_fetched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = b"precious bytes".to_vec();
+    let hash = sha1_hex(&body);
+    let url = format!(
+        "https://resources.download.minecraft.net/{}/{hash}",
+        &hash[..2]
+    );
+    let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+
+    let path = store.object_path(&hash);
+    std::fs::create_dir_all(path.parent().expect("shard dir")).expect("shard dir");
+    std::fs::write(&path, b"corrupt").expect("seed a corrupt entry");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("read-only");
+
+    let fetched = store
+        .fetch_object(&http, &hash, body.len() as u64)
+        .expect("a read-only corrupt entry is removed and re-fetched");
+    assert_eq!(std::fs::read(&fetched).expect("read"), body);
+    assert_eq!(
+        http.calls.borrow().len(),
+        1,
+        "the corrupt entry must be re-downloaded"
+    );
+
+    let mode = std::fs::metadata(&fetched)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o444, "the replacement is read-only again");
+}
+
+#[test]
+fn an_uppercase_hash_finds_the_lowercase_object() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = b"case matters".to_vec();
+    let hash = sha1_hex(&body);
+    let url = format!(
+        "https://resources.download.minecraft.net/{}/{hash}",
+        &hash[..2]
+    );
+    let http = FakeHttp::new(HashMap::from([(url.clone(), body.clone())]));
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+    let uppercase = hash.to_uppercase();
+
+    let path = store
+        .fetch_object(&http, &uppercase, body.len() as u64)
+        .expect("an uppercase hash must resolve to the lowercase object");
+    assert_eq!(
+        path,
+        store.object_path(&hash),
+        "the object lands at the lowercase path"
+    );
+    assert_eq!(http.calls.borrow().len(), 1);
+    assert_eq!(
+        http.calls.borrow()[0],
+        url,
+        "the request uses the lowercase URL"
+    );
+
+    store
+        .fetch_object(&http, &uppercase, body.len() as u64)
+        .expect("cache hit through the uppercase spelling");
+    assert_eq!(
+        http.calls.borrow().len(),
+        1,
+        "the lowercase object must be reused"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_cache_entry_surfaces_the_error_and_keeps_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = b"unreadable bytes".to_vec();
+    let hash = sha1_hex(&body);
+    let url = format!(
+        "https://resources.download.minecraft.net/{}/{hash}",
+        &hash[..2]
+    );
+    let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+
+    let path = store.object_path(&hash);
+    std::fs::create_dir_all(path.parent().expect("shard dir")).expect("shard dir");
+    std::fs::write(&path, &body).expect("seed a valid entry");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("unreadable");
+    if std::fs::read(&path).is_ok() {
+        // A privileged user reads through the mode; there is nothing to assert.
+        return;
+    }
+
+    let error = store
+        .fetch_object(&http, &hash, body.len() as u64)
+        .expect_err("an unreadable entry must not be silently replaced");
+    assert!(matches!(error, StoreError::Io { .. }), "got {error:?}");
+    assert!(path.exists(), "the unreadable entry must be left in place");
+    assert_eq!(
+        http.calls.borrow().len(),
+        0,
+        "no re-download may be attempted"
+    );
+}
