@@ -18,8 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use zip::ZipArchive;
 
-use crate::fetch::is_safe_id;
-use crate::store::{Store, StoreError, write_atomic};
+use crate::store::{Store, StoreError, is_safe_id, write_atomic};
 
 /// Schema version of the extraction manifest; bump to force re-extraction.
 pub const EXTRACTOR_SCHEMA_VERSION: u32 = 1;
@@ -49,17 +48,14 @@ const SIGNATURE_EXTENSIONS: [&str; 4] = ["sf", "rsa", "dsa", "ec"];
 const MAX_ENTRY_PREALLOC: u64 = 1 << 20;
 
 /// Errors from jar extraction.
+///
+/// Filesystem failures carry the store's shape whichever layer produced them:
+/// the extractor's own reads and removals report [`StoreError::Io`] inside
+/// [`ExtractError::Store`], exactly as the store's writes do, so one kind of
+/// failure has one shape in logs and in callers' matches.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
-    /// Filesystem failure.
-    #[error("filesystem error at {path}: {source}")]
-    Io {
-        /// Path involved.
-        path: PathBuf,
-        /// Underlying error.
-        source: std::io::Error,
-    },
-    /// A store write failed.
+    /// A filesystem or store write failure.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The jar is not readable as a zip archive.
@@ -211,6 +207,7 @@ impl<'a> Extractor<'a> {
         let mut archive = self.open_archive(&jar_bytes)?;
         let mut report = ExtractionReport::default();
         let mut entries = BTreeMap::new();
+        let jar_path = self.jar_path()?;
         for index in 0..archive.len() {
             let Some(name) = archive.name_for_index(index).map(str::to_string) else {
                 continue;
@@ -226,13 +223,13 @@ impl<'a> Extractor<'a> {
             let mut file = archive
                 .by_index(index)
                 .map_err(|source| ExtractError::Zip {
-                    path: self.jar_path(),
+                    path: jar_path.clone(),
                     source,
                 })?;
             let mut bytes = Vec::with_capacity(file.size().min(MAX_ENTRY_PREALLOC) as usize);
             file.read_to_end(&mut bytes)
                 .map_err(|source| ExtractError::Entry {
-                    jar: self.jar_path(),
+                    jar: jar_path.clone(),
                     entry: name.clone(),
                     source,
                 })?;
@@ -299,19 +296,22 @@ impl<'a> Extractor<'a> {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(ExtractError::Io { path, source }),
+            Err(source) => Err(StoreError::Io { path, source }.into()),
         }
     }
 
     /// The path of the client jar this extractor reads.
-    fn jar_path(&self) -> PathBuf {
-        self.store.client_jar_path(&self.version)
+    ///
+    /// Every entry point checks the version before this path is built, and
+    /// the store's builder checks it again.
+    fn jar_path(&self) -> Result<PathBuf, ExtractError> {
+        Ok(self.store.client_jar_path(&self.version)?)
     }
 
     /// Reads the jar; it is read whole, which a client jar's size allows.
     fn read_jar(&self) -> Result<Vec<u8>, ExtractError> {
-        let path = self.jar_path();
-        fs::read(&path).map_err(|source| ExtractError::Io { path, source })
+        let path = self.jar_path()?;
+        fs::read(&path).map_err(|source| StoreError::Io { path, source }.into())
     }
 
     /// Opens `bytes` as a zip archive.
@@ -319,10 +319,8 @@ impl<'a> Extractor<'a> {
         &self,
         bytes: &'b [u8],
     ) -> Result<ZipArchive<Cursor<&'b [u8]>>, ExtractError> {
-        ZipArchive::new(Cursor::new(bytes)).map_err(|source| ExtractError::Zip {
-            path: self.jar_path(),
-            source,
-        })
+        let path = self.jar_path()?;
+        ZipArchive::new(Cursor::new(bytes)).map_err(|source| ExtractError::Zip { path, source })
     }
 
     /// Refuses a version id that could escape the store as a path segment.
@@ -341,10 +339,12 @@ impl<'a> Extractor<'a> {
 ///
 /// The refusal rules come first, so a class entry under `assets/` is refused
 /// like any other: nothing reaches the reader without passing every refusal.
-/// Directory entries are recognised by their trailing slash, the JAR format's
-/// convention.
+/// A path segment ending in `.class` is refused even when the entry's own
+/// name does not end in it, so nothing sitting below a class segment is
+/// taken either. Directory entries are recognised by their trailing slash,
+/// the JAR format's convention.
 fn is_extractable(name: &str) -> bool {
-    if ends_with_ignore_ascii_case(name, ".class")
+    if has_class_segment(name)
         || is_signature_file(name)
         || name.starts_with(META_INF_PREFIX)
         || name.ends_with('/')
@@ -355,6 +355,17 @@ fn is_extractable(name: &str) -> bool {
         return false;
     }
     name.starts_with(ASSETS_PREFIX) || ROOT_FILES.contains(&name)
+}
+
+/// True when any of `name`'s path segments ends in `.class`, ignoring ASCII
+/// case.
+///
+/// The entry's own name is covered by its final segment; a directory segment
+/// carrying the extension is refused too, so a path like `foo.class/bar.png`
+/// never reaches the reader.
+fn has_class_segment(name: &str) -> bool {
+    name.split('/')
+        .any(|segment| ends_with_ignore_ascii_case(segment, ".class"))
 }
 
 /// True when the entry's final segment ends in a JAR signing extension.
@@ -431,6 +442,14 @@ mod tests {
             "the class refusal wins under the assets tree too"
         );
         assert!(!is_extractable("assets/minecraft/Foo.CLASS"));
+        assert!(
+            !is_extractable("assets/minecraft/foo.class/bar.png"),
+            "a path below a .class segment stays out"
+        );
+        assert!(
+            !is_extractable("assets/minecraft/Foo.CLASS/bar.png"),
+            "the segment refusal ignores case"
+        );
         assert!(!is_extractable("META-INF/MANIFEST.MF"));
         assert!(!is_extractable("META-INF/MOJANG_C.SF"));
         assert!(!is_extractable("META-INF/versions/9/module-info.class"));

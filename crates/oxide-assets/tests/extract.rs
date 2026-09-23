@@ -50,7 +50,7 @@ fn store_at(dir: &Path) -> Store {
 
 /// Stores `bytes` as the test version's client jar.
 fn write_jar(store: &Store, bytes: &[u8]) {
-    let path = store.client_jar_path(VERSION);
+    let path = store.client_jar_path(VERSION).expect("the client jar path");
     std::fs::create_dir_all(path.parent().expect("the version directory"))
         .expect("create the version directory");
     std::fs::write(&path, bytes).expect("write the jar");

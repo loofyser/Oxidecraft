@@ -67,6 +67,14 @@ pub enum StoreError {
         /// The offending hash.
         hash: String,
     },
+    /// An id that would escape the store when used as a path segment.
+    #[error("{what} id {id:?} is not usable as a path segment")]
+    BadId {
+        /// Which id.
+        what: &'static str,
+        /// The offending id.
+        id: String,
+    },
     /// A store path that must not be a symlink is one.
     #[error("refusing symlinked store path at {path}")]
     SymlinkedPath {
@@ -122,13 +130,18 @@ impl Store {
         Ok(Self { root })
     }
 
-    /// The final path for `hash`, which is used verbatim.
+    /// The final path for `hash`.
     ///
-    /// The shard directory is the first two bytes of the hash; a hash shorter
-    /// than two bytes shards on itself, so this never panics. Fetch and verify
-    /// reject malformed hashes up front and normalize the rest to lowercase
-    /// before asking for a path.
-    pub fn object_path(&self, hash: &str) -> PathBuf {
+    /// The hash is normalized to lowercase and must be exactly forty hex
+    /// characters; anything else is refused with [`StoreError::BadHash`], so a
+    /// string that reached here unvalidated cannot steer the path out of the
+    /// store. The shard directory is the hash's first two bytes.
+    pub fn object_path(&self, hash: &str) -> Result<PathBuf, StoreError> {
+        Ok(self.object_path_for(&validate_hash(hash)?))
+    }
+
+    /// The final path for a hash that has already been validated.
+    fn object_path_for(&self, hash: &str) -> PathBuf {
         self.root.join(OBJECTS_SUBDIR).join(shard(hash)).join(hash)
     }
 
@@ -139,28 +152,31 @@ impl Store {
 
     /// The directory holding one version's files.
     ///
-    /// `version` is used as a path segment; callers pass a version id from the
-    /// version manifest.
-    pub fn version_dir(&self, version: &str) -> PathBuf {
-        self.root.join(VERSIONS_SUBDIR).join(version)
+    /// `version` must be usable as a single path segment; anything else is
+    /// refused with [`StoreError::BadId`], so a version id read from a
+    /// document cannot steer the path out of the store.
+    pub fn version_dir(&self, version: &str) -> Result<PathBuf, StoreError> {
+        check_id("version", version)?;
+        Ok(self.root.join(VERSIONS_SUBDIR).join(version))
     }
 
     /// The version document for `version`, copied from piston-meta.
-    pub fn version_json_path(&self, version: &str) -> PathBuf {
-        self.version_dir(version).join("version.json")
+    pub fn version_json_path(&self, version: &str) -> Result<PathBuf, StoreError> {
+        Ok(self.version_dir(version)?.join("version.json"))
     }
 
     /// The client jar for `version`.
-    pub fn client_jar_path(&self, version: &str) -> PathBuf {
-        self.version_dir(version).join("client.jar")
+    pub fn client_jar_path(&self, version: &str) -> Result<PathBuf, StoreError> {
+        Ok(self.version_dir(version)?.join("client.jar"))
     }
 
     /// The asset index document for index id `id`.
     ///
-    /// `id` is used as the file name's stem; callers pass the id from the
-    /// version document.
-    pub fn index_path(&self, id: &str) -> PathBuf {
-        self.root.join(INDEXES_SUBDIR).join(format!("{id}.json"))
+    /// `id` must be usable as a single path segment; anything else is refused
+    /// with [`StoreError::BadId`]. It is used as the file name's stem.
+    pub fn index_path(&self, id: &str) -> Result<PathBuf, StoreError> {
+        check_id("asset index", id)?;
+        Ok(self.root.join(INDEXES_SUBDIR).join(format!("{id}.json")))
     }
 
     /// Re-hashes every expected object and reports what it finds.
@@ -178,7 +194,7 @@ impl Store {
                 report.mismatched.push(hash.to_string());
                 continue;
             };
-            let path = self.object_path(&hash);
+            let path = self.object_path_for(&hash);
             match fs::read(&path) {
                 Ok(bytes) => match verify_bytes(&bytes, &hash, size) {
                     Ok(()) => {
@@ -208,7 +224,7 @@ impl Store {
         size: u64,
     ) -> Result<PathBuf, StoreError> {
         let hash = validate_hash(hash)?;
-        let path = self.object_path(&hash);
+        let path = self.object_path_for(&hash);
         if path.exists() {
             match self.verify_object(&hash, size) {
                 Ok(()) => return Ok(path),
@@ -220,7 +236,7 @@ impl Store {
             }
         }
 
-        let url = format!("{RESOURCES_BASE_URL}/{}/{hash}", shard(&hash));
+        let url = object_url(&hash);
         let body = http.get(&url)?;
         verify_bytes(&body, &hash, size)?;
         write_object_atomic(&path, &body)?;
@@ -231,7 +247,7 @@ impl Store {
     /// lowercase first.
     pub fn verify_object(&self, hash: &str, size: u64) -> Result<(), StoreError> {
         let hash = validate_hash(hash)?;
-        let path = self.object_path(&hash);
+        let path = self.object_path_for(&hash);
         let bytes = fs::read(&path).map_err(|source| StoreError::Io {
             path: path.clone(),
             source,
@@ -315,6 +331,39 @@ fn validate_hash(hash: &str) -> Result<String, StoreError> {
     }
 }
 
+/// True when `id` can be used as a single path segment: non-empty, without
+/// separators or a NUL, and not a dot name.
+///
+/// The store's path builders, the fetch flow's version and index ids and the
+/// extractor's version all guard their paths with this, so a document that
+/// names something like `../x` cannot steer any of them out of the store.
+pub(crate) fn is_safe_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\']) && !id.contains('\0')
+}
+
+/// Refuses an id that cannot be used as a single path segment.
+fn check_id(what: &'static str, id: &str) -> Result<(), StoreError> {
+    if is_safe_id(id) {
+        Ok(())
+    } else {
+        Err(StoreError::BadId {
+            what,
+            id: id.to_string(),
+        })
+    }
+}
+
+/// The download URL for an object.
+///
+/// The resources base URL, the hash's first two bytes as a directory and the
+/// hash as the file name. This is the one place an object's URL is derived:
+/// the store's fetches and the asset index both use it, so the base URL and
+/// the shard rule cannot drift between two copies. A hash shorter than two
+/// characters shards on itself, so this never panics.
+pub(crate) fn object_url(hash: &str) -> String {
+    format!("{RESOURCES_BASE_URL}/{}/{hash}", shard(hash))
+}
+
 /// Checks `bytes` against the expected SHA-1, ignoring case.
 ///
 /// This is the check the fetch flow uses for a document whose descriptor
@@ -393,7 +442,7 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
-    use super::{StoreError, VerifyReport, proves_corruption};
+    use super::{StoreError, VerifyReport, is_safe_id, proves_corruption};
 
     /// An IO failure of `kind` at an object path.
     fn io_error(kind: io::ErrorKind) -> StoreError {
@@ -436,5 +485,17 @@ mod tests {
             !proves_corruption(&io_error(io::ErrorKind::PermissionDenied)),
             "a failure that proves nothing must not cost the cached object"
         );
+    }
+
+    #[test]
+    fn an_id_that_could_escape_the_store_is_rejected() {
+        assert!(is_safe_id("1.8.9"));
+        assert!(is_safe_id("1.8.9-pre1"));
+        assert!(!is_safe_id(""));
+        assert!(!is_safe_id("."));
+        assert!(!is_safe_id(".."));
+        assert!(!is_safe_id("a/b"));
+        assert!(!is_safe_id("a\\b"));
+        assert!(!is_safe_id("a\0b"));
     }
 }

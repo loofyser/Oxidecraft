@@ -256,21 +256,30 @@ fn fetch_is_idempotent_and_repairs_corruption() {
 
     // Everything landed with the hashes it was fetched under.
     for (hash, size) in &f.objects {
-        let path = store.object_path(hash);
+        let path = store.object_path(hash).expect("the object path");
         assert!(path.is_file(), "object {hash} must exist");
         let bytes = std::fs::read(&path).expect("read the object");
         assert_eq!(bytes.len() as u64, *size);
         assert_eq!(sha1_hex(&bytes), *hash);
     }
-    let stored = std::fs::read_to_string(store.version_json_path(&f.version))
-        .expect("read the stored version document");
+    let stored = std::fs::read_to_string(
+        store
+            .version_json_path(&f.version)
+            .expect("the version document path"),
+    )
+    .expect("read the stored version document");
     let document = oxide_assets::version::parse_version_json(&stored).expect("parse it");
     assert_eq!(
         document.asset_index.total_size, f.total_size,
         "the version document is stored verbatim"
     );
-    let jar_path = store.client_jar_path(&f.version);
-    assert!(store.index_path(&document.assets).is_file());
+    let jar_path = store.client_jar_path(&f.version).expect("the jar path");
+    assert!(
+        store
+            .index_path(&document.assets)
+            .expect("the index path")
+            .is_file()
+    );
     assert_eq!(
         std::fs::read(&jar_path).expect("read the jar").len() as u64,
         f.jar_size
@@ -320,7 +329,7 @@ fn fetch_is_idempotent_and_repairs_corruption() {
 
     // A same-length corruption of one object is repaired instead of trusted.
     let (hash, size) = &f.objects[0];
-    let path = store.object_path(hash);
+    let path = store.object_path(hash).expect("the object path");
     make_writable(&path);
     std::fs::write(&path, b"rotten soun").expect("corrupt in place");
     assert_eq!(
@@ -376,9 +385,19 @@ fn dry_run_resolves_the_plan_and_writes_nothing() {
     // No fetched content landed; the store skeleton and the lock file are
     // there (a dry run still creates the directories and takes the lock), but
     // the lock is free again.
-    assert!(!store.version_json_path("1.8.10").exists());
-    assert!(!store.index_path("1.8").exists());
-    assert!(!store.client_jar_path("1.8.10").exists());
+    assert!(
+        !store
+            .version_json_path("1.8.10")
+            .expect("the version path")
+            .exists()
+    );
+    assert!(!store.index_path("1.8").expect("the index path").exists());
+    assert!(
+        !store
+            .client_jar_path("1.8.10")
+            .expect("the jar path")
+            .exists()
+    );
     assert_lock_released(dir.path());
     assert_eq!(
         std::fs::read_dir(dir.path().join("assets/objects"))
@@ -540,7 +559,10 @@ fn a_version_document_for_another_version_is_refused() {
     );
     assert_eq!(f.http.calls.borrow().len(), 2, "manifest and the document");
     assert!(
-        !store.version_json_path("1.8.10").exists(),
+        !store
+            .version_json_path("1.8.10")
+            .expect("the version path")
+            .exists(),
         "a document for another version must not be stored"
     );
     assert_lock_released(dir.path());
@@ -569,10 +591,18 @@ fn the_1_8_9_client_jar_descriptor_is_guarded_by_the_constants() {
         "the guard fires before the index"
     );
     assert!(
-        !store.version_json_path("1.8.9").exists(),
+        !store
+            .version_json_path("1.8.9")
+            .expect("the version path")
+            .exists(),
         "nothing is stored when the guard refuses"
     );
-    assert!(!store.client_jar_path("1.8.9").exists());
+    assert!(
+        !store
+            .client_jar_path("1.8.9")
+            .expect("the jar path")
+            .exists()
+    );
     assert_lock_released(dir.path());
 }
 
@@ -589,7 +619,7 @@ fn an_unparsable_stored_version_document_is_re_resolved() {
     // Bytes that are not UTF-8 at all: a corruption of the stored document
     // that a reader without care cannot even look at. The run must re-resolve
     // instead of refusing until someone deletes the file.
-    let path = store.version_json_path("1.8.9");
+    let path = store.version_json_path("1.8.9").expect("the version path");
     std::fs::create_dir_all(path.parent().expect("the version directory"))
         .expect("create the version directory");
     std::fs::write(&path, [b'{', b'"', 0xff, 0xfe, b'"', b'}']).expect("write invalid UTF-8");
@@ -643,7 +673,7 @@ fn a_stored_document_that_fails_the_pin_is_re_resolved() {
             }
         }
     });
-    let path = store.version_json_path("1.8.9");
+    let path = store.version_json_path("1.8.9").expect("the version path");
     std::fs::create_dir_all(path.parent().expect("the version directory"))
         .expect("create the version directory");
     std::fs::write(
@@ -702,6 +732,77 @@ fn a_lock_file_left_by_a_dead_run_does_not_block_the_next() {
             .trim(),
         std::process::id().to_string(),
         "the run left its own process id behind"
+    );
+    assert_lock_released(dir.path());
+}
+
+#[test]
+fn a_failed_space_precheck_refuses_before_any_transfer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+    let http = FakeHttp::new(HashMap::new());
+
+    // A version document already in the store, declaring an index larger than
+    // any disk. The run resolves it without touching the transport, so the
+    // space check is the only thing standing between the run and its first
+    // download; the requirement it derives from the document saturates, and
+    // the real check must refuse.
+    let document = serde_json::json!({
+        "id": "1.8.10",
+        "assets": "1.8",
+        "assetIndex": {
+            "id": "1.8",
+            "url": INDEX_URL,
+            "sha1": "0000000000000000000000000000000000000000",
+            "size": 1,
+            "totalSize": u64::MAX
+        },
+        "downloads": {
+            "client": {
+                "url": JAR_URL,
+                "sha1": "0000000000000000000000000000000000000000",
+                "size": 1
+            }
+        }
+    });
+    let path = store
+        .version_json_path("1.8.10")
+        .expect("the version document path");
+    std::fs::create_dir_all(path.parent().expect("the version directory"))
+        .expect("create the version directory");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&document).expect("serialize the document"),
+    )
+    .expect("store the document");
+
+    let error = fetch_version(&store, &http, &options("1.8.10"), |_| {})
+        .expect_err("the space check must refuse the run");
+    assert!(
+        matches!(error, FetchError::InsufficientSpace { .. }),
+        "got {error:?}"
+    );
+    assert!(
+        http.calls.borrow().is_empty(),
+        "the refusal must come before any transfer"
+    );
+    assert!(
+        !store
+            .client_jar_path("1.8.10")
+            .expect("the jar path")
+            .exists(),
+        "nothing may be downloaded when the space check refuses"
+    );
+    assert!(
+        path.is_file(),
+        "the stored document is the run's own input and is left alone"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("assets/objects"))
+            .expect("objects directory")
+            .count(),
+        0,
+        "no object may be written when the space check refuses"
     );
     assert_lock_released(dir.path());
 }

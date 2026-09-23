@@ -23,7 +23,9 @@ use fs4::{FileExt, TryLockError};
 use crate::asset_index::AssetIndex;
 use crate::extract::{ExtractError, ExtractionReport, Extractor};
 use crate::http::{HttpClient, HttpError};
-use crate::store::{Store, StoreError, VerifyReport, verify_bytes, verify_sha1, write_atomic};
+use crate::store::{
+    Store, StoreError, VerifyReport, is_safe_id, verify_bytes, verify_sha1, write_atomic,
+};
 use crate::version::{
     CLIENT_1_8_9_SHA1, CLIENT_1_8_9_SIZE, DownloadInfo, VERSION_MANIFEST_URL, VersionJson,
     find_version, parse_manifest, parse_version_json,
@@ -322,7 +324,7 @@ fn resolve_version_json(
     progress: &mut impl FnMut(Progress),
 ) -> Result<VersionJson, FetchError> {
     let version = options.version.as_str();
-    let path = store.version_json_path(version);
+    let path = store.version_json_path(version)?;
     if let Ok(bytes) = fs::read(&path) {
         // A stored copy that is not UTF-8 text fails the read the same way
         // malformed JSON fails the parse: both fall through to the manifest
@@ -397,7 +399,7 @@ fn resolve_index(
             id: info.id.clone(),
         });
     }
-    let path = store.index_path(&info.id);
+    let path = store.index_path(&info.id)?;
     if let Ok(bytes) = fs::read(&path) {
         if verify_bytes(&bytes, &info.sha1, info.size).is_ok() {
             let index = AssetIndex::parse(as_str(&bytes, ASSET_INDEX)?).map_err(|source| {
@@ -486,13 +488,13 @@ fn fetch_jar(
     }
     let body = http.get(&client.url)?;
     verify_bytes(&body, &client.sha1, client.size)?;
-    write_atomic(&store.client_jar_path(version), &body)?;
+    write_atomic(&store.client_jar_path(version)?, &body)?;
     Ok(false)
 }
 
 /// True when the stored client jar re-hashes against its descriptor.
 fn jar_is_valid(store: &Store, client: &DownloadInfo, version: &str) -> Result<bool, FetchError> {
-    let path = store.client_jar_path(version);
+    let path = store.client_jar_path(version)?;
     match fs::read(&path) {
         Ok(bytes) => Ok(verify_bytes(&bytes, &client.sha1, client.size).is_ok()),
         Err(source) if source.kind() == ErrorKind::NotFound => Ok(false),
@@ -502,7 +504,7 @@ fn jar_is_valid(store: &Store, client: &DownloadInfo, version: &str) -> Result<b
 
 /// Re-hashes the stored client jar for the strict verification pass.
 fn verify_jar(store: &Store, document: &VersionJson, version: &str) -> Result<(), FetchError> {
-    let path = store.client_jar_path(version);
+    let path = store.client_jar_path(version)?;
     let client = &document.downloads.client;
     let bytes = fs::read(&path).map_err(|source| StoreError::Io {
         path: path.clone(),
@@ -563,16 +565,6 @@ fn require_free_space(path: &Path, required: u64) -> Result<(), FetchError> {
 /// Borrows `bytes` as UTF-8 text, naming `what` in the error.
 fn as_str<'a>(bytes: &'a [u8], what: &'static str) -> Result<&'a str, FetchError> {
     std::str::from_utf8(bytes).map_err(|source| FetchError::Text { what, source })
-}
-
-/// True when `id` can be used as a single path segment: non-empty, without
-/// separators or a NUL, and not a dot name.
-///
-/// The store's version and index ids and the extractor's version all guard
-/// their paths with this, so a document that names something like `../x`
-/// cannot steer any of them out of the store.
-pub(crate) fn is_safe_id(id: &str) -> bool {
-    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\']) && !id.contains('\0')
 }
 
 /// The name of the version manifest document, for errors.
@@ -679,7 +671,7 @@ mod tests {
 
     use std::path::Path;
 
-    use super::{FetchError, Lock, is_safe_id, required_bytes, space_shortfall};
+    use super::{FetchError, Lock, required_bytes, space_shortfall};
 
     #[test]
     fn the_space_requirement_is_the_index_total_plus_the_jar_plus_25_percent() {
@@ -714,18 +706,6 @@ mod tests {
             message.contains("1000"),
             "the available space is reported: {message}"
         );
-    }
-
-    #[test]
-    fn a_version_id_that_could_escape_the_store_is_rejected() {
-        assert!(is_safe_id("1.8.9"));
-        assert!(is_safe_id("1.8.9-pre1"));
-        assert!(!is_safe_id(""));
-        assert!(!is_safe_id("."));
-        assert!(!is_safe_id(".."));
-        assert!(!is_safe_id("a/b"));
-        assert!(!is_safe_id("a\\b"));
-        assert!(!is_safe_id("a\0b"));
     }
 
     #[test]

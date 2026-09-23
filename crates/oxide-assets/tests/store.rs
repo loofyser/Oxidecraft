@@ -83,7 +83,7 @@ fn corrupted_object_is_rejected_and_not_kept() {
     let result = store.fetch_object(&http, &hash, body.len() as u64);
     assert!(result.is_err(), "tampered body must fail verification");
     assert!(
-        !store.object_path(&hash).exists(),
+        !store.object_path(&hash).expect("the object path").exists(),
         "nothing may land under the final name"
     );
 }
@@ -100,7 +100,7 @@ fn a_corrupted_cache_entry_is_replaced() {
     let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
     let store = Store::open(dir.path().to_path_buf()).expect("open");
 
-    let path = store.object_path(&hash);
+    let path = store.object_path(&hash).expect("the object path");
     std::fs::create_dir_all(path.parent().expect("shard dir")).expect("shard dir");
     std::fs::write(&path, b"corrupt").expect("seed a corrupt entry");
 
@@ -129,7 +129,7 @@ fn a_body_of_the_wrong_size_is_rejected() {
 
     let result = store.fetch_object(&http, &hash, body.len() as u64 + 1);
     assert!(matches!(result, Err(StoreError::SizeMismatch { .. })));
-    assert!(!store.object_path(&hash).exists());
+    assert!(!store.object_path(&hash).expect("the object path").exists());
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn a_missing_remote_object_surfaces_as_an_http_status_error() {
         result,
         Err(StoreError::Http(HttpError::Status { code: 404, .. }))
     ));
-    assert!(!store.object_path(&hash).exists());
+    assert!(!store.object_path(&hash).expect("the object path").exists());
 }
 
 #[test]
@@ -154,12 +154,12 @@ fn a_malformed_hash_is_rejected_without_panicking() {
     let store = Store::open(dir.path().to_path_buf()).expect("open");
     let http = FakeHttp::new(HashMap::new());
 
-    // A one-character hash must not panic when it is turned into a path.
-    let path = store.object_path("a");
-    assert!(
-        path.starts_with(dir.path()),
-        "a malformed hash must stay under the store root"
-    );
+    // A one-character hash has no path under the store: it is refused before
+    // one is built, so nothing can leave the store root.
+    let error = store
+        .object_path("a")
+        .expect_err("a malformed hash must be refused");
+    assert!(matches!(error, StoreError::BadHash { .. }), "got {error:?}");
 
     let result = store.fetch_object(&http, "a", 1);
     assert!(matches!(result, Err(StoreError::BadHash { .. })));
@@ -167,6 +167,49 @@ fn a_malformed_hash_is_rejected_without_panicking() {
         http.calls.borrow().len(),
         0,
         "a malformed hash must not reach the network"
+    );
+}
+
+#[test]
+fn the_path_builders_refuse_components_that_could_escape_the_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+
+    // An id that is not a single plain path segment has no path under the
+    // store: each builder refuses it before a path is built.
+    for escaping in ["", ".", "..", "a/b", "a\\b", "/etc/passwd"] {
+        assert!(
+            matches!(store.version_dir(escaping), Err(StoreError::BadId { .. })),
+            "version id {escaping:?} must be refused"
+        );
+        assert!(
+            matches!(
+                store.version_json_path(escaping),
+                Err(StoreError::BadId { .. })
+            ),
+            "a version document path for {escaping:?} must be refused"
+        );
+        assert!(
+            matches!(
+                store.client_jar_path(escaping),
+                Err(StoreError::BadId { .. })
+            ),
+            "a client jar path for {escaping:?} must be refused"
+        );
+        assert!(
+            matches!(store.index_path(escaping), Err(StoreError::BadId { .. })),
+            "asset index id {escaping:?} must be refused"
+        );
+    }
+
+    // A valid id still builds the path the store layout spells.
+    assert_eq!(
+        store.version_dir("1.8.9").expect("a valid version id"),
+        dir.path().join("versions").join("1.8.9")
+    );
+    assert_eq!(
+        store.index_path("1.8").expect("a valid index id"),
+        dir.path().join("assets/indexes/1.8.json")
     );
 }
 
@@ -322,7 +365,7 @@ fn an_object_lives_under_its_two_hex_digit_shard() {
         .join(&hash[..2])
         .join(&hash);
     assert_eq!(
-        store.object_path(&hash),
+        store.object_path(&hash).expect("the object path"),
         expected,
         "the layout must be <root>/assets/objects/<first two hex>/<hash>"
     );
@@ -352,7 +395,7 @@ fn a_corrupt_read_only_cache_entry_is_removed_and_re_fetched() {
     let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
     let store = Store::open(dir.path().to_path_buf()).expect("open");
 
-    let path = store.object_path(&hash);
+    let path = store.object_path(&hash).expect("the object path");
     std::fs::create_dir_all(path.parent().expect("shard dir")).expect("shard dir");
     std::fs::write(&path, b"corrupt").expect("seed a corrupt entry");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("read-only");
@@ -392,7 +435,7 @@ fn an_uppercase_hash_finds_the_lowercase_object() {
         .expect("an uppercase hash must resolve to the lowercase object");
     assert_eq!(
         path,
-        store.object_path(&hash),
+        store.object_path(&hash).expect("the object path"),
         "the object lands at the lowercase path"
     );
     assert_eq!(http.calls.borrow().len(), 1);
@@ -427,7 +470,7 @@ fn an_unreadable_cache_entry_surfaces_the_error_and_keeps_the_file() {
     let http = FakeHttp::new(HashMap::from([(url, body.clone())]));
     let store = Store::open(dir.path().to_path_buf()).expect("open");
 
-    let path = store.object_path(&hash);
+    let path = store.object_path(&hash).expect("the object path");
     std::fs::create_dir_all(path.parent().expect("shard dir")).expect("shard dir");
     std::fs::write(&path, &body).expect("seed a valid entry");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("unreadable");
@@ -456,7 +499,7 @@ fn the_verification_pass_reports_verified_missing_and_mismatched_objects() {
     // A valid object on disk.
     let good = b"a good object".to_vec();
     let good_hash = sha1_hex(&good);
-    let good_path = store.object_path(&good_hash);
+    let good_path = store.object_path(&good_hash).expect("the object path");
     std::fs::create_dir_all(good_path.parent().expect("shard dir")).expect("shard dir");
     std::fs::write(&good_path, &good).expect("write the good object");
 
@@ -471,7 +514,7 @@ fn the_verification_pass_reports_verified_missing_and_mismatched_objects() {
         "the corruption keeps the length"
     );
     let tampered_hash = sha1_hex(&real);
-    let tampered_path = store.object_path(&tampered_hash);
+    let tampered_path = store.object_path(&tampered_hash).expect("the object path");
     std::fs::create_dir_all(tampered_path.parent().expect("shard dir")).expect("shard dir");
     std::fs::write(&tampered_path, &tampered).expect("write the tampered object");
 

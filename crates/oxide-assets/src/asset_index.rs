@@ -5,9 +5,6 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde::de::Error as _;
 
-/// Where the object resource server lives.
-const RESOURCES_BASE_URL: &str = "https://resources.download.minecraft.net";
-
 /// The 1.8 asset index.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssetIndex {
@@ -27,16 +24,12 @@ pub struct AssetObject {
 impl AssetObject {
     /// The download URL for this object.
     ///
-    /// The path is the first two hash characters as a directory and the hash as
-    /// the file name. A hash shorter than two characters shards on itself, the
-    /// way the store's paths do, so this never panics.
+    /// Delegates to the store's derivation, the one owner of the resources
+    /// base URL and the shard rule. A hash shorter than two characters shards
+    /// on itself, the way the store's paths do, so this never panics.
     #[must_use]
     pub fn url(&self) -> String {
-        format!(
-            "{RESOURCES_BASE_URL}/{}/{}",
-            self.hash.get(..2).unwrap_or(&self.hash),
-            self.hash
-        )
+        crate::store::object_url(&self.hash)
     }
 }
 
