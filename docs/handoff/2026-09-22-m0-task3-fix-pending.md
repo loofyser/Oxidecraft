@@ -1,7 +1,8 @@
 # Handoff — M0 in progress, Task 3 fix awaiting re-review
 
 Date: 2026-09-22. Repo: https://github.com/loofyser/Oxidecraft. Working copy:
-`/home/lucy/Desktop/Software/Projects/Oxidecraft`. Branch `main` at `4c0db19`, pushed, tree clean.
+`/home/lucy/Desktop/Software/Projects/Oxidecraft`. Branch `main`, pushed, tree clean. The last code
+commit is `4c0db19`; documentation commits follow it — confirm HEAD with `git log --oneline -3`.
 
 ## Mission
 

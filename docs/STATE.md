@@ -25,7 +25,8 @@ specification and continue without asking questions that are already answered he
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
-- Repo: https://github.com/loofyser/Oxidecraft — `main` at `4c0db19`, pushed.
+- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed; the last code commit is `4c0db19`,
+  documentation commits follow it. Confirm HEAD with `git log --oneline -3`.
 
 ## Decisions locked
 
