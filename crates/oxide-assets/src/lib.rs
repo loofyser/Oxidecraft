@@ -1,1 +1,4 @@
-//! piston-meta client, SHA-1 verified store, jar reader, extraction, atlas builder, model baker, font, sound index, skin fetch and cache.
+//! Asset store, Mojang distribution client, jar reader, atlas and model baking.
+
+pub mod http;
+pub mod store;
