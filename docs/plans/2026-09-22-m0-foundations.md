@@ -1464,6 +1464,21 @@ git add crates/oxide-assets crates/oxide-launcher docs/STATE.md
 git commit -m "feat: full launcher fetch with verify and dry-run (M0)"
 ```
 
+### Added requirements (recorded after the Task 4 review)
+
+Spec section 7.2 binds these to the `fetch` command, which is where a fetch session begins. They are
+requirements of this task, not of the store crate:
+
+- **Single-instance lock.** Take an exclusive lock file in the store root before any network work, so
+  two `fetch` runs cannot write the same store at once. Release it on exit, including on error. A
+  second concurrent run fails with a clear message naming the lock file; it must not corrupt the store.
+- **Disk-space precheck.** Before downloading, compute the required bytes from the version JSON (the
+  asset index `totalSize` plus the client jar) and refuse to start when the store's filesystem has
+  less than that plus a 25% margin free. Report the numbers in the error.
+- **`--verify` consumes `VerifyReport`.** The verification pass the store exposes is what `--verify`
+  prints: object count, mismatch count, missing count, and total bytes on disk. No second
+  verification implementation in the CLI.
+
 ---
 
 ### Task 7: Jar extraction with a manifest
