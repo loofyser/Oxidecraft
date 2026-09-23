@@ -1,5 +1,6 @@
 //! Store tests against a fake transport: fetch, cache, verification failures,
-//! on-disk permissions and the refusal to follow a symlinked objects directory.
+//! on-disk permissions, the verification pass and the refusal to follow a
+//! symlinked objects directory.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -445,4 +446,59 @@ fn an_unreadable_cache_entry_surfaces_the_error_and_keeps_the_file() {
         0,
         "no re-download may be attempted"
     );
+}
+
+#[test]
+fn the_verification_pass_reports_verified_missing_and_mismatched_objects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+
+    // A valid object on disk.
+    let good = b"a good object".to_vec();
+    let good_hash = sha1_hex(&good);
+    let good_path = store.object_path(&good_hash);
+    std::fs::create_dir_all(good_path.parent().expect("shard dir")).expect("shard dir");
+    std::fs::write(&good_path, &good).expect("write the good object");
+
+    // An object stored under its own name but with the wrong bytes, the same
+    // length as the real ones: only the hash can catch this.
+    let real = b"the real bytes".to_vec();
+    let mut tampered = real.clone();
+    tampered[0] = b'X';
+    assert_eq!(
+        tampered.len(),
+        real.len(),
+        "the corruption keeps the length"
+    );
+    let tampered_hash = sha1_hex(&real);
+    let tampered_path = store.object_path(&tampered_hash);
+    std::fs::create_dir_all(tampered_path.parent().expect("shard dir")).expect("shard dir");
+    std::fs::write(&tampered_path, &tampered).expect("write the tampered object");
+
+    // An object that was never stored.
+    let absent = b"never written".to_vec();
+    let absent_hash = sha1_hex(&absent);
+
+    let expected = [
+        (good_hash.as_str(), good.len() as u64),
+        (tampered_hash.as_str(), real.len() as u64),
+        (absent_hash.as_str(), absent.len() as u64),
+    ];
+    let report = store.verify_objects(&expected);
+
+    assert_eq!(report.objects, 1, "only the good object verifies");
+    assert_eq!(
+        report.bytes,
+        good.len() as u64,
+        "the bytes of verified objects only"
+    );
+    assert_eq!(report.mismatched, vec![tampered_hash.clone()]);
+    assert_eq!(report.missing, vec![absent_hash.clone()]);
+    assert!(!report.is_clean());
+
+    // The same pass over a store that only holds the good object is clean.
+    let clean = store.verify_objects(&[(good_hash.as_str(), good.len() as u64)]);
+    assert!(clean.is_clean());
+    assert_eq!(clean.objects, 1);
+    assert_eq!(clean.bytes, good.len() as u64);
 }

@@ -12,21 +12,43 @@ specification and continue without asking questions that are already answered he
   `docs/plans/2026-09-22-m0-foundations.md`, one task at a time. The working ledger (gitignored)
   is `.superpowers/sdd/2026-09-22-m0-foundations/progress.md`.
 - M0 tasks complete: T1 workspace and VarInt codec; T2 framing with the 1.8 compression rules
-  (fix round 1 applied); T3 handshake, status ping and the launcher CLI. T3's fix round landed as
-  `4c0db19`; its scoped re-review is the immediate next action.
-- Tests: 36 passing workspace-wide, zero failures (`cargo test --workspace`).
+  (fix round 1 applied); T3 handshake, status ping and the launcher CLI (`4c0db19`, re-reviewed);
+  T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`).
+  T6 `fetch --verify` is implemented on `main` and awaiting its review.
+- Tests: 81 passing workspace-wide, 2 ignored (both require the live endpoints), zero failures
+  (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
-  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`.
-- Remaining M0 tasks: T4 hash-verified store, T5 piston-meta parsing, T6 `fetch --verify`,
-  T7 jar extraction, T8 wgpu window, T9 CI and guards, T10 hygiene and the `m0` tag.
+  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the full fetch run is recorded under
+  "M0 evidence" below.
+- Remaining M0 tasks: T7 jar extraction, T8 wgpu window, T9 CI and guards, T10 hygiene and the
+  `m0` tag.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
-- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed; the last code commit is `4c0db19`,
-  documentation commits follow it. Confirm HEAD with `git log --oneline -3`.
+- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed; the last code commit carries the
+  fetch flow, and documentation commits follow it. Confirm HEAD with `git log --oneline -3`.
+
+## M0 evidence
+
+Task 6 acceptance run, real endpoints, default store at `<data dir>/oxidecraft`, debug build
+(`cargo run -p oxide-launcher -- fetch --version 1.8.9 --verify`), 2026-09-23:
+
+```
+fetch complete: 726 downloaded, 0 reused, 123543629 bytes transferred
+verify: 722 objects, 0 mismatched, 0 missing, 114708537 bytes on disk
+```
+
+- The 1.8 index lists 734 entries over 722 distinct hashes (12 entries repeat a hash), so the
+  store holds 722 object files; the jar, index, version document and manifest are the other
+  transfers. Wall clock: 19 seconds (09:52:10Z to 09:52:29Z). The store's client jar re-hashes to
+  `3870888a6c3d349d3771a3e9d16c9bf5e076b908`, the pinned constant.
+- Second run, same command: `fetch complete: 0 downloaded, 725 reused, 0 bytes transferred` in
+  1.92 s, with the same clean verify. A run on a warm store downloads nothing.
+- Dry run on an empty store: `dry run: 0 file(s) already present, 723 file(s) to download,
+  123170021 bytes` (722 objects plus the jar); only the empty store directories are created.
 
 ## Decisions locked
 
@@ -37,10 +59,10 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Generate the Task 3 re-review package over `1a06e52..4c0db19`, dispatch the scoped re-review, and
-   mark Task 3 complete in the ledger when every finding is addressed.
-2. Continue the M0 plan from Task 4 (the hash-verified store) in order, one task per dispatch, with
-   the task review and fix loop after each.
+1. Package the Task 6 review over `0fc73cb..HEAD` and dispatch the scoped review; mark T6 complete
+   in the ledger when every finding is addressed.
+2. Continue the M0 plan from Task 7 (jar extraction) in order, one task per dispatch, with the task
+   review and fix loop after each.
 3. Every dispatch carries the standing rules: no AI or tooling language in committed files, commit
    messages or code comments; explicit `git add <paths>`; never touch `.superpowers/`.
 

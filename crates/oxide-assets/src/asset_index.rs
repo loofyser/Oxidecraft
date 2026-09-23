@@ -67,17 +67,6 @@ impl AssetIndex {
     }
 }
 
-/// The objects smaller than `max_bytes`, in logical-path order.
-#[must_use]
-pub fn objects_under_size(index: &AssetIndex, max_bytes: u64) -> Vec<(&str, &AssetObject)> {
-    index
-        .objects
-        .iter()
-        .filter(|(_, object)| object.size < max_bytes)
-        .map(|(path, object)| (path.as_str(), object))
-        .collect()
-}
-
 /// True when `hash` can be sharded into a URL path: two or more ASCII hex
 /// characters.
 fn is_shardable_hash(hash: &str) -> bool {

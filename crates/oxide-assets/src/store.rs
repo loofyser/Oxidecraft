@@ -14,11 +14,17 @@ const RESOURCES_BASE_URL: &str = "https://resources.download.minecraft.net";
 /// The content-addressed object directory, relative to the store root.
 const OBJECTS_SUBDIR: &str = "assets/objects";
 
+/// The asset index directory, relative to the store root.
+const INDEXES_SUBDIR: &str = "assets/indexes";
+
+/// The directory holding the per-version files, relative to the store root.
+const VERSIONS_SUBDIR: &str = "versions";
+
 /// Directories [`Store::open`] creates under the store root.
 const STORE_SUBDIRS: [&str; 5] = [
-    "assets/objects",
-    "assets/indexes",
-    "versions",
+    OBJECTS_SUBDIR,
+    INDEXES_SUBDIR,
+    VERSIONS_SUBDIR,
     "extracted",
     "skins",
 ];
@@ -72,6 +78,10 @@ pub enum StoreError {
 /// A report of a verification pass.
 #[derive(Debug, Default)]
 pub struct VerifyReport {
+    /// Objects that were present and verified.
+    pub objects: usize,
+    /// Total bytes on disk of the verified objects.
+    pub bytes: u64,
     /// Objects that were missing.
     pub missing: Vec<String>,
     /// Objects whose bytes did not match their hash.
@@ -120,6 +130,70 @@ impl Store {
     /// before asking for a path.
     pub fn object_path(&self, hash: &str) -> PathBuf {
         self.root.join(OBJECTS_SUBDIR).join(shard(hash)).join(hash)
+    }
+
+    /// The store root, the directory every store path lives under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The directory holding one version's files.
+    ///
+    /// `version` is used as a path segment; callers pass a version id from the
+    /// version manifest.
+    pub fn version_dir(&self, version: &str) -> PathBuf {
+        self.root.join(VERSIONS_SUBDIR).join(version)
+    }
+
+    /// The version document for `version`, copied from piston-meta.
+    pub fn version_json_path(&self, version: &str) -> PathBuf {
+        self.version_dir(version).join("version.json")
+    }
+
+    /// The client jar for `version`.
+    pub fn client_jar_path(&self, version: &str) -> PathBuf {
+        self.version_dir(version).join("client.jar")
+    }
+
+    /// The asset index document for index id `id`.
+    ///
+    /// `id` is used as the file name's stem; callers pass the id from the
+    /// version document.
+    pub fn index_path(&self, id: &str) -> PathBuf {
+        self.root.join(INDEXES_SUBDIR).join(format!("{id}.json"))
+    }
+
+    /// Re-hashes every expected object and reports what it finds.
+    ///
+    /// Each pair is an object's hash and its expected size; pass each object
+    /// once. A missing object is listed in [`VerifyReport::missing`], and an
+    /// object that is present but not verifiable (wrong bytes, wrong size, or
+    /// unreadable) in [`VerifyReport::mismatched`]. The verified objects are
+    /// counted, and their on-disk bytes summed, in the report's `objects` and
+    /// `bytes`.
+    pub fn verify_objects(&self, expected: &[(&str, u64)]) -> VerifyReport {
+        let mut report = VerifyReport::default();
+        for &(hash, size) in expected {
+            let Ok(hash) = validate_hash(hash) else {
+                report.mismatched.push(hash.to_string());
+                continue;
+            };
+            let path = self.object_path(&hash);
+            match fs::read(&path) {
+                Ok(bytes) => match verify_bytes(&bytes, &hash, size) {
+                    Ok(()) => {
+                        report.objects += 1;
+                        report.bytes += bytes.len() as u64;
+                    }
+                    Err(_) => report.mismatched.push(hash),
+                },
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    report.missing.push(hash);
+                }
+                Err(_) => report.mismatched.push(hash),
+            }
+        }
+        report
     }
 
     /// Fetches an object unless already present and valid, then returns its path.
@@ -241,17 +315,12 @@ fn validate_hash(hash: &str) -> Result<String, StoreError> {
     }
 }
 
-/// Checks `bytes` against the expected `hash` and `size`, cheapest check first:
-/// the length, then the SHA-1. The hash has already been lowercased by
-/// [`validate_hash`].
-fn verify_bytes(bytes: &[u8], hash: &str, size: u64) -> Result<(), StoreError> {
-    if bytes.len() as u64 != size {
-        return Err(StoreError::SizeMismatch {
-            hash: hash.to_string(),
-            expected: size,
-            actual: bytes.len() as u64,
-        });
-    }
+/// Checks `bytes` against the expected SHA-1, ignoring case.
+///
+/// This is the check the fetch flow uses for a document whose descriptor
+/// records no size (the version document), and the hash half of
+/// [`verify_bytes`].
+pub(crate) fn verify_sha1(bytes: &[u8], hash: &str) -> Result<(), StoreError> {
     let actual = sha1_hex(bytes);
     if !actual.eq_ignore_ascii_case(hash) {
         return Err(StoreError::HashMismatch {
@@ -260,6 +329,20 @@ fn verify_bytes(bytes: &[u8], hash: &str, size: u64) -> Result<(), StoreError> {
         });
     }
     Ok(())
+}
+
+/// Checks `bytes` against the expected `hash` and `size`, cheapest check first:
+/// the length, then the SHA-1. The hash has already been lowercased when it
+/// comes from [`validate_hash`].
+pub(crate) fn verify_bytes(bytes: &[u8], hash: &str, size: u64) -> Result<(), StoreError> {
+    if bytes.len() as u64 != size {
+        return Err(StoreError::SizeMismatch {
+            hash: hash.to_string(),
+            expected: size,
+            actual: bytes.len() as u64,
+        });
+    }
+    verify_sha1(bytes, hash)
 }
 
 /// True when a verification failure proves the bytes cannot be trusted: a hash
@@ -326,13 +409,13 @@ mod tests {
 
         let missing = VerifyReport {
             missing: vec!["aa".to_string()],
-            mismatched: Vec::new(),
+            ..VerifyReport::default()
         };
         assert!(!missing.is_clean(), "a missing object is not clean");
 
         let mismatched = VerifyReport {
-            missing: Vec::new(),
             mismatched: vec!["bb".to_string()],
+            ..VerifyReport::default()
         };
         assert!(!mismatched.is_clean(), "a mismatched object is not clean");
     }

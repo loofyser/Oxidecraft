@@ -3,7 +3,7 @@
 //! documents. Nothing here touches the network; the live checks at the end of
 //! the file are ignored by default.
 
-use oxide_assets::asset_index::{AssetIndex, AssetObject, objects_under_size};
+use oxide_assets::asset_index::{AssetIndex, AssetObject};
 use oxide_assets::http::{HttpClient, UreqClient};
 use oxide_assets::version::{
     CLIENT_1_8_9_SHA1, CLIENT_1_8_9_SIZE, VERSION_MANIFEST_URL, VersionManifest, find_version,
@@ -91,28 +91,6 @@ fn the_index_total_is_the_sum_of_its_objects() {
     let index_json = r#"{"objects":{"a":{"hash":"aa11","size":10},"b":{"hash":"bb22","size":32}}}"#;
     let index = AssetIndex::parse(index_json).expect("index");
     assert_eq!(index.total_size(), 42);
-}
-
-#[test]
-fn objects_under_size_selects_the_smaller_objects() {
-    let index_json =
-        r#"{"objects":{"big":{"hash":"aa11","size":4096},"small":{"hash":"bb22","size":42}}}"#;
-    let index = AssetIndex::parse(index_json).expect("index");
-
-    let small = objects_under_size(&index, 100);
-    assert_eq!(small.len(), 1, "only the 42 byte object is under 100 bytes");
-    assert_eq!(small[0].0, "small");
-    assert_eq!(small[0].1.size, 42);
-
-    assert!(
-        objects_under_size(&index, 42).is_empty(),
-        "the bound is exclusive"
-    );
-    assert_eq!(
-        objects_under_size(&index, 4097).len(),
-        2,
-        "both objects are under 4097 bytes"
-    );
 }
 
 #[test]

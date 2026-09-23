@@ -1152,7 +1152,7 @@ git commit -m "feat: hash-verified atomic asset store with HTTP trait (M0)"
 - Test: `crates/oxide-assets/tests/metadata.rs` with fixtures under `crates/oxide-assets/tests/fixtures/`
 
 **Interfaces:**
-- Produces: `oxide_assets::version::{VersionManifest, VersionEntry, VersionJson, DownloadInfo, AssetIndexInfo, find_version(&VersionManifest, &str) -> Option<&VersionEntry>}`; `oxide_assets::asset_index::{AssetIndex, AssetObject, objects_under_size}`; constants `VERSION_MANIFEST_URL`, `CLIENT_1_8_9_SHA1`, `CLIENT_1_8_9_SIZE`.
+- Produces: `oxide_assets::version::{VersionManifest, VersionEntry, VersionJson, DownloadInfo, AssetIndexInfo, find_version(&VersionManifest, &str) -> Option<&VersionEntry>}`; `oxide_assets::asset_index::{AssetIndex, AssetObject}` (`objects_under_size` was dropped in Task 6: it never gained a consumer); constants `VERSION_MANIFEST_URL`, `CLIENT_1_8_9_SHA1`, `CLIENT_1_8_9_SIZE`.
 
 - [ ] **Step 1: Create the fixtures by hand**
 
