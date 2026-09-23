@@ -1142,6 +1142,25 @@ git add crates/oxide-assets Cargo.toml Cargo.lock
 git commit -m "feat: hash-verified atomic asset store with HTTP trait (M0)"
 ```
 
+### Corrections applied after review (2026-09-23)
+
+The close-out review found that this section's store snippet predates the store's hardening. The
+code, not this snippet set, is the reference:
+
+- `Store::open` refuses a symlinked `assets/` or `assets/objects/` before it creates anything; the
+  snippet created every directory without that check.
+- The snippet's `fetch_object` dropped the cached object after any failed re-verification and never
+  validated the hash; the code validates the hash's shape first, normalizes it to lowercase and
+  drops a cached object only when the failure proves corruption (a wrong hash, a wrong size, or a
+  file that is gone), so an unreadable object never costs the cache.
+- The path builders (`object_path`, `version_dir`, `index_path` and their dependants) validate
+  their component and return a `Result`; the snippet joined it verbatim.
+- `write_atomic` sets an object's read-only mode before the sync, and `verify_objects` reports
+  missing and mismatched objects separately, with the verified object count and byte total.
+
+Do not copy this section's `store.rs` snippet into later code: its `object_path` panics on a short
+hash, and it lacks the checks above. Read `crates/oxide-assets/src/store.rs` for the current API.
+
 ---
 
 ### Task 5: piston-meta metadata parsing
@@ -1373,6 +1392,22 @@ Expected: 3 passed.
 git add crates/oxide-assets
 git commit -m "feat: piston-meta metadata parsing with fixtures (M0)"
 ```
+
+### Corrections applied after review (2026-09-23)
+
+The close-out review found that this section's metadata snippet predates the fixes that followed it.
+The code, not this snippet set, is the reference:
+
+- `AssetObject::url()` no longer slices `&self.hash[..2]` directly, which panics on a hash shorter
+  than two bytes; it delegates to the store's derivation, the single owner of the resources base
+  URL and the shard rule.
+- `AssetIndex::parse` checks every object hash while the document is read — at least two ASCII hex
+  characters — because no object URL can be derived from anything else; the snippet parsed without
+  checking.
+
+Do not copy this section's `asset_index.rs` snippet into later code: it panics on a short hash and
+skips the index's hash validation. Read `crates/oxide-assets/src/asset_index.rs` for the current
+API.
 
 ---
 

@@ -2,12 +2,12 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Draft v2, for owner review and approval |
+| Status | Draft v3, for owner review and approval |
 | Date | 2026-09-22 |
 | Target | Minecraft Java Edition 1.8.9, protocol 47 |
 | Repo | https://github.com/loofyser/Oxidecraft |
 | License | GPL-3.0 (repo code only; no Mojang assets, no jars redistributed) |
-| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. |
+| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. |
 
 ---
 
@@ -135,6 +135,7 @@ The M2 milestone records the baseline numbers. The M9 milestone proves the targe
 | D15 | Render distance range | v1 matches 1.8.9 exactly, up to 16 chunks. An extended range is a post-v1 item, not a v1 feature |
 | D16 | Offline-mode policy | The offline path exists for the local rig and development. The shipped flow requires a genuine login for online servers; no bypass is provided |
 | D17 | Legal invariants | No `.class` read, no asset committed, runtime fetch only, required README disclaimer. Enforced by review and the CI asset guard |
+| D18 | Window clear colour | The sRGB-aware surface format renders the sky-blue clear colour visibly paler than vanilla 1.8.9's; recorded as entry 4 in `docs/DIVERGENCES.md`. The sky renderer revisits the colour pipeline in a later milestone |
 
 ## 5. Architecture
 
@@ -228,7 +229,7 @@ required download and its contents must be readable. See
 - **Extraction manifest**: `extracted/1.8.9/.manifest.json`, holding the jar SHA-1, the extractor schema version, and the list of extracted paths with sizes. Extraction is skipped only when all three match.
 - **Atomic writes**: every downloaded object and every extracted file is written to a temporary name in the same directory and renamed into place. An interrupted fetch leaves no partial file under a final name.
 - **Single instance**: a lock file in the data directory prevents two launcher runs from writing the store at once.
-- **Retry policy**: three attempts with exponential backoff (1 s, 4 s, 16 s) per request; a failed transfer is resumed from scratch because objects are small.
+- **Retry policy**: three attempts with exponential backoff (1 s then 4 s between attempts) per request; a failed transfer is resumed from scratch because objects are small.
 - **Disk precheck**: roughly 150 MB of free space is required before a first fetch, and the shortfall is reported before any download starts.
 - **Verified store check**: `oxide-launcher fetch --verify` re-hashes every object and the jar, and reports mismatches; CI and M0 use it as the acceptance command.
 - **Vanilla-install reuse**: when a vanilla install is found, matching hashed objects are copied or hard-linked instead of downloaded, with identical hash verification. The `.mcassetsroot` marker convention that vanilla uses to identify an assets root is listed as unverified in the survey; the launcher must therefore verify the directory's contents by probe (look for `assets/indexes/1.8.json` and a sample object) before trusting it, and must fall back to a self-contained download when the probe fails.

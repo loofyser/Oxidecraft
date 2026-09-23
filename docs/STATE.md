@@ -15,19 +15,22 @@ specification and continue without asking questions that are already answered he
   VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
   and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
   `fetch --verify` flow, run against the real endpoints; jar extraction with a manifest; the wgpu
-  window with the FPS counter and adapter logging; CI (six jobs) with the crate-graph, asset and
-  licence guards.
-- Tests: 112 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
+  window with the FPS counter and adapter logging; CI with the crate-graph, asset and licence
+  guards and the release build.
+- Tests: 119 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
   adapter), zero failures (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
   `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the wgpu window is captured at
   `refs/rig/evidence/m0-window.png`; the full fetch run is recorded under "M0 evidence" below.
-- CI: six jobs — format/lint/test, MSRV 1.85.0, portability (`x86_64-pc-windows-gnu`), crate graph,
-  asset guard, licences and advisories — all green in run `35871974117` on head `b42871a`. Caveats
-  to carry forward: `aarch64-apple-darwin` is not checked on Linux runners because its C
-  dependencies need the macOS SDK; the MSRV job installs the 1.85.0 toolchain per run; `cargo-deny`
-  is pinned to 0.20.2 and installed per run.
+- CI: seven jobs — format/lint/test, MSRV 1.85.0, portability (`x86_64-pc-windows-gnu`), release
+  build, crate graph, asset guard, licences and advisories. The M0 tagged head `fe2d3b6` is green in
+  run `35873490870` (six jobs; the release build was added after the tag). Caveats to carry forward:
+  `aarch64-apple-darwin` is not checked on Linux runners because its C dependencies need the macOS
+  SDK; the MSRV job installs the 1.85.0 toolchain per run; `cargo-deny` is pinned to 0.20.2 and
+  installed per run; the two guard scripts are only exercised on the happy path — a negative
+  self-test for each (a forbidden tracked file must fail the asset guard, an unlisted dependency
+  edge must fail the graph check) belongs in the next milestone.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
@@ -106,8 +109,8 @@ client exiting frames=900
 - The instance asks for Vulkan only. Two GPUs are present (Intel Iris Xe and NVIDIA T500) and the
   discrete NVIDIA T500 was selected with driver 615.71.09 and device id 8123; this is the appendix
   C.1 device record for later parity comparisons. An X11/XWayland run of the same binary (with
-  `WAYLAND_DISPLAY` unset) reached the same title and a steady 60 fps, so both session paths work.
-- Escape and window-close exits were not exercised on this session: window enumeration is
+  `WAYLAND_DISPLAY` unset) reached the same title and a steady 60 fps, so both display paths work.
+- Escape and window-close exits were not exercised end to end: window enumeration is
   unavailable on this desktop and synthetic key events are not delivered to the XWayland client.
   The run above exits through the frame limit, which reaches the same `event_loop.exit()`; the
   escape rule itself is unit-tested.
@@ -155,7 +158,7 @@ Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M0:
 
 | Fact | Value |
 | --- | --- |
-| OS / session | CachyOS, kernel 7.2.2, Wayland with GNOME (mutter). XWayland is provided by mutter's `Xwayland :1`, so the 1.8.9 rig client (LWJGL 2) runs without extra setup. Earlier notes say niri; the desktop was switched to GNOME on 2026-09-22 |
+| OS / desktop | CachyOS, kernel 7.2.2, Wayland with GNOME (mutter). XWayland is provided by mutter's `Xwayland :1`, so the 1.8.9 rig client (LWJGL 2) runs without extra setup. Earlier notes say niri; the desktop was switched to GNOME on 2026-09-22 |
 | Rust | rustc 1.95.0, cargo 1.95.0 |
 | Dependency pin | `wgpu 26.0.1` is the newest release whose declared rust-version (1.84) fits the workspace's 1.85 floor (wgpu 27.0.0 declares 1.88, 28.0.0 declares 1.92, 29 and 30 declare 1.87), so cargo's resolver picked it; the pin is not a hand-downgrade. `winit 0.30.13` declares 1.70 (crates.io index metadata, 2026-09-23) |
 | Vulkan | instance 1.4.357; Intel Iris Xe (card2) and NVIDIA T500 (card1) |
