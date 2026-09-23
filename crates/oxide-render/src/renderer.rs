@@ -34,6 +34,31 @@ pub enum RendererError {
     Frame(#[from] wgpu::SurfaceError),
 }
 
+/// What the render loop must do after the next frame could not be acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceAction {
+    /// Reconfigure the surface from its stored configuration and retry the frame once.
+    Reconfigure,
+    /// Drop this frame and continue; the surface stays usable.
+    SkipFrame,
+    /// Stop: the error leaves the surface unusable.
+    Fatal,
+}
+
+/// Classifies a [`wgpu::SurfaceError`] into the action the render loop must take.
+///
+/// `Outdated` and `Lost` mean the surface no longer matches the window, or the driver dropped
+/// it; reconfiguring from the stored configuration makes it current again. `Timeout` means the
+/// frame was not ready in time, which a hidden window produces, so dropping the frame is enough.
+/// `OutOfMemory` and every other error are fatal.
+pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
+    match error {
+        wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost => SurfaceAction::Reconfigure,
+        wgpu::SurfaceError::Timeout => SurfaceAction::SkipFrame,
+        _ => SurfaceAction::Fatal,
+    }
+}
+
 /// Owns the GPU objects for one window: the surface, the device, the queue and the clear pass.
 ///
 /// A clear pass issues no draw calls, so it needs no pipeline; the passes that draw geometry
@@ -152,6 +177,15 @@ impl Renderer {
         }
         self.config.width = size.width;
         self.config.height = size.height;
+        self.reconfigure();
+    }
+
+    /// Reconfigures the surface from the stored configuration.
+    ///
+    /// Call after the surface reported that it went stale: `Outdated` and `Lost` mean it no
+    /// longer matches the window, or the driver dropped it, and reconfiguring makes the next
+    /// frame's acquisition succeed.
+    pub fn reconfigure(&mut self) {
         self.surface.configure(&self.device, &self.config);
     }
 
@@ -217,12 +251,47 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
-    //! Unit test of the blocking helper; the GPU paths need a device and a window.
+    //! Unit tests of the blocking helper and of the surface-error classification; the GPU paths
+    //! need a device and a window.
 
-    use super::block_on;
+    use wgpu::SurfaceError;
+
+    use super::{SurfaceAction, block_on, classify_surface_error};
 
     #[test]
     fn block_on_returns_the_output_of_a_ready_future() {
         assert_eq!(block_on(async { 7_u32 + 1 }), 8);
+    }
+
+    #[test]
+    fn a_stale_surface_is_reconfigured_and_the_frame_retried() {
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Outdated),
+            SurfaceAction::Reconfigure
+        );
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Lost),
+            SurfaceAction::Reconfigure
+        );
+    }
+
+    #[test]
+    fn a_timeout_skips_the_frame() {
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Timeout),
+            SurfaceAction::SkipFrame
+        );
+    }
+
+    #[test]
+    fn out_of_memory_and_generic_errors_are_fatal() {
+        assert_eq!(
+            classify_surface_error(&SurfaceError::OutOfMemory),
+            SurfaceAction::Fatal
+        );
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Other),
+            SurfaceAction::Fatal
+        );
     }
 }

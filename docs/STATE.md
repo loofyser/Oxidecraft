@@ -16,8 +16,8 @@ specification and continue without asking questions that are already answered he
   T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`);
   T6 `fetch --verify` with fix round 1 applied and re-reviewed (`b3fcc51`); T7 jar extraction with
   the manifest, review clean (`8d4dac9`). T8 the wgpu window with the FPS counter is implemented on
-  `main`, acceptance run recorded below, awaiting its review.
-- Tests: 109 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
+  `main` with fix round 1 applied, acceptance run recorded below, awaiting its re-review.
+- Tests: 112 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
   adapter), zero failures (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
@@ -108,6 +108,11 @@ client exiting frames=900
   run above exits through the frame limit, which reaches the same `event_loop.exit()`; the escape
   rule itself is unit-tested.
 
+- Fix round 1 (2026-09-23): a stale surface (`Outdated`, `Lost`) is now reconfigured and the frame
+  retried once instead of stopping the client, a `Timeout` frame is dropped, the error logs carry
+  the full cause chain, and the clear colour's sRGB difference is recorded in `docs/DIVERGENCES.md`
+  (entry 4).
+
 ## Decisions locked
 
 See spec section 4 for the full table. The short version: multiplayer-first v1; Microsoft
@@ -130,6 +135,7 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 | --- | --- |
 | OS / session | CachyOS, kernel 7.2.2, Wayland with GNOME (mutter). XWayland is provided by mutter's `Xwayland :1`, so the 1.8.9 rig client (LWJGL 2) runs without extra setup. Earlier notes say niri; the desktop was switched to GNOME on 2026-09-22 |
 | Rust | rustc 1.95.0, cargo 1.95.0 |
+| Dependency pin | `wgpu 26.0.1` is the newest release whose declared rust-version (1.84) fits the workspace's 1.85 floor (wgpu 27.0.0 declares 1.88, 28.0.0 declares 1.92, 29 and 30 declare 1.87), so cargo's resolver picked it; the pin is not a hand-downgrade. `winit 0.30.13` declares 1.70 (crates.io index metadata, 2026-09-23) |
 | Vulkan | instance 1.4.357; Intel Iris Xe (card2) and NVIDIA T500 (card1) |
 | Java | Java 26 system-wide; the rig uses a standalone JRE 8 tarball |
 | gh CLI | 2.101.0, authorized as loofyser, scopes repo, read:org, gist |

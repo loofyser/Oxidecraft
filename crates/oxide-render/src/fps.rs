@@ -83,7 +83,7 @@ mod tests {
 
     use super::FpsCounter;
 
-    /// The interval between frames of a 60 Hz stream, as the brief's test measures it.
+    /// The interval between frames of a 60 Hz stream.
     const FRAME_60_HZ: Duration = Duration::from_micros(16_666);
 
     #[test]

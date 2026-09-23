@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use oxide_render::fps::FpsCounter;
-use oxide_render::renderer::Renderer;
+use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -75,16 +75,23 @@ impl ClientApp {
     }
 
     /// Presents one frame, updates the title, and stops once the limit is reached.
+    ///
+    /// A frame the surface is not ready for is dropped, and a surface that went stale is
+    /// reconfigured before the frame is retried once. Any other failure stops the client.
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
         self.fps.record_frame(Instant::now());
-        if let Err(error) = renderer.render() {
-            tracing::error!(%error, "the frame could not be presented");
-            self.stopped_on_error = true;
-            event_loop.exit();
-            return;
+        match present_frame(renderer) {
+            Ok(PresentOutcome::Presented) => {}
+            Ok(PresentOutcome::Skipped) => return,
+            Err(error) => {
+                tracing::error!(error = ?error, "the frame could not be presented");
+                self.stopped_on_error = true;
+                event_loop.exit();
+                return;
+            }
         }
         self.frames += 1;
         let fps = self.fps.fps();
@@ -103,6 +110,42 @@ impl ClientApp {
                 event_loop.exit();
             }
         }
+    }
+}
+
+/// Whether a redraw presented a frame or the surface was not ready for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentOutcome {
+    /// The frame was cleared and presented.
+    Presented,
+    /// No frame was presented; the surface was not ready and the next redraw tries again.
+    Skipped,
+}
+
+/// Renders and presents one frame, recovering a stale surface once.
+///
+/// `Outdated` and `Lost` mean the surface went stale: it is reconfigured from its stored
+/// configuration and the frame retried a single time. `Timeout` drops the frame and the next
+/// redraw tries again. Every other failure is returned for the caller to treat as fatal.
+fn present_frame(renderer: &mut Renderer) -> Result<PresentOutcome, RendererError> {
+    match renderer.render() {
+        Ok(()) => Ok(PresentOutcome::Presented),
+        Err(RendererError::Frame(error)) => match classify_surface_error(&error) {
+            SurfaceAction::Reconfigure => {
+                tracing::warn!(
+                    ?error,
+                    "the surface went stale, reconfiguring it and retrying the frame"
+                );
+                renderer.reconfigure();
+                renderer.render().map(|()| PresentOutcome::Presented)
+            }
+            SurfaceAction::SkipFrame => {
+                tracing::debug!(?error, "the surface was not ready, skipping this frame");
+                Ok(PresentOutcome::Skipped)
+            }
+            SurfaceAction::Fatal => Err(RendererError::Frame(error)),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -129,7 +172,7 @@ impl ApplicationHandler for ClientApp {
                 self.renderer = Some(renderer);
             }
             Err(error) => {
-                tracing::error!(%error, "the renderer could not be created");
+                tracing::error!(error = ?error, "the renderer could not be created");
                 self.stopped_on_error = true;
                 event_loop.exit();
                 return;

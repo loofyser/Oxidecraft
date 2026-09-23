@@ -19,6 +19,8 @@ const EXPECTED: [u8; 3] = [158, 194, 250];
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn clears_an_offscreen_target_to_the_sky_colour() {
+    // Mirrors the backend choice in `Renderer::new` (`renderer.rs`); the test target cannot
+    // reach the crate's private code, so keep the two copies in step.
     let backends = if cfg!(target_os = "linux") {
         wgpu::Backends::VULKAN
     } else {
@@ -138,6 +140,9 @@ fn clears_an_offscreen_target_to_the_sky_colour() {
 }
 
 /// Blocks the calling thread until `future` resolves; the test has no async runtime.
+///
+/// The test target cannot reach the private `block_on` in `renderer.rs`, so this is a copy of
+/// it; keep the two in step.
 fn block_on<F: Future>(future: F) -> F::Output {
     /// Wakes the waiting thread by unparking it.
     struct Unpark(std::thread::Thread);
