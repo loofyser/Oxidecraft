@@ -511,6 +511,9 @@ now the reference; the deltas the fix round applied are:
 - Tests added for `TooLong`, `NegativeLength`, a fixed-vector decode (`ZLIB_HELLO`), the compressed
   branch actually compressing at the threshold, and the payload bytes following the marker.
 
+Do not copy this section's `frame.rs` snippet into later code — it is the pre-fix version. Read
+`crates/oxide-proto/src/frame.rs` for the current API when a later task needs it.
+
 ---
 
 ### Task 3: Handshake, status ping and the `ping` command
