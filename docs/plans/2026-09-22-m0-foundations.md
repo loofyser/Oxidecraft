@@ -357,15 +357,20 @@ fn payload_at_threshold_is_compressed_and_round_trips() {
 }
 
 #[test]
-fn threshold_minus_one_never_compresses() {
+fn a_negative_threshold_uses_plain_framing() {
+    // A server threshold of -1 disables compression entirely: no Data Length field is
+    // written, exactly as before Set Compression ever arrived.
     let payload = vec![0x11u8; 4096];
     let mut out = Vec::new();
     write_frame(&mut out, &payload, Compression::Enabled { threshold: -1 }).expect("write");
-    // The frame length is itself a VarInt, so skip it before reading the Data Length marker.
     let mut cursor = &out[..];
-    let _frame_len = oxide_proto::varint::read_varint(&mut cursor).expect("frame length");
-    let data_length = oxide_proto::varint::read_varint(&mut cursor).expect("data length");
-    assert_eq!(data_length, 0);
+    let frame_len = oxide_proto::varint::read_varint(&mut cursor).expect("frame length");
+    assert_eq!(frame_len as usize, payload.len(), "body is the payload alone");
+    assert_eq!(cursor, &payload[..], "no Data Length marker precedes the payload");
+
+    let mut round_trip = &out[..];
+    let read = read_frame(&mut round_trip, Compression::Enabled { threshold: -1 }).expect("read");
+    assert_eq!(read, payload);
 }
 ```
 
@@ -486,6 +491,23 @@ Expected: 4 passed. If the zlib-ng backend fails to build, fall back to the defa
 git add crates/oxide-proto
 git commit -m "feat: add length-prefixed framing with 1.8 compression rules (M0)"
 ```
+
+### Corrections applied after review (2026-09-22)
+
+The implementation review found that this section's `-1` threshold test encoded the wrong
+behaviour and that several hostile-input paths were untested. The code, not this snippet set, is
+now the reference; the deltas the fix round applied are:
+
+- A negative threshold means plain framing in both directions, with
+  `Compression::from_server_threshold` as the documented entry point. The original test in this
+  section asserted a Data Length marker instead.
+- `FrameError` gains `NegativeLength` (a frame length or Data Length below zero) and `EmptyPayload`
+  (refusing to write a zero-length payload, which cannot round-trip in compressed mode).
+- A below-threshold compressed frame is rejected with `BadCompression`, matching vanilla's decoder.
+- Outbound frames are capped at `MAX_FRAME_LEN` after framing, so the writer cannot emit a frame the
+  reader would reject.
+- Tests added for `TooLong`, `NegativeLength`, a fixed-vector decode (`ZLIB_HELLO`), the compressed
+  branch actually compressing at the threshold, and the payload bytes following the marker.
 
 ---
 
