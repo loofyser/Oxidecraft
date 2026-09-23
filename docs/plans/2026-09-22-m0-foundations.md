@@ -775,6 +775,24 @@ git add crates/oxide-proto-v47 crates/oxide-launcher Cargo.toml
 git commit -m "feat: handshake and status ping with launcher CLI (M0)"
 ```
 
+### Corrections applied after review (2026-09-22)
+
+The implementation review found that this section's snippets under-specified error classification and
+connection bounding. The code, not this snippet set, is the reference:
+
+- The `timeout` parameter bounds connection establishment as well as reads and writes, via
+  `ToSocketAddrs` plus `TcpStream::connect_timeout`; the snippet's bare `TcpStream::connect` could
+  block for roughly two minutes on a black-holed host.
+- `PingError` gains `Timeout(Duration)`, classified from `WouldBlock`/`TimedOut` before the framing
+  catch-all, and `BadLength(VarIntError)` for a malformed JSON length; `Truncated` is reserved for
+  genuinely short bodies. A slow server must not read as a framing bug.
+- `Description` gains a catch-all arm so an unknown-but-legal shape degrades to "no plain-text MOTD"
+  instead of failing the whole parse and discarding version and player counts.
+- The CLI prints `MOTD: (none)` when no plain-text MOTD is present.
+
+Do not copy this section's `status.rs` snippet into later code; read
+`crates/oxide-proto-v47/src/status.rs` for the current API.
+
 ---
 
 ### Task 4: The hash-verified store
