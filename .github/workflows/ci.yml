@@ -32,6 +32,15 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  release:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the workspace in release mode
+        run: cargo build --workspace --release
+
   msrv:
     name: msrv 1.85.0
     runs-on: ubuntu-latest
