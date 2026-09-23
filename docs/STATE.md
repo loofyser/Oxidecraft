@@ -8,9 +8,13 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
-- Stage: **milestone M0 (foundations) is complete, and `main` carries the `m0` tag on the M0
-  close-out commit.** Milestone M1 (bytes to world) is next; its scope is the M1 row of
-  `docs/specs/oxidecraft-v1-design.md` section 13.
+- Stage: **milestone M1 (bytes to world) is in progress.** The plan is
+  `docs/plans/2026-09-23-m1-bytes-to-world.md` (13 tasks; approved 2026-09-23 with the owner's
+  answers recorded in it). Task 1 (the buffered connection and the primitive codecs) is complete and
+  pushed at `b950e30` with a clean review; Task 2 (the live capture) was stopped at the owner's
+  request on 2026-09-23 and is the resume point — see
+  `docs/handoff/2026-09-23-m1-task2-stopped.md` and the ledger
+  `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md`. M0 is complete and tagged `m0`.
 - M0 delivered and verified: the eight-crate workspace with its enforced dependency graph; the
   VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
   and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
@@ -128,9 +132,9 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Plan M1 (bytes to world) from the M1 row of spec section 13 — offline login, the keepalive and
-   the five connection obligations, Join Game, Client Settings, chunk parsing, the world store and
-   untextured terrain — and work it in order, milestone by milestone.
+1. Continue milestone M1 in plan order: resume Task 2 (the live capture), then Tasks 3–13. Per task:
+   a fresh implementer works from the extracted brief, an independent reviewer checks the diff, fix
+   rounds close findings, and the ledger records a line per task.
 2. Keep `docs/STATE.md` and `CHANGELOG.md` current, and tag each milestone when it closes.
 3. Run the local gate before every push: `bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`,
    `cargo test --workspace`, `cargo fmt --all --check`,
