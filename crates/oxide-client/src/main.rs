@@ -82,7 +82,6 @@ impl ClientApp {
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
-        self.fps.record_frame(Instant::now());
         match present_frame(renderer) {
             Ok(PresentOutcome::Presented) => {}
             Ok(PresentOutcome::Skipped) => return,
@@ -93,6 +92,10 @@ impl ClientApp {
                 return;
             }
         }
+        // Counted only now, once a frame has actually been presented: a frame
+        // the surface was not ready for is not counted, and a frame the retry
+        // presented counts once.
+        self.fps.record_frame(Instant::now());
         self.frames += 1;
         let fps = self.fps.fps();
         let title = format!("Oxidecraft — {fps:.0} fps — {}", renderer.adapter_name());
