@@ -403,6 +403,8 @@ name = "oxide-assets"
 version = "0.0.0"
 dependencies = [
  "hex",
+ "serde",
+ "serde_json",
  "sha1",
  "tempfile",
  "thiserror",

@@ -1,0 +1,6 @@
+{
+  "latest": { "release": "1.8.9", "snapshot": "1.8.9" },
+  "versions": [
+    { "id": "1.8.9", "type": "release", "url": "https://launchermeta.mojang.com/v1/packages/example/1.8.9.json", "time": "2015-12-09T16:36:48+00:00", "releaseTime": "2015-12-09T16:36:48+00:00", "sha1": "d546f17000000000000000000000000000000000", "complianceLevel": 0 }
+  ]
+}
