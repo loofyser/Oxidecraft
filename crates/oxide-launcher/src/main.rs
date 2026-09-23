@@ -1,4 +1,4 @@
-//! Oxidecraft launcher: fetch and verify assets, then start the client.
+//! Oxidecraft launcher: fetch, extract and verify assets, then start the client.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch and verify the game assets for a version.
+    /// Fetch, extract and verify the game assets for a version.
     Fetch {
         /// Minecraft version, for example 1.8.9.
         #[arg(long, default_value = "1.8.9")]
@@ -112,6 +112,19 @@ fn main() -> anyhow::Result<()> {
                     "fetch complete: {} downloaded, {} reused, {} bytes transferred",
                     report.downloaded, report.reused, report.bytes
                 );
+            }
+            if let Some(extraction) = &report.extraction {
+                if extraction.up_to_date {
+                    println!("extraction: up to date, nothing written");
+                } else {
+                    println!(
+                        "extraction: {} entries read, {} extracted, {} skipped, {} bytes",
+                        extraction.entries_read,
+                        extraction.extracted,
+                        extraction.skipped,
+                        extraction.bytes
+                    );
+                }
             }
             if let Some(verification) = &report.verification {
                 println!(

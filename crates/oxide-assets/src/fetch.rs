@@ -4,10 +4,12 @@
 //! (a local copy is reused when it names the requested version), checks the
 //! pinned client jar constants, checks the store's filesystem has room for the
 //! download, resolves the asset index, downloads every object the index lists
-//! (reusing or repairing the ones already present) and the client jar, and,
-//! when asked, re-hashes every object and the jar through the store's
-//! verification pass. Nothing enters the store before it matches the hash its
-//! descriptor records.
+//! (reusing or repairing the ones already present) and the client jar,
+//! extracts the jar's resources into the store, and, when asked, re-hashes
+//! every object and the jar through the store's verification pass. Nothing
+//! enters the store before it matches the hash its descriptor records, and a
+//! run whose extraction manifest is current skips the extraction step; see
+//! [`crate::extract`].
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 use fs4::{FileExt, TryLockError};
 
 use crate::asset_index::AssetIndex;
+use crate::extract::{ExtractError, ExtractionReport, Extractor};
 use crate::http::{HttpClient, HttpError};
 use crate::store::{Store, StoreError, VerifyReport, verify_bytes, verify_sha1, write_atomic};
 use crate::version::{
@@ -63,6 +66,10 @@ pub struct FetchReport {
     pub planned_bytes: u64,
     /// The verification pass over the index objects, when `verify` was set.
     pub verification: Option<VerifyReport>,
+    /// The extraction pass over the client jar on a real run: what was
+    /// written, or a skipped pass when the extraction was already current.
+    /// `None` on a dry run, which extracts nothing.
+    pub extraction: Option<ExtractionReport>,
 }
 
 /// A progress event from a fetch run.
@@ -193,20 +200,26 @@ pub enum FetchError {
         /// Underlying error.
         source: StoreError,
     },
+    /// Extracting the client jar's resources failed.
+    #[error(transparent)]
+    Extract(#[from] ExtractError),
 }
 
-/// Fetches, verifies and stores everything the client needs for one version.
+/// Fetches, verifies, extracts and stores everything the client needs for one
+/// version.
 ///
 /// The steps run in a fixed order: take the store lock, resolve the version
 /// document, check the jar descriptor against the pinned 1.8.9 constants,
 /// check the store's filesystem for room, resolve the asset index, download
-/// every object the index lists, download the client jar and, when
-/// `options.verify` is set, re-hash every object and the jar; the result of
-/// that pass is the report's `verification` field.
+/// every object the index lists, download the client jar, extract the jar's
+/// resources into the store and, when `options.verify` is set, re-hash every
+/// object and the jar. The result of the extraction is the report's
+/// `extraction` field, and the result of the strict pass is its `verification`
+/// field.
 ///
-/// The caller's `progress` closure sees an event per step; the strict
-/// verification pass is bracketed by `verify` events, so a long re-hash is
-/// not silent until the summary.
+/// The caller's `progress` closure sees an event per step; the extraction and
+/// the strict verification pass are each bracketed by a start and an end
+/// event, so neither is silent until the summary.
 ///
 /// With `options.dry_run`, the run stops after the index: nothing fetched is
 /// stored and the plan lands in the report's `planned` fields. The store's
@@ -270,6 +283,12 @@ pub fn fetch_version(
         report.reused += 1;
     }
     progress(Progress::step("jar", 1, 1));
+
+    // The jar is in place and current; the resources inside it follow.
+    progress(Progress::step("extract", 0, 1));
+    let extraction = Extractor::new(store, version).run()?;
+    report.extraction = Some(extraction);
+    progress(Progress::step("extract", 1, 1));
 
     if options.verify {
         // Bracketed so a long re-hash is visible while it runs, not silent
@@ -548,7 +567,11 @@ fn as_str<'a>(bytes: &'a [u8], what: &'static str) -> Result<&'a str, FetchError
 
 /// True when `id` can be used as a single path segment: non-empty, without
 /// separators or a NUL, and not a dot name.
-fn is_safe_id(id: &str) -> bool {
+///
+/// The store's version and index ids and the extractor's version all guard
+/// their paths with this, so a document that names something like `../x`
+/// cannot steer any of them out of the store.
+pub(crate) fn is_safe_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\']) && !id.contains('\0')
 }
 

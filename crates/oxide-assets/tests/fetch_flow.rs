@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Cursor, Write};
 
 use oxide_assets::fetch::{FetchError, FetchOptions, Progress, fetch_version};
 use oxide_assets::http::{HttpClient, HttpError};
@@ -61,6 +61,26 @@ fn object_url(hash: &str) -> String {
     )
 }
 
+/// The client jar the fake transport serves: a small zip holding one
+/// resource and one class file, the latter refused by the extractor.
+fn client_jar_body() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer
+        .start_file("assets/minecraft/lang/en_US.lang", options)
+        .expect("a resource entry");
+    writer
+        .write_all(b"item.stone=Stone\n")
+        .expect("write the resource");
+    writer
+        .start_file("net/minecraft/client/Minecraft.class", options)
+        .expect("a class entry");
+    writer
+        .write_all(b"a stand-in class payload")
+        .expect("write the class");
+    writer.finish().expect("finish the jar").into_inner()
+}
+
 /// A synthetic version chain: the manifest, a version document, an index with
 /// three entries over two distinct objects, and a client jar, all served by
 /// the fake transport.
@@ -109,7 +129,7 @@ fn fixture_for(advertised: &str, document_id: &str, client: ClientDescriptor) ->
     let index_body = serde_json::to_vec(&index_json).expect("serialize the index");
     let total_size = first.len() as u64 * 2 + second.len() as u64;
 
-    let jar_body = b"fake client jar".to_vec();
+    let jar_body = client_jar_body();
     let jar_sha1 = sha1_hex(&jar_body);
     let jar_size = jar_body.len() as u64;
 
@@ -257,6 +277,26 @@ fn fetch_is_idempotent_and_repairs_corruption() {
     );
     assert_lock_released(dir.path());
 
+    // The client jar was extracted as part of the run: the resource landed
+    // and the class file stayed out.
+    let extraction = first.extraction.as_ref().expect("an extraction report");
+    assert!(!extraction.up_to_date);
+    assert_eq!(extraction.extracted, 1);
+    assert_eq!(extraction.skipped, 1);
+    let extracted_root = dir.path().join("extracted").join(&f.version);
+    assert!(
+        extracted_root
+            .join("assets/minecraft/lang/en_US.lang")
+            .is_file(),
+        "the jar's resource must be extracted"
+    );
+    assert!(
+        !extracted_root
+            .join("net/minecraft/client/Minecraft.class")
+            .exists(),
+        "no path containing .class may exist under the extraction root"
+    );
+
     // Second run: everything is present and valid, nothing goes over the wire.
     let second = fetch_version(&store, &f.http, &opts, |_| {}).expect("second fetch");
     assert_eq!(
@@ -268,6 +308,14 @@ fn fetch_is_idempotent_and_repairs_corruption() {
     assert_eq!(
         second.reused, 5,
         "two objects, the jar, the index and the version document"
+    );
+    assert!(
+        second
+            .extraction
+            .as_ref()
+            .expect("an extraction report")
+            .up_to_date,
+        "the second run must not extract again"
     );
 
     // A same-length corruption of one object is repaired instead of trusted.
@@ -323,6 +371,7 @@ fn dry_run_resolves_the_plan_and_writes_nothing() {
         f.objects.iter().map(|(_, size)| size).sum::<u64>() + f.jar_size
     );
     assert!(report.verification.is_none());
+    assert!(report.extraction.is_none(), "a dry run extracts nothing");
 
     // No fetched content landed; the store skeleton and the lock file are
     // there (a dry run still creates the directories and takes the lock), but

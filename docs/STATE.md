@@ -13,23 +13,23 @@ specification and continue without asking questions that are already answered he
   is `.superpowers/sdd/2026-09-22-m0-foundations/progress.md`.
 - M0 tasks complete: T1 workspace and VarInt codec; T2 framing with the 1.8 compression rules
   (fix round 1 applied); T3 handshake, status ping and the launcher CLI (`4c0db19`, re-reviewed);
-  T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`).
-  T6 `fetch --verify` is implemented on `main` with fix round 1 applied, awaiting its re-review.
-- Tests: 85 passing workspace-wide, 2 ignored (both require the live endpoints), zero failures
+  T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`);
+  T6 `fetch --verify` with fix round 1 applied and re-reviewed (`b3fcc51`). T7 jar extraction with
+  the manifest is implemented on `main`, acceptance run recorded below, awaiting its review.
+- Tests: 99 passing workspace-wide, 2 ignored (both require the live endpoints), zero failures
   (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
   `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the full fetch run is recorded under
   "M0 evidence" below.
-- Remaining M0 tasks: T7 jar extraction, T8 wgpu window, T9 CI and guards, T10 hygiene and the
-  `m0` tag.
+- Remaining M0 tasks: T8 wgpu window, T9 CI and guards, T10 hygiene and the `m0` tag.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
-- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed; the last code commit carries the
-  fetch flow, and documentation commits follow it. Confirm HEAD with `git log --oneline -3`.
+- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed; the last code commit carries jar
+  extraction, and documentation commits follow it. Confirm HEAD with `git log --oneline -3`.
 
 ## M0 evidence
 
@@ -53,6 +53,30 @@ verify: 722 objects, 0 mismatched, 0 missing, 114708537 bytes on disk
   `<store root>/lock`, held for the run and released when the process dies, so a killed run cannot
   lock out the next one; the file itself stays behind with the last run's process id in it.
 
+Task 7 acceptance run, the real client jar already in the store, default store at
+`<data dir>/oxidecraft`, debug build (`cargo run -p oxide-launcher -- fetch --version 1.8.9`),
+2026-09-23:
+
+```
+fetch complete: 0 downloaded, 725 reused, 0 bytes transferred
+extraction: 5597 entries read, 3085 extracted, 2512 skipped, 4553815 bytes
+```
+
+- The 1.8.9 client jar holds 5,597 entries: 3,085 under `assets/`, 2,507 `.class` entries, 3 under
+  `META-INF/` and 2 other root files (`pack.png`, `log4j2.xml`). The extractor takes the 3,085 and
+  refuses the other 2,512, and it reads no class entry at all. The 3,085 matches the survey's
+  census (`docs/research/launcher-assets-auth-survey.md:272`), and an independent pass over the
+  extracted tree found every file byte-identical to its jar entry with no `.class` or `META-INF`
+  path present.
+- The manifest at `extracted/1.8.9/.manifest.json` records 3,085 entries totalling 4,553,815 bytes,
+  the jar SHA-1 `3870888a6c3d349d3771a3e9d16c9bf5e076b908` (the pinned constant) and schema version
+  1. The jar carries no root `pack.mcmeta` or `sounds.json`; the 1.8 sound index comes from the
+  asset objects (`minecraft/sounds.json`), so those two include-rule entries match nothing in this
+  jar.
+- Extraction took 2.3 s on the first run (10:19:35Z to 10:19:37Z); a second run reports
+  `extraction: up to date, nothing written` in under a second, and `fetch --verify` after the
+  extraction still reports a clean store (722 objects, 0 mismatched, 0 missing).
+
 ## Decisions locked
 
 See spec section 4 for the full table. The short version: multiplayer-first v1; Microsoft
@@ -62,9 +86,9 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Re-review the Task 6 fix round on `main`; mark T6 complete in the ledger when every finding is
+1. Review the Task 7 extraction work on `main`; mark T7 complete in the ledger when every finding is
    addressed.
-2. Continue the M0 plan from Task 7 (jar extraction) in order, one task per dispatch, with the task
+2. Continue the M0 plan from Task 8 (wgpu window) in order, one task per dispatch, with the task
    review and fix loop after each.
 3. Every dispatch carries the standing rules: no AI or tooling language in committed files, commit
    messages or code comments; explicit `git add <paths>`; never touch `.superpowers/`.
