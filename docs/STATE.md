@@ -1,6 +1,6 @@
 # Oxidecraft — project state
 
-Updated: 2026-09-22
+Updated: 2026-09-23
 
 This file is the live state of the project. Keep it current before every handoff, long pause,
 and milestone boundary. Anyone picking the work up should be able to read this file plus the
@@ -14,8 +14,8 @@ specification and continue without asking questions that are already answered he
 - M0 tasks complete: T1 workspace and VarInt codec; T2 framing with the 1.8 compression rules
   (fix round 1 applied); T3 handshake, status ping and the launcher CLI (`4c0db19`, re-reviewed);
   T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`).
-  T6 `fetch --verify` is implemented on `main` and awaiting its review.
-- Tests: 81 passing workspace-wide, 2 ignored (both require the live endpoints), zero failures
+  T6 `fetch --verify` is implemented on `main` with fix round 1 applied, awaiting its re-review.
+- Tests: 85 passing workspace-wide, 2 ignored (both require the live endpoints), zero failures
   (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
@@ -49,6 +49,9 @@ verify: 722 objects, 0 mismatched, 0 missing, 114708537 bytes on disk
   1.92 s, with the same clean verify. A run on a warm store downloads nothing.
 - Dry run on an empty store: `dry run: 0 file(s) already present, 723 file(s) to download,
   123170021 bytes` (722 objects plus the jar); only the empty store directories are created.
+- Fix round 1 (2026-09-23): the store lock is now an operating-system lock over
+  `<store root>/lock`, held for the run and released when the process dies, so a killed run cannot
+  lock out the next one; the file itself stays behind with the last run's process id in it.
 
 ## Decisions locked
 
@@ -59,8 +62,8 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Package the Task 6 review over `0fc73cb..HEAD` and dispatch the scoped review; mark T6 complete
-   in the ledger when every finding is addressed.
+1. Re-review the Task 6 fix round on `main`; mark T6 complete in the ledger when every finding is
+   addressed.
 2. Continue the M0 plan from Task 7 (jar extraction) in order, one task per dispatch, with the task
    review and fix loop after each.
 3. Every dispatch carries the standing rules: no AI or tooling language in committed files, commit

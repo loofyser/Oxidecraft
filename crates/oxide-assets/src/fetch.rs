@@ -12,9 +12,11 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+
+use fs4::{FileExt, TryLockError};
 
 use crate::asset_index::AssetIndex;
 use crate::http::{HttpClient, HttpError};
@@ -33,8 +35,12 @@ pub struct FetchOptions {
     /// Version to fetch, for example `1.8.9`.
     pub version: String,
     /// Resolve and report only: no object or jar is downloaded or stored.
+    ///
+    /// The run still creates the store's directory skeleton and takes the
+    /// lock; past that it only reads the store.
     pub dry_run: bool,
-    /// Re-hash every object and the jar after downloading.
+    /// Re-hash every object and the jar after downloading. No effect on a dry
+    /// run, which stops before the downloads.
     pub verify: bool,
 }
 
@@ -42,12 +48,14 @@ pub struct FetchOptions {
 #[derive(Debug, Default)]
 pub struct FetchReport {
     /// Transfers this run made over the transport, the version manifest
-    /// included; the manifest is fetched but never stored.
+    /// included; the manifest is fetched but never stored. Zero on a dry run,
+    /// which transfers while resolving the chain but stores nothing.
     pub downloaded: usize,
     /// Stored files already present and valid: the version document, the
     /// index, every reused object and the jar.
     pub reused: usize,
-    /// Total bytes transferred by those downloads.
+    /// Total bytes transferred by those downloads. Zero on a dry run, like
+    /// `downloaded`.
     pub bytes: u64,
     /// Index objects and the jar a dry run still has to download.
     pub planned: usize,
@@ -142,13 +150,13 @@ pub enum FetchError {
         id: String,
     },
     /// Another fetch run holds the store lock.
-    #[error("another fetch is already running for this store; lock file: {}", path.display())]
+    #[error("another fetch currently holds the lock at {}", path.display())]
     Locked {
         /// The lock file that is held.
         path: PathBuf,
     },
-    /// The lock file could not be created or written.
-    #[error("could not create the lock file {}: {source}", path.display())]
+    /// The lock file could not be opened, locked or written.
+    #[error("could not take the lock at {}: {source}", path.display())]
     LockIo {
         /// The lock file.
         path: PathBuf,
@@ -196,9 +204,14 @@ pub enum FetchError {
 /// `options.verify` is set, re-hash every object and the jar; the result of
 /// that pass is the report's `verification` field.
 ///
-/// With `options.dry_run`, the run stops after the index: the local store is
-/// only read, the plan lands in the report's `planned` fields, and nothing is
-/// written beyond the transient lock file.
+/// The caller's `progress` closure sees an event per step; the strict
+/// verification pass is bracketed by `verify` events, so a long re-hash is
+/// not silent until the summary.
+///
+/// With `options.dry_run`, the run stops after the index: nothing fetched is
+/// stored and the plan lands in the report's `planned` fields. The store's
+/// directory skeleton is still created and the run still takes the lock for
+/// its duration.
 pub fn fetch_version(
     store: &Store,
     http: &dyn HttpClient,
@@ -259,9 +272,13 @@ pub fn fetch_version(
     progress(Progress::step("jar", 1, 1));
 
     if options.verify {
+        // Bracketed so a long re-hash is visible while it runs, not silent
+        // until the summary.
+        progress(Progress::step("verify", 0, 1));
         let verification = store.verify_objects(&objects);
         verify_jar(store, &document, version)?;
         report.verification = Some(verification);
+        progress(Progress::step("verify", 1, 1));
     }
 
     report.downloaded = transport.calls() as usize;
@@ -273,9 +290,10 @@ pub fn fetch_version(
 /// requested version and passes the pinned-constant guard, the manifest chain
 /// otherwise.
 ///
-/// A local copy that does not parse, names another version or fails the guard
-/// is re-resolved from piston-meta, the way a corrupt object is re-fetched,
-/// and replaced once the fresh, verified document passes the same checks.
+/// A local copy that cannot be read, does not parse — bytes that are not
+/// UTF-8 text included — names another version or fails the guard is
+/// re-resolved from piston-meta, the way a corrupt object is re-fetched, and
+/// replaced once the fresh, verified document passes the same checks.
 /// Nothing is stored when a check refuses, and a dry run stores nothing at all.
 fn resolve_version_json(
     store: &Store,
@@ -287,12 +305,19 @@ fn resolve_version_json(
     let version = options.version.as_str();
     let path = store.version_json_path(version);
     if let Ok(bytes) = fs::read(&path) {
-        if let Ok(document) = parse_version_json(as_str(&bytes, VERSION_DOCUMENT)?) {
-            if document.id == version && check_jar_descriptor(&document, version).is_ok() {
-                report.reused += 1;
-                progress(Progress::step("version", 1, 1));
-                return Ok(document);
-            }
+        // A stored copy that is not UTF-8 text fails the read the same way
+        // malformed JSON fails the parse: both fall through to the manifest
+        // chain below instead of ending the run.
+        let stored = as_str(&bytes, VERSION_DOCUMENT)
+            .ok()
+            .and_then(|text| parse_version_json(text).ok())
+            .filter(|document| {
+                document.id == version && check_jar_descriptor(document, version).is_ok()
+            });
+        if let Some(document) = stored {
+            report.reused += 1;
+            progress(Progress::step("version", 1, 1));
+            return Ok(document);
         }
         // Unreadable, unparsable, for another version or guarded: fetch below.
     }
@@ -572,38 +597,55 @@ impl HttpClient for Transfer<'_> {
     }
 }
 
-/// The fetch lock: a file created with `create_new`, so exactly one process
-/// can hold it, removed when the guard drops.
+/// The fetch lock: an exclusive lock the operating system holds over the
+/// store's lock file, taken for the whole run.
+///
+/// The file itself is left in place — the lock lives in the operating system
+/// and is released when the file handle closes, including when the process
+/// dies, so a killed run cannot lock out the next one. The process id in the
+/// file is diagnosis only.
 #[derive(Debug)]
 struct Lock {
-    path: PathBuf,
+    /// The open lock file; holding it holds the lock.
+    file: File,
 }
 
 impl Lock {
-    /// Creates the lock file, refusing when another run holds it.
+    /// Takes the exclusive lock, refusing when another run holds it.
     fn acquire(path: PathBuf) -> Result<Self, FetchError> {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                if let Err(source) = writeln!(file, "{}", std::process::id()) {
-                    // The lock is the file itself, so a failed write must not
-                    // leave it behind.
-                    let _ = fs::remove_file(&path);
-                    return Err(FetchError::LockIo { path, source });
-                }
-                Ok(Self { path })
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // The holder's status line survives a failed acquire: nothing is
+            // truncated until the lock is ours.
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| FetchError::LockIo {
+                path: path.clone(),
+                source,
+            })?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(FetchError::Locked { path }),
+            Err(TryLockError::Error(source)) => {
+                return Err(FetchError::LockIo { path, source });
             }
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
-                Err(FetchError::Locked { path })
-            }
-            Err(source) => Err(FetchError::LockIo { path, source }),
         }
+
+        // The lock is ours: leave the process id in the file for diagnosis.
+        // Nothing is written while another run holds the lock.
+        file.set_len(0)
+            .and_then(|()| file.write_all(format!("{}\n", std::process::id()).as_bytes()))
+            .map_err(|source| FetchError::LockIo { path, source })?;
+        Ok(Self { file })
     }
 }
 
 impl Drop for Lock {
     /// Releases the lock, whatever the run's outcome.
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -664,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_is_exclusive_removed_on_drop_and_carries_the_pid() {
+    fn the_lock_is_exclusive_left_on_disk_and_carries_the_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lock");
 
@@ -687,6 +729,8 @@ mod tests {
         );
 
         drop(lock);
-        assert!(!path.exists(), "dropping the guard releases the lock");
+        assert!(path.is_file(), "the lock file stays in place");
+        let again = Lock::acquire(path.clone()).expect("the lock is free once the guard drops");
+        drop(again);
     }
 }

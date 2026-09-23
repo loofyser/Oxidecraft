@@ -4,10 +4,11 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write;
 
 use oxide_assets::fetch::{FetchError, FetchOptions, Progress, fetch_version};
 use oxide_assets::http::{HttpClient, HttpError};
-use oxide_assets::store::Store;
+use oxide_assets::store::{Store, StoreError};
 use oxide_assets::version::{CLIENT_1_8_9_SHA1, CLIENT_1_8_9_SIZE, VERSION_MANIFEST_URL};
 
 /// The fake versions live under this (reserved, unreachable) domain.
@@ -75,14 +76,24 @@ struct Fixture {
     jar_size: u64,
 }
 
+/// How the fixture's version document describes the client jar.
+#[derive(Clone, Copy)]
+enum ClientDescriptor {
+    /// The descriptor of the stand-in body the fake transport serves.
+    Served,
+    /// The pinned 1.8.9 constants, so the pinned-constant guard passes even
+    /// though the stand-in body cannot carry them.
+    Pinned,
+}
+
 /// Builds the fixture for `version`.
 fn fixture(version: &str) -> Fixture {
-    fixture_for(version, version)
+    fixture_for(version, version, ClientDescriptor::Served)
 }
 
 /// Builds the fixture with a manifest entry advertising `advertised` while the
 /// version document names `document_id`, so a mismatch can be exercised.
-fn fixture_for(advertised: &str, document_id: &str) -> Fixture {
+fn fixture_for(advertised: &str, document_id: &str, client: ClientDescriptor) -> Fixture {
     let first = b"first sound".to_vec();
     let second = b"second sound".to_vec();
     let first_hash = sha1_hex(&first);
@@ -102,6 +113,11 @@ fn fixture_for(advertised: &str, document_id: &str) -> Fixture {
     let jar_sha1 = sha1_hex(&jar_body);
     let jar_size = jar_body.len() as u64;
 
+    let (client_sha1, client_size) = match client {
+        ClientDescriptor::Served => (jar_sha1.clone(), jar_size),
+        ClientDescriptor::Pinned => (CLIENT_1_8_9_SHA1.to_string(), CLIENT_1_8_9_SIZE),
+    };
+
     let version_json = serde_json::json!({
         "id": document_id,
         "assets": "1.8",
@@ -113,7 +129,7 @@ fn fixture_for(advertised: &str, document_id: &str) -> Fixture {
             "totalSize": total_size,
         },
         "downloads": {
-            "client": { "url": JAR_URL, "sha1": jar_sha1, "size": jar_size }
+            "client": { "url": JAR_URL, "sha1": client_sha1, "size": client_size }
         }
     });
     let version_body = serde_json::to_vec(&version_json).expect("serialize the version document");
@@ -166,6 +182,19 @@ fn make_writable(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn make_writable(_path: &std::path::Path) {}
+
+/// Asserts the store lock is free again: the lock file stays on disk (it is
+/// reused, never removed), but an exclusive lock can be taken over it.
+fn assert_lock_released(root: &std::path::Path) {
+    let path = root.join("lock");
+    assert!(path.is_file(), "the lock file stays in place");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open the lock file");
+    fs4::FileExt::try_lock(&file).expect("the lock must be free after the run");
+}
 
 #[test]
 fn fetch_is_idempotent_and_repairs_corruption() {
@@ -226,7 +255,7 @@ fn fetch_is_idempotent_and_repairs_corruption() {
         std::fs::read(&jar_path).expect("read the jar").len() as u64,
         f.jar_size
     );
-    assert!(!dir.path().join("lock").exists(), "the lock is released");
+    assert_lock_released(dir.path());
 
     // Second run: everything is present and valid, nothing goes over the wire.
     let second = fetch_version(&store, &f.http, &opts, |_| {}).expect("second fetch");
@@ -295,11 +324,13 @@ fn dry_run_resolves_the_plan_and_writes_nothing() {
     );
     assert!(report.verification.is_none());
 
-    // No fetched content landed, and the lock is gone.
+    // No fetched content landed; the store skeleton and the lock file are
+    // there (a dry run still creates the directories and takes the lock), but
+    // the lock is free again.
     assert!(!store.version_json_path("1.8.10").exists());
     assert!(!store.index_path("1.8").exists());
     assert!(!store.client_jar_path("1.8.10").exists());
-    assert!(!dir.path().join("lock").exists());
+    assert_lock_released(dir.path());
     assert_eq!(
         std::fs::read_dir(dir.path().join("assets/objects"))
             .expect("objects directory")
@@ -322,7 +353,20 @@ fn a_second_run_is_refused_while_the_lock_is_held() {
     let store = Store::open(dir.path().to_path_buf()).expect("open");
     let f = fixture("1.8.10");
     let lock = dir.path().join("lock");
-    std::fs::write(&lock, b"4242\n").expect("hold the lock");
+
+    // Another run: the file exists and a live process holds the exclusive
+    // operating-system lock over it.
+    let mut holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock)
+        .expect("open the lock file");
+    holder
+        .write_all(b"4242\n")
+        .expect("the holder's status line");
+    fs4::FileExt::try_lock(&holder).expect("hold the lock");
 
     let error = fetch_version(&store, &f.http, &options("1.8.10"), |_| {})
         .expect_err("the lock is held by another run");
@@ -332,12 +376,20 @@ fn a_second_run_is_refused_while_the_lock_is_held() {
         message.contains(&lock.display().to_string()),
         "the message names the lock file: {message}"
     );
+    assert!(
+        message.contains("holds the lock"),
+        "the message says another fetch holds the lock: {message}"
+    );
     assert_eq!(
         f.http.calls.borrow().len(),
         0,
         "no network work may happen before the lock"
     );
-    assert!(lock.exists(), "the holder's lock file must be left alone");
+    assert_eq!(
+        std::fs::read_to_string(&lock).expect("read the lock file"),
+        "4242\n",
+        "the refused run must leave the holder's file alone"
+    );
 }
 
 #[test]
@@ -348,10 +400,7 @@ fn the_lock_is_released_when_a_run_fails() {
 
     fetch_version(&store, &http, &options("1.8.10"), |_| {})
         .expect_err("the manifest is unreachable");
-    assert!(
-        !dir.path().join("lock").exists(),
-        "the lock must be released on the error path"
-    );
+    assert_lock_released(dir.path());
 }
 
 #[test]
@@ -367,11 +416,30 @@ fn verify_reports_the_store_through_its_verification_pass() {
         dry_run: false,
         verify: true,
     };
-    let report = fetch_version(&store, &f.http, &opts, |_| {}).expect("verify fetch");
+    let events = RefCell::new(Vec::new());
+    let report = fetch_version(&store, &f.http, &opts, |progress| {
+        events.borrow_mut().push(progress);
+    })
+    .expect("verify fetch");
     assert_eq!(
         f.http.calls.borrow().len(),
         calls,
         "verifying downloads nothing"
+    );
+
+    let events = events.into_inner();
+    let verify_events: Vec<Progress> = events
+        .iter()
+        .filter(|event| event.name == "verify")
+        .cloned()
+        .collect();
+    assert_eq!(
+        verify_events,
+        vec![
+            Progress::step("verify", 0, 1),
+            Progress::step("verify", 1, 1)
+        ],
+        "the strict pass is bracketed by progress: {events:?}"
     );
 
     let verification = report.verification.expect("a verification report");
@@ -406,14 +474,14 @@ fn an_unknown_version_is_refused_after_the_manifest() {
         1,
         "only the manifest is fetched"
     );
-    assert!(!dir.path().join("lock").exists(), "the lock is released");
+    assert_lock_released(dir.path());
 }
 
 #[test]
 fn a_version_document_for_another_version_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(dir.path().to_path_buf()).expect("open");
-    let f = fixture_for("1.8.10", "1.8.11");
+    let f = fixture_for("1.8.10", "1.8.11", ClientDescriptor::Served);
 
     let error = fetch_version(&store, &f.http, &options("1.8.10"), |_| {})
         .expect_err("the document names 1.8.11");
@@ -426,7 +494,7 @@ fn a_version_document_for_another_version_is_refused() {
         !store.version_json_path("1.8.10").exists(),
         "a document for another version must not be stored"
     );
-    assert!(!dir.path().join("lock").exists(), "the lock is released");
+    assert_lock_released(dir.path());
 }
 
 #[test]
@@ -456,5 +524,135 @@ fn the_1_8_9_client_jar_descriptor_is_guarded_by_the_constants() {
         "nothing is stored when the guard refuses"
     );
     assert!(!store.client_jar_path("1.8.9").exists());
-    assert!(!dir.path().join("lock").exists(), "the lock is released");
+    assert_lock_released(dir.path());
+}
+
+#[test]
+fn an_unparsable_stored_version_document_is_re_resolved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+    // The pinned descriptor for 1.8.9, so the fresh document gets past the
+    // guard; the stand-in jar still cannot match the pinned size, so the run
+    // stops at the jar step. Everything before that — the manifest chain and
+    // the replacement of the stored document — is what this test asserts.
+    let f = fixture_for("1.8.9", "1.8.9", ClientDescriptor::Pinned);
+
+    // Bytes that are not UTF-8 at all: a corruption of the stored document
+    // that a reader without care cannot even look at. The run must re-resolve
+    // instead of refusing until someone deletes the file.
+    let path = store.version_json_path("1.8.9");
+    std::fs::create_dir_all(path.parent().expect("the version directory"))
+        .expect("create the version directory");
+    std::fs::write(&path, [b'{', b'"', 0xff, 0xfe, b'"', b'}']).expect("write invalid UTF-8");
+
+    let error = fetch_version(&store, &f.http, &options("1.8.9"), |_| {})
+        .expect_err("the stand-in jar cannot satisfy the pinned descriptor");
+
+    assert_eq!(
+        f.http.calls.borrow().first().map(String::as_str),
+        Some(VERSION_MANIFEST_URL),
+        "the stored document must not be fatal: the manifest chain runs"
+    );
+    assert_eq!(
+        f.http.calls.borrow().len(),
+        6,
+        "manifest, document, index, two objects and the jar"
+    );
+    assert!(
+        matches!(error, FetchError::Store(StoreError::SizeMismatch { .. })),
+        "the run reaches the jar step: {error:?}"
+    );
+
+    let stored = std::fs::read_to_string(&path).expect("the stored document is replaced");
+    let document =
+        oxide_assets::version::parse_version_json(&stored).expect("parse the replacement");
+    assert_eq!(document.id, "1.8.9");
+    assert_eq!(
+        document.downloads.client.sha1, CLIENT_1_8_9_SHA1,
+        "the replacement is the fresh, verified document"
+    );
+}
+
+#[test]
+fn a_stored_document_that_fails_the_pin_is_re_resolved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+    let f = fixture_for("1.8.9", "1.8.9", ClientDescriptor::Pinned);
+
+    // A stored document that parses and names the requested version but does
+    // not carry the pinned client jar descriptor: it must be re-resolved from
+    // the manifest chain, not trusted.
+    let stale = serde_json::json!({
+        "id": "1.8.9",
+        "assets": "1.8",
+        "assetIndex": { "id": "1.8", "url": INDEX_URL, "sha1": "0000", "size": 1, "totalSize": 1 },
+        "downloads": {
+            "client": {
+                "url": JAR_URL,
+                "sha1": "0000000000000000000000000000000000000000",
+                "size": 1
+            }
+        }
+    });
+    let path = store.version_json_path("1.8.9");
+    std::fs::create_dir_all(path.parent().expect("the version directory"))
+        .expect("create the version directory");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&stale).expect("serialize the stale document"),
+    )
+    .expect("write the stale document");
+
+    let error = fetch_version(&store, &f.http, &options("1.8.9"), |_| {})
+        .expect_err("the stand-in jar cannot satisfy the pinned descriptor");
+
+    assert_eq!(
+        f.http.calls.borrow().first().map(String::as_str),
+        Some(VERSION_MANIFEST_URL),
+        "the stored document must not be trusted: the manifest chain runs"
+    );
+    assert_eq!(
+        f.http.calls.borrow().len(),
+        6,
+        "manifest, document, index, two objects and the jar"
+    );
+    assert!(
+        matches!(error, FetchError::Store(StoreError::SizeMismatch { .. })),
+        "the run reaches the jar step: {error:?}"
+    );
+
+    let stored = std::fs::read_to_string(&path).expect("the stored document is replaced");
+    let document =
+        oxide_assets::version::parse_version_json(&stored).expect("parse the replacement");
+    assert_eq!(document.id, "1.8.9");
+    assert_eq!(
+        document.downloads.client.sha1, CLIENT_1_8_9_SHA1,
+        "the replacement carries the pinned descriptor"
+    );
+    assert_eq!(document.downloads.client.size, CLIENT_1_8_9_SIZE);
+}
+
+#[test]
+fn a_lock_file_left_by_a_dead_run_does_not_block_the_next() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path().to_path_buf()).expect("open");
+    let f = fixture("1.8.10");
+
+    // A lock file a killed run left behind: on disk, but no live process
+    // holds the operating-system lock over it. The next run must take it
+    // instead of claiming another fetch is running.
+    let path = dir.path().join("lock");
+    std::fs::write(&path, b"4242\n").expect("a stale lock file");
+
+    let report = fetch_version(&store, &f.http, &options("1.8.10"), |_| {})
+        .expect("a stale lock file must not lock out the next run");
+    assert_eq!(report.downloaded, 6, "the run completed");
+    assert_eq!(
+        std::fs::read_to_string(&path)
+            .expect("read the lock file")
+            .trim(),
+        std::process::id().to_string(),
+        "the run left its own process id behind"
+    );
+    assert_lock_released(dir.path());
 }

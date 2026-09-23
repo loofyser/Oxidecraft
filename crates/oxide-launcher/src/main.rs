@@ -29,8 +29,9 @@ enum Command {
         /// Re-hash everything already present.
         #[arg(long)]
         verify: bool,
-        /// Resolve and report without downloading.
-        #[arg(long)]
+        /// Resolve and report without downloading; the store directories are
+        /// still created and the fetch lock is taken.
+        #[arg(long, conflicts_with = "verify")]
         dry_run: bool,
     },
     /// Status ping a server.
@@ -126,6 +127,41 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! CLI parsing tests: the fetch flag combinations that must be refused.
+
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn a_dry_run_and_a_verify_together_are_refused() {
+        let error = Cli::try_parse_from(["oxide-launcher", "fetch", "--dry-run", "--verify"])
+            .err()
+            .expect("the combination must not parse");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_parses_alone_without_verify() {
+        let cli = Cli::try_parse_from(["oxide-launcher", "fetch", "--dry-run"])
+            .expect("a lone dry run parses");
+        match cli.command {
+            Command::Fetch {
+                dry_run, verify, ..
+            } => {
+                assert!(dry_run, "the flag is set");
+                assert!(!verify, "verify stays off");
+            }
+            _ => panic!("expected the fetch command"),
         }
     }
 }
