@@ -23,10 +23,9 @@ specification and continue without asking questions that are already answered he
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
   `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the wgpu window is captured at
   `refs/rig/evidence/m0-window.png`; the full fetch run is recorded under "M0 evidence" below.
-- Remaining M0 tasks: T10 hygiene and the `m0` tag, plus the first `main` CI run. T9 is implemented and
-  verified locally: `deny.toml` and the two guard scripts are on `main` (`9ef812d`); `.github/workflows/ci.yml`
-  sits in a held, unpushed commit because the `gh` credential carries no `workflow` scope. Grant it with
-  `gh auth refresh -s workflow`, then push it and watch the run.
+- Remaining M0 tasks: T10 hygiene and the `m0` tag. T9 is in review with fix round 1 applied:
+  `deny.toml` and the two guard scripts are on `main` (`9ef812d`), and `.github/workflows/ci.yml` is
+  pushed (`7b94c7f`), with CI run `35870226435` on that head green across all six jobs.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
