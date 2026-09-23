@@ -278,9 +278,13 @@ impl<S: Read + Write> Conn<S> {
     }
 
     /// Refills the read buffer from the stream.
+    ///
+    /// State is assigned only once the read succeeds: an error leaves the window
+    /// exactly as it was, so a later read can never replay already-consumed bytes.
     fn fill(&mut self) -> io::Result<()> {
+        let n = self.stream.read(&mut self.read_buf)?;
         self.read_start = 0;
-        self.read_end = self.stream.read(&mut self.read_buf)?;
+        self.read_end = n;
         Ok(())
     }
 }
