@@ -259,13 +259,17 @@ impl<S: Read + Write> Conn<S> {
 
     /// Frames and sends one `Packet ID + Data` payload.
     pub fn send(&mut self, payload: &[u8]) -> Result<(), FrameError> {
-        write_frame(&mut *self, payload, self.compression)?;
+        // `compression` is `Copy`: hoist it before the reborrow of `*self`, or the
+        // borrow checker refuses the immutable read during the mutable one.
+        let compression = self.compression;
+        write_frame(&mut *self, payload, compression)?;
         self.flush().map_err(FrameError::Io)
     }
 
     /// Reads one frame and returns the decompressed payload.
     pub fn recv(&mut self) -> Result<Vec<u8>, FrameError> {
-        read_frame(&mut *self, self.compression)
+        let compression = self.compression;
+        read_frame(&mut *self, compression)
     }
 
     /// Returns the wrapped stream.
@@ -498,7 +502,10 @@ pub fn read_string(mut input: impl Read, max_bytes: usize) -> Result<String, Cod
     }
     let len = len as usize;
     if len > max_bytes {
-        return Err(CodecError::TooLong { len, max: max_bytes });
+        return Err(CodecError::TooLong {
+            len,
+            max: max_bytes,
+        });
     }
     let mut bytes = vec![0u8; len];
     read_exact(&mut input, &mut bytes)?;
