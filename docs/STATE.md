@@ -135,6 +135,9 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 3. Run the local gate before every push: `bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`,
    `cargo test --workspace`, `cargo fmt --all --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`.
+4. Post-v1 programme (owner-directed 2026-09-23, spec section 17): singleplayer worlds and Java mod
+   compatibility (Forge 1.8.9 and `.jar` mods). Both start only after v1 completes and each needs its
+   own spec; neither affects the M1–M9 sequence.
 
 ## Resolved dependency versions
 

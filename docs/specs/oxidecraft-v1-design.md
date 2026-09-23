@@ -7,7 +7,7 @@
 | Target | Minecraft Java Edition 1.8.9, protocol 47 |
 | Repo | https://github.com/loofyser/Oxidecraft |
 | License | GPL-3.0 (repo code only; no Mojang assets, no jars redistributed) |
-| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. |
+| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. v4 — section 17 records the owner-directed post-v1 programme (singleplayer and Java mod compatibility) and its feasibility; no v1 scope change. |
 
 ---
 
@@ -53,9 +53,9 @@ which is reconnaissance, not legal advice.
 
 These are explicitly out of scope. Each has a resolution rule in section 16.
 
-- Singleplayer, the integrated server, world generation, and Anvil save loading.
+- Singleplayer, the integrated server, world generation, and Anvil save loading (post-v1 programme, section 17).
 - Minecraft versions other than 1.8.x.
-- Mods, plugins, resource packs, shaders, and any scripting layer.
+- Mods, plugins, resource packs, shaders, and any scripting layer during v1 (Java mod compatibility is a post-v1 programme item, section 17).
 - Packaging for Windows and macOS (the code must stay portable; packaging comes later).
 - Server-side software. Oxidecraft is a client only.
 - Anti-cheat compatibility guarantees on public servers.
@@ -136,6 +136,7 @@ The M2 milestone records the baseline numbers. The M9 milestone proves the targe
 | D16 | Offline-mode policy | The offline path exists for the local rig and development. The shipped flow requires a genuine login for online servers; no bypass is provided |
 | D17 | Legal invariants | No `.class` read, no asset committed, runtime fetch only, required README disclaimer. Enforced by review and the CI asset guard |
 | D18 | Window clear colour | The sRGB-aware surface format renders the sky-blue clear colour visibly paler than vanilla 1.8.9's; recorded as entry 4 in `docs/DIVERGENCES.md`. The sky renderer revisits the colour pipeline in a later milestone |
+| D19 | Post-v1 programme | Owner-directed 2026-09-23: singleplayer worlds and Java mod compatibility (Forge 1.8.9 and `.jar` mods) are in scope for the project, after v1 completes. Both need their own specs; the feasibility analysis and the shape of each track are in section 17 |
 
 ## 5. Architecture
 
@@ -442,12 +443,67 @@ Each milestone ends with a commit, a `docs/STATE.md` update, and a tag.
 | Extended render distance beyond 16 chunks | Post-v1 performance extra, recorded in `docs/DIVERGENCES.md` as a non-vanilla option with the settings-screen consequence stated |
 | Resource packs | The button exists and is a no-op in v1 (D14); real packs are post-v1 |
 | Windows and macOS packaging | After v1 ships on Linux; portability is enforced by CI cross-target checks from M0 |
-| Singleplayer and the integrated server | A separate project after v1, with its own spec |
+| Singleplayer and the integrated server | Post-v1 programme, first track (owner-directed 2026-09-23). A separate project after v1, with its own spec: the integrated server, world generation, and Anvil save loading. Section 17.1 records the feasibility |
+| Java mod loaders and `.jar` mods (Forge 1.8.9) | Post-v1 programme, second track (owner-directed 2026-09-23). Feasible only by running the Java game: a launcher-assembled vanilla-plus-Forge instance on a bundled JRE, everything fetched and verified at runtime and nothing redistributed. Re-implementing Forge's class loading, deobfuscation, and ASM patching in Rust is not a goal. Section 17.2 records the analysis |
 | Other Minecraft versions | One protocol crate per version; world storage is version-parameterised and each protocol crate supplies its own chunk codec |
 | `.mcassetsroot` vanilla-install detection | Verify by content probe before trusting, per section 7.2 |
 | `Map Chunk Bulk` (0x26) emission | Confirm against a live capture in M1 before relying on it |
 | 1.8.9 render-distance slider maximum and the exact 1.8 options set | Confirm on the rig in M6 against the vanilla options screen |
 | Nametag appearance: text scale, background opacity, and distance rule | Not covered by the research reports; confirm on the rig in M4 and add a checklist item |
+
+## 17. Post-v1 programme: singleplayer and Java mod compatibility
+
+Owner-directed 2026-09-23. Neither item changes v1's scope: both start only after v1 is complete,
+and each needs its own spec before any code. What follows is reconnaissance for those specs, not a
+design, and it is separate from the v1 milestones in section 13.
+
+### 17.1 Singleplayer worlds
+
+Feasible within the existing architecture, and the smaller of the two tracks:
+
+- **Integrated server.** The client already owns a tick loop (section 6). Singleplayer needs a
+  server-side world with the same physics and a client that talks to it in-process rather than over
+  a socket. The protocol layer is not involved.
+- **World generation.** Seed-faithful generation means implementing vanilla 1.8.9's generator
+  (biome layout, terrain shape, decoration). Large but well understood, and testable against worlds
+  the rig server generates from the same seed.
+- **Anvil save IO.** The format is already documented in `docs/research/protocol-47-reference.md`
+  section 5, and M1's chunk store is the natural place to serialise from and to. The nibble and
+  section conventions are the same ones the wire format uses, so nothing is relearned.
+- **Legal position unchanged.** A singleplayer world is the user's own data; nothing is fetched,
+  bundled, or redistributed.
+
+### 17.2 Java mod loaders and `.jar` mods (Forge 1.8.9)
+
+What the mods are matters more than any implementation choice: a 1.8.9 Forge mod is a compiled Java
+class library built against a deobfuscated, patched `net.minecraft.client` plus the Forge API. Forge
+loads the game through its own class loader, applies ASM bytecode transformers at class-load time,
+and mods hook the running game through the Forge event bus and direct calls into game classes.
+Rendering goes through LWJGL and OpenGL, and the world, entity, and inventory state the mods touch
+are the Java objects themselves.
+
+Consequences, stated plainly:
+
+- A from-scratch Rust client cannot load these mods into its own process. Their bytecode must run
+  against the classes they were compiled against, which requires a JVM and the vanilla-derived
+  class files. There is no partial version of this that still runs real mods.
+- **The feasible track** is a compatibility mode. The launcher assembles a vanilla 1.8.9 plus Forge
+  instance — Forge installer artefacts and libraries fetched and hash-verified at runtime, the same
+  way assets are today — and runs it on a bundled JRE. Oxidecraft supplies the launcher, the
+  verified store, the account flow (M7), and the process management; the Java game supplies the play
+  experience in that mode. This productises the shape the rig already uses.
+- **Not a goal**: re-implementing Forge's class loading, deobfuscation, and ASM patching in Rust, or
+  mixing LWJGL/OpenGL mod rendering into the wgpu renderer. Both are technically unbounded and
+  neither produces compatible mods.
+- **A cheaper parallel track, to be decided later**: joining modded servers. Server-side Forge mods
+  are the server's problem; a client that speaks the FML handshake (plugin channel `FML|HS`) and
+  applies the 1.8 registry-remapping rules can join many Forge servers with no JVM at all. That is
+  bounded protocol work and gets its own spec if it is taken up.
+- **A third track, if wanted later**: a native mod API of our own (Rust or WebAssembly plugins).
+  Reliable and fast, but not compatible with `.jar` mods; a v2-or-later feature.
+- **Legal position**: nothing Mojang-made, nothing from Forge, and nothing mod-authored is
+  redistributed. The launcher fetches and verifies at runtime, and Forge's own terms are accepted by
+  the user at install time, exactly as an official installation does.
 
 ## Appendix A: dependencies
 
