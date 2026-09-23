@@ -14,15 +14,16 @@ specification and continue without asking questions that are already answered he
 - M0 tasks complete: T1 workspace and VarInt codec; T2 framing with the 1.8 compression rules
   (fix round 1 applied); T3 handshake, status ping and the launcher CLI (`4c0db19`, re-reviewed);
   T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`);
-  T6 `fetch --verify` with fix round 1 applied and re-reviewed (`b3fcc51`). T7 jar extraction with
-  the manifest is implemented on `main`, acceptance run recorded below, awaiting its review.
-- Tests: 99 passing workspace-wide, 2 ignored (both require the live endpoints), zero failures
-  (`cargo test --workspace`).
+  T6 `fetch --verify` with fix round 1 applied and re-reviewed (`b3fcc51`); T7 jar extraction with
+  the manifest, review clean (`8d4dac9`). T8 the wgpu window with the FPS counter is implemented on
+  `main`, acceptance run recorded below, awaiting its review.
+- Tests: 109 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
+  adapter), zero failures (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
-  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the full fetch run is recorded under
-  "M0 evidence" below.
-- Remaining M0 tasks: T8 wgpu window, T9 CI and guards, T10 hygiene and the `m0` tag.
+  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the wgpu window is captured at
+  `refs/rig/evidence/m0-window.png`; the full fetch run is recorded under "M0 evidence" below.
+- Remaining M0 tasks: T9 CI and guards, T10 hygiene and the `m0` tag.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
@@ -76,6 +77,36 @@ extraction: 5597 entries read, 3085 extracted, 2512 skipped, 4553815 bytes
 - Extraction took 2.3 s on the first run (10:19:35Z to 10:19:37Z); a second run reports
   `extraction: up to date, nothing written` in under a second, and `fetch --verify` after the
   extraction still reports a clean store (722 objects, 0 mismatched, 0 missing).
+
+Task 8 acceptance run, a real window on this machine's GNOME/Wayland desktop, debug build
+(`cargo run -p oxide-client`, with `OXIDECRAFT_MAX_FRAMES=900` bounding the smoke run),
+2026-09-23 10:45:11Z to 10:45:26Z:
+
+```
+GPU adapter selected adapter=NVIDIA T500 backend=Vulkan driver=NVIDIA driver_info=615.71.09 device_type=DiscreteGpu vendor_id=4318 device_id=8123
+surface configured format=Bgra8UnormSrgb srgb=true width=1280 height=720 present_mode=Fifo
+renderer ready adapter="NVIDIA T500"
+frame rate frames=60 fps="62.1"
+frame rate frames=120 fps="60.0"
+frame rate frames=300 fps="59.3"
+frame rate frames=600 fps="60.0"
+frame rate frames=900 fps="59.8"
+frame limit reached, exiting frames=900
+client exiting frames=900
+```
+
+- The window title carries the live rate and the adapter name: `Oxidecraft — 60 fps — NVIDIA T500`.
+  The capture is `refs/rig/evidence/m0-window.png` (whole-desktop shot; the 1280x720 client window
+  is the pale sky-blue rectangle, clear colour 0.62/0.76/0.98 written through the sRGB surface
+  format). The run log is `refs/rig/evidence/m0-window-run.log`.
+- The instance asks for Vulkan only. Two GPUs are present (Intel Iris Xe and NVIDIA T500) and the
+  discrete NVIDIA T500 was selected with driver 615.71.09 and device id 8123; this is the appendix
+  C.1 device record for later parity comparisons. An X11/XWayland run of the same binary (with
+  `WAYLAND_DISPLAY` unset) reached the same title and a steady 60 fps, so both session paths work.
+- Escape and window-close exits were not exercised on this session: the desktop-control tooling
+  cannot enumerate windows here and synthetic keys are not delivered to the XWayland client. The
+  run above exits through the frame limit, which reaches the same `event_loop.exit()`; the escape
+  rule itself is unit-tested.
 
 ## Decisions locked
 

@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true

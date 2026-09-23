@@ -39,6 +39,8 @@ tempfile = "3"
 fs4 = "1"
 dirs = "7"
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+wgpu = "26.0.1"
+winit = "0.30.13"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
