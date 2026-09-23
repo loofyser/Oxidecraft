@@ -11,6 +11,9 @@ pub enum VarIntError {
     /// The encoding used more than five bytes.
     #[error("VarInt is longer than five bytes")]
     TooLong,
+    /// The underlying reader failed for a reason other than end of stream.
+    #[error("io error while reading VarInt: {0}")]
+    Io(#[from] io::Error),
 }
 
 /// Writes `value` as a VarInt.
@@ -35,7 +38,7 @@ pub fn read_varint(mut input: impl Read) -> Result<i32, VarIntError> {
             .read_exact(&mut byte)
             .map_err(|error| match error.kind() {
                 io::ErrorKind::UnexpectedEof => VarIntError::UnexpectedEof,
-                _ => VarIntError::UnexpectedEof,
+                _ => VarIntError::Io(error),
             })?;
         result |= u32::from(byte[0] & 0x7f) << (7 * index);
         if byte[0] & 0x80 == 0 {
