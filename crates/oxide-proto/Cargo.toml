@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+flate2 = { version = "1", features = ["zlib-ng-compat"] }
