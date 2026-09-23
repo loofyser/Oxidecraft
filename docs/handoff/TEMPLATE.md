@@ -1,8 +1,8 @@
 # Handoff template
 
 Copy this file to `docs/handoff/YYYY-MM-DD-<topic>.md`, fill it in, commit, and push. The
-point is that someone starting fresh, with none of the previous conversation, can continue
-the work without re-reading a long transcript.
+point is that someone starting fresh can continue the work from the repository alone, with
+no need to re-read earlier discussion.
 
 ---
 
@@ -17,8 +17,8 @@ One paragraph: what the project is and what milestone we are working toward.
 - Read first, in this order: `docs/STATE.md`, `docs/specs/oxidecraft-v1-design.md`
   (sections relevant to the milestone), then the matching report in `docs/research/`.
 - Rules that must not be broken: GPL-3.0, no code copied from RustCraft, no Mojang assets
-  committed, `refs/` and `vanilla/` stay local, no sudo except a leading command in a
-  foreground call.
+  committed, `refs/` and `vanilla/` stay local, no `sudo` except as the leading command of a
+  foreground shell command.
 
 ## Current stage
 
@@ -30,13 +30,13 @@ One paragraph: what the project is and what milestone we are working toward.
 
 <The single next action, with the exact command or file to touch.>
 
-## Open questions for the human
+## Open questions for the project owner
 
 <Numbered list, each with a recommended default.>
 
 ## Environment notes
 
-<anything machine-specific discovered this session: paths, versions, pitfalls>
+<anything machine-specific discovered while working: paths, versions, pitfalls>
 
 ## Verification to run before declaring done
 

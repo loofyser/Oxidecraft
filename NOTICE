@@ -1,0 +1,19 @@
+# NOTICE
+
+Oxidecraft is licensed under the GNU General Public License, version 3 only (GPL-3.0-only). The
+full text is in `LICENSE`.
+
+No Mojang asset, client jar, or other game file is committed to this repository. Game assets are
+fetched at runtime from Mojang's public distribution service and verified by hash before use.
+
+No third-party source code is included in this repository at present. Any adaptation of
+permissively licensed work (for example MIT or Apache-2.0 code, such as from the Stevenarella or
+Azalea projects) will be recorded in this file, with the original copyright line and licence, before
+it lands.
+
+No code from the RustCraft project is used in this repository in any form; it is a read-only
+reference for behavioural comparison only.
+
+Minecraft is a trademark of Mojang Synergies AB. Oxidecraft is not affiliated with, endorsed by, or
+associated with Mojang Studios or Microsoft, and it requires a legitimate copy of Minecraft Java
+Edition to run.

@@ -417,7 +417,7 @@ for a full 64-change batch, otherwise 0x22. (**V**)
 | PrismarineJS `prismarine-chunk` 1.8 (used by mineflayer) | reads/writes 4-bit values with `uint4`'s **LE** variant, i.e. even = high nibble — the **opposite** of vanilla | implementation cross-check |
 
 **Recommendation:** follow the vanilla rule (**V**) — it is what the Notchian client, server, and the Anvil
-on-disk format all use. If you interoperate with tooling derived from prismarine-chunk and see swapped
+on-disk format all use. If you interoperate with a parser derived from prismarine-chunk and see swapped
 light values, this table is why. `⚠ UNVERIFIED` whether prismarine's 1.8 path is a long-standing bug or
 compensated elsewhere in that stack; the vanilla source is unambiguous.
 
@@ -629,8 +629,8 @@ Entity flags (index 0) bits: `0x01` on fire · `0x02` crouched · `0x04` unused 
 
 ### 6.3 Spawn "entity ids"
 
-* **Spawn Object (0x0E)** `Type` byte (1.8 list, from minecraft-data 1.8 `entities.json` + vanilla client
-  dispatch): 1 Boat · 2 Item · 10/11/12 Minecart (rideable; sub-type in `Data`: 0 rideable, 1 chest,
+* **Spawn Object (0x0E)** `Type` byte (1.8 list, from minecraft-data 1.8 `entities.json` + the vanilla
+  client's object-type handling): 1 Boat · 2 Item · 10/11/12 Minecart (rideable; sub-type in `Data`: 0 rideable, 1 chest,
   2 furnace, 3 TNT, 4 spawner, 5 hopper, 6 command block) · 50 PrimedTnt · 51 EnderCrystal · 60 Arrow ·
   61 Snowball · 62 ThrownEgg · 63 Fireball (ghast) · 64 SmallFireball (blaze) · 65 ThrownEnderpearl ·
   66 WitherSkull · 70 FallingSand · 71 ItemFrame · 72 EyeOfEnderSignal · 73 ThrownPotion ·

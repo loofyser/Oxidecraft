@@ -1608,6 +1608,15 @@ git add crates/oxide-render crates/oxide-client docs/evidence docs/STATE.md
 git commit -m "feat: wgpu window with FPS counter and adapter logging (M0)"
 ```
 
+### Corrections applied after review (2026-09-23)
+
+The implementation review found that a stale surface (`Outdated`, `Lost`) stopped the client
+instead of being reconfigured. The renderer now reconfigures and retries the frame once, drops a
+`Timeout` frame, and logs the full cause chain. The step-5 evidence line also changed: images are
+excluded from the tracked tree by the asset guard, so the window capture and its run log live under
+the git-ignored `refs/rig/evidence/` and are cited from `docs/STATE.md`; `docs/evidence/` is not
+used.
+
 ---
 
 ### Task 9: CI, cargo-deny, the crate-graph check and the asset guard
@@ -1732,6 +1741,21 @@ Expected: every job green in the run summary. If `deny.toml`'s allow-list is too
 ```bash
 git add -A && git commit -m "fix: first CI run findings (M0)"
 ```
+
+### Corrections applied after review (2026-09-23)
+
+The implementation review found that this section's guard snippets left three gaps. The scripts,
+not this snippet set, are the reference:
+
+- The asset guard bans `.png` and `.lang` files anywhere in the tracked tree, not only under
+  asset-shaped paths: the only screenshots this project produces live under the git-ignored `refs/`
+  tree, so a committed image is never legitimate. It matches case-insensitively, so a differently
+  cased extension cannot slip past, and it treats a broken `grep` as a failure.
+- The crate-graph check permits exactly the 16 edges of the section 5.1 table. The permissive
+  `oxide-client -> *` arm above is replaced by the client's six explicit edges, and the check
+  asserts that all eight workspace crates are present in the metadata it reads.
+- Both guards fail closed: a missing tool (`git`, `grep`, `cargo`, `jq`) or metadata that cannot be
+  read is an error, never a pass.
 
 ---
 

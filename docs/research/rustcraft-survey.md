@@ -5,7 +5,7 @@ Survey date: 2026-09-22. All claims cite repository paths inside the shallow clo
 
 ## 0. Repository identity / provenance
 
-- **The URL in the task brief is wrong.** `https://github.com/Snowiiii/RustCraft` does not exist:
+- **The URL originally given for RustCraft is wrong.** `https://github.com/Snowiiii/RustCraft` does not exist:
   `git clone` fails with `fatal: could not read Username for 'https://github.com'` (GitHub's
   404-as-credential-prompt behaviour) and `https://api.github.com/repos/Snowiiii/RustCraft` returns
   a JSON body with all fields `null` (404). GitHub's API for the account instead shows the owner's
@@ -134,7 +134,7 @@ rejected, `:86-113`). Encryption: `EncryptedReader`/`EncryptedWriter` implement 
 supported.
 
 **Clientbound play-state coverage — 73 of 74 vanilla 1.8.9 packets (IDs 0x00–0x48).** Parsed in
-`net/packet/clientbound/play.rs` (73 `0xNN =>` arms; dispatch from
+`net/packet/clientbound/play.rs` (73 `0xNN =>` arms; routed from
 `net/packet/clientbound/mod.rs:12-19`, unknown IDs fall through to `ClientboundPacket::Unknown { id }`
 at `play.rs` tail):
 
@@ -424,7 +424,7 @@ be modelled on `assets/index.rs`.
 | CI history | 18 total runs; latest three: **success** (v1.0.0, 2026-08-11), **success** (main, 2026-08-09), cancelled (main, 2026-08-09) |
 | Linux build | Yes — CI produces a Linux AppImage + Linux zip from source on `ubuntu-22.04`; README `:59-63` claims "Windows and Linux support" and "Linux AppImage packaging" |
 
-Not built locally (out of scope per the task). No `rustfmt`/`clippy`/test workflow exists — only the
+Not built locally (out of scope for this survey). No `rustfmt`/`clippy`/test workflow exists — only the
 packaging workflow — so lint/test hygiene is unverified upstream. The shallow clone (`--depth 1`)
 means commit-volume history is not available locally; API counts above are authoritative.
 
@@ -479,8 +479,8 @@ copyrightable, so write your own.
   direct connect. A singleplayer-capable 1.8.9 client must supply its own worldgen + save format.
 - **No launcher / asset pipeline: absent** (see §7). No piston-meta client, no library/version
   resolution, no runtime (Java) management, no asset hashing/download/extraction, no client.jar
-  access. Everything the brief calls "custom launcher that downloads assets from Mojang piston-meta"
-  is greenfield. RustCraft's consumer-side expectations (`assets/indexes/{ver}.json` +
+  access. Everything the description calls "custom launcher that downloads assets from Mojang
+  piston-meta" is greenfield. RustCraft's consumer-side expectations (`assets/indexes/{ver}.json` +
   `assets/objects/xx/hash` + `assets/minecraft/...`) are compatible with that output, which is a
   useful interface constraint.
 - **Protocol:** `0x49 UpdateEntityNBT` unimplemented; no status-state (ping) parser inside `net/`;

@@ -2,42 +2,44 @@
 
 Updated: 2026-09-23
 
-This file is the live state of the project. Keep it current before every handoff, long pause,
-and milestone boundary. Anyone picking the work up should be able to read this file plus the
+This file is the live state of the project. Keep it current before every handoff, long pause, and
+milestone boundary. Anyone picking the work up should be able to read this file plus the
 specification and continue without asking questions that are already answered here.
 
 ## Where we are
 
-- Stage: milestone M0 in progress. Spec v2 is approved, and M0 runs from
-  `docs/plans/2026-09-22-m0-foundations.md`, one task at a time. The working ledger (gitignored)
-  is `.superpowers/sdd/2026-09-22-m0-foundations/progress.md`.
-- M0 tasks complete: T1 workspace and VarInt codec; T2 framing with the 1.8 compression rules
-  (fix round 1 applied); T3 handshake, status ping and the launcher CLI (`4c0db19`, re-reviewed);
-  T4 the hash-verified atomic store (`ad563f5`, fix round 1); T5 piston-meta parsing (`0fc73cb`);
-  T6 `fetch --verify` with fix round 1 applied and re-reviewed (`b3fcc51`); T7 jar extraction with
-  the manifest, review clean (`8d4dac9`). T8 the wgpu window with the FPS counter is implemented on
-  `main` with fix round 1 applied, acceptance run recorded below, awaiting its re-review.
+- Stage: **milestone M0 (foundations) is complete, and `main` carries the `m0` tag on the M0
+  close-out commit.** Milestone M1 (bytes to world) is next; its scope is the M1 row of
+  `docs/specs/oxidecraft-v1-design.md` section 13.
+- M0 delivered and verified: the eight-crate workspace with its enforced dependency graph; the
+  VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
+  and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
+  `fetch --verify` flow, run against the real endpoints; jar extraction with a manifest; the wgpu
+  window with the FPS counter and adapter logging; CI (six jobs) with the crate-graph, asset and
+  licence guards.
 - Tests: 112 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
   adapter), zero failures (`cargo test --workspace`).
 - Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
   `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
   `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the wgpu window is captured at
   `refs/rig/evidence/m0-window.png`; the full fetch run is recorded under "M0 evidence" below.
-- Remaining M0 tasks: T10 hygiene and the `m0` tag. T9 is in review with fix round 1 applied:
-  `deny.toml` and the two guard scripts are on `main` (`9ef812d`), and `.github/workflows/ci.yml` is
-  pushed (`7b94c7f`), with CI run `35870226435` on that head green across all six jobs.
+- CI: six jobs — format/lint/test, MSRV 1.85.0, portability (`x86_64-pc-windows-gnu`), crate graph,
+  asset guard, licences and advisories — all green in run `35871974117` on head `b42871a`. Caveats
+  to carry forward: `aarch64-apple-darwin` is not checked on Linux runners because its C
+  dependencies need the macOS SDK; the MSRV job installs the 1.85.0 toolchain per run; `cargo-deny`
+  is pinned to 0.20.2 and installed per run.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
-- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed; the last code commit carries jar
-  extraction, and documentation commits follow it. Confirm HEAD with `git log --oneline -3`.
+- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed and tagged. Confirm HEAD with
+  `git log --oneline -3`.
 
 ## M0 evidence
 
-Task 6 acceptance run, real endpoints, default store at `<data dir>/oxidecraft`, debug build
-(`cargo run -p oxide-launcher -- fetch --version 1.8.9 --verify`), 2026-09-23:
+Acceptance run: `fetch --verify`, real endpoints, default store at `<data dir>/oxidecraft`, debug
+build (`cargo run -p oxide-launcher -- fetch --version 1.8.9 --verify`), 2026-09-23:
 
 ```
 fetch complete: 726 downloaded, 0 reused, 123543629 bytes transferred
@@ -52,11 +54,11 @@ verify: 722 objects, 0 mismatched, 0 missing, 114708537 bytes on disk
   1.92 s, with the same clean verify. A run on a warm store downloads nothing.
 - Dry run on an empty store: `dry run: 0 file(s) already present, 723 file(s) to download,
   123170021 bytes` (722 objects plus the jar); only the empty store directories are created.
-- Fix round 1 (2026-09-23): the store lock is now an operating-system lock over
+- Post-review fix (2026-09-23): the store lock is now an operating-system lock over
   `<store root>/lock`, held for the run and released when the process dies, so a killed run cannot
   lock out the next one; the file itself stays behind with the last run's process id in it.
 
-Task 7 acceptance run, the real client jar already in the store, default store at
+Acceptance run: jar extraction, the real client jar already in the store, default store at
 `<data dir>/oxidecraft`, debug build (`cargo run -p oxide-launcher -- fetch --version 1.8.9`),
 2026-09-23:
 
@@ -80,7 +82,7 @@ extraction: 5597 entries read, 3085 extracted, 2512 skipped, 4553815 bytes
   `extraction: up to date, nothing written` in under a second, and `fetch --verify` after the
   extraction still reports a clean store (722 objects, 0 mismatched, 0 missing).
 
-Task 8 acceptance run, a real window on this machine's GNOME/Wayland desktop, debug build
+Acceptance run: wgpu window, a real window on this machine's GNOME/Wayland desktop, debug build
 (`cargo run -p oxide-client`, with `OXIDECRAFT_MAX_FRAMES=900` bounding the smoke run),
 2026-09-23 10:45:11Z to 10:45:26Z:
 
@@ -105,15 +107,14 @@ client exiting frames=900
   discrete NVIDIA T500 was selected with driver 615.71.09 and device id 8123; this is the appendix
   C.1 device record for later parity comparisons. An X11/XWayland run of the same binary (with
   `WAYLAND_DISPLAY` unset) reached the same title and a steady 60 fps, so both session paths work.
-- Escape and window-close exits were not exercised on this session: the desktop-control tooling
-  cannot enumerate windows here and synthetic keys are not delivered to the XWayland client. The
-  run above exits through the frame limit, which reaches the same `event_loop.exit()`; the escape
-  rule itself is unit-tested.
-
-- Fix round 1 (2026-09-23): a stale surface (`Outdated`, `Lost`) is now reconfigured and the frame
-  retried once instead of stopping the client, a `Timeout` frame is dropped, the error logs carry
-  the full cause chain, and the clear colour's sRGB difference is recorded in `docs/DIVERGENCES.md`
-  (entry 4).
+- Escape and window-close exits were not exercised on this session: window enumeration is
+  unavailable on this desktop and synthetic key events are not delivered to the XWayland client.
+  The run above exits through the frame limit, which reaches the same `event_loop.exit()`; the
+  escape rule itself is unit-tested.
+- Post-review fix (2026-09-23): a stale surface (`Outdated`, `Lost`) is now reconfigured and the
+  frame retried once instead of stopping the client, a `Timeout` frame is dropped, the error logs
+  carry the full cause chain, and the clear colour's sRGB difference is recorded in
+  `docs/DIVERGENCES.md` (entry 4).
 
 ## Decisions locked
 
@@ -124,12 +125,31 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Review the Task 7 extraction work on `main`; mark T7 complete in the ledger when every finding is
-   addressed.
-2. Continue the M0 plan from Task 8 (wgpu window) in order, one task per dispatch, with the task
-   review and fix loop after each.
-3. Every dispatch carries the standing rules: no AI or tooling language in committed files, commit
-   messages or code comments; explicit `git add <paths>`; never touch `.superpowers/`.
+1. Plan M1 (bytes to world) from the M1 row of spec section 13 — offline login, the keepalive and
+   the five connection obligations, Join Game, Client Settings, chunk parsing, the world store and
+   untextured terrain — and work it in order, milestone by milestone.
+2. Keep `docs/STATE.md` and `CHANGELOG.md` current, and tag each milestone when it closes.
+3. Run the local gate before every push: `bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`,
+   `cargo test --workspace`, `cargo fmt --all --check`,
+   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`.
+
+## Resolved dependency versions
+
+Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M0:
+
+| Crate | Version | Notes |
+| --- | --- | --- |
+| `wgpu` | 26.0.1 | MSRV pin: the newest release whose declared rust-version (1.84) fits the workspace's 1.85 floor (`wgpu-hal` 26.0.6, `naga` 26.0.0) |
+| `winit` | 0.30.13 | declares rust-version 1.70 |
+| `ureq` | 3.4.2 | rustls, no default features (`rustls` 0.23.45) |
+| `zip` | 7.2.0 | deflate only |
+| `flate2` | 1.1.10 | `zlib-ng-compat` backend |
+| `serde` / `serde_json` | 1.0.229 / 1.0.151 | derive |
+| `clap` | 4.6.7 | derive |
+| `thiserror` / `anyhow` | 2.0.20 / 1.0.104 | `thiserror` 1.0.69 is also present transitively |
+| `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | env-filter |
+| `sha1` / `hex` | 0.10.7 / 0.4.3 | |
+| `tempfile` / `fs4` / `dirs` | 3.27.0 / 1.1.0 / 7.0.0 | |
 
 ## Environment facts (development machine)
 
@@ -156,5 +176,5 @@ gitignored and never pushed. Neither is ever redistributed.
 1. Update this file: stage, what changed, next actions, any new environment facts.
 2. Commit and push everything, so the next person can pull it.
 3. Write `docs/handoff/YYYY-MM-DD-<topic>.md` from `docs/handoff/TEMPLATE.md`, fully
-   self-contained: no dependence on the previous conversation.
+   self-contained: a reader should need nothing beyond the repository.
 4. State plainly in the handoff what is verified and what is only planned.

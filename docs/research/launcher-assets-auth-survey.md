@@ -2,7 +2,7 @@
 
 **Target:** a Linux-native Rust launcher that (a) fetches assets from Mojang piston-meta, (b) authenticates a Microsoft
 account, (c) launches a custom native Rust Minecraft **1.8.9** client on CachyOS/Arch.
-**Survey date:** 2026-09-22 (UTC). **Method:** every fact below was checked by live `curl`/`fetch` in this session; HTTP
+**Survey date:** 2026-09-22 (UTC). **Method:** every fact below was checked by live `curl`/`fetch` during this survey; HTTP
 status codes, byte counts and JSON/response bodies are pasted verbatim. Where something could not be verified by fetch
 it is explicitly marked *[unverified]*.
 
@@ -378,7 +378,7 @@ launcher's footprint which additionally pulls a JRE and all 37 libraries.
 
 There is **no** "client ID + client secret" for third parties; the chain is Microsoft Entra ID (Azure AD) →
 Xbox Live → XSTS → Minecraft Services. The canonical community documentation of the whole chain is
-<https://minecraft.wiki/w/Microsoft_authentication> (raw wikitext fetched live in this session and quoted
+<https://minecraft.wiki/w/Microsoft_authentication> (raw wikitext fetched live during this survey and quoted
 below). Microsoft's own documentation covers only the first hop
 (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code>).
 
@@ -844,7 +844,7 @@ you".
 
 ## 5. Legal constraints
 
-Primary sources fetched live in this session:
+Primary sources fetched live during this survey:
 
 * EULA — <https://www.minecraft.net/en-us/eula> (full text also cached locally)
 * Minecraft Usage Guidelines — <https://www.minecraft.net/en-us/usage-guidelines>

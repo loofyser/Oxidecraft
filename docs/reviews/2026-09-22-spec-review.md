@@ -1,6 +1,6 @@
 # Oxidecraft v1 design specification — independent review
 
-Reviewer: independent adversarial review, 2026-09-22.
+Conducted as an independent adversarial review, 2026-09-22.
 Inputs: `docs/specs/oxidecraft-v1-design.md`, `docs/STATE.md`, `docs/DIVERGENCES.md`,
 `docs/handoff/TEMPLATE.md`, and the five reports in `docs/research/`.
 Method: every claim below was checked against the research reports by direct search; the spec was
@@ -14,7 +14,7 @@ not edited. Line references are to the files as of this review date.
 defects are cheap to fix.** The research base it leans on is genuinely verified and the numbers
 mostly reconcile exactly (jar hash and size, 734 objects, 74/26 packets, 4.317/5.612 m/s, cloud
 height 128, 40 particle types, 57 parity tests). However, four of the specification's own technical
-statements contradict the verified reports in ways that would send an implementer down the wrong
+statements contradict the verified reports in ways that would send a developer down the wrong
 path — the chunk is described as 128 blocks / eight sections instead of 256 / sixteen, entity
 interpolation is described as a "3-tick scheme" with three stored positions where the report says
 one-tick interpolation from two, the wire byte order of chunk data is stated as "exact" without the
@@ -22,13 +22,13 @@ array-major grouping, nibble order, or dimension rule that make it exact, and `B
 described as being built from jar JSON that does not contain any of the properties listed. On top
 of that, M0's dependency list cannot build the launcher it describes (no JSON, no TOML, no NBT
 anywhere in the spec), and the acceptance criteria that matter most — P1, P4, R1–R3, S1 — have no
-capture procedure, no tolerance, and no pass condition, so two competent implementers could not
+capture procedure, no tolerance, and no pass condition, so two competent developers could not
 agree on whether any of them is met. None of these require redesign: they are a day or two of
 specification surgery. Do that work, then plan M0.
 
 ---
 
-## Cross-check results (the checks requested in the review brief)
+## Cross-check results (the checks requested of this review)
 
 | # | Claim checked | Result |
 |---|---|---|
@@ -63,7 +63,7 @@ rustcraft-survey.md:276 — the surveyed 1.8.9 client uses `CHUNK_HEIGHT = 256`,
 `SECTION_COUNT = CHUNK_HEIGHT / SECTION_SIZE`.
 
 **Why it matters:** 1.8.9 chunks are 256 blocks tall in 16 sections; the spec's 128/eight is the
-pre-Beta-1.3 shape and is simply wrong for protocol 47. An implementer following §9 will size
+pre-Beta-1.3 shape and is simply wrong for protocol 47. A developer following §9 will size
 storage, masks, light arrays and height maps for half a world and will silently drop mask bits
 8–15, which is where terrain above y=128 lives. The spec's own §10 puts the cloud layer at y=128,
 so the error is self-evident: the world would end at the clouds.
@@ -192,7 +192,7 @@ an explicit PR. State the extraction-manifest format here too (see finding 6).
 later runs skip work." Line 316 — M0 exit: "CI green; `oxide-launcher fetch` produces a fully
 verified store; window opens with an FPS counter."
 
-**Why it matters:** an implementer must invent: the manifest's filename, format and contents (what
+**Why it matters:** a developer must invent: the manifest's filename, format and contents (what
 invalidates it — jar SHA-1 plus extractor version, at minimum); whether extraction is atomic
 (temp dir + rename) and how an interrupted fetch is detected; whether `XDG_DATA_HOME` is honoured
 or the path is literally `~/.local/share` (and what happens on Windows/macOS, which §16 says must
@@ -394,17 +394,17 @@ listed is expected to match vanilla exactly."
   F3 first line is specified as `Minecraft 1.8.9 (1.8.9/vanilla)` by test #5 (render:518) — which
   string does Oxidecraft print there?
 - `options.toml` (line 185) is a divergence from vanilla's `options.txt` and is not listed — if the
-  intent is that users can copy options across, this matters; if not, it still belongs in the ledger.
+  intent is that users can copy options across, this matters; if not, it still belongs in `docs/DIVERGENCES.md`.
 - `MC|Brand` is never decided. Vanilla sends `vanilla` (protocol:153); a server-visible brand is a
   behavioural divergence whichever value is chosen, and plugin channels are used by plugins.
 - M9's "32-chunk render distance" (line 325) is not a 1.8 option value (see "claims I could not
   verify") and, if user-facing, contradicts both the 1.8 video-settings set (test #4, render:517)
-  and the ledger.
+  and `docs/DIVERGENCES.md`.
 
 **Fix:** add the title text and options format to the spec as intentional decisions with their
-rationale, add a `MC|Brand` decision (recommend `vanilla` for parity with a ledger entry
-explaining why), and either drop the 32-chunk setting from v1 or ledger it as a non-vanilla extra
-with the settings-screen consequence spelled out.
+rationale, add a `MC|Brand` decision (recommend `vanilla` for parity, with an entry in
+`docs/DIVERGENCES.md` explaining why), and either drop the 32-chunk setting from v1 or record it in
+`docs/DIVERGENCES.md` as a non-vanilla extra with the settings-screen consequence spelled out.
 
 ---
 
@@ -568,7 +568,7 @@ measured on the **uncompressed `Packet ID + Data` size**, not a "frame", and thr
 disables compression entirely; protocol:62-64 — Set Compression and Login Success may arrive in
 either order and the Play-state 0x46 variant is broken and must not be used.
 
-**Why it matters:** two implementers read "threshold 256" differently — one hardcodes 256, one uses
+**Why it matters:** two developers read "threshold 256" differently — one hardcodes 256, one uses
 the VarInt the server sends. On a server configured with `-1` or `1024`, the hardcoded client
 breaks; measuring the *frame* instead of the payload mis-sends packets right at the boundary.
 
@@ -635,13 +635,13 @@ unit test.
 
 ---
 
-### 24. Ambiguities two competent implementers would resolve differently — MINOR
+### 24. Ambiguities two competent developers would resolve differently — MINOR
 
 1. **Line 291:** "Options that are meaningless for a native renderer, **such as** Advanced OpenGL,
    remain visible with their 1.8 layout and act as documented no-ops." The set is open-ended and
    undefined. Which of VSync, Max Framerate, Use VBOs (off by default in 1.8.9 — render:192), 3D
-   Anaglyph, Fullscreen/Resolution, GUI Scale are no-ops? Implementer A no-ops all four; implementer
-   B implements VSync and framerate cap, which R1's measurement depends on.
+   Anaglyph, Fullscreen/Resolution, GUI Scale are no-ops? One developer no-ops all four; another
+   implements VSync and framerate cap, which R1's measurement depends on.
 2. **Line 92 (S2):** "Malformed or hostile packets never panic the client; they disconnect with a
    clear error", versus the report's guidance that "unknown ⇒ **skip/save the payload**" (protocol:188).
    Is an unknown-but-well-formed id "hostile" (disconnect) or skippable (join modded servers)?
@@ -752,7 +752,7 @@ Added 2026-09-22 after spec v2. Every finding below was applied to
 | 7 | Major | Applied, §12: GitHub Actions named, cross-target checks, committed `deny.toml`, and the asset guard that fails on Mojang binaries in git |
 | 8 | Major | Applied, §9: all three sky-light rules, filtering blocks, four-bit ranges, mask-outside rule, 0x22/0x23 recomputation |
 | 9 | Major | Applied, §10: water exponential at 0.1 (0.01 with Water Breathing), lava exponential at 2.0, sky-pass linear 0 to far plane |
-| 10 | Major | Applied, §11.2 and §16: full server-openable container set, statistics and achievements, skin customization; post-v1 items listed with ledger duty |
+| 10 | Major | Applied, §11.2 and §16: full server-openable container set, statistics and achievements, skin customization; post-v1 items recorded in `docs/DIVERGENCES.md` |
 | 11 | Major | Applied, F5/F6/F9/F10/F12, §10, §11.2, M4/M5/M6: boss bar, nametags, object entities, third-person camera, chat layout, music ticker, F2 and F3 sub-modes, resize and fullscreen, downloading-terrain screen |
 | 12 | Major | Applied, P3 (named list), P4, M2/M3/M6/M8/M9 exits, appendix C: measurement procedures, physics test vectors, defined fresh-machine test, documentation-complete list |
 | 13 | Major | Applied, §6: snapshot lag restricted to meshing; overlays read current tick state; 100 ms input-to-visible latency budget with a test |

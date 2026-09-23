@@ -130,9 +130,9 @@ The M2 milestone records the baseline numbers. The M9 milestone proves the targe
 | D10 | Design outline | Approved; this document expands it |
 | D11 | Options file format | `options.toml`, our own format. Vanilla's `options.txt` is not read or written. Recorded as a divergence |
 | D12 | Title screen version text | "Oxidecraft 1.8.9". Recorded as a divergence. The F3 first line uses the same string |
-| D13 | Client brand | Send `vanilla` in `MC|Brand` for parity; recorded in the divergence ledger with the reason, because plugins read it |
+| D13 | Client brand | Send `vanilla` in `MC|Brand` for parity; recorded in `docs/DIVERGENCES.md` with the reason, because plugins read it |
 | D14 | Options that are no-ops | The no-op set is closed and explicit: Use VBOs, Advanced OpenGL, 3D Anaglyph, Snooper, Super Secret Settings, and the Resource Packs button. VSync, Max Framerate, Fullscreen, Resolution, and GUI Scale are real and functional; R1's measurement protocol depends on that |
-| D15 | Render distance range | v1 matches 1.8.9 exactly, up to 16 chunks. An extended range is a post-v1 ledger item, not a v1 feature |
+| D15 | Render distance range | v1 matches 1.8.9 exactly, up to 16 chunks. An extended range is a post-v1 item, not a v1 feature |
 | D16 | Offline-mode policy | The offline path exists for the local rig and development. The shipped flow requires a genuine login for online servers; no bypass is provided |
 | D17 | Legal invariants | No `.class` read, no asset committed, runtime fetch only, required README disclaimer. Enforced by review and the CI asset guard |
 
@@ -364,7 +364,7 @@ Every item below is in v1 and is verified item by item under P3.
 - HUD: hotbar, health, hunger, armor, experience, air, crosshair, boss health bar, item tooltips, held item, damage flash, block outline, crack overlay, nametags, tab list, scoreboard sidebar, spectator HUD, and third-person camera with HUD hide.
 - Sound: effects and music ticker with streaming, vanilla categories, pitch randomisation, 3D attenuation, the 64-block music range, and the 100-tick fade.
 
-Post-v1, recorded in the divergence ledger: book and quill writing, command block editing, the
+Post-v1, recorded in `docs/DIVERGENCES.md`: book and quill writing, command block editing, the
 win and credits screen, and an extended render distance beyond the vanilla 16 chunks.
 
 ## 12. Testing and verification
@@ -414,7 +414,7 @@ Each milestone ends with a commit, a `docs/STATE.md` update, and a tag.
 | Copying from a non-permissive source by accident | License contamination | `NOTICE` records every adapted file; review each adaptation; cargo-deny plus the review checklist |
 | A Mojang asset enters git history | Unrecoverable without a history rewrite | CI asset guard (section 12) plus `.gitignore` for `refs/` and `vanilla/` |
 | Microsoft changes the auth or session API | M7 blocked | Auth work isolated; Azalea's MIT implementation is a current reference |
-| The Minecraft API permission is refused for the registered application | M7 cannot be tested | Registration starts before M6; fallback is a documented alternative client id or dropping online mode from v1 with a ledger entry |
+| The Minecraft API permission is refused for the registered application | M7 cannot be tested | Registration starts before M6; fallback is a documented alternative client id or dropping online mode from v1 with a `docs/DIVERGENCES.md` entry |
 | Anti-cheat flags a non-vanilla client | Cannot play on some public servers | v1 targets vanilla-compatible behavior and documents this limit; no guarantees |
 | The parity rig fails on this machine (LWJGL2 under XWayland, standalone JRE 8, two GPUs) | P1–P4, R1, R2 all rest on it | The rig is proven in M0, before anything depends on it; appendix C fixes the GPU, driver, settings, and colour-space policy; a rig failure blocks M2 rather than silently weakening it |
 | Colour or gamma mismatch between vanilla's OpenGL output and our Vulkan output | Screenshot parity unverifiable | Appendix C's colour-space policy is fixed and checked with a reference gradient before M2's comparison |
@@ -427,7 +427,7 @@ Each milestone ends with a commit, a `docs/STATE.md` update, and a tag.
 
 - Conventional Commits; trunk-based on `main`; a tag per milestone; `CHANGELOG.md` updated per milestone.
 - `docs/STATE.md` carries the live project state: current milestone, completed work, next actions, open questions, environment facts, and exact commands. It is updated before every handoff and every long pause.
-- `docs/handoff/` holds dated handoff notes, each self-contained enough to resume work without the previous conversation.
+- `docs/handoff/` holds dated handoff notes, each self-contained enough to resume work from the repository alone.
 - Research notes land in `docs/research/`, independent reviews in `docs/reviews/`.
 - `refs/` and `vanilla/` are gitignored: they hold upstream clones, the rig, and the Mojang jar, none of which are redistributed.
 - Dependency policy: versions pinned in a committed `Cargo.lock`, MSRV declared as Rust 1.85 (edition 2024), development on the installed 1.95; dependency updates arrive only through explicit, reviewed commits.
@@ -437,8 +437,8 @@ Each milestone ends with a commit, a `docs/STATE.md` update, and a tag.
 | Item | Resolution rule |
 | --- | --- |
 | Azure application id and Minecraft API permission | Starts before M6 as a tracked owner action. If refused, the owner approves a documented alternative or online mode leaves v1 |
-| Book and quill writing, command block editing, win and credits screen | Post-v1, each with a divergence-ledger entry when the button or screen is present but inert |
-| Extended render distance beyond 16 chunks | Post-v1 performance extra, ledgered as a non-vanilla option with the settings-screen consequence stated |
+| Book and quill writing, command block editing, win and credits screen | Post-v1, each recorded in `docs/DIVERGENCES.md` when the button or screen is present but inert |
+| Extended render distance beyond 16 chunks | Post-v1 performance extra, recorded in `docs/DIVERGENCES.md` as a non-vanilla option with the settings-screen consequence stated |
 | Resource packs | The button exists and is a no-op in v1 (D14); real packs are post-v1 |
 | Windows and macOS packaging | After v1 ships on Linux; portability is enforced by CI cross-target checks from M0 |
 | Singleplayer and the integrated server | A separate project after v1, with its own spec |
@@ -505,7 +505,7 @@ All are permissive licenses, compatible with GPL-3.0, and all are enforced by `d
 2. Both clients run the same render distance, GUI scale, FOV, and graphics settings; HUD is hidden with F1 where the test targets world rendering.
 3. Capture at the same resolution. Screenshots are stored under `docs/parity/YYYY-MM-DD/` with the settings archive.
 4. Compare side by side, then with a per-pixel difference metric. Tolerance: no more than 2% of pixels differing by more than 8/255 per channel, with an absolute cap of 1% differing by more than 24/255. Differences caused by animated textures or entity positions are excluded by freezing the world (`/gamerule doDaylightCycle false`, mobs absent or stationary, `randomTickSpeed 0`).
-5. Every checklist item is recorded as pass, fail, or deferred-with-ledger-entry. Deferrals are only allowed for post-v1 features listed in section 16.
+5. Every checklist item is recorded as pass, fail, or deferred with an entry in `docs/DIVERGENCES.md`. Deferrals are only allowed for post-v1 features listed in section 16.
 
 ### C.3 Protocol parity procedure (P4)
 

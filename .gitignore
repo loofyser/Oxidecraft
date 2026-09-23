@@ -11,6 +11,3 @@
 *.swp
 *.swo
 .DS_Store
-
-# Local scratch space (ledgers, briefs, review packages)
-.superpowers/

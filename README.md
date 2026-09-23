@@ -1,14 +1,33 @@
 # Oxidecraft
 
+**NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.**
+
+Oxidecraft is an independent project. It is not affiliated with, endorsed by, or associated with
+Mojang Studios or Microsoft, and it ships no game assets or code; running it requires a legitimate
+copy of Minecraft Java Edition that you own.
+
 A from-scratch re-implementation of the Minecraft Java Edition client, written in Rust.
 
 Oxidecraft targets Java Edition 1.8.9 (protocol 47) first. The goal is a client that
 plays, feels and looks the same as the official Java Edition client, while being
 faster, more stable, lighter, and open source.
 
-## Status
+## Development status
 
-Pre-alpha. This repository currently contains design documentation only.
+Pre-alpha, and past the groundwork: milestone M0 (foundations) is complete — the workspace, the
+verified asset pipeline, jar extraction and the wgpu window all work, and CI is green. Milestone M1
+(bytes to world) is next. See `docs/STATE.md` for where the project stands, what is verified, and
+the evidence.
+
+## Building
+
+Requires a Rust toolchain 1.85 or newer (edition 2024).
+
+```bash
+cargo build --workspace
+cargo run -p oxide-launcher -- fetch --version 1.8.9
+cargo run -p oxide-client
+```
 
 ## Scope of the first release
 
@@ -19,7 +38,7 @@ Pre-alpha. This repository currently contains design documentation only.
   chat, and place or break blocks.
 - Microsoft account login is planned as a separate later milestone.
 
-## Repository layout (planned)
+## Repository layout
 
 | Path | Contents |
 | --- | --- |
@@ -36,12 +55,11 @@ Pre-alpha. This repository currently contains design documentation only.
 
 ## Legal
 
-Oxidecraft is not affiliated with Mojang Studios or Microsoft. It ships no Mojang
-code, textures, sounds or other game assets. Assets used at runtime are downloaded
-from Mojang's public distribution service by the user's own launcher, exactly as
-the official launcher does. The client jar is used only as a local resource source
-and is never redistributed.
+Game assets used at runtime are downloaded from Mojang's public distribution service by the user's
+own launcher, exactly as the official launcher does. The client jar is used only as a local
+resource source and is never redistributed. Nothing Mojang-made is committed to this repository.
 
 ## License
 
-GNU General Public License v3.0. See `LICENSE`.
+GNU General Public License v3.0 only (GPL-3.0-only). See `LICENSE`; third-party attribution notes
+are in `NOTICE`.
