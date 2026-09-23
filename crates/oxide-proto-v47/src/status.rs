@@ -1,7 +1,12 @@
-//! Status state: request, response, ping and pong.
+//! Status state: the Status Request / Status Response exchange.
+//!
+//! [`ping_server`] performs the exchange: a Handshake with next state 1, a
+//! Status Request, and the server's Status Response. The ping/pong round trip is
+//! not implemented here; it is optional and not needed to read a response.
 
-use std::net::TcpStream;
-use std::time::Duration;
+use std::io::ErrorKind;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use oxide_proto::frame::{Compression, FrameError, read_frame, write_frame};
 use oxide_proto::varint::{VarIntError, read_varint};
@@ -21,7 +26,9 @@ impl StatusRequest {
 /// The `description` field of a status response.
 ///
 /// A formatted MOTD arrives as a chat component object and an unformatted one as
-/// a plain JSON string; both forms are accepted.
+/// a plain JSON string; both forms are accepted. Anything else — an array of
+/// chat components, an object whose `text` is not a string — is kept as
+/// [`Description::Other`] so the rest of the response still parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Description {
@@ -33,6 +40,9 @@ pub enum Description {
     },
     /// A plain JSON string, the form vanilla sends for an unformatted MOTD.
     Plain(String),
+    /// A description shape this client reads no text from; it is a legal part of
+    /// a status response, so the response around it is still parsed.
+    Other(serde_json::Value),
 }
 
 impl Description {
@@ -42,6 +52,7 @@ impl Description {
         match self {
             Description::Object { text } => text,
             Description::Plain(text) => Some(text),
+            Description::Other(_) => None,
         }
     }
 }
@@ -85,6 +96,9 @@ pub enum PingError {
     /// Network failure.
     #[error("network error: {0}")]
     Io(#[from] std::io::Error),
+    /// The server did not answer within the timeout.
+    #[error("server did not answer within {0:?}")]
+    Timeout(Duration),
     /// Framing failure.
     #[error("framing error: {0}")]
     Frame(#[from] FrameError),
@@ -100,20 +114,32 @@ pub enum PingError {
     /// The response body ended before the JSON it declared.
     #[error("status response body is truncated")]
     Truncated,
+    /// The response's JSON length prefix was malformed.
+    #[error("bad status response length prefix: {0}")]
+    BadLength(#[from] VarIntError),
 }
 
 impl PingError {
-    /// Classifies a framing failure: a stream that ended before the response
-    /// arrived is a closed connection, anything else is a framing failure.
-    fn from_frame(error: FrameError) -> Self {
-        match &error {
-            FrameError::VarInt(VarIntError::UnexpectedEof) => PingError::Closed,
-            FrameError::VarInt(VarIntError::Io(io)) | FrameError::Io(io)
-                if io.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                PingError::Closed
-            }
-            _ => PingError::Frame(error),
+    /// Classifies a framing failure: a read that ran into the deadline is a
+    /// timeout, a stream that ended before the response arrived is a closed
+    /// connection, and anything else is a framing failure.
+    fn from_frame(error: FrameError, timeout: Duration) -> Self {
+        // The VarInt reader maps end of stream to `UnexpectedEof` itself, so a
+        // `VarIntError::Io` only ever carries some other kind. Matching on the
+        // kind reaches the error whether it is bare or nested in a VarInt error.
+        let kind = match &error {
+            FrameError::VarInt(VarIntError::Io(io)) | FrameError::Io(io) => Some(io.kind()),
+            _ => None,
+        };
+        match kind {
+            // A read that hits the socket timeout surfaces as `WouldBlock` on
+            // Unix and as `TimedOut` on Windows.
+            Some(ErrorKind::WouldBlock | ErrorKind::TimedOut) => PingError::Timeout(timeout),
+            Some(ErrorKind::UnexpectedEof) => PingError::Closed,
+            _ => match error {
+                FrameError::VarInt(VarIntError::UnexpectedEof) => PingError::Closed,
+                other => PingError::Frame(other),
+            },
         }
     }
 }
@@ -123,8 +149,39 @@ impl PingError {
 /// The exchange is the handshake with `next_state` 1, a Status Request, and the
 /// server's Status Response. The ping/pong round trip is not needed to read the
 /// response, and a server that closes straight after it has still answered.
+///
+/// `timeout` bounds the whole attempt: the connection attempts share it, as does
+/// every read and write after them, so a host that never answers cannot hold the
+/// caller for longer than that.
 pub fn ping_server(host: &str, port: u16, timeout: Duration) -> Result<StatusResponse, PingError> {
-    let mut stream = TcpStream::connect((host, port))?;
+    // Try every address the host resolves to, the way `TcpStream::connect`
+    // does. They share one deadline: a host that answers on a later address
+    // still gets its chance, without the total stretching past the timeout.
+    let deadline = Instant::now() + timeout;
+    let mut stream = None;
+    let mut failure = None;
+    for address in (host, port).to_socket_addrs()? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => failure = Some(error),
+        }
+    }
+    let Some(mut stream) = stream else {
+        return Err(match failure {
+            // The resolver produced no address to connect to at all.
+            None => PingError::Io(std::io::Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("no address resolved for {host}:{port}"),
+            )),
+            // Every address failed; report the last failure, as
+            // `TcpStream::connect` does.
+            Some(error) => PingError::Io(error),
+        });
+    };
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
@@ -133,7 +190,8 @@ pub fn ping_server(host: &str, port: u16, timeout: Duration) -> Result<StatusRes
 
     write_frame(&mut stream, &StatusRequest::PAYLOAD, Compression::Disabled)?;
 
-    let response = read_frame(&mut stream, Compression::Disabled).map_err(PingError::from_frame)?;
+    let response = read_frame(&mut stream, Compression::Disabled)
+        .map_err(|error| PingError::from_frame(error, timeout))?;
     let Some((&packet_id, body)) = response.split_first() else {
         return Err(PingError::Truncated);
     };
@@ -141,7 +199,13 @@ pub fn ping_server(host: &str, port: u16, timeout: Duration) -> Result<StatusRes
         return Err(PingError::UnexpectedPacket(packet_id));
     }
     let mut cursor = body;
-    let len = read_varint(&mut cursor).map_err(|_| PingError::Truncated)? as usize;
+    let len = match read_varint(&mut cursor) {
+        Ok(len) => len as usize,
+        // A body that ends before its length prefix completed is a short body.
+        Err(VarIntError::UnexpectedEof) => return Err(PingError::Truncated),
+        // Any other failure means the length prefix itself was malformed.
+        Err(error) => return Err(error.into()),
+    };
     let json = cursor.get(..len).ok_or(PingError::Truncated)?;
     Ok(serde_json::from_slice(json)?)
 }

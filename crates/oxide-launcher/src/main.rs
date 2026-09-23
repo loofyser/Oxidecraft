@@ -58,11 +58,14 @@ fn main() -> anyhow::Result<()> {
                 status.players.online,
                 status.players.max
             );
-            if let Some(description) = status
+            match status
                 .description
                 .and_then(|description| description.text())
             {
-                println!("MOTD: {description}");
+                Some(motd) => println!("MOTD: {motd}"),
+                // Say so rather than staying silent: no plain-text MOTD is a
+                // normal answer from a server that formats its description.
+                None => println!("MOTD: (none)"),
             }
             Ok(())
         }

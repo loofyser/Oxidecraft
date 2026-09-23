@@ -24,6 +24,19 @@ const PLAIN_DESCRIPTION_JSON: &str = concat!(
     r#""version":{"name":"1.8.9","protocol":47}}"#
 );
 
+/// A status response whose description is an array of chat components, a shape
+/// this client reads no plain-text MOTD from.
+const ARRAY_DESCRIPTION_JSON: &str = concat!(
+    r#"{"version":{"name":"1.8.9","protocol":47},"players":{"max":20,"online":0},"#,
+    r#""description":["Oxidecraft","test server"]}"#
+);
+
+/// A status response whose description is an object whose `text` is not a string.
+const NON_STRING_TEXT_DESCRIPTION_JSON: &str = concat!(
+    r#"{"version":{"name":"1.8.9","protocol":47},"players":{"max":20,"online":3},"#,
+    r#""description":{"text":42}}"#
+);
+
 /// What a fake server read from the client before it answered.
 #[derive(Debug)]
 struct Seen {
@@ -160,4 +173,126 @@ fn connection_closed_before_a_response_is_reported_as_closed() {
     let (_, result, _) = ping_against(|_| {});
 
     assert!(matches!(result, Err(PingError::Closed)));
+}
+
+#[test]
+fn silent_server_is_reported_as_a_timeout() {
+    let (port, handle) = fake_server(|_| {
+        // Hold the connection open, without answering, well past the client's
+        // deadline, so the read times out instead of seeing the server close.
+        thread::sleep(Duration::from_secs(1));
+    });
+    let result = ping_server("127.0.0.1", port, Duration::from_millis(100));
+    handle.join().expect("fake server thread");
+
+    match result {
+        Err(PingError::Timeout(reported)) => assert_eq!(reported, Duration::from_millis(100)),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_description_yields_version_and_players_without_a_motd() {
+    let (_, result, _) = ping_against(move |stream| {
+        let payload = status_payload(ARRAY_DESCRIPTION_JSON);
+        write_frame(stream, &payload, Compression::Disabled).expect("write status response");
+    });
+    let status = result.expect("status response");
+
+    assert_eq!(status.version.name, "1.8.9");
+    assert_eq!(status.version.protocol, 47);
+    assert_eq!(status.players.max, 20);
+    assert_eq!(status.players.online, 0);
+    assert_eq!(
+        status
+            .description
+            .and_then(|description| description.text()),
+        None
+    );
+}
+
+#[test]
+fn description_with_a_non_string_text_yields_no_motd() {
+    let (_, result, _) = ping_against(move |stream| {
+        let payload = status_payload(NON_STRING_TEXT_DESCRIPTION_JSON);
+        write_frame(stream, &payload, Compression::Disabled).expect("write status response");
+    });
+    let status = result.expect("status response");
+
+    assert_eq!(status.version.protocol, 47);
+    assert_eq!(status.players.online, 3);
+    assert_eq!(
+        status
+            .description
+            .and_then(|description| description.text()),
+        None
+    );
+}
+
+#[test]
+fn literal_bytes_reply_is_parsed() {
+    // The successful reply as hand-written wire bytes: the frame length prefix,
+    // the packet id, the JSON length prefix, then the JSON. Only the two length
+    // prefixes are computed, and `write_frame` is never used, so a mistake the
+    // writer and the reader share cannot cancel out in a round trip.
+    const LITERAL_JSON: &[u8] = b"{\"version\":{\"name\":\"1.8.9\",\"protocol\":47},\"players\":{\"max\":20,\"online\":2},\"description\":\"literal bytes\"}";
+
+    let (_, result, _) = ping_against(move |stream| {
+        let mut payload = vec![0x00];
+        write_varint(&mut payload, LITERAL_JSON.len() as i32).expect("write JSON length");
+        payload.extend_from_slice(LITERAL_JSON);
+
+        let mut frame = Vec::new();
+        write_varint(&mut frame, payload.len() as i32).expect("write frame length");
+        frame.extend_from_slice(&payload);
+        stream.write_all(&frame).expect("write literal reply");
+    });
+
+    let status = result.expect("status response");
+    assert_eq!(status.version.name, "1.8.9");
+    assert_eq!(status.version.protocol, 47);
+    assert_eq!(status.players.max, 20);
+    assert_eq!(status.players.online, 2);
+    assert_eq!(
+        status
+            .description
+            .and_then(|description| description.text())
+            .as_deref(),
+        Some("literal bytes")
+    );
+}
+
+#[test]
+fn ping_succeeds_when_the_first_resolved_address_refuses() {
+    // `localhost` resolves to more than one address on most hosts (`::1` and
+    // `127.0.0.1` here) and the fake server listens on one of them, so the
+    // exchange only succeeds if the addresses after the first are tried too.
+    let (port, handle) = fake_server(|stream| {
+        let payload = status_payload(PLAIN_DESCRIPTION_JSON);
+        write_frame(stream, &payload, Compression::Disabled).expect("write status response");
+    });
+    let result = ping_server("localhost", port, Duration::from_secs(5));
+
+    // Assert before joining: if every resolved address is refused, the server
+    // thread is still waiting to accept, and joining it would hang rather than
+    // report the failure.
+    let status = result.expect("status response");
+    assert_eq!(status.version.protocol, 47);
+    handle.join().expect("fake server thread");
+}
+
+#[test]
+fn overlong_json_length_is_reported_as_a_bad_length() {
+    let (_, result, _) = ping_against(|stream| {
+        // A length prefix whose five bytes all carry the continuation bit: the
+        // reader refuses it rather than looking for a sixth.
+        write_frame(
+            stream,
+            &[0x00, 0x80, 0x80, 0x80, 0x80, 0x80],
+            Compression::Disabled,
+        )
+        .expect("write response");
+    });
+
+    assert!(matches!(result, Err(PingError::BadLength(_))));
 }
