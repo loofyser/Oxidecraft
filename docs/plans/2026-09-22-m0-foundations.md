@@ -505,7 +505,9 @@ now the reference; the deltas the fix round applied are:
   (refusing to write a zero-length payload, which cannot round-trip in compressed mode).
 - A below-threshold compressed frame is rejected with `BadCompression`, matching vanilla's decoder.
 - Outbound frames are capped at `MAX_FRAME_LEN` after framing, so the writer cannot emit a frame the
-  reader would reject.
+  reader would reject. In compressed mode the writer also refuses a payload larger than
+  `MAX_FRAME_LEN`, because such a payload's declared length would exceed the limit the reader
+  enforces on the way back in.
 - Tests added for `TooLong`, `NegativeLength`, a fixed-vector decode (`ZLIB_HELLO`), the compressed
   branch actually compressing at the threshold, and the payload bytes following the marker.
 
