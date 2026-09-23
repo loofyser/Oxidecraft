@@ -426,9 +426,9 @@ Each milestone ends with a commit, a `docs/STATE.md` update, and a tag.
 ## 15. Repository conventions and context handoff
 
 - Conventional Commits; trunk-based on `main`; a tag per milestone; `CHANGELOG.md` updated per milestone.
-- `docs/STATE.md` carries the live project state: current milestone, completed work, next actions, open questions, environment facts, and exact commands. It is updated before every context handoff and every long pause.
-- `docs/handoff/` holds dated handoff prompts, each self-contained enough to start a fresh context with no compaction.
-- Long-running work is delegated to subagents; their reports land in `docs/research/`, and independent reviews in `docs/reviews/`.
+- `docs/STATE.md` carries the live project state: current milestone, completed work, next actions, open questions, environment facts, and exact commands. It is updated before every handoff and every long pause.
+- `docs/handoff/` holds dated handoff notes, each self-contained enough to resume work without the previous conversation.
+- Research notes land in `docs/research/`, independent reviews in `docs/reviews/`.
 - `refs/` and `vanilla/` are gitignored: they hold upstream clones, the rig, and the Mojang jar, none of which are redistributed.
 - Dependency policy: versions pinned in a committed `Cargo.lock`, MSRV declared as Rust 1.85 (edition 2024), development on the installed 1.95; dependency updates arrive only through explicit, reviewed commits.
 

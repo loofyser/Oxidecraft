@@ -1,8 +1,8 @@
 # Handoff template
 
 Copy this file to `docs/handoff/YYYY-MM-DD-<topic>.md`, fill it in, commit, and push. The
-point is a fresh context with no memory of the previous conversation can continue the work
-without re-reading a long transcript.
+point is that someone starting fresh, with none of the previous conversation, can continue
+the work without re-reading a long transcript.
 
 ---
 

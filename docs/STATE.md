@@ -2,8 +2,8 @@
 
 Updated: 2026-09-22
 
-This file is the live state of the project. Keep it current before every context handoff,
-long pause, and milestone boundary. A fresh agent should be able to read this file plus the
+This file is the live state of the project. Keep it current before every handoff, long pause,
+and milestone boundary. Anyone picking the work up should be able to read this file plus the
 specification and continue without asking questions that are already answered here.
 
 ## Where we are
@@ -53,7 +53,7 @@ gitignored and never pushed. Neither is ever redistributed.
 ## Handoff protocol
 
 1. Update this file: stage, what changed, next actions, any new environment facts.
-2. Commit and push everything, so a fresh context can pull.
+2. Commit and push everything, so the next person can pull it.
 3. Write `docs/handoff/YYYY-MM-DD-<topic>.md` from `docs/handoff/TEMPLATE.md`, fully
    self-contained: no dependence on the previous conversation.
 4. State plainly in the handoff what is verified and what is only planned.

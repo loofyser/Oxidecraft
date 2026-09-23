@@ -1,6 +1,6 @@
 # M0 Foundations Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **How to work this plan:** one task at a time, in order. Run each step's verification before moving on, and tick the checkboxes (`- [ ]`) as you go.
 
 **Goal:** Stand up the Oxidecraft workspace so that CI is green, the launcher can fetch and verify the complete 1.8.9 asset store, jar resources are extracted with a manifest, a wgpu window opens with an FPS counter, and the verification rig is proven.
 

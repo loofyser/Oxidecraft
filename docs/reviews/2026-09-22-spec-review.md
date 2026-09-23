@@ -1,6 +1,6 @@
 # Oxidecraft v1 design specification — independent review
 
-Reviewer: independent adversarial review (subagent), 2026-09-22.
+Reviewer: independent adversarial review, 2026-09-22.
 Inputs: `docs/specs/oxidecraft-v1-design.md`, `docs/STATE.md`, `docs/DIVERGENCES.md`,
 `docs/handoff/TEMPLATE.md`, and the five reports in `docs/research/`.
 Method: every claim below was checked against the research reports by direct search; the spec was
