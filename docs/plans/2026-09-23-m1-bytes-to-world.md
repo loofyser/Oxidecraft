@@ -410,8 +410,9 @@ fn booleans_read_any_non_zero_byte_as_true() {
 fn unsigned_and_signed_widths_are_read_back_correctly() {
     let mut cursor = Cursor::new(vec![0xff, 0xff]);
     assert_eq!(read_u16(&mut cursor).expect("read"), 0xffff);
-    let mut cursor = Cursor::new(vec![0xff, 0xff]);
-    assert_eq!(read_i32(&mut cursor).expect("read") , 65535);
+    // Two bytes cannot fill an i32; the same value needs four.
+    let mut cursor = Cursor::new(vec![0x00, 0x00, 0xff, 0xff]);
+    assert_eq!(read_i32(&mut cursor).expect("read"), 65_535);
 }
 ```
 
@@ -1181,9 +1182,18 @@ fn a_play_disconnect_carries_its_reason() {
 }
 
 #[test]
-fn unknown_ids_are_named_in_the_error() {
-    let error = clientbound::read_packet_id(&[0x7f]).expect("id");
-    assert_eq!(error.0, 0x7f);
+fn the_packet_id_reader_returns_the_id_and_the_remaining_body() {
+    let (id, rest) = clientbound::read_packet_id(&[0x7f, 0xaa, 0xbb]).expect("id");
+    assert_eq!(id, 0x7f);
+    assert_eq!(rest, &[0xaa, 0xbb]);
+}
+
+#[test]
+fn a_multi_byte_packet_id_is_read_as_a_varint_not_a_byte() {
+    // No M1 packet id is above 0x7f, but the reader must not assume that.
+    let (id, rest) = clientbound::read_packet_id(&[0x80, 0x01, 0x00]).expect("id");
+    assert_eq!(id, 128);
+    assert_eq!(rest, &[0x00]);
 }
 ```
 
@@ -2309,7 +2319,6 @@ fn two_stacked_blocks_share_no_face() {
 
 #[test]
 fn a_neighbour_across_a_section_border_culls_the_face() {
-    let world = world_with(&[(0, 15, 0, 0x0010)]);
     // Section 1, at the matching position, sees the section-0 block below.
     let mut column = oxide_proto_v47::column::ColumnData::empty();
     let mut section = Section::air(true);
