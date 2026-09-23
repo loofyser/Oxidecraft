@@ -192,6 +192,32 @@ fn silent_server_is_reported_as_a_timeout() {
 }
 
 #[test]
+fn a_spent_deadline_is_reported_as_a_timeout() {
+    // A zero-length socket timeout is not settable, so a deadline that leaves
+    // no time must be reported as a timeout instead of reaching the platform.
+    // No connection is attempted: the answer is immediate.
+    let result = ping_server("127.0.0.1", 1, Duration::ZERO);
+    match result {
+        Err(PingError::Timeout(reported)) => assert_eq!(reported, Duration::ZERO),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unrepresentably_large_timeout_does_not_panic() {
+    // A caller-supplied `Duration` beyond what the clock can represent must
+    // not panic the deadline arithmetic; the exchange itself is a normal one.
+    let (port, handle) = fake_server(|stream| {
+        let payload = status_payload(PLAIN_DESCRIPTION_JSON);
+        write_frame(stream, &payload, Compression::Disabled).expect("write status response");
+    });
+    let result = ping_server("127.0.0.1", port, Duration::MAX);
+    let status = result.expect("status response");
+    assert_eq!(status.version.protocol, 47);
+    handle.join().expect("fake server thread");
+}
+
+#[test]
 fn array_description_yields_version_and_players_without_a_motd() {
     let (_, result, _) = ping_against(move |stream| {
         let payload = status_payload(ARRAY_DESCRIPTION_JSON);
