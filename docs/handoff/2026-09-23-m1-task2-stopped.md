@@ -46,7 +46,10 @@ singleplayer worlds and Java mod compatibility (spec section 17, revision v4).
   workspace-wide, `fmt` and `clippy -D warnings` clean.
 - Known unfinished: Task 2's capture. Run A's raw capture exists (unanalysed), run B never ran, no
   fixtures exist, and the findings document was never written. The two rig tools the stopped
-  implementer wrote are unverified.
+  implementer wrote are unverified — and its own synthetic self-test of `analyse_capture.py` was
+  **failing** when it was interrupted (`DESYNC: 0x26 frame 5: 256 bytes left after the last column`),
+  which is the known `0x26` trap: the biome array is always present in bulk columns and must be
+  consumed. Fix or verify that path before trusting any analysis.
 - Nothing is half-applied in git: the working tree is clean, the rig is stopped, and
   `server.properties` is back to `server-port=25565`.
 
