@@ -8,15 +8,24 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
-- Stage: specification v2. Milestone M0 has not started.
-- Specification: `docs/specs/oxidecraft-v1-design.md` v2 — all 25 findings of the independent
-  review applied. Awaiting the owner's approval gate.
+- Stage: milestone M0 in progress. Spec v2 is approved, and M0 runs from
+  `docs/plans/2026-09-22-m0-foundations.md`, one task at a time. The working ledger (gitignored)
+  is `.superpowers/sdd/2026-09-22-m0-foundations/progress.md`.
+- M0 tasks complete: T1 workspace and VarInt codec; T2 framing with the 1.8 compression rules
+  (fix round 1 applied); T3 handshake, status ping and the launcher CLI. T3's fix round landed as
+  `4c0db19`; its scoped re-review is the immediate next action.
+- Tests: 36 passing workspace-wide, zero failures (`cargo test --workspace`).
+- Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
+  `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
+  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`.
+- Remaining M0 tasks: T4 hash-verified store, T5 piston-meta parsing, T6 `fetch --verify`,
+  T7 jar extraction, T8 wgpu window, T9 CI and guards, T10 hygiene and the `m0` tag.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
-- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed.
+- Repo: https://github.com/loofyser/Oxidecraft — `main` at `4c0db19`, pushed.
 
 ## Decisions locked
 
@@ -27,10 +36,12 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Owner approves the specification, or requests changes.
-2. Invoke the `writing-plans` skill to produce the M0 implementation plan.
-3. Execute M0: workspace, CI (asset guard, `deny.toml`, cross-target checks), `oxide-launcher
-   fetch --verify`, jar extraction with manifest, blank wgpu window, README disclaimer, rig proof.
+1. Generate the Task 3 re-review package over `1a06e52..4c0db19`, dispatch the scoped re-review, and
+   mark Task 3 complete in the ledger when every finding is addressed.
+2. Continue the M0 plan from Task 4 (the hash-verified store) in order, one task per dispatch, with
+   the task review and fix loop after each.
+3. Every dispatch carries the standing rules: no AI or tooling language in committed files, commit
+   messages or code comments; explicit `git add <paths>`; never touch `.superpowers/`.
 
 ## Environment facts (development machine)
 
@@ -44,6 +55,7 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 | git push | uses gh as the credential helper for github.com (`gh auth setup-git` has been run; plain `git push` works now) |
 | Minecraft installs | none on this machine; assets are downloaded into the Oxidecraft store |
 | sudo | password required, and only usable as the leading command of a foreground call |
+| Verification rig | `refs/rig/` — Temurin JRE 8, vanilla 1.8.9 server listening on 25565 (offline mode, seed `oxidecraft`), Prism instance `OxideRef-1.8.9` with an offline account; `refs/rig/README.md` documents start/stop and screenshots |
 
 ## Local-only directories
 
