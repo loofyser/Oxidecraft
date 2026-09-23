@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 
 use crate::varint::{VarIntError, read_varint, write_varint};
 
-/// The largest string the protocol allows in any field (the Chat cap).
+/// The protocol-wide ceiling on any string field, in bytes.
 pub const MAX_STRING_BYTES: usize = 32767;
 
 /// Errors from decoding a primitive or a string.
@@ -64,7 +64,11 @@ pub fn read_bool(input: impl Read) -> Result<bool, CodecError> {
 }
 
 /// Reads a length-prefixed UTF-8 string, refusing anything over `max_bytes`.
+///
+/// The protocol ceiling [`MAX_STRING_BYTES`] always applies: a caller cap above
+/// it is clamped down, so no string can exceed the protocol limit.
 pub fn read_string(mut input: impl Read, max_bytes: usize) -> Result<String, CodecError> {
+    let max_bytes = max_bytes.min(MAX_STRING_BYTES);
     let len = read_varint(&mut input)?;
     if len < 0 {
         return Err(CodecError::NegativeLength(len));
@@ -129,7 +133,17 @@ pub fn write_bool(mut out: impl Write, value: bool) -> io::Result<()> {
 }
 
 /// Writes a length-prefixed UTF-8 string.
+///
+/// A string longer than the protocol ceiling [`MAX_STRING_BYTES`] is refused
+/// with [`io::ErrorKind::InvalidInput`] instead of being framed with a length
+/// that would wrap.
 pub fn write_string(mut out: impl Write, value: &str) -> io::Result<()> {
+    if value.len() > MAX_STRING_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "string exceeds the protocol string ceiling",
+        ));
+    }
     write_varint(&mut out, value.len() as i32)?;
     out.write_all(value.as_bytes())
 }

@@ -1,10 +1,11 @@
 //! Tests for the buffered framed connection: write coalescing, buffered reads,
 //! and the compression switch.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 use oxide_proto::conn::Conn;
-use oxide_proto::frame::Compression;
+use oxide_proto::frame::{Compression, FrameError, write_frame};
+use oxide_proto::varint::VarIntError;
 
 /// An in-memory stream that records how the connection calls the underlying
 /// reader and writer: one entry per `read` call and one byte count per `write`
@@ -47,6 +48,60 @@ impl Write for CountingStream {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.write_calls.push(data.len());
         self.written.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One scripted read result: bytes to hand back, or an error kind to raise.
+enum Script {
+    /// Serve these bytes.
+    Bytes(Vec<u8>),
+    /// Fail the read with this error kind.
+    Fail(std::io::ErrorKind),
+}
+
+/// A stream that replays a fixed list of read results, one entry per call, so a
+/// test can place a failure at an exact read. Writes are discarded.
+struct ScriptedStream {
+    script: std::collections::VecDeque<Script>,
+}
+
+impl ScriptedStream {
+    fn new(script: Vec<Script>) -> Self {
+        Self {
+            script: script.into(),
+        }
+    }
+}
+
+impl Read for ScriptedStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self.script.pop_front() {
+            Some(Script::Bytes(bytes)) => {
+                assert!(
+                    bytes.len() <= out.len(),
+                    "scripted read of {} bytes into a {} byte buffer",
+                    bytes.len(),
+                    out.len()
+                );
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            Some(Script::Fail(kind)) => Err(std::io::Error::new(kind, "the scripted read fails")),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the script is exhausted",
+            )),
+        }
+    }
+}
+
+impl Write for ScriptedStream {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         Ok(data.len())
     }
 
@@ -98,4 +153,36 @@ fn compression_applies_after_the_switch() {
 fn a_truncated_stream_is_an_error_not_a_panic() {
     let mut conn = Conn::new(CountingStream::with_input(&[0x05, 0x01]));
     assert!(conn.recv().is_err(), "a short frame must be reported");
+}
+
+#[test]
+fn a_failed_refill_does_not_replay_consumed_bytes() {
+    let mut first = Vec::new();
+    write_frame(&mut first, b"first", Compression::Disabled).expect("frame");
+    let mut second = Vec::new();
+    write_frame(&mut second, b"second", Compression::Disabled).expect("frame");
+
+    let stream = ScriptedStream::new(vec![
+        Script::Bytes(first),
+        Script::Fail(std::io::ErrorKind::WouldBlock),
+        Script::Bytes(second),
+    ]);
+    let mut conn = Conn::new(stream);
+
+    assert_eq!(conn.recv().expect("first recv"), b"first");
+
+    // The frame length prefix is read before anything else, so the failed
+    // refill surfaces through the VarInt layer, keeping the io error kind.
+    let error = conn.recv().expect_err("the failed refill must surface");
+    assert!(
+        matches!(
+            &error,
+            FrameError::VarInt(VarIntError::Io(cause)) if cause.kind() == io::ErrorKind::WouldBlock
+        ),
+        "error: {error:?}"
+    );
+
+    // The third receive serves the second frame. Replaying the first one would
+    // mean the failed refill left its bytes in the read window.
+    assert_eq!(conn.recv().expect("second recv"), b"second");
 }
