@@ -48,7 +48,7 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 | Fact | Value |
 | --- | --- |
-| OS / session | CachyOS, kernel 7.2.2, Wayland with niri |
+| OS / session | CachyOS, kernel 7.2.2, Wayland with GNOME (mutter). XWayland is provided by mutter's `Xwayland :1`, so the 1.8.9 rig client (LWJGL 2) runs without extra setup. Earlier notes say niri; the desktop was switched to GNOME on 2026-09-22 |
 | Rust | rustc 1.95.0, cargo 1.95.0 |
 | Vulkan | instance 1.4.357; Intel Iris Xe (card2) and NVIDIA T500 (card1) |
 | Java | Java 26 system-wide; the rig uses a standalone JRE 8 tarball |
