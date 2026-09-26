@@ -943,10 +943,9 @@ pub enum LoginPacket {
     },
 }
 
-/// Decodes a login-state packet whose id has already been read.
+/// Decodes a login-state packet, reading the packet id itself; pass the payload with the id in place.
 pub fn decode_login(body: &[u8]) -> Result<LoginPacket, PacketError> {
-    // The id is consumed by `read_packet_id` before this is called; the tests
-    // call `decode_login` with the id still in place, so strip it here.
+    // The id is read here, so callers pass the payload with the id still in place.
     let (id, body) = read_packet_id(body)?;
     let mut cursor = Cursor::new(body);
     let packet = match id {
