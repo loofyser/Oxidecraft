@@ -777,9 +777,11 @@ fn set_compression_carries_the_threshold_as_a_varint() {
 
 #[test]
 fn login_success_carries_a_hyphenated_uuid_and_the_name() {
-    let body = "069a79f4-44e9-4726-a5be-fca90e38aaf5OxideDev";
-    let mut payload = vec![0x02, body.len() as u8];
-    payload.extend_from_slice(body.as_bytes());
+    // Two length-prefixed strings: the UUID (36 bytes) then the name (8 bytes).
+    let mut payload = vec![0x02, 0x24];
+    payload.extend_from_slice(b"069a79f4-44e9-4726-a5be-fca90e38aaf5");
+    payload.push(0x08);
+    payload.extend_from_slice(b"OxideDev");
     match decode_login(&payload).expect("decode") {
         LoginPacket::LoginSuccess { uuid, username } => {
             assert_eq!(uuid, "069a79f4-44e9-4726-a5be-fca90e38aaf5");
@@ -983,12 +985,18 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: i32) -> Result<Vec<u8>, PacketErr
     let len = len as usize;
     let start = cursor.position() as usize;
     let end = start + len;
-    let bytes = body_slice(cursor, start, end)?;
-    Ok(bytes.to_vec())
+    let bytes = body_slice(cursor, start, end)?.to_vec();
+    // The cursor must sit after the array, so the trailing check sees it consumed.
+    cursor.set_position(end as u64);
+    Ok(bytes)
 }
 
 /// The bytes between two offsets of the cursor's own buffer.
-fn body_slice(cursor: &Cursor<&[u8]>, start: usize, end: usize) -> Result<&[u8], PacketError> {
+fn body_slice<'a>(
+    cursor: &'a Cursor<&'a [u8]>,
+    start: usize,
+    end: usize,
+) -> Result<&'a [u8], PacketError> {
     cursor
         .get_ref()
         .get(start..end)
@@ -1011,7 +1019,7 @@ fn check_no_trailing(cursor: &Cursor<&[u8]>, len: usize) -> Result<(), PacketErr
 }
 ```
 
-Note on `read_bytes`: after reading, the cursor must advance. Use `cursor.set_position(end as u64)` after a successful slice, so `check_no_trailing` sees the true consumption. The test for the Encryption Request pins this: `public_key` is read, then the token length, then the token, with no trailing bytes left.
+Note on `read_bytes`: after reading, the cursor must advance. Use `cursor.set_position(end as u64)` after a successful slice, so `check_no_trailing` sees the true consumption. The test for the Encryption Request pins this: `public_key` is read, then the token length, then the token, with no trailing bytes left. The module also carries `impl From<VarIntError> for PacketError`, which the bare `?` on `read_varint` needs (`From` is not transitive through `CodecError`); Tasks 4-5 rely on that one impl and must not add a duplicate.
 
 `crates/oxide-proto-v47/src/serverbound.rs`:
 
@@ -2683,10 +2691,11 @@ fn scripted_server_stream() -> Vec<u8> {
     use oxide_proto::frame::write_frame;
     let mut out = Vec::new();
     // Login Success, under compression as the server sends it.
-    let mut login_success = vec![0x02];
-    let body = "069a79f4-44e9-4726-a5be-fca90e38aaf5OxideDev";
-    login_success.push(body.len() as u8);
-    login_success.extend_from_slice(body.as_bytes());
+    // Two length-prefixed strings, the UUID then the name.
+    let mut login_success = vec![0x02, 0x24];
+    login_success.extend_from_slice(b"069a79f4-44e9-4726-a5be-fca90e38aaf5");
+    login_success.push(0x08);
+    login_success.extend_from_slice(b"OxideDev");
     write_frame(&mut out, &login_success, Compression::Enabled { threshold: 256 }).unwrap();
     // Join Game.
     let mut join = vec![0x01];
