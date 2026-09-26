@@ -1525,7 +1525,7 @@ pub struct ColumnData {
 
 - [ ] **Step 1: Write the failing decoder tests**
 
-`crates/oxide-proto-v47/tests/column.rs`:
+`crates/oxide-proto-v47/tests/column.rs` (note added 2026-09-26: the multi-section payload builders in the samples below concatenate whole sections — that is the 1.9+ per-section interleave, not 1.8's wire order. The real order is grouped: all included block arrays, then all block-light arrays, then all sky-light arrays, then the biomes. The committed tests use a `build_column` helper that emits the grouped order, with the sample assertions unchanged; copy that):
 
 ```rust
 //! Tests for the column decoder: the size formula, nibble order, index order,
