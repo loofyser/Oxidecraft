@@ -2204,6 +2204,8 @@ Add `glam` to `[dev-dependencies]` of `oxide-render`? No: `glam` is a normal dep
 
 (Note added 2026-09-26: the resolved `glam` is 0.32.1 — the newest release where `Mat4::perspective_rh` and `Mat4::look_to_rh` are current. From 0.33 these are deprecated in favour of `glam::camera`, which `-D warnings` would reject; do not bump without changing the call sites. The plan's `camera.eye().y as f32` casts are identity casts and fail `clippy::unnecessary_cast`, so the committed tests drop them.)
 
+(Note added 2026-09-26, second correction: the assertions above do not discriminate the convention they name — under `perspective_rh_gl` the ahead point still lands inside 0.0..1.0 and the near point still passes the asymmetric `< 0.01`, and a mirrored basis only flips `ndc.x`, which nothing reads. The committed tests therefore also use a symmetric near assertion (`near_ndc.z.abs() < 0.01`), probe the far plane (a point at `8.0 * 16.0 * SQRT_2` maps to ≈ 1.0 and one beyond it to > 1), and pin handedness (with yaw 0, a point at `(+1, eye_y, 10)` lands at negative `ndc.x`).)
+
 - [ ] **Step 2: Run the tests and watch them fail**
 
 Run: `cargo test -p oxide-render --test terrain_data`
