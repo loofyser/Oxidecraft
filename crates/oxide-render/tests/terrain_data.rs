@@ -28,7 +28,12 @@ fn two_vertices_are_twice_the_bytes() {
             color: [1.0; 3],
         },
     ];
-    assert_eq!(vertex_bytes(&mesh).len(), 2 * VERTEX_BYTES);
+    let bytes = vertex_bytes(&mesh);
+    assert_eq!(bytes.len(), 2 * VERTEX_BYTES);
+    // The second vertex starts at offset 24 and is the only one holding 1.0; its three
+    // position floats sit at offsets 24, 28 and 32.
+    let read = |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    assert_eq!((read(24), read(28), read(32)), (1.0, 1.0, 1.0));
 }
 
 fn pose(yaw: f32, pitch: f32) -> CameraPose {
@@ -118,7 +123,29 @@ fn a_point_ahead_projects_to_the_centre_and_near_maps_to_zero_depth() {
             1.0,
         );
     let near_ndc = near_point.truncate() / near_point.w;
-    assert!(near_ndc.z < 0.01, "near maps to zero: {near_ndc:?}");
+    assert!(near_ndc.z.abs() < 0.01, "near maps to zero: {near_ndc:?}");
+
+    // The far plane is far_chunks * 16 * SQRT_2 = 181.019 blocks away here: a point at that
+    // distance reaches depth 1, and a point twice as far lies beyond the plane.
+    let far = 8.0 * 16.0 * std::f32::consts::SQRT_2;
+    let at_far = view_projection * glam::Vec4::new(0.0, camera.eye().y, far, 1.0);
+    let at_far_ndc = at_far.truncate() / at_far.w;
+    assert!(
+        (at_far_ndc.z - 1.0).abs() < 1e-5,
+        "far maps to one: {at_far_ndc:?}"
+    );
+    let past_far = view_projection * glam::Vec4::new(0.0, camera.eye().y, 2.0 * far, 1.0);
+    let past_far_ndc = past_far.truncate() / past_far.w;
+    assert!(past_far_ndc.z > 1.0, "beyond far: {past_far_ndc:?}");
+
+    // Yaw 0 faces +Z, so a point one block east of the eye sits on the left of the view: its
+    // x lands near -0.080 under a right-handed basis (a mirrored basis would land at +0.080).
+    let east = view_projection * glam::Vec4::new(1.0, camera.eye().y, 10.0, 1.0);
+    let east_ndc = east.truncate() / east.w;
+    assert!(
+        (east_ndc.x + 0.080).abs() < 1e-3,
+        "the basis is right-handed: {east_ndc:?}"
+    );
 }
 
 #[test]

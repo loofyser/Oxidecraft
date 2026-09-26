@@ -45,6 +45,9 @@ pub struct ChunkMesh {
 
 impl ChunkMesh {
     /// Whether the mesh draws nothing.
+    ///
+    /// The draw is indexed, so this reads `indices`; a mesh with vertices but
+    /// no indices is empty.
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
