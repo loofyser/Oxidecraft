@@ -1,6 +1,7 @@
 //! All 74 clientbound and 26 serverbound play packets, plus handshake, status, and login states.
 
 pub mod clientbound;
+pub mod column;
 pub mod handshake;
 pub mod serverbound;
 pub mod status;

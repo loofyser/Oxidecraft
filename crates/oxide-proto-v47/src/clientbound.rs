@@ -6,6 +6,7 @@ use oxide_proto::codec::{self, MAX_STRING_BYTES};
 use oxide_proto::varint::{VarIntError, read_varint};
 
 use crate::PacketError;
+use crate::column::{self, ColumnData};
 
 /// A malformed VarInt inside a packet is a codec failure like any other.
 impl From<VarIntError> for PacketError {
@@ -403,5 +404,139 @@ impl PlayerListItem {
         }
         check_no_trailing(&cursor, body.len())?;
         Ok(Self { entries })
+    }
+}
+
+/// Clientbound Chunk Data (play id 0x21).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkData {
+    /// The column's chunk x.
+    pub chunk_x: i32,
+    /// The column's chunk z.
+    pub chunk_z: i32,
+    /// Whether the packet replaces the whole column.
+    pub ground_up: bool,
+    /// The primary bitmask.
+    pub mask: u16,
+    /// The decoded column. For `ground_up` with an empty mask this carries no
+    /// sections and is the unload shape.
+    pub column: ColumnData,
+}
+
+impl ChunkData {
+    /// The packet id.
+    pub const ID: i32 = 0x21;
+
+    /// Decodes the fields after the packet id, given the dimension's sky flag.
+    ///
+    /// The sky flag is a property of the world, not of the packet: the caller
+    /// keeps it from Join Game or Respawn.
+    pub fn decode(body: &[u8], sky_light_sent: bool) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let chunk_x = codec::read_i32(&mut cursor)?;
+        let chunk_z = codec::read_i32(&mut cursor)?;
+        let ground_up = codec::read_bool(&mut cursor)?;
+        let mask = codec::read_u16(&mut cursor)?;
+        let size = read_varint(&mut cursor)?;
+        if size < 0 {
+            return Err(PacketError::Codec(codec::CodecError::NegativeLength(size)));
+        }
+        let size = size as usize;
+        let start = cursor.position() as usize;
+        let end = start.saturating_add(size);
+        let data = body.get(start..end).ok_or(PacketError::BadColumnSize {
+            got: body.len().saturating_sub(start),
+            expected: size,
+        })?;
+        cursor.set_position(end as u64);
+        check_no_trailing(&cursor, body.len())?;
+        let column = if ground_up && mask == 0 {
+            ColumnData::empty()
+        } else {
+            column::parse_column(data, mask, sky_light_sent, ground_up)?
+        };
+        Ok(Self {
+            chunk_x,
+            chunk_z,
+            ground_up,
+            mask,
+            column,
+        })
+    }
+}
+
+/// One column of a Map Chunk Bulk packet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BulkColumn {
+    /// The column's chunk x.
+    pub chunk_x: i32,
+    /// The column's chunk z.
+    pub chunk_z: i32,
+    /// The column's primary bitmask.
+    pub mask: u16,
+    /// The decoded column.
+    pub column: ColumnData,
+}
+
+/// The bytes one Map Chunk Bulk metadata entry occupies: two ints and the mask.
+const BULK_ENTRY_BYTES: usize = 10;
+
+/// Clientbound Map Chunk Bulk (play id 0x26).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapChunkBulk {
+    /// Whether the columns carry sky light; the flag is per packet.
+    pub sky_light: bool,
+    /// The decoded columns, in the order the packet lists them.
+    pub columns: Vec<BulkColumn>,
+}
+
+impl MapChunkBulk {
+    /// The packet id.
+    pub const ID: i32 = 0x26;
+
+    /// Decodes the fields after the packet id.
+    ///
+    /// The packet carries no per-column length: the metadata block lists every
+    /// column first, and each column's payload is then sized from its own mask
+    /// and the packet's sky-light flag, biome array included.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let sky_light = codec::read_bool(&mut cursor)?;
+        let count = read_varint(&mut cursor)?;
+        if count < 0 {
+            return Err(PacketError::Codec(codec::CodecError::NegativeLength(count)));
+        }
+        let count = count as usize;
+        // The count is hostile until checked: the reservation is bounded by the
+        // bytes still available, so a huge declared count cannot size an
+        // allocation ahead of the reads that would run out of payload.
+        let remaining = body.len().saturating_sub(cursor.position() as usize);
+        let mut metadata = Vec::with_capacity(count.min(remaining / BULK_ENTRY_BYTES));
+        for _ in 0..count {
+            let chunk_x = codec::read_i32(&mut cursor)?;
+            let chunk_z = codec::read_i32(&mut cursor)?;
+            let mask = codec::read_u16(&mut cursor)?;
+            metadata.push((chunk_x, chunk_z, mask));
+        }
+        let mut columns = Vec::with_capacity(metadata.len());
+        for (chunk_x, chunk_z, mask) in metadata {
+            let size = column::column_size(mask, sky_light, true);
+            let start = cursor.position() as usize;
+            let end = start.saturating_add(size);
+            let data = body.get(start..end).ok_or(PacketError::BadColumnSize {
+                got: body.len().saturating_sub(start),
+                expected: size,
+            })?;
+            cursor.set_position(end as u64);
+            let column = column::parse_column(data, mask, sky_light, true)?;
+            columns.push(BulkColumn {
+                chunk_x,
+                chunk_z,
+                mask,
+                column,
+            });
+        }
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { sky_light, columns })
     }
 }
