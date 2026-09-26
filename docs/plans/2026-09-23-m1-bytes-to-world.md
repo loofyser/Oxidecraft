@@ -2173,14 +2173,15 @@ fn a_point_ahead_projects_to_the_centre_and_near_maps_to_zero_depth() {
     };
     let view_projection = camera.view_projection(16.0 / 9.0);
     // Ten blocks ahead along +Z, at eye height.
-    let ahead = view_projection * glam::Vec4::new(0.0, camera.eye().y as f32, 10.0, 1.0);
+    let ahead = view_projection * glam::Vec4::new(0.0, camera.eye().y, 10.0, 1.0);
     let ndc = ahead.truncate() / ahead.w;
     assert!(ndc.x.abs() < 1e-4 && ndc.y.abs() < 1e-4, "centre of view: {ndc:?}");
     assert!(ndc.z > 0.0 && ndc.z < 1.0, "inside the depth range: {ndc:?}");
 
-    // Just beyond the near plane: depth is almost zero.
+    // Just beyond the near plane: depth is almost zero. The sample sits 0.0001
+    // blocks past the plane (0.001 maps to depth 0.0196, above the bar below).
     let near_point = view_projection
-        * glam::Vec4::new(0.0, camera.eye().y as f32, (NEAR_PLANE as f64 + 0.001) as f32, 1.0);
+        * glam::Vec4::new(0.0, camera.eye().y, (NEAR_PLANE as f64 + 0.0001) as f32, 1.0);
     let near_ndc = near_point.truncate() / near_point.w;
     assert!(near_ndc.z < 0.01, "near maps to zero: {near_ndc:?}");
 }
@@ -2194,12 +2195,14 @@ fn a_point_behind_the_camera_has_negative_w() {
         far_chunks: 8.0,
     };
     let behind = camera.view_projection(1.0)
-        * glam::Vec4::new(0.0, camera.eye().y as f32, -5.0, 1.0);
+        * glam::Vec4::new(0.0, camera.eye().y, -5.0, 1.0);
     assert!(behind.w < 0.0, "behind the camera clips: {behind:?}");
 }
 ```
 
 Add `glam` to `[dev-dependencies]` of `oxide-render`? No: `glam` is a normal dependency, so the test target already sees it.
+
+(Note added 2026-09-26: the resolved `glam` is 0.32.1 — the newest release where `Mat4::perspective_rh` and `Mat4::look_to_rh` are current. From 0.33 these are deprecated in favour of `glam::camera`, which `-D warnings` would reject; do not bump without changing the call sites. The plan's `camera.eye().y as f32` casts are identity casts and fail `clippy::unnecessary_cast`, so the committed tests drop them.)
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
