@@ -50,7 +50,7 @@
 
 1. **NBT codec deferred (Decision 1).** Confirmed as not needed for M1?
 2. **`0x26` verification path (Decision 2).** If the live capture shows the vanilla server never emits `0x26` on this rig, the codec's verification rests on a constructed fixture plus the capture's negative evidence. Acceptable?
-3. **Exercise compression live.** The vanilla server skips Set Compression for loopback connections (`NetworkManager.isLocalChannel()`); the plan therefore captures and runs acceptance twice — once with a loopback upstream (uncompressed) and once with the proxy's upstream bound to the machine's LAN address (compressed, threshold 256). Confirm this is the agreed way to see the compressed path on the rig.
+3. **Exercise compression live.** The vanilla server skips Set Compression for loopback connections (`NetworkManager.isLocalChannel()`); the plan therefore captures and runs acceptance twice — once with a loopback upstream (uncompressed) and once with the proxy's upstream bound to the machine's LAN address (compressed, threshold 256). Confirm this is the agreed way to see the compressed path on the rig. *(Corrected 2026-09-26: the capture refuted the loopback premise — this rig negotiates Set Compression, threshold 256, on both paths; see `docs/research/protocol-47-live-capture.md` section 2.)*
 4. **Embedded debug font (Decision 7).** Confirm the M1 overlay may use the throwaway 5×7 font rather than the jar font.
 5. **Committed capture fixture (Decision 12).** Confirm one ~50–120 KB captured column payload may be committed under `crates/oxide-proto-v47/tests/fixtures/`.
 6. **New dependencies (Decision 10 and the Tech Stack line).** Confirm `glam` and `crossbeam-channel` as the only additions, with no `bytemuck`.
@@ -62,7 +62,7 @@
 | --- | --- | --- |
 | 1 | NBT codec in M1 | Out of M1. Protocol 47 chunk data carries no block-entity NBT; the `simdnbt` decision moves to the milestone that first reads NBT |
 | 2 | `0x26` verification standard | Implement and fixture-test both codecs; the live capture decides what the rig server emits, and a negative result is recorded as evidence |
-| 3 | Compression's live evidence | Accepted as proposed: capture and acceptance run once with a loopback upstream (uncompressed) and once with the proxy's upstream over the LAN address (compressed, threshold 256) |
+| 3 | Compression's live evidence | Accepted as proposed: capture and acceptance run once with a loopback upstream (uncompressed) and once with the proxy's upstream over the LAN address (compressed, threshold 256). *Correction 2026-09-26: the loopback run did not stay uncompressed — the rig negotiates threshold 256 on both paths; the findings document records the observation.* |
 | 4 | Debug overlay font | Accepted: embedded 5×7 bitmap font for M1 |
 | 5 | Committed capture fixture | Yes: one or two captured columns plus a provenance manifest |
 | 6 | New dependencies | Confirmed: `glam` and `crossbeam-channel` only, no `bytemuck` |
@@ -681,7 +681,7 @@ cd /home/lucy/Desktop/Software/Projects/Oxidecraft/refs/rig/server
 ./stop.sh 2>/dev/null; ./start.sh
 ```
 
-Run A (loopback upstream; expect no Set Compression, because the server sees a loopback peer):
+Run A (loopback upstream; this rig negotiates Set Compression on this path too — threshold 256, see the correction on open question 3 and the findings document):
 
 ```bash
 cd /home/lucy/Desktop/Software/Projects/Oxidecraft
