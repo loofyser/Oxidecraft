@@ -178,10 +178,8 @@ mask `0x001f` (five sections), sky light true, ground-up true. Its block-id coun
 (id: count; they sum to 20 480 = 5 × 4 096):
 
 ```
-0:8327  1:9919  2:139  3:792  7:785  8:2  9:47  11:89  12:17  13:2  14:11  15:95
-16:149  21:5  31:14  56:3  73:12  169:2  204:1  208:1  221:3  238:3  240:1  255:5
-2560:1  2992:2  3003:1  3258:3  3264:1  3276:3  3328:2  3520:2  3531:2  3549:6
-3566:2  3584:2  3804:1  3822:10  3840:3  4095:15
+0:4085  1:13826  2:235  3:855  7:785  9:47  11:87  12:16  13:106  14:10  15:109
+16:214  21:5  31:85  56:3  73:12
 ```
 
 **`column-4_15.bin` — a bulk payload from run B**, four chunks east and four south of the spawn chunk. SHA-1
@@ -189,10 +187,8 @@ mask `0x001f` (five sections), sky light true, ground-up true. Its block-id coun
 light true, ground-up true. Its block-id counts (they sum to 28 672 = 7 × 4 096):
 
 ```
-0:13254  1:12972  2:162  3:1001  5:2  6:2  7:754  13:129  14:5  15:53  16:139
-18:8  21:10  31:39  56:10  73:31  86:2  103:2  161:13  162:7  175:5
-1092:2  1365:4  1383:2  1638:6  1911:6  3328:1  3584:3  3822:1  3824:1  3839:1
-3840:9  4080:8  4095:28
+0:6997  1:18521  2:254  3:1084  7:754  13:367  14:5  15:84  16:229  18:8
+21:10  31:125  56:10  73:31  161:163  162:18  175:12
 ```
 
 Both files were checked against the world saved by the server. Every block slot, block-light
@@ -202,9 +198,8 @@ its region file except for the two tall-grass halves noted in section 3 — it i
 world as it stood on 23 September. The same chunk in both captures carries identical bytes for
 `column-4_15.bin`, so it doubles as a cross-session check.
 
-The counts include block identifiers well above the ordinary vanilla range (4095, 3840, 3822 and
-others around them): the world itself contains them and the server passed them through unchanged,
-so the reader must take the full 12-bit identifier field rather than assuming an eight-bit id.
+The identifiers are all vanilla ones — the spawn column tops out at 73, the (4, 15) payload at
+175 — so neither file goes beyond the eight-bit range.
 The counts also match the settlement: solid stone and air dominate, bedrock fills the bottom layer
 and its ragged top (five layers in this world), and the terrain stock (grass, dirt, water, ores,
 trees) is present in plausible amounts.
