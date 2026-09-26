@@ -2779,7 +2779,8 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
     assert_eq!(settings[0], 0x15);
     let brand = oxide_proto::frame::read_frame(&mut cursor, Compression::Enabled { threshold: 256 }).unwrap();
     assert_eq!(&brand[..2], b"\x17\x08");
-    assert_eq!(&brand[2..], b"MC|Brandvanilla");
+    // The payload is a length-prefixed string, exactly as the capture records it (07 "vanilla").
+    assert_eq!(&brand[2..], b"MC|Brand\x07vanilla");
     let echo = oxide_proto::frame::read_frame(&mut cursor, Compression::Enabled { threshold: 256 }).unwrap();
     assert_eq!(echo[0], 0x06);
     let keep_alive = oxide_proto::frame::read_frame(&mut cursor, Compression::Enabled { threshold: 256 }).unwrap();
@@ -3278,7 +3279,7 @@ Capture twice: once from the teleport point looking down at the mark and the gro
 
 - [ ] **Step 5: Capture our client's own traffic through the proxy**
 
-Run the client once more with `record_proxy.py` in front of the server (the same two-run setup as Task 2) and confirm from the analysis: handshake with protocol 47 and next-state 2, Login Start, Client Settings with the agreed values, `MC|Brand` = `vanilla`, the position echo, and keepalive replies over the whole run. Save the capture and the analyser's report under `refs/rig/evidence/m1/`.
+Run the client once more with `record_proxy.py` in front of the server (the same two-run setup as Task 2) and confirm from the analysis: handshake with protocol 47 and next-state 2, Login Start, Client Settings with the agreed values, `MC|Brand` carrying the length-prefixed `vanilla` brand string (the capture records `07 76 61 6e 69 6c 6c 61`), the position echo, and keepalive replies over the whole run. Save the capture and the analyser's report under `refs/rig/evidence/m1/`.
 
 - [ ] **Step 6: Write the acceptance note**
 
