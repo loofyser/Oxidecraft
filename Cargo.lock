@@ -1584,6 +1584,8 @@ dependencies = [
 name = "oxide-world"
 version = "0.0.0"
 dependencies = [
+ "oxide-proto",
+ "oxide-proto-v47",
  "thiserror 2.0.20",
 ]
 
