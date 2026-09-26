@@ -66,10 +66,9 @@ pub enum LoginPacket {
     },
 }
 
-/// Decodes a login-state packet whose id has already been read.
+/// Decodes a login-state packet, reading the packet id itself; pass the payload with the id in place.
 pub fn decode_login(body: &[u8]) -> Result<LoginPacket, PacketError> {
-    // The id is consumed by `read_packet_id` before this is called; the tests
-    // call `decode_login` with the id still in place, so strip it here.
+    // The id is read here, so callers pass the payload with the id still in place.
     let (id, body) = read_packet_id(body)?;
     let mut cursor = Cursor::new(body);
     let packet = match id {
@@ -115,7 +114,7 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: i32) -> Result<Vec<u8>, PacketErr
     }
     let len = len as usize;
     let start = cursor.position() as usize;
-    let end = start + len;
+    let end = start.saturating_add(len);
     let bytes = body_slice(cursor, start, end)?.to_vec();
     // The cursor must sit after the array, so the trailing check sees it consumed.
     cursor.set_position(end as u64);

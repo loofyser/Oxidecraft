@@ -1,5 +1,9 @@
 //! Golden-byte tests for the login-state packets, including the hostile paths.
 
+use std::io::ErrorKind;
+
+use oxide_proto::codec::CodecError;
+use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{LoginPacket, decode_login};
 use oxide_proto_v47::serverbound::{LOGIN_START_ID, write_login_start};
 
@@ -16,6 +20,7 @@ fn set_compression_carries_the_threshold_as_a_varint() {
     // 256 encodes as 0x80 0x02.
     let mut payload = vec![0x03];
     oxide_proto::varint::write_varint(&mut payload, 256).expect("write");
+    assert_eq!(&payload[1..], &[0x80, 0x02]);
     match decode_login(&payload).expect("decode") {
         LoginPacket::SetCompression { threshold } => assert_eq!(threshold, 256),
         other => panic!("expected Set Compression, got {other:?}"),
@@ -84,4 +89,56 @@ fn trailing_bytes_are_refused() {
     oxide_proto::varint::write_varint(&mut payload, 100).expect("write");
     payload.push(0x00);
     assert!(decode_login(&payload).is_err());
+}
+
+#[test]
+fn a_negative_byte_array_length_is_refused() {
+    // The encryption request's key length, encoded as -1.
+    let payload = [0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f];
+    match decode_login(&payload) {
+        Err(PacketError::Codec(CodecError::NegativeLength(len))) => assert_eq!(len, -1),
+        other => panic!("expected a negative-length refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unknown_login_packet_id_is_refused() {
+    // 0x24 is the UUID length byte, never a login-state id.
+    match decode_login(&[0x24]) {
+        Err(PacketError::Codec(CodecError::Io(error))) => {
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "unknown login packet id 0x24");
+        }
+        other => panic!("expected an unknown-id refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_oversized_username_is_refused_by_its_cap() {
+    // A valid UUID, then a 17-byte name where 16 is the cap.
+    let uuid = "069a79f4-44e9-4726-a5be-fca90e38aaf5";
+    let username = "x".repeat(17);
+    let mut payload = vec![0x02, uuid.len() as u8];
+    payload.extend_from_slice(uuid.as_bytes());
+    payload.push(username.len() as u8);
+    payload.extend_from_slice(username.as_bytes());
+    match decode_login(&payload) {
+        Err(PacketError::Codec(CodecError::TooLong { len, max })) => {
+            assert_eq!(len, 17);
+            assert_eq!(max, 16);
+        }
+        other => panic!("expected an oversized-string refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_packet_id_truncated_mid_varint_is_refused() {
+    // A continuation bit with nothing after it.
+    match decode_login(&[0x80]) {
+        Err(PacketError::Codec(CodecError::Io(error))) => {
+            assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+            assert_eq!(error.to_string(), "the payload ended inside the packet id");
+        }
+        other => panic!("expected a truncated-id refusal, got {other:?}"),
+    }
 }

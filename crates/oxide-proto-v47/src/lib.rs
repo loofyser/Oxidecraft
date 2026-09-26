@@ -14,6 +14,10 @@ pub const PROTOCOL: i32 = 47;
 pub const NEXT_STATE_LOGIN: i32 = 2;
 
 /// Errors from decoding a packet payload.
+///
+/// The `From<VarIntError>` conversion for a malformed VarInt sits in
+/// [`clientbound`], beside the packet-id reader; it folds the failure into
+/// [`Self::Codec`].
 #[derive(Debug, thiserror::Error)]
 pub enum PacketError {
     /// A field was malformed or the payload ended early.
