@@ -130,7 +130,7 @@ The load is not instantaneous and not complete at the moment the player stops mo
 square around the spawn chunk is 21 × 21 = 441 columns; run A delivered 414 of them, run B 416.
 The absent columns are consistently the outer ring's tail — eleven or so along the west edge
 (x = −10), a few cells on the north and south edges. All 441 columns exist in the saved world, so
-nothing was cut off at the source. The second session delivered exactly the two columns the first
+nothing was cut off at the source. The second session delivered two of the 27 columns the first
 session had still been missing, as lone Chunk Data packets, which shows the tail arriving one
 column at a time well into a session. A client must therefore render a world that fills in
 progressively and must not wait for a fixed column count before showing anything.
@@ -184,7 +184,7 @@ mask `0x001f` (five sections), sky light true, ground-up true. Its block-id coun
 3566:2  3584:2  3804:1  3822:10  3840:3  4095:15
 ```
 
-**`column-4_15.bin` — a bulk payload from run B**, five chunks east of spawn. SHA-1
+**`column-4_15.bin` — a bulk payload from run B**, four chunks east and four south of the spawn chunk. SHA-1
 `c024c2f7a91fa5aa0c426e97bad3a3e880a591fa`, 86 272 bytes, mask `0x007f` (seven sections), sky
 light true, ground-up true. Its block-id counts (they sum to 28 672 = 7 × 4 096):
 
@@ -205,8 +205,9 @@ world as it stood on 23 September. The same chunk in both captures carries ident
 The counts include block identifiers well above the ordinary vanilla range (4095, 3840, 3822 and
 others around them): the world itself contains them and the server passed them through unchanged,
 so the reader must take the full 12-bit identifier field rather than assuming an eight-bit id.
-The counts also match the settlement: solid stone and air dominate, bedrock occupies exactly one
-layer, and the terrain stock (grass, dirt, water, ores, trees) is present in plausible amounts.
+The counts also match the settlement: solid stone and air dominate, bedrock fills the bottom layer
+and its ragged top (five layers in this world), and the terrain stock (grass, dirt, water, ores,
+trees) is present in plausible amounts.
 
 `manifest.json` in the same directory records both columns with their masks, sizes, SHA-1s and
 counts, together with the capture's summary numbers. Its `packets` counts are run A's
