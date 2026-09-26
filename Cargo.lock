@@ -749,6 +749,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1574,6 +1580,7 @@ dependencies = [
 name = "oxide-render"
 version = "0.0.0"
 dependencies = [
+ "glam",
  "thiserror 2.0.20",
  "tracing",
  "wgpu",

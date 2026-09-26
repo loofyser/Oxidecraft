@@ -11,6 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+glam = "0.32"
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
