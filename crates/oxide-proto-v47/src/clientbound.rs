@@ -144,3 +144,264 @@ fn check_no_trailing(cursor: &Cursor<&[u8]>, len: usize) -> Result<(), PacketErr
     }
     Ok(())
 }
+
+/// Clientbound Keep Alive (play id 0x00).
+pub const PLAY_KEEP_ALIVE_ID: i32 = 0x00;
+
+/// A keepalive the client must echo back with the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepAlive {
+    /// The id to echo.
+    pub id: i32,
+}
+
+impl KeepAlive {
+    /// The packet id.
+    pub const ID: i32 = PLAY_KEEP_ALIVE_ID;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let id = read_varint(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { id })
+    }
+}
+
+/// Clientbound Join Game (play id 0x01).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinGame {
+    /// The player's entity id.
+    pub entity_id: i32,
+    /// Gamemode; the 0x08 bit means hardcore.
+    pub gamemode: u8,
+    /// Dimension: -1 nether, 0 overworld, 1 end.
+    pub dimension: i8,
+    /// Difficulty.
+    pub difficulty: u8,
+    /// Maximum player count the server advertises.
+    pub max_players: u8,
+    /// Level type, for example `default`.
+    pub level_type: String,
+    /// Whether the server asks for reduced debug info.
+    pub reduced_debug_info: bool,
+}
+
+impl JoinGame {
+    /// The packet id.
+    pub const ID: i32 = 0x01;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let entity_id = codec::read_i32(&mut cursor)?;
+        let gamemode = codec::read_u8(&mut cursor)?;
+        let dimension = codec::read_u8(&mut cursor)? as i8;
+        let difficulty = codec::read_u8(&mut cursor)?;
+        let max_players = codec::read_u8(&mut cursor)?;
+        let level_type = codec::read_string(&mut cursor, 16)?;
+        let reduced_debug_info = codec::read_bool(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            entity_id,
+            gamemode,
+            dimension,
+            difficulty,
+            max_players,
+            level_type,
+            reduced_debug_info,
+        })
+    }
+}
+
+/// Clientbound Player Position And Look (play id 0x08).
+///
+/// A set flag bit means that value is a delta to apply to the current position;
+/// [`Self::ABSOLUTE`] means every value is absolute.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerPositionAndLook {
+    /// X, absolute unless [`Self::FLAG_X`] is set.
+    pub x: f64,
+    /// Y, absolute unless [`Self::FLAG_Y`] is set.
+    pub y: f64,
+    /// Z, absolute unless [`Self::FLAG_Z`] is set.
+    pub z: f64,
+    /// Yaw, absolute unless [`Self::FLAG_YAW`] is set.
+    pub yaw: f32,
+    /// Pitch, absolute unless [`Self::FLAG_PITCH`] is set.
+    pub pitch: f32,
+    /// The relative-axis flags.
+    pub flags: u8,
+}
+
+impl PlayerPositionAndLook {
+    /// The packet id.
+    pub const ID: i32 = 0x08;
+    /// Every axis is absolute.
+    pub const ABSOLUTE: u8 = 0x00;
+    /// X is a relative delta.
+    pub const FLAG_X: u8 = 0x01;
+    /// Y is a relative delta.
+    pub const FLAG_Y: u8 = 0x02;
+    /// Z is a relative delta.
+    pub const FLAG_Z: u8 = 0x04;
+    /// Yaw is a relative delta.
+    pub const FLAG_YAW: u8 = 0x08;
+    /// Pitch is a relative delta.
+    pub const FLAG_PITCH: u8 = 0x10;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let x = codec::read_f64(&mut cursor)?;
+        let y = codec::read_f64(&mut cursor)?;
+        let z = codec::read_f64(&mut cursor)?;
+        let yaw = codec::read_f32(&mut cursor)?;
+        let pitch = codec::read_f32(&mut cursor)?;
+        let flags = codec::read_u8(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+            flags,
+        })
+    }
+}
+
+/// Clientbound Plugin Message (play id 0x3F).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginMessage {
+    /// The channel name, for example `MC|Brand`.
+    pub channel: String,
+    /// The payload after the channel: the rest of the body, byte for byte.
+    pub data: Vec<u8>,
+}
+
+impl PluginMessage {
+    /// The packet id.
+    pub const ID: i32 = 0x3F;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let channel = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+        // The payload is whatever remains after the channel: unlike every other
+        // field it carries no length of its own, so it runs to the end of the
+        // body and the trailing check below has nothing left to refuse.
+        let start = cursor.position() as usize;
+        let data = body_slice(&cursor, start, body.len())?.to_vec();
+        cursor.set_position(body.len() as u64);
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { channel, data })
+    }
+}
+
+/// Clientbound Disconnect (play id 0x40).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayDisconnect {
+    /// The kick reason as chat JSON.
+    pub reason: String,
+}
+
+impl PlayDisconnect {
+    /// The packet id.
+    pub const ID: i32 = 0x40;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let reason = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { reason })
+    }
+}
+
+/// One entry of a Player List Item add block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerListEntry {
+    /// The player's UUID.
+    pub uuid: [u8; 16],
+    /// The name, present for the add action.
+    pub name: Option<String>,
+    /// The gamemode, present for the add action.
+    pub gamemode: Option<i32>,
+    /// The ping, present for the add action.
+    pub ping: Option<i32>,
+    /// The display name, when the entry carries one.
+    pub display_name: Option<String>,
+}
+
+/// Clientbound Player List Item (play id 0x38), add action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerListItem {
+    /// The entries in this packet.
+    pub entries: Vec<PlayerListEntry>,
+}
+
+impl PlayerListItem {
+    /// The packet id.
+    pub const ID: i32 = 0x38;
+    /// The add action.
+    pub const ACTION_ADD: i32 = 0;
+
+    /// Decodes an add-action packet. Any other action is refused: M1 has no use
+    /// for them, and a silent partial read would desynchronise the stream.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let action = read_varint(&mut cursor)?;
+        if action != Self::ACTION_ADD {
+            return Err(PacketError::Codec(codec::CodecError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unsupported Player List Item action {action}"),
+                ),
+            )));
+        }
+        let count = read_varint(&mut cursor)?;
+        if count < 0 {
+            return Err(PacketError::Codec(codec::CodecError::NegativeLength(count)));
+        }
+        // The count comes off the wire and is hostile until checked: bound the
+        // reservation by the bytes the body can still hold, so a huge declared
+        // count cannot size an allocation before the reads below run out of
+        // payload.
+        let remaining = body.len().saturating_sub(cursor.position() as usize);
+        let mut entries = Vec::with_capacity((count as usize).min(remaining));
+        for _ in 0..count {
+            let uuid = codec::read_uuid(&mut cursor)?;
+            let name = codec::read_string(&mut cursor, 16)?;
+            let properties = read_varint(&mut cursor)?;
+            // The properties count is an Int-safe VarInt: a negative value
+            // cannot be a real list, so it is clamped to zero rather than
+            // trusted.
+            for _ in 0..properties.max(0) {
+                let _name = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                let _value = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                let is_signed = codec::read_bool(&mut cursor)?;
+                if is_signed {
+                    let _signature = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                }
+            }
+            let gamemode = read_varint(&mut cursor)?;
+            let ping = read_varint(&mut cursor)?;
+            let has_display_name = codec::read_bool(&mut cursor)?;
+            let display_name = if has_display_name {
+                Some(codec::read_string(&mut cursor, MAX_STRING_BYTES)?)
+            } else {
+                None
+            };
+            entries.push(PlayerListEntry {
+                uuid,
+                name: Some(name),
+                gamemode: Some(gamemode),
+                ping: Some(ping),
+                display_name,
+            });
+        }
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { entries })
+    }
+}
