@@ -983,7 +983,7 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: i32) -> Result<Vec<u8>, PacketErr
     }
     let len = len as usize;
     let start = cursor.position() as usize;
-    let end = start + len;
+    let end = start.saturating_add(len);
     let bytes = body_slice(cursor, start, end)?.to_vec();
     // The cursor must sit after the array, so the trailing check sees it consumed.
     cursor.set_position(end as u64);
@@ -1730,11 +1730,12 @@ impl ChunkData {
         }
         let size = size as usize;
         let start = cursor.position() as usize;
-        let data = body.get(start..start + size).ok_or(PacketError::BadColumnSize {
+        let end = start.saturating_add(size);
+        let data = body.get(start..end).ok_or(PacketError::BadColumnSize {
             got: body.len().saturating_sub(start),
             expected: size,
         })?;
-        cursor.set_position((start + size) as u64);
+        cursor.set_position(end as u64);
         check_no_trailing(&cursor, body.len())?;
         let column = if ground_up && mask == 0 {
             ColumnData::empty()
