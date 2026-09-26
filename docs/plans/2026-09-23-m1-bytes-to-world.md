@@ -1075,7 +1075,7 @@ Field layouts come from `docs/research/protocol-47-reference.md` §2.1 (clientbo
 
 - [ ] **Step 1: Write the failing play-packet tests**
 
-`crates/oxide-proto-v47/tests/play_packets.rs` — include at least these assertions, in this style:
+`crates/oxide-proto-v47/tests/play_packets.rs` — include at least these assertions, in this style (note added 2026-09-26: the single-arm `match` blocks below trip `clippy::match_single_binding` under the project's `-D warnings` gate; use `let` destructuring with the same assertion literals, as the committed tests do):
 
 ```rust
 //! Golden-byte tests for the play-state packets M1 needs.
@@ -1499,7 +1499,7 @@ git commit -m "feat: add the play-state packets for the connection obligations (
 - Test: `crates/oxide-proto-v47/tests/column_capture.rs` (the committed fixture)
 
 **Interfaces:**
-- Produces: `oxide_proto_v47::column::{ColumnData, SectionData, block_index, column_size, unpack_nibble, unpack_block}` and `clientbound::{ChunkData, MapChunkBulk, BulkColumn}`.
+- Produces: `oxide_proto_v47::column::{ColumnData, SectionData, parse_column, block_index, column_size, unpack_nibble, unpack_block}` and `clientbound::{ChunkData, MapChunkBulk, BulkColumn}`.
 
 ```rust
 /// One section of a column, exactly as the wire delivers it.
@@ -2825,7 +2825,7 @@ Expected: FAIL, unresolved imports.
 
 - `run_over` first writes the handshake (`write_handshake(PROTOCOL, host, port, NEXT_STATE_LOGIN)`) and Login Start, then loops `conn.recv()`:
   - Login phase: `clientbound::decode_login(&payload)`; `SetCompression` → `set_compression(Compression::from_server_threshold(threshold))` and log the threshold; `LoginSuccess` → emit `LoggedIn`, switch to play; `Disconnect` → emit `Disconnected` and return `Ok(())`; `EncryptionRequest` → return `Err(SessionError::EncryptionRequired)`; anything else → warn and skip.
-  - Play phase: dispatch on the id read with `read_packet_id`, then decode and handle: `0x00` keepalive (echo, emit), `0x01` join game (store, build the `World` with `has_sky = dimension == 0`, send Client Settings and `MC|Brand`, emit `Joined`), `0x08` position (apply relative flags against the current position, send the echo with the same absolute values, emit), `0x21` chunk data (apply; on the unload shape unload and emit `ChunkUnloaded`; otherwise rebuild the meshes of the column *and its four neighbours*, emitting `ChunkUpdated` for each), `0x26` bulk (same per column), `0x38` player list (store names; nothing is emitted in M1), `0x3f` plugin message (log at debug), `0x40` play disconnect (emit and return `Ok(())`), `0x46` (warn, ignore), anything else (log at debug, skip).
+  - Play phase: dispatch on the id read with `read_packet_id`, then decode and handle: `0x00` keepalive (echo, emit), `0x01` join game (store, build the `World` with `has_sky = dimension == 0`, send Client Settings and `MC|Brand`, emit `Joined`), `0x08` position (apply relative flags against the current position, send the echo with the same absolute values, emit), `0x21` chunk data (apply; on the unload shape unload and emit `ChunkUnloaded`; otherwise rebuild the meshes of the column *and its four neighbours*, emitting `ChunkUpdated` for each), `0x26` bulk (same per column), `0x38` player list (store names; nothing is emitted in M1 — a Player List Item whose action is not add is refused by the decoder and must be ignored, not treated as corruption: live servers send latency, gamemode and display-name updates routinely), `0x3f` plugin message (log at debug), `0x40` play disconnect (emit and return `Ok(())`), `0x46` (warn, ignore), anything else (log at debug, skip).
   - End of stream (`FrameError` carrying `UnexpectedEof`) → log and return `Ok(())`.
 - The position the session tracks is updated by `0x08` and used for the relative flags; there is no movement in M1, so it is also the camera.
 - Every reply is written with `conn.send`, so compression is applied automatically once enabled.
