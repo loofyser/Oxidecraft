@@ -20,6 +20,7 @@ fn config() -> SessionConfig {
         port: 25565,
         username: "OxideDev".into(),
         settings: ClientSettings::default(),
+        mesh: None,
     }
 }
 

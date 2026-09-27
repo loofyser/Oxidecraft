@@ -46,10 +46,14 @@ const BURIED: [u8; 3] = [255, 0, 0];
 const TEXT: [u8; 3] = [255, 255, 255];
 /// The overlay shadow colour as 8-bit unorm bytes: 0.05 of 255, rounded.
 const SHADOW: [u8; 3] = [13, 13, 13];
-/// The stone colour the block's vertices carry, as `oxide-game`'s palette gives it.
+/// The stone colour the block's vertices carry: a stand-in for the atlas's texel colour,
+/// which tasks 10 and 11 sample.
 const STONE_COLOUR: [f32; 3] = [0.5, 0.5, 0.5];
-/// The buried face's colour, which is no palette entry at all.
+/// The buried face's colour, which is no real texture's at all.
 const BURIED_COLOUR: [f32; 3] = [1.0, 0.0, 0.0];
+/// The packed light of a full-sky corner, both channels: level 15 shifted four bits with the
+/// sampler's eight added.
+const FULL_SKY: u16 = 248;
 
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
@@ -273,8 +277,8 @@ fn with_overlay_pass(
 /// The six faces are the mesher's: wound counter-clockwise seen from outside, each coloured
 /// stone grey times the face's brightness. This test cannot use the mesher itself — the crate
 /// graph gives `oxide-render` no edge to `oxide-game` — so the corner table and the brightness
-/// values mirror `crates/oxide-game/src/mesher.rs` and `crates/oxide-game/src/palette.rs`;
-/// the mesher's own tests pin the original table.
+/// values mirror the mesher's winding and the source's face shade table; both have their own
+/// tests in `oxide-game`.
 ///
 /// The buried face sits half a block up inside the block, facing the camera, wound the same
 /// way, and is indexed after the block's faces. Nothing else can see it while the depth test
@@ -360,13 +364,15 @@ fn stone_block_mesh() -> ChunkMesh {
 fn push_face(mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], brightness: f32, colour: [f32; 3]) {
     let base = mesh.vertices.len() as u32;
     for position in corners {
+        let shade = |channel: usize| (colour[channel] * brightness * 255.0).round() as u8;
         mesh.vertices.push(Vertex {
             position,
-            color: [
-                colour[0] * brightness,
-                colour[1] * brightness,
-                colour[2] * brightness,
-            ],
+            // The shader reads neither the uv nor the light yet (tasks 10 and 11 do): the
+            // corners carry the face's own uv corner order zeroed out and a full-sky packed
+            // light sample.
+            uv: [0.0; 2],
+            light: [FULL_SKY; 2],
+            colour: [shade(0), shade(1), shade(2), 255],
         });
     }
     mesh.indices

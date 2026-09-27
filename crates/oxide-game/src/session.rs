@@ -18,9 +18,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
+use oxide_assets::atlas::Atlas;
 use oxide_proto::conn::{Conn, DeadlineStream, RecvOutcome};
 use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
@@ -36,10 +38,13 @@ use oxide_proto_v47::serverbound::{
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
+use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::world::World;
 use tracing::{debug, info, warn};
 
-use crate::mesher::build_column_meshes;
+use crate::mesher::{
+    BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
+};
 
 /// The plugin channel a vanilla client announces itself on.
 const BRAND_CHANNEL: &str = "MC|Brand";
@@ -76,6 +81,72 @@ pub struct SessionConfig {
     pub username: String,
     /// The settings sent in Client Settings.
     pub settings: ClientSettings,
+    /// The assets the column meshes are built from.
+    ///
+    /// `None` — and a session whose client has no store — meshes every block as
+    /// the atlas's fallback sprite; the session says so once, and the replay
+    /// tests pass `None`.
+    pub mesh: Option<Arc<MeshAssets>>,
+}
+
+/// The assets a session meshes with: the model join, the atlas and the colour
+/// maps.
+///
+/// The client loads these once from the extraction tree; the session only reads
+/// them.
+#[derive(Debug)]
+pub struct MeshAssets {
+    /// The block states' baked models.
+    pub models: BlockModelSet,
+    /// The stitched atlas.
+    pub atlas: Atlas,
+    /// The colour maps the biome tints read.
+    pub tint_maps: TintMaps,
+}
+
+impl MeshAssets {
+    /// The asset-less stand-in: no models, the atlas's own fallback sprite, and
+    /// neutral white colour maps.
+    ///
+    /// Every block draws the fallback sprite, which is what a store-less run
+    /// gets. [`Session::new`] logs it once.
+    pub fn fallback() -> MeshAssets {
+        /// A 256 x 256 RGBA colour map of one value.
+        fn neutral() -> ColorMap {
+            ColorMap::from_rgba(&[255u8; 256 * 256 * 4])
+                .expect("an all-white 256x256 map is a valid colour map")
+        }
+        MeshAssets {
+            models: BlockModelSet::empty(),
+            atlas: Atlas::fallback(),
+            tint_maps: TintMaps {
+                grass: neutral(),
+                foliage: neutral(),
+            },
+        }
+    }
+}
+
+/// The graphics settings the session meshes with until the client owns them.
+///
+/// M2 renders Fast graphics only — the plan's first known limit — so the leaf
+/// rule Task 9 adds reads `true` here.
+const GRAPHICS_FAST: bool = true;
+
+/// The smooth-lighting setting: `GameSettings.ambientOcclusion`'s own default,
+/// 2 (`client/settings/GameSettings.java:78`).
+const SMOOTH_LIGHTING: SmoothLighting = SmoothLighting::Maximum;
+
+/// The context a column build reads: the session's assets and the settings
+/// above.
+fn mesh_context(assets: &MeshAssets) -> MeshContext<'_> {
+    MeshContext {
+        models: &assets.models,
+        atlas: &assets.atlas,
+        tint_maps: &assets.tint_maps,
+        graphics_fast: GRAPHICS_FAST,
+        smooth_lighting: SMOOTH_LIGHTING,
+    }
 }
 
 /// Everything the session reports to the window.
@@ -168,6 +239,8 @@ pub struct Session<S> {
     conn: Conn<S>,
     /// What the session connects with and sends.
     config: SessionConfig,
+    /// The assets the meshes are built from, resolved once.
+    mesh: Arc<MeshAssets>,
 }
 
 impl Session<TcpStream> {
@@ -180,8 +253,19 @@ impl Session<TcpStream> {
 
 impl<S: Read + Write + DeadlineStream> Session<S> {
     /// Wraps an existing connection.
+    ///
+    /// A config with no assets gets the fallback ones, and this logs once that
+    /// every block will draw the fallback sprite: the mesher never logs per
+    /// block.
     pub fn new(conn: Conn<S>, config: SessionConfig) -> Self {
-        Self { conn, config }
+        let mesh = match &config.mesh {
+            Some(assets) => Arc::clone(assets),
+            None => {
+                info!("no mesh assets: every block draws the atlas's fallback sprite");
+                Arc::new(MeshAssets::fallback())
+            }
+        };
+        Self { conn, config, mesh }
     }
 
     /// Runs the session to completion: handshake, login, then the play loop.
@@ -194,7 +278,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
     /// meshes never delay a read, which is what keeps the keepalive echo — and
     /// the teleport echo — answerable while a burst of columns is arriving.
     pub fn run_over(self, events: &Sender<ClientEvent>) -> Result<(), SessionError> {
-        let Session { mut conn, config } = self;
+        let Session {
+            mut conn,
+            config,
+            mesh,
+        } = self;
 
         // Nothing has touched the framing yet: the handshake and Login Start go
         // out plain, and the server answers by naming a compression threshold.
@@ -221,7 +309,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             let payload = match conn.recv_or_idle(MESH_TICK) {
                 Ok(RecvOutcome::Frame(payload)) => payload,
                 Ok(RecvOutcome::Idle) => {
-                    mesh_one(world.as_ref(), &mut pending, events);
+                    mesh_one(world.as_ref(), &mut pending, &mesh, events);
                     continue;
                 }
                 Err(error) if is_stream_end(&error) => {
@@ -365,7 +453,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 }
                 PlayDisconnect::ID => {
                     let disconnect = decoded(id, PlayDisconnect::decode(body))?;
-                    flush_pending(world.as_ref(), &mut pending, events);
+                    flush_pending(world.as_ref(), &mut pending, &mesh, events);
                     report(
                         events,
                         ClientEvent::Disconnected {
@@ -385,7 +473,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 }
             }
         }
-        flush_pending(world.as_ref(), &mut pending, events);
+        flush_pending(world.as_ref(), &mut pending, &mesh, events);
         Ok(())
     }
 }
@@ -603,10 +691,10 @@ fn report(events: &Sender<ClientEvent>, event: ClientEvent) {
 /// every section, `None` for one that draws nothing, which is how the window
 /// learns to drop a mesh it still holds; a neighbour that is not loaded reports
 /// sixteen empty sections to the same end.
-fn remesh(world: &World, cx: i32, cz: i32, events: &Sender<ClientEvent>) {
-    report_chunk(world, cx, cz, events);
+fn remesh(world: &World, cx: i32, cz: i32, assets: &MeshAssets, events: &Sender<ClientEvent>) {
+    report_chunk(world, cx, cz, assets, events);
     for (nx, nz) in [(cx + 1, cz), (cx - 1, cz), (cx, cz + 1), (cx, cz - 1)] {
-        report_chunk(world, nx, nz, events);
+        report_chunk(world, nx, nz, assets, events);
     }
 }
 
@@ -618,10 +706,11 @@ fn remesh(world: &World, cx: i32, cz: i32, events: &Sender<ClientEvent>) {
 fn mesh_one(
     world: Option<&World>,
     pending: &mut VecDeque<(i32, i32)>,
+    assets: &MeshAssets,
     events: &Sender<ClientEvent>,
 ) {
     if let (Some(world), Some((cx, cz))) = (world, pending.pop_front()) {
-        remesh(world, cx, cz, events);
+        remesh(world, cx, cz, assets, events);
     }
 }
 
@@ -632,24 +721,37 @@ fn mesh_one(
 fn flush_pending(
     world: Option<&World>,
     pending: &mut VecDeque<(i32, i32)>,
+    assets: &MeshAssets,
     events: &Sender<ClientEvent>,
 ) {
     if let Some(world) = world {
         while let Some((cx, cz)) = pending.pop_front() {
-            remesh(world, cx, cz, events);
+            remesh(world, cx, cz, assets, events);
         }
     }
     pending.clear();
 }
 
 /// Builds one column's meshes and reports them.
-fn report_chunk(world: &World, cx: i32, cz: i32, events: &Sender<ClientEvent>) {
+///
+/// The snapshot copies the column and its collar out of the store here, on the
+/// session's thread; the build itself reads the snapshot and the assets and
+/// nothing else, which is the shape Task 13's pool hands to a worker.
+fn report_chunk(
+    world: &World,
+    cx: i32,
+    cz: i32,
+    assets: &MeshAssets,
+    events: &Sender<ClientEvent>,
+) {
+    let snapshot = ColumnSnapshot::from_world(world, cx, cz);
+    let ctx = mesh_context(assets);
     report(
         events,
         ClientEvent::ChunkUpdated {
             cx,
             cz,
-            sections: build_column_meshes(world, cx, cz),
+            sections: build_column_meshes(&snapshot, &ctx),
         },
     );
 }

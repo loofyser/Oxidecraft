@@ -714,10 +714,48 @@ fn the_same_input_builds_the_same_bytes() {
     );
 }
 
+/// The stand-in atlas an asset-less session meshes with: the fallback sprite
+/// alone, at its cell, with one level.
+#[test]
+fn the_stand_in_atlas_is_the_fallback_sprite_alone() {
+    let atlas = Atlas::fallback();
+    assert_eq!((atlas.width, atlas.height, atlas.level_count), (16, 16, 1));
+    assert_eq!(atlas.levels.len(), 1);
+    assert_eq!(
+        (atlas.levels[0].width, atlas.levels[0].height),
+        (16, 16),
+        "one level, the sprite's own cell"
+    );
+    assert_eq!(
+        atlas.sprites.get("missingno").copied(),
+        Some(atlas.missing),
+        "the fallback is indexed under the client's own name for it"
+    );
+    assert_eq!(
+        (atlas.missing.content.x, atlas.missing.content.y),
+        (0, 0),
+        "the sprite sits at its cell's top-left corner"
+    );
+    assert_eq!(
+        (atlas.missing.content.w, atlas.missing.content.h),
+        (16, 16),
+        "the fallback is 16x16"
+    );
+    // The checkerboard's first texel is the light magenta the generator's own
+    // tests pin (`TextureUtil.java:363-373`), and its 8-texel neighbour is the
+    // dark one: a flat image would pass neither.
+    let texel = |x: usize, y: usize| {
+        let offset = (y * 16 + x) * 4;
+        atlas.levels[0].rgba[offset..offset + 4].to_vec()
+    };
+    assert_eq!(texel(0, 0), vec![0xf8, 0, 0xf8, 0xff]);
+    assert_eq!(texel(8, 0), vec![0, 0, 0, 0xff]);
+    assert_eq!(atlas.uv(&atlas.missing), [[0.0, 0.0], [1.0, 1.0]]);
+}
+
 /// The real extraction tree, once: every path the model tree resolves
 /// stitches, the fallback is present among the sprites, the level count is
 /// the setting's, and the survey's animated strips carry their frames.
-///
 /// Ignored by default because it needs the user's own store: `OXIDECRAFT_STORE`
 /// must name the store root (the directory that holds `extracted/`), and the
 /// test fails naming the variable when it is unset, so a run without a store

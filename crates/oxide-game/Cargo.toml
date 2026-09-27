@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 crossbeam-channel = "0.5"
+oxide-assets.workspace = true
 oxide-proto.workspace = true
 oxide-proto-v47.workspace = true
 oxide-render.workspace = true
@@ -20,4 +21,4 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-oxide-assets.workspace = true
+tempfile.workspace = true

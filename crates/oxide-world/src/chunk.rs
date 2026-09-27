@@ -98,6 +98,33 @@ impl Section {
             pack_nibble(array, block_index(x, y, z), level);
         }
     }
+
+    /// The section's packed block values, in `block_index` order.
+    ///
+    /// The slice is the raw store the column snapshot copies from; it is 4096
+    /// long and holds `(id << 4) | meta` per cell.
+    pub fn blocks(&self) -> &[u16] {
+        &self.blocks[..]
+    }
+
+    /// The section's stored block-light nibbles, two per byte.
+    ///
+    /// The packed form [`unpack_nibble`] reads; the snapshot unpacks it while
+    /// copying, one cell at a time.
+    pub fn block_light_bytes(&self) -> &[u8] {
+        &self.block_light[..]
+    }
+
+    /// The section's stored sky-light nibbles, two per byte.
+    ///
+    /// Empty for a section without a sky store — a dimension without sky, or
+    /// a section whose packet carried no sky array — where every cell reads 0.
+    pub fn sky_light_bytes(&self) -> &[u8] {
+        match &self.sky_light {
+            Some(array) => &array[..],
+            None => &[],
+        }
+    }
 }
 
 /// Reads a light level a setter was handed, 0..=15.
@@ -302,6 +329,15 @@ impl Chunk {
     /// 0..256; anything above has no section.
     fn section_at(&self, y: usize) -> Option<&Section> {
         self.sections.get(y / SECTION_SIZE)?.as_ref()
+    }
+
+    /// The stored section at a section index, when the column holds it.
+    ///
+    /// The whole-store half of the column snapshot's copy: `sy` is 0..16, and
+    /// a section the column does not hold — an empty slot from a partial send
+    /// — answers `None`.
+    pub fn section(&self, sy: usize) -> Option<&Section> {
+        self.sections.get(sy)?.as_ref()
     }
 
     /// The section a y coordinate falls in, mutably, when the column holds it.

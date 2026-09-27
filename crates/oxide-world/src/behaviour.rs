@@ -1,6 +1,9 @@
 //! The block behaviour table: one row per block id this client renders, carrying
-//! the name, the metadata layout, the light columns, the material, the render
-//! layer, the tint kind and the render path the rest of the milestone consumes.
+//! the name, the metadata layout, the light columns, the two cube predicates
+//! (**`full_cube` from `isFullCube()` and `occludes` from `isOpaqueCube()`**,
+//! which the cull rule reads and which are not the same column), the material,
+//! the render layer, the tint kind and the render path the rest of the
+//! milestone consumes.
 //!
 //! # Scope
 //!
@@ -150,6 +153,32 @@ pub enum Material {
     Gourd,
 }
 
+impl Material {
+    /// Whether this material is translucent, the property the source's
+    /// `Block.isTranslucent()` answers (`block/Block.java:220-223`, carrying the
+    /// block's own `translucent` field, which its constructor sets from the
+    /// material at `:297`).
+    ///
+    /// This table is the six materials that call `setTranslucent()`
+    /// (`block/material/Material.java:14-33`): leaves, glass, tnt, ice, snow and
+    /// cactus. The ambient-occlusion light path reads it when it decides whether
+    /// a quad's corner cell is sampled at all (`BlockModelRenderer.java:377-405`).
+    /// Known limit: the source's field is `!material.blocksLight()`, and
+    /// `MaterialLogic` overrides that to false, so the source also calls a plant
+    /// translucent; no corner substitution this milestone meshes turns on it.
+    pub fn is_translucent(self) -> bool {
+        matches!(
+            self,
+            Material::Leaves
+                | Material::Glass
+                | Material::Tnt
+                | Material::Ice
+                | Material::Snow
+                | Material::Cactus
+        )
+    }
+}
+
 /// Which liquid a block is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiquidKind {
@@ -256,6 +285,18 @@ pub struct BlockBehaviour {
     pub light_emission: u8,
     /// `isFullCube()`: whether the block fills its cell.
     pub full_cube: bool,
+    /// `isOpaqueCube()`: whether the block hides the face of a neighbour that
+    /// culls against it.
+    ///
+    /// This is the predicate `Block.shouldSideBeRendered`'s base rule reads
+    /// (`block/Block.java:468-471`), and it is not `isFullCube()`: the mob
+    /// spawner and ice are full cubes that do not hide a neighbour's face
+    /// (`BlockMobSpawner.java`, `BlockBreakable.java`, inherited by
+    /// `BlockIce.java`), and the two leaf ids answer `!fancyGraphics`
+    /// (`BlockLeaves.java:278-281`), which under M2's Fast graphics is true.
+    /// Everything else carries its `full_cube` value, `Block.isOpaqueCube()`'s
+    /// own default being `true`.
+    pub occludes: bool,
     /// The block's material.
     pub material: Material,
     /// The render layer. Leaves carry the layer M2 renders (`SOLID` under Fast
@@ -647,6 +688,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -665,6 +707,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Grass,
         render_layer: RenderLayer::CutoutMipped,
         tint: TintKind::GrassSideOverlay,
@@ -691,6 +734,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Ground,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -707,6 +751,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -729,6 +774,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -743,6 +789,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -759,6 +806,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 3,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Liquid,
         render_layer: RenderLayer::Translucent,
         tint: TintKind::Water,
@@ -773,6 +821,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 3,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Liquid,
         render_layer: RenderLayer::Translucent,
         tint: TintKind::Water,
@@ -790,6 +839,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 15,
         full_cube: false,
+        occludes: false,
         material: Material::Liquid,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -804,6 +854,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 15,
         full_cube: false,
+        occludes: false,
         material: Material::Liquid,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -826,6 +877,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Sand,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -841,6 +893,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Sand,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -856,6 +909,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -870,6 +924,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -884,6 +939,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -917,6 +973,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -954,6 +1011,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 1,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Leaves,
         render_layer: RenderLayer::Solid,
         tint: TintKind::Foliage,
@@ -969,6 +1027,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Glass,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -983,6 +1042,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1005,6 +1065,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1029,6 +1090,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Vine,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::Grass,
@@ -1045,6 +1107,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Vine,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1067,6 +1130,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Cloth,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1090,6 +1154,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1111,6 +1176,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1128,6 +1194,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 1,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1142,6 +1209,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1157,6 +1225,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Metal,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1171,6 +1240,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Metal,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1202,6 +1272,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1216,6 +1287,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1231,6 +1303,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Tnt,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1245,6 +1318,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1259,6 +1333,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1273,6 +1348,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1296,6 +1372,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 14,
         full_cube: false,
+        occludes: false,
         material: Material::Circuit,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1314,6 +1391,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: true,
+        occludes: false,
         material: Material::Rock,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1357,6 +1435,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1383,6 +1462,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1397,6 +1477,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1411,6 +1492,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Metal,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1426,6 +1508,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1449,6 +1532,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1472,6 +1556,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Ground,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1495,6 +1580,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1516,6 +1602,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 13,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1565,6 +1652,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Wood,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1587,6 +1675,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Circuit,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1626,6 +1715,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1651,6 +1741,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1667,6 +1758,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1682,6 +1774,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 3,
         light_emission: 0,
         full_cube: true,
+        occludes: false,
         material: Material::Ice,
         render_layer: RenderLayer::Translucent,
         tint: TintKind::None,
@@ -1697,6 +1790,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::CraftedSnow,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1720,6 +1814,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Cactus,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1735,6 +1830,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Clay,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1759,6 +1855,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::Grass,
@@ -1775,6 +1872,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1797,6 +1895,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Gourd,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1811,6 +1910,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1826,6 +1926,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Sand,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1842,6 +1943,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 15,
         full_cube: true,
+        occludes: true,
         material: Material::Glass,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1864,6 +1966,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1887,6 +1990,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1908,6 +2012,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1924,6 +2029,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Glass,
         render_layer: RenderLayer::CutoutMipped,
         tint: TintKind::None,
@@ -1939,6 +2045,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Grass,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1953,6 +2060,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -1975,6 +2083,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1996,6 +2105,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Plant,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -2018,6 +2128,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -2055,6 +2166,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 1,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Leaves,
         render_layer: RenderLayer::Solid,
         tint: TintKind::Foliage,
@@ -2087,6 +2199,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 15,
         light_emission: 0,
         full_cube: true,
+        occludes: true,
         material: Material::Wood,
         render_layer: RenderLayer::Solid,
         tint: TintKind::None,
@@ -2133,6 +2246,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_filter: 0,
         light_emission: 0,
         full_cube: false,
+        occludes: false,
         material: Material::Vine,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::Grass,

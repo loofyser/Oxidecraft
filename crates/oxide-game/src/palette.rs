@@ -1,12 +1,11 @@
-//! The M1 block palette: one flat colour per block and face.
+//! The face table: the six faces of a block, their normals, their outward
+//! offsets and vanilla's per-face brightness.
 //!
-//! These colours are the M1 stand-ins for the texture atlas and are replaced in
-//! M2, when the mesher takes its colours from the loaded atlas instead. The ids
-//! and metadata are the vanilla 1.8 block registry's, and an id the table has
-//! no entry for renders as [`UNKNOWN_COLOR`], so a missing entry is
-//! unmistakable rather than plausible. Every id the rig's saved world carries
-//! around spawn has an entry, so the acceptance frames do not lean on that
-//! colour; anything outside the table still does.
+//! M1 also carried a flat colour per block here; M2's mesher takes its colours
+//! from the loaded atlas and the baked models, so only the face table remains.
+//! Its values are the source's: the shading factors are `FaceBakery`'s own face
+//! brightness table (top 1.0, bottom 0.5, north and south 0.8, east and west
+//! 0.6), and the offsets are `EnumFacing`'s front offsets.
 
 /// The six faces of a block, named as vanilla names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,119 +68,5 @@ impl Face {
             Face::North | Face::South => 0.8,
             Face::West | Face::East => 0.6,
         }
-    }
-}
-
-/// What an id with no palette entry renders as: unmistakable magenta.
-pub const UNKNOWN_COLOR: [f32; 3] = [1.0, 0.0, 1.0];
-
-/// The colour for a block, before face brightness.
-///
-/// The id, the metadata and the face all take part: grass block draws a green
-/// top, a log's sides depend on the variant's metadata, wool takes its dye
-/// colour from the metadata, and every other entry is one colour for all six
-/// faces. An id with no entry is [`UNKNOWN_COLOR`].
-pub fn block_color(id: u16, meta: u8, face: Face) -> [f32; 3] {
-    /// The dirt colour: dirt itself, and the grass block's sides and bottom.
-    const DIRT: [f32; 3] = [0.48, 0.36, 0.25];
-    /// The oak log's side colour, shared with the acacia and dark oak log.
-    const LOG_SIDE: [f32; 3] = [0.42, 0.32, 0.19];
-
-    match id {
-        1 => [0.50, 0.50, 0.50],
-        2 => match face {
-            Face::Top => [0.35, 0.61, 0.26],
-            _ => DIRT,
-        },
-        3 => DIRT,
-        4 => [0.44, 0.44, 0.44],
-        5 => [0.65, 0.53, 0.34],
-        7 => [0.30, 0.30, 0.30],
-        8 | 9 => [0.25, 0.40, 0.85],
-        10 | 11 => [0.95, 0.51, 0.12],
-        12 => [0.86, 0.81, 0.59],
-        13 => [0.53, 0.51, 0.50],
-        14 => [0.62, 0.58, 0.42],
-        15 => [0.62, 0.58, 0.55],
-        16 => [0.42, 0.42, 0.42],
-        17 => match face {
-            Face::Top | Face::Bottom => [0.66, 0.53, 0.35],
-            _ => match meta {
-                1 => [0.32, 0.23, 0.13],
-                2 => [0.68, 0.62, 0.50],
-                _ => LOG_SIDE,
-            },
-        },
-        18 => match meta {
-            1 => [0.28, 0.42, 0.30],
-            2 => [0.45, 0.62, 0.30],
-            _ => [0.32, 0.55, 0.24],
-        },
-        20 => [0.85, 0.92, 0.95],
-        21 => [0.42, 0.45, 0.62],
-        24 => [0.86, 0.82, 0.65],
-        31 => [0.35, 0.65, 0.25],
-        32 => [0.58, 0.45, 0.22],
-        35 => match meta {
-            1 => [0.95, 0.60, 0.20],
-            4 => [0.92, 0.85, 0.20],
-            11 => [0.25, 0.30, 0.85],
-            14 => [0.65, 0.20, 0.20],
-            15 => [0.10, 0.10, 0.10],
-            _ => [0.93, 0.93, 0.93],
-        },
-        37 => [0.95, 0.90, 0.25],
-        38 => [0.80, 0.20, 0.20],
-        39 => [0.55, 0.42, 0.32],
-        40 => [0.80, 0.25, 0.25],
-        41 => [0.95, 0.80, 0.25],
-        42 => [0.87, 0.87, 0.87],
-        43 => [0.50, 0.50, 0.50],
-        45 => [0.60, 0.36, 0.30],
-        46 => [0.85, 0.30, 0.25],
-        47 => [0.60, 0.50, 0.35],
-        48 => [0.35, 0.45, 0.35],
-        49 => [0.12, 0.10, 0.18],
-        50 => [0.85, 0.70, 0.35],
-        52 => [0.16, 0.18, 0.24],
-        53 => [0.65, 0.53, 0.34],
-        54 => [0.55, 0.40, 0.22],
-        56 => [0.45, 0.70, 0.70],
-        57 => [0.35, 0.85, 0.85],
-        58 => [0.50, 0.36, 0.22],
-        59 => [0.85, 0.75, 0.35],
-        60 => [0.42, 0.30, 0.18],
-        61 | 62 => [0.44, 0.44, 0.44],
-        64 => [0.60, 0.44, 0.26],
-        65 => [0.60, 0.48, 0.30],
-        67 => [0.44, 0.44, 0.44],
-        72 => [0.65, 0.53, 0.34],
-        73 => [0.55, 0.35, 0.35],
-        79 => [0.55, 0.70, 0.95],
-        80 => [0.95, 0.97, 0.98],
-        81 => [0.35, 0.55, 0.22],
-        82 => [0.63, 0.65, 0.68],
-        83 => [0.55, 0.72, 0.42],
-        85 => [0.65, 0.53, 0.34],
-        86 => [0.85, 0.55, 0.20],
-        87 => [0.60, 0.25, 0.25],
-        88 => [0.40, 0.33, 0.26],
-        89 => [0.95, 0.85, 0.55],
-        98 => [0.47, 0.47, 0.47],
-        99 => [0.60, 0.45, 0.35],
-        100 => [0.78, 0.25, 0.25],
-        102 => [0.85, 0.92, 0.95],
-        110 => [0.55, 0.50, 0.55],
-        129 => [0.42, 0.65, 0.50],
-        141 => [0.35, 0.65, 0.25],
-        142 => [0.35, 0.65, 0.25],
-        155 => [0.93, 0.92, 0.88],
-        161 => match meta {
-            1 => [0.30, 0.48, 0.20],
-            _ => [0.42, 0.60, 0.28],
-        },
-        162 => LOG_SIDE,
-        175 => [0.35, 0.65, 0.25],
-        _ => UNKNOWN_COLOR,
     }
 }

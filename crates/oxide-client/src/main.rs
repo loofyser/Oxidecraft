@@ -279,6 +279,9 @@ fn spawn_session(host: String, port: u16, username: String, server: String) -> S
             port,
             username,
             settings: ClientSettings::default(),
+            // The assets are the bootstrap's to hand in (Task 14); until then
+            // the session meshes every block as the atlas's fallback sprite.
+            mesh: None,
         };
         match Session::connect(&config) {
             Ok(session) => {

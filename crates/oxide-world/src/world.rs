@@ -94,6 +94,46 @@ impl World {
         }
     }
 
+    /// The block-light nibble at world coordinates; 0 when the column is not
+    /// loaded or y is outside 0..256.
+    ///
+    /// The point read the column snapshot's border strips and any caller
+    /// outside the mesher use; a stored section the column does not hold
+    /// answers 0.
+    pub fn block_light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..(SECTION_COUNT * SECTION_SIZE) as i32).contains(&y) {
+            return 0;
+        }
+        let cx = x.div_euclid(SECTION_SIZE as i32);
+        let cz = z.div_euclid(SECTION_SIZE as i32);
+        let local_x = x.rem_euclid(SECTION_SIZE as i32) as usize;
+        let local_z = z.rem_euclid(SECTION_SIZE as i32) as usize;
+        match self.chunks.get(&(cx, cz)) {
+            Some(chunk) => chunk.block_light_at(local_x, y as usize, local_z),
+            None => 0,
+        }
+    }
+
+    /// The sky-light nibble at world coordinates; 0 when the column is not
+    /// loaded or y is outside 0..256.
+    ///
+    /// A loaded column answers its store's own value, which is 15 for an
+    /// absent section of a dimension with sky — the store's documented
+    /// default, not a second rule here.
+    pub fn sky_light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..(SECTION_COUNT * SECTION_SIZE) as i32).contains(&y) {
+            return 0;
+        }
+        let cx = x.div_euclid(SECTION_SIZE as i32);
+        let cz = z.div_euclid(SECTION_SIZE as i32);
+        let local_x = x.rem_euclid(SECTION_SIZE as i32) as usize;
+        let local_z = z.rem_euclid(SECTION_SIZE as i32) as usize;
+        match self.chunks.get(&(cx, cz)) {
+            Some(chunk) => chunk.sky_light_at(local_x, y as usize, local_z),
+            None => 0,
+        }
+    }
+
     /// Removes a column, reporting whether one was present.
     pub fn unload(&mut self, cx: i32, cz: i32) -> bool {
         self.chunks.remove(&(cx, cz)).is_some()

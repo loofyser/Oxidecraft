@@ -357,7 +357,24 @@ fn clamp_01(value: f32) -> f32 {
 /// loaded the fallback biome (ocean) answers, so a missing column is not an
 /// error on this path.
 pub fn tint_at(world: &World, maps: &TintMaps, x: i32, y: i32, z: i32, kind: TintKind) -> [u8; 3] {
-    let data = biome(biome_id_at(world, x, z));
+    tint_at_biome(maps, x, y, z, kind, |x, z| biome_id_at(world, x, z))
+}
+
+/// The world-free half of [`tint_at`]: the biome id at every sample comes from
+/// `biome_at` rather than from the world's columns.
+///
+/// The mesher runs from a column snapshot and has no [`World`], so this is the
+/// entry point it consumes — the tint maths itself stays here, in one place,
+/// and [`tint_at`] delegates to it.
+pub fn tint_at_biome(
+    maps: &TintMaps,
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: TintKind,
+    biome_at: impl Fn(i32, i32) -> u8,
+) -> [u8; 3] {
+    let data = biome(biome_at(x, z));
     match kind {
         TintKind::None => [255, 255, 255],
         TintKind::Grass | TintKind::GrassSideOverlay => grass_colour(data, maps, x, y, z),
@@ -384,10 +401,26 @@ pub fn tint_at_9(
     z: i32,
     kind: TintKind,
 ) -> [u8; 3] {
+    tint_at_9_biome(maps, x, y, z, kind, |x, z| biome_id_at(world, x, z))
+}
+
+/// The world-free half of [`tint_at_9`]: the same nine-sample average, with the
+/// biome id at every sample coming from `biome_at`.
+///
+/// The mesher's entry point, called once per tinted face at the block's own
+/// position.
+pub fn tint_at_9_biome(
+    maps: &TintMaps,
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: TintKind,
+    biome_at: impl Fn(i32, i32) -> u8,
+) -> [u8; 3] {
     let mut sums = [0u32; 3];
     for offset_z in -1..=1 {
         for offset_x in -1..=1 {
-            let colour = tint_at(world, maps, x + offset_x, y, z + offset_z, kind);
+            let colour = tint_at_biome(maps, x + offset_x, y, z + offset_z, kind, &biome_at);
             for (sum, channel) in sums.iter_mut().zip(colour) {
                 *sum += u32::from(channel);
             }

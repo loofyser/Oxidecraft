@@ -156,6 +156,53 @@ impl Atlas {
             h: sprite.content.h >> level,
         }
     }
+
+    /// The stand-in atlas: the procedural fallback sprite alone.
+    ///
+    /// The asset-less session meshes with this when no texture set and model
+    /// source were handed in: every block draws [`Atlas::missing`]'s magenta
+    /// and black checkerboard, indexed under the client's `missingno` name,
+    /// and the atlas is the sprite's own 16x16 cell with one level.
+    ///
+    /// [`build_atlas`] cannot serve here — it needs a [`TextureSet`] read from
+    /// a store — so the fallback's pixels come from the same generator
+    /// `build_atlas` uses ([`missing_pixels`]) and never change.
+    pub fn fallback() -> Atlas {
+        let side = MIN_SIDE.max(MISSING_SIDE);
+        let mut level = image(side, side);
+        blit(
+            &mut level.rgba,
+            side,
+            &missing_pixels(),
+            MISSING_SIDE,
+            MISSING_SIDE,
+            0,
+            0,
+        );
+        let sprite = AtlasSprite {
+            region: SpriteRect {
+                x: 0,
+                y: 0,
+                w: side,
+                h: side,
+            },
+            content: SpriteRect {
+                x: 0,
+                y: 0,
+                w: MISSING_SIDE,
+                h: MISSING_SIDE,
+            },
+        };
+        Atlas {
+            levels: vec![level],
+            width: side,
+            height: side,
+            level_count: 1,
+            sprites: BTreeMap::from([(MISSING_SPRITE.to_string(), sprite)]),
+            animated: BTreeMap::new(),
+            missing: sprite,
+        }
+    }
 }
 
 /// Errors from stitching an atlas.

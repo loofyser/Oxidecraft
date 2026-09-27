@@ -323,3 +323,66 @@ fn the_light_and_visual_columns_hold_their_source_values() {
     assert_eq!(block(86).material, Material::Gourd);
     assert_eq!(block(31).material, Material::Vine);
 }
+
+/// The covered ids whose `isOpaqueCube()` is true under M2's Fast graphics:
+/// the cull rule's opacity column.
+///
+/// `Block.isOpaqueCube()` is `true` (`block/Block.java:507`), so a full cube
+/// hides a neighbour's face unless its class overrides the predicate:
+/// `BlockMobSpawner.java:57` and `BlockBreakable.java:29` answer false — the
+/// latter covering ice, which extends it and overrides only `isFullCube()`
+/// (`BlockIce.java`) — and the double slab answers `isDouble()`
+/// (`BlockSlab.java:96`), true for the covered id 43. The two leaf ids are the
+/// only other overrides among the covered set: `BlockLeaves.java:278-281`
+/// answers `!fancyGraphics`, which under Fast graphics is true, so they occlude
+/// like the full cubes they are.
+const OCCLUDING: [u16; 44] = [
+    1, 2, 3, 4, 5, 7, 12, 13, 14, 15, 16, 17, 18, 21, 24, 35, 41, 42, 43, 45, 46, 47, 48, 49, 56,
+    57, 58, 61, 62, 73, 80, 82, 86, 87, 88, 89, 98, 99, 100, 110, 129, 155, 161, 162,
+];
+
+#[test]
+fn every_covered_id_carries_its_opacity_predicate() {
+    for &id in covered_ids() {
+        let entry = block(id);
+        assert_eq!(
+            entry.occludes,
+            OCCLUDING.contains(&id),
+            "id {id} ({}): the opacity predicate is the source's isOpaqueCube() under Fast graphics",
+            entry.name
+        );
+    }
+}
+
+#[test]
+fn the_opacity_predicate_is_not_the_full_cube_column() {
+    let different: Vec<u16> = covered_ids()
+        .iter()
+        .copied()
+        .filter(|&id| block(id).occludes != block(id).full_cube)
+        .collect();
+    assert_eq!(
+        different,
+        vec![52, 79],
+        "the mob spawner and ice are the full cubes that hide nothing"
+    );
+    // The light columns are not the opacity predicate: the constructor's rule
+    // (`Block.java:296`) derives `lightOpacity` from `isOpaqueCube()` for a
+    // block that sets neither, so the spawner darkens nothing, while ice sets
+    // its own 3 and still hides nothing.
+    assert_eq!(
+        (
+            block(52).light_opacity,
+            block(52).full_cube,
+            block(79).light_opacity,
+            block(79).full_cube
+        ),
+        (0, true, 3, true),
+        "the spawner and ice are full cubes that hide nothing"
+    );
+    assert_eq!(
+        (block(18).occludes, block(161).occludes),
+        (true, true),
+        "the leaves occlude under Fast graphics"
+    );
+}

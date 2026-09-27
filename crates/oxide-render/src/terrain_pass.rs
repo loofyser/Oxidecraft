@@ -25,8 +25,12 @@ use crate::terrain::{ChunkMesh, SectionKey, VERTEX_BYTES, vertex_bytes};
 
 /// The terrain shader: transform a position with the camera, pass the colour through.
 ///
-/// The mesh's colours are already lit — the mesher multiplies the palette entry by the face's
-/// brightness — so the fragment stage writes its input unchanged with full alpha.
+/// The mesh's colours are already lit — the mesher multiplies the atlas entry by the face's
+/// brightness and the biome tint and packs the light with the vertex — so the fragment stage
+/// writes its input unchanged.
+///
+/// The uv and light attributes are declared for the stages that follow (the atlas sampler and
+/// the light ramp) and are not read here yet.
 const SHADER: &str = r#"
 struct Camera {
     view_projection: mat4x4<f32>,
@@ -36,25 +40,27 @@ struct Camera {
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) color: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) light: vec2<u32>,
+    @location(3) colour: vec4<f32>,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec3<f32>,
+    @location(0) colour: vec4<f32>,
 };
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
-    output.color = input.color;
+    output.colour = input.colour;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(input.color, 1.0);
+    return input.colour;
 }
 "#;
 
@@ -68,9 +74,14 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// The size of the camera uniform in bytes: one `mat4x4<f32>`.
 const CAMERA_BYTES: usize = 64;
 
-/// The terrain vertex attributes: a position at offset 0, a colour at offset 12.
-static ATTRIBUTES: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+/// The terrain vertex attributes: a position at offset 0, the uv at offset 12,
+/// the packed light pair at offset 20 and the colour at offset 24.
+static ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x2,
+    2 => Uint16x2,
+    3 => Unorm8x4
+];
 
 /// A section's mesh on the GPU: its two buffers and how many indices to draw.
 struct GpuMesh {
@@ -98,10 +109,10 @@ impl TerrainPass {
     /// Builds the pipeline for colour attachments in `format`.
     ///
     /// The vertex layout is the byte stream [`vertex_bytes`] produces: a `Float32x3` position
-    /// at offset 0 and a `Float32x3` colour at offset 12, with a stride of [`VERTEX_BYTES`].
-    /// The pipeline culls back faces and tests and writes the depth buffer in
-    /// [`DEPTH_FORMAT`], so a pass that draws with it needs a depth attachment of that format
-    /// and a colour attachment in `format`.
+    /// at offset 0, a `Float32x2` uv at 12, a `Uint16x2` light pair at 20 and a `Unorm8x4`
+    /// colour at 24, with a stride of [`VERTEX_BYTES`]. The pipeline culls back faces and
+    /// tests and writes the depth buffer in [`DEPTH_FORMAT`], so a pass that draws with it
+    /// needs a depth attachment of that format and a colour attachment in `format`.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide terrain shader"),
@@ -319,17 +330,23 @@ mod tests {
         let layout = vertex_layout();
         assert_eq!(layout.array_stride, VERTEX_BYTES as u64);
         assert_eq!(layout.step_mode, wgpu::VertexStepMode::Vertex);
-        let [position, color] = layout.attributes else {
-            panic!("two attributes, a position and a colour");
+        let [position, uv, light, colour] = layout.attributes else {
+            panic!("four attributes: a position, a uv, a light pair and a colour");
         };
         assert_eq!(position.shader_location, 0);
         assert_eq!(position.format, VertexFormat::Float32x3);
         assert_eq!(position.offset, 0);
-        assert_eq!(color.shader_location, 1);
-        assert_eq!(color.format, VertexFormat::Float32x3);
-        assert_eq!(color.offset, 12);
+        assert_eq!(uv.shader_location, 1);
+        assert_eq!(uv.format, VertexFormat::Float32x2);
+        assert_eq!(uv.offset, 12);
+        assert_eq!(light.shader_location, 2);
+        assert_eq!(light.format, VertexFormat::Uint16x2);
+        assert_eq!(light.offset, 20);
+        assert_eq!(colour.shader_location, 3);
+        assert_eq!(colour.format, VertexFormat::Unorm8x4);
+        assert_eq!(colour.offset, 24);
         // The last attribute ends exactly at the stride, so no byte of a vertex is unread.
-        assert_eq!(color.offset + 12, layout.array_stride);
+        assert_eq!(colour.offset + 4, layout.array_stride);
     }
 
     #[test]

@@ -4,16 +4,32 @@ use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLA
 use oxide_render::terrain::{VERTEX_BYTES, Vertex, vertex_bytes};
 
 #[test]
-fn a_vertex_is_twenty_four_bytes_of_little_endian_floats() {
+fn a_vertex_is_twenty_eight_bytes_of_little_endian_fields() {
     let vertex = Vertex {
         position: [1.0, 2.0, 3.0],
-        color: [0.5, 0.25, 0.0],
+        uv: [0.5, 0.25],
+        light: [248, 8],
+        colour: [255, 128, 64, 255],
     };
     let bytes = vertex_bytes(&[vertex]);
     assert_eq!(bytes.len(), VERTEX_BYTES);
-    let read = |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    assert_eq!((read(0), read(4), read(8)), (1.0, 2.0, 3.0));
-    assert_eq!((read(12), read(16), read(20)), (0.5, 0.25, 0.0));
+    assert_eq!(
+        bytes,
+        vec![
+            // The position: three f32, 1.0, 2.0 and 3.0.
+            0x00, 0x00, 0x80, 0x3f, // 1.0
+            0x00, 0x00, 0x00, 0x40, // 2.0
+            0x00, 0x00, 0x40, 0x40, // 3.0
+            // The uv: two f32, 0.5 and 0.25.
+            0x00, 0x00, 0x00, 0x3f, // 0.5
+            0x00, 0x00, 0x80, 0x3e, // 0.25
+            // The light: two u16, 248 and 8, sky first.
+            0xf8, 0x00, // 248
+            0x08, 0x00, // 8
+            // The colour: four u8, no padding between the light and it.
+            0xff, 0x80, 0x40, 0xff,
+        ]
+    );
 }
 
 #[test]
@@ -21,19 +37,25 @@ fn two_vertices_are_twice_the_bytes() {
     let mesh = vec![
         Vertex {
             position: [0.0; 3],
-            color: [0.0; 3],
+            uv: [0.0; 2],
+            light: [0; 2],
+            colour: [0; 4],
         },
         Vertex {
             position: [1.0; 3],
-            color: [1.0; 3],
+            uv: [1.0; 2],
+            light: [u16::MAX; 2],
+            colour: [255; 4],
         },
     ];
     let bytes = vertex_bytes(&mesh);
     assert_eq!(bytes.len(), 2 * VERTEX_BYTES);
-    // The second vertex starts at offset 24 and is the only one holding 1.0; its three
-    // position floats sit at offsets 24, 28 and 32.
+    // The second vertex starts at offset 28 and is the only one holding a non-zero position;
+    // its three position floats sit at offsets 28, 32 and 36, and its colour closes the
+    // stream at offsets 52..56.
     let read = |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    assert_eq!((read(24), read(28), read(32)), (1.0, 1.0, 1.0));
+    assert_eq!((read(28), read(32), read(36)), (1.0, 1.0, 1.0));
+    assert_eq!(&bytes[52..56], &[255, 255, 255, 255]);
 }
 
 fn pose(yaw: f32, pitch: f32) -> CameraPose {
