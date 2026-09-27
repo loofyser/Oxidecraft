@@ -34,7 +34,7 @@ const LOCALE_MAX_BYTES: usize = 7;
 /// The client settings the connection uses until a settings screen exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientSettings {
-    /// Locale, at most 7 characters, for example `en_US`.
+    /// Locale, at most 7 bytes, for example `en_US`.
     pub locale: String,
     /// View distance in chunks.
     pub view_distance: u8,

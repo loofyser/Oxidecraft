@@ -665,8 +665,9 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
 fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
     // The shape a live 1.8.9 server sends on join: one 0x26 frame carrying the
     // metadata for every column, then their full payloads. The second column
-    // repeats the fixture one chunk east, so the bulk offset arithmetic is on
-    // trial for every value the first column pins.
+    // repeats the fixture one chunk east; the two payloads are byte-identical,
+    // so a cross-copy mix-up is not detectable by these assertions — a decoder
+    // that filled the second column from the first copy would pass every probe.
     let bulk = bulk_frame();
     let (stream, outgoing) = duplex(stream_with(&[
         join_game_frame(),
@@ -726,6 +727,17 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
         assert_eq!(slots.len(), 16, "({cx}, {cz}) reports all sixteen sections");
         let indices: Vec<usize> = slots.iter().map(|(index, _)| *index).collect();
         assert_eq!(indices, sixteen, "({cx}, {cz}) reports them in order");
+        // The sixteen slots are shape, not content: they come back even for a
+        // world that held no blocks. The fixture's bottom section is bedrock,
+        // so the applied column must have drawn it.
+        let mesh = slots[0]
+            .1
+            .as_ref()
+            .expect("({cx}, {cz}) draws its bottom section");
+        assert!(
+            !mesh.vertices.is_empty(),
+            "({cx}, {cz}) draws its bottom section: a world that held no blocks could not"
+        );
     }
 
     // The values the fixture carries, read through `World::block` on a world
