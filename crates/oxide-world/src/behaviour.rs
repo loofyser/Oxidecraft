@@ -154,28 +154,46 @@ pub enum Material {
 }
 
 impl Material {
-    /// Whether this material is translucent, the property the source's
-    /// `Block.isTranslucent()` answers (`block/Block.java:220-223`, carrying the
-    /// block's own `translucent` field, which its constructor sets from the
-    /// material at `:297`).
+    /// `Material.blocksLight()`: whether this material blocks light, the
+    /// property the source's `Block.translucent` field inverts
+    /// (`block/Block.java:291-297`, read back by `isTranslucent()` at
+    /// `:215-223`).
     ///
-    /// This table is the six materials that call `setTranslucent()`
-    /// (`block/material/Material.java:14-33`): leaves, glass, tnt, ice, snow and
-    /// cactus. The ambient-occlusion light path reads it when it decides whether
-    /// a quad's corner cell is sampled at all (`BlockModelRenderer.java:377-405`).
-    /// Known limit: the source's field is `!material.blocksLight()`, and
-    /// `MaterialLogic` overrides that to false, so the source also calls a plant
-    /// translucent; no corner substitution this milestone meshes turns on it.
-    pub fn is_translucent(self) -> bool {
-        matches!(
+    /// False for the transparent, logic and portal materials — air, fire,
+    /// plants, vine, circuits, carpet, snow and portal
+    /// (`block/material/Material.java:5,15,16,19,21,22,29,37`,
+    /// `MaterialLogic.java:22-25`, `MaterialTransparent.java:22-25`,
+    /// `MaterialPortal.java:21-24`) — and true for every other material. The
+    /// six that call `setTranslucent()` (leaves, glass, tnt, ice, snow, cactus;
+    /// `Material.java:14,23,25,27,29,33`) do not move it: `setTranslucent()`
+    /// sets only `Material.isTranslucent`, which only `isOpaque()` reads
+    /// (`:118-121`, `:170-173`), so a leaf blocks light as a stone does and
+    /// snow is false through its own logic class, not through that call.
+    ///
+    /// The ambient-occlusion corner substitution is the reader
+    /// (`BlockModelRenderer.java:377-405`).
+    pub fn blocks_light(self) -> bool {
+        !matches!(
             self,
-            Material::Leaves
-                | Material::Glass
-                | Material::Tnt
-                | Material::Ice
+            Material::Plant
                 | Material::Snow
-                | Material::Cactus
+                | Material::Circuit
+                | Material::Portal
+                | Material::Vine
         )
+    }
+
+    /// `Material.blocksMovement()`: whether a block of this material is solid.
+    ///
+    /// False for the same three material classes as
+    /// [`Material::blocks_light`] (`MaterialLogic.java:30-33`,
+    /// `MaterialTransparent.java:30-33`, `MaterialPortal.java:29-32`) and for
+    /// the two liquids (`MaterialLiquid.java:23-26`), true otherwise — those
+    /// are the only overrides the source's material classes carry. The
+    /// ambient-occlusion light value reads it through `isBlockNormalCube()`
+    /// (`block/Block.java:347-350`, `:1099-1102`).
+    pub fn blocks_movement(self) -> bool {
+        self.blocks_light() && !matches!(self, Material::Liquid)
     }
 }
 

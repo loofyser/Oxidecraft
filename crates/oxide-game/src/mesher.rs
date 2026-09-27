@@ -22,11 +22,16 @@
 //! light and the model's `ambientocclusion` is true; it samples cells around
 //! the face per vertex and averages them, with the `0 → fourth` substitution
 //! `getAoBrightness` performs (`:506-524`) and the plain four-sample branch at
-//! `:488-504`. Every other quad — the standard path of `:98-101` and `:245-296`
-//! — gives all four vertices the light of one cell: the neighbour the face looks
-//! into for a quad with a `cullface`, the block's own cell for one without (a
-//! cross model's quads; this project's baked quad does not keep the element face
-//! key, which is known limit 12).
+//! `:488-504`, or — for a quad that does not span its face's whole extent, on
+//! a north, south, west or east face — the occlusion-weighted branch of
+//! `:454-488`. The same four cells' `getAmbientOcclusionLightValue()`
+//! (`0.2` for a normal cube, `1.0` otherwise; `block/Block.java:1099-1102`)
+//! multiply the vertex's colour, so a concave corner darkens its vertex
+//! (`:451`, `:491-502`, `:154-165`). Every other quad — the standard path of
+//! `:98-101` and `:245-296` — gives all four vertices the light of one cell:
+//! the neighbour the face looks into for a quad with a `cullface`, the block's
+//! own cell for one without (a cross model's quads; this project's baked quad
+//! does not keep the element face key, which is known limit 12).
 //!
 //! `SmoothLighting::Minimum` and `SmoothLighting::Maximum` are the same path in
 //! this version: the renderer reads only `Minecraft.isAmbientOcclusionEnabled()`
@@ -173,8 +178,9 @@ fn append_quad(
     ctx: &MeshContext<'_>,
 ) {
     let face = quad_face(quad);
-    // The cell the quad's light comes from: the neighbour the face looks into,
-    // or the block's own cell for a quad with no face to look through.
+    // The cell the standard path's single sample comes from: the neighbour the
+    // face looks into, or the block's own cell for a quad with no face to look
+    // through.
     let sample = match quad.cullface {
         Some(cull) => {
             let (dx, dy, dz) = offset(cull);
@@ -184,13 +190,33 @@ fn append_quad(
     };
     let centre = cell_pair(snapshot, sample, block);
     let emission = block.map_or(0, |entry| entry.light_emission);
-    let pairs = if take_ambient_occlusion(ctx, emission, model) {
-        ambient_pairs(snapshot, position, quad, face, centre)
+    let (pairs, multipliers) = if take_ambient_occlusion(ctx, emission, model) {
+        let corners = ambient_corners(
+            snapshot,
+            position,
+            quad,
+            face,
+            block.is_some_and(|entry| entry.full_cube),
+        );
+        (corners.pairs, Some(corners.multipliers))
     } else {
-        [centre; 4]
+        ([centre; 4], None)
     };
     let uvs = atlas_uv(ctx, quad);
-    let colour = vertex_colour(block, quad, face, snapshot, position, ctx);
+    let tint = vertex_tint(block, quad, snapshot, position, ctx);
+    let shade = shade_byte(quad, face);
+    let colour = |multiplier: f32| -> [u8; 4] {
+        [
+            shaded_channel(shade, tint[0], multiplier),
+            shaded_channel(shade, tint[1], multiplier),
+            shaded_channel(shade, tint[2], multiplier),
+            255,
+        ]
+    };
+    let colours: [[u8; 4]; 4] = match multipliers {
+        Some(multipliers) => std::array::from_fn(|index| colour(multipliers[index])),
+        None => [colour(1.0); 4],
+    };
     let base = mesh.vertices.len() as u32;
     for (index, corner) in quad.corners.iter().enumerate() {
         mesh.vertices.push(Vertex {
@@ -201,7 +227,7 @@ fn append_quad(
             ],
             uv: uvs[index],
             light: light_attribute(pairs[index]),
-            colour,
+            colour: colours[index],
         });
     }
     mesh.indices
@@ -235,7 +261,8 @@ fn atlas_uv(ctx: &MeshContext<'_>, quad: &BakedQuad) -> [[f32; 2]; 4] {
     })
 }
 
-/// The vertex colour: the block's tint, or white, times the face's shade.
+/// The tint the quad's colour is multiplied by: the block's tint at the
+/// block's own position, or white.
 ///
 /// The tint is sampled once per tinted face, at the block's own position, from
 /// the nine-sample average the source's tint path consumes — `BlockModelRenderer`
@@ -244,19 +271,14 @@ fn atlas_uv(ctx: &MeshContext<'_>, quad: &BakedQuad) -> [[f32; 2]; 4] {
 /// and `oxide-world`'s [`tint_at_9_biome`] is that average over the snapshot's
 /// biomes. A face with no tint index takes no tint at all — the client tints
 /// nothing else — and a block whose kind is `None` is white.
-///
-/// The shade is the face's own brightness, or none at all for a model face that
-/// turned shading off (`cross`'s quads). The bytes are the source's truncating
-/// conversion, `(int)(channel * 255)`.
-fn vertex_colour(
+fn vertex_tint(
     block: Option<&BlockBehaviour>,
     quad: &BakedQuad,
-    face: Face,
     snapshot: &ColumnSnapshot,
     position: (i32, i32, i32),
     ctx: &MeshContext<'_>,
-) -> [u8; 4] {
-    let tint = match block {
+) -> [u8; 3] {
+    match block {
         Some(entry) if quad.tintindex.is_some() && entry.tint != TintKind::None => tint_at_9_biome(
             ctx.tint_maps,
             position.0,
@@ -266,10 +288,39 @@ fn vertex_colour(
             |x, z| snapshot.biome_at(x, z),
         ),
         _ => [255, 255, 255],
-    };
-    let brightness = if quad.shade { face.brightness() } else { 1.0 };
-    let channel = |index: usize| (f32::from(tint[index]) * brightness) as u8;
-    [channel(0), channel(1), channel(2), 255]
+    }
+}
+
+/// The face's shade as the byte the source bakes into the vertex record.
+///
+/// `FaceBakery.getFaceShadeColor` quantises the face's brightness with
+/// `clamp((int)(shade * 255), 0, 255)` (`client/renderer/block/model/FaceBakery.java:48-53`),
+/// so the six faces carry 127, 255, 204, 204, 153 and 153 — every later
+/// multiply is a byte-times-byte one. A model face that turned shading off
+/// takes the builder's own colour instead, which is the white word `-1`
+/// (`FaceBakery.java:90-93`).
+fn shade_byte(quad: &BakedQuad, face: Face) -> u8 {
+    if quad.shade {
+        (face.brightness() * 255.0) as u8
+    } else {
+        255
+    }
+}
+
+/// One colour channel as the source multiplies it: the baked shade byte times
+/// the ambient-occlusion path's per-vertex multiplier and the tint byte, each
+/// over 255, truncating.
+///
+/// `renderModelAmbientOcclusionQuads` hands `vertexColorMultiplier[i] * tint`
+/// to `WorldRenderer.putColorMultiplier` (`client/renderer/BlockModelRenderer.java:151-165`),
+/// which multiplies the byte already in the vertex record and keeps alpha
+/// (`client/renderer/WorldRenderer.java:297-320`: `k = (int)((j & 255) * red)`).
+/// The standard path is the same expression with the tint alone — it calls the
+/// same method without a multiplier (`:287-293`) — and an untinted quad's tint
+/// is `[255, 255, 255]`, which leaves the shade byte exactly as baked.
+fn shaded_channel(shade: u8, tint: u8, multiplier: f32) -> u8 {
+    let tint = f32::from(tint) / 255.0;
+    (f32::from(shade) * (multiplier * tint)) as u8
 }
 
 /// The fallback cube: the six faces of a block drawn from the atlas's fallback
@@ -449,73 +500,188 @@ fn cell_pair(
     ((u32::from(sky) << 4) << 16 | (u32::from(level) << 4)) as i32
 }
 
-/// The four cells each vertex of an ambient-occlusion quad averages.
+/// One ambient-occlusion quad's per-vertex output.
+struct AmbientCorners {
+    /// The packed light pair of each quad vertex, in vertex order.
+    pairs: [i32; 4],
+    /// The colour multiplier of each quad vertex, in vertex order
+    /// (`AmbientOcclusionFace.vertexColorMultiplier`).
+    multipliers: [f32; 4],
+}
+
+/// The four cells each vertex of an ambient-occlusion quad averages, and the
+/// two results they give it: its packed light pair and its colour multiplier.
 ///
 /// `AmbientOcclusionFace.updateVertexBrightness` (`BlockModelRenderer.java:364-504`):
-/// the base is the cell the quad's face looks into for a quad that covers the
-/// whole face and the block's own cell otherwise; the four tangent neighbours of
-/// the base are read first, then the four corner cells, each corner falling back
-/// to the tangent neighbour that shares its side when that side's block, or the
-/// tangent block itself, is translucent. The centre is the standard path's own
-/// sample.
-fn ambient_pairs(
+/// the base is the cell the quad's face looks into when `fillQuadBounds`'s
+/// flag 0 holds — the quad is the block's face on the face's own axis — and
+/// the block's own cell otherwise; the four tangent neighbours of the base are
+/// read first, then the four corner cells, each corner taking the tangent's
+/// value only when *neither* of the two behind-cells it spans is translucent
+/// (`:377-442`, the source's `Block.translucent`, i.e. `!Material.blocksLight()`).
+/// The centre is the neighbour's cell when flag 0 holds or the neighbour is not
+/// opaque, and the block's own cell otherwise (`:444-449`).
+///
+/// The four cells' `getAmbientOcclusionLightValue()` values answer the vertex's
+/// colour multiplier — their mean in the plain branch (`:491-502`) or the
+/// quad-bounds-weighted mix of the four means in the occlusion-weighted branch
+/// (`:454-488`) — and their packed brightnesses feed the same branch's light
+/// pairs through `getAoBrightness` (`:506-524`).
+fn ambient_corners(
     snapshot: &ColumnSnapshot,
     position: (i32, i32, i32),
     quad: &BakedQuad,
     face: Face,
-    centre: i32,
-) -> [i32; 4] {
+    full_cube: bool,
+) -> AmbientCorners {
+    let bounds = quad_bounds(face, &quad.corners, full_cube);
     let (dx, dy, dz) = offset(direction(face));
-    let base = if covers_full_face(&quad.corners) {
+    let base = if bounds.face_plane {
         (position.0 + dx, position.1 + dy, position.2 + dz)
     } else {
         position
     };
     let tangents = TANGENTS[face as usize];
     let mut side = [0i32; 4];
+    let mut light = [1.0f32; 4];
     let mut translucent = [false; 4];
     let mut cells = [[0i32; 3]; 4];
     for (index, tangent) in tangents.iter().enumerate() {
         let (tx, ty, tz) = offset(*tangent);
         cells[index] = [base.0 + tx, base.1 + ty, base.2 + tz];
-        let behind = snapshot.block(
-            cells[index][0] + dx,
-            cells[index][1] + dy,
-            cells[index][2] + dz,
-        ) >> 4;
-        translucent[index] = behaviour(behind).is_some_and(|entry| entry.material.is_translucent());
-        let cell = (cells[index][0], cells[index][1], cells[index][2]);
-        side[index] = cell_pair(
-            snapshot,
-            cell,
-            behaviour(snapshot.block(cell.0, cell.1, cell.2) >> 4),
-        );
+        let (x, y, z) = (cells[index][0], cells[index][1], cells[index][2]);
+        let value = snapshot.block(x, y, z);
+        side[index] = cell_pair(snapshot, (x, y, z), behaviour(value >> 4));
+        light[index] = ao_light_value(value >> 4);
+        translucent[index] = !blocks_light(snapshot.block(x + dx, y + dy, z + dz) >> 4);
     }
-    let corner = |a: usize, b: usize| -> i32 {
-        if translucent[a] || translucent[b] {
-            return side[a];
+    // The source's `i1`, `j1`, `k1` and `l1`: the first tangent of each pair,
+    // pushed one cell along the second. Each one answers the first tangent's
+    // own value when neither behind-cell is translucent (`:387-442`).
+    let corner = |a: usize, b: usize| -> (i32, f32) {
+        if !translucent[a] && !translucent[b] {
+            return (side[a], light[a]);
         }
         let (bx, by, bz) = offset(tangents[b]);
-        let cell = (cells[a][0] + bx, cells[a][1] + by, cells[a][2] + bz);
-        cell_pair(
-            snapshot,
-            cell,
-            behaviour(snapshot.block(cell.0, cell.1, cell.2) >> 4),
+        let (x, y, z) = (cells[a][0] + bx, cells[a][1] + by, cells[a][2] + bz);
+        let value = snapshot.block(x, y, z);
+        (
+            cell_pair(snapshot, (x, y, z), behaviour(value >> 4)),
+            ao_light_value(value >> 4),
         )
     };
-    let corner_i = corner(0, 2);
-    let corner_j = corner(0, 3);
-    let corner_k = corner(1, 2);
-    let corner_l = corner(1, 3);
-    // `VertexTranslations` names the quad vertex each slot belongs to, and the
-    // four groups the source's plain branch averages into each slot.
+    let (side_i, light_i) = corner(0, 2);
+    let (side_j, light_j) = corner(0, 3);
+    let (side_k, light_k) = corner(1, 2);
+    let (side_l, light_l) = corner(1, 3);
+    let (own_x, own_y, own_z) = position;
+    let neighbour = (own_x + dx, own_y + dy, own_z + dz);
+    let neighbour_value = snapshot.block(neighbour.0, neighbour.1, neighbour.2);
+    let centre = if bounds.face_plane || !is_opaque_cube(neighbour_value >> 4) {
+        cell_pair(snapshot, neighbour, behaviour(neighbour_value >> 4))
+    } else {
+        cell_pair(
+            snapshot,
+            position,
+            behaviour(snapshot.block(own_x, own_y, own_z) >> 4),
+        )
+    };
+    let base_light = {
+        let (x, y, z) = base;
+        ao_light_value(snapshot.block(x, y, z) >> 4)
+    };
+    // The source's plain branch, slot for slot (`:491-502`): each vertex's
+    // light is `getAoBrightness` over two tangents, the corner between them and
+    // the centre, and its multiplier is the mean of the same four cells'
+    // ambient-occlusion light values.
+    let plain_pair = [
+        ao_brightness(side[3], side[0], side_j, centre),
+        ao_brightness(side[2], side[0], side_i, centre),
+        ao_brightness(side[2], side[1], side_k, centre),
+        ao_brightness(side[3], side[1], side_l, centre),
+    ];
+    let plain_multiplier = [
+        (light[3] + light[0] + light_j + base_light) * 0.25,
+        (light[2] + light[0] + light_i + base_light) * 0.25,
+        (light[2] + light[1] + light_k + base_light) * 0.25,
+        (light[3] + light[1] + light_l + base_light) * 0.25,
+    ];
+    let (slot_pair, slot_multiplier) = match (bounds.partial, ORIENTATIONS[face as usize]) {
+        (true, Some(arrays)) => {
+            // The occlusion-weighted branch (`:454-488`): a quad that does not
+            // span its face's whole extent on a north, south, west or east face
+            // mixes the four plain values through the per-slot quad-bounds
+            // products, which for a partial quad are the two fractions of the
+            // face's other axes each vertex's corner sees.
+            let quad_bounds = bounds.oriented();
+            let products = |array: &[u8; 8]| -> [f32; 4] {
+                [
+                    quad_bounds[array[0] as usize] * quad_bounds[array[1] as usize],
+                    quad_bounds[array[2] as usize] * quad_bounds[array[3] as usize],
+                    quad_bounds[array[4] as usize] * quad_bounds[array[5] as usize],
+                    quad_bounds[array[6] as usize] * quad_bounds[array[7] as usize],
+                ]
+            };
+            let weighted: [[f32; 4]; 4] = std::array::from_fn(|slot| products(&arrays[slot]));
+            let mixed_pair = std::array::from_fn(|slot| weighted_pair(plain_pair, &weighted[slot]));
+            let mixed_multiplier = std::array::from_fn(|slot| {
+                plain_multiplier[0] * weighted[slot][0]
+                    + plain_multiplier[1] * weighted[slot][1]
+                    + plain_multiplier[2] * weighted[slot][2]
+                    + plain_multiplier[3] * weighted[slot][3]
+            });
+            (mixed_pair, mixed_multiplier)
+        }
+        _ => (plain_pair, plain_multiplier),
+    };
+    // `VertexTranslations` names the quad vertex each slot belongs to.
     let slots = VERTEX_SLOTS[face as usize];
     let mut pairs = [0i32; 4];
-    pairs[slots[0]] = ao_brightness(side[3], side[0], corner_j, centre);
-    pairs[slots[1]] = ao_brightness(side[2], side[0], corner_i, centre);
-    pairs[slots[2]] = ao_brightness(side[2], side[1], corner_k, centre);
-    pairs[slots[3]] = ao_brightness(side[3], side[1], corner_l, centre);
-    pairs
+    let mut multipliers = [0f32; 4];
+    for slot in 0..4 {
+        pairs[slots[slot]] = slot_pair[slot];
+        multipliers[slots[slot]] = slot_multiplier[slot];
+    }
+    AmbientCorners { pairs, multipliers }
+}
+
+/// `getVertexBrightness`: the four plain vertex pairs mixed by one slot's
+/// quad-bounds products, per 16-bit light field, truncating
+/// (`BlockModelRenderer.java:526-531`).
+fn weighted_pair(plain: [i32; 4], weights: &[f32; 4]) -> i32 {
+    let field = |shift: u32| -> i32 {
+        let mut sum = 0.0f32;
+        for (index, weight) in weights.iter().enumerate() {
+            sum += ((plain[index] >> shift) & 0xFF) as f32 * weight;
+        }
+        (sum as i32) & 0xFF
+    };
+    (field(16) << 16) | field(0)
+}
+
+/// `Block.getAmbientOcclusionLightValue()`: `0.2` for a normal cube and `1.0`
+/// for everything else (`block/Block.java:1099-1102`), where a normal cube is
+/// the material blocking movement and the block being a full cube
+/// (`isBlockNormalCube`, `:347-350`). Air, and an id outside the table, are not
+/// normal cubes.
+fn ao_light_value(id: u16) -> f32 {
+    match behaviour(id) {
+        Some(entry) if entry.material.blocks_movement() && entry.full_cube => 0.2,
+        _ => 1.0,
+    }
+}
+
+/// `Block.isTranslucent()` (`block/Block.java:215-223`): the block's material
+/// does not block light. Air, and an id outside the table, block nothing —
+/// the same non-occluding default the cull rule gives them.
+fn blocks_light(id: u16) -> bool {
+    behaviour(id).is_some_and(|entry| entry.material.blocks_light())
+}
+
+/// `Block.isOpaqueCube()` as the behaviour table's `occludes` column: whether
+/// the block at a cell hides a neighbour's face against it.
+fn is_opaque_cube(id: u16) -> bool {
+    behaviour(id).is_some_and(|entry| entry.occludes)
 }
 
 /// `getAoBrightness`: the two channels' four-sample average, with a zero sample
@@ -532,25 +698,88 @@ fn light_attribute(packed: i32) -> [u16; 2] {
     [field(16), field(0)]
 }
 
-/// Whether a quad's four corners cover a block face: every coordinate at 0 or
-/// 1, with one axis constant and the other two reaching both ends.
+/// A quad's bounds and the two flags `fillQuadBounds` sets.
+struct QuadBounds {
+    /// The quad's bounds in the source's `quadBounds` order: the minimum y,
+    /// maximum y, minimum z, maximum z, minimum x and maximum x
+    /// (`BlockModelRenderer.java:193-207`, indexed by `EnumFacing`'s order).
+    bounds: [f32; 6],
+    /// The source's flag 0: the quad is the block's face on the face's own
+    /// axis, so the ambient-occlusion base cell is the neighbour behind it.
+    face_plane: bool,
+    /// The source's flag 1: the quad does not span the whole face.
+    partial: bool,
+}
+
+impl QuadBounds {
+    /// The twelve values the orientation table indexes: the six bounds, then
+    /// each one's distance from 1 (`BlockModelRenderer.java:195-206`).
+    fn oriented(&self) -> [f32; 12] {
+        std::array::from_fn(|index| {
+            if index < 6 {
+                self.bounds[index]
+            } else {
+                1.0 - self.bounds[index - 6]
+            }
+        })
+    }
+}
+
+/// `fillQuadBounds` (`BlockModelRenderer.java:171-243`): the quad's own
+/// extents, and the two flags the ambient-occlusion path branches on.
 ///
-/// The source's own flag 0 in `fillQuadBounds` asks whether the quad is the
-/// block's full face; a full cube's face is, a partial element's — a grass
-/// overlay, a stairs step — is not.
-fn covers_full_face(corners: &[[f32; 3]; 4]) -> bool {
+/// Flag 0 is `(the face's own plane is the block's plane || the block is a
+/// full cube) && the quad is flat in the face's axis` — the `isFullCube()`
+/// clause is the source's, so a *partial* element's face on one of the block's
+/// own planes satisfies it while a plain "covers the whole face" test does
+/// not. Flag 1 is true when either of the face's other two axes fails to reach
+/// the block's edge, and only a north, south, west or east quad can then reach
+/// the weighted branch (`EnumNeighborInfo.field_178289_i`, `:454`, `:536-541`).
+fn quad_bounds(face: Face, corners: &[[f32; 3]; 4], full_cube: bool) -> QuadBounds {
     let mut min = [f32::MAX; 3];
     let mut max = [f32::MIN; 3];
     for corner in corners {
         for axis in 0..3 {
-            if corner[axis] != 0.0 && corner[axis] != 1.0 {
-                return false;
-            }
             min[axis] = min[axis].min(corner[axis]);
             max[axis] = max[axis].max(corner[axis]);
         }
     }
-    (0..3).filter(|axis| min[*axis] == max[*axis]).count() == 1
+    let (min_x, max_x) = (min[0], max[0]);
+    let (min_y, max_y) = (min[1], max[1]);
+    let (min_z, max_z) = (min[2], max[2]);
+    let edge = 1.0e-4f32;
+    let almost = 0.9999f32;
+    let (face_plane, partial) = match face {
+        Face::Bottom => (
+            (min_y < edge || full_cube) && min_y == max_y,
+            min_x >= edge || min_z >= edge || max_x <= almost || max_z <= almost,
+        ),
+        Face::Top => (
+            (max_y > almost || full_cube) && min_y == max_y,
+            min_x >= edge || min_z >= edge || max_x <= almost || max_z <= almost,
+        ),
+        Face::North => (
+            (min_z < edge || full_cube) && min_z == max_z,
+            min_x >= edge || min_y >= edge || max_x <= almost || max_y <= almost,
+        ),
+        Face::South => (
+            (max_z > almost || full_cube) && min_z == max_z,
+            min_x >= edge || min_y >= edge || max_x <= almost || max_y <= almost,
+        ),
+        Face::West => (
+            (min_x < edge || full_cube) && min_x == max_x,
+            min_y >= edge || min_z >= edge || max_y <= almost || max_z <= almost,
+        ),
+        Face::East => (
+            (max_x > almost || full_cube) && min_x == max_x,
+            min_y >= edge || min_z >= edge || max_y <= almost || max_z <= almost,
+        ),
+    };
+    QuadBounds {
+        bounds: [min_y, max_y, min_z, max_z, min_x, max_x],
+        face_plane,
+        partial,
+    }
 }
 
 /// The four tangent neighbours of each face, in the source's own order:
@@ -565,6 +794,54 @@ const TANGENTS: [[FaceDir; 4]; 6] = [
     [FaceDir::West, FaceDir::East, FaceDir::Down, FaceDir::Up],
     [FaceDir::Up, FaceDir::Down, FaceDir::North, FaceDir::South],
     [FaceDir::Down, FaceDir::Up, FaceDir::North, FaceDir::South],
+];
+
+/// `EnumNeighborInfo`'s four orientation arrays per face
+/// (`BlockModelRenderer.java:536-541`), as the quad-bound indexes they name:
+/// `Orientation`'s index is `EnumFacing`'s order — down 0, up 1, north 2,
+/// south 3, west 4, east 5 — plus six for the flipped form (`:578-599`), and
+/// `quadBounds` is indexed the same way (`:195-206`).
+///
+/// The outer index is [`Face`]'s declaration order and the inner one the
+/// source's field order: `field_178286_j` for the first vertex,
+/// `field_178287_k`, `field_178284_l` and `field_178285_m` for the rest. `Top`
+/// and `Bottom` carry no arrays — the source's `field_178289_i` is false for
+/// them, so the weighted branch never runs on a vertical face (`:454`).
+const ORIENTATIONS: [Option<[[u8; 8]; 4]>; 6] = [
+    None,
+    None,
+    // NORTH: UP, FLIP_WEST, UP, WEST, FLIP_UP, WEST, FLIP_UP, FLIP_WEST and
+    // the three sibling arrays.
+    Some([
+        [1, 10, 1, 4, 7, 4, 7, 10],
+        [1, 11, 1, 5, 7, 5, 7, 11],
+        [0, 11, 0, 5, 6, 5, 6, 11],
+        [0, 10, 0, 4, 6, 4, 6, 10],
+    ]),
+    // SOUTH: UP, FLIP_WEST, FLIP_UP, FLIP_WEST, FLIP_UP, WEST, UP, WEST and
+    // the three sibling arrays.
+    Some([
+        [1, 10, 7, 10, 7, 4, 1, 4],
+        [0, 10, 6, 10, 6, 4, 0, 4],
+        [0, 11, 6, 11, 6, 5, 0, 5],
+        [1, 11, 7, 11, 7, 5, 1, 5],
+    ]),
+    // WEST: UP, SOUTH, UP, FLIP_SOUTH, FLIP_UP, FLIP_SOUTH, FLIP_UP, SOUTH and
+    // the three sibling arrays.
+    Some([
+        [1, 3, 1, 9, 7, 9, 7, 3],
+        [1, 2, 1, 8, 7, 8, 7, 2],
+        [0, 2, 0, 8, 6, 8, 6, 2],
+        [0, 3, 0, 9, 6, 9, 6, 3],
+    ]),
+    // EAST: FLIP_DOWN, SOUTH, FLIP_DOWN, FLIP_SOUTH, DOWN, FLIP_SOUTH, DOWN,
+    // SOUTH and the three sibling arrays.
+    Some([
+        [6, 3, 6, 9, 0, 9, 0, 3],
+        [6, 2, 6, 8, 0, 8, 0, 2],
+        [7, 2, 7, 8, 1, 8, 1, 2],
+        [7, 3, 7, 9, 1, 9, 1, 3],
+    ]),
 ];
 
 /// `VertexTranslations`: the quad vertex each face's four ambient-occlusion

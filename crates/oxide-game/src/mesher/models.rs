@@ -85,17 +85,13 @@ impl Alternatives {
 /// The index a position picks among `total` weights: the source's
 /// `MathHelper.abs((int) hash >> 16) % total`.
 ///
-/// The shift is the sign-preserving one over the hash's low 32 bits, and
-/// `MathHelper.abs` leaves `i32::MIN` negative, which in the source makes the
-/// running total start below zero and picks the first entry; that case answers
-/// 0 here.
+/// The cast takes the hash's low 32 bits and the shift is the sign-preserving
+/// one, so the shifted value is an `i32` in `-32768..=32767`: its absolute
+/// value cannot overflow, and the shifted value is exactly the source's
+/// `(int)hash >> 16`.
 fn alternative_index(hash: i64, total: u32) -> u32 {
     let shifted = ((hash as u32) as i32) >> 16;
-    let magnitude = shifted.wrapping_abs();
-    if magnitude < 0 {
-        return 0;
-    }
-    (magnitude as u32) % total
+    (shifted.wrapping_abs() as u32) % total
 }
 
 /// `MathHelper.getCoordinateRandom`: the per-position hash the weighted pick

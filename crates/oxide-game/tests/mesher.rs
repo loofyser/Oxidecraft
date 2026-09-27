@@ -17,14 +17,15 @@ use oxide_game::mesher::{
 };
 use oxide_proto_v47::column::{ColumnData, SectionData};
 use oxide_render::terrain::{ChunkMesh, Vertex};
-use oxide_world::behaviour::{TintKind, behaviour, covered_ids};
-use oxide_world::biome::{ColorMap, TintMaps, tint_at_9_biome};
+use oxide_world::behaviour::{behaviour, covered_ids};
+use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
 use oxide_world::world::World;
 
 /// The block ids the tests use.
 const STONE: u16 = 1;
 const GRASS: u16 = 2;
+const DIRT: u16 = 3;
 const PLANKS: u16 = 5;
 const WATER: u16 = 8;
 const LEAVES: u16 = 18;
@@ -32,7 +33,23 @@ const GLASS: u16 = 20;
 const LOG: u16 = 17;
 const TALLGRASS: u16 = 31;
 const SPAWNER: u16 = 52;
+const STAIRS: u16 = 67;
 const GLOWSTONE: u16 = 89;
+
+/// One state mapper arm's expectation: the block id, the metadata value, and
+/// the literal `(file, key)` the mapper must answer — `None` for the five ids
+/// the client builds in.
+type MapperArm = (u16, u8, Option<(&'static str, &'static str)>);
+
+/// Asserts each listed state's mapped `(file, key)` against its literal.
+fn assert_targets(arms: &[MapperArm]) {
+    for &(id, meta, expected) in arms {
+        let row = behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"));
+        let answer = blockstate_target(row, meta);
+        let expected = expected.map(|(file, key)| (file.to_string(), key.to_string()));
+        assert_eq!(answer, expected, "id {id} meta {meta}");
+    }
+}
 
 /// One wire block value: the id and its metadata.
 fn state(id: u16, meta: u8) -> u16 {
@@ -325,6 +342,26 @@ fn probe_tree() -> Tree {
     tree.blockstates("mob_spawner", &normal("probe_cube"));
     tree.blockstates("glowstone", &normal("probe_cube"));
     tree.blockstates("tall_grass", &normal("probe_cross"));
+    tree.blockstates("dirt", &normal("probe_cube"));
+
+    // A stairs-like partial element: the lower step of the stairs model, a
+    // half-height box whose four side faces span the y 0..8 band of the block
+    // and are culled against their own sides. The stair state the tests place
+    // is meta 0: east-facing, bottom half, straight.
+    tree.model(
+        "probe_step",
+        r##"{"textures": {"all": "blocks/probe"}, "elements": [
+            {"from": [0, 0, 0], "to": [16, 8, 16], "faces": {
+                "down": {"texture": "#all", "cullface": "down"},
+                "north": {"texture": "#all", "cullface": "north"},
+                "south": {"texture": "#all", "cullface": "south"},
+                "west": {"texture": "#all", "cullface": "west"},
+                "east": {"texture": "#all", "cullface": "east"}}}]}"##,
+    );
+    tree.blockstates(
+        "stone_stairs",
+        r#"{"variants": {"facing=east,half=bottom,shape=straight": [{"model": "minecraft:probe_step"}]}}"#,
+    );
     tree.blockstates(
         "grass",
         r#"{"variants": {"snowy=false": [{"model": "minecraft:probe_grass"}]}}"#,
@@ -876,14 +913,172 @@ fn the_ambient_occlusion_path_weights_the_four_cells() {
 }
 
 #[test]
+fn a_concave_corner_multiplies_its_vertex_by_the_cells_light_value() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Maximum);
+
+    // The stone's top face, whatever is around it: the four vertices' colours.
+    let top_colours = |world: &World| -> Vec<[u8; 4]> {
+        quads(&mesh_of(world, &ctx))
+            .into_iter()
+            .find(|quad| {
+                quad.iter().all(|vertex| {
+                    vertex.position[1] == 65.0
+                        && (0.0..=1.0).contains(&vertex.position[0])
+                        && (0.0..=1.0).contains(&vertex.position[2])
+                })
+            })
+            .expect("the stone's top face")
+            .iter()
+            .map(|vertex| vertex.colour)
+            .collect()
+    };
+
+    // Nothing around it: all four cells of every vertex are air —
+    // `getAmbientOcclusionLightValue()` 1.0 for each — so every multiplier is
+    // 1.0 and the colour is the top face's own shade byte, 255. This world
+    // cannot tell a missing multiplier from a present one.
+    let lone = daylight(&[(0, 64, 0, state(STONE, 0))]);
+    assert_eq!(top_colours(&lone), [[255, 255, 255, 255]; 4]);
+
+    // One solid block at the east-and-south corner of the top face's east
+    // slot, (1, 65, 1). A normal cube answers 0.2 there — the material blocks
+    // movement and the block is a full cube — so that vertex's multiplier is
+    // (0.2 + 1.0 + 1.0 + 1.0) / 4 = 0.8: 255 * 0.8 = 204, and the other three
+    // vertices keep the full byte.
+    let one = daylight(&[(0, 64, 0, state(STONE, 0)), (1, 65, 1, state(STONE, 0))]);
+    assert_eq!(
+        top_colours(&one),
+        [
+            [255, 255, 255, 255],
+            [255, 255, 255, 255],
+            [204, 204, 204, 255],
+            [255, 255, 255, 255],
+        ]
+    );
+
+    // The east tangent cell solid too — (1, 65, 0) — puts two 0.2 values in
+    // that same slot: (0.2 + 0.2 + 1.0 + 1.0) / 4 = 0.6, so 153. That cell is
+    // also one of the *next* slot's four, which drops to
+    // (0.2 + 1.0 + 1.0 + 1.0) / 4 = 0.8 = 204; the remaining two vertices hold
+    // the face's own byte.
+    let two = daylight(&[
+        (0, 64, 0, state(STONE, 0)),
+        (1, 65, 0, state(STONE, 0)),
+        (1, 65, 1, state(STONE, 0)),
+    ]);
+    assert_eq!(
+        top_colours(&two),
+        [
+            [255, 255, 255, 255],
+            [255, 255, 255, 255],
+            [153, 153, 153, 255],
+            [204, 204, 204, 255],
+        ]
+    );
+}
+
+#[test]
+fn a_partial_elements_face_takes_the_quad_bounds_paths() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Maximum);
+
+    // The stair state must resolve, or the mesh would be the fallback cube.
+    assert!(
+        matches!(models.model(STAIRS, 0, 0, 64, 2), ModelChoice::Model(_)),
+        "the east-facing bottom stair state"
+    );
+
+    // The step at (0, 64, 2): its west face is the block's plane at x = 0 and
+    // spans y 0..8 of the 16-unit box, so `fillQuadBounds`'s flag 0 holds — the
+    // block is not a full cube but the quad *is* the face's own plane — and its
+    // flag 1 holds too (y does not reach 1), which puts a west face through the
+    // occlusion-weighted branch. The cells the west face reads sit in the
+    // western border strip, one column over; each carries its own sky level,
+    // and the block at (-1, 65, 1) is solid, so that corner cell's
+    // ambient-occlusion light value is 0.2 where the rest are 1.0.
+    let data = column(&[(0, 64, 2, state(STAIRS, 0))], |_, _| 1, |_, _, _| (0, 0));
+    let west = column(
+        &[(15, 65, 1, state(STONE, 0))],
+        |_, _| 1,
+        |x, y, z| {
+            if x != 15 {
+                return (0, 0);
+            }
+            match (y, z) {
+                (63, 1) => (7, 0),
+                (63, 2) => (2, 0),
+                (63, 3) => (8, 0),
+                (64, 1) => (3, 0),
+                (64, 2) => (6, 0),
+                (64, 3) => (4, 0),
+                (65, 1) => (5, 0),
+                (65, 2) => (1, 0),
+                (65, 3) => (6, 0),
+                _ => (0, 0),
+            }
+        },
+    );
+    let mesh = mesh_of(&world_of(&[(0, 0, data), (-1, 0, west)]), &ctx);
+    let face = quads(&mesh)
+        .into_iter()
+        .find(|quad| quad.iter().all(|vertex| vertex.position[0] == 0.0))
+        .expect("the step's west face")
+        .to_vec();
+
+    // The four slots' plain light pairs, from `getAoBrightness` over the two
+    // tangents, the corner between them and the centre (the neighbour's cell,
+    // 6) — 68, 60, 72 and 80 in the sky field — then mixed by the WEST
+    // orientation table's quad-bounds products (max y = 0.5 with min x = 1 on
+    // the first two rows, 1 - max y on the next two): 74, 66, 72 and 80. The
+    // light attribute is that field with the sampler's eight added, and
+    // `VertexTranslations` puts slot 0 on the third vertex.
+    let lights: Vec<[u16; 2]> = face.iter().map(|vertex| vertex.light).collect();
+    assert_eq!(lights, [[74, 8], [80, 8], [88, 8], [82, 8]]);
+
+    // The colours: the same products mix the four plain multipliers, which are
+    // 1.0 with one corner cell at 0.2 — (0.2 + 1 + 1 + 1) / 4 = 0.8 for the
+    // slot the solid cell sits in. The west face's shade byte is 153, so the
+    // weighted mix is 153 * (0.8 * 0.5 + 1.0 * 0.5) = 153 * 0.9 = 137 for the
+    // first vertex and 153 for the rest.
+    let colours: Vec<[u8; 4]> = face.iter().map(|vertex| vertex.colour).collect();
+    assert_eq!(
+        colours,
+        [
+            [137, 137, 137, 255],
+            [153, 153, 153, 255],
+            [153, 153, 153, 255],
+            [153, 153, 153, 255],
+        ]
+    );
+}
+
+#[test]
 fn the_biome_seam_averages_its_nine_samples() {
     let (models, atlas) = loaded();
     let maps = gradient_maps();
     let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
 
+    // The two pixels the expectations below read, straight out of the map the
+    // mesher is handed: the map holds [column, row, 0, 255], the plains
+    // (temperature 0.8, rainfall 0.4) land on column 50, row 173, and the
+    // desert (temperature 2.0, rainfall 0.0) on column 0, row 255.
+    assert_eq!(
+        maps.grass.pixel(50, 173),
+        Some([50, 173, 0, 255]),
+        "the plains pixel"
+    );
+    assert_eq!(
+        maps.grass.pixel(0, 255),
+        Some([0, 255, 0, 255]),
+        "the desert pixel"
+    );
+
     // The grass sits at the east edge of a plains column whose eastern
-    // neighbour is desert: six of the nine samples are the block's own biome
-    // and three are the neighbour's.
+    // neighbour is desert, so six of the nine samples are plains and three
+    // desert: (6 * 50 + 3 * 0) / 9 = 33 and (6 * 173 + 3 * 255) / 9 = 200.
     let world = world_of(&[
         (
             0,
@@ -897,55 +1092,72 @@ fn the_biome_seam_averages_its_nine_samples() {
         .find_map(|(_, mesh)| mesh)
         .expect("a loaded section");
 
-    let plains = tint_at_9_biome(&maps, 15, 64, 5, TintKind::Grass, |_, _| 1);
-    let desert = tint_at_9_biome(&maps, 15, 64, 5, TintKind::Grass, |_, _| 2);
-    assert_ne!(plains, desert, "the two biomes must tint differently");
-    let average: Vec<u8> = (0..3)
-        .map(|channel| {
-            ((6 * u32::from(plains[channel]) + 3 * u32::from(desert[channel])) / 9) as u8
-        })
-        .collect();
-
     let mesh_quads = quads(&mesh);
     assert_eq!(
         mesh_quads.len(),
         10,
         "six base quads and a four-sided overlay"
     );
-    assert_eq!(
-        mesh_quads[1][0].colour,
-        [average[0], average[1], average[2], 255],
-        "the tinted top"
-    );
-    // The base's own sides and bottom carry no tint index: white, shaded.
-    for (index, shade) in [(0usize, 0.5f32), (2, 0.8), (3, 0.8), (4, 0.6), (5, 0.6)] {
-        let channel = (255.0 * shade) as u8;
+    // The tinted top face: the averaged tint times the top's shade byte, 255.
+    assert_eq!(mesh_quads[1][0].colour, [33, 200, 0, 255], "the tinted top");
+    // The base's own sides and bottom carry no tint index: white, shaded by
+    // each face's own byte — down 127, north and south 204, west and east 153.
+    for (index, shade) in [(0usize, 127u8), (2, 204), (3, 204), (4, 153), (5, 153)] {
         assert_eq!(
             mesh_quads[index][0].colour,
-            [channel, channel, channel, 255],
+            [shade, shade, shade, 255],
             "untinted quad {index}"
         );
     }
     // The overlay's four side faces are tinted by the same average, each
-    // shaded by its own face's brightness: north and south 0.8, west and east
-    // 0.6 — the values the base's untinted sides carry above.
+    // shaded by its own face's byte: 204 * 33 / 255 = 26 and 153 * 33 / 255 =
+    // 19 on the first channel, 204 * 200 / 255 = 160 and 153 * 200 / 255 = 120
+    // on the second.
     for quad in &mesh_quads[6..] {
-        let shade = if quad
+        let north_or_south = quad
             .iter()
-            .all(|vertex| vertex.position[2] == quad[0].position[2])
-        {
-            0.8
+            .all(|vertex| vertex.position[2] == quad[0].position[2]);
+        let expected = if north_or_south {
+            [26, 160, 0, 255]
         } else {
-            0.6
+            [19, 120, 0, 255]
         };
-        let expected = [
-            (f32::from(average[0]) * shade) as u8,
-            (f32::from(average[1]) * shade) as u8,
-            (f32::from(average[2]) * shade) as u8,
-            255,
-        ];
         assert_eq!(quad[0].colour, expected, "the tinted overlay");
     }
+
+    // One biome's own colour, with no seam to average over: every one of the
+    // nine samples is plains, so the tint is the plains pixel itself.
+    let plains = world_of(&[(
+        0,
+        0,
+        column(&[(5, 64, 5, state(GRASS, 0))], |_, _| 1, |_, _, _| (15, 0)),
+    )]);
+    let mesh = mesh_of(&plains, &ctx);
+    assert_eq!(
+        quads(&mesh)[1][0].colour,
+        [50, 173, 0, 255],
+        "one biome tints with its own pixel"
+    );
+
+    // A block whose model carries no tint index stays white whatever the biome
+    // is: a dirt cube in the desert tints nothing, so its top face is the up
+    // shade byte over white and its north face the north byte.
+    let dirt = world_of(&[(
+        0,
+        0,
+        column(&[(5, 64, 5, state(DIRT, 0))], |_, _| 2, |_, _, _| (15, 0)),
+    )]);
+    let mesh = mesh_of(&dirt, &ctx);
+    assert_eq!(
+        quads(&mesh)[1][0].colour,
+        [255, 255, 255, 255],
+        "the dirt's top is untinted"
+    );
+    assert_eq!(
+        quads(&mesh)[2][0].colour,
+        [204, 204, 204, 255],
+        "the dirt's north face is untinted"
+    );
 }
 
 #[test]
@@ -1054,32 +1266,90 @@ fn weighted_alternatives_follow_the_positions_hash() {
 
 #[test]
 fn the_state_mapper_names_literals() {
-    // Stone: the variant property names the file, and the key drops it.
-    let stone = behaviour(STONE).expect("stone is covered");
-    assert_eq!(
-        blockstate_target(stone, 0),
-        Some(("stone".to_string(), "normal".to_string()))
-    );
-    let planks = behaviour(PLANKS).expect("planks are covered");
-    assert_eq!(
-        blockstate_target(planks, 1),
-        Some(("spruce_planks".to_string(), "normal".to_string()))
-    );
-    // A log keeps its axis in the key: meta 5 is the spruce variant on the x
-    // axis.
-    let log = behaviour(LOG).expect("logs are covered");
-    assert_eq!(
-        blockstate_target(log, 5),
-        Some(("spruce_log".to_string(), "axis=x".to_string()))
-    );
-    // Grass keeps its whole property string, and the client builds water in.
-    let grass = behaviour(GRASS).expect("grass is covered");
-    assert_eq!(
-        blockstate_target(grass, 0),
-        Some(("grass".to_string(), "snowy=false".to_string()))
-    );
-    let water = behaviour(WATER).expect("water is covered");
-    assert_eq!(blockstate_target(water, 0), None);
+    // Every arm the mapper answers with a file of its own, pinned to the
+    // literal `(file, key)` the client's state mapper registers. A wrong name
+    // here turns a covered id into the fallback cube without failing any other
+    // test, so each arm carries at least one state, and the entries that share
+    // an arm carry the values that exercise its own rule: the dropped
+    // properties, the suffix, the seamless bit, the axis.
+    let arms: [MapperArm; 28] = [
+        // `Plain`: the registry name and the whole property string.
+        (4, 0, Some(("cobblestone", "normal"))),
+        (GRASS, 0, Some(("grass", "snowy=false"))),
+        // `Name` on the variant: the file is the variant, the key drops it.
+        (STONE, 0, Some(("stone", "normal"))),
+        (12, 1, Some(("red_sand", "normal"))),
+        (98, 3, Some(("chiseled_stonebrick", "normal"))),
+        // `Name` with a suffix.
+        (PLANKS, 1, Some(("spruce_planks", "normal"))),
+        (LOG, 5, Some(("spruce_log", "axis=x"))),
+        (162, 8, Some(("acacia_log", "axis=z"))),
+        // Leaves: `check_decay` and `decayable` never reach the key.
+        (LEAVES, 0, Some(("oak_leaves", "normal"))),
+        (LEAVES, 8, Some(("oak_leaves", "normal"))),
+        (161, 1, Some(("dark_oak_leaves", "normal"))),
+        // The plants and wools named by their type and colour.
+        (24, 2, Some(("smooth_sandstone", "normal"))),
+        (31, 0, Some(("dead_bush", "normal"))),
+        (31, 1, Some(("tall_grass", "normal"))),
+        (31, 2, Some(("fern", "normal"))),
+        (37, 0, Some(("dandelion", "normal"))),
+        (38, 1, Some(("blue_orchid", "normal"))),
+        (38, 8, Some(("oxeye_daisy", "normal"))),
+        (35, 2, Some(("magenta_wool", "normal"))),
+        // The double plant: `facing` dropped, `half` kept.
+        (175, 0, Some(("sunflower", "half=lower"))),
+        (175, 8, Some(("sunflower", "half=upper"))),
+        // `Ignore`: one property dropped, the rest of the key kept whole.
+        (46, 0, Some(("tnt", "normal"))),
+        (
+            64,
+            0,
+            Some((
+                "wooden_door",
+                "facing=east,half=lower,hinge=left,open=false",
+            )),
+        ),
+        (
+            64,
+            8,
+            Some((
+                "wooden_door",
+                "facing=north,half=upper,hinge=left,open=false",
+            )),
+        ),
+        (81, 0, Some(("cactus", "normal"))),
+        (83, 0, Some(("reeds", "normal"))),
+        // `Dirt`: the variant names the file, `snowy` stays for the podzol.
+        (DIRT, 2, Some(("podzol", "snowy=false"))),
+        // `DoubleSlab`: the seamless bit answers `all` over the variant's file.
+        (43, 8, Some(("stone_double_slab", "all"))),
+    ];
+    assert_targets(&arms);
+
+    // The remaining states of the arms whose answer turns on the state: the
+    // dirt variants, the double slabs' variant and seamless combinations, the
+    // quartz column's three axes, the dead bush block, and the five ids the
+    // client builds in with no file at all.
+    let singles: [MapperArm; 12] = [
+        (DIRT, 0, Some(("dirt", "normal"))),
+        (DIRT, 1, Some(("coarse_dirt", "normal"))),
+        (43, 0, Some(("stone_double_slab", "normal"))),
+        (43, 1, Some(("sandstone_double_slab", "normal"))),
+        (43, 12, Some(("brick_double_slab", "all"))),
+        (155, 0, Some(("quartz_block", "normal"))),
+        (155, 1, Some(("chiseled_quartz_block", "normal"))),
+        (155, 2, Some(("quartz_column", "axis=y"))),
+        (155, 3, Some(("quartz_column", "axis=x"))),
+        (155, 4, Some(("quartz_column", "axis=z"))),
+        (32, 0, Some(("dead_bush", "normal"))),
+        (4, 4, Some(("cobblestone", "normal"))),
+    ];
+    assert_targets(&singles);
+    for id in [WATER, 9, 10, 11, 54] {
+        let row = behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"));
+        assert_eq!(blockstate_target(row, 0), None, "id {id} has no file");
+    }
     assert!(behaviour(200).is_none());
 }
 
