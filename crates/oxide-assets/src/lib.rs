@@ -6,6 +6,7 @@ pub mod extract;
 pub mod fetch;
 pub mod http;
 pub mod mcmeta;
+pub mod model;
 pub mod resources;
 pub mod store;
 pub mod texture;
