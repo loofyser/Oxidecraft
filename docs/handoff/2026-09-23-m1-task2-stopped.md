@@ -23,11 +23,11 @@ singleplayer worlds and Java mod compatibility (spec section 17, revision v4).
   `docs/research/protocol-47-reference.md` (byte-level truth for everything on the wire), and the
   progress ledger `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md` (the pre-flight scan
   table, the rulings, and the per-task history — it is the recovery map after any context loss).
-- How the work is run: one task at a time, in plan order. Per task: extract the brief
-  (`bash <superpowers>/skills/subagent-driven-development/scripts/task-brief docs/plans/2026-09-23-m1-bytes-to-world.md N`),
-  dispatch a fresh implementer on it, then an independent reviewer over the diff package
-  (`scripts/review-package PLAN_FILE BASE HEAD`); fix rounds close findings; every decision taken on
-  the owner's behalf is a `Ruling:` line in the ledger and must be listed in the final report.
+- How the work is run: one task at a time, in plan order. Per task: extract the brief from the plan
+  into `task-N-brief.md`, carry the task out against that brief alone, then have the task's frozen
+  diff (`review-BASE..HEAD.diff`) reviewed independently; fix rounds close the findings; every
+  decision taken on the owner's behalf is a `Ruling:` line in the ledger and must be listed in the
+  final report.
 - Rules that must not be broken: GPL-3.0; zero code copied from RustCraft (read-only reference); no
   Mojang asset, jar, `.class`, `.ogg`, or `.png` committed and no `.class` ever read at runtime;
   rust-version 1.85, edition 2024, committed `Cargo.lock`; every public item documented and
