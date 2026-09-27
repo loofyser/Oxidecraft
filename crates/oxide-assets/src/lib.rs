@@ -2,6 +2,7 @@
 //! baking.
 
 pub mod asset_index;
+pub mod atlas;
 pub mod extract;
 pub mod fetch;
 pub mod http;
