@@ -129,6 +129,41 @@ fn the_palette_colours_the_common_blocks() {
 }
 
 #[test]
+fn the_palette_covers_every_id_the_rig_world_carries() {
+    // Every non-air id the rig's saved world carries within the acceptance
+    // area (a scan of refs/rig/server/parity/region, all chunks within 18 of
+    // the spawn chunk (1, 10)). The acceptance frames must show no magenta
+    // below y=128, and magenta is the missing-entry colour; air never reaches
+    // the palette.
+    const WORLD_IDS: [u16; 55] = [
+        1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 24, 31, 32, 35, 37, 38, 39,
+        40, 43, 48, 49, 50, 52, 53, 54, 56, 58, 59, 60, 64, 65, 67, 72, 73, 81, 82, 83, 85, 86, 99,
+        100, 102, 141, 142, 161, 162, 175,
+    ];
+    for id in WORLD_IDS {
+        for face in Face::ALL {
+            assert_ne!(
+                block_color(id, 0, face),
+                UNKNOWN_COLOR,
+                "id {id} has no palette entry"
+            );
+        }
+    }
+    // The two ids the frames lean on most after the terrain itself: the
+    // acacia and dark oak leaves the scan found most of, and the flowers.
+    let acacia_leaves = block_color(161, 0, Face::Top);
+    assert!(
+        acacia_leaves[1] > acacia_leaves[0] && acacia_leaves[1] > acacia_leaves[2],
+        "acacia leaves are green"
+    );
+    let dandelion = block_color(37, 0, Face::Top);
+    assert!(
+        dandelion[0] > 0.8 && dandelion[1] > 0.8 && dandelion[2] < 0.4,
+        "a dandelion is yellow"
+    );
+}
+
+#[test]
 fn brightness_is_baked_into_the_vertex_colour() {
     let world = world_with(&[(0, 0, 0, 0x0010)]);
     let mesh = build_section_mesh(&world, 0, 0, 0).expect("a mesh");
