@@ -15,6 +15,9 @@ const BLOCKS_PER_SECTION: usize = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
 /// Bytes in one light array: two nibbles to a byte.
 const LIGHT_ARRAY_BYTES: usize = BLOCKS_PER_SECTION / 2;
 
+/// The highest level a light nibble holds.
+const MAX_LEVEL: u8 = 15;
+
 /// Biome ids in one column: one per column position.
 const BIOME_COUNT: usize = SECTION_SIZE * SECTION_SIZE;
 
@@ -68,6 +71,63 @@ impl Section {
             None => 0,
         }
     }
+
+    /// Sets the block-light nibble. Indices must be 0..16.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `level` is above 15: a nibble holds 0..15, and a larger
+    /// value is a programming error.
+    pub fn set_block_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+        let level = light_level(level);
+        pack_nibble(&mut self.block_light, block_index(x, y, z), level);
+    }
+
+    /// Sets the sky-light nibble. Indices must be 0..16.
+    ///
+    /// A write into a section without a sky store — a dimension without sky —
+    /// is a no-op: there is no array to store it in, and the section keeps
+    /// reading 0 there.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `level` is above 15.
+    pub fn set_sky_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+        let level = light_level(level);
+        if let Some(array) = &mut self.sky_light {
+            pack_nibble(array, block_index(x, y, z), level);
+        }
+    }
+}
+
+/// Reads a light level a setter was handed, 0..=15.
+///
+/// # Panics
+///
+/// Panics when `level` is above 15: no nibble holds it, so it is a programming
+/// error rather than a value to clamp.
+fn light_level(level: u8) -> u8 {
+    assert!(level <= MAX_LEVEL, "the light level {level} is above 15");
+    level
+}
+
+/// Writes one light level into a packed nibble array: the inverse of
+/// `unpack_nibble`, which stores an even index in the low nibble of a byte and
+/// an odd index in the high one.
+///
+/// The section setters and the light engine's column write-back share it.
+///
+/// # Panics
+///
+/// Panics when `index` is 4096 or greater: no block slot exists there. `level`
+/// must be 0..=15; the callers validate it.
+pub(crate) fn pack_nibble(array: &mut [u8; LIGHT_ARRAY_BYTES], index: usize, level: u8) {
+    let byte = &mut array[index >> 1];
+    *byte = if index & 1 == 0 {
+        (*byte & 0xF0) | (level & 0x0F)
+    } else {
+        (*byte & 0x0F) | (level << 4)
+    };
 }
 
 /// The stored section for wire data: the wire-to-store bridge.
@@ -194,6 +254,37 @@ impl Chunk {
         }
     }
 
+    /// Sets the block-light nibble at world-local coordinates; y 0..256.
+    ///
+    /// A write into a section the column does not hold is a no-op: the cell
+    /// keeps whichever default its reads give (0 for block light).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `level` is above 15.
+    pub fn set_block_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+        let level = light_level(level);
+        if let Some(section) = self.section_mut(y) {
+            section.set_block_light(x % SECTION_SIZE, y % SECTION_SIZE, z % SECTION_SIZE, level);
+        }
+    }
+
+    /// Sets the sky-light nibble at world-local coordinates; y 0..256.
+    ///
+    /// A write into a section the column does not hold, or into a section
+    /// without a sky store, is a no-op: the cell keeps whichever default its
+    /// reads give (15 for an absent section in a dimension with sky).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `level` is above 15.
+    pub fn set_sky_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+        let level = light_level(level);
+        if let Some(section) = self.section_mut(y) {
+            section.set_sky_light(x % SECTION_SIZE, y % SECTION_SIZE, z % SECTION_SIZE, level);
+        }
+    }
+
     /// Whether the column holds no blocks at all.
     pub fn is_empty(&self) -> bool {
         self.sections
@@ -211,5 +302,10 @@ impl Chunk {
     /// 0..256; anything above has no section.
     fn section_at(&self, y: usize) -> Option<&Section> {
         self.sections.get(y / SECTION_SIZE)?.as_ref()
+    }
+
+    /// The section a y coordinate falls in, mutably, when the column holds it.
+    fn section_mut(&mut self, y: usize) -> Option<&mut Section> {
+        self.sections.get_mut(y / SECTION_SIZE)?.as_mut()
     }
 }
