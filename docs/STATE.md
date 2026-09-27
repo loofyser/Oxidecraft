@@ -38,7 +38,8 @@ specification and continue without asking questions that are already answered he
 - CI: seven jobs — format/lint/test, MSRV 1.85.0, portability (`x86_64-pc-windows-gnu`), release
   build, crate graph, asset guard, licences and advisories. The M0 tagged head `fe2d3b6` is green in
   run `35873490870` (six jobs; the release build was added after the tag). The M1 reviewed head
-  `854ca85` is green in run `36288859598` (all seven jobs). Caveats to carry forward:
+  `854ca85` is green in run `36288859598` (all seven jobs), and the M1 close-out commit `930ccab`
+  (the commit the `m1` tag marks) is green in run `36300166552` (all seven jobs). Caveats to carry forward:
   `aarch64-apple-darwin` is not checked on Linux runners because its C dependencies need the macOS
   SDK; the MSRV job installs the 1.85.0 toolchain per run; `cargo-deny` is pinned to 0.20.2 and
   installed per run. The M0 caveat about the guard scripts being exercised only on the happy path is
