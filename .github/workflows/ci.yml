@@ -73,6 +73,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Crate graph self-test
+        run: bash scripts/check-graph.sh --self-test
       - name: Crate graph check
         run: bash scripts/check-graph.sh
 
@@ -81,6 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Asset guard self-test
+        run: bash scripts/check-assets.sh --self-test
       - name: Asset guard
         run: bash scripts/check-assets.sh
 

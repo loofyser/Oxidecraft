@@ -3,6 +3,9 @@
 #
 # The allowed edges are exactly the 17-edge table in section 5.1 of docs/specs/oxidecraft-v1-design.md.
 # This script fails closed: a missing tool or unreadable metadata is an error, never a pass.
+#
+# The edge check runs over a list of "from -> to" lines, so `--self-test` can feed it
+# fixture lists and assert that allowed edges pass while others are refused.
 set -euo pipefail
 
 for tool in cargo jq grep; do
@@ -39,6 +42,65 @@ allowed() {
   esac
 }
 
+# Checks "from -> to" lines on stdin against the allowed table. Prints the number of
+# edges checked on stdout and every forbidden pair on stderr; returns non-zero when
+# the list contains one.
+check_edges() {
+  local fail=0
+  local count=0
+  local edge from to
+  while IFS= read -r edge; do
+    [ -n "$edge" ] || continue
+    count=$((count + 1))
+    from="${edge%% -> *}"
+    to="${edge##* -> }"
+    if ! allowed "$from" "$to"; then
+      echo "forbidden dependency edge: $edge" >&2
+      fail=1
+    fi
+  done
+  echo "$count"
+  return "$fail"
+}
+
+# Feeds fixture edge lists to check_edges and exits non-zero unless every case behaves
+# as stated. The clean list also carries oxide-game -> oxide-proto, the edge the
+# session's framed connection relies on, so a table edit that drops it fails here.
+self_test() {
+  local fail=0
+  if printf '%s\n' 'oxide-proto-v47 -> oxide-proto' 'oxide-game -> oxide-proto' | check_edges >/dev/null; then
+    echo "self-test: clean edge list passes"
+  else
+    echo "self-test: clean edge list was refused" >&2
+    fail=1
+  fi
+  if printf '%s\n' 'oxide-proto -> oxide-world' | check_edges >/dev/null 2>&1; then
+    echo "self-test: reversed edge was not refused" >&2
+    fail=1
+  else
+    echo "self-test: reversed edge refused"
+  fi
+  if printf '%s\n' 'oxide-game -> oxide-launcher' | check_edges >/dev/null 2>&1; then
+    echo "self-test: game-to-launcher edge was not refused" >&2
+    fail=1
+  else
+    echo "self-test: game-to-launcher edge refused"
+  fi
+  return "$fail"
+}
+
+if [ "$#" -gt 0 ]; then
+  if [ "$#" -gt 1 ] || [ "$1" != "--self-test" ]; then
+    echo "check-graph: unrecognised arguments: $*" >&2
+    exit 1
+  fi
+  if ! self_test; then
+    echo "check-graph: self-test failed" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 if ! metadata="$(cargo metadata --format-version 1 --no-deps)"; then
   echo "check-graph: cargo metadata failed, cannot check the crate graph" >&2
   exit 1
@@ -64,20 +126,9 @@ if ! edges="$(jq -r '.packages[] | .name as $from | .dependencies[] |
   exit 1
 fi
 
-fail=0
-count=0
-while IFS= read -r edge; do
-  [ -n "$edge" ] || continue
-  count=$((count + 1))
-  from="${edge%% -> *}"
-  to="${edge##* -> }"
-  if ! allowed "$from" "$to"; then
-    echo "forbidden dependency edge: $edge" >&2
-    fail=1
-  fi
-done <<<"$edges"
-
-if [ "$fail" -ne 0 ]; then
+status=0
+count="$(printf '%s\n' "$edges" | check_edges)" || status=$?
+if [ "$status" -ne 0 ]; then
   echo "crate graph check failed" >&2
   exit 1
 fi
