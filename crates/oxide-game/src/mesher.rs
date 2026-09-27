@@ -671,9 +671,10 @@ fn ao_light_value(id: u16) -> f32 {
     }
 }
 
-/// `Block.isTranslucent()` (`block/Block.java:215-223`): the block's material
-/// does not block light. Air, and an id outside the table, block nothing —
-/// the same non-occluding default the cull rule gives them.
+/// `Material.blocksLight()` — the source's `Block.translucent` field inverts it
+/// (`block/Block.java:291-297`, read by `isTranslucent()` at `:215-223`):
+/// whether the block's material blocks light. Air, and an id outside the table,
+/// block nothing — the same non-occluding default the cull rule gives them.
 fn blocks_light(id: u16) -> bool {
     behaviour(id).is_some_and(|entry| entry.material.blocks_light())
 }

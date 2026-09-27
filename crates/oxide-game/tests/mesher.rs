@@ -1031,10 +1031,11 @@ fn a_partial_elements_face_takes_the_quad_bounds_paths() {
     // The four slots' plain light pairs, from `getAoBrightness` over the two
     // tangents, the corner between them and the centre (the neighbour's cell,
     // 6) — 68, 60, 72 and 80 in the sky field — then mixed by the WEST
-    // orientation table's quad-bounds products (max y = 0.5 with min x = 1 on
-    // the first two rows, 1 - max y on the next two): 74, 66, 72 and 80. The
-    // light attribute is that field with the sampler's eight added, and
-    // `VertexTranslations` puts slot 0 on the third vertex.
+    // orientation table's quad-bounds products (the WEST arrays read the y and
+    // z bounds — max y = 0.5 on the first two rows, 1 - min y = 1 on the next
+    // two — and never an x bound): 74, 66, 72 and 80. The light attribute is
+    // that field with the sampler's eight added, and `VertexTranslations` puts
+    // slot 0 on the third vertex.
     let lights: Vec<[u16; 2]> = face.iter().map(|vertex| vertex.light).collect();
     assert_eq!(lights, [[74, 8], [80, 8], [88, 8], [82, 8]]);
 
