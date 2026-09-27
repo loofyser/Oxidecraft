@@ -273,3 +273,61 @@ fn an_overlong_locale_is_refused() {
     };
     write_client_settings(&mut out, &settings).expect("seven bytes is within the cap");
 }
+
+#[test]
+fn a_seven_byte_locale_reaches_the_payload_unchanged() {
+    // Exactly seven bytes is within the wire's cap, so the helper writes the
+    // locale in full: the id, the length, the bytes, then the four fields
+    // after them.
+    let settings = ClientSettings {
+        locale: "en_US.#".to_string(),
+        ..ClientSettings::default()
+    };
+    let payload = client_settings_payload(&settings);
+    assert_eq!(payload, b"\x15\x07en_US.#\x08\x00\x01\x7f");
+}
+
+#[test]
+fn an_overlong_locale_is_truncated_at_the_wire_cap() {
+    // The helper has no error channel, so it stays total the one way the wire
+    // allows: the locale keeps its first seven bytes, and the rest of the
+    // packet is untouched. The cut is by bytes, and it is this client's own
+    // contract for the helper — the source gives the cap only. Nine bytes,
+    // `en_US.UTF`, reach the wire as `en_US.U`.
+    let settings = ClientSettings {
+        locale: "en_US.UTF".to_string(),
+        ..ClientSettings::default()
+    };
+    let payload = client_settings_payload(&settings);
+    assert_eq!(payload, b"\x15\x07en_US.U\x08\x00\x01\x7f");
+}
+
+#[test]
+fn an_overlong_locale_of_multibyte_characters_is_cut_on_a_character_boundary() {
+    // The field holds a string, so the cut never lands inside a character:
+    // three three-byte characters exceed the cap, and the helper keeps the
+    // longest prefix the cap can hold rather than put a broken sequence on
+    // the wire.
+    let settings = ClientSettings {
+        locale: "\u{65e5}\u{672c}\u{8a9e}".to_string(), // nine bytes
+        ..ClientSettings::default()
+    };
+    let payload = client_settings_payload(&settings);
+    assert_eq!(payload, b"\x15\x06\xe6\x97\xa5\xe6\x9c\xac\x08\x00\x01\x7f");
+}
+
+#[test]
+fn the_writer_refuses_the_locale_the_payload_helper_truncates() {
+    // One value, two contracts: the writer is for callers with an error
+    // channel and never truncates, while the helper cuts to the cap instead.
+    // Pinning both against the same locale keeps them from drifting into
+    // quiet disagreement.
+    let settings = ClientSettings {
+        locale: "en_US.UTF".to_string(),
+        ..ClientSettings::default()
+    };
+    let mut out = Vec::new();
+    let error = write_client_settings(&mut out, &settings).expect_err("nine bytes is past the cap");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(out.is_empty(), "a refusal writes nothing");
+}

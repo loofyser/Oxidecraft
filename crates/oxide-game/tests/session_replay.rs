@@ -8,8 +8,10 @@ use std::time::Duration;
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
 use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
-use oxide_proto_v47::clientbound::PlayerPositionAndLook;
+use oxide_proto_v47::clientbound::{MapChunkBulk, PlayerPositionAndLook};
 use oxide_proto_v47::serverbound::ClientSettings;
+use oxide_render::terrain::ChunkMesh;
+use oxide_world::world::World;
 
 /// The session config the scripts are written against.
 fn config() -> SessionConfig {
@@ -175,6 +177,31 @@ fn chunk_unload_frame(cx: i32, cz: i32) -> Vec<u8> {
     chunk
 }
 
+/// The committed capture payload for chunk (0, 11): the ground-up column the
+/// rig recorded, mask 0x001f, 61,696 bytes of sections, light and biomes.
+fn fixture_column() -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../oxide-proto-v47/tests/fixtures/m1-capture/column-0_11.bin");
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// One Map Chunk Bulk frame carrying the fixture payload twice: at chunk
+/// (0, 11), where the capture recorded it, and again at (1, 11). The 0x26
+/// shape lists every column's metadata first, then the full payloads.
+fn bulk_frame() -> Vec<u8> {
+    let column = fixture_column();
+    let mut bulk = vec![0x26, 1]; // sky light: the Overworld carries it
+    push_varint(&mut bulk, 2); // two columns
+    for (cx, cz) in [(0i32, 11i32), (1, 11)] {
+        bulk.extend_from_slice(&cx.to_be_bytes());
+        bulk.extend_from_slice(&cz.to_be_bytes());
+        bulk.extend_from_slice(&0x001fu16.to_be_bytes());
+    }
+    bulk.extend_from_slice(&column);
+    bulk.extend_from_slice(&column);
+    bulk
+}
+
 /// Player List Item, add action, for one entry.
 fn player_list_add_frame(uuid: [u8; 16], name: &str) -> Vec<u8> {
     let mut payload = vec![0x38];
@@ -220,6 +247,22 @@ fn updated_column(event: &ClientEvent) -> (i32, i32) {
         ClientEvent::ChunkUpdated { cx, cz, .. } => (*cx, *cz),
         other => panic!("expected a chunk update, got {other:?}"),
     }
+}
+
+/// The section slots of the first `ChunkUpdated` for a column, panicking when
+/// no event reports the column.
+fn updated_slots(events: &[ClientEvent], cx: i32, cz: i32) -> &[(usize, Option<ChunkMesh>)] {
+    events
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::ChunkUpdated {
+                cx: event_cx,
+                cz: event_cz,
+                sections,
+            } if *event_cx == cx && *event_cz == cz => Some(sections.as_slice()),
+            _ => None,
+        })
+        .expect("the column is reported")
 }
 
 #[test]
@@ -615,5 +658,94 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
     assert!(
         first < meshed && last_mesh < second,
         "the meshes are built in the quiet stretch, before the next keepalive: {events:?}"
+    );
+}
+
+#[test]
+fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
+    // The shape a live 1.8.9 server sends on join: one 0x26 frame carrying the
+    // metadata for every column, then their full payloads. The second column
+    // repeats the fixture one chunk east, so the bulk offset arithmetic is on
+    // trial for every value the first column pins.
+    let bulk = bulk_frame();
+    let (stream, outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        bulk.clone(),
+        keep_alive_frame(41),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert!(matches!(events[0], ClientEvent::LoggedIn { .. }));
+    assert!(matches!(
+        events[1],
+        ClientEvent::Joined { dimension: 0, .. }
+    ));
+    // The bulk frame draws no reply of its own, and the keepalive behind it is
+    // still answered.
+    assert!(matches!(events[2], ClientEvent::KeepAlive { id: 41 }));
+    let written = outgoing.lock().unwrap().clone();
+    let mut cursor = &written[..];
+    client_frame(&mut cursor, Compression::Disabled); // handshake
+    client_frame(&mut cursor, Compression::Disabled); // login start
+    client_frame(&mut cursor, SERVER_FRAMING); // client settings
+    client_frame(&mut cursor, SERVER_FRAMING); // brand
+    assert_eq!(
+        client_frame(&mut cursor, SERVER_FRAMING),
+        [0x00, 0x29],
+        "the keepalive echo is the only packet the bulk frame drew"
+    );
+    assert!(cursor.is_empty(), "no further packets were sent");
+
+    // Both columns enter the mesh queue in packet order, and each is reported
+    // the way a single column is: the applied column, then its four
+    // neighbours, in the fixed order the session re-meshes them.
+    let columns: Vec<(i32, i32)> = events[3..].iter().map(updated_column).collect();
+    assert_eq!(
+        columns,
+        vec![
+            (0, 11),
+            (1, 11),
+            (-1, 11),
+            (0, 12),
+            (0, 10), // the first column leads its neighbours
+            (1, 11),
+            (2, 11),
+            (0, 11),
+            (1, 12),
+            (1, 10), // then the second column leads its own
+        ],
+        "both bulk columns are meshed, not just the first"
+    );
+    let sixteen: Vec<usize> = (0..16).collect();
+    for (cx, cz) in [(0, 11), (1, 11)] {
+        let slots = updated_slots(&events, cx, cz);
+        assert_eq!(slots.len(), 16, "({cx}, {cz}) reports all sixteen sections");
+        let indices: Vec<usize> = slots.iter().map(|(index, _)| *index).collect();
+        assert_eq!(indices, sixteen, "({cx}, {cz}) reports them in order");
+    }
+
+    // The values the fixture carries, read through `World::block` on a world
+    // built from the same bytes by the same decode-and-apply path the session
+    // runs — the session owns its world privately, so the test rebuilds it
+    // rather than reaching inside. The fixture's first block is bedrock, the
+    // block the manifest counts 785 of, and its local (14, 62, 5) is grass,
+    // from the manifest's 235.
+    let packet = MapChunkBulk::decode(&bulk[1..]).expect("the scripted frame decodes");
+    let mut world = World::new(true);
+    assert_eq!(world.apply_bulk(&packet), 2, "both columns apply");
+    let first = [world.block(0, 0, 176), world.block(14, 62, 181)];
+    let second = [world.block(16, 0, 176), world.block(30, 62, 181)];
+    assert_eq!(
+        first,
+        [0x0070, 0x0020],
+        "bedrock at the column's bottom, grass at local (14, 62, 5)"
+    );
+    assert_eq!(
+        second, first,
+        "the column at (1, 11) is a faithful copy of the column at (0, 11)"
     );
 }

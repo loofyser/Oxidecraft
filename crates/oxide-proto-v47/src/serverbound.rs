@@ -139,13 +139,36 @@ pub fn write_plugin_message(mut out: impl Write, channel: &str, data: &[u8]) -> 
     out.write_all(data)
 }
 
+/// The locale cut to the wire's seven-byte cap, on a character boundary.
+///
+/// A locale at or under the cap is returned unchanged; a longer one keeps its
+/// longest prefix of at most seven bytes. The field carries a string, so the
+/// cut stops at a character boundary rather than inside one.
+fn capped_locale(locale: &str) -> &str {
+    let mut end = locale.len().min(LOCALE_MAX_BYTES);
+    while !locale.is_char_boundary(end) {
+        end -= 1;
+    }
+    &locale[..end]
+}
+
 /// The Client Settings payload as bytes, for byte-exact assertions.
 ///
-/// Panics when the settings are invalid — the locale cap refuses a locale over
-/// seven bytes and this helper has no error channel.
+/// The helper is total: every value produces a payload, and no locale makes
+/// it panic. The locale field is capped at seven bytes by the protocol — the
+/// reference's §2.2 Client Settings row — so an overlong locale is cut to its
+/// longest prefix of at most seven bytes, never inside a character, before
+/// the packet is written. The cap is the protocol's; the cut is this client's
+/// own contract for a helper with no error channel. A caller that would
+/// rather hear about an overlong locale uses [`write_client_settings`], which
+/// refuses one instead of cutting it.
 pub fn client_settings_payload(settings: &ClientSettings) -> Vec<u8> {
+    let capped = ClientSettings {
+        locale: capped_locale(&settings.locale).to_string(),
+        ..settings.clone()
+    };
     let mut out = Vec::new();
-    write_client_settings(&mut out, settings).expect("the locale is within its cap");
+    write_client_settings(&mut out, &capped).expect("a locale within the cap always writes");
     out
 }
 

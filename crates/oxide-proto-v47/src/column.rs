@@ -80,6 +80,13 @@ pub fn unpack_nibble(array: &[u8; 2048], index: usize) -> u8 {
 /// Reads a block value's `(id, meta)` pair by coordinate.
 ///
 /// The id is the full 12-bit field the wire carries, not an eight-bit id.
+///
+/// # Panics
+///
+/// Panics when the index computed from `x`, `y` and `z` is 4096 or greater:
+/// no block slot exists there. Each coordinate is `0..16`, and a `y` of 16 or
+/// above is the case that reaches past the array. The column decoder never
+/// calls it out of range — a section it hands out holds all 4096 slots.
 pub fn unpack_block(blocks: &[u16; 4096], x: usize, y: usize, z: usize) -> (u16, u8) {
     let value = blocks[block_index(x, y, z)];
     (value >> 4, (value & 0x0F) as u8)
