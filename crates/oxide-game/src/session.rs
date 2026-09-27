@@ -498,18 +498,33 @@ fn recv_frame<S: Read + Write>(conn: &mut Conn<S>) -> Result<Option<Vec<u8>>, Se
 ///
 /// A stream that simply stops leaves a read at the end of the file, and a frame
 /// cut off mid-write leaves `read_exact` with an unexpected end; both are how a
-/// server closes a session, so both end the loop quietly.
+/// server closes a session, so both end the loop quietly. A server that exits
+/// abruptly can reset or abort the connection instead of ending it tidily,
+/// which is the same close seen from this end, so those end it quietly too.
 fn is_stream_end(error: &FrameError) -> bool {
     match error {
-        FrameError::Io(cause) => cause.kind() == io::ErrorKind::UnexpectedEof,
+        FrameError::Io(cause) => closed_by_peer(cause.kind()),
         FrameError::VarInt(VarIntError::UnexpectedEof) => true,
-        FrameError::VarInt(VarIntError::Io(cause)) => cause.kind() == io::ErrorKind::UnexpectedEof,
+        FrameError::VarInt(VarIntError::Io(cause)) => closed_by_peer(cause.kind()),
         FrameError::VarInt(VarIntError::TooLong)
         | FrameError::TooLong(..)
         | FrameError::NegativeLength(..)
         | FrameError::BadCompression
         | FrameError::EmptyPayload => false,
     }
+}
+
+/// Whether an IO error kind is the peer closing the connection.
+///
+/// An unexpected end of file, a reset and an abort all mean the server is gone;
+/// only the first is tidy, but none of them is corruption.
+fn closed_by_peer(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
 }
 
 /// Sends one reply frame, folding a stream write failure into [`SessionError::Io`].

@@ -205,6 +205,14 @@ fn client_frame(cursor: &mut &[u8], compression: Compression) -> Vec<u8> {
     oxide_proto::frame::read_frame(cursor, compression).expect("a client frame")
 }
 
+/// The column a ChunkUpdated event reports, panicking on any other event.
+fn updated_column(event: &ClientEvent) -> (i32, i32) {
+    match event {
+        ClientEvent::ChunkUpdated { cx, cz, .. } => (*cx, *cz),
+        other => panic!("expected a chunk update, got {other:?}"),
+    }
+}
+
 #[test]
 fn the_session_logs_in_joins_and_answers_every_obligation() {
     let (stream, outgoing) = duplex(scripted_server_stream());
@@ -237,21 +245,37 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
         }
         other => panic!("expected a chunk update, got {other:?}"),
     }
+    // The applied column leads its four neighbours, in the fixed order the
+    // session re-meshes them: +x, -x, +z, -z.
+    assert_eq!(
+        events.len(),
+        9,
+        "the applied column and its four neighbours: {events:?}"
+    );
+    let columns: Vec<(i32, i32)> = events[4..].iter().map(updated_column).collect();
+    assert_eq!(
+        columns,
+        vec![(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)],
+        "the applied column leads, then its four neighbours"
+    );
 
     let written = outgoing.lock().unwrap().clone();
     // Replay the client's traffic under the same framing and check the packets.
     let mut cursor = &written[..];
+    // The handshake body, byte for byte: the id, protocol 47, the configured
+    // host, the port big endian, and next state 2 for login.
     let handshake = client_frame(&mut cursor, Compression::Disabled);
-    assert_eq!(handshake[0], 0x00, "handshake first");
     assert_eq!(
-        oxide_proto::varint::read_varint(&handshake[1..]).unwrap(),
-        47
+        handshake, b"\x00\x2f\x09127.0.0.1\x63\xdd\x02",
+        "handshake first"
     );
     let login_start = client_frame(&mut cursor, Compression::Disabled);
     assert_eq!(login_start, b"\x00\x08OxideDev");
     // Everything after Set Compression is compressed framing, even when small.
+    // The settings body, byte for byte: the id, the locale, the view distance,
+    // the chat mode, chat colours and the skin parts.
     let settings = client_frame(&mut cursor, SERVER_FRAMING);
-    assert_eq!(settings[0], 0x15);
+    assert_eq!(settings, b"\x15\x05en_US\x08\x00\x01\x7f");
     let brand = client_frame(&mut cursor, SERVER_FRAMING);
     assert_eq!(&brand[..2], b"\x17\x08");
     // The payload is a length-prefixed string, exactly as the capture records
@@ -269,16 +293,10 @@ fn a_relative_teleport_is_answered_with_absolute_values() {
     let (stream, outgoing) = duplex(stream_with(&[
         join_game_frame(),
         position_frame(10.0, 64.0, 20.0, 90.0, 0.0, 0),
-        // x and z are deltas on the position the first teleport settled on;
-        // y, yaw and pitch are unflagged, so they arrive absolute.
-        position_frame(
-            0.5,
-            1.0,
-            -2.5,
-            45.0,
-            -10.0,
-            PlayerPositionAndLook::FLAG_X | PlayerPositionAndLook::FLAG_Z,
-        ),
+        // x and z are deltas on the position the first teleport settled on:
+        // 0x05 is their literal flag bits, x 0x01 and z 0x04. y, yaw and pitch
+        // are unflagged, so they arrive absolute.
+        position_frame(0.5, 1.0, -2.5, 45.0, -10.0, 0x05),
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
@@ -334,12 +352,31 @@ fn an_unload_packet_removes_the_column() {
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            ClientEvent::ChunkUpdated { cx: 3, cz: 4, sections } if sections[0].1.is_some()
-        )),
-        "the column is meshed before it is unloaded: {events:?}"
+    // The applied column leads its four neighbours, in the fixed order the
+    // session re-meshes them: +x, -x, +z, -z, before the unload.
+    assert_eq!(
+        events.len(),
+        8,
+        "the login, the join, five chunk updates and the unload: {events:?}"
+    );
+    match &events[2] {
+        ClientEvent::ChunkUpdated {
+            cx: 3,
+            cz: 4,
+            sections,
+        } => {
+            assert!(
+                sections[0].1.is_some(),
+                "the column is meshed before it is unloaded"
+            );
+        }
+        other => panic!("expected the meshed column, got {other:?}"),
+    }
+    let columns: Vec<(i32, i32)> = events[2..7].iter().map(updated_column).collect();
+    assert_eq!(
+        columns,
+        vec![(3, 4), (4, 4), (2, 4), (3, 5), (3, 3)],
+        "the applied column leads, then its four neighbours"
     );
     match events.last() {
         Some(ClientEvent::ChunkUnloaded { cx, cz }) => assert_eq!((*cx, *cz), (3, 4)),
