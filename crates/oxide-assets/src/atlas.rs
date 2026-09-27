@@ -20,10 +20,13 @@
 //! Mip levels follow the clone's clamp: `TextureMap.loadTextureAtlas`
 //! (`TextureMap.java:154-155`) lowers the setting per sprite to
 //! `min(lowestOneBit(iconWidth), lowestOneBit(iconHeight))` and reports the
-//! final count as `log2` of the smallest over the set (`:166-172`). Levels
-//! are generated per sprite from that sprite's own content, so a reduction
-//! never blends two neighbouring sprites; animated strips are nearest
-//! sampled and stay level-0 only.
+//! final count as `log2` of the smallest over the set (`:166-172`); the
+//! chain is the base image plus that many reductions, which is the count
+//! the client's generator itself allocates (`TextureUtil.java:51`) and
+//! uploads (`:208-210`). Levels are generated per sprite from that sprite's
+//! own content with the client's own gamma-space blend (`:98-156`), so a
+//! reduction never blends two neighbouring sprites; animated strips are
+//! nearest sampled and stay level-0 only.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,14 +42,17 @@ const MAX_SIDE: u32 = 4096;
 /// The side of the procedural fallback sprite, in texels.
 const MISSING_SIDE: u32 = 16;
 
-/// The fallback checkerboard's cell, in texels.
-const MISSING_CELL: u32 = 2;
+/// The fallback checkerboard's cell, in texels: the client's own eight
+/// (`TextureUtil.java:363-373`).
+const MISSING_CELL: u32 = 8;
 
-/// The fallback checkerboard's light colour, magenta.
-const MISSING_LIGHT: [u8; 4] = [255, 0, 255, 255];
+/// The fallback checkerboard's light colour: the client's `0xFFF800F8`,
+/// magenta.
+const MISSING_LIGHT: [u8; 4] = [0xf8, 0, 0xf8, 0xff];
 
-/// The fallback checkerboard's dark colour, black.
-const MISSING_DARK: [u8; 4] = [0, 0, 0, 255];
+/// The fallback checkerboard's dark colour: the client's `0xFF000000`,
+/// black.
+const MISSING_DARK: [u8; 4] = [0, 0, 0, 0xff];
 
 /// The client's name for the fallback sprite
 /// (`TextureMap.LOCATION_MISSING_TEXTURE`): the model layer resolves
@@ -319,6 +325,7 @@ pub fn build_atlas(
             w: plan.width,
             h: plan.height,
             rgba: plan.pixels.to_vec(),
+            transparent: plan.pixels.chunks_exact(4).any(|texel| texel[3] == 0),
         })
         .collect();
     for rank in 1..count {
@@ -332,7 +339,7 @@ pub fn build_atlas(
                 // total rather than unwrapped.
                 continue;
             }
-            let reduced = reduce(&mip.rgba, mip.w, mip.h);
+            let reduced = reduce(&mip.rgba, mip.w, mip.h, mip.transparent);
             blit(
                 &mut image.rgba,
                 image.width,
@@ -451,6 +458,10 @@ struct Mip {
     h: u32,
     /// The buffer's pixels.
     rgba: Vec<u8>,
+    /// True when any of the sprite's level-0 texels is fully transparent:
+    /// the client picks its blend branch from this, once per sprite
+    /// (`TextureUtil.generateMipmapData`'s own scan, `:56-65`).
+    transparent: bool,
 }
 
 /// The smallest square power-of-two atlas side that holds every cell, with
@@ -518,17 +529,22 @@ fn cell_side(width: u32, height: u32) -> u32 {
     side
 }
 
-/// The level count for the plans: the setting clamped by the clone's rule
-/// and floored at one.
+/// The number of level images for the plans: the base image plus the
+/// setting's reductions, clamped by the clone's rule.
 ///
 /// `TextureMap.loadTextureAtlas` lowers `mipmapLevels` to
 /// `min(lowestOneBit(w), lowestOneBit(h))` per sprite
 /// (`TextureMap.java:154-155`) and then to `log2` of the smallest over the
-/// set (`:166-172`), so a set of 16x16 sprites keeps the default setting of
-/// four levels and a sprite that hides only an 8 clamps it to three. An
-/// animated strip counts as its frame, a square of the strip's width. The
-/// fallback is not counted: the clone adds its missing image after the clamp
-/// (`:211-212`).
+/// set (`:166-172`). The chain is what the client's generator allocates for
+/// that count: `int[p + 1][]`, filled for `l1` in `1..=p`
+/// (`TextureUtil.java:51, :67-92`) — the base image plus `p` reductions —
+/// and `TextureUtil.allocateTextureImpl` uploads exactly those levels
+/// (`:202, :208-210`). A set of 16x16 sprites therefore keeps the default
+/// setting's four reductions as five images, and a sprite that hides only
+/// an 8 (2^3) clamps them to three, four images. An animated strip counts
+/// as its frame, a square of the strip's width. The fallback is not
+/// counted: the clone adds its missing image after the clamp (`:211-212`),
+/// so a set of nothing but the fallback keeps the setting.
 fn level_count(plans: &[Plan], mipmap_levels: u32) -> u32 {
     let mut limit: Option<u32> = None;
     for plan in plans {
@@ -542,12 +558,13 @@ fn level_count(plans: &[Plan], mipmap_levels: u32) -> u32 {
         };
         limit = Some(limit.map_or(low, |current| current.min(low)));
     }
-    match limit {
-        Some(limit) => mipmap_levels.min(limit.trailing_zeros()).max(1),
-        // Nothing to clamp against: the setting alone decides, floored at
-        // the base level.
-        None => mipmap_levels.max(1),
-    }
+    let reductions = match limit {
+        Some(limit) => mipmap_levels.min(limit.trailing_zeros()),
+        // Nothing to clamp against: the setting alone decides.
+        None => mipmap_levels,
+    };
+    // The base image, plus one per reduction.
+    (reductions + 1).max(1)
 }
 
 /// The lowest set bit of `value`: the largest power of two dividing it, zero
@@ -601,8 +618,9 @@ fn playback(
     Ok(playback)
 }
 
-/// The fallback sprite's pixels: a 16x16 checkerboard of magenta and black
-/// in 2-texel cells, generated here so no file carries it.
+/// The fallback sprite's pixels: the 16x16 checkerboard of magenta and
+/// black in 8-texel cells the client's own generator builds
+/// (`TextureUtil.java:363-373`), generated here so no file carries it.
 fn missing_pixels() -> Vec<u8> {
     let mut rgba = vec![0u8; (MISSING_SIDE * MISSING_SIDE * 4) as usize];
     for y in 0..MISSING_SIDE {
@@ -646,10 +664,18 @@ fn blit(
     }
 }
 
-/// One 2x2 box-average reduction of a `w` x `h` RGBA image: each axis
-/// halved, every channel averaged as `(a + b + c + d + 2) / 4`, and a block
-/// whose edge falls outside an odd axis sampling the edge texel again.
-fn reduce(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+/// One 2x2 reduction of a still sprite's own `w` x `h` content: each axis
+/// halved, every block blended with the client's kernel
+/// (`TextureUtil.blendColors`, `TextureUtil.java:98-156`).
+///
+/// `transparent` is the sprite-level flag the client derives from its
+/// level-0 texels (`:56-65`): a sprite that holds any fully transparent
+/// texel takes the branch that skips the transparent texels' stored colour
+/// and cuts a low blended alpha. A block whose edge falls outside an odd
+/// axis samples the edge texel again; the level clamp keeps every still
+/// sprite's content even down to its last level, so that path is
+/// unreachable and the code stays total.
+fn reduce(rgba: &[u8], w: u32, h: u32, transparent: bool) -> Vec<u8> {
     let out_w = w / 2;
     let out_h = h / 2;
     let mut out = vec![0u8; (out_w * out_h * 4) as usize];
@@ -659,20 +685,86 @@ fn reduce(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
         for x in 0..out_w {
             let x0 = (2 * x).min(w.saturating_sub(1));
             let x1 = (2 * x + 1).min(w.saturating_sub(1));
-            for channel in 0..4 {
-                let a = u32::from(rgba[texel_at(w, x0, y0, channel)]);
-                let b = u32::from(rgba[texel_at(w, x1, y0, channel)]);
-                let c = u32::from(rgba[texel_at(w, x0, y1, channel)]);
-                let d = u32::from(rgba[texel_at(w, x1, y1, channel)]);
-                out[((y * out_w + x) * 4 + channel) as usize] = ((a + b + c + d + 2) / 4) as u8;
-            }
+            let block = [
+                texel(rgba, w, x0, y0),
+                texel(rgba, w, x1, y0),
+                texel(rgba, w, x0, y1),
+                texel(rgba, w, x1, y1),
+            ];
+            let blended = if transparent {
+                blend_cutout(block)
+            } else {
+                blend_opaque(block)
+            };
+            let at = ((y * out_w + x) * 4) as usize;
+            out[at..at + 4].copy_from_slice(&blended);
         }
     }
     out
 }
 
-/// The byte offset of channel `channel` of the texel `(x, y)` in a `w`-wide
-/// RGBA image.
-fn texel_at(w: u32, x: u32, y: u32, channel: u32) -> usize {
-    ((y * w + x) * 4 + channel) as usize
+/// The client's inverse gamma exponent, `0.45454545454545453D`
+/// (`TextureUtil.java:134`).
+const GAMMA_INVERSE: f64 = 0.454_545_454_545_454_53;
+
+/// The client's blend for a sprite with no fully transparent level-0
+/// texel: every channel, alpha included, through [`blend_component`]
+/// (`TextureUtil.java:100-107`).
+fn blend_opaque(block: [[u8; 4]; 4]) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (channel, blended) in out.iter_mut().enumerate() {
+        *blended = blend_component([
+            block[0][channel],
+            block[1][channel],
+            block[2][channel],
+            block[3][channel],
+        ]);
+    }
+    out
+}
+
+/// One channel of `TextureUtil.blendColorComponent` (`TextureUtil.java:148-156`):
+/// the four texels' gamma-space contributions summed, divided by four and
+/// taken back to a byte, through the client's `f32` round trip on the power.
+fn blend_component(values: [u8; 4]) -> u8 {
+    let sum: f32 = values.iter().map(|&value| gamma(value)).sum();
+    let blended = (f64::from(sum) * 0.25).powf(GAMMA_INVERSE) as f32;
+    (f64::from(blended) * 255.0) as u8
+}
+
+/// The client's blend for a sprite that does hold a fully transparent
+/// texel (`TextureUtil.java:108-145`): only texels with a non-zero alpha
+/// contribute their stored colour, the sums are still divided by four, and
+/// a blended alpha below 96 is forced to zero.
+fn blend_cutout(block: [[u8; 4]; 4]) -> [u8; 4] {
+    let mut sums = [0.0f32; 4];
+    for texel in block {
+        if texel[3] != 0 {
+            for (sum, value) in sums.iter_mut().zip(texel) {
+                *sum += gamma(value);
+            }
+        }
+    }
+    let mut out = [0u8; 4];
+    for (channel, sum) in sums.iter().enumerate() {
+        // The client divides by four in `f32` and takes the power without
+        // the round trip the opaque branch makes (`:130-137`).
+        out[channel] = (f64::from(*sum / 4.0).powf(GAMMA_INVERSE) * 255.0) as u8;
+    }
+    if out[3] < 96 {
+        out[3] = 0;
+    }
+    out
+}
+
+/// `(float)pow((float)channel / 255.0F, 2.2)`: one channel in the gamma-2.2
+/// space the client blends in (`TextureUtil.java:150-153`).
+fn gamma(channel: u8) -> f32 {
+    (f64::from(f32::from(channel) / 255.0).powf(2.2)) as f32
+}
+
+/// The RGBA texel at `(x, y)` of a `w`-wide image.
+fn texel(rgba: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+    let at = ((y * w + x) * 4) as usize;
+    [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]
 }

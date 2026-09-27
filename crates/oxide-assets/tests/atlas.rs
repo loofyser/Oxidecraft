@@ -1,6 +1,7 @@
 //! The atlas tests: a synthetic extraction tree in a temp directory, the
-//! stitcher's observable rules, the mip clamp, the animated frame rects, the
-//! fallback sprite, and the ignored real-tree case.
+//! stitcher's observable rules, the mip clamp, the blend kernel, the
+//! animated frame rects, the fallback sprite, and the ignored real-tree
+//! case.
 //!
 //! The tree's PNGs are built by the small writer at the bottom of this file,
 //! so no file from the game is involved. The writer is a third copy of the
@@ -30,10 +31,18 @@ const CYAN: [u8; 4] = [0, 255, 255, 255];
 const ORANGE: [u8; 4] = [255, 128, 0, 255];
 /// The second row of the out-of-order strip.
 const PURPLE: [u8; 4] = [128, 0, 255, 255];
-/// The fallback checkerboard's light cell.
-const MAGENTA: [u8; 4] = [255, 0, 255, 255];
-/// The fallback checkerboard's dark cell.
-const BLACK: [u8; 4] = [0, 0, 0, 255];
+/// The fallback checkerboard's light cell: the client's `0xFFF800F8`.
+const MAGENTA: [u8; 4] = [0xf8, 0, 0xf8, 0xff];
+/// The fallback checkerboard's dark cell: the client's `0xFF000000`.
+const BLACK: [u8; 4] = [0, 0, 0, 0xff];
+/// The white texel of the two-tone blend kernel block.
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+/// A fully transparent texel whose stored colour is white.
+const CLEAR_WHITE: [u8; 4] = [255, 255, 255, 0];
+/// A fully transparent texel.
+const CLEAR: [u8; 4] = [0, 0, 0, 0];
+/// The green texel of the alpha-cutoff block, three quarters opaque.
+const FADED_GREEN: [u8; 4] = [0, 255, 0, 160];
 
 #[test]
 fn the_atlas_is_power_of_two_and_holds_every_requested_sprite() {
@@ -151,6 +160,20 @@ fn uv_and_level_rect_read_the_content_rect() {
     );
     assert!(u0 < u1 && v0 < v1, "the uv pair is ordered");
 
+    // The strip's cell is 32x32 while its content is 16x32: its uv pair is
+    // the content rect over the atlas size, not the cell.
+    assert_eq!(
+        (atlas.width, atlas.height),
+        (64, 64),
+        "the case's atlas size"
+    );
+    let strip = atlas.sprites["blocks/strip"];
+    assert_eq!(
+        atlas.uv(&strip),
+        [[0.5, 0.0], [0.75, 0.5]],
+        "the strip's uv is its content rect over the atlas size"
+    );
+
     // A level rect is the level-0 content rect shifted right by the level.
     for (path, _) in atlas.sprites.iter() {
         let sprite = &atlas.sprites[path];
@@ -166,15 +189,20 @@ fn uv_and_level_rect_read_the_content_rect() {
 }
 
 #[test]
-fn the_default_mip_setting_keeps_four_levels_and_setting_zero_keeps_one() {
+fn the_default_mip_setting_keeps_five_levels_and_setting_zero_keeps_one() {
     let tree = stitching_tree();
     let set = TextureSet::load(tree.root()).expect("the tree loads");
     let sixteen_only = paths(&["blocks/red", "blocks/blue"]);
 
     let default = build_atlas(&set, &sixteen_only, 4).expect("the default setting stitches");
     assert_eq!(
-        default.level_count, 4,
-        "the default setting of 4 on an all-16x16 set builds 4 levels"
+        default.level_count, 5,
+        "the default setting of 4 on an all-16x16 set builds the base image and 4 reductions"
+    );
+    assert_eq!(
+        (default.width, default.height),
+        (32, 32),
+        "two 16x16 sprites and the fallback fill the first 32-texel atlas"
     );
 
     let none = build_atlas(&set, &sixteen_only, 0).expect("setting 0 stitches");
@@ -182,7 +210,10 @@ fn the_default_mip_setting_keeps_four_levels_and_setting_zero_keeps_one() {
     assert_eq!(none.levels.len(), 1);
 
     let one = build_atlas(&set, &sixteen_only, 1).expect("setting 1 stitches");
-    assert_eq!(one.level_count, 1, "setting 1 keeps one reduction of none");
+    assert_eq!(
+        one.level_count, 2,
+        "setting 1 keeps the base image and one reduction"
+    );
 }
 
 #[test]
@@ -190,7 +221,7 @@ fn a_sprite_whose_size_clamps_the_level_count() {
     // The clone's clamp takes the minimum over the set of
     // `min(lowestOneBit(width), lowestOneBit(height))` and reduces the
     // setting to its log2: a 16x24 sprite hides an 8 (2^3), so the default
-    // setting of 4 clamps to 3.
+    // setting's four reductions clamp to three.
     let tree = Tree::new();
     tree.write(
         "assets/minecraft/textures/blocks/red.png",
@@ -204,7 +235,10 @@ fn a_sprite_whose_size_clamps_the_level_count() {
     let atlas =
         build_atlas(&set, &paths(&["blocks/red", "blocks/odd"]), 4).expect("the tree stitches");
 
-    assert_eq!(atlas.level_count, 3, "the 16x24 sprite clamps 4 to 3");
+    assert_eq!(
+        atlas.level_count, 4,
+        "the 16x24 sprite clamps the default's four reductions to three"
+    );
     let odd = atlas.sprites["blocks/odd"];
     assert_eq!(odd.content.h, 24);
     assert_eq!(
@@ -221,11 +255,87 @@ fn a_sprite_whose_size_clamps_the_level_count() {
 }
 
 #[test]
-fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
-    // Pure red and pure blue, both 16x16, in a tree of their own. The packer
-    // lays their cells edge to edge, so a stitcher-wide reduction would have
-    // its chance to blend exactly there.
+fn the_mip_kernel_blends_in_gamma_space_like_the_client() {
+    // The client reduces a 2x2 block in gamma-2.2 space, not with a plain
+    // byte average: a block of two white and two black texels gives 186,
+    // where the plain `(a + b + c + d + 2) / 4` average gives 128. Each
+    // sprite's top-left 2x2 block sits under the top-left texel of its
+    // level-1 content.
     let tree = Tree::new();
+    tree.write(
+        "assets/minecraft/textures/blocks/twotone.png",
+        &block_png(16, [WHITE, BLACK, BLACK, WHITE], BLACK),
+    );
+    tree.write(
+        "assets/minecraft/textures/blocks/cutout.png",
+        &block_png(16, [RED, CLEAR_WHITE, CLEAR_WHITE, CLEAR_WHITE], CLEAR),
+    );
+    tree.write(
+        "assets/minecraft/textures/blocks/faded.png",
+        &block_png(16, [FADED_GREEN, CLEAR, CLEAR, CLEAR], CLEAR),
+    );
+    let set = TextureSet::load(tree.root()).expect("the tree loads");
+    let atlas = build_atlas(
+        &set,
+        &paths(&["blocks/twotone", "blocks/cutout", "blocks/faded"]),
+        4,
+    )
+    .expect("the three sprites stitch");
+    assert_eq!(atlas.level_count, 5, "the case has a level to check");
+
+    let level = &atlas.levels[1];
+    let top_left = |path: &str| {
+        let rect = atlas.level_rect(&atlas.sprites[path], 1);
+        texel(&level.rgba, level.width, rect.x, rect.y)
+    };
+
+    assert_eq!(
+        top_left("blocks/twotone"),
+        [186, 186, 186, 255],
+        "two white and two black texels blend in gamma space"
+    );
+
+    // The sprite holds a fully transparent texel, so the client takes the
+    // branch that skips the transparent texels' stored colour entirely (the
+    // three white texels are not mixed in) and still divides the sums by
+    // four: the alpha lands on 135, above the cutoff.
+    assert_eq!(
+        top_left("blocks/cutout"),
+        [135, 0, 0, 135],
+        "a cutout sprite's block counts only its opaque texels"
+    );
+
+    // And a blended alpha below 96 is forced to zero, while the colour
+    // channels keep their blend.
+    assert_eq!(
+        top_left("blocks/faded"),
+        [0, 135, 0, 0],
+        "an alpha of 85 is cut to zero"
+    );
+}
+
+#[test]
+fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
+    // Pure red and pure blue, both 16x16, beside a padded 16x32 sprite
+    // whose 32x32 cell leaves a whole column of padding a whole-level
+    // reduction would have its chance to bleed into, and an animated strip
+    // whose cell must stay empty at levels 1 and up: it is where a
+    // reduction over the whole stitched image, rather than each sprite's
+    // own content, becomes visible. The packer lays the red and blue cells
+    // edge to edge.
+    let tree = Tree::new();
+    tree.write(
+        "assets/minecraft/textures/blocks/padded.png",
+        &solid_png(16, 32, GREEN),
+    );
+    tree.write(
+        "assets/minecraft/textures/blocks/strip.png",
+        &rows_png(16, &blocks(&[(16, YELLOW), (16, CYAN)])),
+    );
+    tree.write(
+        "assets/minecraft/textures/blocks/strip.png.mcmeta",
+        br#"{"animation":{"frametime":2}}"#,
+    );
     tree.write(
         "assets/minecraft/textures/blocks/red.png",
         &solid_png(16, 16, RED),
@@ -235,12 +345,21 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
         &solid_png(16, 16, BLUE),
     );
     let set = TextureSet::load(tree.root()).expect("the tree loads");
-    let atlas = build_atlas(&set, &paths(&["blocks/red", "blocks/blue"]), 4)
-        .expect("the two sprites stitch");
+    let atlas = build_atlas(
+        &set,
+        &paths(&["blocks/red", "blocks/blue", "blocks/padded", "blocks/strip"]),
+        4,
+    )
+    .expect("the four sprites stitch");
 
-    assert_eq!(atlas.level_count, 4, "the case has reductions to check");
+    assert_eq!(atlas.level_count, 5, "the case has reductions to check");
     let blue = atlas.sprites["blocks/blue"].content;
     let red = atlas.sprites["blocks/red"].content;
+    let padded = atlas.sprites["blocks/padded"];
+    assert!(
+        padded.region.w > padded.content.w,
+        "the case exercises a padded cell: {padded:?}"
+    );
     let (left, right) = (blue.x.min(red.x), blue.x.max(red.x));
     assert_eq!(blue.y, red.y, "the two cells share a shelf");
     assert_eq!(
@@ -254,8 +373,15 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
         let image = &atlas.levels[level as usize];
         let blue_rect = shift(blue, level);
         let red_rect = shift(red, level);
+        let padded_rect = shift(padded.content, level);
         assert_rect_is(image, blue_rect, BLUE, &format!("blue at level {level}"));
         assert_rect_is(image, red_rect, RED, &format!("red at level {level}"));
+        assert_rect_is(
+            image,
+            padded_rect,
+            GREEN,
+            &format!("the padded sprite at level {level}"),
+        );
 
         // The texels that touch the shared edge are the first candidates.
         let (left_rect, left_colour, right_colour) = if blue.x < red.x {
@@ -295,6 +421,26 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
                 assert!(
                     !is_red_blue_mix(texel),
                     "level {level} blends red and blue at ({x}, {y}): {texel:?}"
+                );
+            }
+        }
+
+        // Outside the sprites' own reduced content every texel of the level
+        // is zero: the generator writes each still sprite's own content and
+        // nothing else, so no cell's padding and no gap ever carries a
+        // blend. A reduction over the whole stitched image would leave
+        // marks here even where its content-side texels happen to come out
+        // equal, which is what makes the rule testable.
+        let written = [blue_rect, red_rect, padded_rect, fallback];
+        for y in 0..image.height {
+            for x in 0..image.width {
+                if written.iter().any(|rect| inside(*rect, x, y)) {
+                    continue;
+                }
+                assert_eq!(
+                    texel(&image.rgba, image.width, x, y),
+                    [0, 0, 0, 0],
+                    "level {level} writes outside a sprite's content at ({x}, {y})"
                 );
             }
         }
@@ -417,11 +563,12 @@ fn the_missing_sprite_is_the_generated_checkerboard() {
         "the fallback is indexed under the client's name for it"
     );
 
-    // A 16x16 checkerboard of magenta and black in 2-texel cells.
+    // A 16x16 checkerboard of magenta and black in 8-texel cells, the
+    // client's own generator's pattern.
     let level = &atlas.levels[0];
     for y in 0..16 {
         for x in 0..16 {
-            let expected = if ((x / 2) + (y / 2)) % 2 == 0 {
+            let expected = if ((x / 8) + (y / 8)) % 2 == 0 {
                 MAGENTA
             } else {
                 BLACK
@@ -606,9 +753,14 @@ fn the_real_extraction_tree_stitches() {
     }
     assert!(atlas.sprites.contains_key("missingno"));
 
-    // The all-16x16 path set keeps the default setting's four levels.
-    assert_eq!(atlas.level_count, 4);
-    assert!(atlas.width.is_power_of_two() && atlas.height.is_power_of_two());
+    // The all-16x16 path set keeps the default setting's four reductions,
+    // five images.
+    assert_eq!(atlas.level_count, 5);
+    assert_eq!(
+        (atlas.width, atlas.height),
+        (2048, 2048),
+        "the first-fit atlas for the real tree"
+    );
     println!(
         "atlas: {}x{}, {} levels",
         atlas.width, atlas.height, atlas.level_count
@@ -897,6 +1049,24 @@ fn rows_png(width: u32, colours: &[[u8; 4]]) -> Vec<u8> {
         }
     }
     png(width, height, &pixels)
+}
+
+/// Builds an 8-bit RGBA PNG of `side` x `side` texels whose top-left 2x2
+/// block is `block` (row-major from `(0, 0)`) and whose other texels are
+/// `rest`.
+fn block_png(side: u32, block: [[u8; 4]; 4], rest: [u8; 4]) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let colour = if x < 2 && y < 2 {
+                block[(y * 2 + x) as usize]
+            } else {
+                rest
+            };
+            pixels.extend_from_slice(&colour);
+        }
+    }
+    png(side, side, &pixels)
 }
 
 /// Builds an 8-bit RGBA PNG of `width` x `height` texels from raw pixel bytes
