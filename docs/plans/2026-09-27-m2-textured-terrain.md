@@ -327,25 +327,25 @@ committed on approval, before Task 1 is dispatched.
 **Interfaces:**
 - Produces:
   - `Section::set_block_light(&mut self, x, y, z, level: u8)` and `Section::set_sky_light(...)` (plus the `Chunk` forwarding pair), validated to 0..=15.
-  - `oxide_world::light::{LightEngine, LightError}`: `LightEngine::new(world: &mut World)` is not how this works — the engine is stateless and works on a `&mut World`:
+  - `oxide_world::light`: the engine is stateless and works on a `&mut World` (planned as a `LightEngine`/`LightError` type pair and corrected after execution: three free functions; no engine type, no error channel and no `Scratch` buffer land in M2):
     - `pub fn light_at(world: &World, x: i32, y: i32, z: i32) -> u8` = `max(sky_light, block_light)`, 0 outside loaded columns.
     - `pub fn recompute(world: &mut World, x: i32, y: i32, z: i32)`: recompute both light kinds for the affected region after a block at `(x, y, z)` changed, by vanilla's rule — the changed column and its eight neighbours over the full height, with propagation stopped by the region's boundary (values outside the region are left as they are, which is what vanilla's incremental engine effectively achieves; a fully loaded test world makes the two equal, and that equality is a test).
-    - `pub fn recompute_column(world: &mut World, cx: i32, cz: i32)`: the whole-column entry point the session uses when a section update arrives, computing sky light from the column's own blocks and block light from its emitters and neighbours.
+    - `pub fn recompute_column(world: &mut World, cx: i32, cz: i32)`: the whole-column entry point, computing sky light from the column's own blocks and block light from its emitters and neighbours (planned as the entry point the session uses when a section update arrives and corrected after execution: a section update runs no local relight — Task 13's pinned text — so the entry point lands for the block-change path and M3's wiring).
   - The three sky rules, as the source states them (spec section 9 and the report agree; where the source's wording differs from spec §9 — for example the decrement through a light-filtering block — **the source wins**, and the difference is recorded as a ruling and a spec correction in the same push):
     1. sky light 15 propagating straight down through a block that does not stop it does not decrease;
-    2. sky light propagating horizontally or upward, and any sky light below 15 spreading to a neighbour, decreases by one (through a light-filtering block per the source's decrement);
+    2. sky light propagating horizontally or upward, and any sky light below 15 spreading to a neighbour, decreases by one through a transparent cell, and by the receiving cell's own light opacity through a filtering one (the source's decrement, settled after execution: water and ice 3, leaves and cobwebs 1 — not a flat one);
     3. opaque blocks stop propagation; light-filtering values come from `BlockBehaviour`'s `light_opacity`/`light_filter` columns (Task 5).
-  - Block light: emitters start at `light_emission`; each step to a neighbour loses one, six directions; opaque blocks stop it.
+  - Block light: emitters start at `light_emission`; each step to a neighbour loses the receiving cell's light opacity — one through air or another transparent cell, three into water or ice, nothing into an opaque non-emitter (corrected after execution) — in six directions; opaque blocks stop it.
 
 **Steps:**
 
-- [ ] **Step 1: Read the rule in the source.** Open `refs/_src/MCP-919`'s `BlockLightEngine`, `SkyLightEngine` (or the 1.8 equivalents — locate them; 1.8's light code is `net.minecraft.world.chunk`/`net.minecraft.world`), `Block.getLightOpacity`, and `BlockLeaves`' opacity. Write down, in the task report, the exact decrement rule for block light and for sky light (including what a light-filtering block does) with file:line citations. Compare with spec §9 and the report's §4.1; note any disagreement before writing code.
+- [ ] **Step 1: Read the rule in the source.** Open `refs/_src/MCP-919`'s `BlockLightEngine`, `SkyLightEngine` (or the 1.8 equivalents — locate them; 1.8's light code is `net.minecraft.world.chunk`/`net.minecraft.world`; settled after execution: 1.8.9 has neither class — the engine is `World.getRawLight`/`checkLightFor` with `Chunk.generateSkylightMap` and the block registrations), `Block.getLightOpacity`, and `BlockLeaves`' opacity. Write down, in the task report, the exact decrement rule for block light and for sky light (including what a light-filtering block does) with file:line citations. Compare with spec §9 and the report's §4.1; note any disagreement before writing code.
 
 - [ ] **Step 2: Write the failing tests.** In `tests/light.rs`, hand-built worlds (build with `World::apply_column` over synthetic `ColumnData`, or a test-only constructor — prefer the real path so the tests exercise the store):
   - sky: a flat world at light 15 on an open column; digging a 1×1 hole 5 deep keeps the hole's sky at 15 straight down and reduces by one going sideways at the bottom;
   - sky under a canopy at 14 (15 − 1 through one light-filtering block) spreading sideways to 13, 12…;
   - sky never rises: a cell below an opaque roof reads by the side-spread chain;
-  - a section outside the mask keeps the light it had before a recompute;
+  - a section outside the mask keeps the light it had before a recompute (settled as the region sense: loaded columns outside the pass's region keep their stored light, pinned by the sentinel test; corrected after execution for a covered column's absent sections: the pass materialises them as air carrying the computed light — their reads become the computed ones, pinned by a test; sparse-column semantics are deferred to M3);
   - block light: one torch (emission 14) at a known cell gives a diamond of values with `14 − manhattan` where unobstructed;
   - block light through an opaque wall is 0 behind it;
   - `recompute` after a change equals a from-scratch `recompute_column` over the same world (idempotence and completeness);
@@ -354,7 +354,7 @@ committed on approval, before Task 1 is dispatched.
 
 - [ ] **Step 3: Run them and watch them fail.** `cargo test -p oxide-world --test light`.
 
-- [ ] **Step 4: Implement.** A bounded BFS over the affected region with a queue of (position, level) and the visit rule "a cell is enqueued when its level increases"; both kinds run separately; the sky pass first computes the "direct" downward exposure, then spreads. Keep the implementation free of allocation per call where cheap to do so (reuse buffers via a small `Scratch` struct held by the caller — the session owns one), but correctness first: the tests above are the contract.
+- [ ] **Step 4: Implement.** A bounded BFS over the affected region with a queue of (position, level) and the visit rule "a cell is enqueued when its level increases"; both kinds run separately; the sky pass first computes the "direct" downward exposure, then spreads. Keep the implementation free of allocation per call where cheap to do so (a small `Scratch` struct held by the caller was planned and is deferred — corrected after execution: no `Scratch` in M2, the engine allocates per call, and a caller-owned buffer returns if a caller ever needs one), but correctness first: the tests above are the contract.
 
 - [ ] **Step 5: Gate and commit.** `feat: add the light engine with the vanilla sky and block rules (M2)`.
 

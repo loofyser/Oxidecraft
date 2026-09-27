@@ -438,12 +438,17 @@ https://github.com/PrismarineJS/prismarine-chunk (`src/pc/1.8/*`, `uint4`).
   = `max(sky light, block light)`; rendering uses client light plus time-of-day/weather darkening
   ("internal sky light"), which is **not** sent over the wire. (**MCW**)
 * **Block light**: emitted by blocks (torch 14, glowstone 15, lava 15, …) and **decreases by 1 per block of
-  taxicab distance** from the source, spreading in all 6 directions. (**MCW**)
+  taxicab distance** from the source, spreading in all 6 directions — where each step subtracts the receiving
+  cell's light opacity: 1 through air or another transparent cell, 3 into water or ice, and nothing into an
+  opaque non-emitter (corrected after execution: a torch beside water gives 11 inside the water cell and 10
+  beyond it, not 13 and 12). (**MCW**)
 * **Sky light**: blocks vertically exposed to the sky have sky light 15. Propagation rules:
   * full-strength (15) sky light propagating **downward** through a transparent block does **not** decrease;
   * propagating **horizontally or upward** (and any sky light < 15 spreading to neighbours) **decreases by 1**;
-  * opaque blocks block propagation; "light-filtering" blocks (water, ice, leaves, cobwebs, …) reduce sky
-    light by exactly 1 in Java Edition;
+  * opaque blocks block propagation; "light-filtering" blocks (water, ice, leaves, cobwebs, …) subtract
+    their own light opacity from sky light — water and ice 3, leaves and cobwebs 1 (corrected after execution:
+    the decrement is the receiving cell's `getLightOpacity`, not a flat 1; a shaft of water under open sky
+    reads 12, 9, 6, 3, 0);
   * sky light is not reduced at night — day/night only affects the derived internal sky light/brightness. (**MCW**)
 * 1.8.9 has **no flood-fill smoothing of the stored values** and no "smoothness" data on the wire; the
   stored nibbles are the raw level values. **Smooth lighting** is a purely client-side *render* effect:
