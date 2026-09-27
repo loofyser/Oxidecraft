@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fails when any workspace crate depends on something outside the allowed edges.
 #
-# The allowed edges are exactly the 16-edge table in section 5.1 of docs/specs/oxidecraft-v1-design.md.
+# The allowed edges are exactly the 17-edge table in section 5.1 of docs/specs/oxidecraft-v1-design.md.
 # This script fails closed: a missing tool or unreadable metadata is an error, never a pass.
 set -euo pipefail
 
@@ -30,7 +30,7 @@ allowed() {
     "oxide-proto-v47 -> oxide-proto") return 0 ;;
     "oxide-world -> oxide-proto" | "oxide-world -> oxide-proto-v47") return 0 ;;
     "oxide-render -> oxide-assets") return 0 ;;
-    "oxide-game -> oxide-proto-v47" | "oxide-game -> oxide-world" | "oxide-game -> oxide-assets" | "oxide-game -> oxide-render") return 0 ;;
+    "oxide-game -> oxide-proto" | "oxide-game -> oxide-proto-v47" | "oxide-game -> oxide-world" | "oxide-game -> oxide-assets" | "oxide-game -> oxide-render") return 0 ;;
     # The client takes the rows above it in the table, not the launcher row: the
     # launcher is a separate binary target and the client does not depend on it.
     "oxide-client -> oxide-proto" | "oxide-client -> oxide-proto-v47" | "oxide-client -> oxide-world" | "oxide-client -> oxide-assets" | "oxide-client -> oxide-render" | "oxide-client -> oxide-game") return 0 ;;

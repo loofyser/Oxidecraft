@@ -21,7 +21,7 @@
 - Dependency additions are explicit commits, pinned in `Cargo.lock`; record the resolved versions in the commit message.
 - Every write to the asset store is atomic: temp file in the same directory, then rename.
 - Datastore paths resolve through `XDG_DATA_HOME` when set, else `~/.local/share`, else the platform equivalent via the `dirs` crate.
-- The allowed crate edges are exactly the section 5.1 table: `oxide-world → {oxide-proto, oxide-proto-v47}`; `oxide-game → {oxide-proto-v47, oxide-world, oxide-assets, oxide-render}`; `oxide-client → all of the above`; `oxide-render → oxide-assets`. `scripts/check-graph.sh` fails the build on anything else.
+- The allowed crate edges are exactly the section 5.1 table: `oxide-world → {oxide-proto, oxide-proto-v47}`; `oxide-game → {oxide-proto, oxide-proto-v47, oxide-world, oxide-assets, oxide-render}`; `oxide-client → all of the above`; `oxide-render → oxide-assets`. `scripts/check-graph.sh` fails the build on anything else.
 - Every public item carries a doc comment (workspace lint `missing_docs`); `unsafe_code` is forbidden workspace-wide.
 - No AI or tooling language in commits, code, comments, or committed documents.
 - `git add` is always explicit with paths; never `git add -A` or `git add .`.

@@ -7,7 +7,7 @@
 | Target | Minecraft Java Edition 1.8.9, protocol 47 |
 | Repo | https://github.com/loofyser/Oxidecraft |
 | License | GPL-3.0 (repo code only; no Mojang assets, no jars redistributed) |
-| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. v4 — section 17 records the owner-directed post-v1 programme (singleplayer and Java mod compatibility) and its feasibility; no v1 scope change. |
+| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. v4 — section 17 records the owner-directed post-v1 programme (singleplayer and Java mod compatibility) and its feasibility; no v1 scope change. v5 — section 5.1: the `oxide-game` row gains `oxide-proto`, because the session owns the framed connection that lives in `oxide-proto`. |
 
 ---
 
@@ -151,7 +151,7 @@ The complete set of allowed dependencies:
 | `oxide-world` | `oxide-proto`, `oxide-proto-v47` |
 | `oxide-assets` | nothing |
 | `oxide-render` | `oxide-assets` |
-| `oxide-game` | `oxide-proto-v47`, `oxide-world`, `oxide-assets`, `oxide-render` |
+| `oxide-game` | `oxide-proto`, `oxide-proto-v47`, `oxide-world`, `oxide-assets`, `oxide-render` |
 | `oxide-client` | all of the above |
 | `oxide-launcher` | `oxide-assets`, `oxide-proto-v47` |
 
