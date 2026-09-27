@@ -1,10 +1,15 @@
-//! The GPU device, the window surface and the clear pass that fills the window.
+//! The GPU device, the window surface and the passes that fill the window.
 
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
+
+use crate::camera::Camera;
+use crate::overlay::OverlayPass;
+use crate::terrain::{ChunkMesh, SectionKey};
+use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 
 /// The sky colour the window is cleared to, as vanilla 1.8.9 clears it.
 pub const SKY_COLOR: wgpu::Color = wgpu::Color {
@@ -59,11 +64,13 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
     }
 }
 
-/// Owns the GPU objects for one window: the surface, the device, the queue and the clear pass.
+/// Owns the GPU objects for one window: the surface, the device, the queue, the depth texture
+/// and the two passes that draw into the frame.
 ///
-/// A clear pass issues no draw calls, so it needs no pipeline; the passes that draw geometry
-/// arrive with the terrain work. [`Renderer::render`] clears the window to [`SKY_COLOR`] and
-/// presents it.
+/// [`Renderer::render`] clears the window to [`SKY_COLOR`] and the depth buffer to the far
+/// plane, draws the section meshes through the terrain pass and the debug overlay over them,
+/// then presents the frame. A frame with no camera set draws no terrain: the clear is the
+/// whole picture, which is what the M0 smoke run shows.
 pub struct Renderer {
     /// The presentable surface attached to the window.
     surface: wgpu::Surface<'static>,
@@ -75,6 +82,14 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     /// What the driver reports about the chosen adapter.
     adapter_info: wgpu::AdapterInfo,
+    /// The depth texture the terrain pass tests and writes.
+    depth: DepthTarget,
+    /// The terrain pipeline, and the section meshes it draws.
+    terrain: TerrainPass,
+    /// The overlay pipeline, and the debug lines it draws.
+    overlay: OverlayPass,
+    /// The camera the next frame is drawn with, until a new one is set.
+    camera: Option<Camera>,
 }
 
 impl Renderer {
@@ -153,12 +168,21 @@ impl Renderer {
             "surface configured"
         );
 
+        let terrain = TerrainPass::new(&device, format);
+        let mut overlay = OverlayPass::new(&device, format);
+        overlay.set_size(&queue, config.width as f32, config.height as f32);
+        let depth = DepthTarget::new(&device, config.width, config.height);
+
         Ok(Self {
             surface,
             device,
             queue,
             config,
             adapter_info,
+            depth,
+            terrain,
+            overlay,
+            camera: None,
         })
     }
 
@@ -184,25 +208,74 @@ impl Renderer {
     ///
     /// Call after the surface reported that it went stale: `Outdated` and `Lost` mean it no
     /// longer matches the window, or the driver dropped it, and reconfiguring makes the next
-    /// frame's acquisition succeed.
+    /// frame's acquisition succeed. When the size changed, the depth texture and the overlay's
+    /// projection are rebuilt too, because both belong to the surface size.
     pub fn reconfigure(&mut self) {
         self.surface.configure(&self.device, &self.config);
+        if self.depth.width != self.config.width || self.depth.height != self.config.height {
+            self.depth = DepthTarget::new(&self.device, self.config.width, self.config.height);
+            self.overlay.set_size(
+                &self.queue,
+                self.config.width as f32,
+                self.config.height as f32,
+            );
+        }
     }
 
-    /// Clears the window to the sky colour and presents the frame.
+    /// Replaces the mesh for a section; `None` removes it.
+    ///
+    /// The mesh is uploaded to the GPU as it is, and an empty mesh removes the section's mesh
+    /// instead, so a section that stopped drawing costs nothing. Task 11 calls this once per
+    /// section of every column the session rebuilds.
+    pub fn set_section_mesh(&mut self, key: SectionKey, mesh: Option<&ChunkMesh>) {
+        match mesh {
+            Some(mesh) => self.terrain.upload(&self.device, &self.queue, key, mesh),
+            None => self.terrain.remove(key),
+        }
+    }
+
+    /// Sets the camera for the next frame.
+    ///
+    /// The view-projection matrix is built in [`Renderer::render`] from the camera and the
+    /// current surface aspect ratio, so a resize between this call and the frame cannot leave
+    /// a stale projection behind.
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.camera = Some(camera);
+    }
+
+    /// Sets the overlay lines drawn this frame; empty hides the overlay.
+    ///
+    /// The lines are laid out and uploaded on the call, so a frame draws exactly the lines the
+    /// caller last set.
+    pub fn set_overlay_lines(&mut self, lines: Vec<String>) {
+        self.overlay.upload_text(&self.device, &self.queue, &lines);
+    }
+
+    /// Draws the frame and presents it.
+    ///
+    /// The colour and depth attachments are cleared in the terrain pass, which draws every
+    /// section mesh in the table when a camera has been set; the overlay pass then draws the
+    /// debug lines over the result, in a pass without a depth attachment, so no terrain can
+    /// hide the text.
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        if let Some(camera) = self.camera {
+            let aspect = self.config.width as f32 / self.config.height as f32;
+            self.terrain.set_camera(&self.queue, camera, aspect);
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("oxide-render encoder"),
             });
         {
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("oxide-render clear pass"),
+            let mut terrain_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxide-render terrain pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -212,14 +285,88 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        // The depth buffer is not read after the pass.
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if self.camera.is_some() {
+                self.terrain.draw(&mut terrain_pass);
+            }
+        }
+        {
+            let mut overlay_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxide-render overlay pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            self.overlay.draw(&mut overlay_pass);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+/// The depth texture the terrain pass tests and writes, with the size it was built for.
+///
+/// The render pass borrows a view of it, and a `TextureView` keeps its texture alive, so the
+/// texture handle itself is not stored.
+struct DepthTarget {
+    /// A view of the whole texture, as the pass's depth attachment needs.
+    view: wgpu::TextureView,
+    /// The width in texels the texture was built for.
+    width: u32,
+    /// The height in texels the texture was built for.
+    height: u32,
+}
+
+impl DepthTarget {
+    /// Creates a depth texture of `width` by `height` texels in [`DEPTH_FORMAT`].
+    ///
+    /// Every drawable surface is at least one texel across, so a zero size, which a hidden
+    /// window reports before the caller filters it, becomes one texel rather than an invalid
+    /// texture.
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("oxide-render depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            view,
+            width,
+            height,
+        }
     }
 }
 
