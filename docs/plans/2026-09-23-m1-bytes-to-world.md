@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024 edition (rust-version 1.85, developed on 1.95), the M0 stack plus two new dependencies: `glam` (matrices, `oxide-render`) and `crossbeam-channel` (session-to-window events, `oxide-game` and `oxide-client`). No `bytemuck`: the workspace forbids `unsafe_code`, which derive-generated `unsafe impl`s trip, so vertex data is serialised by hand (Task 7).
 
-**Spec:** `docs/specs/oxidecraft-v1-design.md` (v3). M1 is the section 13 row "Bytes to world". Read section 8 before Tasks 3–6, section 9 before Task 6, sections 6 and 10 before Tasks 7–11, and appendix C.3 before Task 12. Byte-level detail comes from `docs/research/protocol-47-reference.md`: section 1.4 before Task 3, sections 2.1–2.3 and 3.1–3.4 before Tasks 4–6, section 8 for the worked byte layouts.
+**Spec:** `docs/specs/oxidecraft-v1-design.md` (v3 as written; the binding revision during execution was v5 — see the milestone ledger's Task 9 ruling). M1 is the section 13 row "Bytes to world". Read section 8 before Tasks 3–6, section 9 before Task 6, sections 6 and 10 before Tasks 7–11, and appendix C.3 before Task 12. Byte-level detail comes from `docs/research/protocol-47-reference.md`: section 1.4 before Task 3, sections 2.1–2.3 and 3.1–3.4 before Tasks 4–6, section 8 for the worked byte layouts.
 
 ## Global Constraints
 

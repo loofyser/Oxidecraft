@@ -1,0 +1,743 @@
+# M2 Textured Terrain Implementation Plan
+
+> **How to work this plan:** one task at a time, in order. Run each step's verification before moving on, and tick the checkboxes (`- [ ]`) as you go. Every commit is made on `main` with explicit `git add` paths.
+>
+> **Plan style:** this plan pins every interface, constant, path, and rule the tasks must agree on, and carries code sketches wherever a byte layout, formula, or data shape is the deliverable. Algorithm bodies that mirror vanilla behaviour are derived from the cited MCP-919 source files (`refs/_src/`, local and uncommitted; the tree is fetched in the pre-flight, before Task 1) by the task that needs them, and every derived constant is pinned by a test. Where this plan and a cited document disagree, the document governs and the plan text is corrected first.
+
+**Goal:** Textured terrain. The client builds its block atlas from the user's own client jar, bakes the 1.8 block models, renders terrain with textures, biome tint, and light taken from the wire's nibbles, under vanilla's own colour pipeline, with fog, sky, and clouds, culling and parallel meshing — and the rig procedure of appendix C places both clients at the same position so the screenshots match within the C.2 tolerance. Baseline performance numbers land in `docs/perf.md`.
+
+**Architecture:** `oxide-assets` gains the texture loaders (PNG, `.mcmeta`), the atlas stitcher, and the blockstate/model loader with its baker. `oxide-world` gains the block behaviour table with state properties, the biome table with its tint helpers, and the light engine. `oxide-game` gains the snapshot-driven parallel mesher and the model join. `oxide-render` gains the atlas texture and textured pipelines, the three terrain queues, frustum culling, the lightmap and brightness pipeline, fog, the sky and cloud passes, and the jar-font text path. `oxide-client` gains the font-backed overlay with cached uploads and the comparison flags.
+
+**Tech Stack:** Rust 2024 edition (rust-version 1.85, developed on 1.95), the M1 stack plus two new dependencies: `png` (jar texture decoding, `oxide-assets`) and `rayon` (the meshing pool, `oxide-game`). Both are already listed in spec appendix A. No `bytemuck` (workspace forbids `unsafe_code`), no `arc-swap` (snapshots travel through channels, one owner at a time), no `criterion` (the M2 baseline is the rig measurement protocol of appendix C.4; micro-benchmarks are M9 work).
+
+**Spec:** `docs/specs/oxidecraft-v1-design.md` (v5). M2 is the section 13 row "Textured terrain". Read section 9 before Tasks 5–7, section 10 before Tasks 8–12, section 6 before Task 13, appendices C.1 and C.2 before Tasks 10, 11 and 15, and appendix C.4 before Task 15. Model and atlas detail comes from `docs/research/render-parity-survey.md` sections 1.2–1.4 and 4.1–4.4; light semantics from `docs/research/protocol-47-reference.md` sections 3.3–3.4 and 4.1–4.2; vanilla source citations are `Marcelektro/MCP-919` files fetched into `refs/_src/` (uncommitted), the same source the research reports cite as `MCP-919`.
+
+## Global Constraints
+
+- License GPL-3.0. Adapted third-party code must be recorded in `NOTICE`.
+- Zero code copied from RustCraft. It is a read-only reference only.
+- No Mojang asset, jar, `.class` file, `.ogg`, or `.png` may ever be committed. The extractor must refuse to read `.class` entries, and nothing under `refs/` or `vanilla/` is committed. **Textures, blockstates, models, fonts, and colormaps are read from the user's own store at runtime only.** No test fixture may embed a Mojang pixel: fixtures are synthetic (generated in the test) or read from the store by an ignored test.
+- Never read `.class` files from the jar at runtime. Design invariant.
+- rust-version 1.85, edition 2024. `Cargo.lock` is committed.
+- CI must fail on: formatting, clippy warnings, test failure, license violations, crate-graph violations, or a tracked Mojang asset.
+- Dependency additions are explicit commits, pinned in `Cargo.lock`; record the resolved versions in the commit message. This milestone adds exactly `png` and `rayon`.
+- Every write to the asset store is atomic: temp file in the same directory, then rename. The atlas and every derived texture live in memory only; nothing generated is written into the store.
+- Datastore paths resolve through `XDG_DATA_HOME` when set, else `~/.local/share`, else the platform equivalent via the `dirs` crate.
+- The allowed crate edges are exactly the section 5.1 table (17 edges, `scripts/check-graph.sh`): `oxide-world → {oxide-proto, oxide-proto-v47}`; `oxide-game → {oxide-proto, oxide-proto-v47, oxide-world, oxide-assets, oxide-render}`; `oxide-client → all of the above`; `oxide-render → oxide-assets`. No M2 task adds an edge outside that table. Three of its edges are declared for the first time in this milestone, each in an explicit commit that carries the `Cargo.lock` delta: `oxide-game → oxide-assets` (Task 5, as a dev-dependency; Task 8 promotes it to a regular one), `oxide-render → oxide-assets` (Task 10), and `oxide-client → {oxide-assets, oxide-world}` (Task 14).
+- Every public item carries a doc comment (workspace lint `missing_docs`); `unsafe_code` is forbidden workspace-wide.
+- No AI or tooling language in commits, code, comments, or committed documents.
+- `git add` is always explicit with paths; never `git add -A` or `git add .`.
+- Evidence (captures, screenshots, logs) lives under the git-ignored `refs/` tree. Committed documents cite it by path.
+- The local gate before every push is the six-command set, plus both guard self-tests: `cargo test --workspace`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`, `bash scripts/check-assets.sh && bash scripts/check-assets.sh --self-test`, `bash scripts/check-graph.sh && bash scripts/check-graph.sh --self-test`.
+- Values that come off the wire are hostile until validated: every length, mask, and declared size is checked before it sizes an allocation; framing never panics (spec S2). The same rule now covers everything read out of the jar: a malformed PNG, blockstate, model, or `.mcmeta` is an error with a clear message, never a panic and never silently defaulted.
+- Numerical parity: every rendering constant this milestone introduces (brightness tables, tint lookups, fog parameters, sky and cloud geometry, animation rates, AO mathematics) is traceable to a cited MCP-919 file, a research report, or the jar's own JSON, and is pinned by a test. A constant with no citation does not land.
+
+## Decisions taken in this plan
+
+| # | Decision | Rationale |
+| --- | --- | --- |
+| 1 | The colour-space policy is fixed as **vanilla's non-sRGB pipeline**: the surface is configured with a non-sRGB format (`Bgra8Unorm` when the adapter offers it, the first non-sRGB format otherwise), the atlas and every texture are sampled as `Unorm` (no sRGB decode), and all colour arithmetic happens as vanilla does it — 8-bit channels multiplied in the shader, the brightness table and the gamma value from the video settings applied inside the lightmap, never a conversion at the end. | Spec appendix C.1 requires the policy to be fixed before the first visual comparison, and D18 / `docs/DIVERGENCES.md` entry 4 record the sRGB surface as the reason the clear colour is paler than vanilla's. Matching vanilla's pixels requires vanilla's pipeline; the non-sRGB route is the one that reproduces it, and it retires the entry-4 divergence instead of adding a compensating curve |
+| 2 | The `oxide-client` comparison flags are `--no-overlay` (suppress the debug overlay even when a session exists) and `--render-distance <chunks>` (the far plane and fog distance, default 8). The overlay's default stays as M1 left it: visible when `--server` was given. | The parity procedure needs our client to render without the overlay and at the same render distance as the vanilla side; the smoke path and the M1 acceptance stay reproducible |
+| 3 | Animated textures: `.mcmeta` sidecars are parsed and the **frame advance** is implemented (frame index from the client clock at the `.mcmeta` frame rate, the same rate the jar declares); interpolation blending between frames is **deferred to M6**, and the C.2 metric masks animated-sprites regions, which is the procedure's own "animated textures excluded" rule. | Water, lava, fire, and portal are visible in every rig frame; a static frame 0 would fail the metric for reasons that are pure timing. Frame advance restores the look; masks keep the metric honest about the parts a still comparison cannot decide |
+| 4 | The M2 acceptance scenes are three: (a) the M1 mark from the same position (`/tp` to 31.5 / 150 / 194.5 facing the terrain), (b) a **sample wall**: one 16×16 face per covered block id at its canonical metadata, plus the extra cells for the multi-variant ids the scenes exercise, on a constructed wall near spawn whose rows all sit **below y = 64** (the control band where the height-adjusted temperature cannot apply), viewed head-on from a fixed distance, and (c) the ground-level view at the same spot as M1's `terrain-ground.png`. | (a) and (c) keep continuity with M1's evidence; (b) makes texture and model coverage verifiable block by block instead of by eyeball, and gives the pixel metric a scene whose expected differences are zero outside masks |
+| 5 | Graphics level: M2 implements **Fast** semantics (leaves render solid, clouds flat, smooth lighting per the setting) and the acceptance run sets the vanilla rig client to Fast (`options.txt`), recording the whole settings pair in the acceptance note. Fancy-only paths (cutout-mipped leaves, cloud prisms, per-corner tint) land with the options screen in M6. | C.2 requires identical settings, not defaults; splitting Fast and Fancy would double every model and mesh path for a milestone whose exit is the terrain comparison. The Fast path is the one the M1 evidence and the rig's own recordings use |
+| 6 | Smooth lighting follows the vanilla three-state setting (`off` / `minimum` / `maximum`) with **minimum** as M2's default and the acceptance's recorded value. The three states share one code path and differ only in how the per-vertex light samples are combined; the exact combination rule is derived from `BlockModelRenderer` (which samples the cells around each vertex and averages them, with `maximum` adding the ambient-occlusion mathematics) and pinned by literal tests: a flat-lit corner, a mixed-neighbour corner, and the `off` state. The setting travels in `MeshContext` so the states are a value change when the options screen arrives (M6). | The M2 row names "light from nibbles with all three sky-light rules" and the acceptance runs `minimum`; a single-sample rule would paint hard light steps where vanilla has gradients, so the rule and its tests are pinned here rather than assumed |
+| 7 | The light engine lands complete (both light kinds, all three sky rules, recomputation over an affected region) but is wired only where M2 receives data: chunk application and section updates. Block Change (0x22) and Multi Block Change (0x23) decoders and their light hooks are M3's, with this milestone's engine as their target. | The M2 row names "light from nibbles with all three sky-light rules"; the packets that trigger local recomputation arrive with M3's interaction work. The engine is tested against hand-built worlds (spec section 12) in M2 |
+| 8 | The behaviour table covers: every id the M1 palette carries, every non-air id the acceptance world scan reported, and every block the sample wall places — with meta-derived state properties only (no world-contextual states such as fence or stair connectivity). Anything else renders the M1 magenta and logs once per id. The ignored store test asserts that every covered id resolves a variant for **all sixteen** metadata values against the jar's own blockstate files. | A faithful `getActualState` for all ~175 blocks is M6/M9 work (parity checklist items 40–41); M2's scenes must render, and the magenta fallback keeps coverage gaps unmistakable (Decision 6 of the M1 plan, kept) |
+| 9 | Frustum culling is per section, in `oxide-render`, using the six planes of the frame's view-projection matrix and each section's world-space AABB: a section is culled only when its box lies fully outside one of the planes (the positive-vertex test), so a section containing the camera is never culled. Culling decisions are pinned by tests on synthetic cameras, not by a GPU read-back. | Spec section 10 lists per-section frustum culling among the techniques that must preserve the vanilla image; a wrong cull is a visible hole, so the plane maths gets its own tests |
+| 10 | The meshing pool is a `rayon::ThreadPool` with `available_parallelism() - 1` workers (at least one), owned by the session, fed by **immutable column snapshots** built on the session thread (the column's sixteen sections as received plus the four one-block border strips of its neighbours, all copied values — no locks, no shared mutable state), with a per-column generation counter so a finished mesh whose column changed meanwhile is discarded. | Spec section 6's four contexts and its "immutable `Arc` snapshots, publication by pointer swap" without a lock on the hot path; the generation counter is this project's answer to the same problem the M1 caveat recorded (the unload-not-remeshing bug and the starvable queue) |
+| 11 | The atlas is stitched by this project's own deterministic stitcher: every sprite is padded to the next power of two (minimum 16), sprites are laid out by a shelf packer in descending height order, the atlas grows in powers of two up to 4096×4096, and it fails loudly when the set does not fit. Mip levels are built per sprite in isolation (no cross-sprite bleeding); the level *count* follows report §1.4's reading of vanilla (`min(lowestOneBit(w), lowestOneBit(h))` across the set, so an all-16×16 set keeps 4 levels at the default setting of 4, and setting 0 keeps 1) — the implementer settles the convention against `TextureMap.java:154-172`/`TextureUtil` when the source tree is cloned and pins it with a literal test; filtering is nearest for magnification and mipmapped-linear for minification (vanilla's `blur=false, mipmaps on`). | Vanilla's `TextureMap`/`Stitcher` build a *virtual* atlas; its internal layout is not observable in a screenshot, so the observable rules (POT padding, no bleeding, the filtering pair, the level count) are what M2 pins, and the layout stays simple enough to test without a GPU |
+| 12 | The rig's log-rotation defect (it kept only `latest.log` plus 2-line gz archives and lost the M1 acceptance console) is fixed inside Task 15: `refs/rig/server/start.sh` redirects the server's stdout to a run-stamped console file under `refs/rig/server/logs/`, and the rig README records the change. The rig tree is uncommitted, so this stays rig-local evidence work. | Backlog item 7; the M2 acceptance run's console must survive for its own note, and M1's loss is the precedent |
+| 13 | The parity metric tool is `scripts/parity-diff.py`, committed, standard-library only (`zlib`, `struct`, `argparse`), with a `--self-test` that builds fixture PNGs in a temp directory. It computes appendix C.2's two numbers per image pair, supports named rectangular masks, and prints a JSON report. CI does not run it (there is no screenshot to compare); the acceptance task runs it and keeps its JSON beside the screenshots. | The tolerance is a project-level criterion used again in M6 and M9; a committed, dependency-free tool keeps it reproducible. `Pillow` exists on this machine but not in the repository's dependency story |
+| 14 | Milestone close-out stays a task in this plan (Task 16) and follows the M1 ruling: the final whole-branch review runs over the reviewed code head first, then the close-out writes `docs/STATE.md`, `CHANGELOG.md`, the handoff, `docs/perf.md`'s milestone summary, and the `m2` tag so the tag marks a head that passed the review. | The M1 close-out proved the order matters; the tag should mark reviewed state |
+
+## Open questions for the owner (answers recorded on approval)
+
+1. **Fold the seven-item M2 backlog into this plan (Decision 3 of the close handoff)?** Items 1–6 land as tasks here (1, 13, 14, 16 and the doc corrections); item 7 lands inside Task 15.
+2. **Colour-space policy (Decision 1).** Adopt the non-sRGB pipeline and retire `docs/DIVERGENCES.md` entry 4, with the spec's appendix C.1 line recording the fixed policy and a v6 revision-history row? The alternative — an sRGB surface with a compensating encode — reaches the same pixels with more maths and one more place to get it wrong.
+3. **Cloud scope (Decision 5).** Flat clouds only in M2; the acceptance sets both clients to Fast cloud quality; Fancy prisms ride with the options screen (M6).
+4. **F3 overlay scope.** M2 replaces the debug font with the jar's real font and keeps the M1 nine-line field set; the full vanilla F3 field list and its sub-modes (parity checklist items 5, 6) stay M6. The overlay is off for the M2 comparison run (Decision 2).
+5. **Animated textures (Decision 3).** Frame advance in, interpolation blending deferred, animated-sprites regions masked in the C.2 metric.
+6. **New dependencies.** `png` and `rayon` only (both in spec appendix A), no `bytemuck`, no `arc-swap`, no `criterion` in M2.
+7. **Vanilla-side capture and baseline access.** The parity run needs the vanilla client's HUD hidden (F1) and its frame rate read (F3) for `docs/perf.md`. The plan attempts a rig-local virtual keyboard (Linux `uinput`, needs `sudo` once, documented under `refs/rig/tools/`); if the desktop does not deliver those events, the fallback is: keep the vanilla HUD and mask its fixed rectangles in the metric, and record the baseline's vanilla frame rate with the fallback method named in `docs/perf.md` (the frame-difference count from a screen recording), or mark that number as M9's to complete when nothing works. Confirm the fallback ladder is acceptable.
+8. **Behaviour-table scope (Decision 8).** Covered ids as listed; full 1.8 registry and world-contextual states deferred with the parity-checklist items they belong to.
+
+### Answers recorded on approval (2026-09-27)
+
+| # | Question | Answer |
+| --- | --- | --- |
+| 1 | Backlog folded into M2 | Yes: items 1-6 land as tasks in this plan, item 7 inside Task 15 |
+| 2 | Colour-space policy | Yes: the non-sRGB pipeline; `docs/DIVERGENCES.md` entry 4 retired with its history kept; the spec's appendix C.1 line records the fixed policy and the revision history gains a v6 row when Task 11 amends the text |
+| 3 | Cloud scope | Yes: flat clouds only in M2; the acceptance sets both clients to Fast cloud quality; Fancy prisms ride with the options screen (M6) |
+| 4 | F3 overlay scope | Yes: the jar font replaces the debug font, the M1 nine-line field set stays; the full vanilla F3 field list and sub-modes stay M6; the overlay is off for the M2 comparison run |
+| 5 | Animated textures | Yes: frame advance lands in M2, interpolation blending is deferred to M6, and the C.2 metric masks animated-sprites regions |
+| 6 | New dependencies | Yes: `png` and `rayon` only; no `bytemuck`, no `arc-swap`, no `criterion` in M2 |
+| 7 | Vanilla-side capture and baseline access | Yes, the ladder as written: attempt the rig-local virtual keyboard for F1/F3; if the desktop does not deliver those events, mask the vanilla HUD's fixed rectangles and derive the vanilla frame rate from a screen recording, or mark that number as M9's to complete when nothing works |
+| 8 | Behaviour-table scope | Yes: the covered ids as listed (M1 palette ids, the world-scan ids, the wall's ids), meta-derived state properties only, magenta fallback beyond |
+
+Plan approved by the owner 2026-09-27, all eight questions answered as recommended. The plan is
+committed on approval, before Task 1 is dispatched.
+
+---
+
+### Task 1: The M1 backlog, and the bulk-column replay through the session
+
+**Goal:** Clear the three small M1 review items that touch code, and add the `0x26` bulk replay test through the session that M1's final review asked to schedule first in M2.
+
+**Files:**
+- Modify: `crates/oxide-proto-v47/src/serverbound.rs` (make `client_settings_payload` total)
+- Modify: `crates/oxide-proto-v47/src/column.rs` (the `# Panics` note on `unpack_block`)
+- Modify: `crates/oxide-world/Cargo.toml` (drop the unused `oxide-proto` dependency)
+- Modify: `crates/oxide-world/src/world.rs` and/or `crates/oxide-world/src/chunk.rs` only if the dropped dependency was named there (it is not expected to be)
+- Test: `crates/oxide-game/tests/session_replay.rs` (extend with the bulk replay case)
+- Modify: `crates/oxide-proto-v47/tests/play_packets.rs` (a covering test for the made-total helper)
+
+**Interfaces:**
+- Consumes: `oxide_proto_v47::clientbound::MapChunkBulk`, `ChunkData`; the committed fixture `crates/oxide-proto-v47/tests/fixtures/m1-capture/column-0_11.bin` and its manifest; `oxide_game::session::{Session, SessionConfig, ClientEvent}`; `Session::new(conn, config)` over a duplex.
+- Produces: `oxide_proto_v47::serverbound::client_settings_payload(&ClientSettings) -> Vec<u8>` becomes total (no panic for any input; overlong locale is refused by `write_client_settings` as today). No other public surface changes.
+
+**Steps:**
+
+- [ ] **Step 1: Re-confirm the three findings against the code.** Read the M1 ledger entries for backlog items 3, 4, 5 (`.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md`, the "Task 4: minor (deferred)" line and the M1 final review's Minor 2) and open the current code at each site. The items, verbatim in intent: (3) `client_settings_payload` panics on an overlong locale — make it total; (4) `crates/oxide-world/Cargo.toml:14` declares `oxide-proto` unused — drop it; (5) `unpack_block` in `column.rs` lacks the `# Panics` note that `unpack_nibble` carries.
+
+- [ ] **Step 2: Make the helper total.** `client_settings_payload` currently panics on an overlong locale (the M1 review deferred it: "route callers through `write_client_settings` or make the helper total in M2"). Make the helper total by truncating the locale at the wire's own cap — the protocol reference allows at most 7 bytes for this field (§2.3 of `docs/research/protocol-47-reference.md`, the Client Settings row; the spec repeats it in section 8), and the helper's doc comment states that truncating contract as this client's choice, not the source's. Pin all three behaviours in `play_packets.rs`: a 7-byte locale round-trips unchanged; a 9-byte locale produces the 7-byte prefix; `write_client_settings` still refuses an overlong locale with its error (it never truncates).
+
+- [ ] **Step 3: Drop the unused dependency.** Remove the `oxide-proto` line from `crates/oxide-world/Cargo.toml`. Run `cargo tree -p oxide-world -i oxide-proto` before and after to record the change; `scripts/check-graph.sh` must still report the tree clean (the guard's allow-list is unchanged — dropping an edge never needs a guard edit, and the world crate still legitimately may depend on `oxide-proto-v47`).
+
+- [ ] **Step 4: Add the `# Panics` note.** `unpack_block` takes a pointer into a column payload; state, in the same words `unpack_nibble` uses, the bounds the caller must have checked and what happens otherwise (it panics on an out-of-range index; the decoder never calls it that way).
+
+- [ ] **Step 5: Write the failing bulk replay test.** In `session_replay.rs`, add a case that serves a scripted server stream containing: handshake/status framing as the existing tests do, login (Set Compression then Login Success, in the captured order), Join Game for the Overworld, then one `Map Chunk Bulk` (0x26) frame whose body carries **two** columns, the first being the committed fixture payload (`column-0_11.bin`, mask `0x001f`) and the second a second copy of the same payload at chunk coordinates (1, 11) — the test asserts:
+  - the session reports `ChunkUpdated` for both columns **with all sixteen section slots** (the bulk path must use the same emitter as the single path);
+  - the world the session built answers `World::block` with the fixture's known values at two probe positions per column (take `blocks[0] == 1` and one deeper position from the manifest's block-count table);
+  - the column at (1, 11) is a faithful copy of the column at (0, 11) — a second probe pair equal to the first;
+  - a keepalive sent after the bulk frame is answered (the session is still live).
+  Run it first and watch it fail against the current code only if the current code cannot express the shape; if the current session already passes, say so in the report and keep the test as the pin.
+
+- [ ] **Step 6: Run the covering tests.** `cargo test -p oxide-game --test session_replay`, `cargo test -p oxide-proto-v47`, `cargo test -p oxide-world`, then the full six-command gate.
+
+- [ ] **Step 7: Commit.** `feat: add the bulk-column replay test and clear the M1 code backlog (M2)` with explicit paths for the five files.
+
+**Verification:** the new replay test passes and the bulk path's event shape is pinned; the three backlog items are gone from the code; `bash scripts/check-graph.sh` reports the tree clean with one fewer edge; the gate is green. Deferred minors this task does not touch stay deferred.
+
+---
+
+### Task 2: The texture sources (`oxide-assets`: PNG, `.mcmeta`, `TextureSet`)
+
+**Goal:** Load the jar's texture files into memory as RGBA8 images, with the animation sidecars parsed, and give the rest of the milestone one place to fetch a texture by its resource path.
+
+**Files:**
+- Create: `crates/oxide-assets/src/texture.rs`
+- Create: `crates/oxide-assets/src/mcmeta.rs`
+- Create: `crates/oxide-assets/src/resources.rs`
+- Modify: `crates/oxide-assets/src/lib.rs` (register the three modules)
+- Modify: `crates/oxide-assets/Cargo.toml` (new dependency `png`)
+- Test: `crates/oxide-assets/tests/texture.rs` (synthetic PNGs built in the test, no jar involved)
+- Test: `crates/oxide-assets/tests/resources.rs` (synthetic extraction tree in a temp directory)
+
+**Interfaces:**
+- Consumes: `oxide_assets::store::Store` / `oxide_assets::extract::Extractor::root()` for the on-disk extraction tree layout (`extracted/1.8.9/assets/minecraft/textures/...`); `serde_json` for `.mcmeta`.
+- Produces:
+  - `oxide_assets::texture::{Texture, TextureError}`: `Texture { pub width: u32, pub height: u32, pub rgba: Vec<u8> }` (8-bit RGBA, row-major, top-left origin) and `Texture::from_png(bytes: &[u8]) -> Result<Texture, TextureError>`.
+  - `oxide_assets::mcmeta::{AnimationMeta, McmetaError}`: `AnimationMeta { pub frametime: u32, pub frames: Vec<u32>, pub frame_times: Vec<Option<u32>>, pub interpolate: bool }` — `frametime` in ticks (default 1), `frames` the frame index list (identity when the file omits `frames`), `frame_times[i]` the entry's own `time` when the file gives one, `interpolate` false when absent; `AnimationMeta::parse(json: &str) -> Result<Self, McmetaError>`. The meta keeps the file's values only — the *effective* per-frame schedule is the atlas's to compute (Task 4).
+  - `oxide_assets::resources::{TextureSet, ResourceError}`: `TextureSet::load(extraction_root: &Path) -> Result<TextureSet, ResourceError>`, `TextureSet::get(&self, path: &str) -> Option<&Texture>` keyed by texture path without extension (e.g. `blocks/stone`, `items/stick`, `colormap/grass`, `font/ascii`, `environment/sun`, `gui/widgets`), and `TextureSet::animation(&self, path: &str) -> Option<&AnimationMeta>`.
+
+**Steps:**
+
+- [ ] **Step 1: Write the failing texture tests.** In `tests/texture.rs`, build small PNGs in memory (a 1×1 opaque red, a 2×2 with four distinct RGBA values including a zero-alpha texel, and a 16×32 vertical strip) using a tiny in-test PNG writer: a hand-built zlib stream of stored (uncompressed) blocks for `IDAT`, filter type `None` only — the writer stays independent of the `png` reader and adds no dependency (`flate2` is not a dependency of `oxide-assets` and must not become one for a test). Assert `Texture` dimensions, exact RGBA bytes, and that a truncated PNG and a non-PNG byte slice are errors, not panics. In `tests/resources.rs`, lay out a temp directory with `assets/minecraft/textures/blocks/stone.png`, `blocks/stone.png.mcmeta`, `font/ascii.png`, and one file with an invalid `.mcmeta`; assert the set loads, `get("blocks/stone")` returns the pixels, `animation("blocks/stone")` returns the parsed meta, a missing path returns `None`, and the invalid sidecar is reported with the file name in the message.
+
+- [ ] **Step 2: Run the tests and watch them fail.** `cargo test -p oxide-assets --test texture --test resources`. Expected: unresolved imports.
+
+- [ ] **Step 3: Implement `texture.rs`.** `png` crate with the default decoder; convert any input colour type (greyscale, palette, RGB, RGBA, 16-bit) to 8-bit RGBA in `from_png`. Reject images larger than 4096 on either axis (nothing in the 1.8 jar is; a larger file is a hostile input, and the atlas ceiling is the same number). Errors carry the PNG crate's message.
+
+- [ ] **Step 4: Implement `mcmeta.rs`.** Parse with `serde_json` into a small private struct mirroring the 1.8 sidecar (`animation: { frametime?: u32, frames?: [u32 | { index: u32, time?: u32 }], interpolate?: bool }`). Keep the file's frame semantics only: the frame index list, each entry's own `time` kept as `Some(t)`/`None`, and `frametime` as written. Missing `animation` object: `frametime` 1, `frames` empty, `frame_times` empty, `interpolate` false. Also accept the bare-number `frames` form. The effective per-frame schedule (`frametime` where the entry gives none) is computed by the atlas in Task 4, not here.
+
+- [ ] **Step 5: Implement `resources.rs`.** `TextureSet::load` walks `<root>/assets/minecraft/textures/` (case as the jar has it), loading every `.png` under it, keyed by the path relative to `textures/` without the extension; sidecars (`.png.mcmeta`) attach to their PNG. A `.mcmeta` without a PNG, or a PNG that fails to decode, is an error naming both the file and the reason — the set either loads whole or reports what is wrong. Loading order over hosts is deterministic (sorted paths) so error messages are stable. Skip `textures/font/unicode_page_*.png` (they belong to a later milestone's unicode text; record the skip in the doc comment and count them so the count is asserted).
+
+- [ ] **Step 6: Assert the real tree once, ignored.** Add `#[ignore]`d test `the_real_extraction_tree_loads` gated on an environment variable `OXIDECRAFT_STORE` pointing at a store root: it loads the real `extracted/1.8.9` tree and asserts the loaded texture count is at least **370 blocks / 225 items** / 6 environment / 2 colormap / 1 font-ascii, and that `blocks/stone`, `blocks/water_still`, `blocks/grass_top`, `colormap/grass` and `font/ascii` are present. The floors are floors, not equalities, and the test's comment records why they sit below the survey's census: the extracted tree holds 373 block PNGs and 227 item PNGs (verified against the store and the jar, which agree file-for-file), while the survey's 382/229 counts the `.mcmeta` sidecars alongside the PNGs. This is the test the acceptance task runs against the real store.
+
+- [ ] **Step 7: Run the gate and commit.** `cargo test -p oxide-assets`, then the six-command gate. Commit `feat: add the PNG texture loader and the resource set (M2). New dependency: png (MIT/Apache-2.0)` with explicit paths including `Cargo.lock`.
+
+**Verification:** synthetic tests pass; the ignored test passes against the real store (`OXIDECRAFT_STORE=<store> cargo test -p oxide-assets -- --ignored`); no test fixture contains a Mojang pixel; the gate is green.
+
+---
+
+### Task 3: Blockstates and models (`oxide-assets`, the loader and the baker)
+
+**Goal:** Read the jar's blockstate and model JSON with 1.8 semantics, resolve the `parent` chains and the `builtin/*` parents, and bake every variant into quads the mesher can consume.
+
+**Files:**
+- Create: `crates/oxide-assets/src/model.rs`
+- Modify: `crates/oxide-assets/src/lib.rs`
+- Test: `crates/oxide-assets/tests/model.rs` (synthetic JSON in a temp tree)
+- Test: an `#[ignore]`d case in the same file over the real extraction tree
+
+**Interfaces:**
+- Consumes: the extraction root layout (`extracted/1.8.9/assets/minecraft/blockstates/*.json`, `extracted/1.8.9/assets/minecraft/models/**/*.json`); `oxide_assets::resources::TextureSet` only for the harness that builds the referenced-texture list.
+- Produces:
+  - `oxide_assets::model::{FaceDir, Variant, BlockStates, ModelJson, BakedQuad, BakedModel, ModelError, ModelSource}` with:
+    - `pub enum FaceDir { Down, Up, North, South, West, East }` (this crate's own direction enum; `oxide-game` maps to its mesher faces — `oxide-assets` may not depend on `oxide-game`).
+    - `pub struct Variant { pub model: String, pub x: u8, pub y: u16, pub uvlock: bool, pub weight: u32 }`.
+    - `pub struct BlockStates { pub variants: std::collections::BTreeMap<String, Vec<Variant>> }` with `BlockStates::parse(json: &str) -> Result<Self, ModelError>`.
+    - `pub struct BakedQuad { pub corners: [[f32; 3]; 4], pub uv: [[f32; 2]; 4], pub texture: String, pub cullface: Option<FaceDir>, pub tintindex: Option<u8>, pub shade: bool }` — `corners` in block-local units (0..1), wound counter-clockwise seen from outside the block; `uv` in the sprite's 0..1 space, corner for corner with `corners`; `texture` a resolved resource path like `blocks/stone`.
+    - `pub struct BakedModel { pub quads: Vec<BakedQuad>, pub ambient_occlusion: bool, pub particle: Option<String>, pub missing: bool }`.
+    - `pub struct ModelSource` with `ModelSource::open(extraction_root: &Path) -> Result<Self, ModelError>`, `blockstates(&self, block_name: &str) -> Result<&BlockStates, ModelError>` (cached), `texture_paths(&self) -> BTreeSet<String>` (every texture path the loaded model files reference, resolved through their own `textures` maps, for the atlas), and `bake_variant(&self, variant: &Variant) -> Result<BakedModel, ModelError>` (cached).
+
+**Steps:**
+
+- [ ] **Step 1: Write the failing tests.** Build a temp extraction tree with hand-written JSON: `blockstates/stone.json` (a single empty-key variant to `block/stone`), `blockstates/torch.json` (the report's five facing variants, with `y` rotations), `blockstates/grass.json` (the four-element weighted array), `models/block/cube.json` and `cube_all.json` (pure inheritance helpers), `models/block/stone.json` (parent `cube_all`, `#all` = `blocks/stone`), `models/block/cross.json` (the report's rotation + `shade: false` example), `models/block/stairs.json` (the report's two-element example), an element with a `uv`, `rotation`, `tintindex`, and `cullface` set, a model with an unresolvable parent, and a model whose parents form a cycle. Assert: parse counts and variant fields (including the weight array length); `uvlock` preserved; a resolved texture path for `#all`; the missing texture variable case is an error naming the variable; the parent cycle is an error naming the chain; `builtin/missing` yields `missing: true` with no quads; `builtin/generated` with `layer0..4` yields one flat quad per layer (the item path — parsed for completeness, not consumed in M2); and the element rotation rules below. The failed-parent and cycle cases must be errors, never a default.
+
+- [ ] **Step 2: Run them and watch them fail.** `cargo test -p oxide-assets --test model`.
+
+- [ ] **Step 3: Implement the parse.** `ModelJson` mirrors 1.8 (`parent`, `textures` map, `elements`, `ambientocclusion` default true, `display` parsed into a plain struct and unused this milestone). `elements[].from/to` are floats in 1/16 units, allowed −16…32; `faces` keys are the six names; per face: `uv` (optional), `texture` (`#var`), `cullface`, `rotation` (0/90/180/270; clockwise, counter-clockwise for `down`), `tintindex`. Element `rotation` = `origin`, `axis`, `angle`, `rescale`. All hostile values are errors: a `from` > `to`, an unknown face key, a `texture` that does not start with `#`, an angle outside the four quarter turns, an unknown `axis`.
+
+- [ ] **Step 4: Resolve parents and textures.** Walk the `parent` chain from the model to its root, merging: child `textures` override parent entries variable by variable; the deepest `elements` win; `ambientocclusion` follows the nearest declaration; `parent: "builtin/*"` terminates the chain. Resolve every `#var` to its final non-`#` value, then to a texture path. Cycle detection with the chain named in the error. A model file that does not exist is an error naming the path.
+
+- [ ] **Step 5: Bake.** For each element, emit one `BakedQuad` per face that is present: corners from the element's box for that direction, wound counter-clockwise seen from outside, in block-local 0..1 units; `uv` from the face's `uv` (in 1/16 units, mapped to 0..1 of the sprite, with the ordering vanilla uses per direction — derive it from `BlockFaceUV` in MCP-919 and pin each direction with a test that names the corner order); element rotation applied to positions and (when vanilla rotates them) the uv; `shade` and `tintindex` carried through; `cullface` carried through. `ambient_occlusion` = the model's resolved value. `missing` true only for `builtin/missing`.
+
+- [ ] **Step 6: Variant rotation and the weighted array.** Blockstate variant `x`/`y` rotate the baked quads: implement vanilla's `BlockStateModelRotation` semantics, including `uvlock` (with `uvlock` the uv stays locked to the block face; without it the uv rotates with the geometry — the difference is observable and pinned by a test using the report's torch cases). Weighted arrays stay arrays: `bake_variant` bakes one entry; the mesher owns the position-based choice (Task 8).
+
+- [ ] **Step 7: The real-tree test, ignored.** `#[ignore]`d, gated on `OXIDECRAFT_STORE`: load the real `extracted/1.8.9` tree, parse **all 340** blockstate files and **all 1595** model files under `models/`, and assert: every blockstate file parses; every model parses; the referenced texture-path set contains `blocks/stone`, `blocks/grass_top`, `blocks/water_still`, `blocks/lava_still`, `blocks/leaves_oak`, and `blocks/glass`; and `blocks/stone` bakes to exactly six quads with `cullface` set on all six.
+
+- [ ] **Step 8: Gate and commit.** `feat: add the blockstate and model loader with the 1.8 baker (M2)`.
+
+**Verification:** synthetic tests pass; the ignored test passes against the real tree and its counts are the report's (§1.1: 340 blockstates, 1595 models); no Mojang pixel or JSON is committed (the temp tree is built byte by byte in the test); the gate is green.
+
+---
+
+### Task 4: The atlas (`oxide-assets`: stitching, mip levels, sprite index, animation)
+
+**Goal:** Stitch the given texture paths (plus the procedurally generated fallback sprite) into one atlas with the filtering behaviour vanilla uses, index every sprite, and carry each animated sprite's frame list into the index. The atlas's input set is exactly the paths the caller passes — there is no hidden extra set.
+
+**Files:**
+- Create: `crates/oxide-assets/src/atlas.rs`
+- Modify: `crates/oxide-assets/src/lib.rs`
+- Test: `crates/oxide-assets/tests/atlas.rs`
+
+**Interfaces:**
+- Consumes: `TextureSet`, `AnimationMeta`, `ModelSource::texture_paths`.
+- Produces:
+  - `pub struct SpriteRect { pub x: u32, pub y: u32, pub w: u32, pub h: u32 }` (pixels in the atlas; `w`/`h` of *content*, not padding).
+  - `pub struct AtlasSprite { pub region: SpriteRect, pub content: SpriteRect }` (`region` = the padded power-of-two cell, `content` = the sprite's own pixels inside it, at level 0).
+  - `pub struct AnimatedSprite { pub frames: Vec<AtlasSprite>, pub times: Vec<u32>, pub interpolate: bool }`.
+  - `pub struct AtlasLevel { pub width: u32, pub height: u32, pub rgba: Vec<u8> }` and `pub struct Atlas { pub levels: Vec<AtlasLevel>, pub width: u32, pub height: u32, pub level_count: u32, pub sprites: BTreeMap<String, AtlasSprite>, pub animated: BTreeMap<String, AnimatedSprite>, pub missing: AtlasSprite }` — `levels[0]` is the full atlas, `levels[l]` its `l`-th reduction (each axis halved, floored at 1), so the uploader walks the vector in order; `Atlas::level_rect(&self, sprite: &AtlasSprite, level: u32) -> SpriteRect` returns the sprite's level-0 content rect shifted right by `level` (the convention every consumer uses).
+  - `pub fn build_atlas(textures: &TextureSet, paths: &BTreeSet<String>, mipmap_levels: u32) -> Result<Atlas, AtlasError>`, and `Atlas::uv(&self, sprite: &AtlasSprite) -> [[f32; 2]; 2]` returning the `(u0, v0)`/`(u1, v1)` pair a quad's uv maps into (the content rect divided by the atlas size, at level 0).
+
+**Steps:**
+
+- [ ] **Step 1: Write the failing tests.** Synthetic `TextureSet` in a temp tree: two 16×16 sprites with distinct flat colours, one 32×32, one 16×32 vertical strip with a `.mcmeta` (frametime 2, interpolate true), one 16×16 whose `.mcmeta` has `frames` out of order, and a path that does not exist in the set but is requested (must error). Assert: the atlas is a power of two on both axes; every requested sprite is present; two sprites' regions do not overlap; each sprite's content pixels are byte-identical to the source at level 0, in the right place; the strip's frame rects are stacked top-down at ground height/frame-height steps and `times` are the effective per-frame times; the missing sprite exists, is 16×16, and is the magenta/black checkerboard; asking for a sprite that is neither in the set nor the fallback is an error; and the no-bleed rule below holds.
+
+- [ ] **Step 2: Run them and watch them fail.** `cargo test -p oxide-assets --test atlas`.
+
+- [ ] **Step 3: Implement the stitcher (Decision 11).** Pad every sprite to the next power of two ≥ max(w, h) (minimum 16); sort by height descending then path ascending; place on shelves; grow the atlas 16 → 32 → … → 4096 on both axes; error (`AtlasError::TooLarge`) when a sprite does not fit. Deterministic: the same input set produces the same byte layout, asserted by building the atlas twice and comparing hashes.
+
+- [ ] **Step 4: Mip levels.** `level_count = max(1, min(mipmap_levels, log2(min region size)))`, where `min region size` is the smallest sprite region's power of two. That is report §1.4's reading of vanilla's clamp (`min(lowestOneBit(w), lowestOneBit(h))` across the set): the default setting (4) on an all-16×16 set builds **4** levels, and setting 0 builds 1. Settle the convention against `TextureMap.java:154–172` and `TextureUtil`'s generator in the cloned source before implementing, record the resolution in the task report, and pin both cases with literal assertions (4 for the default on 16×16 sprites, 1 for setting 0). Generate levels 1..level_count per sprite from that sprite's own content with a 2×2 box average (integer `(a+b+c+d+2)/4`) and edge clamping; write each level's pixels into that level's atlas image. No-bleed rule: build a case with two adjacent sprites of pure red and pure blue and assert that no pixel of level 1 or above contains a blend of the two.
+
+- [ ] **Step 5: Animated sprites.** A sprite whose `.mcmeta` has an `animation` object becomes an `AnimatedSprite`: its frames are the strip's rows (height / frame_count), each frame an `AtlasSprite` whose content rect is that row (level 0 only — animated sprites carry no mip levels; vanilla's animated sprites are nearest-filtered, and the masking rule of Decision 3 covers them). `times[i]` = the frame's own time when the sidecar gives one, else `frametime`. All frames are part of the atlas image at level 0, stacked as in the source file. A strip whose height is not a multiple of the frame count is an error naming the file.
+
+- [ ] **Step 6: The fallback sprite.** `missing` is generated procedurally: a 16×16 checkerboard of `(1.0, 0.0, 1.0)` and `(0.0, 0.0, 0.0)` in 2-pixel cells, no jar file required. The model baker's `builtin/missing` and any unresolvable sprite path use it.
+
+- [ ] **Step 7: Gate and commit.** `feat: add the texture atlas with mip levels and animation frames (M2)`.
+
+**Verification:** tests pass; determinism pinned by double build; no Bleeding across sprite regions at levels ≥ 1; the gate is green.
+
+---
+
+### Task 5: The block behaviour table and the state properties (`oxide-world`)
+
+**Goal:** One table that answers, for every block id this client renders: its name, how its metadata maps to blockstate variant properties, its light behaviour, its material and render layer, and its tint kind — cross-checked against the decompiled 1.8.9 source.
+
+**Files:**
+- Create: `crates/oxide-world/src/behaviour.rs`
+- Modify: `crates/oxide-world/src/lib.rs`
+- Test: `crates/oxide-world/tests/behaviour.rs`
+- Test: an `#[ignore]`d case over the jar's blockstate files, living in `crates/oxide-game/tests/behaviour_store.rs` — **not** in `oxide-world`: reading the jar's blockstate JSON needs `oxide_assets`, and the crate graph gives `oxide-world` no edge to `oxide-assets` (§5.1). `oxide-game` has — and this task adds — the `oxide-assets` edge; the test is the join's first consumer.
+- Modify: `crates/oxide-game/Cargo.toml` (add `oxide-assets.workspace = true` as a dev-dependency; Task 8 promotes it to a regular dependency when `BlockModelSet` needs it)
+- Rig tool (uncommitted): the clone of `Marcelektro/MCP-919` into `refs/_src/MCP-919` used for the cross-check
+
+**Interfaces:**
+- Produces:
+  - `pub enum TintKind { None, Grass, Foliage, Water, GrassSideOverlay }`.
+  - `pub enum RenderLayer { Solid, CutoutMipped, Cutout, Translucent }`.
+  - `pub enum Material { Stone, Wood, Grass, Leaves, Glass, Cloth, Liquid, Plant, Metal, Ground, Sand, Rock, Ice, Snow, Tnt, Piston, Circuit, Portal, Web, RedstoneLight, Vine }` — the subset the covered ids need (extend only against the source).
+  - `pub struct BlockBehaviour { pub id: u16, pub name: &'static str, pub properties: &'static [PropertyDef], pub light_opacity: u8, pub light_filter: u8, pub light_emission: u8, pub full_cube: bool, pub material: Material, pub render_layer: RenderLayer, pub tint: TintKind, pub liquid: Option<LiquidKind>, pub render: RenderKind }` where `pub enum LiquidKind { Water, Lava }` and `pub enum RenderKind { Model, Liquid, Cross }` (liquid render only for the two liquids; cross for the flat models whose `shade` is false — the mesher still reads that from the model; `RenderKind` exists to route water/lava away from the model path, as `BlockLiquid` does in vanilla).
+  - `pub struct PropertyDef { pub name: &'static str, pub kind: PropertyKind }` with `pub enum PropertyKind { Bool { offset: u8 }, Int { offset: u8, bits: u8, values: u8 }, Enum { offset: u8, bits: u8, values: &'static [&'static str] } }` — the 1.8 metadata layout: properties are ordered as vanilla's `Block.createBlockState` declares them, values packed little-endian from bit 0.
+  - `pub fn behaviour(id: u16) -> Option<&'static BlockBehaviour>`; `pub fn variant_key(block: &BlockBehaviour, meta: u8) -> String` producing the blockstate key (`"variant=granite,axis=y"`; `""` for a block with no properties); `pub fn covered_ids() -> &'static [u16]`.
+  - `pub fn liquid_height_percent(level: u8) -> f32` with `pub fn liquid_kind(id: u16) -> Option<LiquidKind>`, the `BlockLiquid` surface rule the mesher uses (derive the exact formula and level→meta mapping from MCP-919 `BlockLiquid`/`BlockFluid`/`BlockDynamicLiquid`; pin `level = meta & 7` for water and lava, full height for non-waterlogged source levels the source names, and the `1.0 - (level + 1) / 9.0`-family formula as the source states it — do not carry an unverified formula).
+
+- [ ] **Step 1: Verify the source tree.** The `refs/_src/MCP-919` clone is fetched in the pre-flight (its HEAD hash is in the ledger) because Task 3 already derives from it; confirm it exists and confirm the paths the research reports cite exist: `refs/_src/MCP-919/src/minecraft/net/minecraft/block/Block.java`, `.../block/BlockLiquid.java`, `.../block/BlockStaticLiquid.java`, `.../block/BlockDynamicLiquid.java`, `.../block/BlockLeaves.java`, `.../block/BlockGlass.java`, `.../block/BlockSlab.java`, `.../block/BlockStairs.java`, `.../block/state/BlockState.java`, `.../block/state/BlockStateContainer.java`, `.../block/properties/*.java`, `.../init/Blocks.java`, and the state-mapper class (`init/BlockStateMapper`? verify the name). Re-record the HEAD hash in the report.
+
+- [ ] **Step 2: Write the table.** Populate `behaviour()` for `covered_ids()`: every id in `crates/oxide-game/src/palette.rs`'s table at M1's head, plus every non-air id the acceptance world scan reported (the M1 evidence file `refs/rig/evidence/m1/task12-world-id-scan.txt`, and re-scan in Task 14), plus every id the sample wall will place (the wall is generated from this same list — the two must be the same set, asserted in Task 15's tooling). For each id take from the source: the `Blocks.<field>` registration name (the blockstate file name), the `PropertyHelper`/`createBlockState` declarations in the constructor order (name, kind, value count, offsets), `getLightOpacity`/`isOpaqueCube`/`isFullCube` semantics (1.8: `lightOpacity` per block; leaves 1, water 3, glass 0 — take the real values), `getLightValue` emissions (torch 14, glowstone 15, lava 15, portal 11, …), the material, and the render layer from `getRenderLayer()`/`setGraphicsLevel` semantics (`BlockLeaves.getRenderLayer` returns `CUTOUT_MIPPED` when graphics are Fancy and `SOLID` when Fast — M2 implements the Fast path per Decision 5, so the table stores both and the mesher picks by the graphics setting). `TintKind` per `getBlockColor`/`getMapColor`/`ColorizerGrass` usage: grass top and grass side overlay → Grass/GrassSideOverlay, leaves and grass-type plants → Foliage, water → Water, everything else None.
+
+- [ ] **Step 3: Write the tests.** In `tests/behaviour.rs`: every covered id has a table entry; ids outside it return None; `variant_key` for a set of pinned (id, meta) pairs matches the string the source's `getMetaFromState`/`getStateFromMeta` order implies — pin at least: wool `35:14` → `color=red`; log `17:1` → `variant=spruce,axis=y`; log `17:4` → `variant=oak,axis=x`; stone `1:3` → `variant=andesite`; planks `5:2` → `variant=birch`; stone brick `98:2` → `variant=cracked_stonebrick`; grass block `2:0` → `snowy=false`; water `9:0` → `level=0`; stairs `53:2` → `facing=north,half=bottom,shape=straight` (world-contextual `shape` pinned to `straight`, the not-yet-implemented contextual value, recorded in a doc comment per Decision 8); slab `44:8` → `half=top`; sand `24:1` → `variant=chiseled_sandstone`... **verify every one of these against the source while writing the test** — the list is the intent, the source is the authority, and any pair whose real key differs is corrected in the test and flagged in the report. Also pin `liquid_height_percent` at levels 0 and 7, `behaviour(0)` is None, and `covered_ids()` is sorted and has no duplicates.
+
+- [ ] **Step 4: The store test, ignored, in `oxide-game`.** `crates/oxide-game/tests/behaviour_store.rs`, `#[ignore]`d, gated on `OXIDECRAFT_STORE`: for every covered id and every `meta` in `0..16`, `variant_key` must resolve to a variant that exists in that block's blockstate file (or the file's variants contain an entry that a `uvlock`-only difference still satisfies), parsed through `oxide_assets::model::BlockStates`. This is the coverage test Decision 8 names; anything that fails it either gains the missing property definition or is removed from `covered_ids()` with a note. Run it with `cargo test -p oxide-game --test behaviour_store -- --ignored` and record the output in the report.
+
+- [ ] **Step 5: Gate and commit.** `feat: add the block behaviour table with 1.8 state properties (M2)`.
+
+**Verification:** the cross-check note in the task report names each source file consulted with its path under `refs/_src/MCP-919`; the ignored all-meta test passes; every pinned variant key was taken from the source, not memory; the gate is green. No Mojang source text is copied into the repository — values and names only, as the research reports do.
+
+---
+
+### Task 6: The biome table and the tint path (`oxide-world`)
+
+**Goal:** Answer "what colour does grass, foliage and water take at this position" with vanilla's own rules: the per-biome temperature and rainfall, the height-adjusting noise, the colour-map lookup, the nine-sample neighbourhood average, and the fixed swamp/mesa overrides.
+
+**Files:**
+- Create: `crates/oxide-world/src/biome.rs`
+- Create: `crates/oxide-world/src/noise.rs` (the Perlin generator vanilla's height adjustment uses)
+- Modify: `crates/oxide-world/src/lib.rs`
+- Test: `crates/oxide-world/tests/biome.rs`
+- Test vectors (uncommitted): produced by running the decompiled `NoiseGenerator*` classes from `refs/_src/MCP-919` on the local JVM, kept under `refs/_src/vectors/`
+
+**Interfaces:**
+- Produces:
+  - `oxide_world::biome::{BiomeData, biome, BiomeTable}`: `pub struct BiomeData { pub id: u8, pub name: &'static str, pub temperature: f32, pub rainfall: f32, pub water_colour: [f32; 3] }`; `pub fn biome(id: u8) -> &'static BiomeData` mapping the full 1.8 id space (0–39 and the 128–167 variants to their parent data unless the source gives the variant its own numbers); unknown ids fall back to the ocean entry and the report says so.
+  - `pub fn height_adjusted_temperature(base: f32, x: i32, y: i32, z: i32) -> f32` and `..._rainfall(...)` implementing `BiomeGenBase.getFloatTemperature`/`getFloatRainfall` exactly: below y = 64 the base value; above it the base minus `(noise(x/8, z/8) * 4 + y − 64) * 0.05 / 30`, with `noise` the Perlin sample from `oxide_world::noise` seeded as the source seeds it.
+  - `oxide_world::biome::{ColorMap, TintMaps}`: `ColorMap` wrapping a 256×256 RGBA texture; `TintMaps { pub grass: ColorMap, pub foliage: ColorMap }`; `pub fn colormap_colour(map: &ColorMap, temperature: f32, rainfall: f32) -> [u8; 3]` implementing the `(1 − temp, 1 − rain·temp)` lookup, and `pub fn tint_at(world: &World, maps: &TintMaps, x: i32, y: i32, z: i32, kind: TintKind) -> [u8; 3]` — the single-sample lookup: Grass/Foliage through the maps and the height adjustment, `GrassSideOverlay` = the same as Grass, Water = the biome's `water_colour` multiplier scaled to bytes, with the fixed swamp and mesa overrides from the source.
+  - `pub fn tint_at_9(world, maps, x, y, z, kind) -> [u8; 3]`: the nine-sample neighbourhood average (`x−1..=x+1`, `z−1..=z+1`, integer mean per channel, truncating). **The mesher consumes this value in both graphics modes** — the nine-sample average is what vanilla's non-smooth path feeds from `BlockColors`/`BiomeColorHelper` (checklist item 39 applies the 3×3 average and its seam behaviour to Fast too, with the colour constant per face instead of per corner). The task confirms which call the non-smooth path makes in `BlockModelRenderer`/`BlockColors` and records it; `tint_at` stays the single-sample helper the average builds on, not a mesher input. The Fast value is pinned by a literal seam test in Task 8.
+  - `oxide_world::noise::perlin_sample(seed: i64, octaves: u32, x: f64, z: f64) -> f64`: the generator structure vanilla uses (`NoiseGeneratorOctaves` over `NoiseGeneratorPerlin` with the source's octave count and the seeded permutation built from `java.util.Random`'s LCG — port the LCG and the perlin algorithm, not the source text). Cross-checked by the vectors below.
+  - `oxide_world::noise::JavaRandom`: `pub struct JavaRandom` with `new(seed: i64)`, `next_bits(&mut self, bits: u32) -> u32`, `next_float(&mut self) -> f32` and `next_int(&mut self, bound: u32) -> u32` — the 48-bit LCG both the perlin permutation and Task 12's star field consume (one port, two callers). Its `next_float` sequence for a pinned seed is asserted against values from the same JVM harness the vectors come from.
+
+**Steps:**
+
+- [ ] **Step 1: Produce the vectors.** Write a small harness under `refs/_src/vectors/` (uncommitted): copy the decompiled `NoiseGenerator`, `NoiseGeneratorOctaves`, `NoiseGeneratorPerlin`, `NoiseGeneratorSimplex` sources from the MCP-919 clone into that directory, compile them with the system JDK (`javac`), and run a harness that prints `TEMPERATURE_NOISE.func_151601_a(x/8, z/8)` for at least 24 pinned coordinates plus the resulting `getFloatTemperature` values at y = 64, 70, 100 and 150 for a plains biome. Record the command and the JVM version in the task report. These numbers are the Rust test's expected values. Nothing from this directory is committed; only the *numbers* appear in the test, with the provenance recorded in a comment.
+
+- [ ] **Step 2: Write the failing tests.** In `tests/biome.rs`: the biome table's pinned rows (plains 0, desert 2, forest 4, swamp 6, jungle 21, ocean 0… take the temperature/rainfall/water values from the source and pin at least eight, including swamp's and mesa's fixed tints); `height_adjusted_temperature` equals the vector values at the four heights (within 1e-5); below y = 64 it equals the base value exactly; `colormap_colour` on a synthetic 256×256 map (a map whose pixel (x, y) encodes x and y in its channels makes the lookup position directly assertable) returns the pixel at `(255·(1 − temp), 255·(1 − rain·temp))` with truncation; `tint_at_9` on a hand-built world with two biomes meeting at a seam equals the nine-sample mean, and equals `tint_at` in the middle of a biome; the swamp override ignores the colormap.
+
+- [ ] **Step 3: Run them and watch them fail.** `cargo test -p oxide-world --test biome`.
+
+- [ ] **Step 4: Implement.** The biome table as a `const` array; ids outside it fall back to ocean. The Perlin port: permutation table generated by the LCG from the source's seed, gradient lookup, octave summation — the standard algorithm, written here from the structure the vectors pin. The tint helpers per the interfaces above. `tint_at` takes `&World` only for the biome lookup; when the column at that position is not loaded it returns the fallback biome's colour (a missing column is not an error on the tint path).
+
+- [ ] **Step 5: Gate and commit.** `feat: add the biome table and the tint path with the height adjustment (M2)`.
+
+**Verification:** the vector test passes; the provenance of every vector (command, JVM version, source files used) is in the task report; nothing under `refs/_src/vectors/` is committed; the gate is green.
+
+---
+
+### Task 7: The light engine (`oxide-world`)
+
+**Goal:** Implement vanilla's light model over the stored nibbles: block light spreading from emitters, sky light with its three propagation rules, the two-way recomputation after a change, and the query the mesher uses.
+
+**Files:**
+- Create: `crates/oxide-world/src/light.rs`
+- Modify: `crates/oxide-world/src/chunk.rs` (light setters on `Section`/`Chunk`)
+- Modify: `crates/oxide-world/src/lib.rs`
+- Test: `crates/oxide-world/tests/light.rs`
+
+**Interfaces:**
+- Produces:
+  - `Section::set_block_light(&mut self, x, y, z, level: u8)` and `Section::set_sky_light(...)` (plus the `Chunk` forwarding pair), validated to 0..=15.
+  - `oxide_world::light::{LightEngine, LightError}`: `LightEngine::new(world: &mut World)` is not how this works — the engine is stateless and works on a `&mut World`:
+    - `pub fn light_at(world: &World, x: i32, y: i32, z: i32) -> u8` = `max(sky_light, block_light)`, 0 outside loaded columns.
+    - `pub fn recompute(world: &mut World, x: i32, y: i32, z: i32)`: recompute both light kinds for the affected region after a block at `(x, y, z)` changed, by vanilla's rule — the changed column and its eight neighbours over the full height, with propagation stopped by the region's boundary (values outside the region are left as they are, which is what vanilla's incremental engine effectively achieves; a fully loaded test world makes the two equal, and that equality is a test).
+    - `pub fn recompute_column(world: &mut World, cx: i32, cz: i32)`: the whole-column entry point the session uses when a section update arrives, computing sky light from the column's own blocks and block light from its emitters and neighbours.
+  - The three sky rules, as the source states them (spec section 9 and the report agree; where the source's wording differs from spec §9 — for example the decrement through a light-filtering block — **the source wins**, and the difference is recorded as a ruling and a spec correction in the same push):
+    1. sky light 15 propagating straight down through a block that does not stop it does not decrease;
+    2. sky light propagating horizontally or upward, and any sky light below 15 spreading to a neighbour, decreases by one (through a light-filtering block per the source's decrement);
+    3. opaque blocks stop propagation; light-filtering values come from `BlockBehaviour`'s `light_opacity`/`light_filter` columns (Task 5).
+  - Block light: emitters start at `light_emission`; each step to a neighbour loses one, six directions; opaque blocks stop it.
+
+**Steps:**
+
+- [ ] **Step 1: Read the rule in the source.** Open `refs/_src/MCP-919`'s `BlockLightEngine`, `SkyLightEngine` (or the 1.8 equivalents — locate them; 1.8's light code is `net.minecraft.world.chunk`/`net.minecraft.world`), `Block.getLightOpacity`, and `BlockLeaves`' opacity. Write down, in the task report, the exact decrement rule for block light and for sky light (including what a light-filtering block does) with file:line citations. Compare with spec §9 and the report's §4.1; note any disagreement before writing code.
+
+- [ ] **Step 2: Write the failing tests.** In `tests/light.rs`, hand-built worlds (build with `World::apply_column` over synthetic `ColumnData`, or a test-only constructor — prefer the real path so the tests exercise the store):
+  - sky: a flat world at light 15 on an open column; digging a 1×1 hole 5 deep keeps the hole's sky at 15 straight down and reduces by one going sideways at the bottom;
+  - sky under a canopy at 14 (15 − 1 through one light-filtering block) spreading sideways to 13, 12…;
+  - sky never rises: a cell below an opaque roof reads by the side-spread chain;
+  - a section outside the mask keeps the light it had before a recompute;
+  - block light: one torch (emission 14) at a known cell gives a diamond of values with `14 − manhattan` where unobstructed;
+  - block light through an opaque wall is 0 behind it;
+  - `recompute` after a change equals a from-scratch `recompute_column` over the same world (idempotence and completeness);
+  - `light_at` = max of the two kinds.
+  Every expected number is written literally in the test, derived from the rules, not from the implementation.
+
+- [ ] **Step 3: Run them and watch them fail.** `cargo test -p oxide-world --test light`.
+
+- [ ] **Step 4: Implement.** A bounded BFS over the affected region with a queue of (position, level) and the visit rule "a cell is enqueued when its level increases"; both kinds run separately; the sky pass first computes the "direct" downward exposure, then spreads. Keep the implementation free of allocation per call where cheap to do so (reuse buffers via a small `Scratch` struct held by the caller — the session owns one), but correctness first: the tests above are the contract.
+
+- [ ] **Step 5: Gate and commit.** `feat: add the light engine with the vanilla sky and block rules (M2)`.
+
+**Verification:** all rule tests pass; the from-scratch equality test passes; the source citations are in the report; if spec §9 needed a correction it is in the same push as a `docs:` change with the ruling recorded; the gate is green.
+
+---
+
+### Task 8: The mesh core (`oxide-game`): snapshots, model quads, light per vertex
+
+**Goal:** Replace the M1 palette mesher with the model-driven one: a column snapshot the pool can own, quads from the baked models with atlas UVs and cullface, per-vertex light and colour, and the magenta fallback. Liquids and the translucent layer are Task 9; this task lands the opaque and cutout geometry.
+
+**Files:**
+- Create: `crates/oxide-game/src/mesher/snapshot.rs`
+- Create: `crates/oxide-game/src/mesher/models.rs`
+- Modify: `crates/oxide-game/Cargo.toml` (promote `oxide-assets` from the dev-dependency Task 5 added to a regular dependency)
+- Modify: `crates/oxide-game/src/session.rs` (the interim wiring: `SessionConfig` gains the optional-assets field here, the play loop builds the snapshot inline at the apply site and calls the new mesher with an asset-less fallback context when no assets were handed in — the workspace must build and the gate must pass at this task's commit, and Task 13 later moves these calls onto the pool)
+- Modify: `crates/oxide-world/src/world.rs` and `crates/oxide-world/src/chunk.rs` (the slice and point accessors the snapshot copy uses — Step 3 names them)
+- Rewrite: `crates/oxide-game/src/mesher.rs` (keep the module path and `face_corners`' role)
+- Modify: `crates/oxide-render/src/terrain.rs` (`Vertex` becomes the M2 layout; `vertex_bytes` and the byte-layout test move with it)
+- Modify: `crates/oxide-render/tests/terrain_data.rs`
+- Test: `crates/oxide-game/tests/mesher.rs`
+- Delete-or-keep note: `crates/oxide-game/src/palette.rs` stays only for `Face` (`ALL`, `offset`, `brightness`, `normal`); `block_color` and `UNKNOWN_COLOR` are removed with the palette table once the mesher no longer uses them — the ids in that table are Task 5's `covered_ids()` input, so copy the list into the behaviour table first (Task 5 lands before this one).
+
+**Interfaces:**
+- Consumes: `oxide_assets::model::{BakedModel, BakedQuad, ModelSource}`, `oxide_assets::atlas::Atlas`, `oxide_world::behaviour::*`, `oxide_world::biome::*`, `oxide_world::world::World`, `oxide_world::chunk::{SECTION_SIZE, SECTION_COUNT}`.
+- Produces:
+  - `pub struct ColumnSnapshot { pub cx: i32, pub cz: i32, pub has_sky: bool, pub biome: [u8; 256], blocks: Vec<u16>, block_light: Vec<u8>, sky_light: Vec<u8>, borders: [Border; 4] }` with `ColumnSnapshot::from_world(world: &World, cx: i32, cz: i32) -> ColumnSnapshot` and local-coordinate reads `block(&self, x: i32, y: i32, z: i32) -> u16`, `light(&self, x: i32, y: i32, z: i32) -> (u8, u8)` valid for `x, z ∈ −1..=16` and `y ∈ 0..=255` (a `Border` holds one neighbouring strip of blocks and both light kinds).
+  - `pub struct BlockModelSet { … }` with `BlockModelSet::load(models: &ModelSource, behaviour-join) -> Result<Self, ModelSetError>` resolving every covered (id) and every meta `0..16` to `Option<Arc<BakedModel>>` (weighted arrays expanded by weight into a `Vec<Arc<BakedModel>>`, chosen per position by `variant_index = (position_hash) % count` where `position_hash` is a deterministic hash of `(x, y, z)` — verify vanilla's own selection rule in `BlockModelShapes`/`BlockRendererDispatcher` and match it if it is position-based; record the finding either way), plus `fn model(&self, id: u16, meta: u8) -> ModelChoice` where `pub enum ModelChoice<'a> { Model(&'a BakedModel), Missing }`.
+  - `oxide_render::terrain::Vertex`: `pub struct Vertex { pub position: [f32; 3], pub uv: [f32; 2], pub light: [u16; 2], pub colour: [u8; 4] }`, `pub const VERTEX_BYTES: usize = 28`, layout in this order with offsets 0, 12, 20, 24 and `vertex_bytes` updated to match. The light pair is `(sky, block)` scaled to the lightmap's 0..256 space as `(level * 16 + 8) as u16`; the colour is RGBA with the tint, face shade and AO already multiplied in (Task 8 uses tint × face shade; Task 11 defines what the fragment stage does with it, and Task 11's brief may re-derive the exact lightmap convention against MCP-919 and amend this constant with a plan correction).
+  - `ChunkMesh` keeps M1's single-buffer shape in this task (`vertices` + `indices`); Task 9 splits it into the three layers when the translucent pass arrives. The opaque and cutout geometry both land in that single buffer here.
+  - `pub enum SmoothLighting { Off, Minimum, Maximum }` (Decision 6) and `pub struct MeshContext<'a> { pub models: &'a BlockModelSet, pub atlas: &'a Atlas, pub tint_maps: &'a TintMaps, pub graphics_fast: bool, pub smooth_lighting: SmoothLighting }` and `pub fn build_section_mesh(snapshot: &ColumnSnapshot, sy: usize, ctx: &MeshContext) -> Option<ChunkMesh>`; `build_column_meshes(snapshot, ctx) -> Vec<(usize, Option<ChunkMesh>)>` keeps its shape.
+  - `SessionConfig` gains `pub mesh: Option<Arc<MeshAssets>>` with `pub struct MeshAssets { pub models: BlockModelSet, pub atlas: Atlas, pub tint_maps: TintMaps }` — the session builds meshes with real assets when given, and with a minimal fallback context (the magenta sprite only, no models) when not, so the replay tests and any asset-less session keep working without a store (a session created without them logs once that every block draws the fallback). Task 14's bootstrap hands the real assets in.
+
+**Steps:**
+
+- [ ] **Step 1: Write the failing tests.** In `tests/mesher.rs`, build snapshots from hand-made worlds (synthetic `ColumnData` through `World::apply_column`) containing: a lone stone block (six faces, each with its own sprite's uv corners in the atlas, face shade in the colour, and its six cullface neighbours recorded), two adjacent stone blocks (no faces between them), a stone block at a section border with a neighbour in the next section and one in the next column (culling crosses both), a grass block beside a dirt block **across a biome seam** (grass top tinted by the nine-sample averaged tint with the literal byte value asserted against Task 6's two-biome world; the single-biome part of the same world tints with that biome's colour; dirt not tinted), a corner with three different neighbour light values (the averaged lightmap pair pinned as literals for `SmoothLighting::Minimum`, and the face's own cell for `SmoothLighting::Off`; a flat-lit corner gives the value itself), a log with a `variant`/`axis` metadata (the right blockstate variant's texture), an unknown id (magenta fallback sprite and colour), a block with `cullface` against a *non-opaque* neighbour (the face stays), a plant (cross model, `shade: false` — full brightness), and a face at y = 255 and y = 0 (no panic, correct culling against "outside the world"). Assert: expected quad counts, the exact uv corner pairs for the stone cube against the atlas rect (computed from the test's own synthetic atlas), and that `vertex_bytes` of a known vertex equals a literal 28-byte array.
+
+- [ ] **Step 2: Run them and watch them fail.** `cargo test -p oxide-game --test mesher`.
+
+- [ ] **Step 3: Implement the snapshot.** Copy the column's blocks and both light kinds into flat vectors indexed `(y << 8) | (z << 4) | x` — the wire order — plus the four border strips (16×256 blocks and their light) and the biome row (256 bytes). The copy goes through accessors added here to `oxide-world` (both files are in this task's list): `Chunk::section(&self, sy: usize) -> Option<&Section>`, `Section::blocks(&self) -> &[u16]`, `Section::block_light_bytes(&self) -> &[u8]`, `Section::sky_light_bytes(&self) -> &[u8]` (the stored nibbles, unpacked while copying), plus `World::sky_light(&self, x, y, z) -> u8` and `World::block_light(&self, x, y, z) -> u8` for the border strips and the point reads. The snapshot is `Send`.
+
+- [ ] **Step 4: Implement the model join and the mesher.** First write the per-vertex light derivation into the report: read `BlockModelRenderer`'s smooth path in `refs/_src/MCP-919` and record, with file:line, which cells supply each vertex's samples and how they combine for `Minimum`, what `Maximum` adds, and what `Off` uses (a single-sample rule would paint hard light steps where vanilla has gradients, so this derivation is a required artefact of the task). Then, for each of the 4096 cells: value → id/meta; `ModelChoice`; for `Model`, for each quad: cullface skip when the neighbour (through the snapshot, crossing section, column and border boundaries) is a full cube in the sense `BlockBehaviour` gives (verify vanilla's `shouldSideBeRendered` for the model path in the source — this rule decides whether you can see through glass and into leaves, and the tests above pin the cases this milestone needs); emit four vertices with position = block origin + quad corner, uv mapped into the sprite's content rect, light = the corner's lightmap pair per `ctx.smooth_lighting` and that derivation, colour = the tint from `oxide_world::biome::tint_at_9` sampled once per face at the block's own position (confirm in `BlockModelRenderer`/`BlockColors` that the non-smooth path consumes the averaged value, and record the confirmation) times `face_shade`, with the truncating byte conversion vanilla uses (`(int)(c * 255.0)`); indices as in M1 (two triangles per quad, same winding). `Missing` emits the magenta quad set from the atlas's fallback sprite (the six-cube form M1 had); a covered id that fails to resolve is logged once from `BlockModelSet::load`, and the mesher draws magenta without logging per block. `graphics_fast` arrives for Task 9's leaves rule; unused here beyond being carried.
+
+- [ ] **Step 5: Keep the old tests honest.** The M1 mesher tests asserted palette colours; they are rewritten against the new contract (same geometry assertions, colour assertions replaced by tier/light assertions where the tint is now biome-derived). The winding test stays and now covers model quads. The `is_empty` semantics stay: a section with no quads is `None`.
+
+- [ ] **Step 6: Gate and commit.** `feat: replace the palette mesher with the model-driven mesh core (M2)`.
+
+**Verification:** the mesher tests pass with literal expectations; `vertex_bytes`'s layout is pinned byte-for-byte; the mesher compiles without `palette::block_color`; the gate is green. The palette table's removal is preceded by Task 5 having absorbed its id list (a test in Task 5 pins `covered_ids()` ⊇ the M1 palette ids).
+
+---
+
+### Task 9: Liquids, leaves, and the translucent layer (`oxide-game`)
+
+**Goal:** Water and lava render as vanilla's liquid geometry, leaves follow the Fast-graphics rule, plants land in the cutout layer, and each section's mesh splits into the three layers with the translucent quads in a stable back-to-front order.
+
+**Files:**
+- Modify: `crates/oxide-game/src/mesher.rs` (the liquid and layer paths)
+- Modify: `crates/oxide-game/src/mesher/models.rs` (layer per quad from the behaviour table and the model)
+- Modify: `crates/oxide-render/src/terrain.rs` (`ChunkMesh` becomes per-layer)
+- Test: `crates/oxide-game/tests/mesher_liquids.rs`
+- Test: `crates/oxide-render/tests/terrain_data.rs` (the per-layer shape)
+
+**Interfaces:**
+- Produces:
+  - `oxide_render::terrain::{LayerMesh, ChunkMesh, Layer}`: `pub enum Layer { Opaque, Cutout, Translucent }`, `pub struct LayerMesh { pub vertices: Vec<Vertex>, pub indices: Vec<u32> }` with `is_empty`, `pub struct ChunkMesh { pub layers: [LayerMesh; 3] }` with `ChunkMesh::is_empty()` (all three empty), and `ChunkMesh::layer(Layer) -> &LayerMesh`. Index order in `layers` is `[Opaque, Cutout, Translucent]`.
+  - Mesher: `build_section_mesh` routes quads by layer: `Solid` → Opaque; `CutoutMipped`/`Cutout` → Cutout; `Translucent` → Translucent (with the graphics-level override of Task 5). A quad's layer is the block's render layer, not the model's.
+  - Liquid path: for a cell whose `BlockBehaviour.render` is `Liquid`, geometry comes from `liquid_height_percent` and the neighbour levels rather than from a model: the top surface at the liquid's height, side faces down to the neighbouring liquid's height (or the full block when the neighbour is not the same liquid), no faces between two cells of the same liquid, and the liquid's still/flowing sprite (still for the top, `flowing` for the sides when the source says so, `still` otherwise; derive the exact sprite choice from `BlockLiquid`/`BlockFluid`/`BlockDynamicLiquid`). Water is `Translucent`, lava is `Opaque` (verify each against `getRenderLayer` in the source).
+
+**Steps:**
+
+- [ ] **Step 1: Derive the liquid rules from the source.** In the report: `BlockLiquid.getLiquidHeightPercent` (the exact formula and the level direction), `BlockFluid`/`BlockStaticLiquid` source level vs flowing level, the height a side face takes against a higher/lower neighbour, the "same liquid culls" rule, and the `BlockLiquid.getRenderLayer` per liquid. Cite file:line for each. Where the source's formula differs from Task 5's `liquid_height_percent` stub, this task owns the correction (Task 5 pinned the signature; this task pins the numbers).
+
+- [ ] **Step 2: Write the failing tests.** `tests/mesher_liquids.rs`, all from synthetic columns: a 2×1 water pool at level 0 (top at the source's height, no top face where a block sits above, side faces full height against air, no faces between the two water cells); a water block at level 5 beside a level 0 block (the shared side face is the lower height, and which of the two draws it is pinned); lava likewise; a water block with air above and air beside (four sides + top); leaves adjacent to leaves (Fast: no internal faces, and a face against air renders in Opaque as the source's Fast rule says); leaves adjacent to air with graphics Fancy (the same cells render in Cutout — the flag's effect pinned in one test); a plant (cross) whose model has `shade:false` renders in Cutout with full-brightness colour; and a mixed section (stone + water + plant) yields exactly three non-empty layers with the counts the case implies.
+
+- [ ] **Step 3: Run them and watch them fail.** `cargo test -p oxide-game --test mesher_liquids`.
+
+- [ ] **Step 4: Implement the layer split and the ordering rule.** Each layer's indices are built in the mesher's visit order; the translucent layer is then sorted by descending distance from the section centre to each quad's centre (a stable sort over quads, computed before indices are emitted) so a section's water draws back to front from outside. Document the limit in the module docs: sorting is per section and static; the renderer draws translucent sections back to front by camera distance, which is the ordering M2 needs (per-frame per-quad sorting is the transparent-terrain pass M6's overlays revisit).
+
+- [ ] **Step 5: Run the whole mesher suite and the gate, then commit.** `feat: render the liquids, the Fast leaves rule and the three terrain layers (M2)`.
+
+**Verification:** every liquid height and culling case is pinned by a literal assertion; the three-layer split is explicit in the types; the sorting rule has a test with three quads at known distances; the gate is green.
+
+---
+
+### Task 10: The textured pipeline, the three queues, and frustum culling (`oxide-render`)
+
+**Goal:** Draw the M2 vertices with the atlas: one pipeline per layer (opaque, cutout with alpha test, translucent with alpha blending), the atlas uploaded once with its mip levels and vanilla's filtering pair, and per-section frustum culling in front of the draws.
+
+**Files:**
+- Create: `crates/oxide-render/src/atlas_texture.rs` (the GPU-side atlas: texture, view, sampler, bind group)
+- Modify: `crates/oxide-render/Cargo.toml` (add `oxide-assets.workspace = true` — the graph's permitted edge, declared for the first time here; the `Cargo.lock` path entry rides in the same commit)
+- Modify: `crates/oxide-render/src/terrain_pass.rs` (the three pipelines, the bind group, per-layer draws, culling)
+- Modify: `crates/oxide-render/src/terrain.rs` (vertex attributes move to the 28-byte layout)
+- Modify: `crates/oxide-render/src/renderer.rs` (`set_atlas`, the draw order, the resize path for the atlas bind group)
+- Modify: `crates/oxide-render/src/lib.rs`
+- Test: `crates/oxide-render/tests/pipeline_headless.rs` (extend the ignored GPU tests)
+- Test: `crates/oxide-render/tests/culling.rs` (pure maths, always run)
+
+**Interfaces:**
+- Produces:
+  - `pub struct AtlasTexture { … }` with `AtlasTexture::upload(device: &wgpu::Device, queue: &wgpu::Queue, atlas: &oxide_assets::atlas::Atlas) -> AtlasTexture` — an `Rgba8Unorm` texture with `mip_level_count = atlas.level_count`, every level written in order from `atlas.levels[l]` (`AtlasLevel { width, height, rgba }`, Task 4's pinned layout), magnification and minification filters `Nearest`, mipmap filter `Linear`, address mode `ClampToEdge`, and the four bytes per texel copied verbatim (no sRGB anywhere — Decision 1).
+  - `oxide_render::frustum::{Frustum, Aabb3}`: `Frustum::from_view_projection(Mat4) -> Frustum` (the six planes, normalised, from the matrix rows the 0..1-depth right-handed convention produces), `Frustum::intersects(&self, aabb: &Aabb3) -> bool` (false only when the box is fully outside a plane), and `Aabb3::new(min: [f32; 3], max: [f32; 3])`.
+  - `TerrainPass::{set_atlas, draw}` keeps its call shape; the pass now owns one pipeline per layer with the same vertex layout and depth state, differing by: Opaque (no blending, back-face culling), Cutout (no blending, fragment discards `alpha < 0.1`), Translucent (alpha blending `src_alpha / one_minus_src_alpha`, no back-face culling — vanilla draws translucent geometry without culling), and the pass culls sections before each draw.
+  - `Renderer::set_atlas(&mut self, atlas: &Atlas)` — uploads once and stores the bind group; calling it again replaces the atlas (the animation path re-uploads in M6; M2 may call it once per session).
+  - `Renderer::set_section_mesh(&mut self, key: SectionKey, mesh: Option<&ChunkMesh>)` keeps its M1 signature but now uploads each non-empty layer separately and removes the layers that are empty, so a section whose water vanished frees its translucent buffers too.
+
+**Steps:**
+
+- [ ] **Step 1: Write the failing maths tests.** `tests/culling.rs`: a camera at the origin looking down −Z with a 70° FOV, near 0.05, far 256 — a section spanning the origin is visible; the section directly behind the camera is culled; a section exactly at the far plane's distance with the far plane itself intersecting is visible; a section at a large negative coordinate that *is* in view is not culled (the negative-coordinate trap from M1's `div_euclid` work); a zero-size box on a plane boundary is visible (the "any corner inside" rule). Extract the planes and assert each plane's normal against a hand-computed expectation for one camera.
+
+- [ ] **Step 2: Run them and watch them fail.** `cargo test -p oxide-render --test culling`.
+
+- [ ] **Step 3: Implement the frustum.** Gribb–Hartmann-style extraction from the row combination that matches wgpu's clip space (x, y ∈ [−1,1], z ∈ [0,1], right-handed view): left = row3 + row0, right = row3 − row0, bottom = row3 + row1, top = row3 − row1, near = row2, far = row3 − row2 (verify each against glam 0.32's `Mat4` layout and the camera's own projection test, which already pins the 0..1 depth convention). Normalise each plane by its normal's length. `intersects` returns true when the box's positive vertex is beyond all six planes.
+
+- [ ] **Step 4: Implement the atlas texture and the pipelines.** The vertex attributes: position `Float32x3` at 0, uv `Float32x2` at 12, light `Uint16x2` at 20, colour `Unorm8x4` at 24, stride 28 — pinned by a test that reads the descriptor and compares against `VERTEX_BYTES` and the offsets. The WGSL: `@location(0) position`, `(1) uv`, `(2) light`, `(3) colour`; vertex stage passes `colour` and `uv` through and the light pair as two floats (Task 11 uses them); fragment stage samples the atlas at `uv` (structure: `textureSample(atlas, atlas_sampler, uv)`), multiplies by the vertex colour and returns it. Cutout adds `discard` on `alpha < 0.1`; translucent uses the blend state. Alpha in the atlas is used for the cutout test and for the translucent blend; opaque disregards it (colour from RGB).
+
+- [ ] **Step 5: Culling in the pass.** For each layer's draw list: compute the section's AABB (`x * 16 .. x * 16 + 16`, likewise z, `y = sy * 16 .. + 16` — never `sy as f32` arithmetic that loses the multiplication order), test it against the frame's frustum, skip the draw when fully outside. The section table iteration order is already unspecified; do not sort the opaque/cutout lists (depth testing makes order irrelevant); sort the translucent list by descending distance from the camera position to the section centre and draw it last.
+
+- [ ] **Step 6: Extend the ignored GPU tests.** In `tests/pipeline_headless.rs`: render a 2×2 textured quad from a hand-built atlas and read the framebuffer back: the four texel colours come back byte-identical (this is also the Decision 1 reference check); render a quad with `uv` sampling two adjacent atlas texels and assert the sample is the nearer one (nearest magnification); render two overlapping quads in different layers and assert the translucent one blends over the opaque one with the expected mix (pick colours where the blend result is exactly assertable, e.g. 50% alpha of a known value); and render a cutout quad with a zero-alpha texel and assert the discard (the pixel behind it shows through).
+
+- [ ] **Step 7: Gate and commit.** `feat: draw the terrain from the atlas with the three layers and frustum culling (M2)`.
+
+**Verification:** the maths tests pass without a GPU; the ignored GPU tests pass on this machine's T500 (record the adapter line); the four Texel read-backs are byte-exact; the gate is green.
+
+---
+
+### Task 11: The lightmap, the brightness pipeline, the colour-space policy and fog (`oxide-render` + `oxide-game`)
+
+**Goal:** Reproduce vanilla's lighting and colour maths: the 16×16 lightmap built from the brightness table, the sun's contribution and the gamma setting; the frame's fog colour from the per-dimension base with time-of-day and the void factor; linear fog on the terrain; and the non-sRGB pipeline of Decision 1 configured in the surface.
+
+**Files:**
+- Create: `crates/oxide-render/src/lightmap.rs`
+- Create: `crates/oxide-render/src/fog.rs`
+- Modify: `crates/oxide-render/src/terrain_pass.rs` (the lightmap texture binding, the fog uniforms, the fragment shader)
+- Modify: `crates/oxide-render/src/renderer.rs` (the surface format choice and the clear colour from the frame's fog colour)
+- Modify: `crates/oxide-render/src/lib.rs`
+- Test: `crates/oxide-render/tests/lightmap.rs` (pure CPU, always run)
+- Test: the ignored GPU case in `tests/pipeline_headless.rs` for the lightmap sampling
+
+**Interfaces:**
+- Produces:
+  - `oxide_render::lightmap::{LightLevels, BrightnessTable, lightmap_image}` with `pub struct BrightnessTable([f32; 16])` built as vanilla builds it (`WorldProvider.getBrightnessTable`, with the gamma table the source applies), `pub fn lightmap_image(table: &BrightnessTable, sun_brightness: f32, gamma: f32) -> [u8; 16 * 16 * 4]` implementing `EntityRenderer.updateLightmap` exactly: for every `(sky, block)` cell the RGBA bytes the source's arithmetic produces, in the source's index order, and `pub fn sample_index(sky: u8, block: u8) -> (u32, u32)` returning the cell's `(u, v)` — the convention that ties `Vertex::light` to this texture (both follow the source's lightmap coordinate packing; Task 8's stub may be corrected by this task with a plan-correction docs commit when the derived convention differs).
+  - `oxide_render::fog::{FogParams, fog_colour}`: `pub struct FogParams { pub colour: [f32; 3], pub start: f32, pub end: f32, pub far_plane: f32 }`; `pub fn fog_colour(dimension: i8, time_of_day: f32, eye_y: f64, void_y_factor: f32) -> [f32; 3]` implementing the source's chain steps 1, 4 and the basis of 7's dimension base for the Overworld (the per-dimension base colour with the day-night factor, the void-fog altitude factor when below the threshold, clamped as the source clamps), and `pub fn linear_params(far_plane: f32) -> (f32, f32)` = `(far_plane * 0.75, far_plane)` — the default-mode constants of the report's §4.3 table.
+  - `oxide_render::renderer::Renderer: pub fn set_fog(&mut self, params: FogParams)`; `Renderer::render` clears to the fog colour when one is set (vanilla's `glClearColor`), else to `SKY_COLOR` as M1 did.
+  - The fragment shader: `colour = texture(atlas, uv) * vertex_colour * texture(lightmap, light / 256)` (the lightmap sampled with linear filtering, through its own sampler), then the fog mix: `dist = -view_z` (planar eye-space depth — verify the GL default in the source and note it if the source's fog uses radial distance), `factor = clamp((end - dist) / (end - start), 0, 1)`, `out = mix(fog_colour, colour, factor)`.
+
+**Steps:**
+
+- [ ] **Step 1: Port the lightmap with the source open.** Read `EntityRenderer.updateLightmap` and `WorldProvider.getBrightnessTable` (and the gamma application) in `refs/_src/MCP-919`; write the derivation into the report: the brightness table formula with its work-through, the sun-brightness factor and how the day time enters, the gamma formula and its default, the order of operations, and the lightmap coordinate convention in `BlockModelRenderer` (how (sky, block) map to the short pair and where the 0..256 scale comes from). The test pins: the table's 16 values as literal floats; at least six `(sky, block)` cells' RGBA bytes as literals (hand-computed from the derivation, not from the code); the monotonicity in both axes; and the (0, 0) cell equals the source's floor (the darkest dark).
+
+- [ ] **Step 2: Write the failing tests.** `tests/lightmap.rs`: the brightness table literal values; the six cells; monotonicity; `fog_colour` at noon in the Overworld equals the source's base value (a literal); at midnight it is the source's darkened value (a literal); with `eye_y` under the void threshold the factor applies (a literal); above it, unchanged; `linear_params(128.0) == (96.0, 128.0)`.
+
+- [ ] **Step 3: Run them and watch them fail.** `cargo test -p oxide-render --test lightmap`.
+
+- [ ] **Step 4: Implement, then wire the pipeline.** The lightmap is uploaded as a 16×16 `Rgba8Unorm` texture with `Linear` filtering on both min and mag and `ClampToEdge`. Uniforms: the fog parameters (three `vec4`s or a flat `[f32; 12]`, whatever the WGSL side prefers) and nothing else; the lightmap is a texture binding. The surface format in `Renderer::new`: pick `Bgra8Unorm` when the capability list has it, else the first non-sRGB format, else fall back to the sRGB choice with a `warn!` naming why (this is the policy Decision 1 fixes; log the chosen format at info level as M1 does). The clear colour becomes the fog colour for frames with a fog set.
+
+- [ ] **Step 5: The reference-gradient check.** Extend the ignored GPU test: render a quad textured with a 2×2 atlas whose texels are `(255, 0, 0)`, `(0, 255, 0)`, `(0, 0, 255)`, `(255, 255, 255)` with `light` = the brightest cell and `colour` = opaque white, then assert the read-back framebuffer bytes equal the texel bytes exactly (this is C.1's "our surface format and lightmap scaling reproduce vanilla's non-sRGB output" expressed as a test), and a second case with `light` = the dimmest cell asserting the read-back equals the lightmap's own bytes for that cell times the texel (byte-exact, computed from `lightmap_image`'s output in the test).
+
+- [ ] **Step 6: Update the documents.** `docs/DIVERGENCES.md`: retire entry 4 (the surface no longer lightens the clear colour) with a line recording that the M2 pipeline matches vanilla's non-sRGB output and citing the reference-gradient test; keep the entry's history in the notes section rather than deleting it silently. Spec appendix C.1's colour-space line gains the fixed policy sentence (one clause: the surface is non-sRGB, the atlas and lightmap are unorm, nothing is converted at the end). This is a `docs:` commit in the same push, with the exact wording reviewed in the plan's review (the wording is proposed in Task 16's checklist if not here).
+
+- [ ] **Step 7: Gate and commit.** `feat: add the lightmap, the brightness pipeline and linear fog, and fix the colour space (M2)` (plus the docs commit).
+
+**Verification:** the lightmap literals are hand-derived from the source; the reference-gradient test is byte-exact; `docs/DIVERGENCES.md` entry 4 is retired with its history kept; the surface format is logged on the acceptance run and is non-sRGB; the gate is green.
+
+---
+
+### Task 12: The world clock, the sky pass, and the clouds (`oxide-proto-v47` + `oxide-world` + `oxide-render` + `oxide-game`)
+
+**Goal:** Time Update feeds the world clock; the sky draws as vanilla draws it (the gradient band, the sun, the moon, the stars, the celestial rotation, drawn with the sky pass's own fog range); the clouds draw as the flat layer with vanilla's geometry, drift and tint.
+
+**Files:**
+- Modify: `crates/oxide-proto-v47/src/clientbound.rs` (Time Update, play 0x03)
+- Modify: `crates/oxide-proto-v47/tests/play_packets.rs`
+- Modify: `crates/oxide-world/src/biome.rs` (the sky-colour helpers) or a new `crates/oxide-world/src/sky.rs`
+- Create: `crates/oxide-render/src/sky.rs` (the sky pass and the cloud pass)
+- Modify: `crates/oxide-render/src/renderer.rs` (the pass order: sky, clouds after opaque; `set_sky`)
+- Modify: `crates/oxide-game/src/session.rs` (report the clock)
+- Modify: `crates/oxide-client/src/main.rs` (the clock and the sky parameters reach the renderer)
+- Test: `crates/oxide-render/tests/sky_math.rs` (the CPU maths), plus the ignored GPU case
+
+**Interfaces:**
+- Produces:
+  - `oxide_proto_v47::clientbound::TimeUpdate { pub world_age: i64, pub time_of_day: i64 }` with `ID` and `decode` following the 0x03 layout (id, `i64` age, `i64` time); a byte-level test with a literal payload.
+  - `ClientEvent::Time { world_age: i64, time_of_day: i64 }`; the session reports it on every Time Update.
+  - The clock's rules, derived from the source and recorded before implementing: the sign convention for `time_of_day` (the reference's §2.1 row records that a negative value means the sun is frozen), what the client does with the value between Time Updates (M2 has no tick loop — M3's — so the sky renders from the last received update with `partial_ticks = 0`; state that in the module docs and in the report), and which of the two fields drives the celestial angle. Task 15's `/time set 6000` yields a positive value the client consumes; verify that on the run.
+  - `oxide_world::sky` (or `biome`) helpers: `pub fn celestial_angle(time_of_day: i64, partial_ticks: f32) -> f32` (port `World.getCelestialAngle` exactly), `pub fn sun_brightness(time_of_day: i64, partial_ticks: f32, rain_strength: f32) -> f32`, `pub fn star_brightness(...) -> f32`, `pub fn sky_colour(world: &World, x: i32, y: i32, z: i32, celestial_angle: f32) -> [f32; 3]` (port `World.getSkyColorBody` and the biome temperature ramp `BiomeGenBase.getSkyColorByTemp`, with the 4×4 view-position sampling the source uses — pin the sampling extent against the source and say so in the report). Rain strength is a parameter; M2 passes 0.0 (no weather packets are decoded yet — the acceptance note and Task 16's caveats record it).
+  - `oxide_render::sky::{SkyPass, CloudPass, SkyParams}`: `pub struct SkyParams { pub celestial_angle: f32, pub sky_colour: [f32; 3], pub sun_brightness: f32, pub star_brightness: f32, pub fog_colour: [f32; 3], pub far_plane: f32, pub cloud_offset_ticks: i64, pub cloud_colour: [f32; 3] }`; `Renderer::set_sky(&mut self, params: SkyParams)`; the sky pass draws first with the sky fog range (`start 0`, `end far_plane`) and depth writes off; the cloud pass draws after the opaque and cutout layers and before the translucent layer, with the terrain fog range, blending `src_alpha / one_minus_src_alpha`, culling off, depth testing on and depth writes off (verify each against the source's `renderSky`/`renderClouds` GL state).
+  - `Renderer::set_sky_textures(&mut self, textures: SkyTextures)` with `pub struct SkyTextures { pub sun: oxide_assets::texture::Texture, pub moon_phases: oxide_assets::texture::Texture, pub clouds: oxide_assets::texture::Texture }` — the three environment textures, uploaded once by whichever caller owns the `TextureSet` (Task 14's bootstrap); Task 12 defines the entry point and its own GPU test builds the three textures synthetically.
+  - Sky geometry: the gradient band as the source generates it (cells of 64×64 units spanning ±384 on both axes, two quads per cell between the below-horizon plane and the horizon band, vertex colours from the sky colour with the source's fade so the band's lower edge reaches transparency at the horizon); the sun as a 32×32 quad of half-size 30 at y = +100 in the rotated celestial frame; the moon as a 20-half-size quad at y = −100 whose UV picks the phase cell from `environment/moon_phases` per `getMoonPhase`; the rotation `rotate(−90°, Y)` then `rotate(celestial_angle · 360°, X)`; 1500 stars generated once from the ported `java.util.Random` (`seed 10842`, positions `nextFloat()·2 − 1`, quad sizes ≤ 0.25) drawn with brightness `star_brightness × (1 − rain)` and skipped when that is ≤ 0.
+  - Clouds: one flat layer of 32-block cells spanning ±256 around the camera's x/z at `y = 128 − camera_y + 0.33`, uv scale `1/2048` per block, uv offset `cloud_offset_ticks × 4.8828125E-4` westward, tinted by `cloud_colour`, drawn only when the camera is under the layer. **Cloud offset rule:** derive from the source whether the counter is client-local or world-seeded; implement exactly that rule and record it in the report — if it is client-local, the acceptance note records that the two clients' cloud phases are independent and the C.2 metric masks the cloud band (Decision 3's masking rule covers it as a timing difference, and the acceptance says so in its own words).
+
+**Steps:**
+
+- [ ] **Step 1: Codec and session first.** Add the Time Update struct, its test, the session arm and the event; extend the session replay test with a Time Update frame and assert the event. Run `cargo test -p oxide-proto-v47 --test play_packets` and `-p oxide-game --test session_replay`.
+
+- [ ] **Step 2: CPU maths with tests.** `tests/sky_math.rs`: `celestial_angle` literal values at the source's key times (0, 6000, 12000, 18000 with partial 0.0 and one fractional case); `sun_brightness`, `star_brightness` literals at noon and midnight; `sky_colour` at noon on a hand-built plains world equals a literal triple, at midnight the darker literal, and the temperature ramp's two ends (a hot desert and a cold biome) pinned; the cloud parameters asserted as literals — one tick advances the uv offset by `4.8828125E-4` (one block per tick across the 2048-unit span), a cell is 32 blocks, the layer sits at 128.0 and draws at `128.0 − camera_y + 0.33`; and the celestial geometry asserted as literals — the sun's half-size 30 at `y = +100`, the moon's half-size 20 at `y = −100` on the `128×64` 4×2 phase grid, and the band's 64-unit cells spanning ±384. All literals derived from the source by hand before the code exists.
+
+- [ ] **Step 3: The sky pass on the GPU.** Implement `SkyPass` with its own pipeline (depth writes off, depth test off — the sky is the background), the sky fog range in its shader, and the celestial transforms; `CloudPass` with the cloud texture sampled from the *environment* texture set (not the block atlas — load `environment/sun`, `environment/moon_phases`, `environment/clouds` through the `TextureSet` and upload them as their own small textures in this task). Wire `Renderer::render`: sky pass (clears colour to the fog colour; no depth clear needed before it, the terrain pass still clears depth), terrain layers, clouds after opaque+cutout, translucent last, overlay.
+
+- [ ] **Step 4: The stars' generator.** Reuse Task 6's LCG (`java.util.Random` equivalent): pin the first three stars' coordinates as literals (computed by the same JVM harness method Task 6 used, or hand-derived from the LCG), and the count (1500).
+
+- [ ] **Step 5: The ignored GPU test.** Render the sky at noon with a fixed camera from an empty world and assert the read-back's sky band centre pixel is within ±2 of the sky colour's byte value (the depthless sky pass is the one whose failure mode is a black screen), and that a night-time frame with `star_brightness = 0` draws no star pixels.
+
+- [ ] **Step 6: Gate and commit.** `feat: add the world clock, the sky pass and the cloud layer (M2)`.
+
+**Verification:** codec and session tests pass; every sky constant is a source-derived literal; the cloud offset rule is recorded with its citation; the gate is green.
+
+---
+
+### Task 13: Parallel meshing and the session's mesh queue (`oxide-game`)
+
+**Goal:** Move meshing off the session thread: snapshot-driven jobs on a rayon pool, a bounded dirty set with per-column generations, results delivered as events, and the M1 caveats closed (unload re-meshes neighbours; a busy server cannot starve the queue).
+
+**Files:**
+- Create: `crates/oxide-game/src/mesh_queue.rs`
+- Modify: `crates/oxide-game/src/session.rs` (the play loop's idle path, the apply path, the unload path, the end-of-session drain)
+- Modify: `crates/oxide-game/Cargo.toml` (new dependency `rayon`)
+- Test: `crates/oxide-game/tests/mesh_queue.rs` (the bookkeeping, no threads)
+- Test: `crates/oxide-game/tests/session_replay.rs` (a multi-column batch through a real pool)
+
+**Interfaces:**
+- Produces:
+  - `pub struct MeshQueue` (pure bookkeeping, no threads): `mark_dirty(&mut self, cx: i32, cz: i32)`, `next_job(&mut self) -> Option<MeshJob>` where `pub struct MeshJob { pub cx: i32, pub cz: i32, pub generation: u64 }`, `mark_running(&mut self, job)`, `complete(&mut self, job: MeshJob) -> bool` — the queue itself compares `job.generation` against the column's current generation; a stale completion re-marks the column dirty and returns false — `mark_column_unloaded(&mut self, cx, cz)` (marks the four neighbours dirty and forgets the column), `pending(&self) -> usize` (the bound for the drain loop), and `fn generations(&self)` for tests. One rule set, documented: a column appears at most once in the dirty set; every change bumps its generation; a completion whose generation is stale is discarded and the column is re-queued.
+  - `Session`'s play loop: `MESH_TICK` keeps its role as the idle wait; on each idle return and after each applied packet, the loop (a) drains up to `PENDING_JOBS_CAP` (4) jobs into `pool.spawn`, (b) drains finished results with `try_recv` and reports `ChunkUpdated` for the fresh ones. The world is owned by the session thread as today; the snapshot (Task 8) is built on the session thread and moved into the job; the `MeshContext`'s model set/atlas/tint maps travel as `Arc`s so jobs share them without locks.
+  - The pool: `rayon::ThreadPoolBuilder::new().num_threads(available_parallelism() − 1, at least 1).build()` created once per session and dropped at the end; a `crossbeam-channel` results channel per session.
+  - `SessionConfig.mesh: Option<Arc<MeshAssets>>` (declared in Task 8, same fallback semantics) is what the pool jobs consume; this task only moves the call sites from the inline path onto the pool.
+  - On a section update (0x21 with `GroundUpContinuous = false`), the apply keeps M1's semantics, which the cited documents support (spec §9; protocol reference §3.3/§4.2): the listed sections are replaced with their blocks **and the light the payload carries**, and sections outside the mask keep their stored light. **No local relight runs on this path** — local recomputation belongs to the 0x22/0x23 path, which Decision 7 leaves to M3. Pin the rule with a session test that applies a section update and asserts: the listed sections' light equals the payload's, an unlisted section of the same column keeps its previous light, and no other column changes.
+  - End of session: outstanding jobs are allowed to finish and drained (so a clean stop still reports its last meshes) with a bounded wait (100 ms), then the pool is dropped.
+
+**Steps:**
+
+- [ ] **Step 1: Write the failing bookkeeping tests.** `tests/mesh_queue.rs`: marking the same column twice yields one job; a second mark between `next_job` and `complete` makes the completion stale (returns false, the column is re-queued and the next job's generation is higher); `mark_column_unloaded` queues the four neighbours and drops the column itself; `pending` counts distinct columns; completing fresh drains to zero.
+
+- [ ] **Step 2: Write the session-level test.** Extend `session_replay.rs`: a scripted stream with six columns (three plain 0x21, three bulk 0x26 covering others), applied back to back with a keepalive between; after the stream ends, the session's reported `ChunkUpdated` set equals exactly the six columns (compare as a map — arrival order is not deterministic across a pool) and each carries all sixteen section slots; a keepalive sent mid-burst was answered (the pool never holds the read loop). Also assert the unload path: a column removed (the packet shape the server uses for unload) reports `ChunkUnloaded` for it and fresh `ChunkUpdated`s for its loaded neighbours.
+
+- [ ] **Step 3: Run them and watch them fail.** `cargo test -p oxide-game --test mesh_queue --test session_replay`.
+
+- [ ] **Step 4: Implement.** The session restructure is the only delicate part: the world stays on the session thread; snapshot building is a bounded copy (Task 8's `from_world`), so it cannot starve reads; results are drained with `try_recv` only (never a blocking receive in the loop); the `MESH_TICK` idle wait is unchanged. Delete M1's `remesh`/`mesh_one`/`flush_pending` and their tests, or keep them only as the single-threaded fallback used by tests that want determinism — prefer deletion: the tests that relied on in-order events are rewritten against the map comparison.
+
+- [ ] **Step 5: Gate and commit.** `feat: mesh on a rayon pool with a generation-tracked dirty set (M2). New dependency: rayon (MIT/Apache-2.0)`.
+
+**Verification:** bookkeeping tests pass; the session test's column set is exact and order-independent; the unload path re-meshes neighbours (the M1 caveat, closed with a covering test); a follow-up soak note in the report records the pool's thread count on this machine; the gate is green.
+
+---
+
+### Task 14: The asset bootstrap, the jar font, the cache, and the comparison flags (`oxide-client` + `oxide-render` + `oxide-assets`)
+
+**Goal:** The client loads its assets at startup (store → extraction root → textures → models → atlas → tint maps → font), the F3 overlay draws with the jar's own font from a cached geometry upload, and the two comparison flags of Decision 2 exist.
+
+**Files:**
+- Create: `crates/oxide-assets/src/font.rs` (the sheet and its widths)
+- Modify: `crates/oxide-assets/src/lib.rs`
+- Create: `crates/oxide-client/src/assets.rs` (the bootstrap)
+- Modify: `crates/oxide-client/src/main.rs` (the bootstrap, the flags, the sky/clock wiring from Task 12)
+- Modify: `crates/oxide-client/Cargo.toml` (add `oxide-assets.workspace = true` and `oxide-world.workspace = true` — both permitted rows of the section 5.1 table, declared for the first time here; the `Cargo.lock` path entries ride in the same commit)
+- Modify: `crates/oxide-render/src/overlay.rs` (textured glyphs, geometry cache)
+- Modify: `crates/oxide-render/src/debug_text.rs` (the per-pixel quad builder is replaced; keep the layout helper only if the new path uses it)
+- Test: `crates/oxide-assets/tests/font.rs`
+- Test: `crates/oxide-render/tests/overlay_geometry.rs` (the cached upload path, no GPU)
+
+**Interfaces:**
+- Produces:
+  - `oxide_assets::font::{Font, FontError}`: `Font::load(sheet: &Texture, glyph_sizes: Option<&[u8]>) -> Result<Font, FontError>` computing each printable ASCII glyph's width from the sheet by the source's ink-column scan (`FontRenderer.readFontTexture`) and the advance rule (`charWidth = 3 + glyphWidth` for the ascii sheet; verify against the source with the report's §2 table); `Font::advance(char) -> u32`; `Font::glyph_rect(char) -> Option<(u32, u32, u32, u32)>` (the 8×8 cell, clipped to the ink width); `Font::height() -> u32` (9).
+  - `oxide_render::overlay::OverlayPass::{set_font(&mut self, device, queue, sheet: &Texture), upload_text}` — glyphs become one textured quad per glyph (cell UVs, advance-scaled), the shadow copy stays (one pixel down-right, the shadow colour from the report: the glyph colour × 0.25 with alpha, per the source — pin the shadow rule against `FontRenderer` and record it), and `upload_text` becomes a no-op when the line set equals the last uploaded set (a `Vec<String>` comparison; the M1 backlog item 1's fix), with the geometry buffers reused instead of recreated.
+  - `oxide_client::assets::{ClientAssets, AssetError}`: `ClientAssets::load(store_root_or_config) -> Result<ClientAssets, AssetError>` doing the whole chain (store paths through `oxide_assets`' existing resolution; the `extracted/1.8.9` root must exist — a clear error says to run `oxide-launcher fetch` first), exposing the `Atlas`, the `BlockModelSet`, the `TintMaps`, the `Font` and the environment textures.
+  - `oxide-client` CLI: `--no-overlay` (Decision 2) and `--render-distance <chunks>` (u8, default 8; feeds `FAR_CHUNKS`, the fog far plane and `ClientSettings.view_distance`); `--frames` unchanged; with a session the client passes `SkyParams` each frame from the clock and the fog params from Task 11; without a session the M0 smoke path is unchanged.
+  - The client's startup order: parse CLI → load assets (fail fast with a clear message) → open the window → build the renderer → set the atlas, the font, the lightmap and the sky textures (Task 12's `set_sky_textures`) → run. Those uploads happen once, before the first frame. The client's `SessionConfig` carries `mesh: Some(Arc::new(MeshAssets { … }))` once the assets are loaded (Task 8's field), so the session meshes with the real models instead of the fallback.
+
+**Steps:**
+
+- [ ] **Step 1: Font tests.** `tests/font.rs`: a synthetic 128×128 sheet in a temp tree where each cell is a known pattern (e.g. cell `c` has ink in columns 0..=k); assert the computed widths for a handful of characters, the advance rule, the height, a character with no ink and the space itself (report §2's table pins the space's advance at 4 px; reconcile the ink-scan rule so the pinned literals match the source, and record the resolution) and a non-ASCII character (falls back to the space's advance, per the source's behaviour — verify and record). The real sheet is exercised in the ignored store test added to Task 2's file: `font/ascii` loads and a spot check of `'A'`'s width against the source-derived value.
+
+- [ ] **Step 2: Overlay geometry test.** `tests/overlay_geometry.rs`: the quad list for a known line is computed without a GPU (a pure function that returns `(vertices, indices)` given the font, the scale and the layout origin — keep it public enough to test), asserting the glyph quad count, one whole quad's four corners and UVs by literal, and that a second `upload_text` with the same lines reports "unchanged" (the cache) while a changed line reports "changed".
+
+- [ ] **Step 3: Implement the bootstrap and run it live.** `cargo run -p oxide-client -- --server 127.0.0.1:25565` against the rig is the acceptance run; before that, a local smoke: with a session absent the client must still start and draw (the M0 path is intact), and with `--server` but no store the error names the fetch command.
+
+- [ ] **Step 4: Wire the flags and re-check the M1 acceptance shape.** `--no-overlay --render-distance 8 --server 127.0.0.1:25565 --username OxideDev` reproduces the M1 run's visuals *with textures* minus the overlay; `--frames 900` still bounds a smoke run; the overlay toggle (F3) still works when the overlay is on.
+
+- [ ] **Step 5: Gate and commit.** `feat: load the client assets at startup and draw the overlay with the jar font (M2)`.
+
+**Verification:** the geometry test pins the glyph quads; the cache is pinned by the unchanged/unchanged/changed sequence; the bootstrap's failure messages are clear; the live smoke run's log line shows the atlas dimensions and the font's sheet size; the gate is green.
+
+---
+
+### Task 15: The rig session: the parity capture, the metric, and the baseline
+
+**Goal:** Run the M2 exit procedure on the rig: build the sample wall, place both clients at the same positions with the same settings, capture the three scenes, measure the C.2 metric with its masks, record the baseline numbers in `docs/perf.md`, and fix the rig's log rotation so this run's console survives.
+
+**Files:**
+- Create: `scripts/parity-diff.py` (committed; standard library only; `--self-test`)
+- Create: `refs/rig/tools/sample_wall.sh` (uncommitted; generated commands)
+- Modify: `refs/rig/server/start.sh` and `refs/rig/README.md` (the log-rotation fix; uncommitted)
+- Create: `docs/perf.md` (committed; the baseline)
+- Create: `refs/rig/evidence/m2/acceptance-notes.md` (uncommitted, like M1's note)
+- Evidence: `refs/rig/evidence/m2/*.png`, `*.json`, `*.log`
+
+**Steps:**
+
+- [ ] **Step 1: Fix the rig's log rotation first.** In `refs/rig/server/start.sh`, redirect the server's stdout/stderr to a run-stamped console file (`logs/console-<UTC timestamp>.log`) instead of over the log4j-managed `logs/latest.log`, so nothing rotates the run's console away; keep the log4j file as the server sees it. Update the rig README's log section **and its screenshots section** (STATE records that section as still describing the portal route; this edit corrects it to the niri substitute). Verify by starting the server, stopping it cleanly, and checking that the run-stamped file holds the whole run and that `logs/latest.log` is no longer clobbered by a second writer. This is the M1 backlog item 7 and it lands before any acceptance run so this run's console survives.
+
+- [ ] **Step 2: Write `scripts/parity-diff.py`.** Standard library only: a PNG reader for 8-bit RGB/RGBA non-interlaced files (all five filter types), an optional mask list (`--mask x,y,w,h` repeatable, and `--mask-file` with one `x y w h label` per line), and the C.2 metric per pair: `pixels_total`, `pixels_over_8` (any channel differing by more than 8), `pixels_over_24` (more than 24), each as a count and a fraction, plus `pass` when `over_8_frac ≤ 0.02` and `over_24_frac ≤ 0.01`, and masked variants of the same numbers. Output: a JSON object per pair on stdout. `--self-test` builds fixture PNGs in a temp directory (one identical pair, one pair with a known 1% differing-by-10 case, one pair with a known 0.5% differing-by-30 case, one masked case) and asserts the metric and the pass/fail verdicts; run it in the gate for this task and record its output. The tolerance sentence (2% / 1%) is quoted from appendix C.2 in the script's header comment, and the header records that the tool implements C.2 step 4. The self-test includes at least one **failing** pair (a known 3 %-over-8 image asserting `pass: false`) and one boundary pair (an exactly 2 % case), so the verdict's negative side is pinned, and `python3 scripts/parity-diff.py --self-test` joins the gate commands for Tasks 15–16 (CI stays untouched: it has no screenshots to compare and this machine's Python is not the repository's toolchain).
+
+- [ ] **Step 3: Build the sample wall.** Take the covered (id, name, meta) list from `oxide_world::behaviour` (add an `#[ignore]`d printing test in `crates/oxide-world/tests/behaviour.rs` if Task 5 did not leave one, and capture its output with `tee` into `refs/rig/tools/`), generate `/fill` (clear) and `/setblock` console commands into `refs/rig/tools/sample_wall.sh`, send them through `refs/rig/server/server.stdin`, and record the wall's rectangle: **all rows at y = 56..63** (below y = 64, so the height-adjusted temperature term cannot apply — Decision 4's control region), sixteen columns wide in x; the cell set is one cell per covered id at its **canonical meta** (the metadata the table names first for that id) plus extra cells for the multi-variant ids whose variants the scenes exercise (wool's and planks' colours, the logs' variants and axes, stone's and stone brick's and sandstone's named variants, the slabs' two halves, the grass block's snowy pair), capped at the 128-cell grid, with the full generated list kept beside the commands in `refs/rig/tools/` so the placement is auditable, the wall standing in open air with the surrounding area cleared, a stone platform in front for the viewer. Assert the placed cell count equals the generated list's count by re-reading the blocks through the console (`/testforblock`-free: use `/setblock ... keep`'s failure messages? simpler: `/fill` with `keep` then count success lines in the console, or scan the region with a small tool). Record in the note what was placed.
+
+- [ ] **Step 4: The scene protocol.** Start the rig server; start the vanilla client (`refs/rig/client/launch-client.sh`) and set its options per C.1: fixed render distance, GUI scale, VSync off, graphics Fast, clouds Fast, smooth lighting Minimum, mipmap 4, fullscreen off, window 1280×720, and archive the whole `options.txt` in the evidence directory; start our client with `--no-overlay --render-distance <the same value> --server 127.0.0.1:25565 --username OxideDev`. Through the console: `/gamerule doDaylightCycle false`, `/gamerule randomTickSpeed 0`, `/weather clear`, `/time set 6000`, then `/tp` both clients to (a) the M1 mark position `31.5 150.0 194.5` with the same facing (`135 20`), (b) the wall's viewpoint (a fixed coordinate facing the wall square-on), and (c) the M1 ground position `15.5 71.0 178.5`. **The clock**: our client's sky needs `time_of_day`; with `doDaylightCycle false` the server sends one Time Update, which is all the frozen scene needs; record the `time_of_day` value `/time set 6000` yields (positive, per Task 12's derived sign convention) and the client's log line for the Time Update it received; if the frozen sky in our client differs from vanilla's, record it and check the Time Update handling before changing anything else.
+
+- [ ] **Step 5: Capture.** For each client and each scene, capture with niri's substitute procedure (focus the window, then `niri msg action screenshot-screen --write-to-disk true --show-pointer false --path <file>`), one client at a time; crop each capture to the client window's content rectangle (record the rectangles); assert both clients' crops are the same pixel size for a pair before comparing. Record in the acceptance note that the screenshots live under `refs/rig/evidence/m2/` rather than C.2 step 3's `docs/parity/YYYY-MM-DD/`: the asset guard forbids tracked images and the repository keeps evidence under `refs/` — a stated deviation, not an omission. Attempt the vanilla HUD hide (F1) through the rig-local virtual keyboard (Linux `uinput`, one `sudo` step, tool under `refs/rig/tools/`): if the events arrive, capture the vanilla scenes with the HUD hidden and record that the tool worked; if they do not, keep the HUD and mask its fixed rectangles (the hotbar band, the health/hunger bands, the crosshair square, the experience bar) with the mask list recorded per scene.
+
+- [ ] **Step 6: Measure and iterate (bounded).** Run `scripts/parity-diff.py` per scene pair with the masks (animated sprites: the water, lava, fire and portal rects of the scene; the cloud band if the cloud offset rule proved client-local; the vanilla HUD rects if F1 was unavailable). Record the numbers in the note. For any failing pair, fix the cause *in the owning task's code* with a fix round through the normal loop rather than by widening masks; a mask is only legitimate for a difference the procedure itself excludes (animated textures, timing, the vanilla HUD when it cannot be hidden). Record every mask with its justification.
+
+- [ ] **Step 7: The baseline numbers.** Run the appendix C.4 route (fixed scripted route: the three teleport positions plus a fourth at the wall's far end, held 60 s each; VSync off; same GPU; render distance and settings recorded) for both clients, one run each with no warm-up pass (C.4's three-minute warm-up and three-run median are the M9 protocol; M2 records the baseline with the method stated, and `docs/perf.md` carries that departure sentence explicitly): our client's frame rate from its own log lines; the vanilla client's frame rate through the F3 readout (via the virtual keyboard if it works; otherwise through the frame-difference count of a screen recording of the route, or, if neither works, record the scene and settings and mark that number as M9's to complete — Question 7's ladder); resident memory from `/proc/<pid>/status` after each route for both; cold start (our client: process start to the first presented frame, from the log's own timestamps; vanilla: launcher start to the title screen, from its log). Write `docs/perf.md` with the numbers, the method per number, the device and driver record (T500, driver 615.71.09 as M0 recorded), the settings archives' paths, and a one-line statement of which numbers are baseline-only and which belong to M9's proof.
+
+- [ ] **Step 8: Stop the rig and commit.** Stop the server through `stop.sh` (world saved), stop both clients, confirm nothing listens on 25565/25566, and confirm `server.properties` is back at `server-port=25565`. Commit with explicit paths: `test: add the parity metric tool and the M2 baseline (M2)` for `scripts/parity-diff.py` + `docs/perf.md`; the rig files stay uncommitted under `refs/`.
+
+**Verification:** the metric's self-test passes and is recorded; each scene pair's numbers are in `refs/rig/evidence/m2/acceptance-notes.md` with the masks and their justifications; the wall's cell count matches the generated list; the run-stamped server console exists with the whole run; `docs/perf.md` exists with method-stated numbers; the rig is stopped and restored.
+
+---
+
+### Task 16: The M2 close-out
+
+**Goal:** Write the milestone's documents over the reviewed head, tag it, and push.
+
+**Files:**
+- Modify: `docs/STATE.md` (stage: M2 complete; the M2 evidence section; caveats; the resolved versions with `png` and `rayon`; the refreshed backlog; the desktop facts if the rig work changed any)
+- Modify: `CHANGELOG.md` (the M2 section)
+- Create: `docs/handoff/<date>-m2-close.md` (from `docs/handoff/TEMPLATE.md`, self-contained: mission, context, current stage with evidence, exact next step into M3, open questions with recommended defaults, environment notes, the verification commands)
+- Modify: `docs/specs/oxidecraft-v1-design.md` if any task's ruling left a spec line uncorrected (the revision-history row gains v6 when a task amended the text; otherwise it stays v5 and the close-out says so)
+- Modify: `docs/perf.md` (the milestone summary line linking the STATE entry)
+
+**Steps:**
+
+- [ ] **Step 1: Only after the final whole-branch review is clean** over the reviewed code head. The close-out commit must not contain code changes; if the review left a residual finding that needs code, it goes back into the loop first.
+- [ ] **Step 2: Update STATE's stage block** (M2 complete and tagged, the reviewed head's short hash, the acceptance evidence's paths, the test counts, the CI run id once green), the M2 evidence section (the three scenes, the metric numbers, the wall, the client traffic if captured, the baseline's headline numbers), and the caveats (each with its owner milestone): Fast graphics only; no weather (rain strength fixed 0); the sunset band not implemented; clouds' offset rule and its masking; translucent sorting per section; the atlas is rebuilt at startup (the R3 "no atlas rebuild" requirement's caching is M9's); the baseline's departure from C.4 and the capture path's departure from C.2 step 3, each with its reason; the uinput outcome; whatever the run found.
+- [ ] **Step 3: Refresh the backlog** for M3 from the review's deferred minors and the run's findings, ordered, in the same style as M1's close-out left it.
+- [ ] **Step 4: CHANGELOG** entry: the milestone's features in the project's existing voice, the new dependencies, the divergence entry retired, the corrected documents.
+- [ ] **Step 5: The handoff** — written for a reader who has only the repository; the exact next step into M3 (player physics, input, camera FOV, raycast, break/place, the two block-change packets, death and respawn) and the state M3 will start from.
+- [ ] **Step 6: The gate and the tag.** The full gate (six commands plus both self-tests), `cargo test --workspace -- --ignored` where the environment allows, then the annotated tag `m2` on the close-out commit, `git push --follow-tags`, and the CI run recorded into STATE in a follow-up commit as M1 did.
+
+**Verification:** the tag dereferences to the close-out commit; CI is green on the pushed head before the state file records the run id; STATE, CHANGELOG, `docs/perf.md` and the handoff agree with each other and with the ledger; the ledger's `Ruling:` lines are all listed in the session's final report to the owner.
+
+---
+
+## Milestone exit criteria (spec section 13, M2 row) and where each is met
+
+| Spec item | Met by | Evidence |
+| --- | --- | --- |
+| Atlas | Tasks 2–4, 14 | the atlas built from the real jar (ignored store tests); the acceptance run's log line with its dimensions |
+| Block models | Tasks 3, 5, 8, 9 | the baker's tests; the wall scene's per-cell comparison |
+| Behaviour table cross-check | Task 5 | the store test over all metadata values; the source citations in the report |
+| Biome tint | Task 6 | the tint tests; the wall's grass/foliage cells in the metric |
+| Light from nibbles, all three sky rules | Tasks 7, 8, 11 | the light-engine rule tests; the lightmap literals; the scenes' light-dependent pixels in the metric |
+| Fog | Task 11 | the fog colour and parameter tests; the ground scene's horizon |
+| Sky | Task 12 | the sky maths literals; the sky band in the scenes' metric |
+| Clouds | Task 12 | the offset rule's citation; the cloud band per the masks |
+| Colour-space policy | Tasks 11, 15 | the reference-gradient GPU test; `docs/DIVERGENCES.md` entry 4 retired; the surface format logged on the run |
+| Frustum culling | Task 10 | the culling maths tests; the acceptance frames with no missing geometry |
+| Parallel meshing | Task 13 | the mesh-queue tests; the session batch test; the pool's thread count in the report |
+| Parity checklist classified | already committed (`docs/parity/checklist.md`, 36/19/2) | the close-out's STATE line points at it; no M2 work |
+| Baseline recorded | Task 15 | `docs/perf.md` |
+| Exit: both clients placed by the appendix C procedure, screenshots within tolerance | Task 15 | the three scene pairs, the metric JSONs, the acceptance note |
+| Exit: baseline numbers in `docs/perf.md` | Task 15 | as above |
+
+## Pre-flight (controller work, before Task 1)
+
+- Fetch the source tree: `git clone --depth 1 https://github.com/Marcelektro/MCP-919 refs/_src/MCP-919` (uncommitted; `refs/` is gitignored) and record the clone's HEAD hash in the ledger — every task from Task 3 onward derives from it, so it must exist before Task 1 is dispatched.
+- One `docs:` commit carrying: this plan (filled with the owner's answers once recorded), the spec §5.2 correction ("asserts the graph with `cargo tree`" → `cargo metadata`, the guard's own wording), and a correction line in the M1 plan's header citing spec v5 rather than v3.
+- Write the pre-flight conflict scan into the milestone ledger (`.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`): one row per pair of tasks that share a file or an interface, one row per task's self-consistency, and a ruling for each finding before Task 1 is dispatched.
+- Record the plan's approval (this file's "Answers recorded on approval" table filled from the owner's answers) in the ledger.
+
+## Known limits this plan accepts (each recorded for the close-out)
+
+1. Graphics Fast only; Fancy paths (cutout-mipped leaves as a separate layer, cloud prisms, per-corner tint) ride with the options screen (M6).
+2. No weather: rain strength is a parameter fixed to 0 until the weather packets land in M6; the rain-darkened fog and sky are therefore unverified.
+3. The sunrise/sunset band is not implemented in M2 (the acceptance captures at noon, where it is invisible); M6's sky work adds it with a dawn capture.
+4. Translucent sorting is per section and static within a section; a large water surface may show ordering artefacts the metric does not chase in M2.
+5. Item models (`builtin/generated`) are parsed but nothing renders items yet; item textures are in the atlas only if a block model references them.
+6. Unicode font pages are skipped; the overlay is ASCII.
+7. The atlas is built at startup and not cached; R3's "no atlas rebuild" clause needs an atlas cache, which is M9's to add (recorded in STATE).
+8. The behaviour table's world-contextual states (stairs and fences' connections, redstone states) are pinned to their straight/default variants; items 40–41 of the parity checklist own the real rules (M6).
+9. `docs/DIVERGENCES.md` entry 4 is retired by the non-sRGB pipeline; any *new* visible divergence the acceptance run finds is added only with the owner's acceptance, in the M1 style.
+10. Fog scope: M2 implements the default linear mode (terrain start `far_plane × 0.75`, end `far_plane`; sky range 0 to `far_plane`) and the fog colour chain's steps 1 (the per-dimension base with the day-night factor) and 4 (the void-fog altitude factor). The water and lava exponential modes, the world-border/XZ mode, blindness, the sunset bleed, rain darkening, the boss tint and night vision are M6's, with the effects, weather and overlays that trigger them.
+
+
+
+
+

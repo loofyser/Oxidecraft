@@ -160,7 +160,7 @@ and starts the client binary.
 
 ### 5.2 Layering rules
 
-1. Only the edges in the table above exist. A CI check asserts the graph with `cargo tree` and fails the build on any unlisted edge.
+1. Only the edges in the table above exist. A CI check asserts the graph with `cargo metadata` and fails the build on any unlisted edge.
 2. `oxide-proto` knows about bytes, framing, compression, encryption, and the NBT codec. It never knows about blocks, chunks, or rendering.
 3. `oxide-proto-v47` holds the packet definitions for protocol 47. Each further Minecraft version becomes its own protocol crate, for example `oxide-proto-v107` for 1.9. Protocol-specific chunk and packet codecs live in the protocol crate, so the world layer's storage stays version-parameterised (see section 16).
 4. `oxide-world` knows chunks, blocks, light, entities, and inventory, and carries the block behaviour table (section 9). It never touches wgpu, windowing, sockets, or HTTP.
