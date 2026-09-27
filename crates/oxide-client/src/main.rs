@@ -5,10 +5,21 @@
 //! in the title. Escape or closing the window exits. A bounded smoke run sets
 //! `OXIDECRAFT_MAX_FRAMES` to a frame count; the client then exits cleanly once that many
 //! frames have been presented.
+//!
+//! With `--server host:port` a session thread joins the server and reports through a channel:
+//! every frame the client drains it into the renderer and the F3 debug overlay. When the
+//! session ends the client exits — a server that closed the connection cleanly is a normal
+//! exit, not an error.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use clap::Parser;
+use crossbeam_channel::{Receiver, unbounded};
+use oxide_game::hud::{HudState, debug_lines};
+use oxide_game::session::{ClientEvent, Session, SessionConfig};
+use oxide_proto_v47::serverbound::ClientSettings;
+use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
 use oxide_render::fps::FpsCounter;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use winit::application::ApplicationHandler;
@@ -21,6 +32,54 @@ use winit::window::{Window, WindowId};
 /// The frame count that bounds a smoke run, read from the environment.
 const MAX_FRAMES_VAR: &str = "OXIDECRAFT_MAX_FRAMES";
 
+/// The projection's far plane, in chunks; the plane itself is `far_chunks * 16 * √2`.
+const FAR_CHUNKS: f32 = 8.0;
+
+/// How many sections one column has.
+const SECTIONS_PER_COLUMN: u8 = 16;
+
+/// The command line.
+#[derive(Parser)]
+#[command(name = "oxide-client", version, about = "Oxidecraft client")]
+struct Cli {
+    /// Server to join, for example 127.0.0.1:25565. Without it the client
+    /// shows the window and connects to nothing.
+    #[arg(long)]
+    server: Option<String>,
+    /// The offline-mode player name.
+    #[arg(long, default_value = "OxideDev")]
+    username: String,
+    /// Stop after this many presented frames.
+    #[arg(long)]
+    frames: Option<u64>,
+}
+
+/// The frame count to stop after: the flag when given, the environment variable
+/// otherwise, and only when positive.
+fn frame_limit(frames: Option<u64>) -> Option<u64> {
+    let limit = frames.or_else(|| {
+        std::env::var(MAX_FRAMES_VAR)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    limit.filter(|limit| *limit > 0)
+}
+
+/// Splits a `host:port` address into its parts, or explains why it cannot.
+///
+/// The split takes the last colon, so an IPv6 literal keeps its own colons in
+/// the host.
+fn parse_server_address(address: &str) -> anyhow::Result<(String, u16)> {
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("the server address must be host:port, got {address:?}"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|error| anyhow::anyhow!("the server port {port:?} is not a number: {error}"))?;
+    anyhow::ensure!(!host.is_empty(), "the server address has no host");
+    Ok((host.to_string(), port))
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -28,8 +87,10 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // The client is built before the window: a bad --server is refused before
+    // anything is opened.
+    let mut app = ClientApp::new(Cli::parse())?;
     let event_loop = EventLoop::new()?;
-    let mut app = ClientApp::new();
     event_loop.run_app(&mut app)?;
     anyhow::ensure!(
         !app.stopped_on_error,
@@ -38,13 +99,14 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The application handler: owns the window and the renderer and presents one frame per redraw.
+/// The application handler: owns the window, the renderer and the session link,
+/// and presents one frame per redraw.
 struct ClientApp {
     /// The window, once the event loop has resumed and it has been created.
     window: Option<Arc<Window>>,
     /// The renderer for that window.
     renderer: Option<Renderer>,
-    /// The frame-rate accounting shown in the title.
+    /// The frame-rate accounting shown in the title and the overlay.
     fps: FpsCounter,
     /// Frames presented since start.
     frames: u64,
@@ -52,36 +114,103 @@ struct ClientApp {
     max_frames: Option<u64>,
     /// Whether the client must report a failure once the event loop returns.
     stopped_on_error: bool,
+    /// The session thread and the events it reports, when `--server` was given.
+    session: Option<SessionLink>,
+    /// What the debug overlay reports, updated from the session's events.
+    hud: HudState,
+    /// Whether F3 has the overlay showing.
+    overlay_visible: bool,
 }
 
 impl ClientApp {
-    /// Builds the handler and reads the smoke-run frame limit.
-    fn new() -> Self {
-        let max_frames = std::env::var(MAX_FRAMES_VAR)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|limit| *limit > 0);
+    /// Builds the handler, reads the smoke-run frame limit, and opens the
+    /// session when `--server` was given.
+    fn new(cli: Cli) -> anyhow::Result<Self> {
+        let max_frames = frame_limit(cli.frames);
         if let Some(limit) = max_frames {
             tracing::info!(frames = limit, "a frame limit is set, exiting after it");
         }
-        Self {
+        let session = match cli.server {
+            Some(address) => {
+                let (host, port) = parse_server_address(&address)?;
+                tracing::info!(server = %address, username = %cli.username, "joining the server");
+                Some(spawn_session(host, port, cli.username, address))
+            }
+            None => None,
+        };
+        // The overlay starts visible when a session exists, because there is
+        // something to report; the smoke path keeps it hidden until F3.
+        let overlay_visible = session.is_some();
+        let server = session
+            .as_ref()
+            .map(|link| link.server.clone())
+            .unwrap_or_default();
+        Ok(Self {
             window: None,
             renderer: None,
             fps: FpsCounter::new(Duration::from_secs(1)),
             frames: 0,
             max_frames,
             stopped_on_error: false,
-        }
+            session,
+            hud: HudState {
+                fps: 0.0,
+                position: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                dimension: 0,
+                server,
+                entity_id: 0,
+            },
+            overlay_visible,
+        })
     }
 
     /// Presents one frame, updates the title, and stops once the limit is reached.
     ///
-    /// A frame the surface is not ready for is dropped, and a surface that went stale is
-    /// reconfigured before the frame is retried once. Any other failure stops the client.
+    /// The session's events are drained first, so the meshes and the pose they
+    /// carry are what this frame draws. A frame the surface is not ready for is
+    /// dropped, and a surface that went stale is reconfigured before the frame
+    /// is retried once. Any other failure stops the client.
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        // Drained into a list first, so the rest of the frame works from owned
+        // events and holds no borrow of the session.
+        let events: Vec<ClientEvent> = match self.session.as_ref() {
+            Some(session) => session.events.try_iter().collect(),
+            None => Vec::new(),
+        };
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
+        let mut session_ended = false;
+        for event in events {
+            session_ended |= apply_session_event(renderer, &mut self.hud, event);
+        }
+        if session_ended {
+            tracing::info!("the session ended, exiting");
+            event_loop.exit();
+            return;
+        }
+        // The camera follows the pose the server last reported. The smoke path
+        // without a session stays as M0 left it: no camera, so the frame is the
+        // sky clear.
+        if self.session.is_some() {
+            renderer.set_camera(Camera {
+                pose: CameraPose {
+                    position: self.hud.position,
+                    yaw: self.hud.yaw,
+                    pitch: self.hud.pitch,
+                },
+                fov_degrees: DEFAULT_FOV,
+                near: NEAR_PLANE,
+                far_chunks: FAR_CHUNKS,
+            });
+        }
+        renderer.set_overlay_lines(if self.overlay_visible {
+            debug_lines(&self.hud)
+        } else {
+            Vec::new()
+        });
         match present_frame(renderer) {
             Ok(PresentOutcome::Presented) => {}
             Ok(PresentOutcome::Skipped) => return,
@@ -98,7 +227,17 @@ impl ClientApp {
         self.fps.record_frame(Instant::now());
         self.frames += 1;
         let fps = self.fps.fps();
-        let title = format!("Oxidecraft — {fps:.0} fps — {}", renderer.adapter_name());
+        // The overlay reports the rate the counter last measured, so it shows
+        // this value from the next frame on.
+        self.hud.fps = fps;
+        let title = match self.session.as_ref() {
+            Some(session) => format!(
+                "Oxidecraft — {fps:.0} fps — {} — {}",
+                renderer.adapter_name(),
+                session.server
+            ),
+            None => format!("Oxidecraft — {fps:.0} fps — {}", renderer.adapter_name()),
+        };
         window.set_title(title.as_str());
         if self.frames % 60 == 0 {
             tracing::info!(
@@ -112,6 +251,117 @@ impl ClientApp {
                 tracing::info!(frames = self.frames, "frame limit reached, exiting");
                 event_loop.exit();
             }
+        }
+    }
+}
+
+/// The session thread's end of the wiring: where it came from and what it has
+/// reported so far.
+struct SessionLink {
+    /// The address as the command line gave it, shown on the overlay.
+    server: String,
+    /// The events the session thread reports, drained once per frame.
+    events: Receiver<ClientEvent>,
+}
+
+/// Opens a session on its own thread and returns the link the window drains.
+///
+/// The thread owns the connection, because the session blocks on reads and the
+/// window must keep drawing. It runs to completion, reports the failure in the
+/// log if it has one, and then reports [`ClientEvent::Disconnected`] whatever
+/// the outcome was, so the window can stop. A session that returned cleanly is
+/// a normal exit: the server closed the connection.
+fn spawn_session(host: String, port: u16, username: String, server: String) -> SessionLink {
+    let (sender, receiver) = unbounded();
+    std::thread::spawn(move || {
+        let config = SessionConfig {
+            host,
+            port,
+            username,
+            settings: ClientSettings::default(),
+        };
+        match Session::connect(&config) {
+            Ok(session) => {
+                if let Err(error) = session.run(&sender) {
+                    tracing::error!(error = ?error, "the session ended with an error");
+                }
+            }
+            Err(error) => tracing::error!(error = ?error, "the connection could not be opened"),
+        }
+        let _ = sender.send(ClientEvent::Disconnected {
+            reason: "the session thread ended".into(),
+        });
+    });
+    SessionLink {
+        server,
+        events: receiver,
+    }
+}
+
+/// Applies one event the session reported: meshes go to the renderer, the pose
+/// and the join parameters to the overlay state.
+///
+/// Returns whether the session ended, which stops the client. The session
+/// returns `Ok(())` when the server closed the connection, so its end is a
+/// normal exit, not an error.
+fn apply_session_event(renderer: &mut Renderer, hud: &mut HudState, event: ClientEvent) -> bool {
+    match event {
+        ClientEvent::LoggedIn { uuid, username } => {
+            tracing::info!(%uuid, %username, "logged in");
+            false
+        }
+        ClientEvent::Joined {
+            entity_id,
+            gamemode,
+            dimension,
+            difficulty,
+            max_players,
+            level_type,
+        } => {
+            tracing::info!(
+                entity_id,
+                gamemode,
+                dimension,
+                difficulty,
+                max_players,
+                %level_type,
+                "joined the world"
+            );
+            hud.entity_id = entity_id;
+            hud.dimension = dimension;
+            false
+        }
+        ClientEvent::PlayerPosition {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+        } => {
+            hud.position = [x, y, z];
+            hud.yaw = yaw;
+            hud.pitch = pitch;
+            false
+        }
+        ClientEvent::ChunkUpdated { cx, cz, sections } => {
+            for (section, mesh) in &sections {
+                renderer.set_section_mesh((cx, cz, *section as u8), mesh.as_ref());
+            }
+            false
+        }
+        ClientEvent::ChunkUnloaded { cx, cz } => {
+            for section in 0..SECTIONS_PER_COLUMN {
+                renderer.set_section_mesh((cx, cz, section), None);
+            }
+            false
+        }
+        ClientEvent::KeepAlive { id } => {
+            tracing::debug!(id, "keepalive answered");
+            false
+        }
+        ClientEvent::Disconnected { reason } => {
+            tracing::info!(%reason, "the session ended");
+            true
         }
     }
 }
@@ -201,6 +451,15 @@ impl ApplicationHandler for ClientApp {
                 tracing::info!("escape was pressed, exiting");
                 event_loop.exit();
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if is_f3_press(event.state, &event.logical_key) =>
+            {
+                self.overlay_visible = !self.overlay_visible;
+                tracing::info!(
+                    visible = self.overlay_visible,
+                    "the debug overlay was toggled"
+                );
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
@@ -229,11 +488,19 @@ fn is_escape_press(state: ElementState, key: &Key) -> bool {
     state == ElementState::Pressed && *key == Key::Named(NamedKey::Escape)
 }
 
+/// Whether a key event is a press of F3.
+///
+/// Kept out of the event match so the overlay toggle can be pinned without an event loop.
+fn is_f3_press(state: ElementState, key: &Key) -> bool {
+    state == ElementState::Pressed && *key == Key::Named(NamedKey::F3)
+}
+
 #[cfg(test)]
 mod tests {
-    //! Key-routing tests for the exit shortcut.
+    //! Key-routing and command-line tests.
 
-    use super::is_escape_press;
+    use super::{Cli, ClientApp, is_escape_press, is_f3_press, parse_server_address};
+    use clap::Parser;
     use winit::event::ElementState;
     use winit::keyboard::{Key, NamedKey};
 
@@ -255,5 +522,63 @@ mod tests {
             ElementState::Pressed,
             &Key::Character("w".into())
         ));
+    }
+
+    #[test]
+    fn only_a_press_of_f3_toggles() {
+        assert!(is_f3_press(
+            ElementState::Pressed,
+            &Key::Named(NamedKey::F3)
+        ));
+        assert!(!is_f3_press(
+            ElementState::Released,
+            &Key::Named(NamedKey::F3)
+        ));
+        assert!(!is_f3_press(
+            ElementState::Pressed,
+            &Key::Character("f3".into())
+        ));
+    }
+
+    #[test]
+    fn the_frame_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["oxide-client", "--frames", "120"]).expect("the flag parses");
+        assert_eq!(cli.frames, Some(120));
+    }
+
+    #[test]
+    fn the_defaults_are_an_offline_username_and_no_server() {
+        let cli = Cli::try_parse_from(["oxide-client"]).expect("a bare invocation parses");
+        assert_eq!(cli.username, "OxideDev");
+        assert!(cli.server.is_none());
+        assert_eq!(cli.frames, None);
+    }
+
+    #[test]
+    fn a_server_address_splits_into_a_host_and_a_port() {
+        let (host, port) = parse_server_address("localhost:25566").expect("the address parses");
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 25566);
+    }
+
+    #[test]
+    fn a_server_without_a_port_is_refused() {
+        let error = parse_server_address("127.0.0.1").expect_err("the address must be refused");
+        assert!(error.to_string().contains("host:port"), "{error}");
+    }
+
+    #[test]
+    fn a_server_port_that_is_not_a_number_is_refused() {
+        let error = parse_server_address("127.0.0.1:game").expect_err("the port must be refused");
+        assert!(error.to_string().contains("port"), "{error}");
+    }
+
+    #[test]
+    fn the_smoke_path_starts_without_a_session_or_the_overlay() {
+        let cli = Cli::try_parse_from(["oxide-client"]).expect("a bare invocation parses");
+        let app = ClientApp::new(cli).expect("the client builds without a server");
+        assert!(app.session.is_none(), "no session is opened");
+        assert!(!app.overlay_visible, "the overlay stays hidden");
     }
 }

@@ -1539,6 +1539,10 @@ name = "oxide-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "oxide-game",
+ "oxide-proto-v47",
  "oxide-render",
  "thiserror 2.0.20",
  "tracing",
