@@ -10,12 +10,17 @@ specification and continue without asking questions that are already answered he
 
 - Stage: **milestone M2 (textured terrain) is in progress** — spec section 13 of
   `docs/specs/oxidecraft-v1-design.md` (v5), plan `docs/plans/2026-09-27-m2-textured-terrain.md`
-  (sixteen tasks, approved by the owner on 2026-09-27). Four tasks are closed and independently
+  (sixteen tasks, approved by the owner on 2026-09-27). Six tasks are closed and independently
   reviewed: Task 1 (`856cbec..864ffcd`) closed the M1 code backlog and added the bulk-column replay
   through the session; Task 2 (`864ffcd..e4f53e4`) added the PNG texture loader, the `.mcmeta` parser
   and `TextureSet`; Task 3 (`e4f53e4..46e4c5e`) added the blockstate and model loader with the 1.8
   baker; Task 4 (`93d671d..8183c16`) added the atlas — the client's mip chain and blend kernel, the
-  sprite index, animation frames and the fallback sprite. Next is Task 5, the block behaviour table.
+  sprite index, animation frames and the fallback sprite; Task 5 (`cf75cf7..2472b25`) added the block
+  behaviour table (the 73 covered ids with their state properties, light columns, layers and tints,
+  the liquid rule, and the ignored store cross-check) with one fix round; Task 6 (`2472b25..f38c4c6`)
+  added the biome table and the tint path (the Perlin and `java.util.Random` ports, the colour-map
+  lookup, the nine-sample average, and the swamp, mesa and roofed-forest overrides) with one fix
+  round. Next is Task 7, the light engine.
   Every task's brief, report, review and every ruling live in the plan's ledger
   `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`. M1 is complete and tagged `m1` (the
   annotated tag marks the close-out commit `930ccab`; the reviewed code head is `854ca85` and its
@@ -32,9 +37,9 @@ specification and continue without asking questions that are already answered he
   the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
   with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
   overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
-- Tests: 301 passing workspace-wide, 8 ignored, zero failures (`cargo test --workspace`, 40 suites).
+- Tests: 339 passing workspace-wide, 9 ignored, zero failures (`cargo test --workspace`, 43 suites).
   The ignored set is two live-endpoint metadata tests, three GPU tests (they pass locally with
-  `-- --ignored`) and three real-tree tests in `oxide-assets` and `oxide-game` that run against the
+  `-- --ignored`) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
   store when `OXIDECRAFT_STORE` points at it (`~/.local/share/oxidecraft`).
 - Live evidence: the M0 ping and captures stand; M1's acceptance run — the join, 180 seconds of
   keep-alives, the mark and both screenshots, and the proxy capture of our client's own traffic — is
@@ -57,7 +62,7 @@ specification and continue without asking questions that are already answered he
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
 - Repo: https://github.com/loofyser/Oxidecraft — `main` pushed and tagged (`m0`, `m1`), with the M2
-  commit chain pushed through this handoff's checkpoint. Confirm HEAD with `git log --oneline -3`.
+  commit chain pushed through the checkpoint this handoff closes. Confirm HEAD with `git log --oneline -3`.
 
 ## M0 evidence
 
@@ -219,11 +224,11 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M2 (textured terrain) is the live milestone; its plan is
-`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–4 are closed and reviewed (head `8183c16`).
+`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–6 are closed and reviewed (head `f38c4c6`).
 The M1 backlog that previously stood here rode into the plan: items 2–6 closed in Task 1, item 1 (the
 overlay's cached uploads) is Task 14's, and item 7 (the rig's log rotation) is Task 15's. The next
-work is **Task 5, the block behaviour table** — `crates/oxide-world/src/behaviour.rs` plus the
-ignored store cross-check in `oxide-game` — then Tasks 6–16 in plan order. Parked for the milestone's
+work is **Task 7, the light engine** — `crates/oxide-world/src/light.rs` with the three sky-light
+rules, the two light kinds and the recomputation the mesher queries — then Tasks 8–16 in plan order. Parked for the milestone's
 final review: the seven deferred Minors from Task 2, the eight from Task 3 and Task 4's remaining
 wording nits, each listed in the plan's ledger. The milestone's acceptance (Task 15) runs the rig
 under `refs/rig/` against the store at `~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
