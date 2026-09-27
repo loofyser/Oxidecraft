@@ -1541,6 +1541,9 @@ dependencies = [
 name = "oxide-game"
 version = "0.0.0"
 dependencies = [
+ "oxide-proto-v47",
+ "oxide-render",
+ "oxide-world",
  "thiserror 2.0.20",
 ]
 

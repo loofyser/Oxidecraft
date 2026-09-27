@@ -11,4 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+oxide-proto-v47.workspace = true
+oxide-render.workspace = true
+oxide-world.workspace = true
 thiserror.workspace = true

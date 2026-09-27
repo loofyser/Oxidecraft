@@ -68,21 +68,37 @@ impl Section {
             None => 0,
         }
     }
+}
 
-    /// The wire data as a stored section.
-    ///
-    /// A sky-light array is kept only for a dimension with sky; a section the
-    /// packet gave no sky-light array for reads as dark.
-    fn from_data(data: &SectionData, has_sky: bool) -> Self {
-        Self {
-            blocks: data.blocks.clone(),
-            block_light: data.block_light.clone(),
-            sky_light: if has_sky {
-                data.sky_light.clone()
-            } else {
-                None
-            },
-        }
+/// The stored section for wire data: the wire-to-store bridge.
+///
+/// The protocol crate cannot name [`Section`] in the wire types it defines, so
+/// the crossing lives here: tests and any later code that needs one build a
+/// stored section from [`SectionData`] through this function.
+///
+/// A sky-light array is kept only for a dimension with sky; a section the
+/// packet gave no sky-light array for reads as dark.
+pub fn section_from_data(data: &SectionData, has_sky: bool) -> Section {
+    Section {
+        blocks: data.blocks.clone(),
+        block_light: data.block_light.clone(),
+        sky_light: if has_sky {
+            data.sky_light.clone()
+        } else {
+            None
+        },
+    }
+}
+
+/// The wire data for a stored section: the store-to-wire half of the bridge.
+///
+/// A sky-light array is carried over only when the section holds one: a
+/// section from a dimension without sky reads back without one.
+pub fn data_from_section(section: &Section) -> SectionData {
+    SectionData {
+        blocks: section.blocks.clone(),
+        block_light: section.block_light.clone(),
+        sky_light: section.sky_light.clone(),
     }
 }
 
@@ -137,7 +153,7 @@ impl Chunk {
         self.has_sky = has_sky;
         for (index, slot) in self.sections.iter_mut().enumerate() {
             match data.sections[index].as_ref() {
-                Some(section) => *slot = Some(Section::from_data(section, has_sky)),
+                Some(section) => *slot = Some(section_from_data(section, has_sky)),
                 None if ground_up => *slot = None,
                 None => {}
             }
