@@ -189,6 +189,20 @@ const ROOFED_GRASS_COLOURS: [(i32, i32, [u32; 2]); 6] = [
     (3, 4, [3822085, 3887621]),
 ];
 
+/// The roofed-forest transform over flat base colours whose low bits the
+/// coordinate map never sets: `(base, ((base & 16711422) + 2634762) >> 1)`,
+/// pinning the mask's width bit by bit (`BiomeGenForest.java:170`).
+const ROOFED_MASK_SAMPLES: [(u32, u32); 8] = [
+    (16711422, 9673092),
+    (5200386, 3884806),
+    (5177856, 3873541),
+    (154112, 1394437),
+    (5135114, 3884810),
+    (5069378, 3819302),
+    (5003906, 3819334),
+    (0, 1317381),
+];
+
 /// Swamp's grass override: `GRASS_COLOR_NOISE` samples (seed 2345) at
 /// `x * 0.0225, z * 0.0225`, and the colour that follows, per `(x, z)`.
 const SWAMP_SAMPLES: [(i32, i32, f64, u32); 10] = [
@@ -334,7 +348,7 @@ const HEIGHTS: [i32; 4] = [64, 70, 100, 150];
 
 #[test]
 fn biome_table_rows_pin_the_source_numbers() {
-    let rows: [(u8, &str, f32, f32, [f32; 3]); 17] = [
+    let rows: [(u8, &str, f32, f32, [f32; 3]); 18] = [
         (0, "Ocean", 0.5, 0.5, [1.0, 1.0, 1.0]),
         (PLAINS, "Plains", 0.8, 0.4, [1.0, 1.0, 1.0]),
         (DESERT, "Desert", 2.0, 0.0, [1.0, 1.0, 1.0]),
@@ -350,6 +364,7 @@ fn biome_table_rows_pin_the_source_numbers() {
         (21, "Jungle", 0.95, 0.9, [1.0, 1.0, 1.0]),
         (ROOFED_FOREST, "Roofed Forest", 0.7, 0.8, [1.0, 1.0, 1.0]),
         (MESA, "Mesa", 2.0, 0.0, [1.0, 1.0, 1.0]),
+        (38, "Mesa Plateau F", 2.0, 0.0, [1.0, 1.0, 1.0]),
         (39, "Mesa Plateau", 2.0, 0.0, [1.0, 1.0, 1.0]),
         (129, "Sunflower Plains", 0.8, 0.4, [1.0, 1.0, 1.0]),
         (132, "Flower Forest", 0.7, 0.8, [1.0, 1.0, 1.0]),
@@ -676,8 +691,12 @@ fn swamp_overrides_ignore_the_colour_map() {
 
 #[test]
 fn mesa_grass_and_foliage_are_the_fixed_tints() {
-    // The mesa class overrides both colours for all four of its ids.
-    for id in [MESA, 165u8, 166, 167] {
+    // All six mesa rows answer both fixed colours: 37, 38 and 39 are
+    // `BiomeGenMesa` instances (`BiomeGenBase.java:123-125`) and the class
+    // overrides both colour methods without a condition
+    // (`BiomeGenMesa.java:56-63`); 165, 166 and 167 are their mutations, each
+    // built as a `BiomeGenMesa` too (`BiomeGenMesa.java:317-334`).
+    for id in [MESA, 38u8, 39, 165, 166, 167] {
         let world = world_of(id);
         let maps = maps();
         let other = TintMaps {
@@ -725,6 +744,30 @@ fn roofed_forest_grass_applies_the_source_transform() {
         }
     }
     assert_eq!(rgb(ROOFED_GRASS_COLOURS[0].2[0]), [58, 82, 5]);
+}
+
+#[test]
+fn roofed_forest_mask_low_bits_are_pinned() {
+    // The transform masks the map colour with 16711422 (0x00FEFEFE), which
+    // clears bit 0 of each byte and keeps bit 1 of the blue byte; every pixel
+    // of the coordinate map has blue 0, so a mask that cleared one more bit
+    // (16711420) would answer the same colours there. These flat maps feed the
+    // base colours that do set those bits, and the vectors above pin the
+    // transform on them.
+    let world = world_of(ROOFED_FOREST);
+    for (base, expected) in ROOFED_MASK_SAMPLES {
+        let map = flat_map((base >> 16) as u8, (base >> 8) as u8, base as u8, 255);
+        let maps = TintMaps {
+            grass: map,
+            foliage: flat_map(0, 0, 0, 255),
+        };
+        assert_eq!(
+            tint_at(&world, &maps, 0, 64, 0, TintKind::Grass),
+            rgb(expected),
+            "the roofed transform of {base:#08X}"
+        );
+    }
+    assert_eq!(rgb(ROOFED_MASK_SAMPLES[0].1), [147, 153, 132]);
 }
 
 #[test]

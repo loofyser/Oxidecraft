@@ -420,7 +420,9 @@ fn map_colour(map: &ColorMap, data: &BiomeData, x: i32, y: i32, z: i32) -> [u8; 
 /// * Swamp and its mutation answer one of two fixed colours, chosen by the
 ///   second Perlin (`BiomeGenSwamp.java:37-41`); the colour map is not read and
 ///   neither is y.
-/// * The mesa rows answer one fixed colour (`BiomeGenMesa.java:61-64`).
+/// * All six mesa rows — 37, 38 and 39, each constructed as a `BiomeGenMesa`
+///   (`BiomeGenBase.java:123-125`), and their mutations 165-167 — answer one
+///   fixed colour (`BiomeGenMesa.java:61-64`).
 /// * Roofed forest and its mutation halve the map colour
 ///   (`BiomeGenForest.java:167-171`), which is what darkens that biome's grass;
 ///   the mutation delegates there (`BiomeGenMutated.java:68-71`).
@@ -439,7 +441,7 @@ fn grass_colour(data: &BiomeData, maps: &TintMaps, x: i32, y: i32, z: i32) -> [u
                 rgb(SWAMP_GRASS_LIGHT)
             }
         }
-        37 | 165 | 166 | 167 => rgb(MESA_GRASS),
+        37 | 38 | 39 | 165 | 166 | 167 => rgb(MESA_GRASS),
         29 | 157 => roofed_forest_grass(map_colour(&maps.grass, data, x, y, z)),
         _ => map_colour(&maps.grass, data, x, y, z),
     }
@@ -472,7 +474,7 @@ fn scale_water(colour: [f32; 3]) -> [u8; 3] {
 fn foliage_colour(data: &BiomeData, maps: &TintMaps, x: i32, y: i32, z: i32) -> [u8; 3] {
     match data.id {
         6 | 134 => rgb(SWAMP_GRASS_LIGHT),
-        37 | 165 | 166 | 167 => rgb(MESA_FOLIAGE),
+        37 | 38 | 39 | 165 | 166 | 167 => rgb(MESA_FOLIAGE),
         _ => map_colour(&maps.foliage, data, x, y, z),
     }
 }
