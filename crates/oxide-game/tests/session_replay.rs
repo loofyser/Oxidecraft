@@ -3,9 +3,10 @@
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
-use oxide_proto::conn::Conn;
+use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
 use oxide_proto_v47::clientbound::PlayerPositionAndLook;
 use oxide_proto_v47::serverbound::ClientSettings;
@@ -43,6 +44,14 @@ impl Write for Duplex {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl DeadlineStream for Duplex {
+    /// An in-memory stream never idles: its bytes — or its end — are always
+    /// there, so a deadline always finds the stream readable.
+    fn wait_readable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -352,36 +361,34 @@ fn an_unload_packet_removes_the_column() {
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    // The applied column leads its four neighbours, in the fixed order the
-    // session re-meshes them: +x, -x, +z, -z, before the unload.
+    // The unload is reported as its packet arrives, and the pending rebuild it
+    // queued runs when the session drains the queue, against the world as it
+    // stands: the applied column leads its four neighbours, +x, -x, +z, -z.
     assert_eq!(
         events.len(),
         8,
-        "the login, the join, five chunk updates and the unload: {events:?}"
+        "the login, the join, the unload and five chunk updates: {events:?}"
     );
     match &events[2] {
-        ClientEvent::ChunkUpdated {
-            cx: 3,
-            cz: 4,
-            sections,
-        } => {
+        ClientEvent::ChunkUnloaded { cx, cz } => assert_eq!((*cx, *cz), (3, 4)),
+        other => panic!("expected the unload, got {other:?}"),
+    }
+    match &events[3] {
+        ClientEvent::ChunkUpdated { cx, cz, sections } => {
+            assert_eq!((*cx, *cz), (3, 4));
             assert!(
-                sections[0].1.is_some(),
-                "the column is meshed before it is unloaded"
+                sections.iter().all(|(_, mesh)| mesh.is_none()),
+                "the unloaded column draws nothing"
             );
         }
-        other => panic!("expected the meshed column, got {other:?}"),
+        other => panic!("expected the deferred rebuild of the unloaded column, got {other:?}"),
     }
-    let columns: Vec<(i32, i32)> = events[2..7].iter().map(updated_column).collect();
+    let columns: Vec<(i32, i32)> = events[3..].iter().map(updated_column).collect();
     assert_eq!(
         columns,
         vec![(3, 4), (4, 4), (2, 4), (3, 5), (3, 3)],
         "the applied column leads, then its four neighbours"
     );
-    match events.last() {
-        Some(ClientEvent::ChunkUnloaded { cx, cz }) => assert_eq!((*cx, *cz), (3, 4)),
-        other => panic!("expected the unload, got {other:?}"),
-    }
 }
 
 #[test]
@@ -485,4 +492,128 @@ fn player_list_updates_do_not_end_the_session() {
         "the keepalive is the only packet the player list drew"
     );
     assert!(cursor.is_empty(), "no further packets were sent");
+}
+
+#[test]
+fn a_keepalive_behind_a_column_burst_is_answered_before_any_mesh_is_built() {
+    // A live server sends its initial columns as a burst with the keepalives
+    // behind it on the wire. The echo is a connection obligation, and the
+    // server closes a session that leaves it unanswered for about thirty
+    // seconds, so the burst must not hold up the read loop: the echo is
+    // answered before the meshes the burst queued are built.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        chunk_data_frame(0, 0),
+        chunk_data_frame(1, 0),
+        keep_alive_frame(21),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let answered = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 21 }))
+        .expect("the keepalive is answered");
+    let meshed = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
+        .expect("the columns are meshed");
+    assert!(
+        answered < meshed,
+        "the echo must not wait for the meshes: {events:?}"
+    );
+}
+
+/// A duplex with a quiet stretch: after `head` is consumed, the stream reports
+/// nothing readable for `stalls` waits, then serves `tail`.
+struct GappedDuplex {
+    head: std::io::Cursor<Vec<u8>>,
+    tail: std::io::Cursor<Vec<u8>>,
+    stalls: usize,
+    outgoing: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Read for GappedDuplex {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.head.position() < self.head.get_ref().len() as u64 {
+            self.head.read(out)
+        } else {
+            self.tail.read(out)
+        }
+    }
+}
+
+impl Write for GappedDuplex {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.outgoing.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl DeadlineStream for GappedDuplex {
+    fn wait_readable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+        if self.head.position() < self.head.get_ref().len() as u64 {
+            Ok(true)
+        } else if self.stalls > 0 {
+            self.stalls -= 1;
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+}
+
+#[test]
+fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
+    // The burst has arrived and a keepalive has been answered; the connection
+    // then goes quiet before the next keepalive. The pending meshes are rebuilt
+    // during that quiet stretch — not deferred to the end of the stream — and
+    // the next keepalive is still read after them.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &chunk_data_frame(0, 0), SERVER_FRAMING);
+    frame(&mut head, &keep_alive_frame(31), SERVER_FRAMING);
+    let mut tail = Vec::new();
+    frame(&mut tail, &keep_alive_frame(32), SERVER_FRAMING);
+
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(tail),
+        stalls: 2,
+        outgoing: Arc::clone(&outgoing),
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let first = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 31 }))
+        .expect("the first keepalive is answered");
+    let meshed = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
+        .expect("the column is meshed");
+    let last_mesh = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
+        .expect("the column is meshed");
+    let second = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 32 }))
+        .expect("the second keepalive is answered");
+    assert!(
+        first < meshed && last_mesh < second,
+        "the meshes are built in the quiet stretch, before the next keepalive: {events:?}"
+    );
 }

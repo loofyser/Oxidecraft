@@ -9,13 +9,19 @@
 //! A packet the client has no use for is skipped, and one whose id it cannot
 //! even name is not fatal (spec S2), so a proxy or a modded server cannot end
 //! the session by sending something unexpected.
+//!
+//! The column meshes are rebuilt between reads, never inside a read that other
+//! packets are waiting behind: a burst of columns on join would otherwise hold
+//! the loop for minutes, and the server closes a session whose keepalive echo
+//! goes unanswered for about thirty seconds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
-use oxide_proto::conn::Conn;
+use oxide_proto::conn::{Conn, DeadlineStream, RecvOutcome};
 use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
@@ -41,6 +47,15 @@ const BRAND_CHANNEL: &str = "MC|Brand";
 /// The brand payload, as the capture records the vanilla client sending it: a
 /// length-prefixed `vanilla`.
 const BRAND_PAYLOAD: &[u8] = b"\x07vanilla";
+
+/// How long the play loop waits for a frame to start before it rebuilds one
+/// pending column's meshes.
+///
+/// The wait is a deadline, not a blocking read: it consumes nothing, so a
+/// keepalive behind a column burst is still read — and echoed — as soon as its
+/// bytes are readable. One mesh batch is bounded by this wait plus the batch
+/// itself, which is what keeps the echo well inside the server's timeout.
+const MESH_TICK: Duration = Duration::from_millis(20);
 
 /// The login-state packet ids the client decodes. Anything else is skipped
 /// rather than refused, so the login survives a packet M1 does not know.
@@ -163,7 +178,7 @@ impl Session<TcpStream> {
     }
 }
 
-impl<S: Read + Write> Session<S> {
+impl<S: Read + Write + DeadlineStream> Session<S> {
     /// Wraps an existing connection.
     pub fn new(conn: Conn<S>, config: SessionConfig) -> Self {
         Self { conn, config }
@@ -173,6 +188,11 @@ impl<S: Read + Write> Session<S> {
     ///
     /// Returns `Ok(())` when the server closed the connection or the stream
     /// ended. Malformed packets are reported as an error, never a panic.
+    ///
+    /// The play loop reads with [`Conn::recv_or_idle`], so between frames it
+    /// rebuilds the column meshes the server's chunk packets queued. The
+    /// meshes never delay a read, which is what keeps the keepalive echo — and
+    /// the teleport echo — answerable while a burst of columns is arriving.
     pub fn run_over(self, events: &Sender<ClientEvent>) -> Result<(), SessionError> {
         let Session { mut conn, config } = self;
 
@@ -195,11 +215,20 @@ impl<S: Read + Write> Session<S> {
         let mut world: Option<World> = None;
         let mut position = Position::default();
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
+        let mut pending: VecDeque<(i32, i32)> = VecDeque::new();
 
         loop {
-            let Some(payload) = recv_frame(&mut conn)? else {
-                debug!("the server closed the stream");
-                return Ok(());
+            let payload = match conn.recv_or_idle(MESH_TICK) {
+                Ok(RecvOutcome::Frame(payload)) => payload,
+                Ok(RecvOutcome::Idle) => {
+                    mesh_one(world.as_ref(), &mut pending, events);
+                    continue;
+                }
+                Err(error) if is_stream_end(&error) => {
+                    debug!(error = %error, "the server closed the stream");
+                    break;
+                }
+                Err(error) => return Err(SessionError::Frame(error)),
             };
             let (id, body) = match read_packet_id(&payload) {
                 Ok(read) => read,
@@ -220,6 +249,7 @@ impl<S: Read + Write> Session<S> {
                     // The dimension decides whether columns carry sky light. A
                     // re-sent Join Game starts the column set over.
                     world = Some(World::new(join.dimension == 0));
+                    pending.clear();
                     let settings = payload_of(|out| write_client_settings(out, &config.settings))?;
                     send_reply(&mut conn, &settings)?;
                     let brand =
@@ -270,7 +300,7 @@ impl<S: Read + Write> Session<S> {
                     };
                     let column = decoded(id, ChunkData::decode(body, store.has_sky()))?;
                     if store.apply_chunk_data(&column) {
-                        remesh(store, column.chunk_x, column.chunk_z, events);
+                        pending.push_back((column.chunk_x, column.chunk_z));
                     } else {
                         report(
                             events,
@@ -290,7 +320,7 @@ impl<S: Read + Write> Session<S> {
                     store.apply_bulk(&bulk);
                     for column in &bulk.columns {
                         if store.chunk(column.chunk_x, column.chunk_z).is_some() {
-                            remesh(store, column.chunk_x, column.chunk_z, events);
+                            pending.push_back((column.chunk_x, column.chunk_z));
                         } else {
                             report(
                                 events,
@@ -335,6 +365,7 @@ impl<S: Read + Write> Session<S> {
                 }
                 PlayDisconnect::ID => {
                     let disconnect = decoded(id, PlayDisconnect::decode(body))?;
+                    flush_pending(world.as_ref(), &mut pending, events);
                     report(
                         events,
                         ClientEvent::Disconnected {
@@ -354,6 +385,8 @@ impl<S: Read + Write> Session<S> {
                 }
             }
         }
+        flush_pending(world.as_ref(), &mut pending, events);
+        Ok(())
     }
 }
 
@@ -575,6 +608,38 @@ fn remesh(world: &World, cx: i32, cz: i32, events: &Sender<ClientEvent>) {
     for (nx, nz) in [(cx + 1, cz), (cx - 1, cz), (cx, cz + 1), (cx, cz - 1)] {
         report_chunk(world, nx, nz, events);
     }
+}
+
+/// Rebuilds the meshes of the oldest pending column, when one is waiting.
+///
+/// The queue holds every column the server applied whose meshes have not been
+/// rebuilt yet, in arrival order; the play loop drains one batch per idle wait,
+/// so the connection is read between batches rather than after all of them.
+fn mesh_one(
+    world: Option<&World>,
+    pending: &mut VecDeque<(i32, i32)>,
+    events: &Sender<ClientEvent>,
+) {
+    if let (Some(world), Some((cx, cz))) = (world, pending.pop_front()) {
+        remesh(world, cx, cz, events);
+    }
+}
+
+/// Rebuilds every pending column's meshes; the session ends with its work done.
+///
+/// The meshes are built from the world as it stands, so a column the server has
+/// since unloaded reports itself as drawing nothing.
+fn flush_pending(
+    world: Option<&World>,
+    pending: &mut VecDeque<(i32, i32)>,
+    events: &Sender<ClientEvent>,
+) {
+    if let Some(world) = world {
+        while let Some((cx, cz)) = pending.pop_front() {
+            remesh(world, cx, cz, events);
+        }
+    }
+    pending.clear();
 }
 
 /// Builds one column's meshes and reports them.

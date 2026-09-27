@@ -1,11 +1,62 @@
 //! A framed connection over one stream: buffered reads and coalesced writes.
 
 use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
 
 use crate::frame::{Compression, FrameError, read_frame, write_frame};
 
 /// Bytes pulled from the stream in one read call.
 const READ_CHUNK: usize = 8 * 1024;
+
+/// What [`Conn::recv_or_idle`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecvOutcome {
+    /// One complete frame, decompressed.
+    Frame(Vec<u8>),
+    /// Nothing was readable within the deadline; nothing was consumed.
+    Idle,
+}
+
+/// A stream whose readability can be awaited with a deadline.
+///
+/// The deadline exists so a reader can idle without disturbing the framing.
+/// [`DeadlineStream::wait_readable`] consumes nothing either way, and a read
+/// that follows a ready report waits without a deadline of its own, so a
+/// deadline that passes can never cut a frame in half.
+pub trait DeadlineStream: Read + Write {
+    /// Waits up to `timeout` for at least one readable byte.
+    ///
+    /// `Ok(true)` means a byte is readable — or the stream ended, which the
+    /// next read reports — and the stream is left ready for a read with no
+    /// deadline. `Ok(false)` means the deadline passed; nothing was consumed.
+    fn wait_readable(&mut self, timeout: Duration) -> io::Result<bool>;
+}
+
+impl DeadlineStream for TcpStream {
+    fn wait_readable(&mut self, timeout: Duration) -> io::Result<bool> {
+        self.set_read_timeout(Some(timeout))?;
+        // `peek` takes the deadline without consuming anything, so a deadline
+        // that passes leaves the stream exactly where it was.
+        let mut probe = [0_u8; 1];
+        match self.peek(&mut probe) {
+            Ok(_) => {
+                self.set_read_timeout(None)?;
+                Ok(true)
+            }
+            Err(error) if is_deadline(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Whether a wait failed because its deadline passed.
+fn is_deadline(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
 
 /// A connection that frames packets, buffering both directions.
 ///
@@ -71,6 +122,24 @@ impl<S: Read + Write> Conn<S> {
     pub fn recv(&mut self) -> Result<Vec<u8>, FrameError> {
         let compression = self.compression;
         read_frame(&mut *self, compression)
+    }
+
+    /// Reads one frame, waiting at most `idle` for it to start.
+    ///
+    /// This is [`Conn::recv`] with a deadline in front of it: with no buffered
+    /// bytes and nothing readable within `idle`, nothing is consumed and
+    /// [`RecvOutcome::Idle`] is returned, so a caller with other work to do can
+    /// do it and come back without risking the framing. Call it at a frame
+    /// boundary; once a frame has started the read waits without a deadline, so
+    /// a slow frame is never cut in half.
+    pub fn recv_or_idle(&mut self, idle: Duration) -> Result<RecvOutcome, FrameError>
+    where
+        S: DeadlineStream,
+    {
+        if self.read_start == self.read_end && !self.stream.wait_readable(idle)? {
+            return Ok(RecvOutcome::Idle);
+        }
+        self.recv().map(RecvOutcome::Frame)
     }
 
     /// Returns the wrapped stream.

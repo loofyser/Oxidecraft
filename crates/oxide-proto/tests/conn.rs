@@ -2,8 +2,9 @@
 //! and the compression switch.
 
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
-use oxide_proto::conn::Conn;
+use oxide_proto::conn::{Conn, RecvOutcome};
 use oxide_proto::frame::{Compression, FrameError, write_frame};
 use oxide_proto::varint::VarIntError;
 
@@ -54,6 +55,97 @@ impl Write for CountingStream {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// The scripted stream a deadline-aware read drives, with its writer held by
+/// the test: a real socket, so the `DeadlineStream` implementation under test
+/// is the one the client uses.
+fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+    let addr = listener.local_addr().expect("the bound address");
+    let sender = std::net::TcpStream::connect(addr).expect("connect to the listener");
+    let (receiver, _) = listener.accept().expect("accept the connection");
+    (receiver, sender)
+}
+
+#[test]
+fn an_idle_read_reports_idle_and_loses_nothing() {
+    // The frame arrives after the first read attempt: the attempt must report
+    // Idle without consuming anything, and a later attempt must return the
+    // frame itself.
+    let (receiver, mut sender) = socket_pair();
+    let mut frame = Vec::new();
+    write_frame(&mut frame, b"late", Compression::Disabled).expect("a frame");
+
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        sender.write_all(&frame).expect("write the frame");
+        std::thread::sleep(Duration::from_millis(200));
+    });
+
+    let mut conn = Conn::new(receiver);
+    assert_eq!(
+        conn.recv_or_idle(Duration::from_millis(20))
+            .expect("a quiet read"),
+        RecvOutcome::Idle,
+        "nothing has arrived yet"
+    );
+
+    let mut received = None;
+    for _ in 0..50 {
+        match conn
+            .recv_or_idle(Duration::from_millis(50))
+            .expect("a read")
+        {
+            RecvOutcome::Frame(payload) => {
+                received = Some(payload);
+                break;
+            }
+            RecvOutcome::Idle => continue,
+        }
+    }
+    assert_eq!(received.expect("the frame arrives"), b"late");
+    writer.join().expect("the writer thread ends");
+}
+
+#[test]
+fn a_frame_that_stalls_mid_body_is_read_whole() {
+    // The body arrives in two pieces with a gap longer than the deadline. A
+    // deadline may only pass between frames: a frame cut in half would desync
+    // the framing, so the frame must come back whole.
+    let (receiver, mut sender) = socket_pair();
+    let mut frame = Vec::new();
+    write_frame(&mut frame, &[0x33_u8; 512], Compression::Disabled).expect("a frame");
+    let (first, rest) = frame.split_at(300);
+    let first = first.to_vec();
+    let rest = rest.to_vec();
+
+    let writer = std::thread::spawn(move || {
+        sender.write_all(&first).expect("write the first half");
+        std::thread::sleep(Duration::from_millis(120));
+        sender.write_all(&rest).expect("write the second half");
+        std::thread::sleep(Duration::from_millis(200));
+    });
+
+    let mut conn = Conn::new(receiver);
+    let mut received = None;
+    for _ in 0..50 {
+        match conn
+            .recv_or_idle(Duration::from_millis(20))
+            .expect("a read")
+        {
+            RecvOutcome::Frame(payload) => {
+                received = Some(payload);
+                break;
+            }
+            RecvOutcome::Idle => continue,
+        }
+    }
+    assert_eq!(
+        received.expect("the frame arrives whole"),
+        vec![0x33_u8; 512]
+    );
+    writer.join().expect("the writer thread ends");
 }
 
 /// One scripted read result: bytes to hand back, or an error kind to raise.
