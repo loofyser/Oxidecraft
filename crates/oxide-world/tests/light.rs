@@ -40,6 +40,8 @@ const WATER: u16 = 9 << 4;
 const LEAVES: u16 = 18 << 4;
 /// A torch, id 50: emission 14, opacity 0.
 const TORCH: u16 = 50 << 4;
+/// Glowstone, id 89: opaque (opacity 255) and luminous (emission 15).
+const GLOWSTONE: u16 = 89 << 4;
 
 // ---------------------------------------------------------------------------
 // Helpers.
@@ -146,6 +148,62 @@ fn sky(world: &World, x: i32, y: i32, z: i32) -> u8 {
 /// The stored block light at a world position.
 fn block(world: &World, x: i32, y: i32, z: i32) -> u8 {
     stored(world, x, y, z).1
+}
+
+/// The stored sky and block light of every cell of a whole column, y varying
+/// fastest inside each (x, z) position.
+fn stored_column(world: &World, cx: i32, cz: i32) -> Vec<(u8, u8)> {
+    let chunk = world.chunk(cx, cz).expect("the column is loaded");
+    let mut cells = Vec::with_capacity(SECTION_SIZE * SECTION_SIZE * SECTION_COUNT * SECTION_SIZE);
+    for lz in 0..SECTION_SIZE {
+        for lx in 0..SECTION_SIZE {
+            for y in 0..SECTION_COUNT * SECTION_SIZE {
+                cells.push((
+                    chunk.sky_light_at(lx, y, lz),
+                    chunk.block_light_at(lx, y, lz),
+                ));
+            }
+        }
+    }
+    cells
+}
+
+/// The stored block values of every cell of a whole column, y varying fastest
+/// inside each (x, z) position.
+fn stored_blocks(world: &World, cx: i32, cz: i32) -> Vec<u16> {
+    let chunk = world.chunk(cx, cz).expect("the column is loaded");
+    let mut blocks = Vec::with_capacity(SECTION_SIZE * SECTION_SIZE * SECTION_COUNT * SECTION_SIZE);
+    for lz in 0..SECTION_SIZE {
+        for lx in 0..SECTION_SIZE {
+            for y in 0..SECTION_COUNT * SECTION_SIZE {
+                blocks.push(chunk.block(lx, y, lz));
+            }
+        }
+    }
+    blocks
+}
+
+/// The biome array of a whole column, in the wire's order: z-major, then x.
+fn stored_biomes(world: &World, cx: i32, cz: i32) -> Vec<u8> {
+    let chunk = world.chunk(cx, cz).expect("the column is loaded");
+    let mut biomes = Vec::with_capacity(SECTION_SIZE * SECTION_SIZE);
+    for lz in 0..SECTION_SIZE {
+        for lx in 0..SECTION_SIZE {
+            biomes.push(chunk.biome(lx, lz));
+        }
+    }
+    biomes
+}
+
+/// How many section slots a column holds.
+///
+/// The store answers no presence query, and in a dimension with sky a present
+/// air section reads 15 above a column's blockers — exactly what an absent
+/// section's default answers — so the slots are counted out of the column's
+/// own debug view.
+fn held_sections(world: &World, cx: i32, cz: i32) -> usize {
+    let chunk = world.chunk(cx, cz).expect("the column is loaded");
+    format!("{chunk:?}").matches("Some(Section").count()
 }
 
 // ---------------------------------------------------------------------------
@@ -264,8 +322,12 @@ fn an_opaque_roof_lights_by_the_side_spread_only() {
         15,
         "beside the roof, the column is open"
     );
-    // Under the roof nothing comes down: every cell reads the chain that came
-    // in sideways off the open column at x = 11, losing one a step.
+    // Under the roof nothing comes down. The pinned cells take the chain that
+    // comes in sideways off the open column at x = -1 (the local x = 15 edge of
+    // the neighbouring chunk): 15 - 1 at x = 0 down to 15 - 6 at x = 5. The open
+    // column at x = 11 also sends a chain in, but it is one step weaker at these
+    // cells (4..=9 at x = 0..=5, the two chains tying at 9 at x = 5), so it
+    // dominates only from x = 6 east.
     for (x, expected) in [(0, 14), (1, 13), (2, 12), (3, 11), (4, 10), (5, 9)] {
         assert_eq!(
             sky(&world, x, 63, 5),
@@ -317,6 +379,34 @@ fn a_light_filtering_block_costs_its_own_opacity() {
         0,
         "the shaft's stone wall takes nothing"
     );
+}
+
+#[test]
+fn a_glowstone_cell_receives_sky_light_and_emits_block_light() {
+    // Stone through y 63 with a glowstone cell at (8, 64, 8), open to the sky.
+    // Glowstone is opaque (opacity 255, `behaviour.rs` id 89) and luminous
+    // (emission 15, `Block.java:1348`): the opaque-and-luminous clause of
+    // `World.getRawLight` (`:2795-2798`) lifts its attenuation from "no inflow"
+    // to 1, so the cell takes the sky one step down from full and still holds
+    // and spreads its own emission. With the clause off it would take nothing
+    // and read sky 0 — the one regression this test exists to catch.
+    let mut world = world_of(1, |_, _| {
+        column_of(0, 0, |x, y, z| {
+            if x == 8 && y == 64 && z == 8 {
+                GLOWSTONE
+            } else if y <= 63 {
+                STONE
+            } else {
+                AIR
+            }
+        })
+    });
+    recompute_column(&mut world, 0, 0);
+
+    assert_eq!(sky(&world, 8, 64, 8), 14, "the glowstone takes 15 - 1");
+    assert_eq!(block(&world, 8, 64, 8), 15, "and holds its emission");
+    assert_eq!(block(&world, 9, 64, 8), 14, "which spreads one step out");
+    assert_eq!(sky(&world, 8, 65, 8), 15, "the sky above it stays full");
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +646,178 @@ fn cells_outside_the_region_keep_their_light() {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_column_pass_reads_a_loaded_neighbours_sky_at_the_border() {
+    // Two loaded columns side by side. The west one is flat stone through
+    // y 62, so its y 63 layer sits under open sky at 15. The east one is stone
+    // through y 63 with a one-cell pocket at its west edge, local (0, 63, 0),
+    // covered by stone at (0, 64, 0) and walled by stone on every other side:
+    // the west column's edge cell (15, 63, 0) is the pocket's only source, and
+    // the one-cell border read `recompute_column` makes is what carries it
+    // across, at 15 - max(1, 0) = 14. With the border read off the pocket
+    // stays 0.
+    let mut world = world_of(1, |_, _| {
+        column_of(0, 0, |_, y, _| if y <= 62 { STONE } else { AIR })
+    });
+    let mut east = ColumnData::empty();
+    for sy in 0..SECTION_COUNT {
+        east.sections[sy] = Some(section_of(true, 0, 0, |lx, ly, lz| {
+            let y = sy * SECTION_SIZE + ly;
+            let pocket = lx == 0 && lz == 0 && y == 63;
+            let cover = lx == 0 && lz == 0 && y == 64;
+            if (y <= 63 && !pocket) || cover {
+                STONE
+            } else {
+                AIR
+            }
+        }));
+        east.mask |= 1u16 << sy;
+    }
+    world.apply_column(1, 0, &east, true);
+
+    // The west column's own pass gives it its light; the pocket starts dark.
+    recompute_column(&mut world, 0, 0);
+    assert_eq!(sky(&world, 15, 63, 0), 15, "the west column's open edge");
+    assert_eq!(sky(&world, 16, 63, 0), 0, "the pocket before the pass");
+    assert_eq!(sky(&world, 16, 64, 0), 0, "and its cover takes nothing");
+
+    recompute_column(&mut world, 1, 0);
+    assert_eq!(
+        sky(&world, 16, 63, 0),
+        14,
+        "the pocket takes 15 - 1 across the border"
+    );
+
+    // A second pass over a now-correct column changes nothing.
+    let before = stored_column(&world, 1, 0);
+    recompute_column(&mut world, 1, 0);
+    assert_eq!(
+        stored_column(&world, 1, 0),
+        before,
+        "a second column pass is a no-op"
+    );
+}
+
+#[test]
+fn a_column_pass_materialises_the_sections_the_column_does_not_hold() {
+    // A section outside the mask "keeps the light it had before a recompute"
+    // in the region sense: the loaded columns outside the pass's region keep
+    // their stored light, which `cells_outside_the_region_keep_their_light`
+    // pins. In the store's own sense — a section the column does not hold — the
+    // pass changes the value: it materialises the absent sections as air
+    // carrying the computed light, so their reads become the computed ones.
+    // That is the defined behaviour for M2; sparse-column semantics are
+    // deferred to M3.
+    //
+    // The world is one column holding only a stone-filled section 5 (y 80..95):
+    // nothing lights the cells below the stone, and the cell above it is
+    // directly exposed.
+    let mut world = World::new(true);
+    let mut sparse = ColumnData::empty();
+    sparse.sections[5] = Some(section_of(true, 0, 0, |_, _, _| STONE));
+    sparse.mask = 1u16 << 5;
+    world.apply_column(0, 0, &sparse, true);
+
+    assert_eq!(held_sections(&world, 0, 0), 1, "only section 5 is held");
+    assert_eq!(
+        sky(&world, 0, 40, 0),
+        15,
+        "an absent section reads its sky default"
+    );
+
+    recompute_column(&mut world, 0, 0);
+
+    assert_eq!(
+        held_sections(&world, 0, 0),
+        SECTION_COUNT,
+        "the pass materialises all sixteen sections"
+    );
+    assert_eq!(sky(&world, 0, 40, 0), 0, "the y-40 read is now computed");
+    assert_eq!(
+        sky(&world, 0, 96, 0),
+        15,
+        "the cell above the stone is direct"
+    );
+    for y in 80..96 {
+        assert_eq!(world.block(0, y, 0), STONE, "the stone at y {y} survives");
+    }
+    assert_eq!(world.block(0, 100, 0), AIR, "and the air above is air");
+    for y in 0..96 {
+        assert_eq!(sky(&world, 0, y, 0), 0, "nothing below the stone lights");
+    }
+}
+
+#[test]
+fn a_column_pass_keeps_the_biomes_and_the_blocks() {
+    // The write-back rebuilds the column from its blocks and its recomputed
+    // light and carries no biome array, and the store keeps the biomes it
+    // holds, so a relit column must come through with its 256-byte biome array
+    // and its blocks unchanged.
+    let mut world = World::new(true);
+    let mut column = column_of(0, 0, |_, y, _| if y <= 63 { STONE } else { AIR });
+    column.biomes = Some([7u8; 256]);
+    world.apply_column(0, 0, &column, true);
+
+    let biomes_before = stored_biomes(&world, 0, 0);
+    let blocks_before = stored_blocks(&world, 0, 0);
+    assert_eq!(
+        biomes_before,
+        vec![7u8; 256],
+        "the column holds a biome array"
+    );
+
+    recompute_column(&mut world, 0, 0);
+
+    assert_eq!(
+        stored_biomes(&world, 0, 0),
+        biomes_before,
+        "the biome array is unchanged"
+    );
+    assert_eq!(
+        stored_blocks(&world, 0, 0),
+        blocks_before,
+        "and every block is preserved"
+    );
+}
+
+#[test]
+fn a_relight_in_a_dimension_without_sky_leaves_the_sky_dark() {
+    // A dimension without sky: the passes gate the sky kind on `has_sky`, the
+    // write-back stores no sky-light array, and the store drops one for such a
+    // dimension. Block light still spreads, and every sky read stays 0.
+    let mut world = World::new(false);
+    let column = column_of(0, 0, |x, y, z| {
+        if x == 8 && y == 64 && z == 8 {
+            TORCH
+        } else {
+            AIR
+        }
+    });
+    world.apply_column(0, 0, &column, true);
+
+    recompute_column(&mut world, 0, 0);
+
+    assert_eq!(block(&world, 8, 64, 8), 14, "the torch cell holds 14");
+    assert_eq!(block(&world, 9, 64, 8), 13, "and one step of spread");
+    assert_eq!(
+        light_at(&world, 8, 64, 8),
+        14,
+        "the query reads the block light, not a sky default"
+    );
+    let chunk = world.chunk(0, 0).expect("the column is loaded");
+    for lz in 0..SECTION_SIZE {
+        for lx in 0..SECTION_SIZE {
+            for y in 0..SECTION_COUNT * SECTION_SIZE {
+                assert_eq!(
+                    chunk.sky_light_at(lx, y, lz),
+                    0,
+                    "no sky light at ({lx}, {y}, {lz})"
+                );
             }
         }
     }

@@ -398,7 +398,12 @@ fn seed_block(levels: &mut Levels, emission: &[u8]) {
 /// Lets the cells outside the rectangle feed the ones at its edge.
 ///
 /// A source outside the region never changes during the pass, so one pass over
-/// the rectangle's edge cells takes everything it has to give.
+/// the rectangle's edge cells takes everything it has to give. A neighbour the
+/// world does not hold contributes nothing here, although the source's own
+/// `getLightFor` answers the sky kind's default of 15 for a position no
+/// column holds (`World.java:789-803`): vanilla refuses to relight around an
+/// unloaded neighbour too (`World.checkLightFor`'s loaded-area bound,
+/// `World.java:2838`), so the engine reads it as dark.
 fn seed_border(world: &World, region: &Region, kind: Kind, levels: &mut Levels) {
     for index in 0..levels.level.len() {
         let (x, y, z) = region.cell_of(index);
@@ -443,6 +448,10 @@ fn spread(region: &Region, levels: &mut Levels) {
     while let Some(index) = levels.queue.pop_front() {
         let (x, y, z) = region.cell_of(index);
         let level = levels.level[index];
+        // A cell at 1 or below can raise nothing: every receivable neighbour
+        // attenuates by at least 1, so the candidate it offers is at most 0,
+        // which never passes the strict rise test below. The exit is a
+        // work-saver only; values and termination are the same without it.
         if level <= 1 {
             continue;
         }
