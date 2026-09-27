@@ -1,6 +1,6 @@
 # Oxidecraft — project state
 
-Updated: 2026-09-23
+Updated: 2026-09-26
 
 This file is the live state of the project. Keep it current before every handoff, long pause, and
 milestone boundary. Anyone picking the work up should be able to read this file plus the
@@ -8,34 +8,45 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
-- Stage: **milestone M1 (bytes to world) is in progress.** The plan is
-  `docs/plans/2026-09-23-m1-bytes-to-world.md` (13 tasks; approved 2026-09-23 with the owner's
-  answers recorded in it). Task 1 (the buffered connection and the primitive codecs) is complete and
-  pushed at `b950e30` with a clean review; Task 2 (the live capture) was stopped at the owner's
-  request on 2026-09-23 and is the resume point — see
-  `docs/handoff/2026-09-23-m1-task2-stopped.md` and the ledger
-  `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md`. M0 is complete and tagged `m0`.
+- Stage: **milestone M1 (bytes to world) is complete and tagged `m1`.** The annotated tag marks the
+  close-out commit and the reviewed code head is `854ca85`. All thirteen tasks of
+  `docs/plans/2026-09-23-m1-bytes-to-world.md` are closed and reviewed, the acceptance run passed on
+  the rig (evidence below), and the final whole-branch review over `d04a2cd..854ca85` returned
+  **ready to merge** with no Critical or Important findings. The per-task reviews, the rulings and the
+  final review are recorded in the ledger
+  `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md`. Next is **M2 (textured terrain)**,
+  spec section 13 of `docs/specs/oxidecraft-v1-design.md` (v5), starting from the backlog under
+  "Next actions". M0 is complete and tagged `m0`.
 - M0 delivered and verified: the eight-crate workspace with its enforced dependency graph; the
   VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
   and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
   `fetch --verify` flow, run against the real endpoints; jar extraction with a manifest; the wgpu
   window with the FPS counter and adapter logging; CI with the crate-graph, asset and licence
   guards and the release build.
-- Tests: 119 passing workspace-wide, 3 ignored (two require the live endpoints, one requires a GPU
-  adapter), zero failures (`cargo test --workspace`).
-- Live evidence: our own `cargo run -p oxide-launcher -- ping 127.0.0.1:25565` answers
-  `1.8.9 — protocol 47 — 0/20 players`; the vanilla client title screen is captured at
-  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`; the wgpu window is captured at
-  `refs/rig/evidence/m0-window.png`; the full fetch run is recorded under "M0 evidence" below.
+- M1 delivered and verified: the buffered framed connection with the compression handover; the 1.8.9
+  login and play packet codecs; the live capture with its findings document and chunk fixtures; the
+  `0x21`/`0x26` column decoder; the chunk store; the session with the five connection obligations;
+  the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
+  with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
+  overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
+- Tests: 253 passing workspace-wide, 5 ignored, zero failures (`cargo test --workspace`, 36 suites).
+  The ignored set is two live-endpoint metadata tests and three GPU tests; the GPU tests pass
+  locally with `-- --ignored`.
+- Live evidence: the M0 ping and captures stand; M1's acceptance run — the join, 180 seconds of
+  keep-alives, the mark and both screenshots, and the proxy capture of our client's own traffic — is
+  recorded under "M1 evidence" below, with the raw files under `refs/rig/evidence/m1/`.
 - CI: seven jobs — format/lint/test, MSRV 1.85.0, portability (`x86_64-pc-windows-gnu`), release
   build, crate graph, asset guard, licences and advisories. The M0 tagged head `fe2d3b6` is green in
-  run `35873490870` (six jobs; the release build was added after the tag). Caveats to carry forward:
+  run `35873490870` (six jobs; the release build was added after the tag). The M1 reviewed head
+  `854ca85` is green in run `36288859598` (all seven jobs). Caveats to carry forward:
   `aarch64-apple-darwin` is not checked on Linux runners because its C dependencies need the macOS
   SDK; the MSRV job installs the 1.85.0 toolchain per run; `cargo-deny` is pinned to 0.20.2 and
-  installed per run; the two guard scripts are only exercised on the happy path — a negative
-  self-test for each (a forbidden tracked file must fail the asset guard, an unlisted dependency
-  edge must fail the graph check) belongs in the next milestone.
-- Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding.
+  installed per run. The M0 caveat about the guard scripts being exercised only on the happy path is
+  closed: both guards carry `--self-test` modes since `854ca85`, and CI runs each one before its
+  normal check.
+- Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding; the
+  M1 per-task reviews and the final whole-branch review are in the milestone ledger
+  `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md`.
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
@@ -123,6 +134,76 @@ client exiting frames=900
   carry the full cause chain, and the clear colour's sRGB difference is recorded in
   `docs/DIVERGENCES.md` (entry 4).
 
+## M1 evidence
+
+Acceptance run: the client against the rig server, `./target/debug/oxide-client --server
+127.0.0.1:25565 --username OxideDev`, 2026-09-26 (evening, CDT; log timestamps are UTC), raw files
+under `refs/rig/evidence/m1/`:
+
+```
+[20:55:45] OxideDev[/127.0.0.1:58520] logged in with entity id 3757 at (20.5, 64.0, 174.5)   (server)
+2026-09-27T01:55:46.086719Z  INFO oxide_client: joined the world entity_id=3757 gamemode=0 dimension=0 …
+2026-09-27T01:55:48.058929Z DEBUG oxide_client: keepalive answered id=22184315                (client;
+2026-09-27T01:58:44.209128Z DEBUG oxide_client: keepalive answered id=22360615                 87 lines)
+```
+
+- Joined the world as entity 3757; **87 keep-alive echoes over 180 s** (~2.05 s apart) with no
+  server-side kick, then stopped deliberately (the server logs the stop as `Disconnected`, not a
+  fault).
+- The mark: `/fill 9 140 172 21 140 184 minecraft:wool 14` and `/fill 9 141 172 21 145 184
+  minecraft:stone` placed a 13×13 stone column over its red-wool base above y=128; `/tp OxideDev 31
+  150 194 135 20` teleported the client onto it (`Teleported OxideDev to 31.5, 150.0, 194.5`), and a
+  second teleport (`15 71 178 0 0`) returned it to the ground (15.5, 71.0, 178.5).
+- Screenshots (niri's own focused-output capture; see the Environment facts): `terrain-both-halves.png`
+  — the mark as a grey stone block over the red wool base, grass, dirt, water, sand and trees below,
+  the overlay legible with `x/y/z: 31.500 / 150.00000 / 194.500`, `Facing: north (135.0 / 20.0)`,
+  `Server: 127.0.0.1:25565 (protocol 47)` — and `terrain-ground.png` (overlay `x/y/z: 15.500 /
+  71.00000 / 178.500`). Both show geometry above and below y=128, with no magenta. The vanilla client
+  was teleported to the same two spots for eyeball comparison (`vanilla-on-mark.png`,
+  `vanilla-ground.png`).
+- Our client's own traffic (recorder proxy on 25565, server behind it on 25566, non-loopback upstream
+  so the server negotiates compression; `oxide-client-traffic.*`): the handshake
+  `0f 00 2f 09 "127.0.0.1" 63 dd 02` (protocol 47, next state 2); `0x03 Set Compression threshold=256`
+  **before** `0x02 Login Success`, the client's first compressed frame being #2; the brand payload
+  `07 76 61 6e 69 6c 6c 61` (`\x07vanilla`); Client Settings `en_US`, view distance 8; the position
+  echo; and **56/56 keep-alive echoes, none missing, none unmatched, median interval 2.0499 s**.
+- The capture's chunk findings: the rig's vanilla server **does emit `0x26`** — run A 9×`0x21` +
+  44×`0x26` (414 columns), run B 2×`0x21` + 42×`0x26` (416 columns); our client's own session
+  received 1×`0x21` + 43×`0x26` (431 distinct columns, zero size-formula mismatches). The findings
+  document is `docs/research/protocol-47-live-capture.md` and the committed fixtures are under
+  `crates/oxide-proto-v47/tests/fixtures/m1-capture/`.
+- Two defects the acceptance run uncovered, both fixed on `main` with covering tests: `8b14e4e`
+  (keep-alive starvation — the mesh rebuilds ran inside the read loop; they are now queued and
+  drained between reads) and `0187ae8` (palette coverage — 22 block ids the rig's world carries had
+  no palette entry).
+
+## Caveats
+
+Carried by M1 as delivered (each confirmed by the final whole-branch review):
+
+- **Set Compression arriving after Login Success is unhandled by construction.** The session switches
+  to the play state on Login Success, so a late `0x03` lands in the play wildcard and fails cleanly.
+  A heuristic cannot distinguish it from a play-state Time Update on a server that legitimately runs
+  with compression disabled; the capture and the rig fix the order as "before". A modded server that
+  reorders compression breaks with a clear error — M1's scope is the rig.
+- **An unload does not re-mesh neighbours**: a column that unloads can leave transient border holes
+  in a loaded neighbour's mesh until that neighbour next rebuilds.
+- **Meshing is single-threaded** and runs on the session thread between reads; applying a column
+  rebuilds that column plus its four neighbours.
+- **A server that never leaves a ≥20 ms idle gap starves the mesh queue** (unbounded growth): the
+  idle read waits at most one 20 ms tick and drains one batch per wait. Fine for the rig; recorded
+  for M2.
+- **The debug font is scaffolding** (Decision 7): a small embedded 5×7 bitmap table, one opaque quad
+  per set pixel; the jar's font (`ascii.png`) replaces it in M2.
+- **Water draws opaque**, like every block: M1 renders flat colours with no transparency or light.
+- **No live uncompressed-play capture exists on this rig**: run A's loopback premise was refuted (the
+  server negotiated compression over the proxy anyway). Uncompressed framing is covered by the login
+  phase, every sub-threshold frame and the synthetic self-test.
+- **The acceptance run's raw server-console output was not preserved**: the rig's log rotation keeps
+  only `latest.log` plus 2-line gz archives, so the acceptance note's console quotes are corroborated
+  by the client log, the screenshots and the capture, but they cannot be re-verified from the
+  artifacts (see the backlog: fix the rotation).
+
 ## Decisions locked
 
 See spec section 4 for the full table. The short version: multiplayer-first v1; Microsoft
@@ -132,20 +213,36 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-1. Continue milestone M1 in plan order: resume Task 2 (the live capture), then Tasks 3–13. Per task:
-   a fresh implementer works from the extracted brief, an independent reviewer checks the diff, fix
-   rounds close findings, and the ledger records a line per task.
-2. Keep `docs/STATE.md` and `CHANGELOG.md` current, and tag each milestone when it closes.
-3. Run the local gate before every push: `bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`,
-   `cargo test --workspace`, `cargo fmt --all --check`,
-   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`.
-4. Post-v1 programme (owner-directed 2026-09-23, spec section 17): singleplayer worlds and Java mod
-   compatibility (Forge 1.8.9 and `.jar` mods). Both start only after v1 completes and each needs its
-   own spec; neither affects the M1–M9 sequence.
+Milestone M2 (textured terrain, spec section 13, spec v5) starts from this ordered backlog — the
+final whole-branch review's deferred Minors, all riding into M2; none hides a defect:
+
+1. Cache the overlay uploads: `crates/oxide-render/src/overlay.rs` rebuilds its geometry (one quad
+   per set font pixel — about 2 000 for the acceptance overlay's nine lines, each drawn twice for the
+   shadow) and creates two fresh GPU buffers every frame, although the text changes about once a
+   second.
+2. Add a `0x26` bulk replay test through the session (M1 covers the case by fixture tests and by the
+   live run's 43 bulk packets).
+3. Make `client_settings_payload` total (`crates/oxide-proto-v47/src/serverbound.rs`; it panics on an
+   overlong locale today).
+4. Drop or justify the unused `oxide-world → oxide-proto` dependency
+   (`crates/oxide-world/Cargo.toml:14`).
+5. Add the missing `# Panics` note to `unpack_block` (`crates/oxide-proto-v47/src/column.rs`).
+6. Fix the spec §5.2 wording that says the graph is asserted "with `cargo tree`" where the guard uses
+   `cargo metadata` (and the M1 plan header still cites spec v3).
+7. Fix the rig's log rotation, which discards session logs (only `latest.log` plus 2-line gz archives
+   survive) — it lost the acceptance run's server console.
+
+Then, as always: keep `docs/STATE.md` and `CHANGELOG.md` current and tag each milestone when it
+closes; run the local gate before every push (`cargo test --workspace`, `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`,
+`bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`). The post-v1 programme (owner-directed
+2026-09-23, spec section 17: singleplayer worlds and Java mod compatibility) starts only after v1
+completes and does not affect the M2–M9 sequence.
 
 ## Resolved dependency versions
 
-Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M0:
+Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M1 (the M0 set, plus the two
+M1 additions):
 
 | Crate | Version | Notes |
 | --- | --- | --- |
@@ -160,12 +257,15 @@ Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M0:
 | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | env-filter |
 | `sha1` / `hex` | 0.10.7 / 0.4.3 | |
 | `tempfile` / `fs4` / `dirs` | 3.27.0 / 1.1.0 / 7.0.0 | |
+| `glam` | 0.32.1 | `oxide-render` (terrain vertices, the camera). Do not bump past 0.32 under `-D warnings`: `Mat4::perspective_rh`/`look_to_rh` are deprecated from 0.33.1 (migrating to `glam::camera` is mechanical but a deliberate change) |
+| `crossbeam-channel` | 0.5.17 | `oxide-game` and `oxide-client`, the session-to-window event channel |
 
 ## Environment facts (development machine)
 
 | Fact | Value |
 | --- | --- |
-| OS / desktop | CachyOS, kernel 7.2.2, Wayland with GNOME (mutter). XWayland is provided by mutter's `Xwayland :1`, so the 1.8.9 rig client (LWJGL 2) runs without extra setup. Earlier notes say niri; the desktop was switched to GNOME on 2026-09-22 |
+| OS / desktop | CachyOS, kernel 7.2.6, Wayland with **niri 26.04** on **two outputs**; `xwayland-satellite` on DISPLAY=:1, so the 1.8.9 rig client (LWJGL 2) runs without extra setup. The M1 acceptance run used niri; earlier notes claiming GNOME/mutter are wrong for this machine |
+| Screenshots | The portal route fails here — `xdg-desktop-portal-gnome` → `org.gnome.Shell.Screenshot` → niri asserts a single output against the two this session has. The working substitute: focus the target window, then `niri msg action screenshot-screen --write-to-disk true --show-pointer false --path <file>`; it captures the focused 1920×1080 output. `computer_use` cannot enumerate windows unless `CUA_DRIVER_RS_ENABLE_WAYLAND=1` is set (it is not, and no keyboard input is injectable) |
 | Rust | rustc 1.95.0, cargo 1.95.0 |
 | Dependency pin | `wgpu 26.0.1` is the newest release whose declared rust-version (1.84) fits the workspace's 1.85 floor (wgpu 27.0.0 declares 1.88, 28.0.0 declares 1.92, 29 and 30 declare 1.87), so cargo's resolver picked it; the pin is not a hand-downgrade. `winit 0.30.13` declares 1.70 (crates.io index metadata, 2026-09-23) |
 | Vulkan | instance 1.4.357; Intel Iris Xe (card2) and NVIDIA T500 (card1) |
@@ -174,7 +274,7 @@ Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M0:
 | git push | uses gh as the credential helper for github.com (`gh auth setup-git` has been run; plain `git push` works now) |
 | Minecraft installs | none on this machine; assets are downloaded into the Oxidecraft store |
 | sudo | password required, and only usable as the leading command of a foreground call |
-| Verification rig | `refs/rig/` — Temurin JRE 8, vanilla 1.8.9 server listening on 25565 (offline mode, seed `oxidecraft`), Prism instance `OxideRef-1.8.9` with an offline account; `refs/rig/README.md` documents start/stop and screenshots |
+| Verification rig | `refs/rig/` — Temurin JRE 8, vanilla 1.8.9 server listening on 25565 (offline mode, seed `oxidecraft`, view-distance 10, compression threshold 256; capture runs move it to 25566 behind the recorder proxy on 25565), Prism instance `OxideRef-1.8.9` with an offline account. The proxy's upstream uses the machine's LAN address (10.0.0.84 on wlan0 at the acceptance run — DHCP, re-check before use). `refs/rig/README.md` documents start/stop; its screenshots section still describes the portal route — use the Screenshots row above instead |
 
 ## Local-only directories
 
