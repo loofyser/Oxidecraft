@@ -11,7 +11,10 @@ publish = false
 workspace = true
 
 [dependencies]
+crossbeam-channel = "0.5"
+oxide-proto.workspace = true
 oxide-proto-v47.workspace = true
 oxide-render.workspace = true
 oxide-world.workspace = true
 thiserror.workspace = true
+tracing.workspace = true

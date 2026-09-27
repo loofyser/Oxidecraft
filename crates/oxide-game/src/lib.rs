@@ -2,3 +2,4 @@
 
 pub mod mesher;
 pub mod palette;
+pub mod session;
