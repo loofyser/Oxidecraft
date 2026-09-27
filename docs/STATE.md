@@ -24,8 +24,15 @@ specification and continue without asking questions that are already answered he
   vanilla sky and block rules, the two-way recomputation, the query the mesher uses and the
   `Section`/`Chunk` light setters — with one fix round that closed the review's coverage gaps (the
   border read, the opaque-emitter clause, the sparse-column pin and three more tests) and carried
-  the settled light rules into the spec, the protocol report and the plan text. Next is Task 8,
-  the mesh core.
+  the settled light rules into the spec, the protocol report and the plan text. Task 8
+  (`b2fa9a8..0be1d8f`) replaced the palette mesher with the model-driven mesh core — `oxide-game`'s
+  `mesher.rs` with the column snapshot, the model join with the position-based variant choice, quads
+  carrying atlas UVs, cullface and per-vertex light and colour, the ambient-occlusion path in full
+  (the quad-bounds base cell, both combination branches and the per-vertex colour multiplier) and the
+  magenta fallback — with one fix round that closed the review's Critical and four Important findings
+  (the AO colour multiplier, the translucent predicate, the quad-bounds branches, the literal tint
+  pins and the store-test mapper) and one wording round, and it corrected the plan's colour rule.
+  Next is Task 9, the translucent layer and the liquids.
   Every task's brief, report, review and every ruling live in the plan's ledger
   `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`. M1 is complete and tagged `m1` (the
   annotated tag marks the close-out commit `930ccab`; the reviewed code head is `854ca85` and its
@@ -42,7 +49,7 @@ specification and continue without asking questions that are already answered he
   the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
   with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
   overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
-- Tests: 360 passing workspace-wide, 9 ignored, zero failures (`cargo test --workspace`, 44 suites).
+- Tests: 373 passing workspace-wide, 9 ignored, zero failures (`cargo test --workspace`, 44 suites).
   The ignored set is two live-endpoint metadata tests, three GPU tests (they pass locally with
   `-- --ignored`) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
   store when `OXIDECRAFT_STORE` points at it (`~/.local/share/oxidecraft`).
@@ -229,13 +236,14 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M2 (textured terrain) is the live milestone; its plan is
-`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–7 are closed and reviewed (head `4bb0584`).
+`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–8 are closed and reviewed (head `0be1d8f`).
 The M1 backlog that previously stood here rode into the plan: items 2–6 closed in Task 1, item 1 (the
 overlay's cached uploads) is Task 14's, and item 7 (the rig's log rotation) is Task 15's. The next
-work is **Task 8, the mesh core** — snapshots, model quads and per-vertex light in `oxide-game` —
-then Tasks 9–16 in plan order. Parked for the milestone's
+work is **Task 9, the translucent layer and the liquids** — the three mesh layers, the liquid
+geometry and the leaves rule in `oxide-game` — then Tasks 10–16 in plan order. Parked for the
+milestone's
 final review: the seven deferred Minors from Task 2, the eight from Task 3, Task 4's remaining
-wording nits and Task 7's one carried Minor (the block-kind border read), each listed in the plan's ledger. The milestone's acceptance (Task 15) runs the rig
+wording nits and Task 7's one carried Minor (the block-kind border read), each listed in the plan's ledger; Task 8 carried none (its two wording corrections landed in `0be1d8f` and its two coverage notes — the north/south/east orientation arrays and `Material::Web` — sit in `task-8-report.md`). The milestone's acceptance (Task 15) runs the rig
 under `refs/rig/` against the store at `~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
 
 Then, as always: keep `docs/STATE.md` and `CHANGELOG.md` current and tag each milestone when it
