@@ -191,7 +191,12 @@ fn the_pinned_variant_keys_match_the_source() {
         (52, 0, ""),
         (46, 1, "explode=true"),
         (83, 1, "age=1"),
+        // The pressure plate reads as pressed only at metadata 1
+        // (BlockPressurePlate.getStateFromMeta); 0 and the odd values above 1
+        // are unpressed.
+        (72, 0, "powered=false"),
         (72, 1, "powered=true"),
+        (72, 3, "powered=false"),
         (2, 8, "snowy=false"),
         (110, 15, "snowy=false"),
     ];
@@ -263,6 +268,10 @@ fn the_light_and_visual_columns_hold_their_source_values() {
     assert_eq!(block(43).light_opacity, 255);
     assert_eq!(block(53).light_opacity, 255);
     assert!(!block(53).full_cube);
+    // The mob spawner is non-opaque but still a full cube: the source overrides
+    // only isOpaqueCube (BlockMobSpawner.java:57-60), and isFullCube is the
+    // default it keeps (Block.java:366-369).
+    assert!(block(52).full_cube);
     // Ice is translucent with the registration's opacity 3.
     assert_eq!(block(79).light_opacity, 3);
     assert_eq!(block(79).render_layer, RenderLayer::Translucent);
@@ -275,6 +284,15 @@ fn the_light_and_visual_columns_hold_their_source_values() {
     assert_eq!(block(73).light_emission, 0);
     // The grass block's tinted faces are the top and the side overlay.
     assert_eq!(block(2).tint, TintKind::GrassSideOverlay);
+    // The grass block renders in the cutout-mipped queue: the side overlay is an
+    // alpha-cutout texture (BlockGrass.getBlockLayer returns CUTOUT_MIPPED for
+    // every state; only the leaves' layer follows the graphics level).
+    assert_eq!(block(2).render_layer, RenderLayer::CutoutMipped);
+    // The double plant's tinted quads are the grass colour: its grass and fern
+    // variants are the two the source tints (BlockDoublePlant.colorMultiplier)
+    // and their models inherit block/tallgrass's tint index; the flowering
+    // variants' models carry none, so this kind reaches no quad of theirs.
+    assert_eq!(block(175).tint, TintKind::Grass);
     // The cross-quad plants carry the cross render kind.
     for id in [31, 32, 37, 38, 39, 40, 59, 83, 141, 142, 175] {
         assert_eq!(

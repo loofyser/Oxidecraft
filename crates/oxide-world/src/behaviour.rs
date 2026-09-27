@@ -187,9 +187,10 @@ pub const NOT_IN_METADATA: u8 = u8::MAX;
 ///
 /// The three kinds are the 1.8 layout: a property takes the metadata bits from
 /// `offset`, and the bits below it belong to the properties a state declares
-/// before it. The read itself mirrors the source's own lookups: an index past
-/// the last listed value falls back to the first one, the same choice
-/// `byMetadata` makes for out-of-range metadata.
+/// before it. The read mirrors the source's own lookups for the metadata those
+/// lookups can build; an index past the last listed value falls back to the
+/// first *listed* value — this project's own documented choice for the values
+/// the source's filtered lookups cannot build (see [`variant_key`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyKind {
     /// A flag: `true` when bit `offset` is set. At [`NOT_IN_METADATA`] it is
@@ -295,8 +296,11 @@ pub fn behaviour(id: u16) -> Option<&'static BlockBehaviour> {
 /// The values are the ones the source's `getStateFromMeta` produces for the
 /// metadata. A metadata value outside a property's own value space — a log2
 /// variant index that names no wood, a mushroom variant the lookup leaves
-/// unset — takes the property's first value, the fallback the source's own
-/// `byMetadata` lookups use; no loaded world carries such a value.
+/// unset — takes the property's first listed value. Where the list was filtered
+/// down from a wider source enum (the log2 and leaves2 variants), that fallback
+/// is this project's own documented choice for a state the source cannot build:
+/// the source's lookup would return the whole enum's first value, which the
+/// filtered property does not allow. No loaded world carries such a value.
 pub fn variant_key(block: &BlockBehaviour, meta: u8) -> String {
     let mut properties: Vec<&PropertyDef> = block.properties.iter().collect();
     properties.sort_by_key(|property| property.name);
@@ -546,6 +550,15 @@ const DOOR_FACINGS: [&str; 16] = [
 /// The stairs' facings per metadata value: `getFront(5 - (meta & 3))`.
 const STAIR_FACINGS: [&str; 4] = ["east", "west", "south", "north"];
 
+/// The wooden pressure plate's `powered` answer for each metadata value: the
+/// source reads the flag as `meta == 1` (`BlockPressurePlate.getStateFromMeta`,
+/// BlockPressurePlate.java:73-76), so only metadata 1 is pressed and every
+/// other value — including the odd values above 1 — is unpressed.
+const PRESSURE_PLATE_POWERED: [&str; 16] = [
+    "false", "true", "false", "false", "false", "false", "false", "false", "false", "false",
+    "false", "false", "false", "false", "false", "false",
+];
+
 /// `BlockStairs.EnumShape`'s names; the meta-derived state always holds the
 /// first one, because the shape is world-contextual.
 const STAIR_SHAPES: [&str; 5] = [
@@ -642,6 +655,8 @@ const TABLE: &[BlockBehaviour] = &[
     },
     // BlockGrass: SNOWY (BlockGrass.java:21); the metadata packs the flag away
     // (getMetaFromState returns 0), so the meta-derived state is never snowy.
+    // Its layer is the cutout-mipped queue for every state (getBlockLayer,
+    // BlockGrass.java:157-160): the side overlay is an alpha-cutout texture.
     BlockBehaviour {
         id: 2,
         name: "grass",
@@ -651,7 +666,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_emission: 0,
         full_cube: true,
         material: Material::Grass,
-        render_layer: RenderLayer::Solid,
+        render_layer: RenderLayer::CutoutMipped,
         tint: TintKind::GrassSideOverlay,
         liquid: None,
         render: RenderKind::Model,
@@ -1287,8 +1302,10 @@ const TABLE: &[BlockBehaviour] = &[
         liquid: None,
         render: RenderKind::Model,
     },
-    // BlockMobSpawner: no properties, non-opaque, cutout, and the client
-    // registers no light emission for it.
+    // BlockMobSpawner: no properties, non-opaque (BlockMobSpawner.java:57-60
+    // overrides only isOpaqueCube), still a full cube — the default it keeps
+    // (Block.java:366-369) — cutout, and the client registers no light
+    // emission for it.
     BlockBehaviour {
         id: 52,
         name: "mob_spawner",
@@ -1296,7 +1313,7 @@ const TABLE: &[BlockBehaviour] = &[
         light_opacity: 0,
         light_filter: 0,
         light_emission: 0,
-        full_cube: false,
+        full_cube: true,
         material: Material::Rock,
         render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
@@ -1616,13 +1633,19 @@ const TABLE: &[BlockBehaviour] = &[
         render: RenderKind::Model,
     },
     // BlockPressurePlate with Material.wood: POWERED (BlockPressurePlate.java:17,
-    // 73-89), the pressure plate geometry non-opaque.
+    // 73-89), the pressure plate geometry non-opaque; only metadata 1 reads as
+    // pressed (getStateFromMeta, BlockPressurePlate.java:73-76), so the value
+    // list is the source's own per-metadata answer.
     BlockBehaviour {
         id: 72,
         name: "wooden_pressure_plate",
         properties: &[PropertyDef {
             name: "powered",
-            kind: PropertyKind::Bool { offset: 0 },
+            kind: PropertyKind::Enum {
+                offset: 0,
+                bits: 4,
+                values: &PRESSURE_PLATE_POWERED,
+            },
         }],
         light_opacity: 0,
         light_filter: 0,
@@ -2071,8 +2094,12 @@ const TABLE: &[BlockBehaviour] = &[
         render: RenderKind::Model,
     },
     // BlockDoublePlant: HALF + VARIANT + FACING (BlockDoublePlant.java:28-39,
-    // 281-316), Material.vine; the plant models carry no tint index, so the
-    // block is untinted however its colour function answers.
+    // 281-316), Material.vine. The source tints the grass and fern variants with
+    // the grass colour and leaves the rest white (colorMultiplier,
+    // BlockDoublePlant.java:149-153); those two variants' double_grass and
+    // double_fern models inherit block/tallgrass's tint index, while the
+    // flowering variants' models are block/cross, which carries none, so this
+    // value reaches no quad of theirs.
     BlockBehaviour {
         id: 175,
         name: "double_plant",
@@ -2108,7 +2135,7 @@ const TABLE: &[BlockBehaviour] = &[
         full_cube: false,
         material: Material::Vine,
         render_layer: RenderLayer::Cutout,
-        tint: TintKind::None,
+        tint: TintKind::Grass,
         liquid: None,
         render: RenderKind::Cross,
     },
@@ -2179,7 +2206,9 @@ mod tests {
     #[test]
     fn an_out_of_range_index_falls_back_to_the_first_value() {
         // log2's variant index covers two woods; the other two indices name no
-        // wood, and the source's own lookup falls back to the first value.
+        // wood, and the table falls back to the first of its listed woods —
+        // this project's own choice for a state the source cannot build (its
+        // lookup would name a wood the filtered property does not allow).
         let log2 = behaviour(162).expect("log2");
         assert_eq!(variant_key(log2, 2), "axis=y,variant=acacia");
         assert_eq!(variant_key(log2, 3), "axis=y,variant=acacia");
