@@ -1575,6 +1575,7 @@ name = "oxide-game"
 version = "0.0.0"
 dependencies = [
  "crossbeam-channel",
+ "oxide-assets",
  "oxide-proto",
  "oxide-proto-v47",
  "oxide-render",

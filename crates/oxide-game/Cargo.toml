@@ -18,3 +18,6 @@ oxide-render.workspace = true
 oxide-world.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+oxide-assets.workspace = true
