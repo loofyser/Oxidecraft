@@ -9,37 +9,29 @@
 //! supplies the texture. The vertex stage hands the uv, the colour and the light pair (as two
 //! floats) to the fragment stage; the light is what the M2 light ramp will read next.
 //!
-//! The three layers differ only where this task pins them apart. Opaque draws solid geometry
-//! with the depth test and no blending, culling back faces. Cutout is the same with the
-//! client's alpha test: a fragment whose alpha is below [`CUTOUT_ALPHA`] is discarded
-//! (`GlStateManager.alphaFunc(516, 0.1F)`, `Minecraft.java:542`, set for the block layers at
-//! `EntityRenderer.java:1393`), which punches leaves-like holes through the texture.
-//! Translucent blends `src_alpha / one_minus_src_alpha` over what is already in the target
-//! (`EntityRenderer.java:1459`), drawing last and culling nothing.
-//!
-//! All three layers test and write depth. Writing depth for the translucent layer is this
-//! task's pinned choice (all three pipelines share one depth state), where the client switches
-//! depth writes off for its translucent block layer (`GlStateManager.depthMask(false)`,
-//! `EntityRenderer.java:1463`); with our per-section back-to-front order the farthest blended
-//! surface lands first and each nearer one passes the test and blends over it, so the picture
-//! matches while the depth buffer stays valid for the passes that follow the terrain.
-//!
-//! Culling the back faces of the translucent layer is likewise this task's pin — the client
-//! renders that layer with culling enabled (`GlStateManager.enableCull()`,
-//! `EntityRenderer.java:1458`, before the layer draws at `:1467`) and culls faces in the mesh
-//! build instead — and it can only draw geometry the mesher emitted on purpose, never hide a
-//! face: a glass or water face seen from either side draws.
-//!
-//! The winding is load-bearing. The mesher emits every face counter-clockwise seen from
-//! outside the block, so the opaque and cutout layers declare counter-clockwise front faces
-//! and cull back faces: a face wound the other way, or a pipeline that culls the wrong side,
-//! disappears, and the headless pipeline test's read-back fails on it. The same test fails if
-//! the depth test, the depth write or the depth attachment stops working.
+//! The three layers differ only where the client's own block-layer state differs. Opaque
+//! draws solid geometry: no blending, back faces culled, the depth test and write on. Cutout
+//! is the same with the client's alpha test — a fragment whose alpha is below
+//! [`CUTOUT_ALPHA`] is discarded (`GlStateManager.alphaFunc(516, 0.1F)`, `Minecraft.java:542`,
+//! set for the block layers at `EntityRenderer.java:1393`) — which punches leaves-like holes
+//! through the texture. Translucent carries the client's state as it stands at the translucent
+//! draw (`EntityRenderer.java:1467`): the same alpha test (`:1460`), blending
+//! `src_alpha / one_minus_src_alpha` with the separate alpha pair `(1, 0)` (`:1459`), back
+//! faces culled (`GlStateManager.enableCull()`, `:1458`) and depth writes off
+//! (`GlStateManager.depthMask(false)`, `:1463`, restored at `:1469`). It draws last.
 //!
 //! Depth: the camera's projection maps the near plane to 0 and the far plane to 1, which is
-//! the convention [`DEPTH_FORMAT`] with [`wgpu::CompareFunction::Less`] expects. All three
-//! pipelines test and write depth, so the nearest surface wins whatever order the meshes draw
-//! in.
+//! the convention [`DEPTH_FORMAT`] with [`wgpu::CompareFunction::Less`] expects. Opaque and
+//! cutout test and write depth, so the nearest surface wins whatever order their meshes draw
+//! in. Translucent tests depth and, like the client, writes none: a translucent fragment never
+//! rejects a later one, so the per-section back-to-front order below decides which surface
+//! blends over which, and every face the client would blend reaches the target.
+//!
+//! The winding is load-bearing. The mesher emits every face counter-clockwise seen from
+//! outside the block, so every layer declares counter-clockwise front faces and culls back
+//! faces: a face wound the other way, or a pipeline that culls the wrong side,
+//! disappears, and the headless pipeline test's read-back fails on it. The same test fails if
+//! the depth test, the depth write or the depth attachment stops working.
 //!
 //! Draw order: the frame is culled per section — a section whose box lies fully outside the
 //! frame's frustum is skipped before its draw — and the translucent layer draws last, sorted
@@ -68,10 +60,10 @@ use oxide_assets::atlas::Atlas;
 /// The mesh's colours are already lit — the mesher multiplies the atlas entry by the face's
 /// brightness and the biome tint and packs the light with the vertex — so the fragment stage's
 /// work is the sample and the multiply. The two fragment entries are the layer difference:
-/// [`FRAGMENT_MAIN`] hands the colour on, [`FRAGMENT_CUTOUT`] discards a fragment the atlas
-/// made (nearly) transparent.
+/// [`FRAGMENT_MAIN`] hands the colour on, and [`FRAGMENT_CUTOUT`] — which the cutout and
+/// translucent layers both run — discards a fragment the atlas made (nearly) transparent.
 ///
-/// The cutout threshold is written from [`CUTOUT_ALPHA`], so the shader's literal and the
+/// The discard threshold is written from [`CUTOUT_ALPHA`], so the shader's literal and the
 /// constant the tests pin cannot disagree.
 fn shader_source() -> String {
     format!(
@@ -84,8 +76,8 @@ struct Camera {{
 @group(1) @binding(0) var atlas: texture_2d<f32>;
 @group(1) @binding(1) var atlas_sampler: sampler;
 
-// The alpha below which the cutout layer discards a fragment: the client's own tenth
-// (`GlStateManager.alphaFunc(516, 0.1F)` in `Minecraft.java`).
+// The alpha below which every layer with the client's alpha test discards a fragment: the
+// client's own tenth (`GlStateManager.alphaFunc(516, 0.1F)` in `Minecraft.java`).
 const CUTOUT_ALPHA: f32 = {CUTOUT_ALPHA};
 
 struct VertexInput {{
@@ -132,15 +124,16 @@ fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {{
 /// The vertex entry point every layer's pipeline uses.
 const VS_ENTRY: &str = "vs_main";
 
-/// The fragment entry point of the opaque and translucent layers: the sample times the colour.
+/// The fragment entry point of the opaque layer: the sample times the colour.
 const FRAGMENT_MAIN: &str = "fs_main";
 
-/// The fragment entry point of the cutout layer: like [`FRAGMENT_MAIN`], discarding below
-/// [`CUTOUT_ALPHA`].
+/// The fragment entry point of the cutout and translucent layers: like [`FRAGMENT_MAIN`],
+/// discarding below [`CUTOUT_ALPHA`].
 const FRAGMENT_CUTOUT: &str = "fs_cutout";
 
-/// The alpha below which the cutout layer discards a fragment: the client's own 0.1
-/// (`Minecraft.java:542`, `EntityRenderer.java:1393`).
+/// The alpha below which a layer with the client's alpha test discards a fragment: the
+/// client's own 0.1 (`Minecraft.java:542`, set for the block layers at
+/// `EntityRenderer.java:1393` and in force at the translucent draw, `:1460`).
 const CUTOUT_ALPHA: f32 = 0.1;
 
 /// The depth format the pipeline tests and writes against.
@@ -165,16 +158,19 @@ static ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
 /// One layer's pipeline choices.
 ///
 /// Kept apart from the pipeline itself so the per-layer differences — the fragment entry, the
-/// blend state and the cull mode — are pure values the unit tests pin without a device; the
-/// vertex layout and the depth state are shared by all three layers and take no part here.
+/// blend state, the cull mode and the depth write — are pure values the unit tests pin without
+/// a device; the vertex layout and the depth test are shared by all three layers and take no
+/// part here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LayerPlan {
     /// The fragment entry point the layer's pipeline runs.
     fragment: &'static str,
     /// The colour blend state; `None` writes the fragment's colour as it is.
     blend: Option<wgpu::BlendState>,
-    /// The faces to cull: back faces for the opaque layers, none for the translucent one.
+    /// The faces to cull: back faces for every layer.
     cull: Option<wgpu::Face>,
+    /// Whether the layer writes the depth buffer; the translucent layer does not.
+    depth_write: bool,
 }
 
 /// The plan for one layer.
@@ -184,37 +180,44 @@ fn layer_plan(layer: Layer) -> LayerPlan {
             fragment: FRAGMENT_MAIN,
             blend: None,
             cull: Some(wgpu::Face::Back),
+            depth_write: true,
         },
         Layer::Cutout => LayerPlan {
             fragment: FRAGMENT_CUTOUT,
             blend: None,
             cull: Some(wgpu::Face::Back),
+            depth_write: true,
         },
         Layer::Translucent => LayerPlan {
-            fragment: FRAGMENT_MAIN,
+            fragment: FRAGMENT_CUTOUT,
             blend: Some(translucent_blend()),
-            cull: None,
+            cull: Some(wgpu::Face::Back),
+            depth_write: false,
         },
     }
 }
 
-/// The translucent layer's blend: `src_alpha` over `one_minus_src_alpha`, added.
+/// The translucent layer's blend: `src_alpha` over `one_minus_src_alpha`, with the target's
+/// alpha left as it stands.
 ///
-/// The colour component is the client's own pair for the translucent block layer
-/// (`EntityRenderer.java:1459`, `GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0)` —
-/// `GL_SRC_ALPHA` and `GL_ONE_MINUS_SRC_ALPHA` — set just before the layer draws at
-/// `EntityRenderer.java:1467`). The alpha component is the same pair, as this task pins; the
-/// client's separate alpha pair is `(1, 0)`, which only differs in the target's own alpha
-/// byte, and every read-back in this milestone is compared on colour.
+/// Both components are the client's own for the translucent block layer
+/// (`EntityRenderer.java:1459`, `GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0)`, in
+/// force when the layer draws at `EntityRenderer.java:1467`): the colour pair is
+/// `GL_SRC_ALPHA` / `GL_ONE_MINUS_SRC_ALPHA`, and the separate alpha pair `(1, 0)`
+/// multiplies the destination's alpha byte by zero, so it keeps its value where the colour
+/// pair would have scaled it.
 fn translucent_blend() -> wgpu::BlendState {
-    let component = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::SrcAlpha,
-        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-        operation: wgpu::BlendOperation::Add,
-    };
     wgpu::BlendState {
-        color: component,
-        alpha: component,
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
     }
 }
 
@@ -287,10 +290,10 @@ impl TerrainPass {
     ///
     /// The vertex layout is the byte stream [`vertex_bytes`] produces: a `Float32x3` position
     /// at offset 0, a `Float32x2` uv at 12, a `Uint16x2` light pair at 20 and a `Unorm8x4`
-    /// colour at 24, with a stride of [`VERTEX_BYTES`]. Every layer culls back faces except
-    /// the translucent one and every layer tests and writes the depth buffer in
-    /// [`DEPTH_FORMAT`], so a pass that draws with them needs a depth attachment of that
-    /// format and a colour attachment in `format`. Group 0 is the camera uniform; group 1 is
+    /// colour at 24, with a stride of [`VERTEX_BYTES`]. Every layer culls back faces and
+    /// tests the depth buffer in [`DEPTH_FORMAT`]; the translucent layer's depth writes are
+    /// off, so a pass that draws with them needs a depth attachment of that format and a
+    /// colour attachment in `format`. Group 0 is the camera uniform; group 1 is
     /// the atlas, whose layout this builds once for the pipelines and for
     /// [`TerrainPass::set_atlas`]'s bind groups.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -343,7 +346,7 @@ impl TerrainPass {
                     buffers: &[vertex_layout()],
                 },
                 primitive: primitive_state(plan.cull),
-                depth_stencil: Some(depth_state()),
+                depth_stencil: Some(depth_state(plan.depth_write)),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -538,8 +541,8 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 ///
 /// A face is front-facing exactly when the camera sees its outside, because the mesher winds
 /// every face counter-clockwise seen from outside; culling back faces then drops the faces
-/// the camera cannot see, and the translucent layer culls nothing so both sides of a glass or
-/// water surface draw.
+/// the camera cannot see. Every layer culls, as the client's cull state is enabled at all
+/// three of its block-layer draws.
 fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
     wgpu::PrimitiveState {
         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -549,11 +552,16 @@ fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
     }
 }
 
-/// The depth state: test and write depth, a nearer fragment winning.
-fn depth_state() -> wgpu::DepthStencilState {
+/// The depth state every layer shares, with the write on or off.
+///
+/// The format and the comparison are the same for all three layers — the projection maps the
+/// near plane to 0 and the far plane to 1, as [`wgpu::CompareFunction::Less`] expects, and a
+/// nearer fragment wins — and `write` is the client's depth mask: on for its solid layers,
+/// off for the translucent one (`GlStateManager.depthMask(false)`, `EntityRenderer.java:1463`).
+fn depth_state(write: bool) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
-        depth_write_enabled: true,
+        depth_write_enabled: write,
         depth_compare: wgpu::CompareFunction::Less,
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
@@ -633,33 +641,46 @@ mod tests {
     }
 
     #[test]
-    fn the_depth_state_tests_and_writes_the_depth_buffer() {
-        let depth = depth_state();
+    fn the_depth_state_tests_every_layer_and_only_the_solid_layers_write() {
         assert_eq!(DEPTH_FORMAT, TextureFormat::Depth32Float);
-        assert_eq!(depth.format, DEPTH_FORMAT);
-        assert!(depth.depth_write_enabled, "the terrain writes depth");
-        assert_eq!(depth.depth_compare, CompareFunction::Less, "nearer wins");
+        let solid = depth_state(layer_plan(Layer::Opaque).depth_write);
+        assert_eq!(solid.format, DEPTH_FORMAT);
+        assert!(solid.depth_write_enabled, "the terrain writes depth");
+        assert_eq!(solid.depth_compare, CompareFunction::Less, "nearer wins");
+        let cutout = depth_state(layer_plan(Layer::Cutout).depth_write);
+        assert_eq!(cutout.format, solid.format);
+        assert!(
+            cutout.depth_write_enabled,
+            "the cutout layer writes depth too"
+        );
+        assert_eq!(cutout.depth_compare, solid.depth_compare);
+        // The translucent layer's own state: the same format and test, the client's depth
+        // mask off.
+        let translucent = depth_state(layer_plan(Layer::Translucent).depth_write);
+        assert_eq!(translucent.format, DEPTH_FORMAT);
+        assert_eq!(translucent.depth_compare, CompareFunction::Less);
+        assert!(
+            !translucent.depth_write_enabled,
+            "the translucent layer writes no depth"
+        );
     }
 
     #[test]
-    fn the_opaque_and_cutout_layers_cull_the_back_faces_and_show_two_sided() {
-        let opaque = primitive_state(layer_plan(Layer::Opaque).cull);
-        let cutout = primitive_state(layer_plan(Layer::Cutout).cull);
-        let translucent = primitive_state(layer_plan(Layer::Translucent).cull);
-        for (primitive, what) in [
-            (opaque, "the opaque layer"),
-            (cutout, "the cutout layer"),
-            (translucent, "the translucent layer"),
+    fn every_layer_culls_the_back_faces() {
+        for (layer, what) in [
+            (Layer::Opaque, "the opaque layer"),
+            (Layer::Cutout, "the cutout layer"),
+            (Layer::Translucent, "the translucent layer"),
         ] {
+            let primitive = primitive_state(layer_plan(layer).cull);
             assert_eq!(primitive.topology, PrimitiveTopology::TriangleList);
             assert_eq!(primitive.front_face, FrontFace::Ccw, "{what}");
+            assert_eq!(
+                primitive.cull_mode,
+                Some(Face::Back),
+                "{what} culls its back faces"
+            );
         }
-        assert_eq!(opaque.cull_mode, Some(Face::Back), "the opaque layer");
-        assert_eq!(cutout.cull_mode, Some(Face::Back), "the cutout layer");
-        assert_eq!(
-            translucent.cull_mode, None,
-            "the translucent layer draws both sides of a surface"
-        );
     }
 
     #[test]
@@ -680,20 +701,20 @@ mod tests {
         assert_eq!(blend.color.src_factor, BlendFactor::SrcAlpha);
         assert_eq!(blend.color.dst_factor, BlendFactor::OneMinusSrcAlpha);
         assert_eq!(blend.color.operation, BlendOperation::Add);
-        assert_eq!(
-            blend.alpha, blend.color,
-            "both components are the same pair"
-        );
+        // The separate alpha pair `(1, 0)`: the destination's alpha keeps its value.
+        assert_eq!(blend.alpha.src_factor, BlendFactor::One);
+        assert_eq!(blend.alpha.dst_factor, BlendFactor::Zero);
+        assert_eq!(blend.alpha.operation, BlendOperation::Add);
         assert_eq!(target.write_mask, ColorWrites::ALL);
     }
 
     #[test]
-    fn the_cutout_layer_runs_the_discarding_fragment_entry() {
+    fn the_cutout_and_translucent_layers_run_the_discarding_fragment_entry() {
         assert_eq!(layer_plan(Layer::Opaque).fragment, FRAGMENT_MAIN);
-        assert_eq!(layer_plan(Layer::Translucent).fragment, FRAGMENT_MAIN);
         assert_eq!(layer_plan(Layer::Cutout).fragment, FRAGMENT_CUTOUT);
-        // The entries the pipelines name are the entries the shader declares, and the cutout
-        // one discards at the client's own threshold.
+        assert_eq!(layer_plan(Layer::Translucent).fragment, FRAGMENT_CUTOUT);
+        // The entries the pipelines name are the entries the shader declares, and the
+        // discarding one discards at the client's own threshold.
         let shader = shader_source();
         for entry in [VS_ENTRY, FRAGMENT_MAIN, FRAGMENT_CUTOUT] {
             assert!(
@@ -701,7 +722,7 @@ mod tests {
                 "the shader declares {entry}"
             );
         }
-        assert!(shader.contains("discard"), "the cutout entry discards");
+        assert!(shader.contains("discard"), "the discarding entry discards");
         assert!(
             shader.contains(&format!("const CUTOUT_ALPHA: f32 = {CUTOUT_ALPHA};")),
             "the shader's own threshold is the client's tenth"

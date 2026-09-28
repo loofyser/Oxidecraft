@@ -28,12 +28,15 @@
 //! and checks the glyph pixels and the one-pixel shadow offset against the layout
 //! `debug_text` produces.
 //!
-//! The four atlas tests come next: the texels of a four-colour atlas are read back
-//! byte-identical (the reference check for the non-sRGB colour-space decision: a stored byte
-//! must arrive as the same byte), a magnified sample picks the nearer of two texels, the
-//! translucent layer blends its 50%-alpha fragment over the opaque layer's colour exactly as
-//! `src_alpha / one_minus_src_alpha` says, and a cutout fragment whose texel alpha is zero is
-//! discarded so the surface behind it shows through.
+//! The atlas tests come next: the texels of a four-colour atlas are read back byte-identical
+//! (the reference check for the non-sRGB colour-space decision: a stored byte must arrive as
+//! the same byte), a magnified sample picks the nearer of two texels, the translucent layer
+//! blends its 50%-alpha fragment over the opaque layer's colour exactly as
+//! `src_alpha / one_minus_src_alpha` says, a cutout fragment whose texel alpha is zero is
+//! discarded so the surface behind it shows through, a translucent fragment whose alpha sits
+//! below the client's tenth is discarded the same way, and an atlas with three mip levels is
+//! read back at its first and last level, so the level-by-level uploader is pinned beyond
+//! level 0.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -85,6 +88,18 @@ const CUTOUT_TEXELS: [[u8; 4]; 4] = [
     [0, 0, 255, 255],
     [255, 255, 255, 255],
 ];
+/// The atlas the translucent-discard test uses: a red texel whose alpha, 24/255, sits below
+/// the client's 0.1 threshold, an opaque green one, and two more that only fill the image
+/// out.
+const TRANSLUCENT_TEXELS: [[u8; 4]; 4] = [
+    [255, 0, 0, 24],
+    [0, 255, 0, 255],
+    [0, 0, 255, 255],
+    [255, 255, 255, 255],
+];
+/// The three levels of the multi-level atlas, one flat colour each: a 16x16 red level 0, an
+/// 8x8 green level 1 and a 4x4 blue level 2, so a read-back names the level it sampled.
+const LEVEL_TEXELS: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
 
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
@@ -300,6 +315,90 @@ fn the_cutout_layer_discards_the_zero_alpha_texel() {
     );
 }
 
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_translucent_layer_discards_the_below_threshold_texel() {
+    let (device, queue) = headless_device();
+    let mut mesh = ChunkMesh::default();
+    // A white opaque quad behind everything, then a translucent quad over it whose left half
+    // samples a texel with alpha 24/255 — below the client's 0.1 alpha test — and whose right
+    // half samples an opaque green one. The discarded half must leave the white surface
+    // behind it visible; a translucent layer without the alpha test would blend the texel
+    // anyway and tint that pixel (255, 231, 231).
+    push_quad(
+        &mut mesh,
+        Layer::Opaque,
+        covering_quad(3.0, [[0.75, 0.75], [0.75, 0.75]]),
+        [255, 255, 255, 255],
+    );
+    push_quad(
+        &mut mesh,
+        Layer::Translucent,
+        covering_quad(2.0, [[0.25, 0.25], [0.75, 0.25]]),
+        [255, 255, 255, 255],
+    );
+    let pixels = render_terrain(&device, &queue, &atlas(2, 2, &TRANSLUCENT_TEXELS), &mesh);
+
+    expect_pixel(
+        &pixels,
+        16,
+        32,
+        [255, 255, 255],
+        "the surface behind the discarded translucent fragment",
+    );
+    expect_texel(
+        &pixels,
+        48,
+        32,
+        TRANSLUCENT_TEXELS[1],
+        "the translucent fragment above the threshold",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_multi_level_atlas_reads_back_every_level_it_writes() {
+    let (device, queue) = headless_device();
+    // A magnified view of the three-level atlas: each fragment's level of detail sits far
+    // below the chain, so the sampler reads level 0 and the read-back is its red exactly.
+    let mut magnified = ChunkMesh::default();
+    push_quad(
+        &mut magnified,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
+        [255, 255, 255, 255],
+    );
+    let pixels = render_terrain(&device, &queue, &levelled_atlas(), &magnified);
+    expect_texel(&pixels, 16, 32, LEVEL_TEXELS[0], "the magnified level 0");
+
+    // The same atlas sampled 32 times over: every fragment's level of detail passes the
+    // chain's deepest level, so the sampler clamps there and the read-back is level 2's blue
+    // exactly. A level written with the wrong size, row pitch or order — or skipped and left
+    // as wgpu initialised it — reads black or garbage instead.
+    let mut minified = ChunkMesh::default();
+    push_quad(
+        &mut minified,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [32.0, 32.0]]),
+        [255, 255, 255, 255],
+    );
+    let pixels = render_terrain(&device, &queue, &levelled_atlas(), &minified);
+    expect_texel(
+        &pixels,
+        16,
+        32,
+        LEVEL_TEXELS[2],
+        "the clamped deepest level",
+    );
+    expect_texel(
+        &pixels,
+        48,
+        16,
+        LEVEL_TEXELS[2],
+        "another pixel of the same level",
+    );
+}
+
 /// Renders one mesh through the terrain pass with one atlas and reads the frame back.
 fn render_terrain(
     device: &wgpu::Device,
@@ -369,6 +468,52 @@ fn atlas(width: u32, height: u32, texels: &[[u8; 4]]) -> Atlas {
 /// A one-colour atlas of `side` x `side` texels.
 fn solid_atlas(side: u32, colour: [u8; 4]) -> Atlas {
     atlas(side, side, &vec![colour; (side * side) as usize])
+}
+
+/// A hand-built stand-in atlas with one level per entry of [`LEVEL_TEXELS`]: a 16x16 level 0,
+/// an 8x8 level 1 and a 4x4 level 2, each a flat colour at its own size, and one sprite
+/// covering the image.
+///
+/// The level sizes and the flat colours are generated here; no asset store is read and no
+/// Mojang pixel is embedded. A stitcher-built atlas cannot stand in: `build_atlas` needs a
+/// `TextureSet`, which only `TextureSet::load` builds, and these tests never touch a store.
+fn levelled_atlas() -> Atlas {
+    const SIDE: u32 = 16;
+    let levels = LEVEL_TEXELS
+        .iter()
+        .enumerate()
+        .map(|(level, texel)| {
+            let side = (SIDE >> level).max(1);
+            AtlasLevel {
+                width: side,
+                height: side,
+                rgba: texel.repeat((side * side) as usize),
+            }
+        })
+        .collect();
+    let whole = AtlasSprite {
+        region: SpriteRect {
+            x: 0,
+            y: 0,
+            w: SIDE,
+            h: SIDE,
+        },
+        content: SpriteRect {
+            x: 0,
+            y: 0,
+            w: SIDE,
+            h: SIDE,
+        },
+    };
+    Atlas {
+        levels,
+        width: SIDE,
+        height: SIDE,
+        level_count: LEVEL_TEXELS.len() as u32,
+        sprites: BTreeMap::from([("test:levels".to_string(), whole)]),
+        animated: BTreeMap::new(),
+        missing: whole,
+    }
 }
 
 /// The four corners of a quad on the plane z = -`depth` that exactly covers the frame.

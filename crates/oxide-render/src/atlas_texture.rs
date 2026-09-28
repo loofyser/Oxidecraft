@@ -12,13 +12,17 @@
 //! non-blur branch with mipmaps on, whose filters are `GL_NEAREST_MIPMAP_LINEAR` for
 //! minification and `GL_NEAREST` for magnification — the same pair
 //! `AbstractTexture.setBlurMipmapDirect` installs at `AbstractTexture.java:27-28`, and M2's
-//! Decision 11 pins it). The wrap is `ClampToEdge` on every axis, as this task pins: a uv at
-//! the atlas's outer edge reads the edge texel instead of wrapping to the opposite side. That
-//! is a deliberate difference from the source — 1.8.9 leaves the block atlas at `GL_REPEAT`
-//! (`TextureMap.java:235` uploads each sprite with clamp off, which reaches
-//! `TextureUtil.setTextureClamped(false)` at `TextureUtil.java:171` and sets `GL_REPEAT` at
-//! `TextureUtil.java:250-251`) — and it is unobservable for the uvs this project's own
-//! stitcher emits, which stay inside their sprite.
+//! Decision 11 pins it). The wrap is `ClampToEdge` on every axis, a declared divergence: 1.8.9
+//! leaves the block atlas at `GL_REPEAT` (`TextureMap.java:235` uploads each sprite with the
+//! clamp flag off, which reaches `TextureUtil.setTextureClamped(false)` at
+//! `TextureUtil.java:171` and sets `GL_REPEAT` at `TextureUtil.java:250-251`), where the
+//! clamp reads the edge texel instead of wrapping to the opposite side. The two can be told
+//! apart only by a coordinate outside `[0, 1]` or exactly `1.0`; the uvs this project's own
+//! stitcher emits are content-rect offsets divided by the power-of-two level-0 size, so every
+//! ordinary fragment centre lands strictly inside a sprite and the divergence stays
+//! unobservable — the one theoretical exception is a sample at exactly 1.0 on a sprite flush
+//! to the atlas's far edge, where the clamp is the safe side (it repeats the edge texel where
+//! a wrapped sample would jump to the atlas's opposite edge).
 //!
 //! The draw-order rules that pair with the texture (opaque and cutout first, translucent
 //! last, sorted back to front) live in [`crate::terrain_pass::TerrainPass::draw`].
@@ -51,10 +55,14 @@ impl AtlasTexture {
     ///
     /// The texture has `atlas.level_count` levels and level `l` is written from
     /// `atlas.levels[l]` at that level's own size, in order — the uploader's contract with the
-    /// stitcher. The level count and each level's size are clamped to what a texture of the
-    /// atlas's level-0 size can hold, and a level whose declared size or byte count does not
-    /// match its mip is skipped with a warning rather than panicking: an atlas is built by
-    /// this project's own stitcher, so the guards only fire on a hand-built malformed one.
+    /// stitcher. A hand-built malformed atlas cannot panic the upload: the level count is
+    /// clamped to the levels a texture of the atlas's level-0 size can hold, and a level whose
+    /// declared size or byte count does not match its mip is skipped with a warning, leaving
+    /// that level as wgpu initialised it (zero-filled) rather than half-written. Both guards
+    /// are defensive only — a stitcher-built atlas's chain is exactly the shape the texture is
+    /// created with, every level matches, and neither guard can fire for it — so an atlas that
+    /// trips one is malformed input, and the texture's `mip_level_count` may then be below
+    /// `atlas.level_count`.
     pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) -> AtlasTexture {
         let width = atlas.width.max(1);
         let height = atlas.height.max(1);
@@ -188,6 +196,9 @@ fn texture_descriptor(width: u32, height: u32, levels: u32) -> wgpu::TextureDesc
 }
 
 /// The sampler descriptor: the client's `NEAREST_MIPMAP_LINEAR` pair, clamped on every axis.
+///
+/// [`AtlasTexture::upload`]'s module doc records the clamp as the declared divergence from the
+/// source's `GL_REPEAT`; the filters themselves are the source's own.
 fn sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
     wgpu::SamplerDescriptor {
         label: Some("oxide terrain atlas sampler"),
