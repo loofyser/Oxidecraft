@@ -42,8 +42,13 @@
 //! level 0.
 //!
 //! Every read-back expectation of a lit surface is computed from `lightmap_image`'s own
-//! output for the pair the fixture's corners carry, so a change to the lightmap, to the pair's
-//! axis order or to the texture's colour space fails here rather than passing quietly.
+//! output for the pair the fixture's corners carry, so the bytes the pass uploads, the
+//! fragment's arithmetic and the texture's colour space are pinned here rather than passing
+//! quietly — while a change to `lightmap_image`'s own maths moves the texture and the
+//! expectation together and is the CPU suite's to catch. The pair's axis order is the
+//! asymmetric case's to pin: its two pairs address different cells, so a transposed link reads
+//! the other one and fails, where every symmetric pair here would read the same either way
+//! round.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -245,8 +250,9 @@ fn the_atlas_texels_come_back_lit_by_the_lightmap() {
     );
 
     // The same quads at the lightmap's floor, the darkest dark: every texel comes back times
-    // 14/255. A light pair that sampled the wrong axis, or a lightmap texture whose bytes were
-    // converted to another colour space, would read something else here.
+    // 14/255. A lightmap texture whose bytes were converted to another colour space would read
+    // something else here; this pair is symmetric, so a transposed link reads the same cell and
+    // the axis order is the asymmetric case's to catch instead.
     let dark = light_cell(0, 0);
     assert_eq!(dark, [14, 14, 14, 255], "the lightmap's floor");
     let mut mesh = ChunkMesh::default();
@@ -271,6 +277,56 @@ fn the_atlas_texels_come_back_lit_by_the_lightmap() {
         48,
         shaded(FOUR_TEXELS[3], WHITE, dark),
         "the dim bottom-right texel",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn an_asymmetric_light_pair_reads_its_own_cell() {
+    // The one fixture here whose two levels differ, so a transposed link cannot pass: the two
+    // pairs address different cells — `(sky 12, block 4)` is [161, 152, 144] and `(sky 4,
+    // block 12)` is [210, 194, 164], both pinned by the CPU suite (`tests/lightmap.rs`) — and
+    // the expectation is computed from `lightmap_image`'s own output like every other read-back
+    // here. The pair's fields are (block, sky): the block level picks the texel column and the
+    // sky level the row.
+    let (device, queue) = headless_device();
+    // Two quads at one depth, one per half of the frame: the left carries (block 4, sky 12) and
+    // the right its transposition, each written as the packed pair a vertex carries.
+    let half = 2.0 * (DEFAULT_FOV / 2.0).to_radians().tan();
+    let quad = |x0: f32, x1: f32| {
+        [
+            ([x0, -half, -2.0], [0.0, 1.0]),
+            ([x1, -half, -2.0], [1.0, 1.0]),
+            ([x1, half, -2.0], [1.0, 0.0]),
+            ([x0, half, -2.0], [0.0, 0.0]),
+        ]
+    };
+    let mut mesh = ChunkMesh::default();
+    // A level `L` of a field is packed as `L * 16 + 8`: 72 is block level 4, 200 sky level 12.
+    push_quad_with_light(&mut mesh, Layer::Opaque, quad(-half, 0.0), WHITE, [72, 200]);
+    push_quad_with_light(&mut mesh, Layer::Opaque, quad(0.0, half), WHITE, [200, 72]);
+    let pixels = render_terrain(
+        &device,
+        &queue,
+        &solid_atlas(4, [255, 255, 255, 255]),
+        &mesh,
+    );
+
+    // A link that transposed the fields would swap these two: the left half would read
+    // [210, 194, 164] instead of [161, 152, 144], and the right the other way round.
+    expect_texel(
+        &pixels,
+        16,
+        32,
+        shaded(WHITE, WHITE, light_cell(4, 12)),
+        "the (block 4, sky 12) half",
+    );
+    expect_texel(
+        &pixels,
+        48,
+        32,
+        shaded(WHITE, WHITE, light_cell(12, 4)),
+        "the (block 12, sky 4) half",
     );
 }
 

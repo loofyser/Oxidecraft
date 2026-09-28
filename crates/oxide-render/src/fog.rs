@@ -4,7 +4,8 @@
 //! which M2 lands two steps — the per-dimension base with the day-night factor
 //! (`WorldProvider.getFogColor`, `WorldProvider.java:177-188`) and the void-fog altitude factor
 //! (`EntityRenderer.java:1860-1887`) — plus the default linear range `setupFog` installs for
-//! terrain (`:2002-2016`). The rain blend, the sunset band, the boss tint, the night-vision
+//! terrain (`:2002-2016`). The rain blend, the sunset band, the sky-colour mix whose strength
+//! comes from the render distance (`:1767-1768`, `:1803-1805`), the boss tint, the night-vision
 //! term and the per-block overrides are the later scene work's.
 //!
 //! The colour is also the window's clear colour: the source ends `updateFogColor` by handing it
@@ -39,13 +40,13 @@ const SURFACE_FOG: [f32; 3] = [0.7529412, 0.84705883, 1.0];
 /// (`WorldProviderHell.getFogColor`, `WorldProviderHell.java:26-29`).
 const NETHER_FOG: [f32; 3] = [0.2, 0.03, 0.03];
 
-/// The End's fog: its colour `0xA08020` over 255, scaled by the provider's constant `0.15`
-/// (`WorldProviderEnd.getFogColor`, `WorldProviderEnd.java:50-62`, where the celestial-angle
-/// term is multiplied by zero).
+/// The End's fog: the provider's int `10518688` = `0xA080A0`, each channel over 255 and scaled
+/// by its constant `0.15` (`WorldProviderEnd.getFogColor`, `WorldProviderEnd.java:50-62`, where
+/// the celestial-angle term is multiplied by zero).
 const END_FOG: [f32; 3] = [
     (0xA0 as f32) / 255.0 * 0.15,
     (0x80 as f32) / 255.0 * 0.15,
-    (0x20 as f32) / 255.0 * 0.15,
+    (0xA0 as f32) / 255.0 * 0.15,
 ];
 
 /// The frame's fog colour for a dimension, a world time and an eye height.
@@ -57,10 +58,11 @@ const END_FOG: [f32; 3] = [
 /// zero partial ticks.
 ///
 /// `void_y_factor` is the dimension's own `getVoidFogYFactor` (`WorldProvider.java:231-234`:
-/// `0.03125` for every world type but Flat, which answers `1.0`). `eye_y` is the eye's world
-/// height in blocks; the factor darkens the colour by `(eye_y * void_y_factor)^2` while that
-/// product is below one, clamped above zero, and leaves it alone from one upwards
-/// (`EntityRenderer.java:1876-1887`).
+/// `0.03125` for every world type but Flat, which answers `1.0`). `eye_y` is the value the
+/// source multiplies: the render-view entity's interpolated `posY` (`EntityRenderer.java:1860`),
+/// the feet rather than the eye's height. The factor darkens the colour by
+/// `(eye_y * void_y_factor)^2` while that product is below one, clamped above zero, and leaves
+/// it alone from one upwards (`EntityRenderer.java:1876-1887`).
 ///
 /// Dimension 0 is the Overworld and is the only one the M2 acceptance compares; -1 is the
 /// Nether and 1 the End, each its provider's fixed base (the day-night factor is the
@@ -104,9 +106,10 @@ pub fn linear_params(far_plane: f32) -> (f32, f32) {
 /// and the last by `f * 0.91 + 0.09`.
 ///
 /// The source takes this cosine from `MathHelper.cos`, whose 65536-entry table
-/// (`MathHelper.java:30-41`) quantises the angle; the quantisation moves the factor by at most
-/// about `5e-5`, well under one byte of colour, and exactly nothing at the noon and midnight
-/// angles the tests pin, where the clamped factor is 1 and 0 either way.
+/// (`MathHelper.java:30-41`) quantises the angle: the lookup truncates to a table step, so the
+/// factor can move by at most about `2e-4` (one step, doubled by the `* 2`) — well under one
+/// byte of colour, and exactly nothing at the noon and midnight angles the tests pin, where the
+/// clamped factor is 1 and 0 either way.
 fn surface_fog(celestial_angle: f32) -> [f32; 3] {
     let factor = ((celestial_angle * PI * 2.0).cos() * 2.0 + 0.5).clamp(0.0, 1.0);
     [

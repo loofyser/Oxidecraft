@@ -29,9 +29,9 @@
 
 /// The light-to-brightness table of a dimension, one entry per light level 0..=15.
 ///
-/// M2 needed the Overworld's only ([`BrightnessTable::overworld`]); the Nether's and the End's
-/// providers build their own with a different floor (`WorldProviderHell.java:34-44`,
-/// `WorldProviderEnd.java:34-44`) and are the dimension work's to add.
+/// M2 needed the Overworld's only ([`BrightnessTable::overworld`]). Only the Nether's provider
+/// overrides the builder with a different floor (`WorldProviderHell.java:34-43`, `f = 0.1`);
+/// the End inherits the Overworld's table, and the Nether's is the dimension work's to add.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrightnessTable([f32; 16]);
 

@@ -5,8 +5,7 @@
 //! (`WorldProvider.java:63-72`), the image from `EntityRenderer.updateLightmap`
 //! (`EntityRenderer.java:922-1057`), the fog colour from `WorldProvider.getFogColor`
 //! (`:177-188`) with `EntityRenderer.updateFogColor`'s void factor (`:1860-1887`) and the
-//! celestial angle from `WorldProvider.calculateCelestialAngle` (`:115-133`). The work-through
-//! is in `docs/plans`' task report; these tests pin its results.
+//! celestial angle from `WorldProvider.calculateCelestialAngle` (`:115-133`).
 
 use oxide_render::fog::{fog_colour, linear_params};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
@@ -222,12 +221,12 @@ fn the_void_factor_leaves_the_colour_above_the_threshold() {
 #[test]
 fn the_other_dimensions_keep_their_providers_fixed_bases() {
     // The Nether's provider returns one constant colour whatever the time
-    // (`WorldProviderHell.java:26-29`); the End's multiplies its `0xA08020` by the constant
+    // (`WorldProviderHell.java:26-29`); the End's multiplies its `0xA080A0` by the constant
     // 0.15 because the celestial-angle term carries a zero factor (`WorldProviderEnd.java:50-62`).
     assert_eq!(fog_colour(-1, 6000.0, 64.0, 0.03125), [0.2, 0.03, 0.03]);
     assert_eq!(
         fog_colour(1, 6000.0, 64.0, 0.03125),
-        [0.09411766, 0.07529412, 0.01882353]
+        [0.09411766, 0.07529412, 0.09411766]
     );
     // The same fixed bases still take the void factor below the threshold.
     assert_eq!(

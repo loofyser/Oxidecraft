@@ -208,8 +208,8 @@ const CAMERA_BYTES: usize = 64;
 /// uniform.
 const FOG_BINDING: u32 = 1;
 
-/// The size of the fog uniform in bytes: two `vec4<f32>` — the colour and the start, then the
-/// end and the far plane.
+/// The size of the fog uniform in bytes: two `vec4<f32>` — the colour, then the start, the end
+/// and the far plane.
 const FOG_BYTES: usize = 32;
 
 /// The binding the lightmap texture occupies in group 2.
