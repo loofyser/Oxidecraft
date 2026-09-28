@@ -294,7 +294,7 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
             sections,
         } => {
             let mesh = sections[0].1.as_ref().expect("section 0 draws");
-            assert_eq!(mesh.vertices.len(), 24, "one stone block, six faces");
+            assert_eq!(mesh.vertex_count(), 24, "one stone block, six faces");
         }
         other => panic!("expected a chunk update, got {other:?}"),
     }
@@ -736,7 +736,7 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
             .as_ref()
             .expect("({cx}, {cz}) draws its bottom section");
         assert!(
-            !mesh.vertices.is_empty(),
+            !mesh.is_empty(),
             "({cx}, {cz}) draws its bottom section: a world that held no blocks could not"
         );
     }

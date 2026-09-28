@@ -16,7 +16,7 @@ use oxide_game::mesher::{
     build_column_meshes,
 };
 use oxide_proto_v47::column::{ColumnData, SectionData};
-use oxide_render::terrain::{ChunkMesh, Vertex};
+use oxide_render::terrain::{ChunkMesh, Layer, LayerMesh, Vertex};
 use oxide_world::behaviour::{behaviour, covered_ids};
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
@@ -440,9 +440,27 @@ fn mesh_of(world: &World, ctx: &MeshContext<'_>) -> ChunkMesh {
         .expect("a loaded section")
 }
 
-/// A mesh's quads, as slices of four vertices.
+/// One layer's quads, as slices of four vertices.
+fn layer_quads(layer: &LayerMesh) -> Vec<&[Vertex]> {
+    layer.vertices.chunks(4).collect()
+}
+
+/// A mesh's quads, as slices of four vertices: each layer in draw order.
 fn quads(mesh: &ChunkMesh) -> Vec<&[Vertex]> {
-    mesh.vertices.chunks(4).collect()
+    mesh.layers.iter().flat_map(layer_quads).collect()
+}
+
+/// A mesh's vertices across its layers, in draw order.
+fn vertices(mesh: &ChunkMesh) -> Vec<&Vertex> {
+    mesh.layers
+        .iter()
+        .flat_map(|layer| layer.vertices.iter())
+        .collect()
+}
+
+/// The number of indices across a mesh's layers.
+fn index_count(mesh: &ChunkMesh) -> usize {
+    mesh.layers.iter().map(|layer| layer.indices.len()).sum()
 }
 
 // -- the tests --------------------------------------------------------------
@@ -484,11 +502,12 @@ fn a_lone_stone_block_draws_six_faces() {
     let world = daylight(&[(3, 64, 7, state(STONE, 0))]);
     let mesh = mesh_of(&world, &ctx);
 
-    assert_eq!(mesh.vertices.len(), 24, "six faces of four vertices");
-    assert_eq!(mesh.indices.len(), 36, "six faces of two triangles");
-    assert_eq!(mesh.vertex_count(), 24);
+    assert_eq!(mesh.vertex_count(), 24, "six faces of four vertices");
+    assert_eq!(index_count(&mesh), 36, "six faces of two triangles");
     assert!(!mesh.is_empty());
-    assert_eq!(&mesh.indices[..6], &[0, 1, 2, 0, 2, 3]);
+    // The stone's row is the solid layer, so every quad is in the first slot,
+    // and its indices address that layer from zero.
+    assert_eq!(&mesh.layer(Layer::Opaque).indices[..6], &[0, 1, 2, 0, 2, 3]);
 
     // The quads come in the client's face order — down, up, north, south, west,
     // east — each in its own plane through the block: the axis and value.
@@ -512,7 +531,7 @@ fn a_lone_stone_block_draws_six_faces() {
 
     // Every vertex takes the cell its face looks into: full daylight, no block
     // light, so both channels are 15 * 16 + 8.
-    for vertex in &mesh.vertices {
+    for vertex in vertices(&mesh) {
         assert_eq!(vertex.light, [248, 8]);
     }
 
@@ -523,7 +542,7 @@ fn a_lone_stone_block_draws_six_faces() {
         [[0.132_812_5, 0.007_812_5], [0.195_312_5, 0.070_312_5]]
     );
     let corners = sprite_corners("blocks/probe");
-    for (index, vertex) in mesh.vertices.iter().enumerate() {
+    for (index, vertex) in vertices(&mesh).into_iter().enumerate() {
         assert_eq!(vertex.uv, corners[index % 4], "vertex {index}");
     }
 
@@ -566,8 +585,8 @@ fn adjacent_stone_culls_the_face_between_them() {
     let mesh = mesh_of(&world, &ctx);
 
     // Two cubes, the pair between them culled: ten faces, not twelve.
-    assert_eq!(mesh.vertices.len(), 40);
-    assert_eq!(mesh.indices.len(), 60);
+    assert_eq!(mesh.vertex_count(), 40);
+    assert_eq!(index_count(&mesh), 60);
     // Only the two outer faces sit in an x plane of their own.
     let x_planes = quads(&mesh)
         .iter()
@@ -592,7 +611,7 @@ fn culling_follows_the_neighbours_opacity() {
     for neighbour in [GLASS, SPAWNER] {
         let world = daylight(&[(0, 64, 0, state(STONE, 0)), (1, 64, 0, state(neighbour, 0))]);
         let mesh = mesh_of(&world, &ctx);
-        assert_eq!(mesh.vertices.len(), 44, "eleven faces for {neighbour}");
+        assert_eq!(mesh.vertex_count(), 44, "eleven faces for {neighbour}");
         assert_eq!(
             quads(&mesh)
                 .iter()
@@ -607,7 +626,7 @@ fn culling_follows_the_neighbours_opacity() {
     // nothing at all in the x = 1 plane.
     let world = daylight(&[(0, 64, 0, state(STONE, 0)), (1, 64, 0, state(LEAVES, 0))]);
     let mesh = mesh_of(&world, &ctx);
-    assert_eq!(mesh.vertices.len(), 40);
+    assert_eq!(mesh.vertex_count(), 40);
     assert!(
         quads(&mesh)
             .iter()
@@ -631,7 +650,7 @@ fn culling_reads_across_the_column_and_section_edges() {
         .into_iter()
         .find_map(|(_, mesh)| mesh)
         .expect("a loaded section");
-    assert_eq!(mesh.vertices.len(), 20);
+    assert_eq!(mesh.vertex_count(), 20);
     assert!(
         quads(&mesh)
             .iter()
@@ -642,11 +661,11 @@ fn culling_reads_across_the_column_and_section_edges() {
     let world = daylight(&[(2, 15, 2, state(STONE, 0)), (2, 16, 2, state(STONE, 0))]);
     let sections = meshes(&world, &ctx);
     assert_eq!(
-        sections[0].1.as_ref().expect("section 0").vertices.len(),
+        sections[0].1.as_ref().expect("section 0").vertex_count(),
         20
     );
     assert_eq!(
-        sections[1].1.as_ref().expect("section 1").vertices.len(),
+        sections[1].1.as_ref().expect("section 1").vertex_count(),
         20
     );
 }
@@ -688,7 +707,7 @@ fn a_block_samples_the_cell_its_face_looks_into() {
     assert_eq!(snapshot.light(1, 64, 0), (7, 2));
     assert_eq!(snapshot.light(-1, 64, 0), (7, 2), "the west collar");
     assert_eq!(snapshot.light(0, 64, -1), (7, 2), "the north collar");
-    for vertex in &mesh_of(&world, &ctx).vertices {
+    for vertex in vertices(&mesh_of(&world, &ctx)) {
         assert_eq!(vertex.light, [120, 40], "7 * 16 + 8 and 2 * 16 + 8");
     }
 }
@@ -714,8 +733,8 @@ fn a_cross_model_reads_its_own_cell_and_takes_no_shade() {
     );
     let world = world_of(&[(0, 0, data)]);
     let mesh = mesh_of(&world, &ctx);
-    assert_eq!(mesh.vertices.len(), 16);
-    for vertex in &mesh.vertices {
+    assert_eq!(mesh.vertex_count(), 16);
+    for vertex in vertices(&mesh) {
         assert_eq!(vertex.light, [88, 24], "5 * 16 + 8 and 1 * 16 + 8");
         assert_eq!(vertex.colour, [255, 255, 255, 255]);
     }
@@ -767,7 +786,7 @@ fn a_glowstone_stays_on_the_standard_path() {
     let all: Vec<Vec<Vertex>> = minimum
         .iter()
         .filter_map(|(_, mesh)| mesh.as_ref())
-        .flat_map(|mesh| mesh.vertices.chunks(4).map(<[Vertex]>::to_vec))
+        .flat_map(|mesh| quads(mesh).into_iter().map(<[Vertex]>::to_vec))
         .collect();
     assert_eq!(all.len(), 10, "the stone's five faces and the glowstone's");
     // The stone's bottom face is the one quad at the glowstone's top plane.
@@ -783,7 +802,7 @@ fn a_glowstone_stays_on_the_standard_path() {
         sections
             .iter()
             .filter_map(|(_, mesh)| mesh.as_ref())
-            .flat_map(|mesh| mesh.vertices.chunks(4).map(<[Vertex]>::to_vec))
+            .flat_map(|mesh| quads(mesh).into_iter().map(<[Vertex]>::to_vec))
             .filter(|quad| {
                 quad.iter().all(|vertex| {
                     (5.0..=6.0).contains(&vertex.position[0])
@@ -1166,12 +1185,17 @@ fn an_unresolved_state_draws_the_fallback_cube() {
     let (models, atlas) = loaded();
     let maps = white_maps();
     let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    // The water beside it has a row and no model: its geometry is the fluid
+    // renderer's, in the row's translucent layer, not the fallback cube; the
+    // id outside the covered table has no row to route by and draws the
+    // fallback in the opaque layer, missingno and all.
     let world = daylight(&[(0, 64, 0, state(WATER, 0)), (4, 64, 0, state(200, 0))]);
     let mesh = mesh_of(&world, &ctx);
-    assert_eq!(mesh.vertices.len(), 48);
+    assert_eq!(mesh.vertex_count(), 11 * 4 + 24);
     let corners = sprite_corners("missingno");
-    let fallback = quads(&mesh);
-    for quad in [fallback[0], fallback[6]] {
+    let fallback = layer_quads(mesh.layer(Layer::Opaque));
+    assert_eq!(fallback.len(), 6, "the uncovered id's six faces");
+    for quad in fallback {
         for (index, vertex) in quad.iter().enumerate() {
             assert_eq!(vertex.uv, corners[index]);
         }
@@ -1207,11 +1231,11 @@ fn reads_above_and_below_the_column_answer_air_and_darkness() {
     assert_eq!(snapshot.light(0, 256, 0), (0, 0));
     let sections = build_column_meshes(&snapshot, &ctx);
     assert_eq!(
-        sections[15].1.as_ref().expect("section 15").vertices.len(),
+        sections[15].1.as_ref().expect("section 15").vertex_count(),
         24
     );
     assert_eq!(
-        sections[0].1.as_ref().expect("section 0").vertices.len(),
+        sections[0].1.as_ref().expect("section 0").vertex_count(),
         24
     );
     // The top block's own top face looks into the cell above: air, so it is

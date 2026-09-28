@@ -28,7 +28,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::SKY_COLOR;
-use oxide_render::terrain::{ChunkMesh, Vertex};
+use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 
 /// The size of the offscreen target in texels.
@@ -360,12 +360,14 @@ fn stone_block_mesh() -> ChunkMesh {
     mesh
 }
 
-/// Appends one face to `mesh`: four corners, then six indices for two triangles.
+/// Appends one face to `mesh`'s opaque layer — the fixture's faces are solid
+/// terrain — four corners, then six indices for two triangles.
 fn push_face(mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], brightness: f32, colour: [f32; 3]) {
-    let base = mesh.vertices.len() as u32;
+    let layer = &mut mesh.layers[Layer::Opaque.index()];
+    let base = layer.vertices.len() as u32;
     for position in corners {
         let shade = |channel: usize| (colour[channel] * brightness * 255.0).round() as u8;
-        mesh.vertices.push(Vertex {
+        layer.vertices.push(Vertex {
             position,
             // The shader reads neither the uv nor the light yet (tasks 10 and 11 do): the
             // corners carry the face's own uv corner order zeroed out and a full-sky packed
@@ -375,7 +377,8 @@ fn push_face(mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], brightness: f32, colo
             colour: [shade(0), shade(1), shade(2), 255],
         });
     }
-    mesh.indices
+    layer
+        .indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 

@@ -37,14 +37,41 @@
 //! this version: the renderer reads only `Minecraft.isAmbientOcclusionEnabled()`
 //! (`Minecraft.java:2491-2493`), which is the setting not being `Off`.
 //!
+//! # The layers
+//!
+//! A quad's layer is its block's render layer (`Block.getBlockLayer`,
+//! `block/Block.java:516-519`), the behaviour table's `render_layer` column:
+//! `Solid` to the opaque layer, `CutoutMipped` and `Cutout` to the cutout
+//! layer, `Translucent` to the translucent one. Air, and an id outside the
+//! table, are opaque. Leaves are the one graphics-level override — the table
+//! stores their Fast row, and [`MeshContext::graphics_fast`] false names the
+//! other column (`BlockLeaves.getBlockLayer`, `block/BlockLeaves.java:293-296`),
+//! the cutout layer — while the same flag makes their `occludes` read false
+//! (`isOpaqueCube`, `:278-281`), so the cull rule and the layer cannot
+//! disagree.
+//!
+//! The translucent layer's quads are sorted back to front before its indices
+//! are emitted: descending distance from the section's centre to each quad's
+//! centre, the mean of its four vertex positions, as a stable sort over quads.
+//! The order is static and per section — the renderer draws translucent
+//! sections back to front by camera distance, which is the ordering this
+//! milestone needs; per-frame per-quad sorting is the transparent-terrain pass
+//! a later milestone's overlays revisit.
+//!
+//! # Liquids
+//!
+//! A block whose `render` column is `Liquid` takes no model: the client builds
+//! the liquid blocks in and never bakes them, so their geometry is the fluid
+//! renderer's own rules, ported in [`liquid`] from
+//! `client/renderer/BlockFluidRenderer.java` and `block/BlockLiquid.java`.
+//!
 //! # Known interim state
 //!
-//! Liquids and special render layers are Task 9's: this core draws whichever
-//! quads a block's resolved model has, in the single [`ChunkMesh`] buffer M1
-//! used. A state with no model — an id outside the behaviour table, a state the
-//! model set could not resolve, the client's built-in blocks — draws the magenta
-//! fallback cube from the atlas's own fallback sprite.
+//! The client's remaining built-in blocks still draw the magenta fallback cube
+//! from the atlas's own fallback sprite, as do ids outside the behaviour table
+//! and states the model set could not resolve.
 
+mod liquid;
 mod models;
 mod snapshot;
 
@@ -53,8 +80,10 @@ pub use snapshot::{Border, ColumnSnapshot};
 
 use oxide_assets::atlas::Atlas;
 use oxide_assets::model::{BakedModel, BakedQuad, FaceDir};
-use oxide_render::terrain::{ChunkMesh, Vertex};
-use oxide_world::behaviour::{BlockBehaviour, TintKind, behaviour};
+use oxide_render::terrain::{ChunkMesh, Layer, LayerMesh, Vertex};
+use oxide_world::behaviour::{
+    BlockBehaviour, Material, RenderKind, RenderLayer, TintKind, behaviour,
+};
 use oxide_world::biome::{TintMaps, tint_at_9_biome};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
 
@@ -84,8 +113,10 @@ pub struct MeshContext<'a> {
     pub atlas: &'a Atlas,
     /// The grass and foliage colour maps.
     pub tint_maps: &'a TintMaps,
-    /// Whether the graphics setting is Fast. Task 9's leaves rule reads it; this
-    /// core carries it without using it.
+    /// Whether the graphics setting is Fast.
+    ///
+    /// The leaves' rule reads it, from the one flag, in both places it moves:
+    /// their layer and their occlusion (`layer_of`, `occludes`).
     pub graphics_fast: bool,
     /// Which light path the build takes.
     pub smooth_lighting: SmoothLighting,
@@ -111,21 +142,96 @@ pub fn build_section_mesh(
     section: usize,
     ctx: &MeshContext<'_>,
 ) -> Option<ChunkMesh> {
-    let mut mesh = ChunkMesh::default();
     let base = section * SECTION_SIZE;
+    let mut builder = SectionBuilder::new(base as i32);
     for y in base..base + SECTION_SIZE {
         for z in 0..SECTION_SIZE {
             for x in 0..SECTION_SIZE {
-                append_block(&mut mesh, snapshot, (x as i32, y as i32, z as i32), ctx);
+                append_block(&mut builder, snapshot, (x as i32, y as i32, z as i32), ctx);
             }
         }
     }
+    let mesh = builder.finish();
     if mesh.is_empty() { None } else { Some(mesh) }
 }
 
-/// Appends one cell's geometry to the section's mesh.
+/// A section's quads while it is built: one list per layer, in visit order.
+///
+/// The section's centre is the sort key's origin; the translucent layer's quads
+/// are reordered against it in [`SectionBuilder::finish`], once every quad of
+/// the section is in.
+struct SectionBuilder {
+    /// The layers' quads, indexed by [`Layer::index`], four vertices each.
+    quads: [Vec<[Vertex; 4]>; 3],
+    /// The section's centre, in the column's own coordinates:
+    /// `(8, base + 8, 8)`, the middle of the section.
+    centre: [f32; 3],
+}
+
+impl SectionBuilder {
+    /// A builder for the section whose first cell is at `base` on the y axis.
+    fn new(base: i32) -> SectionBuilder {
+        SectionBuilder {
+            quads: std::array::from_fn(|_| Vec::new()),
+            centre: [8.0, base as f32 + 8.0, 8.0],
+        }
+    }
+
+    /// Appends one quad to one layer.
+    fn push(&mut self, layer: Layer, quad: [Vertex; 4]) {
+        self.quads[layer.index()].push(quad);
+    }
+
+    /// The section's mesh: each layer's quads in visit order, the translucent
+    /// layer sorted back to front, each quad's two triangles over its four
+    /// vertices.
+    ///
+    /// The sort runs on quads, before any index is emitted, so it is a stable
+    /// one: two quads the same distance from the centre keep the visit order.
+    fn finish(self) -> ChunkMesh {
+        let centre = self.centre;
+        let mut quads = self.quads;
+        quads[Layer::Translucent.index()]
+            .sort_by(|a, b| quad_distance(b, centre).total_cmp(&quad_distance(a, centre)));
+        ChunkMesh {
+            layers: std::array::from_fn(|index| {
+                let mut layer = LayerMesh::default();
+                for quad in &quads[index] {
+                    let base = layer.vertices.len() as u32;
+                    layer.vertices.extend_from_slice(quad);
+                    layer.indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
+                }
+                layer
+            }),
+        }
+    }
+}
+
+/// The distance from a section's centre to a quad's centre, the mean of the
+/// quad's four vertex positions.
+fn quad_distance(quad: &[Vertex; 4], centre: [f32; 3]) -> f32 {
+    let mut sum = [0.0f32; 3];
+    for vertex in quad {
+        for (axis, total) in sum.iter_mut().enumerate() {
+            *total += vertex.position[axis];
+        }
+    }
+    let dx = sum[0] / 4.0 - centre[0];
+    let dy = sum[1] / 4.0 - centre[1];
+    let dz = sum[2] / 4.0 - centre[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Appends one cell's geometry to the section's builder.
 fn append_block(
-    mesh: &mut ChunkMesh,
+    builder: &mut SectionBuilder,
     snapshot: &ColumnSnapshot,
     position: (i32, i32, i32),
     ctx: &MeshContext<'_>,
@@ -137,18 +243,72 @@ fn append_block(
     }
     let meta = (value & 0x0F) as u8;
     let block = behaviour(id);
+    let layer = layer_of(block, ctx.graphics_fast);
+    if block.is_some_and(|entry| entry.render == RenderKind::Liquid) {
+        // Every liquid row carries its kind, and the table's own tests pin it;
+        // a row without one is no liquid the fluid renderer could draw, so it
+        // takes the fallback cube rather than a guessed surface.
+        match block.and_then(|entry| entry.liquid) {
+            Some(kind) => liquid::append(builder, snapshot, position, kind, block, layer, ctx),
+            None => append_fallback(builder, snapshot, position, layer, ctx),
+        }
+        return;
+    }
     match ctx
         .models
         .model(id, meta, position.0, position.1, position.2)
     {
-        ModelChoice::Model(model) => append_model(mesh, snapshot, position, block, model, ctx),
-        ModelChoice::Missing => append_fallback(mesh, snapshot, position, ctx),
+        ModelChoice::Model(model) => append_model(builder, snapshot, position, block, model, ctx),
+        ModelChoice::Missing => append_fallback(builder, snapshot, position, layer, ctx),
+    }
+}
+
+/// The layer a block's quads land in.
+///
+/// The block's render layer, the client's `getBlockLayer`
+/// (`block/Block.java:516-519`) as the table carries it, with the leaves'
+/// graphics-level exception: the table stores their Fast row, and Fancy
+/// graphics name the other layer — `CUTOUT_MIPPED`, this project's cutout
+/// bucket (`BlockLeaves.getBlockLayer`, `block/BlockLeaves.java:293-296`).
+/// Air, and an id outside the table, draw in the opaque layer, as does the
+/// fallback cube for an id with no row.
+fn layer_of(block: Option<&BlockBehaviour>, graphics_fast: bool) -> Layer {
+    match block {
+        Some(entry) if entry.material == Material::Leaves && !graphics_fast => Layer::Cutout,
+        Some(entry) => bucket(entry.render_layer),
+        None => Layer::Opaque,
+    }
+}
+
+/// One render layer's bucket: `CUTOUT` and `CUTOUT_MIPPED` share the cutout
+/// pass, and the other two stand alone.
+fn bucket(layer: RenderLayer) -> Layer {
+    match layer {
+        RenderLayer::Solid => Layer::Opaque,
+        RenderLayer::CutoutMipped | RenderLayer::Cutout => Layer::Cutout,
+        RenderLayer::Translucent => Layer::Translucent,
+    }
+}
+
+/// Whether the block at a cell hides a neighbour's face against it: the
+/// table's `occludes` column, the source's `Block.isOpaqueCube()`.
+///
+/// The leaves are the one graphics-level override, and it is the same flag
+/// that moves their layer: `BlockLeaves.isOpaqueCube` answers
+/// `!fancyGraphics` (`block/BlockLeaves.java:278-281`), so the table's Fast
+/// values stand only while `graphics_fast` does. Air, and an id outside the
+/// table, occlude nothing.
+fn occludes(id: u16, graphics_fast: bool) -> bool {
+    match behaviour(id) {
+        Some(entry) if entry.material == Material::Leaves => graphics_fast,
+        Some(entry) => entry.occludes,
+        None => false,
     }
 }
 
 /// Appends every quad of a resolved model, in the model's own order.
 fn append_model(
-    mesh: &mut ChunkMesh,
+    builder: &mut SectionBuilder,
     snapshot: &ColumnSnapshot,
     position: (i32, i32, i32),
     block: Option<&BlockBehaviour>,
@@ -159,17 +319,18 @@ fn append_model(
         if let Some(cull) = quad.cullface {
             let (dx, dy, dz) = offset(cull);
             let neighbour = snapshot.block(position.0 + dx, position.1 + dy, position.2 + dz) >> 4;
-            if behaviour(neighbour).is_some_and(|entry| entry.occludes) {
+            if occludes(neighbour, ctx.graphics_fast) {
                 continue;
             }
         }
-        append_quad(mesh, snapshot, position, block, quad, model, ctx);
+        append_quad(builder, snapshot, position, block, quad, model, ctx);
     }
 }
 
-/// Appends one quad: four vertices, then the two triangles over them.
+/// Appends one quad: four vertices, then the two triangles over them, in the
+/// block's own render layer.
 fn append_quad(
-    mesh: &mut ChunkMesh,
+    builder: &mut SectionBuilder,
     snapshot: &ColumnSnapshot,
     position: (i32, i32, i32),
     block: Option<&BlockBehaviour>,
@@ -177,6 +338,7 @@ fn append_quad(
     model: &BakedModel,
     ctx: &MeshContext<'_>,
 ) {
+    let layer = layer_of(block, ctx.graphics_fast);
     let face = quad_face(quad);
     // The cell the standard path's single sample comes from: the neighbour the
     // face looks into, or the block's own cell for a quad with no face to look
@@ -197,6 +359,7 @@ fn append_quad(
             quad,
             face,
             block.is_some_and(|entry| entry.full_cube),
+            ctx.graphics_fast,
         );
         (corners.pairs, Some(corners.multipliers))
     } else {
@@ -217,21 +380,17 @@ fn append_quad(
         Some(multipliers) => std::array::from_fn(|index| colour(multipliers[index])),
         None => [colour(1.0); 4],
     };
-    let base = mesh.vertices.len() as u32;
-    for (index, corner) in quad.corners.iter().enumerate() {
-        mesh.vertices.push(Vertex {
-            position: [
-                position.0 as f32 + corner[0],
-                position.1 as f32 + corner[1],
-                position.2 as f32 + corner[2],
-            ],
-            uv: uvs[index],
-            light: light_attribute(pairs[index]),
-            colour: colours[index],
-        });
-    }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    let vertices = std::array::from_fn(|index| Vertex {
+        position: [
+            position.0 as f32 + quad.corners[index][0],
+            position.1 as f32 + quad.corners[index][1],
+            position.2 as f32 + quad.corners[index][2],
+        ],
+        uv: uvs[index],
+        light: light_attribute(pairs[index]),
+        colour: colours[index],
+    });
+    builder.push(layer, vertices);
 }
 
 /// Whether a quad's vertices take the ambient-occlusion path.
@@ -291,20 +450,23 @@ fn vertex_tint(
     }
 }
 
-/// The face's shade as the byte the source bakes into the vertex record.
+/// The face's own shade as the byte the source bakes into the vertex record.
 ///
 /// `FaceBakery.getFaceShadeColor` quantises the face's brightness with
 /// `clamp((int)(shade * 255), 0, 255)` (`client/renderer/block/model/FaceBakery.java:48-53`),
 /// so the six faces carry 127, 255, 204, 204, 153 and 153 — every later
-/// multiply is a byte-times-byte one. A model face that turned shading off
-/// takes the builder's own colour instead, which is the white word `-1`
-/// (`FaceBakery.java:90-93`).
+/// multiply is a byte-times-byte one. The fluid renderer's own shades are the
+/// same six values (`BlockFluidRenderer.java:53-56`), so the liquid path
+/// composes its colours through this byte too.
+fn face_shade(face: Face) -> u8 {
+    (face.brightness() * 255.0) as u8
+}
+
+/// The shade byte of a model quad's face: the face's own shade, or the
+/// builder's own colour when the model face turned shading off, which is the
+/// white word `-1` (`FaceBakery.java:90-93`).
 fn shade_byte(quad: &BakedQuad, face: Face) -> u8 {
-    if quad.shade {
-        (face.brightness() * 255.0) as u8
-    } else {
-        255
-    }
+    if quad.shade { face_shade(face) } else { 255 }
 }
 
 /// One colour channel as the source multiplies it: the baked shade byte times
@@ -331,16 +493,17 @@ fn shaded_channel(shade: u8, tint: u8, multiplier: f32) -> u8 {
 /// palette mesher gave an id it could not colour, with the magenta coming from
 /// the sprite now rather than from the vertex.
 fn append_fallback(
-    mesh: &mut ChunkMesh,
+    builder: &mut SectionBuilder,
     snapshot: &ColumnSnapshot,
     position: (i32, i32, i32),
+    layer: Layer,
     ctx: &MeshContext<'_>,
 ) {
     let rect = ctx.atlas.uv(&ctx.atlas.missing);
     for face in Face::ALL {
         let (dx, dy, dz) = face.offset();
         let neighbour = snapshot.block(position.0 + dx, position.1 + dy, position.2 + dz) >> 4;
-        if behaviour(neighbour).is_some_and(|entry| entry.occludes) {
+        if occludes(neighbour, ctx.graphics_fast) {
             continue;
         }
         let pair = light_attribute(cell_pair(
@@ -348,11 +511,11 @@ fn append_fallback(
             (position.0 + dx, position.1 + dy, position.2 + dz),
             None,
         ));
-        let shade = [(face.brightness() * 255.0) as u8; 3];
-        let base = mesh.vertices.len() as u32;
-        for (index, corner) in FALLBACK_CORNERS[face as usize].iter().enumerate() {
+        let shade = face_shade(face);
+        let vertices = std::array::from_fn(|index| {
+            let corner = FALLBACK_CORNERS[face as usize][index];
             let uv = SPRITE_CORNERS[index];
-            mesh.vertices.push(Vertex {
+            Vertex {
                 position: [
                     position.0 as f32 + corner[0],
                     position.1 as f32 + corner[1],
@@ -363,11 +526,10 @@ fn append_fallback(
                     rect[0][1] + uv[1] * (rect[1][1] - rect[0][1]),
                 ],
                 light: pair,
-                colour: [shade[0], shade[1], shade[2], 255],
-            });
-        }
-        mesh.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                colour: [shade, shade, shade, 255],
+            }
+        });
+        builder.push(layer, vertices);
     }
 }
 
@@ -520,7 +682,9 @@ struct AmbientCorners {
 /// value only when *neither* of the two behind-cells it spans is translucent
 /// (`:377-442`, the source's `Block.translucent`, i.e. `!Material.blocksLight()`).
 /// The centre is the neighbour's cell when flag 0 holds or the neighbour is not
-/// opaque, and the block's own cell otherwise (`:444-449`).
+/// opaque, and the block's own cell otherwise (`:444-449`) — "opaque" read
+/// through [`occludes`], the leaves' graphics-level clause included, the same
+/// reading the cull rule takes.
 ///
 /// The four cells' `getAmbientOcclusionLightValue()` values answer the vertex's
 /// colour multiplier — their mean in the plain branch (`:491-502`) or the
@@ -533,6 +697,7 @@ fn ambient_corners(
     quad: &BakedQuad,
     face: Face,
     full_cube: bool,
+    graphics_fast: bool,
 ) -> AmbientCorners {
     let bounds = quad_bounds(face, &quad.corners, full_cube);
     let (dx, dy, dz) = offset(direction(face));
@@ -577,7 +742,7 @@ fn ambient_corners(
     let (own_x, own_y, own_z) = position;
     let neighbour = (own_x + dx, own_y + dy, own_z + dz);
     let neighbour_value = snapshot.block(neighbour.0, neighbour.1, neighbour.2);
-    let centre = if bounds.face_plane || !is_opaque_cube(neighbour_value >> 4) {
+    let centre = if bounds.face_plane || !occludes(neighbour_value >> 4, graphics_fast) {
         cell_pair(snapshot, neighbour, behaviour(neighbour_value >> 4))
     } else {
         cell_pair(
@@ -677,12 +842,6 @@ fn ao_light_value(id: u16) -> f32 {
 /// block nothing — the same non-occluding default the cull rule gives them.
 fn blocks_light(id: u16) -> bool {
     behaviour(id).is_some_and(|entry| entry.material.blocks_light())
-}
-
-/// `Block.isOpaqueCube()` as the behaviour table's `occludes` column: whether
-/// the block at a cell hides a neighbour's face against it.
-fn is_opaque_cube(id: u16) -> bool {
-    behaviour(id).is_some_and(|entry| entry.occludes)
 }
 
 /// `getAoBrightness`: the two channels' four-sample average, with a zero sample

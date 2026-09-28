@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use glam::Mat4;
 
 use crate::camera::Camera;
-use crate::terrain::{ChunkMesh, SectionKey, VERTEX_BYTES, vertex_bytes};
+use crate::terrain::{ChunkMesh, Layer, SectionKey, VERTEX_BYTES, vertex_bytes};
 
 /// The terrain shader: transform a position with the camera, pass the colour through.
 ///
@@ -208,26 +208,38 @@ impl TerrainPass {
             self.remove(key);
             return;
         }
+        // The layers walk in their own order into one buffer pair, each layer's
+        // indices rebased onto the range its vertices land in: this pass draws
+        // every layer in one call, and the per-layer upload and draw order are
+        // the next task's.
+        let mut vertices = Vec::with_capacity(mesh.vertex_count());
+        let mut indices = Vec::new();
+        for layer in Layer::ALL {
+            let layer = mesh.layer(layer);
+            let base = vertices.len() as u32;
+            vertices.extend_from_slice(&layer.vertices);
+            indices.extend(layer.indices.iter().map(|index| index + base));
+        }
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxide terrain vertices"),
-            size: (mesh.vertices.len() * VERTEX_BYTES) as u64,
+            size: (vertices.len() * VERTEX_BYTES) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&vertex_buffer, 0, &vertex_bytes(&mesh.vertices));
+        queue.write_buffer(&vertex_buffer, 0, &vertex_bytes(&vertices));
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxide terrain indices"),
-            size: (mesh.indices.len() * std::mem::size_of::<u32>()) as u64,
+            size: (indices.len() * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&index_buffer, 0, &index_bytes(&mesh.indices));
+        queue.write_buffer(&index_buffer, 0, &index_bytes(&indices));
         self.meshes.insert(
             key,
             GpuMesh {
                 vertex_buffer,
                 index_buffer,
-                index_count: mesh.indices.len() as u32,
+                index_count: indices.len() as u32,
             },
         );
     }

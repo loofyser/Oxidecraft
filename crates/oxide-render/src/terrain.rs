@@ -47,27 +47,79 @@ pub fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
     bytes
 }
 
-/// A section's geometry, ready to be uploaded.
+/// A section's geometry, ready to be uploaded: one buffer per render layer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChunkMesh {
+    /// The three layers, indexed by [`Layer::index`] — opaque, cutout,
+    /// translucent, which is also the order the client draws them in.
+    pub layers: [LayerMesh; 3],
+}
+
+impl ChunkMesh {
+    /// Whether the mesh draws nothing.
+    ///
+    /// The draw is indexed, so this reads every layer's `indices`; a mesh with
+    /// vertices but no indices is empty.
+    pub fn is_empty(&self) -> bool {
+        self.layers.iter().all(LayerMesh::is_empty)
+    }
+
+    /// One layer's geometry.
+    pub fn layer(&self, layer: Layer) -> &LayerMesh {
+        &self.layers[layer.index()]
+    }
+
+    /// The number of vertices across the layers.
+    pub fn vertex_count(&self) -> usize {
+        self.layers.iter().map(|layer| layer.vertices.len()).sum()
+    }
+}
+
+/// One render layer's geometry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayerMesh {
     /// Vertices, in triangle order.
     pub vertices: Vec<Vertex>,
     /// Indices into `vertices`.
     pub indices: Vec<u32>,
 }
 
-impl ChunkMesh {
-    /// Whether the mesh draws nothing.
+impl LayerMesh {
+    /// Whether the layer draws nothing.
     ///
-    /// The draw is indexed, so this reads `indices`; a mesh with vertices but
+    /// The draw is indexed, so this reads `indices`; a layer with vertices but
     /// no indices is empty.
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
+}
 
-    /// The number of vertices.
-    pub fn vertex_count(&self) -> usize {
-        self.vertices.len()
+/// A terrain render layer: the client's `RenderLayer` buckets, one draw pass
+/// each.
+///
+/// The client's four layers collapse to three buckets here: `CUTOUT` and
+/// `CUTOUT_MIPPED` differ only in whether the pass mipmaps its textures
+/// (`RenderLayer.java:43-77`), and both draw in the same pass with an alpha
+/// test. The variants are declared in the pass order the client draws them
+/// (`EntityRenderer`'s pass list), which is also the order
+/// [`ChunkMesh::layers`] is indexed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// The solid pass: `RenderLayer.SOLID`.
+    Opaque,
+    /// The cutout pass: `RenderLayer.CUTOUT` and `RenderLayer.CUTOUT_MIPPED`.
+    Cutout,
+    /// The translucent pass: `RenderLayer.TRANSLUCENT`.
+    Translucent,
+}
+
+impl Layer {
+    /// Every layer, in the order the client draws them.
+    pub const ALL: [Layer; 3] = [Layer::Opaque, Layer::Cutout, Layer::Translucent];
+
+    /// The layer's slot in [`ChunkMesh::layers`].
+    pub fn index(self) -> usize {
+        self as usize
     }
 }
 

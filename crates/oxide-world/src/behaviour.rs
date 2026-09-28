@@ -195,6 +195,34 @@ impl Material {
     pub fn blocks_movement(self) -> bool {
         self.blocks_light() && !matches!(self, Material::Liquid)
     }
+
+    /// `Material.isSolid()`: whether a block of this material counts as solid
+    /// ground, the flag the fluid-height predicate reads.
+    ///
+    /// True by default (`block/material/Material.java:94-97`) and false for
+    /// exactly four material classes — `MaterialTransparent`
+    /// (`MaterialTransparent.java:14-17`), `MaterialLogic`
+    /// (`MaterialLogic.java:14-17`), `MaterialLiquid`
+    /// (`MaterialLiquid.java:31-34`) and `MaterialPortal`
+    /// (`MaterialPortal.java:13-16`) — which in this table's vocabulary is
+    /// [`Material::Plant`], [`Material::Vine`], [`Material::Circuit`],
+    /// [`Material::Snow`], [`Material::Liquid`] and [`Material::Portal`].
+    /// Nothing else moves it: the web's `blocksMovement` override
+    /// (`Material.java:39-45`) is the recorded latent note and is not this
+    /// flag.
+    ///
+    /// The fluid-height predicate reads it (`client/renderer/BlockFluidRenderer.java:272-278`).
+    pub fn is_solid(self) -> bool {
+        !matches!(
+            self,
+            Material::Plant
+                | Material::Vine
+                | Material::Circuit
+                | Material::Snow
+                | Material::Liquid
+                | Material::Portal
+        )
+    }
 }
 
 /// Which liquid a block is.
