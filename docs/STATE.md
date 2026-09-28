@@ -10,7 +10,7 @@ specification and continue without asking questions that are already answered he
 
 - Stage: **milestone M2 (textured terrain) is in progress** — spec section 13 of
   `docs/specs/oxidecraft-v1-design.md` (v5), plan `docs/plans/2026-09-27-m2-textured-terrain.md`
-  (sixteen tasks, approved by the owner on 2026-09-27). Nine tasks are closed and independently
+  (sixteen tasks, approved by the owner on 2026-09-27). Ten tasks are closed and independently
   reviewed: Task 1 (`856cbec..864ffcd`) closed the M1 code backlog and added the bulk-column replay
   through the session; Task 2 (`864ffcd..e4f53e4`) added the PNG texture loader, the `.mcmeta` parser
   and `TextureSet`; Task 3 (`e4f53e4..46e4c5e`) added the blockstate and model loader with the 1.8
@@ -40,8 +40,8 @@ specification and continue without asking questions that are already answered he
   back-to-front sort, the two-branch leaves rule on `graphics_fast`, `Material::is_solid`, the
   fallback cube's layer routing and the interim renderer-side shape adaptation — with one review
   (approved with minors) whose fix round closed all four findings and a scoped re-review that
-  closed F1–F4 and the two records-hygiene findings; Task 9 carries no open Minor.
-  Next is Task 10, the textured pipeline, the three queues and frustum culling.
+  closed F1–F4 and the two records-hygiene findings; Task 9 carries no open Minor. Task 10 (`012d326`, with the pre-fix plan corrections `1edba03` and the fix round `c4cb3d6`) drew the terrain from the atlas — the per-layer textured pipelines (the translucent layer carrying the client's cull, depth-writes-off, alpha-test and blend states), the atlas upload with its mip chain, the frustum and per-section culling, the per-layer upload and removal and the per-section translucent order; its review's two Important findings were plan pins contradicting the source, ruled to the source with the plan corrected first, and the fix round's scoped re-review closed all six findings with no new breakage; Task 10 carries no open Minor bar the three ledgered notes.
+  Next is Task 11, the lightmap, the brightness pipeline, the colour-space policy and fog.
   Every task's brief, report, review and every ruling live in the plan's ledger
   `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`. M1 is complete and tagged `m1` (the
   annotated tag marks the close-out commit `930ccab`; the reviewed code head is `854ca85` and its
@@ -58,9 +58,9 @@ specification and continue without asking questions that are already answered he
   the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
   with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
   overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
-- Tests: 392 passing workspace-wide, 9 ignored, zero failures (`cargo test --workspace`, 45 suites).
-  The ignored set is two live-endpoint metadata tests, three GPU tests (they pass locally with
-  `-- --ignored`) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
+- Tests: 412 passing workspace-wide, 15 ignored, zero failures (`cargo test --workspace`, 46 suites).
+  The ignored set is two live-endpoint metadata tests, nine GPU tests (eight in `pipeline_headless`,
+  one in `headless`; they pass locally with `-- --ignored`) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
   store when `OXIDECRAFT_STORE` points at it (`~/.local/share/oxidecraft`).
 - Live evidence: the M0 ping and captures stand; M1's acceptance run — the join, 180 seconds of
   keep-alives, the mark and both screenshots, and the proxy capture of our client's own traffic — is
@@ -245,16 +245,15 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M2 (textured terrain) is the live milestone; its plan is
-`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–9 are closed and reviewed (head `64ccd4a`).
+`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–10 are closed and reviewed (head `c4cb3d6`).
 The M1 backlog that previously stood here rode into the plan: items 2–6 closed in Task 1, item 1 (the
 overlay's cached uploads) is Task 14's, and item 7 (the rig's log rotation) is Task 15's. The next
-work is **Task 10, the textured pipeline, the three queues and frustum culling** — the per-layer GPU
-upload, the three pipelines and the culling maths in `oxide-render` — then Tasks 11–16 in plan
-order. Parked for the milestone's
+work is **Task 11, the lightmap, the brightness pipeline, the colour-space policy and fog**
+(`oxide-render` + `oxide-game`) — then Tasks 12–16 in plan order. Parked for the milestone's
 final review: the seven deferred Minors from Task 2, the eight from Task 3, Task 4's remaining
 wording nits and Task 7's one carried Minor (the block-kind border read), each listed in the plan's ledger; Task 8 carried none (its two wording corrections landed in `0be1d8f` and its two coverage notes — the north/south/east orientation arrays and `Material::Web` — sit in `task-8-report.md`). Task 9 carried none either — its review's four findings closed (two in
 `64ccd4a`, two in the report) and the re-review's two records-hygiene items sit in
-`task-9-report.md` and `task-9-re-review-1.md`. The milestone's acceptance (Task 15) runs the rig
+`task-9-report.md` and `task-9-re-review-1.md`. Task 10 carried none beyond three ledgered notes: the `Aabb3::section` transpose hygiene, the pre-existing `Less`-vs-`LEQUAL` depth compare, and its brief's pre-ruling text. The milestone's acceptance (Task 15) runs the rig
 under `refs/rig/` against the store at `~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
 
 Then, as always: keep `docs/STATE.md` and `CHANGELOG.md` current and tag each milestone when it
