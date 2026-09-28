@@ -530,9 +530,10 @@ fn a_lone_stone_block_draws_six_faces() {
     }
 
     // Every vertex takes the cell its face looks into: full daylight, no block
-    // light, so both channels are 15 * 16 + 8.
+    // light, so the pair is the sky field 15 * 16 + 8 and the block field
+    // 0 * 16 + 8.
     for vertex in vertices(&mesh) {
-        assert_eq!(vertex.light, [248, 8]);
+        assert_eq!(vertex.light, [8, 248]);
     }
 
     // The uv: the probe sprite's content rect, corner for corner. The sprite
@@ -708,7 +709,11 @@ fn a_block_samples_the_cell_its_face_looks_into() {
     assert_eq!(snapshot.light(-1, 64, 0), (7, 2), "the west collar");
     assert_eq!(snapshot.light(0, 64, -1), (7, 2), "the north collar");
     for vertex in vertices(&mesh_of(&world, &ctx)) {
-        assert_eq!(vertex.light, [120, 40], "7 * 16 + 8 and 2 * 16 + 8");
+        assert_eq!(
+            vertex.light,
+            [40, 120],
+            "2 * 16 + 8 in the block field and 7 * 16 + 8 in the sky one"
+        );
     }
 }
 
@@ -735,7 +740,11 @@ fn a_cross_model_reads_its_own_cell_and_takes_no_shade() {
     let mesh = mesh_of(&world, &ctx);
     assert_eq!(mesh.vertex_count(), 16);
     for vertex in vertices(&mesh) {
-        assert_eq!(vertex.light, [88, 24], "5 * 16 + 8 and 1 * 16 + 8");
+        assert_eq!(
+            vertex.light,
+            [24, 88],
+            "1 * 16 + 8 in the block field and 5 * 16 + 8 in the sky one"
+        );
         assert_eq!(vertex.colour, [255, 255, 255, 255]);
     }
 }
@@ -828,11 +837,12 @@ fn a_glowstone_stays_on_the_standard_path() {
     let mut pairs: Vec<[u16; 2]> = glow.iter().map(|quad| quad[0].light).collect();
     pairs.sort();
     // Each drawn face's sky channel is the looked-into cell's, one per face,
-    // and the block channel is the block's own emission in every one of them.
+    // and the block channel is the block's own emission in every one of them:
+    // the pair's first component is the block field and the second the sky one.
     assert_eq!(
         pairs,
-        [[120, 248], [136, 248], [152, 248], [168, 248], [184, 248]],
-        "7, 8, 9, 10 and 11 in the sky field, 15 in the block field"
+        [[248, 120], [248, 136], [248, 152], [248, 168], [248, 184]],
+        "15 in the block field, and 7, 8, 9, 10 and 11 in the sky field"
     );
 }
 
@@ -887,7 +897,11 @@ fn a_dark_corner_falls_back_to_its_centre_sample() {
         .expect("the top face")
         .to_vec();
     for vertex in &top {
-        assert_eq!(vertex.light, [248, 8], "240 >> 2, plus the attribute's 8");
+        assert_eq!(
+            vertex.light,
+            [8, 248],
+            "the sky field is 240 >> 2 plus the attribute's 8; the block field is dark"
+        );
     }
     // Every other face of the stone reads dark cells throughout.
     for quad in quads(&mesh)
@@ -928,7 +942,7 @@ fn the_ambient_occlusion_path_weights_the_four_cells() {
         .expect("the top face")
         .to_vec();
     let lights: Vec<[u16; 2]> = top.iter().map(|vertex| vertex.light).collect();
-    assert_eq!(lights, [[8, 8], [8, 8], [68, 8], [68, 8]]);
+    assert_eq!(lights, [[8, 8], [8, 8], [8, 68], [8, 68]]);
 }
 
 #[test]
@@ -1049,14 +1063,14 @@ fn a_partial_elements_face_takes_the_quad_bounds_paths() {
 
     // The four slots' plain light pairs, from `getAoBrightness` over the two
     // tangents, the corner between them and the centre (the neighbour's cell,
-    // 6) — 68, 60, 72 and 80 in the sky field — then mixed by the WEST
-    // orientation table's quad-bounds products (the WEST arrays read the y and
-    // z bounds — max y = 0.5 on the first two rows, 1 - min y = 1 on the next
-    // two — and never an x bound): 74, 66, 72 and 80. The light attribute is
-    // that field with the sampler's eight added, and `VertexTranslations` puts
-    // slot 0 on the third vertex.
+    // 6) — 68, 60, 72 and 80 in the sky field, which is the pair's second
+    // component — then mixed by the WEST orientation table's quad-bounds
+    // products (the WEST arrays read the y and z bounds — max y = 0.5 on the
+    // first two rows, 1 - min y = 1 on the next two — and never an x bound):
+    // 74, 66, 72 and 80. The light attribute is that field with the sampler's
+    // eight added, and `VertexTranslations` puts slot 0 on the third vertex.
     let lights: Vec<[u16; 2]> = face.iter().map(|vertex| vertex.light).collect();
-    assert_eq!(lights, [[74, 8], [80, 8], [88, 8], [82, 8]]);
+    assert_eq!(lights, [[8, 74], [8, 80], [8, 88], [8, 82]]);
 
     // The colours: the same products mix the four plain multipliers, which are
     // 1.0 with one corner cell at 0.2 — (0.2 + 1 + 1 + 1) / 4 = 0.8 for the

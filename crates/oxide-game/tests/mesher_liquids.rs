@@ -702,7 +702,7 @@ fn a_water_cell_under_an_ice_sheet_keeps_the_second_top_pass() {
     assert!(
         surface
             .iter()
-            .all(|quad| quad.iter().all(|vertex| vertex.light == [248, 8])),
+            .all(|quad| quad.iter().all(|vertex| vertex.light == [8, 248])),
         "the liquid's own cell and the cell above it, in daylight"
     );
     assert!(
@@ -822,7 +822,7 @@ fn a_lone_water_cell_draws_the_still_top_and_the_flowing_sides() {
             .iter()
             .all(|vertex| vertex.colour == [204, 204, 204, 255])
     );
-    assert!(north[0].iter().all(|vertex| vertex.light == [248, 8]));
+    assert!(north[0].iter().all(|vertex| vertex.light == [8, 248]));
 }
 
 #[test]
@@ -853,18 +853,18 @@ fn a_liquid_samples_the_cell_and_the_cell_above() {
     let y = surface_y(64.0, SOURCE_SURFACE);
 
     // The top: the per-channel maximum of the cell and the cell above it,
-    // packed as the sampler's `level * 16 + 8`.
+    // packed as the sampler's `level * 16 + 8` in the pair's (block, sky) order.
     let surface = quads_at(&quads, [2.0, y, 2.0]);
     assert_eq!(surface.len(), 2);
     for quad in &surface {
-        assert!(quad.iter().all(|vertex| vertex.light == [152, 56]));
+        assert!(quad.iter().all(|vertex| vertex.light == [56, 152]));
     }
     // The bottom: the same maximum over the cell below.
     let bottom = quads_at(&quads, [2.0, 64.0, 3.0]);
-    assert!(bottom[0].iter().all(|vertex| vertex.light == [88, 40]));
+    assert!(bottom[0].iter().all(|vertex| vertex.light == [40, 88]));
     // The sides: the maximum over the neighbour the face looks into.
     let north = quads_at(&quads, [2.0, y, 2.001]);
-    assert!(north[0].iter().all(|vertex| vertex.light == [120, 104]));
+    assert!(north[0].iter().all(|vertex| vertex.light == [104, 120]));
 }
 
 #[test]
@@ -1039,7 +1039,7 @@ fn lava_draws_the_same_geometry_in_the_opaque_layer() {
     );
     for quad in &surface {
         assert!(
-            quad.iter().all(|vertex| vertex.light == [248, 8]),
+            quad.iter().all(|vertex| vertex.light == [8, 248]),
             "the light is the world's own: the renderer asks \
              `getCombinedLight(pos, 0)`, so a block's light value never enters \
              its own quads — a real server's light data already carries the \
@@ -1127,7 +1127,7 @@ fn the_fast_leaves_rule_culls_between_leaves_and_draws_in_the_opaque_layer() {
     // face's own shade and no tint — the probe cube carries no tint index.
     let top = plane_quads(&quads, 1, 65.0);
     for quad in &top {
-        assert!(quad.iter().all(|vertex| vertex.light == [248, 8]));
+        assert!(quad.iter().all(|vertex| vertex.light == [8, 248]));
         assert!(
             quad.iter()
                 .all(|vertex| vertex.colour == [255, 255, 255, 255])
@@ -1178,7 +1178,7 @@ fn a_plant_lands_in_the_cutout_layer_at_full_brightness() {
     assert_eq!(cutout.indices.len(), 24);
     // The quad's own cell, in daylight: nothing culls a cross.
     for vertex in &cutout.vertices {
-        assert_eq!(vertex.light, [248, 8]);
+        assert_eq!(vertex.light, [8, 248]);
         assert_eq!(vertex.colour, [255, 255, 255, 255]);
     }
 }

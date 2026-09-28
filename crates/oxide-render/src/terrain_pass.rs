@@ -40,6 +40,22 @@
 //! infos in reverse for the translucent layer (`RenderGlobal.java:1055-1063`) on top of the
 //! per-section back-to-front vertex sort the mesher already made.
 //!
+//! Lighting and fog are the client's own arithmetic too. The fragment stage samples the 16x16
+//! lightmap — built from the Overworld's brightness table, the sun at its noon brightness and
+//! the default gamma ([`crate::lightmap::lightmap_image`]) — at the vertex's packed light pair
+//! over 256, the coordinate `enableLightmap`'s texture matrix installs
+//! (`EntityRenderer.java:892-909`: scale `1/256`, translate eight), and multiplies that texel
+//! into the atlas texel and the vertex colour: the three factors the client's block layers
+//! carry, in its non-sRGB colour space (`docs/DIVERGENCES.md` records the policy). The same
+//! stage then fades the result towards the frame's fog colour
+//! ([`crate::fog::FogParams`]) over the distance from the eye:
+//! `clamp((end - depth) / (end - start), 0, 1)` mixed in, with `depth` the fragment's
+//! eye-space depth. That distance is the fixed-function fog's planar default; the source asks
+//! the driver for radial distance when `GL_NV_fog_distance` is present
+//! (`EntityRenderer.java:2018-2021`), which the acceptance rig checks rather than this pass.
+//! A frame that has set no fog draws unfogged: the pass starts with a range that does not run
+//! forwards, and such a range cannot fog anything.
+//!
 //! Nothing draws until both a camera and an atlas have been set: the pipelines bind the atlas
 //! at group 1 and sample it in every layer, so a draw without one would be a validation error
 //! and a picture of nothing. The shipping client sets the atlas from its bootstrap once the
@@ -51,17 +67,21 @@ use glam::{Mat4, Vec3};
 
 use crate::atlas_texture::AtlasTexture;
 use crate::camera::Camera;
+use crate::fog::FogParams;
 use crate::frustum::{Aabb3, Frustum};
+use crate::lightmap::{BrightnessTable, lightmap_image};
 use crate::terrain::{ChunkMesh, Layer, LayerMesh, SectionKey, VERTEX_BYTES, vertex_bytes};
 use oxide_assets::atlas::Atlas;
 
-/// The terrain shader source: sample the atlas at the vertex's uv, multiply by its colour.
+/// The terrain shader source: sample the atlas at the vertex's uv, multiply by its colour and
+/// by the lightmap's texel, then fade towards the frame's fog colour.
 ///
-/// The mesh's colours are already lit — the mesher multiplies the atlas entry by the face's
+/// The mesh's colours are already shaded — the mesher multiplies the atlas entry by the face's
 /// brightness and the biome tint and packs the light with the vertex — so the fragment stage's
-/// work is the sample and the multiply. The two fragment entries are the layer difference:
-/// [`FRAGMENT_MAIN`] hands the colour on, and [`FRAGMENT_CUTOUT`] — which the cutout and
-/// translucent layers both run — discards a fragment the atlas made (nearly) transparent.
+/// work is the three samples and the fog mix. Both fragment entries run the same [`shade`]
+/// helper; the two differ only in the alpha test, which [`FRAGMENT_CUTOUT`] performs on the
+/// alpha the helper hands back. The light is scaled by `1/256` — the scale factor the client's
+/// own lightmap matrix carries — so the pair's `+ 8` puts every sample on a texel centre.
 ///
 /// The discard threshold is written from [`CUTOUT_ALPHA`], so the shader's literal and the
 /// constant the tests pin cannot disagree.
@@ -72,9 +92,20 @@ struct Camera {{
     view_projection: mat4x4<f32>,
 }};
 
+// The frame's fog: the colour the terrain fades to and the range it fades over — the distance
+// the fade starts at and the distance it reaches full strength at. The far plane rides along in
+// the third component as the frame's own record of the range; the mix below reads the other two.
+struct Fog {{
+    colour: vec4<f32>,
+    params: vec4<f32>,
+}};
+
 @group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<uniform> fog: Fog;
 @group(1) @binding(0) var atlas: texture_2d<f32>;
 @group(1) @binding(1) var atlas_sampler: sampler;
+@group(2) @binding(0) var lightmap: texture_2d<f32>;
+@group(2) @binding(1) var lightmap_sampler: sampler;
 
 // The alpha below which every layer with the client's alpha test discards a fragment: the
 // client's own tenth (`GlStateManager.alphaFunc(516, 0.1F)` in `Minecraft.java`).
@@ -92,26 +123,53 @@ struct VertexOutput {{
     @location(0) uv: vec2<f32>,
     @location(1) light: vec2<f32>,
     @location(2) colour: vec4<f32>,
+    @location(3) depth: f32,
 }};
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {{
     var output: VertexOutput;
     output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
+    // The perspective divide's denominator is the eye-space depth of the vertex, so the
+    // interpolated varying is the fragment's own depth: the distance the fog is measured over.
+    output.depth = output.clip_position.w;
     output.uv = input.uv;
     output.light = vec2<f32>(f32(input.light.x), f32(input.light.y));
     output.colour = input.colour;
     return output;
 }}
 
+// The client's block fragment: the atlas texel times the vertex colour times the lightmap's
+// texel, then the fog mix. The lightmap's own alpha is one, so the fragment's alpha comes from
+// the atlas and the vertex colour alone.
+fn shade(uv: vec2<f32>, light: vec2<f32>, colour: vec4<f32>, depth: f32) -> vec4<f32> {{
+    let texel = textureSample(atlas, atlas_sampler, uv)
+        * colour
+        * textureSample(lightmap, lightmap_sampler, light / 256.0);
+    return fogged(texel, depth);
+}}
+
+// The linear fog: the factor is one at the fade's start and zero at its end, and the colour is
+// mixed towards the fog colour as the source's fixed-function fog does — the alpha is left as
+// the fragment wrote it. A range that does not run forwards leaves the colour alone: that is
+// the state a frame with no fog set draws in.
+fn fogged(colour: vec4<f32>, depth: f32) -> vec4<f32> {{
+    let span = fog.params.y - fog.params.x;
+    if (span <= 0.0) {{
+        return colour;
+    }}
+    let factor = clamp((fog.params.y - depth) / span, 0.0, 1.0);
+    return vec4<f32>(mix(fog.colour.rgb, colour.rgb, factor), colour.a);
+}}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {{
-    return textureSample(atlas, atlas_sampler, input.uv) * input.colour;
+    return shade(input.uv, input.light, input.colour, input.depth);
 }}
 
 @fragment
 fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {{
-    let colour = textureSample(atlas, atlas_sampler, input.uv) * input.colour;
+    let colour = shade(input.uv, input.light, input.colour, input.depth);
     if (colour.a < CUTOUT_ALPHA) {{
         discard;
     }}
@@ -145,6 +203,43 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// The size of the camera uniform in bytes: one `mat4x4<f32>`.
 const CAMERA_BYTES: usize = 64;
+
+/// The binding the fog uniform occupies in group 0, next to the camera as the frame's other
+/// uniform.
+const FOG_BINDING: u32 = 1;
+
+/// The size of the fog uniform in bytes: two `vec4<f32>` — the colour and the start, then the
+/// end and the far plane.
+const FOG_BYTES: usize = 32;
+
+/// The binding the lightmap texture occupies in group 2.
+const LIGHTMAP_BINDING: u32 = 0;
+
+/// The binding the lightmap sampler occupies in group 2.
+const LIGHTMAP_SAMPLER_BINDING: u32 = 1;
+
+/// The lightmap's size in texels on each axis: one texel per light level
+/// (`DynamicTexture(16, 16)`, `EntityRenderer.java:190`).
+const LIGHTMAP_SIZE: u32 = 16;
+
+/// The sun's brightness the lightmap is built with: `World.getSunBrightness` at the noon
+/// celestial angle of zero, where `1 - (cos(0) * 2 + 0.2)` clamps to zero and the value is
+/// `1 * 0.8 + 0.2` (`World.java:1418-1427`). A live clock's per-frame value is M6's.
+const SUN_BRIGHTNESS_NOON: f32 = 1.0;
+
+/// The gamma the lightmap is built with: `GameSettings.gammaSetting`'s default, the float
+/// field's own zero (`GameSettings.java:171`, whose constructor leaves it and whose only
+/// writers are the options file and the slider, `:718`, `:270`).
+const GAMMA_DEFAULT: f32 = 0.0;
+
+/// The fog a frame draws with until one is set: a range that does not run forwards, which the
+/// shader's mix reads as "leave the fragment as it is".
+const NO_FOG: FogParams = FogParams {
+    colour: [0.0; 3],
+    start: 0.0,
+    end: 0.0,
+    far_plane: 0.0,
+};
 
 /// The terrain vertex attributes: a position at offset 0, the uv at offset 12,
 /// the packed light pair at offset 20 and the colour at offset 24.
@@ -262,7 +357,8 @@ struct FrameState {
     eye: Vec3,
 }
 
-/// The three terrain pipelines, the atlas they sample and the meshes they draw.
+/// The three terrain pipelines, the frame's uniforms they read, the atlas and the lightmap
+/// they sample and the meshes they draw.
 pub struct TerrainPass {
     /// One pipeline per layer, indexed by [`Layer::index`], built in the draw order.
     pipelines: [wgpu::RenderPipeline; 3],
@@ -271,8 +367,14 @@ pub struct TerrainPass {
     atlas_layout: wgpu::BindGroupLayout,
     /// The uniform buffer holding the frame's view-projection matrix.
     camera_buffer: wgpu::Buffer,
-    /// The bind group the pipelines read the uniform through.
-    camera_bind_group: wgpu::BindGroup,
+    /// The uniform buffer holding the frame's fog.
+    fog_buffer: wgpu::Buffer,
+    /// The bind group the pipelines read the frame's uniforms through: the camera at
+    /// [`CAMERA_BYTES`]' binding and the fog at [`FOG_BINDING`].
+    frame_bind_group: wgpu::BindGroup,
+    /// The lightmap's texture and sampler, and the group-2 bind group they are bound through;
+    /// built with the pass and holding the image the client starts with.
+    lightmap_bind_group: wgpu::BindGroup,
     /// The atlas's texture and sampler, once one has been set; holding the texture keeps the
     /// view it is sampled through valid.
     atlas: Option<AtlasTexture>,
@@ -286,52 +388,121 @@ pub struct TerrainPass {
 }
 
 impl TerrainPass {
-    /// Builds the three layer pipelines for colour attachments in `format`.
+    /// Builds the three layer pipelines for colour attachments in `format`, and the lightmap
+    /// they sample.
     ///
     /// The vertex layout is the byte stream [`vertex_bytes`] produces: a `Float32x3` position
     /// at offset 0, a `Float32x2` uv at 12, a `Uint16x2` light pair at 20 and a `Unorm8x4`
     /// colour at 24, with a stride of [`VERTEX_BYTES`]. Every layer culls back faces and
     /// tests the depth buffer in [`DEPTH_FORMAT`]; the translucent layer's depth writes are
     /// off, so a pass that draws with them needs a depth attachment of that format and a
-    /// colour attachment in `format`. Group 0 is the camera uniform; group 1 is
-    /// the atlas, whose layout this builds once for the pipelines and for
-    /// [`TerrainPass::set_atlas`]'s bind groups.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    /// colour attachment in `format`. Group 0 is the frame's uniforms — the camera matrix and
+    /// the fog; group 1 is the atlas, whose layout this builds once for the pipelines and for
+    /// [`TerrainPass::set_atlas`]'s bind groups; group 2 is the lightmap, built here with the
+    /// image a fresh client holds (the Overworld's table, the noon sun and the default gamma).
+    /// The fog starts at [`NO_FOG`], so the first frame a caller draws is unfogged until
+    /// [`TerrainPass::set_fog`] gives one.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide terrain shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source().into()),
         });
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("oxide terrain camera layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(CAMERA_BYTES as u64),
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("oxide terrain frame layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(CAMERA_BYTES as u64),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: FOG_BINDING,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(FOG_BYTES as u64),
+                    },
+                    count: None,
+                },
+            ],
         });
         let atlas_layout = AtlasTexture::bind_group_layout(device);
+        let lightmap_layout = lightmap_bind_group_layout(device);
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxide terrain camera"),
             size: CAMERA_BYTES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("oxide terrain camera bind group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+        let fog_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oxide terrain fog"),
+            size: FOG_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oxide terrain frame bind group"),
+            layout: &frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: FOG_BINDING,
+                    resource: fog_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let lightmap_texture = device.create_texture(&lightmap_texture_descriptor());
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &lightmap_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &lightmap_image(
+                &BrightnessTable::overworld(),
+                SUN_BRIGHTNESS_NOON,
+                GAMMA_DEFAULT,
+            ),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(LIGHTMAP_SIZE * 4),
+                rows_per_image: Some(LIGHTMAP_SIZE),
+            },
+            wgpu::Extent3d {
+                width: LIGHTMAP_SIZE,
+                height: LIGHTMAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        let lightmap_view = lightmap_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let lightmap_sampler = device.create_sampler(&lightmap_sampler_descriptor());
+        let lightmap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oxide terrain lightmap bind group"),
+            layout: &lightmap_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: LIGHTMAP_BINDING,
+                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: LIGHTMAP_SAMPLER_BINDING,
+                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
+                },
+            ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("oxide terrain pipeline layout"),
-            bind_group_layouts: &[&camera_layout, &atlas_layout],
+            bind_group_layouts: &[&frame_layout, &atlas_layout, &lightmap_layout],
             push_constant_ranges: &[],
         });
         let pipelines = Layer::ALL.map(|layer| {
@@ -358,16 +529,20 @@ impl TerrainPass {
                 cache: None,
             })
         });
-        Self {
+        let mut pass = Self {
             pipelines,
             atlas_layout,
             camera_buffer,
-            camera_bind_group,
+            fog_buffer,
+            frame_bind_group,
+            lightmap_bind_group,
             atlas: None,
             atlas_bind_group: None,
             meshes: HashMap::new(),
             frame: None,
-        }
+        };
+        pass.set_fog(queue, NO_FOG);
+        pass
     }
 
     /// Uploads `atlas` and binds it for the frames that follow, replacing any earlier atlas.
@@ -397,6 +572,14 @@ impl TerrainPass {
             frustum: Frustum::from_view_projection(view_projection),
             eye: camera.eye(),
         });
+    }
+
+    /// Writes the frame's fog for the frames that follow.
+    ///
+    /// The renderer calls this once per frame, before the draw, with the frame's own colour and
+    /// range; a pass that has never been given one keeps [`NO_FOG`] and draws unfogged.
+    pub fn set_fog(&mut self, queue: &wgpu::Queue, params: FogParams) {
+        queue.write_buffer(&self.fog_buffer, 0, &fog_bytes(params));
     }
 
     /// Adds or replaces a section's mesh on the GPU.
@@ -461,8 +644,9 @@ impl TerrainPass {
                 continue;
             }
             pass.set_pipeline(&self.pipelines[layer.index()]);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(0, &self.frame_bind_group, &[]);
             pass.set_bind_group(1, atlas_bind_group, &[]);
+            pass.set_bind_group(2, &self.lightmap_bind_group, &[]);
             for (_, mesh) in draws {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -602,6 +786,96 @@ fn index_bytes(indices: &[u32]) -> Vec<u8> {
     bytes
 }
 
+/// Packs a frame's fog into the 32 little-endian bytes of the shader's two `vec4`s.
+///
+/// The first `vec4` holds the colour, the second the fade's start, its end and the far plane,
+/// with the components the mix does not read left zero. WGSL lays a uniform struct's `vec4`
+/// fields out in declaration order, so the bytes go out in that order field by field.
+fn fog_bytes(params: FogParams) -> [u8; FOG_BYTES] {
+    let mut bytes = [0u8; FOG_BYTES];
+    let values = [
+        params.colour[0],
+        params.colour[1],
+        params.colour[2],
+        0.0,
+        params.start,
+        params.end,
+        params.far_plane,
+        0.0,
+    ];
+    for (index, value) in values.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// The group-2 layout: the lightmap texture and the sampler the fragment stage reads it
+/// through. Filterable and single-sampled, because the lightmap is a plain 2D texture the
+/// fragment stage samples with its own filtering.
+fn lightmap_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("oxide terrain lightmap layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: LIGHTMAP_BINDING,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: LIGHTMAP_SAMPLER_BINDING,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The lightmap's texture descriptor: [`LIGHTMAP_SIZE`] texels on each axis, `Rgba8Unorm`
+/// because the client's lightmap image is plain bytes the fixed pipeline blended without any
+/// transfer function, and uploadable because the pass fills it with `write_texture`.
+fn lightmap_texture_descriptor() -> wgpu::TextureDescriptor<'static> {
+    wgpu::TextureDescriptor {
+        label: Some("oxide terrain lightmap"),
+        size: wgpu::Extent3d {
+            width: LIGHTMAP_SIZE,
+            height: LIGHTMAP_SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    }
+}
+
+/// The lightmap's sampler descriptor: linear filtering on both axes and clamping on every
+/// axis, the parameters the client installs for its lightmap texture
+/// (`EntityRenderer.enableLightmap`, `:902-905`).
+///
+/// Linear filtering is what makes the light levels blend from texel to texel — the client
+/// installs it here, not `GL_NEAREST` — and the clamp is what keeps the coordinate's `+ 8`
+/// offset from wrapping the brightest level into the dimmest.
+fn lightmap_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("oxide terrain lightmap sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use wgpu::{
@@ -610,10 +884,15 @@ mod tests {
     };
 
     use super::{
-        CUTOUT_ALPHA, DEPTH_FORMAT, FRAGMENT_CUTOUT, FRAGMENT_MAIN, VS_ENTRY, color_target,
-        depth_state, layer_plan, primitive_state, shader_source, vertex_layout,
+        CUTOUT_ALPHA, DEPTH_FORMAT, FOG_BINDING, FOG_BYTES, FRAGMENT_CUTOUT, FRAGMENT_MAIN,
+        GAMMA_DEFAULT, LIGHTMAP_BINDING, LIGHTMAP_SAMPLER_BINDING, LIGHTMAP_SIZE, NO_FOG,
+        SUN_BRIGHTNESS_NOON, VS_ENTRY, color_target, depth_state, fog_bytes, layer_plan,
+        lightmap_sampler_descriptor, lightmap_texture_descriptor, primitive_state, shader_source,
+        vertex_layout,
     };
     use crate::atlas_texture::{ATLAS_BINDING, SAMPLER_BINDING};
+    use crate::fog::FogParams;
+    use crate::lightmap::{BrightnessTable, lightmap_image};
     use crate::terrain::{Layer, VERTEX_BYTES};
 
     #[test]
@@ -731,14 +1010,138 @@ mod tests {
     }
 
     #[test]
-    fn the_shader_binds_the_camera_at_group_zero_and_the_atlas_at_group_one() {
+    fn the_shader_binds_the_frames_uniforms_at_group_zero_the_atlas_at_one_and_the_lightmap_at_two()
+    {
         let shader = shader_source();
         assert!(shader.contains("@group(0) @binding(0) var<uniform> camera: Camera"));
+        assert!(shader.contains(&format!(
+            "@group(0) @binding({FOG_BINDING}) var<uniform> fog: Fog"
+        )));
         assert!(shader.contains(&format!(
             "@group(1) @binding({ATLAS_BINDING}) var atlas: texture_2d<f32>"
         )));
         assert!(shader.contains(&format!(
             "@group(1) @binding({SAMPLER_BINDING}) var atlas_sampler: sampler"
         )));
+        assert!(shader.contains(&format!(
+            "@group(2) @binding({LIGHTMAP_BINDING}) var lightmap: texture_2d<f32>"
+        )));
+        assert!(shader.contains(&format!(
+            "@group(2) @binding({LIGHTMAP_SAMPLER_BINDING}) var lightmap_sampler: sampler"
+        )));
+        // The lightmap's coordinate is the packed light over 256, the scale the client's own
+        // texture matrix installs, so a level's `+ 8` lands on the texel's centre.
+        assert!(
+            shader.contains("light / 256.0"),
+            "the packed light is scaled by 256"
+        );
+        // Both fragment entries shade through the one helper — the atlas texel, the vertex
+        // colour and the lightmap texel — and the discarding one tests the alpha it returns.
+        assert_eq!(
+            shader
+                .matches("shade(input.uv, input.light, input.colour, input.depth)")
+                .count(),
+            2,
+            "both entries run the shared shade"
+        );
+        assert!(
+            shader.contains("let colour = shade("),
+            "the cutout entry shades and then tests"
+        );
+        assert!(
+            shader.contains("textureSample(lightmap, lightmap_sampler"),
+            "the shade samples the lightmap"
+        );
+    }
+
+    #[test]
+    fn the_fog_uniform_packs_the_colour_the_start_the_end_and_the_far_plane() {
+        let params = FogParams {
+            colour: [0.25, 0.5, 0.75],
+            start: 96.0,
+            end: 128.0,
+            far_plane: 128.0,
+        };
+        let bytes = fog_bytes(params);
+        assert_eq!(bytes.len(), FOG_BYTES, "two `vec4<f32>`");
+        for (index, expected) in [
+            0.25f32, 0.5, 0.75,
+            0.0, // the first vec4: the colour, its unused fourth left zero
+            96.0, 128.0, 128.0,
+            0.0, // the second: the fade's start and end, the far plane, zero
+        ]
+        .iter()
+        .enumerate()
+        {
+            let value = f32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+            assert_eq!(value, *expected, "component {index}");
+        }
+    }
+
+    #[test]
+    fn a_frame_with_no_fog_set_cannot_fog_anything() {
+        // The span the shader computes for a fresh pass cannot come out positive: the range
+        // the pass holds does not run forwards. The check is a compile-time one, so the
+        // constant cannot drift away from the shader's own guard unproven.
+        const { assert!(NO_FOG.end - NO_FOG.start <= 0.0) };
+        let shader = shader_source();
+        assert!(
+            shader.contains("let span = fog.params.y - fog.params.x;"),
+            "the shader's span is the uniform's own end minus its start"
+        );
+        assert!(
+            shader.contains("if (span <= 0.0)"),
+            "and a span that does not run forwards skips the mix"
+        );
+    }
+
+    #[test]
+    fn the_lightmap_is_a_filtered_clamped_sixteen_texel_texture() {
+        let texture = lightmap_texture_descriptor();
+        assert_eq!(texture.size.width, LIGHTMAP_SIZE);
+        assert_eq!(texture.size.height, LIGHTMAP_SIZE);
+        assert_eq!(texture.size.depth_or_array_layers, 1);
+        assert_eq!(
+            texture.mip_level_count, 1,
+            "one mip: the image has no chain"
+        );
+        assert_eq!(texture.sample_count, 1);
+        assert_eq!(
+            texture.format,
+            TextureFormat::Rgba8Unorm,
+            "the image is plain bytes, sampled without a transfer function"
+        );
+        assert!(
+            texture.usage.contains(wgpu::TextureUsages::COPY_DST),
+            "the pass writes the image into it"
+        );
+        assert!(texture.usage.contains(wgpu::TextureUsages::TEXTURE_BINDING));
+        assert!(
+            texture.view_formats.is_empty(),
+            "no sRGB view: the lightmap's bytes are used as the client uses them"
+        );
+        let sampler = lightmap_sampler_descriptor();
+        assert_eq!(sampler.mag_filter, wgpu::FilterMode::Linear);
+        assert_eq!(sampler.min_filter, wgpu::FilterMode::Linear);
+        assert_eq!(sampler.address_mode_u, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_v, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_w, wgpu::AddressMode::ClampToEdge);
+    }
+
+    #[test]
+    fn the_passes_lightmap_is_the_clients_own_starting_image() {
+        // The triple the pass builds its texture with: `getSunBrightness` at the noon angle —
+        // `1 - (cos(0) * 2 + 0.2)` clamps away to zero, leaving `1 * 0.8 + 0.2`
+        // (`World.java:1418-1427`) — and `gammaSetting`'s default zero
+        // (`GameSettings.java:171`).
+        let sun = SUN_BRIGHTNESS_NOON;
+        let gamma = GAMMA_DEFAULT;
+        assert_eq!(sun, 1.0, "the noon sun's brightness");
+        assert_eq!(gamma, 0.0, "the default gamma");
+        assert_eq!(
+            lightmap_image(&BrightnessTable::overworld(), sun, gamma),
+            lightmap_image(&BrightnessTable::overworld(), 1.0, 0.0),
+            "the pass builds the image the client starts the game with"
+        );
     }
 }

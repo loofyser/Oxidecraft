@@ -851,11 +851,20 @@ fn ao_brightness(first: i32, second: i32, third: i32, fourth: i32) -> i32 {
     (filled(first) + filled(second) + filled(third) + fourth) >> 2 & 0x00FF_00FF
 }
 
-/// The light attribute pair of a packed value: each combined field with the
-/// sampler's eight added, sky first.
+/// The light attribute pair of a packed value: the block field first, then the
+/// sky field, each with the sampler's eight added.
+///
+/// The order is the client's own: the packed int holds the block level at bits
+/// 4..8 and the sky level at bits 20..24 (`World.getCombinedLight`,
+/// `World.java:832-842`), and `ItemRenderer.setLightMapFromPlayer`
+/// (`:113-116`) hands the low half — the block field — to
+/// `glMultiTexCoord2f` first, as a vertex's pair of shorts carries it. The
+/// first component is therefore the block level, which is the lightmap's own
+/// first axis: its column is `i % 16` and its row `i / 16`
+/// (`EntityRenderer.java:934-937`).
 fn light_attribute(packed: i32) -> [u16; 2] {
     let field = |shift: u32| ((((packed as u32) >> shift) & 0xFF) + 8) as u16;
-    [field(16), field(0)]
+    [field(0), field(16)]
 }
 
 /// A quad's bounds and the two flags `fillQuadBounds` sets.

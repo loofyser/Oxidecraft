@@ -28,15 +28,22 @@
 //! and checks the glyph pixels and the one-pixel shadow offset against the layout
 //! `debug_text` produces.
 //!
-//! The atlas tests come next: the texels of a four-colour atlas are read back byte-identical
-//! (the reference check for the non-sRGB colour-space decision: a stored byte must arrive as
-//! the same byte), a magnified sample picks the nearer of two texels, the translucent layer
-//! blends its 50%-alpha fragment over the opaque layer's colour exactly as
+//! The atlas tests come next: the texels of a four-colour atlas are read back through the
+//! client's own brightness — the atlas texel times the lightmap's cell — at both the
+//! lightmap's brightest cell and its floor (the reference-gradient check for the non-sRGB
+//! colour-space decision, and for the lightmap's bytes: the pass's brightest cell is 252, not
+//! 255, because the source's closing `* 0.96 + 0.03` chain leaves the full-day cell at 0.99),
+//! a magnified sample picks the nearer of two texels, the translucent layer blends its
+//! 50%-alpha fragment over the opaque layer's colour exactly as
 //! `src_alpha / one_minus_src_alpha` says, a cutout fragment whose texel alpha is zero is
 //! discarded so the surface behind it shows through, a translucent fragment whose alpha sits
 //! below the client's tenth is discarded the same way, and an atlas with three mip levels is
 //! read back at its first and last level, so the level-by-level uploader is pinned beyond
 //! level 0.
+//!
+//! Every read-back expectation of a lit surface is computed from `lightmap_image`'s own
+//! output for the pair the fixture's corners carry, so a change to the lightmap, to the pair's
+//! axis order or to the texture's colour space fails here rather than passing quietly.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -44,6 +51,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
+use oxide_render::fog::{FogParams, fog_colour};
+use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::SKY_COLOR;
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
@@ -69,9 +78,13 @@ const SHADOW: [u8; 3] = [13, 13, 13];
 const STONE_COLOUR: [f32; 3] = [0.5, 0.5, 0.5];
 /// The buried face's colour, which is no real texture's at all.
 const BURIED_COLOUR: [f32; 3] = [1.0, 0.0, 0.0];
-/// The packed light of a full-sky corner, both channels: level 15 shifted four bits with the
-/// sampler's eight added.
-const FULL_SKY: u16 = 248;
+/// The packed light of a corner with both levels full: level 15 shifted four bits with the
+/// sampler's eight added, in the block field and again in the sky one.
+const FULL_LIGHT: u16 = 248;
+/// The packed light of a corner both of whose levels are dark: level 0 shifted four bits with
+/// the sampler's eight added, in the block field and again in the sky one.
+const LOW_LIGHT: u16 = 8;
+
 /// The four texels of the atlas the read-back and magnification tests use, row-major with the
 /// first row at the top: red and green on the top row, blue and white below.
 const FOUR_TEXELS: [[u8; 4]; 4] = [
@@ -109,7 +122,7 @@ fn the_terrain_pass_draws_the_block_and_keeps_the_buried_face_hidden() {
     let target = create_target(&device, format);
     let depth = create_depth(&device);
 
-    let mut terrain = TerrainPass::new(&device, format);
+    let mut terrain = TerrainPass::new(&device, &queue, format);
     terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
     terrain.set_camera(&queue, camera(), 1.0);
     terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
@@ -141,7 +154,7 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
     let target = create_target(&device, format);
     let depth = create_depth(&device);
 
-    let mut terrain = TerrainPass::new(&device, format);
+    let mut terrain = TerrainPass::new(&device, &queue, format);
     terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
     terrain.set_camera(&queue, camera(), 1.0);
     terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
@@ -184,24 +197,81 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
 
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
-fn the_atlas_texels_come_back_byte_identical() {
+fn the_atlas_texels_come_back_lit_by_the_lightmap() {
+    // The reference-gradient check for the colour-space policy (the spec's appendix C.1): the
+    // fragment's colour is the atlas texel times the vertex colour times the lightmap's cell,
+    // with nothing converted on the way in or out.
+    let light = light_cell(15, 15);
+    assert_eq!(light, [252, 252, 252, 255], "the lightmap's brightest cell");
     let (device, queue) = headless_device();
     let mut mesh = ChunkMesh::default();
     push_quad(
         &mut mesh,
         Layer::Opaque,
         covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
-        [255, 255, 255, 255],
+        WHITE,
     );
     let pixels = render_terrain(&device, &queue, &atlas(2, 2, &FOUR_TEXELS), &mesh);
 
-    // One pixel per texel, each sampling the middle of its quadrant. The bytes must match the
-    // uploaded texel exactly: this is the reference check for the non-sRGB policy, which is
-    // also what makes the shader's colour multiplies match the client's.
-    expect_texel(&pixels, 16, 16, FOUR_TEXELS[0], "the top-left texel");
-    expect_texel(&pixels, 48, 16, FOUR_TEXELS[1], "the top-right texel");
-    expect_texel(&pixels, 16, 48, FOUR_TEXELS[2], "the bottom-left texel");
-    expect_texel(&pixels, 48, 48, FOUR_TEXELS[3], "the bottom-right texel");
+    // One pixel per texel, each sampling the middle of its quadrant: the read-back is the
+    // texel times 252/255 exactly, so a texel of 255 reads back 252 and a black one stays 0.
+    expect_texel(
+        &pixels,
+        16,
+        16,
+        shaded(FOUR_TEXELS[0], WHITE, light),
+        "the lit top-left texel",
+    );
+    expect_texel(
+        &pixels,
+        48,
+        16,
+        shaded(FOUR_TEXELS[1], WHITE, light),
+        "the lit top-right texel",
+    );
+    expect_texel(
+        &pixels,
+        16,
+        48,
+        shaded(FOUR_TEXELS[2], WHITE, light),
+        "the lit bottom-left texel",
+    );
+    expect_texel(
+        &pixels,
+        48,
+        48,
+        shaded(FOUR_TEXELS[3], WHITE, light),
+        "the lit bottom-right texel",
+    );
+
+    // The same quads at the lightmap's floor, the darkest dark: every texel comes back times
+    // 14/255. A light pair that sampled the wrong axis, or a lightmap texture whose bytes were
+    // converted to another colour space, would read something else here.
+    let dark = light_cell(0, 0);
+    assert_eq!(dark, [14, 14, 14, 255], "the lightmap's floor");
+    let mut mesh = ChunkMesh::default();
+    push_quad_with_light(
+        &mut mesh,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
+        WHITE,
+        [LOW_LIGHT; 2],
+    );
+    let pixels = render_terrain(&device, &queue, &atlas(2, 2, &FOUR_TEXELS), &mesh);
+    expect_texel(
+        &pixels,
+        16,
+        16,
+        shaded(FOUR_TEXELS[0], WHITE, dark),
+        "the dim top-left texel",
+    );
+    expect_texel(
+        &pixels,
+        48,
+        48,
+        shaded(FOUR_TEXELS[3], WHITE, dark),
+        "the dim bottom-right texel",
+    );
 }
 
 #[test]
@@ -221,18 +291,21 @@ fn nearest_magnification_samples_the_nearer_texel() {
     );
     let pixels = render_terrain(&device, &queue, &atlas(2, 2, &FOUR_TEXELS), &mesh);
 
+    // The fragment is lit by the lightmap's brightest cell like every other fixture here, so
+    // each texel comes back through that factor.
+    let light = light_cell(15, 15);
     expect_texel(
         &pixels,
         16,
         32,
-        FOUR_TEXELS[0],
+        shaded(FOUR_TEXELS[0], WHITE, light),
         "the pixel nearer the left texel",
     );
     expect_texel(
         &pixels,
         48,
         32,
-        FOUR_TEXELS[1],
+        shaded(FOUR_TEXELS[1], WHITE, light),
         "the pixel nearer the right texel",
     );
 }
@@ -244,7 +317,9 @@ fn the_translucent_layer_blends_over_the_opaque_one() {
     let mut mesh = ChunkMesh::default();
     // A green opaque quad three units out, and a red half-transparent one in front of it.
     // The white stand-in atlas carries the colours, so the blend's own arithmetic is what the
-    // read-back shows: 50% of red over green is (128, 127, 0) byte-exact.
+    // read-back shows — through the brightness every terrain fragment takes: the lightmap's
+    // brightest cell scales both surfaces by 252/255, so 128/255 of red over green is
+    // (126, 126, 0) byte-exact, half a byte above the 125.5 the green channel lands on.
     push_quad(
         &mut mesh,
         Layer::Opaque,
@@ -268,12 +343,12 @@ fn the_translucent_layer_blends_over_the_opaque_one() {
         &pixels,
         SIZE / 2,
         SIZE / 2,
-        [128, 127, 0],
+        [126, 126, 0],
         "the blended centre",
     );
     // The translucent quad covers the whole frame, so a pixel well away from the centre is
     // the same blend: the result does not depend on where in the quad it lands.
-    expect_pixel_exact(&pixels, 16, 48, [128, 127, 0], "a blended pixel off centre");
+    expect_pixel_exact(&pixels, 16, 48, [126, 126, 0], "a blended pixel off centre");
 }
 
 #[test]
@@ -299,18 +374,20 @@ fn the_cutout_layer_discards_the_zero_alpha_texel() {
     );
     let pixels = render_terrain(&device, &queue, &atlas(2, 2, &CUTOUT_TEXELS), &mesh);
 
+    // The surface behind the discarded fragment is the lit white quad: the lightmap's
+    // brightest cell scales it to 252, which is the strongest a lit surface can read back.
     expect_pixel(
         &pixels,
         16,
         32,
-        [255, 255, 255],
+        [252, 252, 252],
         "the surface behind the discarded fragment",
     );
     expect_texel(
         &pixels,
         48,
         32,
-        CUTOUT_TEXELS[1],
+        shaded(CUTOUT_TEXELS[1], WHITE, light_cell(15, 15)),
         "the fragment the cutout layer keeps",
     );
 }
@@ -339,18 +416,20 @@ fn the_translucent_layer_discards_the_below_threshold_texel() {
     );
     let pixels = render_terrain(&device, &queue, &atlas(2, 2, &TRANSLUCENT_TEXELS), &mesh);
 
+    // The lit white surface behind the discarded fragment, and the kept fragment: an opaque
+    // texel blended over the lit surface is that texel times the lightmap's cell.
     expect_pixel(
         &pixels,
         16,
         32,
-        [255, 255, 255],
+        [252, 252, 252],
         "the surface behind the discarded translucent fragment",
     );
     expect_texel(
         &pixels,
         48,
         32,
-        TRANSLUCENT_TEXELS[1],
+        shaded(TRANSLUCENT_TEXELS[1], WHITE, light_cell(15, 15)),
         "the translucent fragment above the threshold",
     );
 }
@@ -369,7 +448,14 @@ fn the_multi_level_atlas_reads_back_every_level_it_writes() {
         [255, 255, 255, 255],
     );
     let pixels = render_terrain(&device, &queue, &levelled_atlas(), &magnified);
-    expect_texel(&pixels, 16, 32, LEVEL_TEXELS[0], "the magnified level 0");
+    let light = light_cell(15, 15);
+    expect_texel(
+        &pixels,
+        16,
+        32,
+        shaded(LEVEL_TEXELS[0], WHITE, light),
+        "the magnified level 0",
+    );
 
     // The same atlas sampled 32 times over: every fragment's level of detail passes the
     // chain's deepest level, so the sampler clamps there and the read-back is level 2's blue
@@ -383,35 +469,173 @@ fn the_multi_level_atlas_reads_back_every_level_it_writes() {
         [255, 255, 255, 255],
     );
     let pixels = render_terrain(&device, &queue, &levelled_atlas(), &minified);
+    let light = light_cell(15, 15);
     expect_texel(
         &pixels,
         16,
         32,
-        LEVEL_TEXELS[2],
+        shaded(LEVEL_TEXELS[2], WHITE, light),
         "the clamped deepest level",
     );
     expect_texel(
         &pixels,
         48,
         16,
-        LEVEL_TEXELS[2],
+        shaded(LEVEL_TEXELS[2], WHITE, light),
         "another pixel of the same level",
     );
 }
 
+/// The lightmap the pass builds its texture with: the client's own starting image — the
+/// Overworld's brightness table, `getSunBrightness` at the noon angle and the default gamma
+/// (`World.java:1418-1427`, `GameSettings.java:171`).
+///
+/// The read-backs below are computed from it rather than from the texels alone, because the
+/// fragment stage multiplies the atlas texel by it. Its brightest cell is 252 and not 255: the
+/// source's closing `* 0.96 + 0.03` chain leaves the full-day cell at 0.99, so even a fully lit
+/// surface reads back a little darker than its texture. Its floor is the darkest dark, 14.
+fn lightmap() -> [u8; 16 * 16 * 4] {
+    lightmap_image(&BrightnessTable::overworld(), 1.0, 0.0)
+}
+
+/// One cell of [`lightmap`] as RGBA, addressed through the module's own convention: the block
+/// level across, the sky level down.
+fn light_cell(block: u8, sky: u8) -> [u8; 4] {
+    let (u, v) = sample_index(sky, block);
+    let image = lightmap();
+    let index = ((v * 16 + u) * 4) as usize;
+    [
+        image[index],
+        image[index + 1],
+        image[index + 2],
+        image[index + 3],
+    ]
+}
+
+/// An opaque white vertex colour, which the fixtures whose colour is not the point carry.
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+/// A texel as the fragment's maths produces it: the atlas texel times the vertex colour times
+/// the lightmap's cell. A byte is a 255th, so three of them multiply into a 65025th and the
+/// byte comes back rounded to the nearest: `(texel * colour * light + 32512) / 65025`.
+///
+/// The GPU multiplies the three unorm values in floating point; the product of three integers
+/// over 65025 is never exactly a half-integer, so this integer form and the GPU's rounding
+/// agree byte for byte.
+fn shaded(texel: [u8; 4], colour: [u8; 4], light: [u8; 4]) -> [u8; 4] {
+    let channel = |index: usize| {
+        ((u32::from(texel[index]) * u32::from(colour[index]) * u32::from(light[index]) + 32512)
+            / 65025) as u8
+    };
+    [channel(0), channel(1), channel(2), channel(3)]
+}
+
+/// A colour as the target's unorm bytes: each float times 255, rounded.
+fn unorm_bytes(colour: [f32; 3]) -> [u8; 3] {
+    let channel = |index: usize| (colour[index] * 255.0).round() as u8;
+    [channel(0), channel(1), channel(2)]
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_frames_fog_fades_the_terrain_towards_its_colour() {
+    // The Overworld's colour at dusk, and a frame whose fade starts two units from the eye and
+    // reaches full strength at six. A quad at each distance shows the three states of the mix:
+    // at the start the surface keeps its whole colour, at the end it is the fog colour, and
+    // between them it is the two mixed — `clamp((end - depth) / (end - start), 0, 1)`.
+    let colour = fog_colour(0, 14000.0, 64.0, 0.03125);
+    let fog = FogParams {
+        colour,
+        start: 2.0,
+        end: 6.0,
+        far_plane: 8.0,
+    };
+    let (device, queue) = headless_device();
+    let lit = shaded(WHITE, WHITE, light_cell(15, 15));
+
+    let frame = |depth: f32| -> Vec<u8> {
+        let mut mesh = ChunkMesh::default();
+        push_quad(
+            &mut mesh,
+            Layer::Opaque,
+            covering_quad(depth, [[0.0, 0.0], [1.0, 1.0]]),
+            WHITE,
+        );
+        render_terrain_with_fog(
+            &device,
+            &queue,
+            &solid_atlas(4, [255, 255, 255, 255]),
+            &mesh,
+            Some(fog),
+        )
+    };
+
+    // At the fade's start the factor is one: the lit surface, unreached by the fog.
+    expect_pixel(
+        &frame(2.0),
+        SIZE / 2,
+        SIZE / 2,
+        [252, 252, 252],
+        "the surface at the fade's start",
+    );
+    // At its end the factor is zero: the frame's fog colour alone.
+    expect_pixel(
+        &frame(6.0),
+        SIZE / 2,
+        SIZE / 2,
+        unorm_bytes(colour),
+        "the surface at the fade's end",
+    );
+    // Halfway between them the factor is a half, and the fragment is the two mixed.
+    let lit_f = [
+        f32::from(lit[0]) / 255.0,
+        f32::from(lit[1]) / 255.0,
+        f32::from(lit[2]) / 255.0,
+    ];
+    let mixed = [
+        colour[0] * 0.5 + lit_f[0] * 0.5,
+        colour[1] * 0.5 + lit_f[1] * 0.5,
+        colour[2] * 0.5 + lit_f[2] * 0.5,
+    ];
+    expect_pixel(
+        &frame(4.0),
+        SIZE / 2,
+        SIZE / 2,
+        unorm_bytes(mixed),
+        "the surface halfway through the fade",
+    );
+}
+
 /// Renders one mesh through the terrain pass with one atlas and reads the frame back.
+///
+/// The frame draws with no fog set, which is the pass's own default: the shader's mix leaves
+/// every fragment as it is.
 fn render_terrain(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     atlas: &Atlas,
     mesh: &ChunkMesh,
 ) -> Vec<u8> {
+    render_terrain_with_fog(device, queue, atlas, mesh, None)
+}
+
+/// Renders one mesh through the terrain pass with one atlas and `fog`, reads the frame back.
+fn render_terrain_with_fog(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atlas: &Atlas,
+    mesh: &ChunkMesh,
+    fog: Option<FogParams>,
+) -> Vec<u8> {
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let target = create_target(device, format);
     let depth = create_depth(device);
-    let mut terrain = TerrainPass::new(device, format);
+    let mut terrain = TerrainPass::new(device, queue, format);
     terrain.set_atlas(device, queue, atlas);
     terrain.set_camera(queue, frame_camera(), 1.0);
+    if let Some(fog) = fog {
+        terrain.set_fog(queue, fog);
+    }
     // The vertices are world-space; the key only decides which draw entry carries them, and
     // it is a section the frustum keeps (chunk -1, -1, section 0).
     terrain.upload(device, queue, (-1, -1, 0), mesh);
@@ -534,11 +758,25 @@ fn covering_quad(depth: f32, uv: [[f32; 2]; 2]) -> [([f32; 3], [f32; 2]); 4] {
 }
 
 /// Appends one textured quad to `mesh`'s layer: four corners, then six indices.
+///
+/// The corners carry [`FULL_LIGHT`]; a quad that needs another light uses
+/// [`push_quad_with_light`].
 fn push_quad(
     mesh: &mut ChunkMesh,
     layer: Layer,
     corners: [([f32; 3], [f32; 2]); 4],
     colour: [u8; 4],
+) {
+    push_quad_with_light(mesh, layer, corners, colour, [FULL_LIGHT; 2]);
+}
+
+/// Appends one textured quad whose corners all carry `light`.
+fn push_quad_with_light(
+    mesh: &mut ChunkMesh,
+    layer: Layer,
+    corners: [([f32; 3], [f32; 2]); 4],
+    colour: [u8; 4],
+    light: [u16; 2],
 ) {
     let target = &mut mesh.layers[layer.index()];
     let base = target.vertices.len() as u32;
@@ -546,7 +784,7 @@ fn push_quad(
         target.vertices.push(Vertex {
             position,
             uv,
-            light: [FULL_SKY; 2],
+            light,
             colour,
         });
     }
@@ -813,7 +1051,7 @@ fn push_face(mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], brightness: f32, colo
         layer.vertices.push(Vertex {
             position,
             uv,
-            light: [FULL_SKY; 2],
+            light: [FULL_LIGHT; 2],
             colour: [shade(0), shade(1), shade(2), 255],
         });
     }

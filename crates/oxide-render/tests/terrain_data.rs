@@ -8,7 +8,7 @@ fn a_vertex_is_twenty_eight_bytes_of_little_endian_fields() {
     let vertex = Vertex {
         position: [1.0, 2.0, 3.0],
         uv: [0.5, 0.25],
-        light: [248, 8],
+        light: [8, 248],
         colour: [255, 128, 64, 255],
     };
     let bytes = vertex_bytes(&[vertex]);
@@ -23,9 +23,9 @@ fn a_vertex_is_twenty_eight_bytes_of_little_endian_fields() {
             // The uv: two f32, 0.5 and 0.25.
             0x00, 0x00, 0x00, 0x3f, // 0.5
             0x00, 0x00, 0x80, 0x3e, // 0.25
-            // The light: two u16, 248 and 8, sky first.
-            0xf8, 0x00, // 248
+            // The light: two u16, the block field 8 and the sky field 248.
             0x08, 0x00, // 8
+            0xf8, 0x00, // 248
             // The colour: four u8, no padding between the light and it.
             0xff, 0x80, 0x40, 0xff,
         ]

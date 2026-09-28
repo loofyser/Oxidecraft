@@ -189,9 +189,11 @@ impl ColumnSnapshot {
 
     /// The light at a column-local position, as `(sky, block)` levels.
     ///
-    /// The order matches the packed pair a vertex carries: sky first, then
-    /// block. `x` and `z` may reach one cell out into the collar; `y` is
-    /// 0..256. Anything outside answers `(0, 0)`.
+    /// The order is the lightmap image's own index order — the sky level down
+    /// its rows, the block level across its columns (`EntityRenderer.java:934-937`)
+    /// — which is the reverse of the pair a vertex's light attribute carries
+    /// (block first, `light_attribute`). `x` and `z` may reach one cell out into
+    /// the collar; `y` is 0..256. Anything outside answers `(0, 0)`.
     pub fn light(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
         if !in_collar(x, z) || !in_height(y) {
             return (0, 0);

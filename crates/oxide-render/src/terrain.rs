@@ -8,9 +8,13 @@ pub struct Vertex {
     pub position: [f32; 3],
     /// Atlas uv of the corner, in level-0 texture coordinates.
     pub uv: [f32; 2],
-    /// The light sampled at the corner, as the packed `(sky, block)` pair the
-    /// client's light sampler produces: each channel is the 0..15 level shifted
-    /// left four bits with eight added, so a full-sky corner is 248.
+    /// The light sampled at the corner, as the pair the client's light sampler
+    /// produces: each channel is the 0..15 level shifted left four bits with
+    /// eight added, so a full-sky corner is 248. The first channel is the block
+    /// field and the second the sky field — the order the client hands the two
+    /// to `glMultiTexCoord2f` (`ItemRenderer.java:113-116`) — so the first
+    /// addresses the lightmap's column, which is the block level, and the
+    /// second its row, the sky level.
     pub light: [u16; 2],
     /// Linear colour, already multiplied by the face brightness and the tint.
     pub colour: [u8; 4],

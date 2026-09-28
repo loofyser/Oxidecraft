@@ -9,11 +9,17 @@ use winit::window::Window;
 use oxide_assets::atlas::Atlas;
 
 use crate::camera::Camera;
+use crate::fog::FogParams;
 use crate::overlay::OverlayPass;
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 
-/// The sky colour the window is cleared to, as vanilla 1.8.9 clears it.
+/// The sky colour the window is cleared to when the frame has no fog, as vanilla 1.8.9 clears
+/// it.
+///
+/// The first frame of a session has no fog to clear to — nothing has computed the world's own
+/// colour yet — and a session without an asset store has no world at all, so the clear is this
+/// constant until [`Renderer::set_fog`] gives the frame its colour.
 pub const SKY_COLOR: wgpu::Color = wgpu::Color {
     r: 0.62,
     g: 0.76,
@@ -69,11 +75,13 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 /// Owns the GPU objects for one window: the surface, the device, the queue, the depth texture
 /// and the two passes that draw into the frame.
 ///
-/// [`Renderer::render`] clears the window to [`SKY_COLOR`] and the depth buffer to the far
-/// plane, draws the section meshes through the terrain pass and the debug overlay over them,
-/// then presents the frame. A frame with no camera set draws no terrain — and neither does one
-/// with no atlas: the clear is the whole picture, which is what the M0 smoke run shows and
-/// what a session that has not loaded an asset store yet draws.
+/// [`Renderer::render`] clears the window to the frame's fog colour — the sky the terrain fades
+/// towards, so the two agree where the terrain ends — and the depth buffer to the far plane,
+/// draws the section meshes through the terrain pass and the debug overlay over them, then
+/// presents the frame. Until [`Renderer::set_fog`] gives a frame its fog, the clear is
+/// [`SKY_COLOR`]. A frame with no camera set draws no terrain — and neither does one with no
+/// atlas: the clear is the whole picture, which is what the M0 smoke run shows and what a
+/// session that has not loaded an asset store yet draws.
 pub struct Renderer {
     /// The presentable surface attached to the window.
     surface: wgpu::Surface<'static>,
@@ -93,6 +101,8 @@ pub struct Renderer {
     overlay: OverlayPass,
     /// The camera the next frame is drawn with, until a new one is set.
     camera: Option<Camera>,
+    /// The fog the next frames are drawn and cleared with, until a new one is set.
+    fog: Option<FogParams>,
 }
 
 impl Renderer {
@@ -139,13 +149,35 @@ impl Renderer {
         .map_err(RendererError::NoDevice)?;
 
         let capabilities = surface.get_capabilities(&adapter);
+        // The surface is configured with a format that is *not* sRGB. The client's whole
+        // fragment chain — the atlas texels, the vertex colours and the lightmap — is written
+        // in the space its bytes describe, with no transfer function anywhere
+        // (`docs/DIVERGENCES.md` records the policy and `docs/specs/oxidecraft-v1-design.md`
+        // §C.1 the colour space), so a linear-to-sRGB conversion at the swapchain would brighten
+        // the whole picture against the reference. `Bgra8Unorm` is preferred where the surface
+        // offers it, then the first format that is not sRGB, and a surface that offers nothing
+        // else keeps its first format with a warning: there the conversion cannot be avoided.
         let format = capabilities
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
+            .find(|format| *format == wgpu::TextureFormat::Bgra8Unorm)
+            .or_else(|| {
+                capabilities
+                    .formats
+                    .iter()
+                    .copied()
+                    .find(|format| !format.is_srgb())
+            })
             .or_else(|| capabilities.formats.first().copied())
             .ok_or(RendererError::NoSurfaceFormat)?;
+        if format.is_srgb() {
+            tracing::warn!(
+                ?format,
+                "the surface offers no format that is not sRGB; the window converts the client's \
+                 colour space and the picture will read brighter than the reference"
+            );
+        }
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -171,7 +203,7 @@ impl Renderer {
             "surface configured"
         );
 
-        let terrain = TerrainPass::new(&device, format);
+        let terrain = TerrainPass::new(&device, &queue, format);
         let mut overlay = OverlayPass::new(&device, format);
         overlay.set_size(&queue, config.width as f32, config.height as f32);
         let depth = DepthTarget::new(&device, config.width, config.height);
@@ -186,6 +218,7 @@ impl Renderer {
             terrain,
             overlay,
             camera: None,
+            fog: None,
         })
     }
 
@@ -259,6 +292,19 @@ impl Renderer {
         self.camera = Some(camera);
     }
 
+    /// Sets the fog every following frame is drawn and cleared with.
+    ///
+    /// The colour and the range go to the terrain pass, which mixes them into every terrain
+    /// fragment, and the same colour becomes the clear the sky behind the terrain is drawn in,
+    /// so the two agree where the terrain ends. What the colour is for a given world is the
+    /// caller's step — [`crate::fog::fog_colour`] produces one for a dimension, a time and an
+    /// eye position, and [`crate::fog::linear_params`] the range for a far plane. Until this
+    /// is called the frames clear to [`SKY_COLOR`] and draw no terrain fog at all.
+    pub fn set_fog(&mut self, params: FogParams) {
+        self.terrain.set_fog(&self.queue, params);
+        self.fog = Some(params);
+    }
+
     /// Sets the overlay lines drawn this frame; empty hides the overlay.
     ///
     /// The lines are laid out and uploaded on the call, so a frame draws exactly the lines the
@@ -269,10 +315,12 @@ impl Renderer {
 
     /// Draws the frame and presents it.
     ///
-    /// The colour and depth attachments are cleared in the terrain pass, which draws every
-    /// section mesh the frame's frustum keeps when a camera and an atlas have both been set;
-    /// the overlay pass then draws the debug lines over the result, in a pass without a depth
-    /// attachment, so no terrain can hide the text.
+    /// The colour and depth attachments are cleared in the terrain pass: the colour to the
+    /// frame's fog colour, so the sky behind the terrain is the colour the terrain fades to,
+    /// and the depth to the far plane. The pass draws every section mesh the frame's frustum
+    /// keeps when a camera and an atlas have both been set; the overlay pass then draws the
+    /// debug lines over the result, in a pass without a depth attachment, so no terrain can
+    /// hide the text.
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
@@ -289,6 +337,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("oxide-render encoder"),
             });
+        let clear = clear_colour(self.fog);
         {
             let mut terrain_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("oxide-render terrain pass"),
@@ -297,7 +346,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -338,6 +387,23 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+/// The colour the window is cleared to: the frame's fog colour when one is set, so the sky
+/// behind the terrain is the colour the terrain fades towards, and [`SKY_COLOR`] otherwise.
+///
+/// The fog colour's three components are the shader's, handed to the clear as they are; the
+/// alpha is opaque, because the surface is.
+fn clear_colour(fog: Option<FogParams>) -> wgpu::Color {
+    match fog {
+        Some(params) => wgpu::Color {
+            r: params.colour[0] as f64,
+            g: params.colour[1] as f64,
+            b: params.colour[2] as f64,
+            a: 1.0,
+        },
+        None => SKY_COLOR,
     }
 }
 
@@ -419,11 +485,34 @@ mod tests {
 
     use wgpu::SurfaceError;
 
-    use super::{SurfaceAction, block_on, classify_surface_error};
+    use super::{SKY_COLOR, SurfaceAction, block_on, classify_surface_error, clear_colour};
+    use crate::fog::{FogParams, fog_colour};
 
     #[test]
     fn block_on_returns_the_output_of_a_ready_future() {
         assert_eq!(block_on(async { 7_u32 + 1 }), 8);
+    }
+
+    #[test]
+    fn a_frame_with_no_fog_clears_to_the_sky_colour() {
+        assert_eq!(clear_colour(None), SKY_COLOR);
+    }
+
+    #[test]
+    fn a_frame_with_a_fog_clears_to_the_fogs_own_colour() {
+        // The Overworld's colour at noon and the eye on the ground: the base exactly, as
+        // `World.getFogColor` hands it over (`fog_colour`'s own test pins the value).
+        let colour = fog_colour(0, 6000.0, 64.0, 0.03125);
+        let clear = clear_colour(Some(FogParams {
+            colour,
+            start: 24.0,
+            end: 32.0,
+            far_plane: 32.0,
+        }));
+        assert!((clear.r - f64::from(colour[0])).abs() < 1e-9);
+        assert!((clear.g - f64::from(colour[1])).abs() < 1e-9);
+        assert!((clear.b - f64::from(colour[2])).abs() < 1e-9);
+        assert_eq!(clear.a, 1.0, "the surface is opaque");
     }
 
     #[test]
