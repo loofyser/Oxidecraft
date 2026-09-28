@@ -10,7 +10,7 @@ specification and continue without asking questions that are already answered he
 
 - Stage: **milestone M2 (textured terrain) is in progress** — spec section 13 of
   `docs/specs/oxidecraft-v1-design.md` (v5), plan `docs/plans/2026-09-27-m2-textured-terrain.md`
-  (sixteen tasks, approved by the owner on 2026-09-27). Seven tasks are closed and independently
+  (sixteen tasks, approved by the owner on 2026-09-27). Eight tasks are closed and independently
   reviewed: Task 1 (`856cbec..864ffcd`) closed the M1 code backlog and added the bulk-column replay
   through the session; Task 2 (`864ffcd..e4f53e4`) added the PNG texture loader, the `.mcmeta` parser
   and `TextureSet`; Task 3 (`e4f53e4..46e4c5e`) added the blockstate and model loader with the 1.8
