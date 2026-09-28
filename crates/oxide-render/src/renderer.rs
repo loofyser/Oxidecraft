@@ -6,6 +6,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use oxide_assets::atlas::Atlas;
+
 use crate::camera::Camera;
 use crate::overlay::OverlayPass;
 use crate::terrain::{ChunkMesh, SectionKey};
@@ -69,8 +71,9 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 ///
 /// [`Renderer::render`] clears the window to [`SKY_COLOR`] and the depth buffer to the far
 /// plane, draws the section meshes through the terrain pass and the debug overlay over them,
-/// then presents the frame. A frame with no camera set draws no terrain: the clear is the
-/// whole picture, which is what the M0 smoke run shows.
+/// then presents the frame. A frame with no camera set draws no terrain — and neither does one
+/// with no atlas: the clear is the whole picture, which is what the M0 smoke run shows and
+/// what a session that has not loaded an asset store yet draws.
 pub struct Renderer {
     /// The presentable surface attached to the window.
     surface: wgpu::Surface<'static>,
@@ -224,14 +227,27 @@ impl Renderer {
 
     /// Replaces the mesh for a section; `None` removes it.
     ///
-    /// The mesh is uploaded to the GPU as it is, and an empty mesh removes the section's mesh
-    /// instead, so a section that stopped drawing costs nothing. Task 11 calls this once per
-    /// section of every column the session rebuilds.
+    /// Each non-empty layer of the mesh is uploaded on its own and a layer the mesh draws
+    /// nothing in is removed, so a section whose water vanished frees its translucent buffers
+    /// too. An empty mesh removes the section's mesh instead, so a section that stopped
+    /// drawing costs nothing. Task 11 calls this once per section of every column the session
+    /// rebuilds.
     pub fn set_section_mesh(&mut self, key: SectionKey, mesh: Option<&ChunkMesh>) {
         match mesh {
             Some(mesh) => self.terrain.upload(&self.device, &self.queue, key, mesh),
             None => self.terrain.remove(key),
         }
+    }
+
+    /// Uploads the block atlas the terrain draws with.
+    ///
+    /// The atlas is uploaded once and bound for every frame that follows; calling this again
+    /// replaces it, dropping the old texture and its bind group. Until an atlas is set the
+    /// terrain pass issues no draw calls, so a session that has no asset store yet — the
+    /// shipping client sets one from its bootstrap — still renders its clear colour rather
+    /// than sampling an unbound texture. M6 re-uploads here when an animated sprite advances.
+    pub fn set_atlas(&mut self, atlas: &Atlas) {
+        self.terrain.set_atlas(&self.device, &self.queue, atlas);
     }
 
     /// Sets the camera for the next frame.
@@ -254,9 +270,9 @@ impl Renderer {
     /// Draws the frame and presents it.
     ///
     /// The colour and depth attachments are cleared in the terrain pass, which draws every
-    /// section mesh in the table when a camera has been set; the overlay pass then draws the
-    /// debug lines over the result, in a pass without a depth attachment, so no terrain can
-    /// hide the text.
+    /// section mesh the frame's frustum keeps when a camera and an atlas have both been set;
+    /// the overlay pass then draws the debug lines over the result, in a pass without a depth
+    /// attachment, so no terrain can hide the text.
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame

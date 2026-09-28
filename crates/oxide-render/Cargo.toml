@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 glam = "0.32"
+oxide-assets.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true

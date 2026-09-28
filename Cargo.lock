@@ -1622,6 +1622,7 @@ name = "oxide-render"
 version = "0.0.0"
 dependencies = [
  "glam",
+ "oxide-assets",
  "thiserror 2.0.20",
  "tracing",
  "wgpu",
