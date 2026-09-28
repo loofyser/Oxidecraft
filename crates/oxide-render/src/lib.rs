@@ -9,5 +9,6 @@ pub mod frustum;
 pub mod lightmap;
 pub mod overlay;
 pub mod renderer;
+pub mod sky;
 pub mod terrain;
 pub mod terrain_pass;

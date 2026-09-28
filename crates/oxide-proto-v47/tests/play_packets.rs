@@ -5,7 +5,7 @@ use std::io::{Cursor, ErrorKind};
 use oxide_proto::codec::CodecError;
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, JoinGame, KeepAlive, PlayDisconnect, PlayerListItem, PlayerPositionAndLook,
+    self, JoinGame, KeepAlive, PlayDisconnect, PlayerListItem, PlayerPositionAndLook, TimeUpdate,
 };
 use oxide_proto_v47::serverbound::{
     ClientSettings, ClientStatusAction, client_settings_payload, player_position_and_look_payload,
@@ -54,6 +54,39 @@ fn join_game_decodes_all_seven_fields() {
     assert_eq!((difficulty, max_players), (1, 20));
     assert_eq!(level_type, "default");
     assert!(!reduced_debug_info);
+}
+
+#[test]
+fn time_update_reads_the_age_and_the_time_of_day() {
+    // The 0x03 layout: the id, then the world's age and the time of day, each a
+    // big-endian i64. The time is negative here, the shape a server sends while
+    // the sun is frozen (S03PacketTimeUpdate negates worldTime).
+    let mut body = vec![0x03];
+    body.extend_from_slice(&48_000i64.to_be_bytes());
+    body.extend_from_slice(&(-6001i64).to_be_bytes());
+    let TimeUpdate {
+        world_age,
+        time_of_day,
+    } = TimeUpdate::decode(&body[1..]).expect("decode");
+    assert_eq!(world_age, 48_000, "the world's age");
+    assert_eq!(time_of_day, -6001, "the time of day, sign kept");
+    assert_eq!(TimeUpdate::ID, 0x03, "the packet id");
+}
+
+#[test]
+fn a_time_update_with_extra_bytes_is_refused() {
+    // The trailing check keeps the two i64s honest: /time set 6000 arrives with
+    // a positive time and nothing after it.
+    let mut body = vec![0x03];
+    body.extend_from_slice(&48_000i64.to_be_bytes());
+    body.extend_from_slice(&6000i64.to_be_bytes());
+    let decoded = TimeUpdate::decode(&body[1..]).expect("decode");
+    assert_eq!(decoded.time_of_day, 6000);
+    body.push(0);
+    assert!(
+        TimeUpdate::decode(&body[1..]).is_err(),
+        "an extra byte is refused"
+    );
 }
 
 #[test]

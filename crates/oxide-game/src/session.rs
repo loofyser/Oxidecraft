@@ -4,7 +4,10 @@
 //! world store, and the column meshes (plan Decision 3). It logs in, answers
 //! everything a vanilla server expects of a client — the keepalive echo, the
 //! teleport echo, Client Settings and the brand plugin message — and reports
-//! what the window draws through a [`ClientEvent`] channel.
+//! what the window draws through a [`ClientEvent`] channel. The world clock
+//! rides along: every Time Update is reported, and the sky the clock and the
+//! view block produce is computed here and reported with it, because the
+//! window's own crate may not reach the world store.
 //!
 //! A packet the client has no use for is skipped, and one whose id it cannot
 //! even name is not fatal (spec S2), so a proxy or a modded server cannot end
@@ -29,7 +32,7 @@ use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
     self, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk, PlayDisconnect,
-    PlayerListItem, PlayerPositionAndLook, PluginMessage, read_packet_id,
+    PlayerListItem, PlayerPositionAndLook, PluginMessage, TimeUpdate, read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -39,6 +42,9 @@ use oxide_proto_v47::serverbound::{
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
 use oxide_world::biome::{ColorMap, TintMaps};
+use oxide_world::sky::{
+    celestial_angle, cloud_colour, sky_colour, star_brightness, sun_brightness,
+};
 use oxide_world::world::World;
 use tracing::{debug, info, warn};
 
@@ -187,6 +193,35 @@ pub enum ClientEvent {
         /// Absolute pitch in degrees.
         pitch: f32,
     },
+    /// Time Update arrived: the world's clock.
+    ///
+    /// The time of day is the value the celestial angle and the moon phase are read from, and a
+    /// negative one is the frozen-sun convention (`S03PacketTimeUpdate.java:17-31`): the sign is
+    /// reported as received. The age is carried for later work.
+    Time {
+        /// The world's age in ticks.
+        world_age: i64,
+        /// The world's time of day in ticks; negative while the sun is frozen.
+        time_of_day: i64,
+    },
+    /// The sky the session's world and view block produce, from the last clock.
+    ///
+    /// The session computes these because its client may not: `oxide-client` has no edge to
+    /// `oxide-world`, and `oxide-render` may not reach it at all, so the five world-derived
+    /// values travel with the event. `partial_ticks` is zero (M2 has no tick loop) and the rain
+    /// strength is zero (no weather packets are decoded yet).
+    Sky {
+        /// The celestial angle in `0..1`, from the world time.
+        celestial_angle: f32,
+        /// The sky's colour at the view block's biome.
+        colour: [f32; 3],
+        /// The sun's brightness.
+        sun_brightness: f32,
+        /// The stars' brightness, the rain already folded in.
+        star_brightness: f32,
+        /// The clouds' tint.
+        cloud_colour: [f32; 3],
+    },
     /// A column's meshes were (re)built; `None` means the section now draws
     /// nothing.
     ChunkUpdated {
@@ -302,6 +337,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
 
         let mut world: Option<World> = None;
         let mut position = Position::default();
+        let mut clock: Option<i64> = None;
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
         let mut pending: VecDeque<(i32, i32)> = VecDeque::new();
 
@@ -380,6 +416,21 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             pitch: position.pitch,
                         },
                     );
+                    // The view block moved: the sky's colour is sampled at the player's own
+                    // block, so a teleport can change it without a new clock.
+                    report_sky(world.as_ref(), position, clock, events);
+                }
+                TimeUpdate::ID => {
+                    let update = decoded(id, TimeUpdate::decode(body))?;
+                    clock = Some(update.time_of_day);
+                    report(
+                        events,
+                        ClientEvent::Time {
+                            world_age: update.world_age,
+                            time_of_day: update.time_of_day,
+                        },
+                    );
+                    report_sky(world.as_ref(), position, clock, events);
                 }
                 ChunkData::ID => {
                     let Some(store) = world.as_mut() else {
@@ -682,6 +733,46 @@ fn decoded<T>(id: i32, result: Result<T, PacketError>) -> Result<T, SessionError
 /// Reports one event; a window that stopped listening is not an error here.
 fn report(events: &Sender<ClientEvent>, event: ClientEvent) {
     let _ = events.send(event);
+}
+
+/// Reports the sky the clock and the view block produce, when both are known.
+///
+/// The angle and the colours come from the world clock; the block is the render-view entity's
+/// own, floored exactly as `World.getSkyColor` floors it (`World.java:1437-1443`). M2 has no
+/// client tick loop, so the partial tick is zero, and no weather is decoded, so the rain
+/// strength is zero; both are recorded in the module docs and the report. A session with no
+/// clock yet — or no world, as before Join Game — has no sky to report.
+fn report_sky(
+    world: Option<&World>,
+    position: Position,
+    clock: Option<i64>,
+    events: &Sender<ClientEvent>,
+) {
+    let (Some(world), Some(time_of_day)) = (world, clock) else {
+        return;
+    };
+    /// M2 renders from the last update with no tick to interpolate over.
+    const PARTIAL_TICKS: f32 = 0.0;
+    /// No weather packets are decoded yet, so the rain strength is zero.
+    const RAIN_STRENGTH: f32 = 0.0;
+    let angle = celestial_angle(time_of_day, PARTIAL_TICKS);
+    let colour = sky_colour(
+        world,
+        position.x.floor() as i32,
+        position.y.floor() as i32,
+        position.z.floor() as i32,
+        angle,
+    );
+    report(
+        events,
+        ClientEvent::Sky {
+            celestial_angle: angle,
+            colour,
+            sun_brightness: sun_brightness(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
+            star_brightness: star_brightness(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
+            cloud_colour: cloud_colour(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
+        },
+    );
 }
 
 /// Re-meshes a column and its four neighbours (plan Decision 4) and reports

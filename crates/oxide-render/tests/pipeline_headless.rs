@@ -55,13 +55,19 @@ use std::sync::mpsc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
+use oxide_assets::texture::Texture;
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::SKY_COLOR;
+use oxide_render::sky::{
+    CloudPass, SkyParams, SkyPass, SkyTextures, celestial_rotation, star_field,
+};
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
+
+use glam::Vec3;
 
 /// The size of the offscreen target in texels.
 const SIZE: u32 = 64;
@@ -660,6 +666,240 @@ fn the_frames_fog_fades_the_terrain_towards_its_colour() {
         unorm_bytes(mixed),
         "the surface halfway through the fade",
     );
+}
+
+/// The sky and cloud passes at noon, at night and over the cloud layer: the band's read-back,
+/// the star brightness gate and the layer's blend.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
+    // The sky is the pass whose failure mode is a black screen: it draws the frame's background
+    // with no depth writes of its own, so a pipeline that lost its state or its geometry shows
+    // the clear colour instead of the band. The three textures are synthetic stand-ins built
+    // here — no asset store and no Mojang pixel.
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let textures = synthetic_sky_textures();
+    let mut sky = SkyPass::new(&device, &queue, format);
+    sky.set_textures(&device, &queue, &textures.sun, &textures.moon_phases);
+    let mut cloud = CloudPass::new(&device, &queue, format);
+    cloud.set_texture(&device, &queue, &textures.clouds);
+
+    // The band at noon, the fog set to the band's own colour so the read-back is the band.
+    let noon = [120.0 / 255.0, 167.0 / 255.0, 1.0];
+    let day = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: noon,
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        fog_colour: noon,
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+    };
+    let pixels = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        day,
+        sky_camera(65.0, 0.0, -20.0, DEFAULT_FOV),
+        false,
+    );
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        unorm_bytes(noon),
+        "the sky band at noon",
+    );
+
+    // The star gate: a narrow camera aimed at the first star of the source's field, with the
+    // pass given the boost the source's own brightness would never give at noon — the gate is
+    // the pass's, and the star must be drawn when it is above zero and skipped at zero.
+    let star = star_field()[0];
+    let direction = celestial_rotation(0.0)
+        .transform_vector3(Vec3::new(
+            star.centre[0] as f32,
+            star.centre[1] as f32,
+            star.centre[2] as f32,
+        ))
+        .normalize();
+    let yaw = (-direction.x).atan2(direction.z).to_degrees();
+    let pitch = (-direction.y).asin().to_degrees();
+    let night = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.5,
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+    };
+    let camera = sky_camera(65.0, yaw, pitch, 0.5);
+    let lit = render_sky(&device, &queue, &mut sky, &mut cloud, night, camera, false);
+    let mut dark_params = night;
+    dark_params.star_brightness = 0.0;
+    let dark = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        dark_params,
+        camera,
+        false,
+    );
+    assert!(
+        brightest(&lit) >= 16,
+        "the aimed star is drawn when its brightness is above zero: {}",
+        brightest(&lit)
+    );
+    assert!(
+        brightest(&dark) <= 2,
+        "no star pixel is drawn when the brightness is zero: {}",
+        brightest(&dark)
+    );
+
+    // The cloud layer blended over the band: a white texel at the source's 0.8 alpha over the
+    // black night band is 204 exactly, and a layer that lost its blend state or its geometry
+    // reads the band's black instead. The camera looks 30 degrees up, clear of the noon sun.
+    let night_band = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+    };
+    let pixels = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        night_band,
+        sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV),
+        true,
+    );
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        [204, 204, 204],
+        "the cloud layer over the band",
+    );
+}
+
+/// The three synthetic environment textures: flat white stand-ins generated here, with the
+/// source's own sun, moon sheet and cloud sizes.
+fn synthetic_sky_textures() -> SkyTextures {
+    SkyTextures {
+        sun: flat_texture(32, 32),
+        moon_phases: flat_texture(128, 64),
+        clouds: flat_texture(64, 64),
+    }
+}
+
+/// A `width` x `height` texture of one opaque white texel value.
+fn flat_texture(width: u32, height: u32) -> Texture {
+    Texture {
+        width,
+        height,
+        rgba: vec![255u8; (width * height * 4) as usize],
+    }
+}
+
+/// The clear colour for a sky frame, opaque.
+fn sky_clear(colour: [f32; 3]) -> wgpu::Color {
+    wgpu::Color {
+        r: f64::from(colour[0]),
+        g: f64::from(colour[1]),
+        b: f64::from(colour[2]),
+        a: 1.0,
+    }
+}
+
+/// A camera at `feet_y` looking along `yaw` and `pitch`, with `fov` degrees of view.
+fn sky_camera(feet_y: f64, yaw: f32, pitch: f32, fov: f32) -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: [0.5, feet_y, 0.5],
+            yaw,
+            pitch,
+        },
+        fov_degrees: fov,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+    }
+}
+
+/// Draws one sky frame into a fresh target — the sky, then the cloud layer when `clouds` — and
+/// reads it back. Both passes are given `camera` and `params`; the target is cleared to the
+/// frame's sky colour, the colour the source's `updateFogColor` hands `glClearColor`.
+fn render_sky(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    sky: &mut SkyPass,
+    cloud: &mut CloudPass,
+    params: SkyParams,
+    camera: Camera,
+    clouds: bool,
+) -> Vec<u8> {
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(device, format);
+    let depth = create_depth(device);
+    sky.set_params(queue, params);
+    sky.set_camera(queue, camera, 1.0);
+    if clouds {
+        cloud.set_params(queue, params);
+        cloud.set_camera(queue, camera, 1.0);
+    }
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide sky headless encoder"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("oxide sky headless pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(sky_clear(params.sky_colour)),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        sky.draw(&mut pass);
+        if clouds {
+            cloud.draw(&mut pass);
+        }
+    }
+    queue.submit(Some(encoder.finish()));
+    read_pixels(device, queue, &target)
+}
+
+/// The largest colour channel in a read-back; the alpha byte is the opaque surface's and takes
+/// no part.
+fn brightest(pixels: &[u8]) -> u8 {
+    pixels
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .max()
+        .unwrap_or(0)
 }
 
 /// Renders one mesh through the terrain pass with one atlas and reads the frame back.

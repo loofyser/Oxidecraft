@@ -431,7 +431,10 @@ pub fn tint_at_9_biome(
 
 /// The biome id at a column position: the column's biome array when the column
 /// is loaded, the fallback biome's id (ocean, 0) when it is not.
-fn biome_id_at(world: &World, x: i32, z: i32) -> u8 {
+///
+/// The sky's colour samples through this too ([`crate::sky::sky_colour`]),
+/// which is why it is visible to the rest of the crate.
+pub(crate) fn biome_id_at(world: &World, x: i32, z: i32) -> u8 {
     match world.chunk(x >> 4, z >> 4) {
         Some(chunk) => chunk.biome((x & 15) as usize, (z & 15) as usize),
         None => 0,

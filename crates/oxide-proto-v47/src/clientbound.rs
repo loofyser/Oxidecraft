@@ -215,6 +215,37 @@ impl JoinGame {
     }
 }
 
+/// Clientbound Time Update (play id 0x03).
+///
+/// The world's age in ticks and its time of day in ticks, both big-endian `i64`s
+/// (`S03PacketTimeUpdate.java:36-49`). The server negates the time of day to freeze the
+/// sun (`:17-31`), so a negative [`Self::time_of_day`] is kept as received rather than
+/// normalised; the age is the counter that never stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeUpdate {
+    /// The world's age in ticks.
+    pub world_age: i64,
+    /// The world's time of day in ticks; negative while the sun is frozen.
+    pub time_of_day: i64,
+}
+
+impl TimeUpdate {
+    /// The packet id.
+    pub const ID: i32 = 0x03;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let world_age = codec::read_i64(&mut cursor)?;
+        let time_of_day = codec::read_i64(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            world_age,
+            time_of_day,
+        })
+    }
+}
+
 /// Clientbound Player Position And Look (play id 0x08).
 ///
 /// A set flag bit means that value is a delta to apply to the current position;

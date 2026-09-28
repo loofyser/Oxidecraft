@@ -147,6 +147,14 @@ fn keep_alive_frame(id: i32) -> Vec<u8> {
     keep_alive
 }
 
+/// Time Update: the world's age and the time of day, each a big-endian i64.
+fn time_update_frame(world_age: i64, time_of_day: i64) -> Vec<u8> {
+    let mut time = vec![0x03];
+    time.extend_from_slice(&world_age.to_be_bytes());
+    time.extend_from_slice(&time_of_day.to_be_bytes());
+    time
+}
+
 /// One ground-up Chunk Data column with a single stone block at its origin,
 /// shaped as the capture records a column: the block light and sky light of the
 /// section the mask selects, then the biome array.
@@ -248,6 +256,21 @@ fn updated_column(event: &ClientEvent) -> (i32, i32) {
         ClientEvent::ChunkUpdated { cx, cz, .. } => (*cx, *cz),
         other => panic!("expected a chunk update, got {other:?}"),
     }
+}
+
+/// The five world-derived values a Sky event carries, in the test's own shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SkyReport {
+    /// The celestial angle.
+    celestial_angle: f32,
+    /// The sky's colour.
+    colour: [f32; 3],
+    /// The sun's brightness.
+    sun_brightness: f32,
+    /// The stars' brightness.
+    star_brightness: f32,
+    /// The clouds' tint.
+    cloud_colour: [f32; 3],
 }
 
 /// The section slots of the first `ChunkUpdated` for a column, panicking when
@@ -760,5 +783,101 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
     assert_eq!(
         second, first,
         "the column at (1, 11) is a faithful copy of the column at (0, 11)"
+    );
+}
+
+#[test]
+fn the_session_reports_the_clock_and_the_sky_it_moves() {
+    // A join, a teleport into the column the script loads, the column whose biome array is
+    // plains, `/time set 6000`'s own frame, the same frame with the time negated — the frozen
+    // sun — and a teleport inside that column. The clock comes back per update and the sky
+    // follows it and the view block, because the client cannot sample the world itself.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
+        chunk_data_frame(0, 0),
+        time_update_frame(48_000, 6000),
+        time_update_frame(48_000, -6001),
+        position_frame(12.5, 65.0, 4.5, 0.0, 0.0, 0),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let session = Session::new(Conn::new(stream), config());
+    session
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let clocks: Vec<(i64, i64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Time {
+                world_age,
+                time_of_day,
+            } => Some((*world_age, *time_of_day)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        clocks,
+        vec![(48_000, 6000), (48_000, -6001)],
+        "every Time Update is reported, the sign of the time kept as received"
+    );
+
+    // The sky's shape carries the view-block colour and the other world-derived values.
+    let skies: Vec<SkyReport> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Sky {
+                celestial_angle,
+                colour,
+                sun_brightness,
+                star_brightness,
+                cloud_colour,
+            } => Some(SkyReport {
+                celestial_angle: *celestial_angle,
+                colour: *colour,
+                sun_brightness: *sun_brightness,
+                star_brightness: *star_brightness,
+                cloud_colour: *cloud_colour,
+            }),
+            _ => None,
+        })
+        .collect();
+    let midnight = oxide_world::sky::celestial_angle(-6001, 0.0);
+    let frozen = SkyReport {
+        celestial_angle: midnight,
+        colour: [0.0, 0.0, 0.0],
+        sun_brightness: 0.2,
+        star_brightness: 0.5,
+        cloud_colour: [0.1, 0.1, 0.15],
+    };
+    assert_eq!(
+        skies,
+        vec![
+            // The plains noon the loaded column's biome gives.
+            SkyReport {
+                celestial_angle: 0.0,
+                colour: [120.0 / 255.0, 167.0 / 255.0, 1.0],
+                sun_brightness: 1.0,
+                star_brightness: 0.0,
+                cloud_colour: [1.0, 1.0, 1.0],
+            },
+            // The frozen midnight, reported again for the moved view block.
+            frozen,
+            frozen,
+        ],
+        "the sky colour follows the clock and the biome under the player"
+    );
+    let last_position = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::PlayerPosition { .. }))
+        .expect("the teleports are reported");
+    let last_sky = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Sky { .. }))
+        .expect("the sky is reported");
+    assert!(
+        last_position < last_sky,
+        "a moved view block reports the sky again: {events:?}"
     );
 }

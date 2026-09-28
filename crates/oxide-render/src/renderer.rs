@@ -11,6 +11,7 @@ use oxide_assets::atlas::Atlas;
 use crate::camera::Camera;
 use crate::fog::FogParams;
 use crate::overlay::OverlayPass;
+use crate::sky::{CloudPass, SkyParams, SkyPass, SkyTextures, cloud_under_layer};
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 
@@ -73,15 +74,17 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 }
 
 /// Owns the GPU objects for one window: the surface, the device, the queue, the depth texture
-/// and the two passes that draw into the frame.
+/// and the passes that draw into the frame.
 ///
 /// [`Renderer::render`] clears the window to the frame's fog colour — the sky the terrain fades
 /// towards, so the two agree where the terrain ends — and the depth buffer to the far plane,
-/// draws the section meshes through the terrain pass and the debug overlay over them, then
-/// presents the frame. Until [`Renderer::set_fog`] gives a frame its fog, the clear is
-/// [`SKY_COLOR`]. A frame with no camera set draws no terrain — and neither does one with no
-/// atlas: the clear is the whole picture, which is what the M0 smoke run shows and what a
-/// session that has not loaded an asset store yet draws.
+/// draws the sky through the sky pass, the cloud layer while the eye is under it, the section
+/// meshes through the terrain pass and the debug overlay over them, then presents the frame.
+/// Until [`Renderer::set_fog`] gives a frame its fog, the clear is [`SKY_COLOR`], and until
+/// [`Renderer::set_sky`] gives it its sky only the clear colour stands in for it. A frame
+/// with no camera set draws no terrain, sky or clouds — and neither does one with no atlas: the
+/// clear is the whole picture, which is what the M0 smoke run shows and what a session that has
+/// not loaded an asset store yet draws.
 pub struct Renderer {
     /// The presentable surface attached to the window.
     surface: wgpu::Surface<'static>,
@@ -97,6 +100,10 @@ pub struct Renderer {
     depth: DepthTarget,
     /// The terrain pipeline, and the section meshes it draws.
     terrain: TerrainPass,
+    /// The sky pass, drawing the band, the void, the sun, the moon and the stars.
+    sky: SkyPass,
+    /// The cloud pass, drawing the flat layer under the camera.
+    cloud: CloudPass,
     /// The overlay pipeline, and the debug lines it draws.
     overlay: OverlayPass,
     /// The camera the next frame is drawn with, until a new one is set.
@@ -204,6 +211,8 @@ impl Renderer {
         );
 
         let terrain = TerrainPass::new(&device, &queue, format);
+        let sky = SkyPass::new(&device, &queue, format);
+        let cloud = CloudPass::new(&device, &queue, format);
         let mut overlay = OverlayPass::new(&device, format);
         overlay.set_size(&queue, config.width as f32, config.height as f32);
         let depth = DepthTarget::new(&device, config.width, config.height);
@@ -216,6 +225,8 @@ impl Renderer {
             adapter_info,
             depth,
             terrain,
+            sky,
+            cloud,
             overlay,
             camera: None,
             fog: None,
@@ -292,16 +303,46 @@ impl Renderer {
         self.camera = Some(camera);
     }
 
+    /// Uploads the three environment textures the sky and the clouds sample, replacing any
+    /// earlier set.
+    ///
+    /// The sun and the moon phase sheet go to the sky pass, the cloud texture to the cloud pass.
+    /// Until this is called the sky draws its band, its void and its stars, and the clouds draw
+    /// nothing: the sun and the moon and the layer itself need their textures. Task 14's
+    /// bootstrap calls this once its texture set is loaded.
+    pub fn set_sky_textures(&mut self, textures: SkyTextures) {
+        self.sky.set_textures(
+            &self.device,
+            &self.queue,
+            &textures.sun,
+            &textures.moon_phases,
+        );
+        self.cloud
+            .set_texture(&self.device, &self.queue, &textures.clouds);
+    }
+
+    /// Sets the sky the following frames draw and the cloud layer they tint.
+    ///
+    /// The parameters are the session's clock-derived values plus the client's own fog colour,
+    /// far plane and cloud counter; see [`crate::sky::SkyParams`]. The cloud counter changes
+    /// every frame in M2, so this is called per frame.
+    pub fn set_sky(&mut self, params: SkyParams) {
+        self.sky.set_params(&self.queue, params);
+        self.cloud.set_params(&self.queue, params);
+    }
+
     /// Sets the fog every following frame is drawn and cleared with.
     ///
-    /// The colour and the range go to the terrain pass, which mixes them into every terrain
-    /// fragment, and the same colour becomes the clear the sky behind the terrain is drawn in,
-    /// so the two agree where the terrain ends. What the colour is for a given world is the
-    /// caller's step — [`crate::fog::fog_colour`] produces one for a dimension, a time and an
-    /// eye position, and [`crate::fog::linear_params`] the range for a far plane. Until this
-    /// is called the frames clear to [`SKY_COLOR`] and draw no terrain fog at all.
+    /// The colour and the range go to the terrain pass and the cloud pass, which mix them into
+    /// every fragment they draw, and the same colour becomes the clear the sky behind the
+    /// terrain is drawn in, so the two agree where the terrain ends. What the colour is for a
+    /// given world is the caller's step — [`crate::fog::fog_colour`] produces one for a
+    /// dimension, a time and an eye position, and [`crate::fog::linear_params`] the range for a
+    /// far plane — and the sky pass's own range comes from [`SkyParams`]. Until this is called
+    /// the frames clear to [`SKY_COLOR`] and draw no terrain fog at all.
     pub fn set_fog(&mut self, params: FogParams) {
         self.terrain.set_fog(&self.queue, params);
+        self.cloud.set_fog(&self.queue, params);
         self.fog = Some(params);
     }
 
@@ -315,11 +356,12 @@ impl Renderer {
 
     /// Draws the frame and presents it.
     ///
-    /// The colour and depth attachments are cleared in the terrain pass: the colour to the
-    /// frame's fog colour, so the sky behind the terrain is the colour the terrain fades to,
-    /// and the depth to the far plane. The pass draws every section mesh the frame's frustum
-    /// keeps when a camera and an atlas have both been set; the overlay pass then draws the
-    /// debug lines over the result, in a pass without a depth attachment, so no terrain can
+    /// The colour and depth attachments are cleared in the frame's single scene pass: the colour
+    /// to the frame's fog colour, so the sky behind the terrain is the colour the terrain fades
+    /// to, and the depth to the far plane. The sky pass draws first over that clear, then the
+    /// cloud layer while the camera's eye is under it, then every section mesh the frame's
+    /// frustum keeps when a camera and an atlas have both been set; the overlay pass then draws
+    /// the debug lines over the result, in a pass without a depth attachment, so no terrain can
     /// hide the text.
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
@@ -330,6 +372,8 @@ impl Renderer {
         if let Some(camera) = self.camera {
             let aspect = self.config.width as f32 / self.config.height as f32;
             self.terrain.set_camera(&self.queue, camera, aspect);
+            self.sky.set_camera(&self.queue, camera, aspect);
+            self.cloud.set_camera(&self.queue, camera, aspect);
         }
 
         let mut encoder = self
@@ -339,8 +383,8 @@ impl Renderer {
             });
         let clear = clear_colour(self.fog);
         {
-            let mut terrain_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("oxide-render terrain pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxide-render scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -362,8 +406,12 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if self.camera.is_some() {
-                self.terrain.draw(&mut terrain_pass);
+            if let Some(camera) = self.camera {
+                self.sky.draw(&mut pass);
+                if cloud_under_layer(&camera) {
+                    self.cloud.draw(&mut pass);
+                }
+                self.terrain.draw(&mut pass);
             }
         }
         {

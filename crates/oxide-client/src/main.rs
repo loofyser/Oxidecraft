@@ -7,7 +7,8 @@
 //! frames have been presented.
 //!
 //! With `--server host:port` a session thread joins the server and reports through a channel:
-//! every frame the client drains it into the renderer and the F3 debug overlay. When the
+//! every frame the client drains it into the renderer and the F3 debug overlay, and the
+//! session's clock and sky reports become the frame's fog and sky parameters. When the
 //! session ends the client exits — a server that closed the connection cleanly is a normal
 //! exit, not an error.
 
@@ -20,8 +21,10 @@ use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::session::{ClientEvent, Session, SessionConfig};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
+use oxide_render::fog::{FogParams, fog_colour, linear_params};
 use oxide_render::fps::FpsCounter;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
+use oxide_render::sky::SkyParams;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -118,8 +121,50 @@ struct ClientApp {
     session: Option<SessionLink>,
     /// What the debug overlay reports, updated from the session's events.
     hud: HudState,
+    /// The clock and the sky the session last reported.
+    sky: SkyState,
+    /// The cloud counter M2 advances once per rendered frame.
+    ///
+    /// The source's counter is client-local and advances once per client tick
+    /// (`RenderGlobal.updateClouds`, `RenderGlobal.java:1138-1142`, from `Minecraft.runTick`,
+    /// `Minecraft.java:2193-2196`); M2 has no tick loop until M3, so the frame stands in for
+    /// the tick and the two clients' cloud phases are independent.
+    cloud_ticks: i64,
     /// Whether F3 has the overlay showing.
     overlay_visible: bool,
+}
+
+/// The clock and the sky the session last reported: what each frame's sky parameters and fog
+/// are built from.
+#[derive(Debug, Default)]
+struct SkyState {
+    /// The world's time of day in ticks, from the last Time Update.
+    time_of_day: Option<i64>,
+    /// The sky the last Time Update or teleport produced.
+    sky: Option<SkyValues>,
+    /// The void-fog factor the last Join Game's level type asks for.
+    void_y_factor: f32,
+}
+
+/// The world-derived sky values the session's `Sky` event carries.
+#[derive(Debug, Clone, Copy)]
+struct SkyValues {
+    /// The celestial angle in `0..1`.
+    celestial_angle: f32,
+    /// The sky's colour at the view block.
+    colour: [f32; 3],
+    /// The sun's brightness.
+    sun_brightness: f32,
+    /// The stars' brightness.
+    star_brightness: f32,
+    /// The clouds' tint.
+    cloud_colour: [f32; 3],
+}
+
+/// The void-fog factor a level type asks for: `WorldProvider.getVoidFogYFactor`
+/// (`WorldProvider.java:231-234`), one in a flat world and 0.03125 otherwise.
+fn void_y_factor(level_type: &str) -> f32 {
+    if level_type == "flat" { 1.0 } else { 0.03125 }
 }
 
 impl ClientApp {
@@ -162,6 +207,8 @@ impl ClientApp {
                 server,
                 entity_id: 0,
             },
+            sky: SkyState::default(),
+            cloud_ticks: 0,
             overlay_visible,
         })
     }
@@ -184,7 +231,7 @@ impl ClientApp {
         };
         let mut session_ended = false;
         for event in events {
-            session_ended |= apply_session_event(renderer, &mut self.hud, event);
+            session_ended |= apply_session_event(renderer, &mut self.hud, &mut self.sky, event);
         }
         if session_ended {
             tracing::info!("the session ended, exiting");
@@ -205,6 +252,36 @@ impl ClientApp {
                 near: NEAR_PLANE,
                 far_chunks: FAR_CHUNKS,
             });
+            // The counter M3's tick loop will advance once per tick; see the field's own note.
+            self.cloud_ticks += 1;
+            if let (Some(time_of_day), Some(values)) = (self.sky.time_of_day, self.sky.sky) {
+                // The render distance in blocks, the source's `farPlaneDistance`: the fog's
+                // reference distance and the sky projection's own factor's base.
+                let far_plane = FAR_CHUNKS * 16.0;
+                let (start, end) = linear_params(far_plane);
+                let colour = fog_colour(
+                    self.hud.dimension,
+                    time_of_day as f32,
+                    self.hud.position[1],
+                    self.sky.void_y_factor,
+                );
+                renderer.set_fog(FogParams {
+                    colour,
+                    start,
+                    end,
+                    far_plane,
+                });
+                renderer.set_sky(SkyParams {
+                    celestial_angle: values.celestial_angle,
+                    sky_colour: values.colour,
+                    sun_brightness: values.sun_brightness,
+                    star_brightness: values.star_brightness,
+                    fog_colour: colour,
+                    far_plane,
+                    cloud_offset_ticks: self.cloud_ticks,
+                    cloud_colour: values.cloud_colour,
+                });
+            }
         }
         renderer.set_overlay_lines(if self.overlay_visible {
             debug_lines(&self.hud)
@@ -302,12 +379,18 @@ fn spawn_session(host: String, port: u16, username: String, server: String) -> S
 }
 
 /// Applies one event the session reported: meshes go to the renderer, the pose
-/// and the join parameters to the overlay state.
+/// and the join parameters to the overlay state, and the clock and the sky to
+/// the frame's parameters.
 ///
 /// Returns whether the session ended, which stops the client. The session
 /// returns `Ok(())` when the server closed the connection, so its end is a
 /// normal exit, not an error.
-fn apply_session_event(renderer: &mut Renderer, hud: &mut HudState, event: ClientEvent) -> bool {
+fn apply_session_event(
+    renderer: &mut Renderer,
+    hud: &mut HudState,
+    sky: &mut SkyState,
+    event: ClientEvent,
+) -> bool {
     match event {
         ClientEvent::LoggedIn { uuid, username } => {
             tracing::info!(%uuid, %username, "logged in");
@@ -332,6 +415,7 @@ fn apply_session_event(renderer: &mut Renderer, hud: &mut HudState, event: Clien
             );
             hud.entity_id = entity_id;
             hud.dimension = dimension;
+            sky.void_y_factor = void_y_factor(&level_type);
             false
         }
         ClientEvent::PlayerPosition {
@@ -344,6 +428,30 @@ fn apply_session_event(renderer: &mut Renderer, hud: &mut HudState, event: Clien
             hud.position = [x, y, z];
             hud.yaw = yaw;
             hud.pitch = pitch;
+            false
+        }
+        ClientEvent::Time {
+            world_age,
+            time_of_day,
+        } => {
+            tracing::debug!(world_age, time_of_day, "the clock was set");
+            sky.time_of_day = Some(time_of_day);
+            false
+        }
+        ClientEvent::Sky {
+            celestial_angle,
+            colour,
+            sun_brightness,
+            star_brightness,
+            cloud_colour,
+        } => {
+            sky.sky = Some(SkyValues {
+                celestial_angle,
+                colour,
+                sun_brightness,
+                star_brightness,
+                cloud_colour,
+            });
             false
         }
         ClientEvent::ChunkUpdated { cx, cz, sections } => {
@@ -502,7 +610,9 @@ fn is_f3_press(state: ElementState, key: &Key) -> bool {
 mod tests {
     //! Key-routing and command-line tests.
 
-    use super::{Cli, ClientApp, is_escape_press, is_f3_press, parse_server_address};
+    use super::{
+        Cli, ClientApp, is_escape_press, is_f3_press, parse_server_address, void_y_factor,
+    };
     use clap::Parser;
     use winit::event::ElementState;
     use winit::keyboard::{Key, NamedKey};
@@ -583,5 +693,11 @@ mod tests {
         let app = ClientApp::new(cli).expect("the client builds without a server");
         assert!(app.session.is_none(), "no session is opened");
         assert!(!app.overlay_visible, "the overlay stays hidden");
+    }
+
+    #[test]
+    fn only_a_flat_world_asks_for_the_full_void_fog_factor() {
+        assert_eq!(void_y_factor("flat"), 1.0);
+        assert_eq!(void_y_factor("default"), 0.03125);
     }
 }
