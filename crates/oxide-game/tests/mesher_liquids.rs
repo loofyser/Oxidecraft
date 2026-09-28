@@ -37,8 +37,8 @@ use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
 use oxide_world::world::World;
 
-/// The block ids the tests use: the flowing and still liquid pairs, the leaves
-/// and the plant.
+/// The block ids the tests use: the flowing and still liquid pairs, the leaves,
+/// the plant, and the ice the second top pass's ring reads.
 const WATER: u16 = 8;
 const WATER_STILL: u16 = 9;
 const LAVA: u16 = 10;
@@ -46,6 +46,7 @@ const LAVA_STILL: u16 = 11;
 const LEAVES: u16 = 18;
 const TALLGRASS: u16 = 31;
 const STONE: u16 = 1;
+const ICE: u16 = 79;
 
 // -- the source's own float shapes, as literals ------------------------------
 
@@ -646,6 +647,75 @@ fn a_liquid_top_culls_only_against_the_same_liquid() {
         "the bottom face culls against the liquid below"
     );
     assert_eq!(quads_at(&quads, [2.0, 64.0, 1.0]).len(), 1);
+}
+
+#[test]
+fn a_water_cell_under_an_ice_sheet_keeps_the_second_top_pass() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off, true);
+    // One water source under a 3 x 3 sheet of ice, so every cell of the ring
+    // `shouldRenderSides` reads at `pos.up()` (`BlockFluidRenderer.java:128`,
+    // `block/BlockLiquid.java:101-119`) holds ice. Ice does not stop that ring:
+    // `block/Block.java:295` assigns the full-block field once from
+    // `isOpaqueCube()` while the block is constructed, and `BlockBreakable`'s
+    // override answers false (`BlockBreakable.java:29-32`, reached through
+    // `BlockIce.java:22`) — so the sheet is a full cube that hides nothing and
+    // the second pass draws.
+    let world = daylight(&[
+        (2, 64, 2, state(WATER_STILL, 0)),
+        (1, 65, 1, state(ICE, 0)),
+        (2, 65, 1, state(ICE, 0)),
+        (3, 65, 1, state(ICE, 0)),
+        (1, 65, 2, state(ICE, 0)),
+        (2, 65, 2, state(ICE, 0)),
+        (3, 65, 2, state(ICE, 0)),
+        (1, 65, 3, state(ICE, 0)),
+        (2, 65, 3, state(ICE, 0)),
+        (3, 65, 3, state(ICE, 0)),
+    ]);
+    let mesh = mesh_of(&world, &ctx);
+    let quads = quads(&mesh, Layer::Translucent);
+
+    // The surface: a lone source's average all round — the ice above is not
+    // the same liquid, so the waterfall clause stays silent — sunk by the top
+    // pass, the still sprite because the cell's flow vector is zero.
+    let y = surface_y(64.0, SOURCE_SURFACE);
+    let surface = quads_at(&quads, [2.0, y, 2.0]);
+    assert_eq!(surface.len(), 2, "the top and the pass the ice keeps");
+    assert_eq!(
+        positions(surface[0]),
+        [[2.0, y, 2.0], [2.0, y, 3.0], [3.0, y, 3.0], [3.0, y, 2.0]]
+    );
+    // The second pass walks the same four points in the source's own order —
+    // the north-west, north-east, south-east and south-west corners
+    // (`BlockFluidRenderer.java:130-133`) — with the top pass's uv.
+    assert_eq!(
+        positions(surface[1]),
+        [[2.0, y, 2.0], [3.0, y, 2.0], [3.0, y, 3.0], [2.0, y, 3.0]]
+    );
+    let still = rect_corners(STILL);
+    assert_eq!(uvs(surface[0]), still);
+    assert_eq!(uvs(surface[1]), [still[0], still[3], still[2], still[1]]);
+    // Its light and colour are the top pass's: the source computes the pair
+    // and the tint once, above the gate, and writes them into both passes.
+    assert!(
+        surface
+            .iter()
+            .all(|quad| quad.iter().all(|vertex| vertex.light == [248, 8])),
+        "the liquid's own cell and the cell above it, in daylight"
+    );
+    assert!(
+        surface.iter().all(|quad| quad
+            .iter()
+            .all(|vertex| vertex.colour == [255, 255, 255, 255])),
+        "the white tint at the top face's brightness"
+    );
+
+    // The water's eleven quads — the top, its reverse, the bottom and the four
+    // sides twice — plus the sheet's nine unresolved cubes, six faces apiece,
+    // share the layer.
+    assert_eq!(quads.len(), 65);
 }
 
 #[test]

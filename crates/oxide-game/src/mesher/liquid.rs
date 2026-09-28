@@ -382,11 +382,25 @@ fn same_liquid(snapshot: &ColumnSnapshot, cell: (i32, i32, i32), kind: LiquidKin
     behaviour(id_at(snapshot, cell)).is_some_and(|entry| entry.liquid == Some(kind))
 }
 
-/// `Block.isFullBlock()`: whether a block fills its cell whole, the ring test's
-/// own clause (`block/Block.java:295` sets the field from `isOpaqueCube()` when
-/// the block is constructed). Air, and an id outside the table, do not.
+/// `Block.isFullBlock()` (`block/Block.java:207-210`): whether the ring test's
+/// nine cells are stopped by a full block, read as the field it is.
+///
+/// The field is the opacity predicate, not the table's `full_cube` column:
+/// `block/Block.java:295` assigns it once, from `isOpaqueCube()`, while the
+/// block is constructed, and the two disagree where a block overrides that
+/// predicate without being anything less than a full cube — ice and the mob
+/// spawner are full cubes whose field is false
+/// (`BlockBreakable.java:29-32`; `BlockMobSpawner.java:57-60`). For every
+/// covered id the table's `occludes` column carries exactly the field, so the
+/// ring reads it plainly. The leaves' field is true in both graphics states:
+/// `BlockLeaves.isOpaqueCube` answers `!fancyGraphics`
+/// (`BlockLeaves.java:278-281`), but the capture happens before
+/// `BlockLeavesBase` assigns `fancyGraphics` (`BlockLeavesBase.java:12-16`),
+/// and `setGraphicsLevel` never moves the field
+/// (`BlockLeaves.java:286-291`) — the graphics clause is not applied here.
+/// Air, and an id outside the table, are not full blocks.
 fn is_full_block(snapshot: &ColumnSnapshot, cell: (i32, i32, i32)) -> bool {
-    behaviour(id_at(snapshot, cell)).is_some_and(|entry| entry.full_cube)
+    behaviour(id_at(snapshot, cell)).is_some_and(|entry| entry.occludes)
 }
 
 /// `BlockLiquid.shouldRenderSides` (`block/BlockLiquid.java:101-119`): whether
