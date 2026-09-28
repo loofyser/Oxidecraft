@@ -8,7 +8,6 @@ vanilla exactly. Add an entry only after the project owner accepts the differenc
 | 1 | Java-specific options such as "Advanced OpenGL" keep their 1.8.9 layout but have no effect | The native renderer has no equivalent setting | None; the button stores its value and nothing changes |
 | 2 | Account tokens are stored in the OS keyring instead of a launcher profile file | Security | None |
 | 3 | The title screen shows "Oxidecraft 1.8.9" where vanilla shows "Minecraft 1.8.9" | Honest identification of the running program | Cosmetic; one line of text |
-| 4 | The window's clear colour is visibly paler than vanilla 1.8.9's sky blue | The surface format is sRGB-aware, so the linear clear values 0.62/0.76/0.98 are encoded to sRGB before display, which lightens them | Cosmetic for now: the sky reads lighter than vanilla. The real renderer must match vanilla's colour pipeline in a later milestone |
 
 Notes:
 
@@ -17,6 +16,10 @@ Notes:
 - Nothing in this file relaxes the parity criteria in the specification. World rendering,
   GUI layout, controls, physics, and protocol behaviour must still match.
 - Entry 4, recorded 2026-09-23 from the window run's capture (`refs/rig/evidence/m0-window.png`):
-  the sRGB surface leaves the clear colour visibly paler than the vanilla 1.8.9 sky captured at
-  `refs/rig/evidence/minecraft-1.8.9-title-screen.png`. Accepted for this milestone; the sky
-  renderer revisits the colour pipeline.
+  the sRGB-aware surface left the clear colour visibly paler than the vanilla 1.8.9 sky captured
+  at `refs/rig/evidence/minecraft-1.8.9-title-screen.png`. Retired on 2026-09-28: the M2
+  pipeline matches vanilla's non-sRGB output — the surface is configured with a format that is
+  not sRGB, so the client's own clear values and texture bytes reach the window unconverted —
+  and the reference-gradient check `the_atlas_texels_come_back_lit_by_the_lightmap`
+  (`crates/oxide-render/tests/pipeline_headless.rs`) reads the frame back against the client's
+  own lightmap arithmetic byte for byte.

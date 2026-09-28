@@ -7,7 +7,7 @@
 | Target | Minecraft Java Edition 1.8.9, protocol 47 |
 | Repo | https://github.com/loofyser/Oxidecraft |
 | License | GPL-3.0 (repo code only; no Mojang assets, no jars redistributed) |
-| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. v4 — section 17 records the owner-directed post-v1 programme (singleplayer and Java mod compatibility) and its feasibility; no v1 scope change. v5 — section 5.1: the `oxide-game` row gains `oxide-proto`, because the session owns the framed connection that lives in `oxide-proto`. |
+| Revision history | v1 — initial design, approved by the owner. v2 — all 25 findings of `docs/reviews/2026-09-22-spec-review.md` applied. v3 — section 5.1: the `oxide-launcher` row gains `oxide-proto-v47`, because the launcher's status ping is spoken through the protocol crate. v4 — section 17 records the owner-directed post-v1 programme (singleplayer and Java mod compatibility) and its feasibility; no v1 scope change. v5 — section 5.1: the `oxide-game` row gains `oxide-proto`, because the session owns the framed connection that lives in `oxide-proto`. v6 — appendix C.1: the colour-space policy is fixed — the surface is not sRGB, the atlas and the lightmap are unorm, and no colour value is converted at the end of the pipeline; `docs/DIVERGENCES.md` entry 4 is retired. |
 
 ---
 
@@ -554,7 +554,7 @@ All are permissive licenses, compatible with GPL-3.0, and all are enforced by `d
 - GPU and driver for every comparison: record the exact device and driver version, and select it explicitly (Vulkan device choice, or `DRI_PRIME` for the OpenGL side). Two GPUs are present; comparisons never mix them.
 - Vanilla runs under XWayland when XWayland is the only option; the fact is recorded, and the frame-rate baseline is only valid if vanilla is not XWayland-throttled (checked by comparing fullscreen and windowed frame rates).
 - Vanilla settings for comparison runs: fixed render distance, fixed GUI scale, VSync off, particles and graphics settings recorded, fullscreen, and the exact `options.txt` archived alongside the screenshots.
-- Colour space: our surface format and lightmap scaling reproduce vanilla's non-sRGB output; verified with a reference gradient screenshot before the first visual comparison.
+- Colour space: our surface format and lightmap scaling reproduce vanilla's non-sRGB output; verified with a reference gradient screenshot before the first visual comparison. The policy is fixed as of v6: the surface is configured with a format that is not sRGB, the atlas and the lightmap are unorm textures, and no colour value is converted at the end of the pipeline.
 
 ### C.2 Screenshot parity procedure (P1)
 
