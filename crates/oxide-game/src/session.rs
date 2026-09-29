@@ -13,18 +13,20 @@
 //! even name is not fatal (spec S2), so a proxy or a modded server cannot end
 //! the session by sending something unexpected.
 //!
-//! The column meshes are rebuilt between reads, never inside a read that other
-//! packets are waiting behind: a burst of columns on join would otherwise hold
-//! the loop for minutes, and the server closes a session whose keepalive echo
-//! goes unanswered for about thirty seconds.
+//! The column meshes are built off this thread, on a per-session rayon pool:
+//! each applied column enters a dirty set with a generation, the loop copies
+//! its snapshot out of the store and hands the build to a worker, and the
+//! finished meshes come back as events. A burst of columns on join therefore
+//! cannot hold the read loop, and the server closes a session whose keepalive
+//! echo goes unanswered for about thirty seconds.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use oxide_assets::atlas::Atlas;
 use oxide_proto::conn::{Conn, DeadlineStream, RecvOutcome};
 use oxide_proto::frame::{Compression, FrameError};
@@ -46,8 +48,10 @@ use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
 };
 use oxide_world::world::World;
+use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
+use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
 };
@@ -59,14 +63,28 @@ const BRAND_CHANNEL: &str = "MC|Brand";
 /// length-prefixed `vanilla`.
 const BRAND_PAYLOAD: &[u8] = b"\x07vanilla";
 
-/// How long the play loop waits for a frame to start before it rebuilds one
-/// pending column's meshes.
+/// How long the play loop waits for a frame to start before it tends the mesh
+/// queue.
 ///
 /// The wait is a deadline, not a blocking read: it consumes nothing, so a
 /// keepalive behind a column burst is still read — and echoed — as soon as its
-/// bytes are readable. One mesh batch is bounded by this wait plus the batch
+/// bytes are readable. One mesh batch is bounded by this wait plus the pump
 /// itself, which is what keeps the echo well inside the server's timeout.
 const MESH_TICK: Duration = Duration::from_millis(20);
+
+/// How many queued columns one pump hands to the pool.
+///
+/// The snapshot copy happens on the session's thread, so the cap is what
+/// bounds this thread's own work between two reads: at most this many copies
+/// before the next frame is read, whatever the burst behind it.
+const PENDING_JOBS_CAP: usize = 4;
+
+/// How long the end-of-session drain waits for the pool's outstanding jobs.
+///
+/// A clean stop reports its last meshes; the bound keeps a wedged build from
+/// holding the session's end forever. The pool is dropped when the session
+/// returns.
+const END_OF_SESSION_WAIT: Duration = Duration::from_millis(100);
 
 /// The login-state packet ids the client decodes. Anything else is skipped
 /// rather than refused, so the login survives a packet M1 does not know.
@@ -268,6 +286,9 @@ pub enum SessionError {
     /// A write of our own reply failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The session's mesh pool could not be built.
+    #[error("the mesh pool could not be built: {0}")]
+    Pool(#[from] ThreadPoolBuildError),
 }
 
 /// A client session over one framed connection.
@@ -310,16 +331,24 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
     /// Returns `Ok(())` when the server closed the connection or the stream
     /// ended. Malformed packets are reported as an error, never a panic.
     ///
-    /// The play loop reads with [`Conn::recv_or_idle`], so between frames it
-    /// rebuilds the column meshes the server's chunk packets queued. The
-    /// meshes never delay a read, which is what keeps the keepalive echo — and
-    /// the teleport echo — answerable while a burst of columns is arriving.
+    /// The play loop reads with [`Conn::recv_or_idle`]; between frames, and
+    /// after every applied packet, it hands the mesh queue's next columns to
+    /// the pool and reports whatever builds have finished. A build never runs
+    /// on this thread and a drain never blocks, which is what keeps the
+    /// keepalive echo — and the teleport echo — answerable while a burst of
+    /// columns is arriving.
     pub fn run_over(self, events: &Sender<ClientEvent>) -> Result<(), SessionError> {
         let Session {
             mut conn,
             config,
             mesh,
         } = self;
+
+        // The pool and the results channel live for the whole play loop; the
+        // handshake and the login above mesh nothing.
+        let pool = mesh_pool()?;
+        let (finished, results) = crossbeam_channel::unbounded::<MeshResult>();
+        let mut queue = MeshQueue::new();
 
         // Nothing has touched the framing yet: the handshake and Login Start go
         // out plain, and the server answers by naming a compression threshold.
@@ -341,13 +370,20 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut position = Position::default();
         let mut clock: Option<i64> = None;
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
-        let mut pending: VecDeque<(i32, i32)> = VecDeque::new();
 
         loop {
             let payload = match conn.recv_or_idle(MESH_TICK) {
                 Ok(RecvOutcome::Frame(payload)) => payload,
                 Ok(RecvOutcome::Idle) => {
-                    mesh_one(world.as_ref(), &mut pending, &mesh, events);
+                    pump_meshes(
+                        world.as_ref(),
+                        &mut queue,
+                        &pool,
+                        &mesh,
+                        &finished,
+                        &results,
+                        events,
+                    );
                     continue;
                 }
                 Err(error) if is_stream_end(&error) => {
@@ -373,9 +409,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 JoinGame::ID => {
                     let join = decoded(id, JoinGame::decode(body))?;
                     // The dimension decides whether columns carry sky light. A
-                    // re-sent Join Game starts the column set over.
+                    // re-sent Join Game starts the column set over: the queue's
+                    // columns belong to the old world, and any job still out
+                    // completes stale and builds against the new one.
                     world = Some(World::new(join.dimension == 0));
-                    pending.clear();
+                    queue = MeshQueue::new();
                     let settings = payload_of(|out| write_client_settings(out, &config.settings))?;
                     send_reply(&mut conn, &settings)?;
                     let brand =
@@ -441,8 +479,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     };
                     let column = decoded(id, ChunkData::decode(body, store.has_sky()))?;
                     if store.apply_chunk_data(&column) {
-                        pending.push_back((column.chunk_x, column.chunk_z));
+                        queue.mark_dirty(column.chunk_x, column.chunk_z);
                     } else {
+                        queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
                         report(
                             events,
                             ClientEvent::ChunkUnloaded {
@@ -461,8 +500,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     store.apply_bulk(&bulk);
                     for column in &bulk.columns {
                         if store.chunk(column.chunk_x, column.chunk_z).is_some() {
-                            pending.push_back((column.chunk_x, column.chunk_z));
+                            queue.mark_dirty(column.chunk_x, column.chunk_z);
                         } else {
+                            queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
                             report(
                                 events,
                                 ClientEvent::ChunkUnloaded {
@@ -506,7 +546,15 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 }
                 PlayDisconnect::ID => {
                     let disconnect = decoded(id, PlayDisconnect::decode(body))?;
-                    flush_pending(world.as_ref(), &mut pending, &mesh, events);
+                    finish_meshes(
+                        world.as_ref(),
+                        &mut queue,
+                        &pool,
+                        &mesh,
+                        &finished,
+                        &results,
+                        events,
+                    );
                     report(
                         events,
                         ClientEvent::Disconnected {
@@ -525,8 +573,25 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     );
                 }
             }
+            pump_meshes(
+                world.as_ref(),
+                &mut queue,
+                &pool,
+                &mesh,
+                &finished,
+                &results,
+                events,
+            );
         }
-        flush_pending(world.as_ref(), &mut pending, &mesh, events);
+        finish_meshes(
+            world.as_ref(),
+            &mut queue,
+            &pool,
+            &mesh,
+            &finished,
+            &results,
+            events,
+        );
         Ok(())
     }
 }
@@ -779,74 +844,106 @@ fn report_sky(
     );
 }
 
-/// Re-meshes a column and its four neighbours (plan Decision 4) and reports
-/// each of them.
+/// One finished build: the job it answers and the column's sixteen sections.
+type MeshResult = (MeshJob, Vec<(usize, Option<ChunkMesh>)>);
+
+/// Builds the session's mesh pool: one worker fewer than the machine's
+/// parallelism, at least one.
 ///
-/// The applied column leads its neighbours in a fixed order. All five report
-/// every section, `None` for one that draws nothing, which is how the window
-/// learns to drop a mesh it still holds; a neighbour that is not loaded reports
-/// sixteen empty sections to the same end.
-fn remesh(world: &World, cx: i32, cz: i32, assets: &MeshAssets, events: &Sender<ClientEvent>) {
-    report_chunk(world, cx, cz, assets, events);
-    for (nx, nz) in [(cx + 1, cz), (cx - 1, cz), (cx, cz + 1), (cx, cz - 1)] {
-        report_chunk(world, nx, nz, assets, events);
-    }
+/// The session thread keeps a core for reading and for copying snapshots; the
+/// rest build meshes. A machine that reports a single processor gets a
+/// one-thread pool rather than none, and a failed query falls back to one.
+fn mesh_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
+    let threads = std::thread::available_parallelism()
+        .map(|available| available.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    ThreadPoolBuilder::new().num_threads(threads).build()
 }
 
-/// Rebuilds the meshes of the oldest pending column, when one is waiting.
+/// Hands the queue's next columns to the pool and reports every finished build.
 ///
-/// The queue holds every column the server applied whose meshes have not been
-/// rebuilt yet, in arrival order; the play loop drains one batch per idle wait,
-/// so the connection is read between batches rather than after all of them.
-fn mesh_one(
+/// One pass spawns at most [`PENDING_JOBS_CAP`] builds. The snapshot copy
+/// happens here, on the session's thread — the world never leaves it — so the
+/// cap is what bounds this thread's own work between two reads; the build
+/// itself reads only the snapshot and the shared assets. The results are then
+/// taken with a non-blocking receive: a build that is not finished yet is
+/// picked up by a later pass, never waited for.
+fn pump_meshes(
     world: Option<&World>,
-    pending: &mut VecDeque<(i32, i32)>,
-    assets: &MeshAssets,
-    events: &Sender<ClientEvent>,
-) {
-    if let (Some(world), Some((cx, cz))) = (world, pending.pop_front()) {
-        remesh(world, cx, cz, assets, events);
-    }
-}
-
-/// Rebuilds every pending column's meshes; the session ends with its work done.
-///
-/// The meshes are built from the world as it stands, so a column the server has
-/// since unloaded reports itself as drawing nothing.
-fn flush_pending(
-    world: Option<&World>,
-    pending: &mut VecDeque<(i32, i32)>,
-    assets: &MeshAssets,
+    queue: &mut MeshQueue,
+    pool: &ThreadPool,
+    mesh: &Arc<MeshAssets>,
+    finished: &Sender<MeshResult>,
+    results: &Receiver<MeshResult>,
     events: &Sender<ClientEvent>,
 ) {
     if let Some(world) = world {
-        while let Some((cx, cz)) = pending.pop_front() {
-            remesh(world, cx, cz, assets, events);
+        for _ in 0..PENDING_JOBS_CAP {
+            let Some(job) = queue.next_job() else {
+                break;
+            };
+            queue.mark_running(job);
+            let snapshot = ColumnSnapshot::from_world(world, job.cx, job.cz);
+            let assets = Arc::clone(mesh);
+            let finished = finished.clone();
+            pool.spawn(move || {
+                let ctx = mesh_context(&assets);
+                let sections = build_column_meshes(&snapshot, &ctx);
+                let _ = finished.send((job, sections));
+            });
         }
     }
-    pending.clear();
+    drain_meshes(queue, results, events);
 }
 
-/// Builds one column's meshes and reports them.
+/// Reports every finished build that is waiting; a stale one is discarded.
 ///
-/// The snapshot copies the column and its collar out of the store here, on the
-/// session's thread; the build itself reads the snapshot and the assets and
-/// nothing else, which is the shape Task 13's pool hands to a worker.
-fn report_chunk(
-    world: &World,
-    cx: i32,
-    cz: i32,
-    assets: &MeshAssets,
+/// The receive never blocks, so a pass over the channel is bounded by what has
+/// already arrived.
+fn drain_meshes(
+    queue: &mut MeshQueue,
+    results: &Receiver<MeshResult>,
     events: &Sender<ClientEvent>,
 ) {
-    let snapshot = ColumnSnapshot::from_world(world, cx, cz);
-    let ctx = mesh_context(assets);
-    report(
-        events,
-        ClientEvent::ChunkUpdated {
-            cx,
-            cz,
-            sections: build_column_meshes(&snapshot, &ctx),
-        },
-    );
+    while let Ok((job, sections)) = results.try_recv() {
+        if queue.complete(job) {
+            report(
+                events,
+                ClientEvent::ChunkUpdated {
+                    cx: job.cx,
+                    cz: job.cz,
+                    sections,
+                },
+            );
+        }
+    }
+}
+
+/// Finishes the outstanding builds at the end of a session, within a bound.
+///
+/// A clean stop still reports its last meshes: the queue's columns go to the
+/// pool and the results are drained until nothing is outstanding or
+/// [`END_OF_SESSION_WAIT`] passes. The bound keeps a wedged build from holding
+/// the session's end forever; the pool is dropped when the session returns.
+fn finish_meshes(
+    world: Option<&World>,
+    queue: &mut MeshQueue,
+    pool: &ThreadPool,
+    mesh: &Arc<MeshAssets>,
+    finished: &Sender<MeshResult>,
+    results: &Receiver<MeshResult>,
+    events: &Sender<ClientEvent>,
+) {
+    if world.is_none() {
+        // No world was ever joined, so nothing can be queued for it.
+        return;
+    }
+    let deadline = Instant::now() + END_OF_SESSION_WAIT;
+    loop {
+        pump_meshes(world, queue, pool, mesh, finished, results, events);
+        if queue.pending() == 0 || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

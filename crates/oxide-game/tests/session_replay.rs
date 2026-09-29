@@ -1,6 +1,7 @@
 //! Replay tests: a scripted 1.8.9 server stream drives the session, and the
 //! client's own traffic and events are asserted byte for byte.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,8 +10,9 @@ use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
 use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
 use oxide_proto_v47::clientbound::{MapChunkBulk, PlayerPositionAndLook};
+use oxide_proto_v47::column::block_index;
 use oxide_proto_v47::serverbound::ClientSettings;
-use oxide_render::terrain::ChunkMesh;
+use oxide_render::terrain::{ChunkMesh, Vertex};
 use oxide_world::world::World;
 
 /// The session config the scripts are written against.
@@ -155,35 +157,108 @@ fn time_update_frame(world_age: i64, time_of_day: i64) -> Vec<u8> {
     time
 }
 
-/// One ground-up Chunk Data column with a single stone block at its origin,
-/// shaped as the capture records a column: the block light and sky light of the
-/// section the mask selects, then the biome array.
-fn chunk_data_frame(cx: i32, cz: i32) -> Vec<u8> {
-    let mut column = Vec::new();
-    column.extend_from_slice(&[0u8; 8192]);
+/// The payload one simple ground-up column carries: one stone block at its
+/// origin in section 0, dark block light, full sky light, plains biomes.
+fn simple_column_payload() -> Vec<u8> {
+    let mut column = vec![0u8; 8192];
     column[..2].copy_from_slice(&0x0010u16.to_le_bytes());
     column.extend_from_slice(&[0u8; 2048]); // block light
     column.extend_from_slice(&[0xFFu8; 2048]); // sky light
     column.extend_from_slice(&[1u8; 256]); // biomes
+    column
+}
+
+/// One Chunk Data frame (0x21) with the fields and payload given.
+fn column_frame(cx: i32, cz: i32, ground_up: bool, mask: u16, data: &[u8]) -> Vec<u8> {
     let mut chunk = vec![0x21];
     chunk.extend_from_slice(&cx.to_be_bytes());
     chunk.extend_from_slice(&cz.to_be_bytes());
-    chunk.push(1); // ground up
-    chunk.extend_from_slice(&0x0001u16.to_be_bytes());
-    push_varint(&mut chunk, column.len() as i32);
-    chunk.extend_from_slice(&column);
+    chunk.push(ground_up as u8);
+    chunk.extend_from_slice(&mask.to_be_bytes());
+    push_varint(&mut chunk, data.len() as i32);
+    chunk.extend_from_slice(data);
     chunk
+}
+
+/// One ground-up Chunk Data column with a single stone block at its origin,
+/// shaped as the capture records a column: the block light and sky light of the
+/// section the mask selects, then the biome array.
+fn chunk_data_frame(cx: i32, cz: i32) -> Vec<u8> {
+    column_frame(cx, cz, true, 0x0001, &simple_column_payload())
 }
 
 /// The unload shape: a ground-up Chunk Data with an empty mask and no data.
 fn chunk_unload_frame(cx: i32, cz: i32) -> Vec<u8> {
-    let mut chunk = vec![0x21];
-    chunk.extend_from_slice(&cx.to_be_bytes());
-    chunk.extend_from_slice(&cz.to_be_bytes());
-    chunk.push(1); // ground up
-    chunk.extend_from_slice(&0x0000u16.to_be_bytes());
-    push_varint(&mut chunk, 0);
-    chunk
+    column_frame(cx, cz, true, 0x0000, &[])
+}
+
+/// One Map Chunk Bulk frame (0x26) carrying a simple ground-up column at each
+/// of `columns`: the metadata block first, then the payloads.
+fn bulk_frame_of(columns: &[(i32, i32)]) -> Vec<u8> {
+    let payload = simple_column_payload();
+    let mut bulk = vec![0x26, 1]; // sky light: the Overworld carries it
+    push_varint(&mut bulk, columns.len() as i32);
+    for (cx, cz) in columns {
+        bulk.extend_from_slice(&cx.to_be_bytes());
+        bulk.extend_from_slice(&cz.to_be_bytes());
+        bulk.extend_from_slice(&0x0001u16.to_be_bytes());
+    }
+    for _ in columns {
+        bulk.extend_from_slice(&payload);
+    }
+    bulk
+}
+
+/// The mask selecting `sections`.
+fn mask_of(sections: &[usize]) -> u16 {
+    sections
+        .iter()
+        .fold(0u16, |mask, &section| mask | (1 << section))
+}
+
+/// The payload a light-carrying column sends: one stone block at local
+/// (1, 1, 1) in every listed section, and the same uniform light in all four
+/// cells around it, so every vertex of the section's mesh reads one pair. A
+/// ground-up payload carries the biome array; the section-update shape
+/// (`GroundUpContinuous = false`) does not.
+fn lit_column_payload(
+    sections: &[usize],
+    block_light: u8,
+    sky_light: u8,
+    ground_up: bool,
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    let index = block_index(1, 1, 1);
+    for _ in sections {
+        let mut blocks = vec![0u8; 8192];
+        blocks[index * 2..index * 2 + 2].copy_from_slice(&0x0010u16.to_le_bytes());
+        data.extend_from_slice(&blocks);
+    }
+    for _ in sections {
+        // Both nibbles of every byte: one uniform level over the array.
+        data.extend_from_slice(&[block_light * 17; 2048]);
+    }
+    for _ in sections {
+        data.extend_from_slice(&[sky_light * 17; 2048]);
+    }
+    if ground_up {
+        data.extend_from_slice(&[1u8; 256]); // plains
+    }
+    data
+}
+
+/// One Chunk Data frame whose listed sections carry one stone block each and
+/// uniform light, in the shape `ground_up` names.
+fn lit_column_frame(
+    cx: i32,
+    cz: i32,
+    sections: &[usize],
+    block_light: u8,
+    sky_light: u8,
+    ground_up: bool,
+) -> Vec<u8> {
+    let payload = lit_column_payload(sections, block_light, sky_light, ground_up);
+    column_frame(cx, cz, ground_up, mask_of(sections), &payload)
 }
 
 /// The committed capture payload for chunk (0, 11): the ground-up column the
@@ -250,14 +325,6 @@ fn client_frame(cursor: &mut &[u8], compression: Compression) -> Vec<u8> {
     oxide_proto::frame::read_frame(cursor, compression).expect("a client frame")
 }
 
-/// The column a ChunkUpdated event reports, panicking on any other event.
-fn updated_column(event: &ClientEvent) -> (i32, i32) {
-    match event {
-        ClientEvent::ChunkUpdated { cx, cz, .. } => (*cx, *cz),
-        other => panic!("expected a chunk update, got {other:?}"),
-    }
-}
-
 /// The world-derived values a Sky event carries, in the test's own shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SkyReport {
@@ -291,6 +358,50 @@ fn updated_slots(events: &[ClientEvent], cx: i32, cz: i32) -> &[(usize, Option<C
         .expect("the column is reported")
 }
 
+/// The section slots of the last `ChunkUpdated` for a column, panicking when
+/// no event reports the column.
+fn last_updated_slots(events: &[ClientEvent], cx: i32, cz: i32) -> &[(usize, Option<ChunkMesh>)] {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ClientEvent::ChunkUpdated {
+                cx: event_cx,
+                cz: event_cz,
+                sections,
+            } if *event_cx == cx && *event_cz == cz => Some(sections.as_slice()),
+            _ => None,
+        })
+        .expect("the column is reported")
+}
+
+/// The light pair every vertex of a single-block section's mesh carries, and a
+/// panic when the vertices disagree.
+fn uniform_light(mesh: &ChunkMesh) -> [u16; 2] {
+    let vertices: Vec<&Vertex> = mesh
+        .layers
+        .iter()
+        .flat_map(|layer| layer.vertices.iter())
+        .collect();
+    let light = vertices.first().expect("the mesh draws a block").light;
+    assert!(
+        vertices.iter().all(|vertex| vertex.light == light),
+        "every vertex was expected to read the same light"
+    );
+    light
+}
+
+/// The columns some `ChunkUpdated` reports, deduplicated.
+fn updated_columns(events: &[ClientEvent]) -> BTreeSet<(i32, i32)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::ChunkUpdated { cx, cz, .. } => Some((*cx, *cz)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn the_session_logs_in_joins_and_answers_every_obligation() {
     let (stream, outgoing) = duplex(scripted_server_stream());
@@ -318,23 +429,21 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
             cz: 0,
             sections,
         } => {
+            assert_eq!(sections.len(), 16, "all sixteen section slots are reported");
             let mesh = sections[0].1.as_ref().expect("section 0 draws");
             assert_eq!(mesh.vertex_count(), 24, "one stone block, six faces");
         }
         other => panic!("expected a chunk update, got {other:?}"),
     }
-    // The applied column leads its four neighbours, in the fixed order the
-    // session re-meshes them: +x, -x, +z, -z.
     assert_eq!(
         events.len(),
-        9,
-        "the applied column and its four neighbours: {events:?}"
+        5,
+        "the login, the join, the teleport, the echo and one mesh: {events:?}"
     );
-    let columns: Vec<(i32, i32)> = events[4..].iter().map(updated_column).collect();
     assert_eq!(
-        columns,
-        vec![(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)],
-        "the applied column leads, then its four neighbours"
+        updated_columns(&events),
+        BTreeSet::from([(0, 0)]),
+        "the applied column is the only one the change marked: {events:?}"
     );
 
     let written = outgoing.lock().unwrap().clone();
@@ -417,11 +526,18 @@ fn a_relative_teleport_is_answered_with_absolute_values() {
 }
 
 #[test]
-fn an_unload_packet_removes_the_column() {
-    // Preceded by the same login sequence, then a ground-up chunk with mask 0.
+fn an_unload_packet_removes_the_column_and_remeshes_its_neighbours() {
+    // The unloaded column and its four neighbours are loaded first; then the
+    // server unloads the column in the middle. The unload is reported as its
+    // packet arrives, and the four loaded neighbours are re-meshed after it:
+    // a column that leaves the store changes the collar their meshes read.
     let (stream, _outgoing) = duplex(stream_with(&[
         join_game_frame(),
         chunk_data_frame(3, 4),
+        chunk_data_frame(4, 4),
+        chunk_data_frame(2, 4),
+        chunk_data_frame(3, 5),
+        chunk_data_frame(3, 3),
         chunk_unload_frame(3, 4),
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -430,33 +546,106 @@ fn an_unload_packet_removes_the_column() {
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    // The unload is reported as its packet arrives, and the pending rebuild it
-    // queued runs when the session drains the queue, against the world as it
-    // stands: the applied column leads its four neighbours, +x, -x, +z, -z.
-    assert_eq!(
-        events.len(),
-        8,
-        "the login, the join, the unload and five chunk updates: {events:?}"
+    let unloaded = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::ChunkUnloaded { cx: 3, cz: 4 }))
+        .unwrap_or_else(|| panic!("the unload is reported: {events:?}"));
+    let neighbours: BTreeSet<(i32, i32)> = BTreeSet::from([(4, 4), (2, 4), (3, 5), (3, 3)]);
+    let reported = updated_columns(&events);
+    assert!(
+        neighbours.is_subset(&reported),
+        "every loaded neighbour is re-meshed: {events:?}"
     );
-    match &events[2] {
-        ClientEvent::ChunkUnloaded { cx, cz } => assert_eq!((*cx, *cz), (3, 4)),
-        other => panic!("expected the unload, got {other:?}"),
+    assert!(
+        reported.is_subset(&neighbours.iter().copied().chain([(3, 4)]).collect()),
+        "no other column is reported: {events:?}"
+    );
+    for (cx, cz) in neighbours {
+        let last = events
+            .iter()
+            .rposition(|event| {
+                matches!(event, ClientEvent::ChunkUpdated { cx: event_cx, cz: event_cz, .. }
+                    if *event_cx == cx && *event_cz == cz)
+            })
+            .unwrap_or_else(|| panic!("({cx}, {cz}) is re-meshed"));
+        assert!(
+            last > unloaded,
+            "({cx}, {cz})'s last report follows the unload: {events:?}"
+        );
+        let slots = last_updated_slots(&events, cx, cz);
+        assert_eq!(slots.len(), 16, "({cx}, {cz}) reports all sixteen sections");
+        let mesh = slots[0].1.as_ref().expect("({cx}, {cz}) draws its block");
+        assert_eq!(
+            mesh.vertex_count(),
+            24,
+            "({cx}, {cz}) draws its stone block"
+        );
     }
-    match &events[3] {
-        ClientEvent::ChunkUpdated { cx, cz, sections } => {
-            assert_eq!((*cx, *cz), (3, 4));
-            assert!(
-                sections.iter().all(|(_, mesh)| mesh.is_none()),
-                "the unloaded column draws nothing"
-            );
-        }
-        other => panic!("expected the deferred rebuild of the unloaded column, got {other:?}"),
+    // A stale build of the unloaded column is discarded and rebuilt against
+    // the world as it stands: the report, when the race leaves one, draws
+    // nothing. The window drops the column's meshes from the unload report
+    // itself.
+    if let Some(sections) = events
+        .iter()
+        .skip(unloaded)
+        .rev()
+        .find_map(|event| match event {
+            ClientEvent::ChunkUpdated {
+                cx: 3,
+                cz: 4,
+                sections,
+            } => Some(sections.as_slice()),
+            _ => None,
+        })
+    {
+        assert!(
+            sections.iter().all(|(_, mesh)| mesh.is_none()),
+            "the removed column draws nothing"
+        );
     }
-    let columns: Vec<(i32, i32)> = events[3..].iter().map(updated_column).collect();
+}
+
+#[test]
+fn a_section_update_carries_its_light_and_keeps_unlisted_sections() {
+    // A ground-up column with sections 1 and 2, light 3/7, then the 0x21
+    // section-update shape (GroundUpContinuous = false) replacing section 1
+    // alone with light 4/9. The listed section draws with the payload's light;
+    // section 2, outside the mask, keeps the light the store held; and no
+    // other column is touched. The exact values pin the rule the spec's §9 and
+    // the protocol reference's §3.3/§4.2 state: a section update replaces the
+    // listed sections' blocks *and* their light, and no local relight runs on
+    // this path.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        // The store's initial column: sections 1 and 2, block light 3, sky 7.
+        lit_column_frame(0, 0, &[1, 2], 3, 7, true),
+        // The section update: section 1 alone, block light 4, sky 9.
+        lit_column_frame(0, 0, &[1], 4, 9, false),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
     assert_eq!(
-        columns,
-        vec![(3, 4), (4, 4), (2, 4), (3, 5), (3, 3)],
-        "the applied column leads, then its four neighbours"
+        updated_columns(&events),
+        BTreeSet::from([(0, 0)]),
+        "no other column is touched: {events:?}"
+    );
+    let slots = last_updated_slots(&events, 0, 0);
+    assert_eq!(slots.len(), 16, "all sixteen section slots are reported");
+    let listed = slots[1].1.as_ref().expect("section 1 draws its block");
+    assert_eq!(
+        uniform_light(listed),
+        [4 * 16 + 8, 9 * 16 + 8],
+        "section 1 draws with the light the payload carried"
+    );
+    let unlisted = slots[2].1.as_ref().expect("section 2 draws its block");
+    assert_eq!(
+        uniform_light(unlisted),
+        [3 * 16 + 8, 7 * 16 + 8],
+        "section 2 outside the mask keeps its stored light"
     );
 }
 
@@ -564,13 +753,15 @@ fn player_list_updates_do_not_end_the_session() {
 }
 
 #[test]
-fn a_keepalive_behind_a_column_burst_is_answered_before_any_mesh_is_built() {
+fn a_keepalive_behind_a_column_burst_is_answered() {
     // A live server sends its initial columns as a burst with the keepalives
     // behind it on the wire. The echo is a connection obligation, and the
     // server closes a session that leaves it unanswered for about thirty
-    // seconds, so the burst must not hold up the read loop: the echo is
-    // answered before the meshes the burst queued are built.
-    let (stream, _outgoing) = duplex(stream_with(&[
+    // seconds, so the burst must not hold up the read loop: the loop hands
+    // jobs to the pool and drains finished results without ever blocking, so
+    // the echo does not wait for a build. The pool's results arrive in no
+    // fixed order, so the meshes are compared as a set, not an order.
+    let (stream, outgoing) = duplex(stream_with(&[
         join_game_frame(),
         chunk_data_frame(0, 0),
         chunk_data_frame(1, 0),
@@ -582,18 +773,31 @@ fn a_keepalive_behind_a_column_burst_is_answered_before_any_mesh_is_built() {
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    let answered = events
-        .iter()
-        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 21 }))
-        .expect("the keepalive is answered");
-    let meshed = events
-        .iter()
-        .position(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
-        .expect("the columns are meshed");
     assert!(
-        answered < meshed,
-        "the echo must not wait for the meshes: {events:?}"
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::KeepAlive { id: 21 })),
+        "the keepalive is answered: {events:?}"
     );
+    assert_eq!(
+        updated_columns(&events),
+        BTreeSet::from([(0, 0), (1, 0)]),
+        "both columns are meshed: {events:?}"
+    );
+    // The echo is written: it is the only packet the burst drew, right after
+    // the settings and the brand.
+    let written = outgoing.lock().unwrap().clone();
+    let mut cursor = &written[..];
+    client_frame(&mut cursor, Compression::Disabled); // handshake
+    client_frame(&mut cursor, Compression::Disabled); // login start
+    client_frame(&mut cursor, SERVER_FRAMING); // client settings
+    client_frame(&mut cursor, SERVER_FRAMING); // brand
+    assert_eq!(
+        client_frame(&mut cursor, SERVER_FRAMING),
+        [0x00, 0x15],
+        "the keepalive is the only packet the burst drew"
+    );
+    assert!(cursor.is_empty(), "no further packets were sent");
 }
 
 /// A duplex with a quiet stretch: after `head` is consumed, the stream reports
@@ -626,11 +830,15 @@ impl Write for GappedDuplex {
 }
 
 impl DeadlineStream for GappedDuplex {
-    fn wait_readable(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+    fn wait_readable(&mut self, timeout: Duration) -> std::io::Result<bool> {
         if self.head.position() < self.head.get_ref().len() as u64 {
             Ok(true)
         } else if self.stalls > 0 {
             self.stalls -= 1;
+            // A real deadline blocks for up to the timeout before it reports
+            // nothing; the fake waits the same span, so the pool gets the
+            // window the tick gives it.
+            std::thread::sleep(timeout);
             Ok(false)
         } else {
             Ok(true)
@@ -641,9 +849,10 @@ impl DeadlineStream for GappedDuplex {
 #[test]
 fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
     // The burst has arrived and a keepalive has been answered; the connection
-    // then goes quiet before the next keepalive. The pending meshes are rebuilt
-    // during that quiet stretch — not deferred to the end of the stream — and
-    // the next keepalive is still read after them.
+    // then goes quiet before the next keepalive. The queue's meshes are
+    // handed to the pool and drained during that quiet stretch — not deferred
+    // to the end of the stream — and the next keepalive is still read after
+    // them.
     let mut head = Vec::new();
     login_sequence(&mut head);
     frame(&mut head, &join_game_frame(), SERVER_FRAMING);
@@ -713,7 +922,12 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
     ));
     // The bulk frame draws no reply of its own, and the keepalive behind it is
     // still answered.
-    assert!(matches!(events[2], ClientEvent::KeepAlive { id: 41 }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::KeepAlive { id: 41 })),
+        "the keepalive is answered: {events:?}"
+    );
     let written = outgoing.lock().unwrap().clone();
     let mut cursor = &written[..];
     client_frame(&mut cursor, Compression::Disabled); // handshake
@@ -727,25 +941,13 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
     );
     assert!(cursor.is_empty(), "no further packets were sent");
 
-    // Both columns enter the mesh queue in packet order, and each is reported
-    // the way a single column is: the applied column, then its four
-    // neighbours, in the fixed order the session re-meshes them.
-    let columns: Vec<(i32, i32)> = events[3..].iter().map(updated_column).collect();
+    // Both columns are handed to the pool and each is reported once, with all
+    // sixteen section slots; the results arrive in no fixed order, so the
+    // comparison is a set.
     assert_eq!(
-        columns,
-        vec![
-            (0, 11),
-            (1, 11),
-            (-1, 11),
-            (0, 12),
-            (0, 10), // the first column leads its neighbours
-            (1, 11),
-            (2, 11),
-            (0, 11),
-            (1, 12),
-            (1, 10), // then the second column leads its own
-        ],
-        "both bulk columns are meshed, not just the first"
+        updated_columns(&events),
+        BTreeSet::from([(0, 11), (1, 11)]),
+        "both bulk columns are meshed, not just the first: {events:?}"
     );
     let sixteen: Vec<usize> = (0..16).collect();
     for (cx, cz) in [(0, 11), (1, 11)] {
@@ -786,6 +988,78 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
         second, first,
         "the column at (1, 11) is a faithful copy of the column at (0, 11)"
     );
+}
+
+#[test]
+fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
+    // Three plain 0x21 columns and one 0x26 bulk covering three more, applied
+    // back to back with a keepalive between. The columns abut, so a session
+    // that re-meshed a change's neighbours would report far more than the six;
+    // the dirty set records only the column each packet changed. The pool's
+    // results arrive in no fixed order, so the reported set is compared as a
+    // map, and the keepalive behind the burst is answered while the pool
+    // still works.
+    let bulk = bulk_frame_of(&[(3, 0), (4, 0), (5, 0)]);
+    let (stream, outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        chunk_data_frame(0, 0),
+        chunk_data_frame(1, 0),
+        keep_alive_frame(61),
+        chunk_data_frame(2, 0),
+        bulk,
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::KeepAlive { id: 61 })),
+        "the keepalive between the bursts is answered: {events:?}"
+    );
+    assert_eq!(
+        updated_columns(&events),
+        BTreeSet::from([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]),
+        "exactly the six columns, each report answering its own packet: {events:?}"
+    );
+    let updates = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
+        .count();
+    assert_eq!(updates, 6, "each column is reported once: {events:?}");
+    for (cx, cz) in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)] {
+        let slots = updated_slots(&events, cx, cz);
+        assert_eq!(slots.len(), 16, "({cx}, {cz}) reports all sixteen sections");
+        let indices: Vec<usize> = slots.iter().map(|(index, _)| *index).collect();
+        assert_eq!(
+            indices,
+            (0..16).collect::<Vec<_>>(),
+            "({cx}, {cz}) reports them in order"
+        );
+        let mesh = slots[0].1.as_ref().expect("({cx}, {cz}) draws its block");
+        assert_eq!(
+            mesh.vertex_count(),
+            24,
+            "({cx}, {cz}) draws its stone block"
+        );
+    }
+    // The keepalive echo is the only packet the burst drew, after the settings
+    // and the brand.
+    let written = outgoing.lock().unwrap().clone();
+    let mut cursor = &written[..];
+    client_frame(&mut cursor, Compression::Disabled); // handshake
+    client_frame(&mut cursor, Compression::Disabled); // login start
+    client_frame(&mut cursor, SERVER_FRAMING); // client settings
+    client_frame(&mut cursor, SERVER_FRAMING); // brand
+    assert_eq!(
+        client_frame(&mut cursor, SERVER_FRAMING),
+        [0x00, 0x3d],
+        "the keepalive echo is the only packet the six columns drew"
+    );
+    assert!(cursor.is_empty(), "no further packets were sent");
 }
 
 #[test]
