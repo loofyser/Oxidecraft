@@ -159,6 +159,47 @@ struct SkyValues {
     star_brightness: f32,
     /// The clouds' tint.
     cloud_colour: [f32; 3],
+    /// The moon's phase in `0..8`.
+    moon_phase: u8,
+}
+
+/// The fog and the sky one frame draws with, from the session's clock and sky and the client's
+/// own frame state.
+///
+/// The session owns the world, so the five world-derived values and the moon's phase come from
+/// its `Sky` event; the fog colour, the far plane and the cloud counter are the client's own.
+/// The far plane is the render distance in blocks — the source's `farPlaneDistance`, which the
+/// sky pass doubles and the cloud pass quadruples — and the fog's range comes from
+/// [`linear_params`] of it.
+fn frame_params(
+    time_of_day: i64,
+    dimension: i8,
+    eye_y: f64,
+    void_y_factor: f32,
+    values: SkyValues,
+    cloud_ticks: i64,
+) -> (FogParams, SkyParams) {
+    let far_plane = FAR_CHUNKS * 16.0;
+    let (start, end) = linear_params(far_plane);
+    let colour = fog_colour(dimension, time_of_day as f32, eye_y, void_y_factor);
+    let fog = FogParams {
+        colour,
+        start,
+        end,
+        far_plane,
+    };
+    let sky = SkyParams {
+        celestial_angle: values.celestial_angle,
+        sky_colour: values.colour,
+        sun_brightness: values.sun_brightness,
+        star_brightness: values.star_brightness,
+        fog_colour: colour,
+        far_plane,
+        cloud_offset_ticks: cloud_ticks,
+        cloud_colour: values.cloud_colour,
+        moon_phase: values.moon_phase,
+    };
+    (fog, sky)
 }
 
 /// The void-fog factor a level type asks for: `WorldProvider.getVoidFogYFactor`
@@ -255,32 +296,16 @@ impl ClientApp {
             // The counter M3's tick loop will advance once per tick; see the field's own note.
             self.cloud_ticks += 1;
             if let (Some(time_of_day), Some(values)) = (self.sky.time_of_day, self.sky.sky) {
-                // The render distance in blocks, the source's `farPlaneDistance`: the fog's
-                // reference distance and the sky projection's own factor's base.
-                let far_plane = FAR_CHUNKS * 16.0;
-                let (start, end) = linear_params(far_plane);
-                let colour = fog_colour(
+                let (fog, sky) = frame_params(
+                    time_of_day,
                     self.hud.dimension,
-                    time_of_day as f32,
                     self.hud.position[1],
                     self.sky.void_y_factor,
+                    values,
+                    self.cloud_ticks,
                 );
-                renderer.set_fog(FogParams {
-                    colour,
-                    start,
-                    end,
-                    far_plane,
-                });
-                renderer.set_sky(SkyParams {
-                    celestial_angle: values.celestial_angle,
-                    sky_colour: values.colour,
-                    sun_brightness: values.sun_brightness,
-                    star_brightness: values.star_brightness,
-                    fog_colour: colour,
-                    far_plane,
-                    cloud_offset_ticks: self.cloud_ticks,
-                    cloud_colour: values.cloud_colour,
-                });
+                renderer.set_fog(fog);
+                renderer.set_sky(sky);
             }
         }
         renderer.set_overlay_lines(if self.overlay_visible {
@@ -444,6 +469,7 @@ fn apply_session_event(
             sun_brightness,
             star_brightness,
             cloud_colour,
+            moon_phase,
         } => {
             sky.sky = Some(SkyValues {
                 celestial_angle,
@@ -451,6 +477,7 @@ fn apply_session_event(
                 sun_brightness,
                 star_brightness,
                 cloud_colour,
+                moon_phase,
             });
             false
         }
@@ -611,7 +638,8 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Cli, ClientApp, is_escape_press, is_f3_press, parse_server_address, void_y_factor,
+        Cli, ClientApp, SkyValues, frame_params, is_escape_press, is_f3_press,
+        parse_server_address, void_y_factor,
     };
     use clap::Parser;
     use winit::event::ElementState;
@@ -699,5 +727,32 @@ mod tests {
     fn only_a_flat_world_asks_for_the_full_void_fog_factor() {
         assert_eq!(void_y_factor("flat"), 1.0);
         assert_eq!(void_y_factor("default"), 0.03125);
+    }
+
+    #[test]
+    fn one_frames_parameters_carry_the_clock_the_sky_and_the_fog() {
+        let values = SkyValues {
+            celestial_angle: 0.25,
+            colour: [0.5, 0.6, 0.7],
+            sun_brightness: 0.9,
+            star_brightness: 0.1,
+            cloud_colour: [1.0, 0.5, 0.25],
+            moon_phase: 5,
+        };
+        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, values, 7);
+        // The Overworld's noon fog at the eye on the ground is the provider's base itself
+        // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`), and the range is the
+        // terrain's own for the eight-chunk far plane (`EntityRenderer.java:2014-2015`).
+        assert_eq!(fog.colour, [0.7529412, 0.84705883, 1.0]);
+        assert_eq!((fog.start, fog.end, fog.far_plane), (96.0, 128.0, 128.0));
+        assert_eq!(sky.celestial_angle, 0.25);
+        assert_eq!(sky.sky_colour, [0.5, 0.6, 0.7]);
+        assert_eq!(sky.sun_brightness, 0.9);
+        assert_eq!(sky.star_brightness, 0.1);
+        assert_eq!(sky.fog_colour, fog.colour);
+        assert_eq!(sky.far_plane, 128.0);
+        assert_eq!(sky.cloud_offset_ticks, 7);
+        assert_eq!(sky.cloud_colour, [1.0, 0.5, 0.25]);
+        assert_eq!(sky.moon_phase, 5);
     }
 }

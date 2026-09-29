@@ -7,7 +7,7 @@
 //! `refs/m2-task-12/star_field.java`, which copies the source's generator expression for
 //! expression and runs the real `java.util.Random(10842L)` — the same method Task 6 used
 //! for its random vectors. The first harness, `sky_literals.java`, omitted the per-star spin
-//! draw (`RenderGlobal.java:414`), so the accepted count and the later stars' centres it
+//! draw (`RenderGlobal.java:431`), so the accepted count and the later stars' centres it
 //! printed were not the source's; the corrected harness's figures are the ones pinned here.
 //!
 //! Nothing here needs a device: these are the values the pass's geometry and uniforms are

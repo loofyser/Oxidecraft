@@ -258,7 +258,7 @@ fn updated_column(event: &ClientEvent) -> (i32, i32) {
     }
 }
 
-/// The five world-derived values a Sky event carries, in the test's own shape.
+/// The world-derived values a Sky event carries, in the test's own shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SkyReport {
     /// The celestial angle.
@@ -271,6 +271,8 @@ struct SkyReport {
     star_brightness: f32,
     /// The clouds' tint.
     cloud_colour: [f32; 3],
+    /// The moon's phase.
+    moon_phase: u8,
 }
 
 /// The section slots of the first `ChunkUpdated` for a column, panicking when
@@ -790,8 +792,9 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
 fn the_session_reports_the_clock_and_the_sky_it_moves() {
     // A join, a teleport into the column the script loads, the column whose biome array is
     // plains, `/time set 6000`'s own frame, the same frame with the time negated — the frozen
-    // sun — and a teleport inside that column. The clock comes back per update and the sky
-    // follows it and the view block, because the client cannot sample the world itself.
+    // sun — a teleport inside that column, and a third day's frame. The clock comes back per
+    // update and the sky follows it and the view block, because the client cannot sample the
+    // world itself.
     let (stream, _outgoing) = duplex(stream_with(&[
         join_game_frame(),
         position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
@@ -799,6 +802,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
         time_update_frame(48_000, 6000),
         time_update_frame(48_000, -6001),
         position_frame(12.5, 65.0, 4.5, 0.0, 0.0, 0),
+        time_update_frame(48_000, 72_000),
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     let session = Session::new(Conn::new(stream), config());
@@ -819,7 +823,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
         .collect();
     assert_eq!(
         clocks,
-        vec![(48_000, 6000), (48_000, -6001)],
+        vec![(48_000, 6000), (48_000, -6001), (48_000, 72_000)],
         "every Time Update is reported, the sign of the time kept as received"
     );
 
@@ -833,23 +837,27 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
                 sun_brightness,
                 star_brightness,
                 cloud_colour,
+                moon_phase,
             } => Some(SkyReport {
                 celestial_angle: *celestial_angle,
                 colour: *colour,
                 sun_brightness: *sun_brightness,
                 star_brightness: *star_brightness,
                 cloud_colour: *cloud_colour,
+                moon_phase: *moon_phase,
             }),
             _ => None,
         })
         .collect();
-    let midnight = oxide_world::sky::celestial_angle(-6001, 0.0);
+    // The JVM harness's own frozen angle (`refs/m2-task-12/sky_literals.out`, `angle t=-6001`).
+    let midnight = 0.49993455;
     let frozen = SkyReport {
         celestial_angle: midnight,
         colour: [0.0, 0.0, 0.0],
         sun_brightness: 0.2,
         star_brightness: 0.5,
         cloud_colour: [0.1, 0.1, 0.15],
+        moon_phase: 0,
     };
     assert_eq!(
         skies,
@@ -861,10 +869,21 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
                 sun_brightness: 1.0,
                 star_brightness: 0.0,
                 cloud_colour: [1.0, 1.0, 1.0],
+                moon_phase: 0,
             },
             // The frozen midnight, reported again for the moved view block.
             frozen,
             frozen,
+            // The third day's sunrise angle (`angle t=0` is the same day fraction), whose
+            // `worldTime / 24000 % 8` is phase 3.
+            SkyReport {
+                celestial_angle: 0.8535534,
+                colour: [120.0 / 255.0, 167.0 / 255.0, 1.0],
+                sun_brightness: 1.0,
+                star_brightness: 0.0,
+                cloud_colour: [1.0, 1.0, 1.0],
+                moon_phase: 3,
+            },
         ],
         "the sky colour follows the clock and the biome under the player"
     );

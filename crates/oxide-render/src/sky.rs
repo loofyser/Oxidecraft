@@ -3,24 +3,25 @@
 //!
 //! # What the passes draw
 //!
-//! [`SkyPass`] draws, in the source's order, the horizon band, the below-horizon plane, the void
-//! the source fills in under the horizon, and the sun, the moon and the stars in the celestial
-//! frame (`RenderGlobal.renderSky`, `RenderGlobal.java:1213-1417`):
+//! [`SkyPass`] draws, in the source's order, the horizon band, the sun, the moon and the stars
+//! in the celestial frame, then the void the source fills in under the horizon and the
+//! below-horizon plane (`RenderGlobal.renderSky`, `RenderGlobal.java:1213-1417`):
 //!
 //! * The band is the source's generated 64-unit grid spanning `-384..=384` on both axes
-//!   (`RenderGlobal.java:340-365`) at `y = +16` (`:325`), flat in the frame's sky colour. It is
-//!   the only sky surface the source draws with fog enabled; `disableFog()` follows its draw
-//!   (`:1240`), so the celestial quads, the below-horizon plane and the void are unfogged.
+//!   (`RenderGlobal.java:340-365`) at `y = +16` (`:325`), flat in the frame's sky colour. The
+//!   source draws it with fog enabled (`:1231`), disables fog for the celestial quads (`:1248`)
+//!   and re-enables it for the void and the below-horizon plane (`:1349`), all under the sky
+//!   range `setupFog(-1)` installs (`EntityRenderer.java:1348`, `:2009-2010`).
 //! * The below-horizon plane is the same grid generated at `y = -16` with its winding reversed
 //!   (`:291`, `renderSky(worldrenderer, -16.0F, true)`), lifted so it sits at the world horizon:
 //!   the source translates it by `16 - (eyeY - 63)` (`:1404`), reaching `y = -(eyeY - 63)`, and
-//!   tints it `(c * 0.2 + 0.04, c * 0.2 + 0.04, c * 0.6 + 0.1)` (`:1402-1409`). There is no
-//!   alpha fade in the band or the plane; the transparent edge the source fades at sunset is the
-//!   deferred sunset fan (`:1243-1288`).
+//!   tints it `(c * 0.2 + 0.04, c * 0.2 + 0.04, c * 0.6 + 0.1)` (`:1402-1409`). It is fogged
+//!   (`:1349`). There is no alpha fade in the band or the plane; the transparent edge the source
+//!   fades at sunset is the deferred sunset fan (`:1243-1288`).
 //! * The void is the source's black box (`:1375-1399`): a `±1` column hanging from one unit under
 //!   the eye down to `-(d0 + 65)` with `d0 = eyeY - 63`, drawn only while the eye is below the
-//!   horizon (`d0 < 0`), together with the same reversed grid lifted to `y = -4` (`:1381`).
-//!   [`void_box_low`] answers the floor.
+//!   horizon (`d0 < 0`), together with the same reversed grid lifted to `y = -4` (`:1381`). It is
+//!   fogged too (`:1349`); [`void_box_low`] answers the floor.
 //! * The sun is a 60 by 60 quad at `y = +100`, textured by `environment/sun` with uvs `0..1`
 //!   (`:1301-1308`); the moon a 40 by 40 quad at `y = -100` whose uv picks the phase's cell from
 //!   the 128x64 4x2 `environment/moon_phases` sheet (`:1309-1323`, [`moon_uv`]). Both are drawn
@@ -45,9 +46,9 @@
 //! `RenderGlobal.java:1420-1481`): one flat layer of 32-block cells spanning `-256..256` around
 //! the camera's own x and z (`:1432`, `:1467-1474`) at `y = 128 - eyeY + 0.33` in the camera's
 //! frame (`:1462`; `WorldProvider.getCloudHeight` is 128.0 for the Overworld, `:206-209`),
-//! textured by `environment/clouds` at `1/2048` of a uv per block (`:1424`), tinted by the
+//! textured by `environment/clouds` at `1/2048` of a uv per block (`:1454`), tinted by the
 //! frame's cloud colour at alpha 0.8 (`:1471-1474`) and blended
-//! `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` (`:1429`). Culling is off for the layer (`:1427`), the depth
+//! `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` (`:1438`). Culling is off for the layer (`:1430`), the depth
 //! test is on and — because `renderSky` restores `depthMask(true)` before this (`:1416`) and the
 //! fast arm masks nothing — the depth writes are on too. The fog is the terrain range
 //! (`EntityRenderer.setupFog(0)`, `EntityRenderer.java:1361`, `:1500`).
@@ -67,15 +68,22 @@
 //! `entity.posY + eyeHeight < 128.0` (`EntityRenderer.java:1364-1367`, [`cloud_under_layer`]).
 //! The at-or-above arm (`:1474-1478`) is the later scene work's.
 //!
-//! # Projections and state
+//! # Projections, the eye and the frame
 //!
-//! The source gives every pass its own far plane: the terrain projection ends at
-//! `farPlaneDistance * sqrt(2)`, the sky at `* 2` (`EntityRenderer.java:1352`, `:1357`) and the
-//! clouds at `* 4` (`:1497`). The passes mirror that: the sky's view-projection ends at
+//! The source gives every pass its own far plane: the sky's projection ends at
+//! `farPlaneDistance * 2` (`EntityRenderer.java:1352`), the terrain's at `* sqrt(2)` (`:1357`)
+//! and the clouds' at `* 4` (`:1497`). The passes mirror that: the sky's view-projection ends at
 //! `SkyParams.far_plane * 2` and the cloud's at `* 4`, with `SkyParams.far_plane` the source's
 //! `farPlaneDistance` — the render distance in blocks, 128 for the default eight chunks — which
 //! is also the fog's reference distance (the sky's range is `0..far_plane`, the terrain's and the
 //! clouds' `setupFog(0)` range comes from [`crate::fog::linear_params`]).
+//!
+//! The modelview the source draws the sky with ends with
+//! `GlStateManager.translate(0.0F, -f, 0.0F)` with `f = getEyeHeight()` (`EntityRenderer.java:738`),
+//! so the local geometry — the band's `+16`, the sun's `+100`, the grids' `±384`, the box's `-1`
+//! — is measured from the ground the entity stands on and the camera sits `EYE_HEIGHT` above the
+//! frame's origin. The sky pass builds its view with the origin at `(0, EYE_HEIGHT, 0)`, which is
+//! that translation; the below-plane lift and the void floor already carry the absolute eye.
 //!
 //! The sky's pipelines write no depth, matching `depthMask(false)` (`:1230`) and the restore at
 //! `:1416`; the depth test is off as the brief specifies, which is what the source's test
@@ -172,11 +180,11 @@ pub const CLOUD_ALPHA: f32 = 0.8;
 /// The block count the cloud uv wraps on, per axis (`RenderGlobal.java:1457-1458`).
 pub const CLOUD_WRAP: f64 = 2048.0;
 
-/// The uv one block of the cloud texture spans (`RenderGlobal.java:1424`).
+/// The uv one block of the cloud texture spans (`RenderGlobal.java:1454`).
 pub const CLOUD_UV_PER_BLOCK: f64 = 4.8828125E-4;
 
 /// The blocks one cloud counter tick drifts: the source's own `0.03` float literal, widened to
-/// `f64` (`RenderGlobal.java:1455`), which is `0.029999999329447746` and not the round decimal.
+/// `f64` (`RenderGlobal.java:1456`), which is `0.029999999329447746` and not the round decimal.
 /// One tick is therefore `0.03 * 4.8828125E-4 = 1.46484375E-5` of uv, not one uv per tick.
 pub const CLOUD_DRIFT_PER_TICK: f64 = 0.029999999329447746;
 
@@ -185,7 +193,7 @@ pub const CLOUD_DRIFT_PER_TICK: f64 = 0.029999999329447746;
 const BELOW_LIFT: f32 = 12.0;
 
 /// The sky projection's far plane as a multiple of the frame's `far_plane`
-/// (`EntityRenderer.java:1357`).
+/// (`EntityRenderer.java:1352`).
 const SKY_FAR_MULTIPLIER: f32 = 2.0;
 
 /// The cloud projection's far plane as a multiple of the frame's `far_plane`
@@ -283,8 +291,9 @@ pub fn void_box_low(eye_y: f32) -> f32 {
 pub struct Star {
     /// The star's centre, in the camera-relative celestial frame.
     pub centre: [f64; 3],
-    /// The star's extent: the quad's half diagonal (`0.15F + nextFloat() * 0.1F`,
-    /// `RenderGlobal.java:411`).
+    /// The star's extent: its half-extent along each of the quad's two basis directions
+    /// (`0.15F + nextFloat() * 0.1F`, `RenderGlobal.java:411`), so a corner sits
+    /// `size * sqrt(2)` from the centre.
     pub size: f64,
     /// The quad's four corners, in the order the source winds them
     /// (`RenderGlobal.java:429-448`).
@@ -355,7 +364,7 @@ pub fn star_field() -> Vec<Star> {
 /// Task 6's port lives in `oxide_world::noise::JavaRandom`; this crate has no edge to
 /// `oxide-world` (section 5.1's table, `scripts/check-graph.sh`), so the two constants and the
 /// float draws are repeated here rather than reached across crates. The star literals
-/// `refs/m2-task-12/sky_literals.java` printed pin both copies.
+/// `refs/m2-task-12/star_field.java` printed pin both copies.
 struct FloatRandom {
     /// The generator's state: the low 48 bits of the scrambled seed.
     seed: u64,
@@ -429,6 +438,9 @@ pub struct SkyParams {
     pub cloud_offset_ticks: i64,
     /// The clouds' tint.
     pub cloud_colour: [f32; 3],
+    /// The moon's phase in `0..8`, from the clock's `getMoonPhase`; the pass draws that cell of
+    /// the phase sheet. Any value outside `0..8` wraps.
+    pub moon_phase: u8,
 }
 
 /// The three environment textures the sky and the clouds draw with, decoded by the caller's
@@ -586,7 +598,7 @@ fn base(input: VertexOutput) -> vec4<f32> {
     }
 }
 
-// The band's linear fog, the same mix the terrain uses.
+// The linear fog every ground-facing sky surface mixes in, the same mix the terrain uses.
 fn fogged(colour: vec4<f32>, depth: f32) -> vec4<f32> {
     let span = sky.fog_range.y - sky.fog_range.x;
     if (span <= 0.0) {
@@ -599,9 +611,11 @@ fn fogged(colour: vec4<f32>, depth: f32) -> vec4<f32> {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let colour = base(input);
-    // Only the horizon band is fogged: the source disables fog right after its draw
-    // (`RenderGlobal.java:1240`).
-    if (input.kind == 0u) {
+    // The band, the void and the below-horizon plane are fogged: the source enables fog for the
+    // band (`RenderGlobal.java:1231`) and, after the celestial quads, for the under-horizon
+    // geometry (`:1349`). The sun, the moon and the stars draw between those two with fog
+    // disabled (`:1248`), so kinds 4 and 5 are left alone.
+    if (input.kind <= 3u) {
         return fogged(colour, input.depth);
     }
     return colour;
@@ -628,7 +642,7 @@ struct Cloud {{
 
 // The layer's world height (`RenderGlobal.java:1462`, `WorldProvider.java:206-209`).
 const CLOUD_Y: f32 = {CLOUD_Y};
-// The uv one block spans (`RenderGlobal.java:1424`).
+// The uv one block spans (`RenderGlobal.java:1454`).
 const CLOUD_UV_PER_BLOCK: f32 = {CLOUD_UV_PER_BLOCK};
 // The quad's alpha (`RenderGlobal.java:1471-1474`).
 const CLOUD_ALPHA: f32 = {CLOUD_ALPHA};
@@ -696,7 +710,7 @@ fn celestial_blend() -> wgpu::BlendState {
 }
 
 /// The cloud layer's blend (`GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0)`,
-/// `RenderGlobal.java:1429`): the source over one minus it, the destination's alpha kept.
+/// `RenderGlobal.java:1438`): the source over one minus it, the destination's alpha kept.
 fn cloud_blend() -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -1078,8 +1092,8 @@ fn sun_quad_vertices() -> Vec<SkyVertex> {
 /// The moon quad at its source's height and size (`RenderGlobal.java:1309-1323`), textured by
 /// [`moon_uv`] for `phase`.
 ///
-/// M2 has no field to carry the phase — the session's sky event and [`SkyParams`] were settled
-/// without one — so the pass builds the first cell's quad and records the gap.
+/// [`SkyPass::new`] builds one quad per phase cell, so the pass draws the clock's phase without
+/// rebuilding a buffer.
 fn moon_quad_vertices(phase: i32) -> Vec<SkyVertex> {
     let positions = [
         [-MOON_HALF_SIZE, MOON_HEIGHT, MOON_HALF_SIZE],
@@ -1174,8 +1188,10 @@ pub struct SkyPass {
     sun: Option<(GpuTexture, wgpu::BindGroup)>,
     /// `environment/moon_phases`, once uploaded, and its bind group.
     moon: Option<(GpuTexture, wgpu::BindGroup)>,
-    /// The horizon band and the below-horizon plane.
+    /// The horizon band and the below-horizon plane, band first.
     background: wgpu::Buffer,
+    /// How many vertices the band holds; the below-horizon plane follows it.
+    band_vertices: u32,
     /// How many vertices the background holds.
     background_vertices: u32,
     /// The void box and the black plane drawn while the eye is below the horizon.
@@ -1184,8 +1200,8 @@ pub struct SkyPass {
     void_vertices: u32,
     /// The sun quad.
     sun_quad: wgpu::Buffer,
-    /// The moon quad.
-    moon_quad: wgpu::Buffer,
+    /// The moon's eight phase quads, indexed by the phase.
+    moon_quads: [wgpu::Buffer; 8],
     /// The star field.
     stars: wgpu::Buffer,
     /// How many vertices the star field holds.
@@ -1276,9 +1292,12 @@ impl SkyPass {
         let fallback_bind_group = fallback.bind_group(device, &texture_layout);
 
         let background = {
-            let mut vertices = grid_vertices(KIND_BAND, BAND_HEIGHT, false);
+            let band = grid_vertices(KIND_BAND, BAND_HEIGHT, false);
+            let band_vertices = band.len() as u32;
+            let mut vertices = band;
             vertices.extend(grid_vertices(KIND_BELOW, BELOW_HEIGHT, true));
-            vertex_buffer(device, queue, "oxide sky background", &vertices)
+            let (buffer, total) = vertex_buffer(device, queue, "oxide sky background", &vertices);
+            (buffer, band_vertices, total)
         };
         let void = {
             let mut vertices = grid_vertices(KIND_VOID_PLANE, BELOW_HEIGHT + BELOW_LIFT, true);
@@ -1286,7 +1305,16 @@ impl SkyPass {
             vertex_buffer(device, queue, "oxide sky void", &vertices)
         };
         let sun = vertex_buffer(device, queue, "oxide sky sun", &sun_quad_vertices());
-        let moon = vertex_buffer(device, queue, "oxide sky moon", &moon_quad_vertices(0));
+        // One quad per phase cell, so the pass picks the clock's phase without rebuilding.
+        let moon_quads = std::array::from_fn(|phase| {
+            vertex_buffer(
+                device,
+                queue,
+                "oxide sky moon",
+                &moon_quad_vertices(phase as i32),
+            )
+            .0
+        });
         let stars = vertex_buffer(device, queue, "oxide sky stars", &star_vertices());
 
         Self {
@@ -1299,11 +1327,12 @@ impl SkyPass {
             sun: None,
             moon: None,
             background: background.0,
-            background_vertices: background.1,
+            band_vertices: background.1,
+            background_vertices: background.2,
             void: void.0,
             void_vertices: void.1,
             sun_quad: sun.0,
-            moon_quad: moon.0,
+            moon_quads,
             stars: stars.0,
             star_vertices: stars.1,
             params: None,
@@ -1322,8 +1351,10 @@ impl SkyPass {
     /// Stores the camera and the surface aspect the next draw is built with, and refreshes the
     /// uniform.
     ///
-    /// The view is the camera's pose at the origin: the sky's geometry is camera-relative, as
-    /// the source's own modelview makes it, so only the camera's orientation enters.
+    /// The view is the camera's pose with the camera at `(0, EYE_HEIGHT, 0)`: the sky's geometry
+    /// is measured from the ground the entity stands on, as the source's own modelview makes it
+    /// (`GlStateManager.translate(0.0F, -f, 0.0F)`, `EntityRenderer.java:738`), so the camera
+    /// sits an eye's height above the frame's origin.
     pub fn set_camera(&mut self, queue: &wgpu::Queue, camera: Camera, aspect: f32) {
         self.camera = Some(camera);
         self.aspect = aspect;
@@ -1358,7 +1389,14 @@ impl SkyPass {
             aspect,
             camera.near,
             far_plane,
-        ) * Mat4::look_to_rh(Vec3::ZERO, camera.forward(), Vec3::Y);
+        ) * Mat4::look_to_rh(
+            // The source's modelview ends with the eye-height translation
+            // (`EntityRenderer.java:738`), so the camera sits an eye's height above the frame
+            // the local geometry is measured in.
+            Vec3::new(0.0, EYE_HEIGHT, 0.0),
+            camera.forward(),
+            Vec3::Y,
+        );
         let celestial = celestial_rotation(params.celestial_angle);
         let eye_y = camera.eye().y;
         let below_lift = 16.0 - (eye_y - HORIZON);
@@ -1392,12 +1430,16 @@ impl SkyPass {
         queue.write_buffer(&self.frame_buffer, 0, &bytes);
     }
 
-    /// Draws the sky: the void first (so the below-horizon plane paints over it where both are
-    /// visible), then the band and the plane, then the sun, the moon and the stars.
+    /// Draws the sky in the source's own order: the band, the sun, the moon and the stars, then
+    /// — while the eye is below the horizon — the void, and last the below-horizon plane
+    /// (`RenderGlobal.java:1231-1414`). The order decides occlusion, because the sky writes no
+    /// depth: the celestial quads paint over the band, the void over both, and the plane over
+    /// everything before it.
     ///
     /// Nothing draws until both parameters and a camera have been set; the sun and the moon are
-    /// skipped until their textures land, and the stars when the frame's brightness is not above
-    /// zero (`RenderGlobal.java:1327`).
+    /// skipped until their textures land, the moon's quad is the frame's phase cell, and the
+    /// stars are skipped when the frame's brightness is not above zero
+    /// (`RenderGlobal.java:1327`).
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         let (Some(params), Some(_)) = (self.params.as_ref(), self.camera.as_ref()) else {
             return;
@@ -1406,12 +1448,8 @@ impl SkyPass {
         pass.set_bind_group(1, &self.fallback_bind_group, &[]);
 
         pass.set_pipeline(&self.background_pipeline);
-        if self.below_horizon {
-            pass.set_vertex_buffer(0, self.void.slice(..));
-            pass.draw(0..self.void_vertices, 0..1);
-        }
         pass.set_vertex_buffer(0, self.background.slice(..));
-        pass.draw(0..self.background_vertices, 0..1);
+        pass.draw(0..self.band_vertices, 0..1);
 
         if self.sun.is_some() || self.moon.is_some() {
             pass.set_pipeline(&self.celestial_pipeline);
@@ -1422,7 +1460,8 @@ impl SkyPass {
             }
             if let Some((_, bind)) = self.moon.as_ref() {
                 pass.set_bind_group(1, bind, &[]);
-                pass.set_vertex_buffer(0, self.moon_quad.slice(..));
+                let phase = usize::from(params.moon_phase % 8);
+                pass.set_vertex_buffer(0, self.moon_quads[phase].slice(..));
                 pass.draw(0..6, 0..1);
             }
         }
@@ -1432,6 +1471,14 @@ impl SkyPass {
             pass.set_vertex_buffer(0, self.stars.slice(..));
             pass.draw(0..self.star_vertices, 0..1);
         }
+
+        pass.set_pipeline(&self.background_pipeline);
+        if self.below_horizon {
+            pass.set_vertex_buffer(0, self.void.slice(..));
+            pass.draw(0..self.void_vertices, 0..1);
+        }
+        pass.set_vertex_buffer(0, self.background.slice(..));
+        pass.draw(self.band_vertices..self.background_vertices, 0..1);
     }
 }
 
@@ -1522,7 +1569,7 @@ impl CloudPass {
                 buffers: &[cloud_vertex_layout()],
             },
             // The source's fast arm disables culling for the layer
-            // (`GlStateManager.disableCull()`, `RenderGlobal.java:1427`).
+            // (`GlStateManager.disableCull()`, `RenderGlobal.java:1430`).
             primitive: primitive_state(None),
             depth_stencil: Some(cloud_depth_state()),
             multisample: wgpu::MultisampleState::default(),
@@ -1762,6 +1809,22 @@ mod tests {
     fn the_moon_cell_wraps_across_the_sheet() {
         assert_eq!(moon_uv(0)[0], [0.25, 0.5]);
         assert_eq!(moon_uv(5)[0], [0.5, 1.0]);
+    }
+
+    #[test]
+    fn the_moon_quads_carry_each_phase_cell() {
+        // The pass keeps one quad per phase; each carries its own cell's uvs. Phase 5 is the
+        // sheet's second column, second row: 0.25..0.5 across, 0.5..1 down.
+        let vertices = super::moon_quad_vertices(5);
+        assert_eq!(vertices[0].uv, [0.5, 1.0], "the cell's bottom-right corner");
+        assert_eq!(vertices[5].uv, [0.5, 0.5], "the cell's top-right corner");
+        for phase in 0..8 {
+            let cell = moon_uv(phase);
+            let quad = super::moon_quad_vertices(phase);
+            for (index, corner) in [(0usize, 0usize), (1, 1), (2, 2), (5, 3)] {
+                assert_eq!(quad[index].uv, cell[corner], "phase {phase}");
+            }
+        }
     }
 
     #[test]

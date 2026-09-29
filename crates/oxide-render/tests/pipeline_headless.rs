@@ -62,7 +62,8 @@ use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::SKY_COLOR;
 use oxide_render::sky::{
-    CloudPass, SkyParams, SkyPass, SkyTextures, celestial_rotation, star_field,
+    CloudPass, HORIZON, MOON_HEIGHT, SkyParams, SkyPass, SkyTextures, celestial_rotation,
+    star_field,
 };
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
@@ -668,8 +669,8 @@ fn the_frames_fog_fades_the_terrain_towards_its_colour() {
     );
 }
 
-/// The sky and cloud passes at noon, at night and over the cloud layer: the band's read-back,
-/// the star brightness gate and the layer's blend.
+/// The sky and cloud passes: the band's read-back over a contrasting clear, the star brightness
+/// gate, the moon's phase cell, the under-horizon plane's fog and the layer's blend.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
@@ -685,7 +686,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
     let mut cloud = CloudPass::new(&device, &queue, format);
     cloud.set_texture(&device, &queue, &textures.clouds);
 
-    // The band at noon, the fog set to the band's own colour so the read-back is the band.
+    // The band at noon, the fog set to the band's own colour so the read-back is the band. The
+    // target clears to a colour no band fragment can produce, so a pass that drew nothing —
+    // the black screen this case exists for — fails the assertion.
     let noon = [120.0 / 255.0, 167.0 / 255.0, 1.0];
     let day = SkyParams {
         celestial_angle: 0.0,
@@ -696,37 +699,39 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         far_plane: 128.0,
         cloud_offset_ticks: 0,
         cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
     };
     let pixels = render_sky(
         &device,
         &queue,
         &mut sky,
         &mut cloud,
-        day,
-        sky_camera(65.0, 0.0, -20.0, DEFAULT_FOV),
-        false,
+        SkyRequest {
+            params: day,
+            camera: sky_camera(65.0, 0.0, -20.0, DEFAULT_FOV),
+            clear: [1.0, 0.0, 1.0],
+            clouds: false,
+        },
     );
     expect_pixel(
         &pixels,
         SIZE / 2,
         SIZE / 2,
         unorm_bytes(noon),
-        "the sky band at noon",
+        "the sky band at noon over a contrasting clear",
     );
 
     // The star gate: a narrow camera aimed at the first star of the source's field, with the
     // pass given the boost the source's own brightness would never give at noon — the gate is
-    // the pass's, and the star must be drawn when it is above zero and skipped at zero.
+    // the pass's, and the star must be drawn when it is above zero and skipped at zero. The
+    // camera sits an eye's height above the geometry's frame origin (`EntityRenderer.java:738`).
     let star = star_field()[0];
-    let direction = celestial_rotation(0.0)
-        .transform_vector3(Vec3::new(
-            star.centre[0] as f32,
-            star.centre[1] as f32,
-            star.centre[2] as f32,
-        ))
-        .normalize();
-    let yaw = (-direction.x).atan2(direction.z).to_degrees();
-    let pitch = (-direction.y).asin().to_degrees();
+    let target = celestial_rotation(0.0).transform_point3(Vec3::new(
+        star.centre[0] as f32,
+        star.centre[1] as f32,
+        star.centre[2] as f32,
+    ));
+    let (yaw, pitch) = aim_at(target);
     let night = SkyParams {
         celestial_angle: 0.0,
         sky_colour: [0.0, 0.0, 0.0],
@@ -736,19 +741,35 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         far_plane: 128.0,
         cloud_offset_ticks: 0,
         cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
     };
     let camera = sky_camera(65.0, yaw, pitch, 0.5);
-    let lit = render_sky(&device, &queue, &mut sky, &mut cloud, night, camera, false);
-    let mut dark_params = night;
-    dark_params.star_brightness = 0.0;
+    let lit = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: night,
+            camera,
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+        },
+    );
     let dark = render_sky(
         &device,
         &queue,
         &mut sky,
         &mut cloud,
-        dark_params,
-        camera,
-        false,
+        SkyRequest {
+            params: SkyParams {
+                star_brightness: 0.0,
+                ..night
+            },
+            camera,
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+        },
     );
     assert!(
         brightest(&lit) >= 16,
@@ -761,11 +782,13 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         brightest(&dark)
     );
 
-    // The cloud layer blended over the band: a white texel at the source's 0.8 alpha over the
-    // black night band is 204 exactly, and a layer that lost its blend state or its geometry
-    // reads the band's black instead. The camera looks 30 degrees up, clear of the noon sun.
-    let night_band = SkyParams {
-        celestial_angle: 0.0,
+    // The moon's phase cell: a camera aimed at the moon, whose synthetic sheet paints one
+    // colour per cell. The sun is underfoot at this angle, so only the moon is in the frame.
+    // Each phase must read its own cell, which a pass that pinned phase 0 could not do.
+    let moon_target = celestial_rotation(0.375).transform_point3(Vec3::new(0.0, MOON_HEIGHT, 0.0));
+    let (moon_yaw, moon_pitch) = aim_at(moon_target);
+    let moon = SkyParams {
+        celestial_angle: 0.375,
         sky_colour: [0.0, 0.0, 0.0],
         sun_brightness: 1.0,
         star_brightness: 0.0,
@@ -773,15 +796,100 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         far_plane: 128.0,
         cloud_offset_ticks: 0,
         cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 5,
     };
+    let moon_camera = sky_camera(65.0, moon_yaw, moon_pitch, DEFAULT_FOV);
+    for phase in [5u8, 0u8] {
+        let pixels = render_sky(
+            &device,
+            &queue,
+            &mut sky,
+            &mut cloud,
+            SkyRequest {
+                params: SkyParams {
+                    moon_phase: phase,
+                    ..moon
+                },
+                camera: moon_camera,
+                clear: [0.0, 0.0, 0.0],
+                clouds: false,
+            },
+        );
+        expect_pixel(
+            &pixels,
+            SIZE / 2,
+            SIZE / 2,
+            moon_cell_colour(phase),
+            "the moon's phase cell",
+        );
+    }
+
+    // The under-horizon plane is fogged under the sky's own range: looking 45 degrees down at
+    // it, the fragment is the plane's darkened colour mixed towards the fog colour. The depth
+    // is the geometry's — the plane sits `d0 + EYE_HEIGHT` below the camera, so the planar
+    // depth is that drop over sin(45) — and the mix is the shader's own linear one.
+    let below_sky = [0.0f32, 0.0, 0.0];
+    let below = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: below_sky,
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        fog_colour: [1.0, 1.0, 1.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    let feet = 65.0f32;
+    let pitch = 45.0f32;
     let pixels = render_sky(
         &device,
         &queue,
         &mut sky,
         &mut cloud,
-        night_band,
-        sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV),
-        true,
+        SkyRequest {
+            params: below,
+            camera: sky_camera(f64::from(feet), 0.0, pitch, DEFAULT_FOV),
+            clear: below_sky,
+            clouds: false,
+        },
+    );
+    let d0 = (feet + EYE_HEIGHT) - HORIZON;
+    let depth = (EYE_HEIGHT + d0) / pitch.to_radians().sin();
+    let factor = ((below.far_plane - depth) / below.far_plane).clamp(0.0, 1.0);
+    let below_colour = [
+        below_sky[0] * 0.2 + 0.04,
+        below_sky[1] * 0.2 + 0.04,
+        below_sky[2] * 0.6 + 0.1,
+    ];
+    let mixed = std::array::from_fn(|channel| {
+        below.fog_colour[channel] + (below_colour[channel] - below.fog_colour[channel]) * factor
+    });
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        unorm_bytes(mixed),
+        "the fogged below-horizon plane",
+    );
+
+    // The cloud layer blended over the band: a white texel at the source's 0.8 alpha over the
+    // black night band is 204 exactly, and a layer that lost its blend state or its geometry
+    // reads the band's black instead. The camera looks 30 degrees up, clear of the noon sun.
+    let pixels = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: SkyParams {
+                star_brightness: 0.0,
+                ..night
+            },
+            camera: sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV),
+            clear: below_sky,
+            clouds: true,
+        },
     );
     expect_pixel(
         &pixels,
@@ -792,12 +900,36 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
     );
 }
 
-/// The three synthetic environment textures: flat white stand-ins generated here, with the
-/// source's own sun, moon sheet and cloud sizes.
+/// One sky frame the test asks for: the parameters, the camera, the target's clear colour and
+/// whether the cloud layer draws after the sky.
+struct SkyRequest {
+    /// The frame's sky parameters.
+    params: SkyParams,
+    /// The camera both passes draw with.
+    camera: Camera,
+    /// The target's clear colour, opaque.
+    clear: [f32; 3],
+    /// Whether the cloud layer draws after the sky.
+    clouds: bool,
+}
+
+/// The camera's yaw and pitch for a local target position, from the camera at
+/// `(0, EYE_HEIGHT, 0)` — the frame origin the source's modelview translates the geometry by
+/// (`EntityRenderer.java:738`).
+fn aim_at(target: Vec3) -> (f32, f32) {
+    let direction = (target - Vec3::new(0.0, EYE_HEIGHT, 0.0)).normalize();
+    let yaw = (-direction.x).atan2(direction.z).to_degrees();
+    let pitch = (-direction.y).asin().to_degrees();
+    (yaw, pitch)
+}
+
+/// The three synthetic environment textures: flat white sun and cloud stand-ins and the painted
+/// moon sheet, with the source's own sun, moon sheet and cloud sizes — all generated here, never
+/// a pixel from the asset store.
 fn synthetic_sky_textures() -> SkyTextures {
     SkyTextures {
         sun: flat_texture(32, 32),
-        moon_phases: flat_texture(128, 64),
+        moon_phases: moon_sheet(),
         clouds: flat_texture(64, 64),
     }
 }
@@ -811,14 +943,31 @@ fn flat_texture(width: u32, height: u32) -> Texture {
     }
 }
 
-/// The clear colour for a sky frame, opaque.
-fn sky_clear(colour: [f32; 3]) -> wgpu::Color {
-    wgpu::Color {
-        r: f64::from(colour[0]),
-        g: f64::from(colour[1]),
-        b: f64::from(colour[2]),
-        a: 1.0,
+/// The moon phase sheet: the source's 128x64 4x2 grid, each 32x32 cell one opaque colour, so a
+/// read-back names the phase the pass drew.
+fn moon_sheet() -> Texture {
+    let mut rgba = vec![0u8; 128 * 64 * 4];
+    for phase in 0..8u8 {
+        let column = usize::from(phase % 4);
+        let row = usize::from(phase / 4);
+        for y in row * 32..(row + 1) * 32 {
+            for x in column * 32..(column + 1) * 32 {
+                let offset = (y * 128 + x) * 4;
+                let colour = moon_cell_colour(phase);
+                rgba[offset..offset + 4].copy_from_slice(&[colour[0], colour[1], colour[2], 255]);
+            }
+        }
     }
+    Texture {
+        width: 128,
+        height: 64,
+        rgba,
+    }
+}
+
+/// The colour [`moon_sheet`] paints the cell of `phase`.
+fn moon_cell_colour(phase: u8) -> [u8; 3] {
+    [phase * 30, 255 - phase * 30, 100]
 }
 
 /// A camera at `feet_y` looking along `yaw` and `pitch`, with `fov` degrees of view.
@@ -835,27 +984,25 @@ fn sky_camera(feet_y: f64, yaw: f32, pitch: f32, fov: f32) -> Camera {
     }
 }
 
-/// Draws one sky frame into a fresh target — the sky, then the cloud layer when `clouds` — and
-/// reads it back. Both passes are given `camera` and `params`; the target is cleared to the
-/// frame's sky colour, the colour the source's `updateFogColor` hands `glClearColor`.
+/// Draws one sky frame into a fresh target — the sky, then the cloud layer when asked — and
+/// reads it back. The target clears to the request's colour.
 fn render_sky(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     sky: &mut SkyPass,
     cloud: &mut CloudPass,
-    params: SkyParams,
-    camera: Camera,
-    clouds: bool,
+    request: SkyRequest,
 ) -> Vec<u8> {
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let target = create_target(device, format);
     let depth = create_depth(device);
-    sky.set_params(queue, params);
-    sky.set_camera(queue, camera, 1.0);
-    if clouds {
-        cloud.set_params(queue, params);
-        cloud.set_camera(queue, camera, 1.0);
+    sky.set_params(queue, request.params);
+    sky.set_camera(queue, request.camera, 1.0);
+    if request.clouds {
+        cloud.set_params(queue, request.params);
+        cloud.set_camera(queue, request.camera, 1.0);
     }
+    let clear = to_color(request.clear);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide sky headless encoder"),
@@ -868,7 +1015,7 @@ fn render_sky(
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(sky_clear(params.sky_colour)),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -884,12 +1031,22 @@ fn render_sky(
             occlusion_query_set: None,
         });
         sky.draw(&mut pass);
-        if clouds {
+        if request.clouds {
             cloud.draw(&mut pass);
         }
     }
     queue.submit(Some(encoder.finish()));
     read_pixels(device, queue, &target)
+}
+
+/// A colour as an opaque clear value.
+fn to_color(colour: [f32; 3]) -> wgpu::Color {
+    wgpu::Color {
+        r: f64::from(colour[0]),
+        g: f64::from(colour[1]),
+        b: f64::from(colour[2]),
+        a: 1.0,
+    }
 }
 
 /// The largest colour channel in a read-back; the alpha byte is the opaque surface's and takes

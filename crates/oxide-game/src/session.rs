@@ -43,7 +43,7 @@ use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::sky::{
-    celestial_angle, cloud_colour, sky_colour, star_brightness, sun_brightness,
+    celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
 };
 use oxide_world::world::World;
 use tracing::{debug, info, warn};
@@ -207,8 +207,8 @@ pub enum ClientEvent {
     /// The sky the session's world and view block produce, from the last clock.
     ///
     /// The session computes these because its client may not: `oxide-client` has no edge to
-    /// `oxide-world`, and `oxide-render` may not reach it at all, so the five world-derived
-    /// values travel with the event. `partial_ticks` is zero (M2 has no tick loop) and the rain
+    /// `oxide-world`, and `oxide-render` may not reach it at all, so the world-derived values
+    /// travel with the event. `partial_ticks` is zero (M2 has no tick loop) and the rain
     /// strength is zero (no weather packets are decoded yet).
     Sky {
         /// The celestial angle in `0..1`, from the world time.
@@ -221,6 +221,8 @@ pub enum ClientEvent {
         star_brightness: f32,
         /// The clouds' tint.
         cloud_colour: [f32; 3],
+        /// The moon's phase in `0..8`, from the world time.
+        moon_phase: u8,
     },
     /// A column's meshes were (re)built; `None` means the section now draws
     /// nothing.
@@ -771,6 +773,8 @@ fn report_sky(
             sun_brightness: sun_brightness(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
             star_brightness: star_brightness(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
             cloud_colour: cloud_colour(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
+            // `moon_phase` answers `0..8`, so the narrowing cannot lose a case.
+            moon_phase: moon_phase(time_of_day) as u8,
         },
     );
 }
