@@ -145,6 +145,41 @@ fn an_unload_requeues_an_in_flight_column_for_a_last_build() {
 }
 
 #[test]
+fn a_forgotten_column_never_reuses_a_generation() {
+    // The column is unloaded while a job is out, then sent again. The build
+    // that was out when the column vanished took its snapshot before the
+    // unload; it must not be able to answer as the re-created column's
+    // current build, so the new job is handed a generation no job has carried.
+    let mut queue = MeshQueue::new();
+    queue.mark_dirty(8, 8);
+    let stale = take(&mut queue);
+    queue.mark_column_unloaded(8, 8);
+    queue.mark_dirty(8, 8);
+    let mut fresh = None;
+    while let Some(job) = queue.next_job() {
+        queue.mark_running(job);
+        if (job.cx, job.cz) == (8, 8) {
+            fresh = Some(job);
+        }
+    }
+    let fresh = fresh.expect("the re-created column is queued");
+    assert!(
+        fresh.generation > stale.generation,
+        "the re-created column's job carries a new generation: {} against {}",
+        fresh.generation,
+        stale.generation
+    );
+    assert!(
+        !queue.complete(stale),
+        "the pre-unload build is discarded, not reported fresh"
+    );
+    assert!(
+        queue.complete(fresh),
+        "the rebuild is the column's current build"
+    );
+}
+
+#[test]
 fn every_change_bumps_the_column_generation() {
     let mut queue = MeshQueue::new();
     queue.mark_dirty(9, 9);

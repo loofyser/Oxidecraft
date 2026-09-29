@@ -7,8 +7,10 @@
 //!
 //! - a column appears at most once in the dirty set, however often it is
 //!   marked;
-//! - every change bumps the column's generation, so a job's generation names
-//!   the state of the column its snapshot was taken from;
+//! - every change bumps the column's generation, and no generation is ever
+//!   reused: a job's generation names the state of the column its snapshot
+//!   was taken from, even across an unload that forgets the column and a
+//!   packet that loads it anew;
 //! - a completion whose generation is stale is discarded: the queue re-marks
 //!   the column dirty and answers `false`. A fresh completion answers `true`
 //!   and forgets the column;
@@ -61,6 +63,10 @@ pub struct MeshQueue {
     /// Every outstanding column's state: dirty or running. A column leaves
     /// the map when its build completes fresh.
     states: HashMap<(i32, i32), State>,
+    /// The last generation handed out. Every fresh mark and every re-queue of
+    /// a forgotten column takes the next value, so no two jobs can ever carry
+    /// the same generation for one column, not even across an unload.
+    next_generation: u64,
 }
 
 impl MeshQueue {
@@ -69,6 +75,7 @@ impl MeshQueue {
         MeshQueue {
             dirty: VecDeque::new(),
             states: HashMap::new(),
+            next_generation: 0,
         }
     }
 
@@ -78,10 +85,11 @@ impl MeshQueue {
     /// whose job is out stays out of it, and the completion of that job
     /// becomes stale.
     pub fn mark_dirty(&mut self, cx: i32, cz: i32) {
+        let generation = self.fresh_generation();
         match self.states.get_mut(&(cx, cz)) {
-            Some(State::Dirty(generation)) | Some(State::Running(generation)) => *generation += 1,
+            Some(State::Dirty(stored)) | Some(State::Running(stored)) => *stored = generation,
             None => {
-                self.states.insert((cx, cz), State::Dirty(1));
+                self.states.insert((cx, cz), State::Dirty(generation));
                 self.dirty.push_back((cx, cz));
             }
         }
@@ -156,9 +164,12 @@ impl MeshQueue {
             return false;
         }
         // The column was forgotten: it was unloaded, or a new world replaced
-        // it. The stale build is discarded and the column is queued once more,
-        // so the last word on it reflects the world as it stands.
-        self.states.insert((job.cx, job.cz), State::Dirty(1));
+        // it. The stale build is discarded and the column is queued once more
+        // with a generation no earlier job carries, so a snapshot taken before
+        // the column vanished can never answer as the new one's current build.
+        let generation = self.fresh_generation();
+        self.states
+            .insert((job.cx, job.cz), State::Dirty(generation));
         self.dirty.push_back((job.cx, job.cz));
         false
     }
@@ -200,6 +211,13 @@ impl MeshQueue {
         if let Some(position) = self.dirty.iter().position(|&column| column == (cx, cz)) {
             self.dirty.remove(position);
         }
+    }
+
+    /// The next generation to hand out. Monotonic for the queue's lifetime, so
+    /// a generation is never reused, whatever the column's history.
+    fn fresh_generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation
     }
 }
 

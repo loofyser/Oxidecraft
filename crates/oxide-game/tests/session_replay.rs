@@ -187,6 +187,24 @@ fn chunk_data_frame(cx: i32, cz: i32) -> Vec<u8> {
     column_frame(cx, cz, true, 0x0001, &simple_column_payload())
 }
 
+/// One ground-up column payload with a single stone block at the given local
+/// position of section 0, dark block light, full sky light and plains biomes.
+fn column_payload_at(x: usize, z: usize) -> Vec<u8> {
+    let mut column = vec![0u8; 8192];
+    let index = block_index(x, 0, z);
+    column[index * 2..index * 2 + 2].copy_from_slice(&0x0010u16.to_le_bytes());
+    column.extend_from_slice(&[0u8; 2048]); // block light
+    column.extend_from_slice(&[0xFFu8; 2048]); // sky light
+    column.extend_from_slice(&[1u8; 256]); // biomes
+    column
+}
+
+/// One ground-up Chunk Data column with a single stone block at the given
+/// local position of section 0.
+fn chunk_data_frame_at(cx: i32, cz: i32, x: usize, z: usize) -> Vec<u8> {
+    column_frame(cx, cz, true, 0x0001, &column_payload_at(x, z))
+}
+
 /// The unload shape: a ground-up Chunk Data with an empty mask and no data.
 fn chunk_unload_frame(cx: i32, cz: i32) -> Vec<u8> {
     column_frame(cx, cz, true, 0x0000, &[])
@@ -284,6 +302,12 @@ fn bulk_frame() -> Vec<u8> {
     bulk.extend_from_slice(&column);
     bulk.extend_from_slice(&column);
     bulk
+}
+
+/// One ground-up Chunk Data frame carrying the committed capture column: a
+/// heavy five-section payload, used where a burst has to keep the pool busy.
+fn fixture_chunk_frame(cx: i32, cz: i32) -> Vec<u8> {
+    column_frame(cx, cz, true, 0x001f, &fixture_column())
 }
 
 /// Player List Item, add action, for one entry.
@@ -758,13 +782,20 @@ fn a_keepalive_behind_a_column_burst_is_answered() {
     // behind it on the wire. The echo is a connection obligation, and the
     // server closes a session that leaves it unanswered for about thirty
     // seconds, so the burst must not hold up the read loop: the loop hands
-    // jobs to the pool and drains finished results without ever blocking, so
-    // the echo does not wait for a build. The pool's results arrive in no
-    // fixed order, so the meshes are compared as a set, not an order.
+    // jobs to the pool and drains finished results without ever blocking.
+    // Six heavy fixture columns make the builds outlive the read, so the
+    // echo must be reported while at least one build is still outstanding —
+    // a session that answered the keepalive only after the burst's meshes
+    // would report every mesh first. The pool's results arrive in no fixed
+    // order, so the meshes are compared as a set.
     let (stream, outgoing) = duplex(stream_with(&[
         join_game_frame(),
-        chunk_data_frame(0, 0),
-        chunk_data_frame(1, 0),
+        fixture_chunk_frame(0, 11),
+        fixture_chunk_frame(1, 11),
+        fixture_chunk_frame(2, 11),
+        fixture_chunk_frame(3, 11),
+        fixture_chunk_frame(4, 11),
+        fixture_chunk_frame(5, 11),
         keep_alive_frame(21),
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -773,16 +804,22 @@ fn a_keepalive_behind_a_column_burst_is_answered() {
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, ClientEvent::KeepAlive { id: 21 })),
-        "the keepalive is answered: {events:?}"
-    );
+    let answered = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 21 }))
+        .expect("the keepalive is answered");
     assert_eq!(
         updated_columns(&events),
-        BTreeSet::from([(0, 0), (1, 0)]),
-        "both columns are meshed: {events:?}"
+        BTreeSet::from([(0, 11), (1, 11), (2, 11), (3, 11), (4, 11), (5, 11)]),
+        "every burst column is meshed: {events:?}"
+    );
+    let last_mesh = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
+        .expect("the burst is meshed");
+    assert!(
+        answered < last_mesh,
+        "the echo was answered before the burst's last meshes, not after them: {events:?}"
     );
     // The echo is written: it is the only packet the burst drew, right after
     // the settings and the brand.
@@ -865,7 +902,9 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
     let stream = GappedDuplex {
         head: std::io::Cursor::new(head),
         tail: std::io::Cursor::new(tail),
-        stalls: 2,
+        // Three deadlines of quiet, so the pool has three tick windows to
+        // finish the mesh the chunk packet queued before the tail arrives.
+        stalls: 3,
         outgoing: Arc::clone(&outgoing),
     };
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -874,14 +913,6 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    let first = events
-        .iter()
-        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 31 }))
-        .expect("the first keepalive is answered");
-    let meshed = events
-        .iter()
-        .position(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
-        .expect("the column is meshed");
     let last_mesh = events
         .iter()
         .rposition(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
@@ -891,7 +922,7 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
         .position(|event| matches!(event, ClientEvent::KeepAlive { id: 32 }))
         .expect("the second keepalive is answered");
     assert!(
-        first < meshed && last_mesh < second,
+        last_mesh < second,
         "the meshes are built in the quiet stretch, before the next keepalive: {events:?}"
     );
 }
@@ -994,11 +1025,11 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
 fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
     // Three plain 0x21 columns and one 0x26 bulk covering three more, applied
     // back to back with a keepalive between. The columns abut, so a session
-    // that re-meshed a change's neighbours would report far more than the six;
-    // the dirty set records only the column each packet changed. The pool's
-    // results arrive in no fixed order, so the reported set is compared as a
-    // map, and the keepalive behind the burst is answered while the pool
-    // still works.
+    // whose boundary refresh marked anything beyond the burst would report a
+    // column outside the six; the dirty set records each applied column and
+    // its loaded neighbours, all of them inside the burst. The pool's results
+    // arrive in no fixed order and a refreshed column may be reported more
+    // than once, so the reported set is compared as a map.
     let bulk = bulk_frame_of(&[(3, 0), (4, 0), (5, 0)]);
     let (stream, outgoing) = duplex(stream_with(&[
         join_game_frame(),
@@ -1023,13 +1054,8 @@ fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
     assert_eq!(
         updated_columns(&events),
         BTreeSet::from([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]),
-        "exactly the six columns, each report answering its own packet: {events:?}"
+        "exactly the six columns: {events:?}"
     );
-    let updates = events
-        .iter()
-        .filter(|event| matches!(event, ClientEvent::ChunkUpdated { .. }))
-        .count();
-    assert_eq!(updates, 6, "each column is reported once: {events:?}");
     for (cx, cz) in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)] {
         let slots = updated_slots(&events, cx, cz);
         assert_eq!(slots.len(), 16, "({cx}, {cz}) reports all sixteen sections");
@@ -1060,6 +1086,42 @@ fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
         "the keepalive echo is the only packet the six columns drew"
     );
     assert!(cursor.is_empty(), "no further packets were sent");
+}
+
+#[test]
+fn an_applied_column_refreshes_its_loaded_neighbours() {
+    // Column (0, 0) holds a block on the face it shares with (1, 0), and
+    // (1, 0) arrives after it. The neighbour's block lands in the first
+    // column's collar and culls the shared face, so the first column must be
+    // rebuilt after the neighbour applies. Without the boundary refresh it
+    // keeps the six faces it drew while the collar was air.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        chunk_data_frame_at(0, 0, 15, 0),
+        chunk_data_frame_at(1, 0, 0, 0),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let slots = last_updated_slots(&events, 0, 0);
+    let mesh = slots[0].1.as_ref().expect("(0, 0) draws its block");
+    assert_eq!(
+        mesh.vertex_count(),
+        20,
+        "the shared face is culled once the neighbour applied: {events:?}"
+    );
+    // The neighbour reads the first column's block through its own collar, so
+    // its shared face is culled from its first build.
+    let slots = last_updated_slots(&events, 1, 0);
+    let mesh = slots[0].1.as_ref().expect("(1, 0) draws its block");
+    assert_eq!(
+        mesh.vertex_count(),
+        20,
+        "the neighbour culls its shared face too"
+    );
 }
 
 #[test]

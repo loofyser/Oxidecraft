@@ -479,7 +479,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     };
                     let column = decoded(id, ChunkData::decode(body, store.has_sky()))?;
                     if store.apply_chunk_data(&column) {
-                        queue.mark_dirty(column.chunk_x, column.chunk_z);
+                        mark_column_changed(store, &mut queue, column.chunk_x, column.chunk_z);
                     } else {
                         queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
                         report(
@@ -500,7 +500,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     store.apply_bulk(&bulk);
                     for column in &bulk.columns {
                         if store.chunk(column.chunk_x, column.chunk_z).is_some() {
-                            queue.mark_dirty(column.chunk_x, column.chunk_z);
+                            mark_column_changed(store, &mut queue, column.chunk_x, column.chunk_z);
                         } else {
                             queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
                             report(
@@ -846,6 +846,24 @@ fn report_sky(
 
 /// One finished build: the job it answers and the column's sixteen sections.
 type MeshResult = (MeshJob, Vec<(usize, Option<ChunkMesh>)>);
+
+/// Marks an applied column dirty together with each of its loaded neighbours.
+///
+/// A neighbour's snapshot collar reads the applied column, so its boundary
+/// faces and light change when the column lands: the queue rebuilds it too,
+/// which is M1's boundary refresh carried onto the queue and the rule the
+/// plan's Task 13 interfaces state. A neighbour that is not loaded is not
+/// marked: it has no mesh to refresh, and the burst's reported set stays the
+/// columns the server sent. An unload is the reverse case and goes through
+/// [`MeshQueue::mark_column_unloaded`], which marks all four neighbours.
+fn mark_column_changed(store: &World, queue: &mut MeshQueue, cx: i32, cz: i32) {
+    queue.mark_dirty(cx, cz);
+    for (nx, nz) in [(cx + 1, cz), (cx - 1, cz), (cx, cz + 1), (cx, cz - 1)] {
+        if store.chunk(nx, nz).is_some() {
+            queue.mark_dirty(nx, nz);
+        }
+    }
+}
 
 /// Builds the session's mesh pool: one worker fewer than the machine's
 /// parallelism, at least one.
