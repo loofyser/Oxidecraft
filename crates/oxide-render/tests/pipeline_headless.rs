@@ -25,8 +25,8 @@
 //! test pins the cull mode itself.)
 //!
 //! The second test renders the same block, then draws a line through the overlay pass over it
-//! and checks the glyph pixels and the one-pixel shadow offset against the layout
-//! `debug_text` produces.
+//! with a synthetic font sheet and checks the glyph pixels, the advances and the one-font-pixel
+//! shadow offset (now at the source's 63/255) against the layout `debug_text` produces.
 //!
 //! The atlas tests come next: the texels of a four-colour atlas are read back through the
 //! client's own brightness — the atlas texel times the lightmap's cell — at both the
@@ -81,10 +81,11 @@ const SKY: [u8; 3] = [158, 194, 250];
 const STONE: [u8; 3] = [128, 128, 128];
 /// The buried face's colour, which must never reach the target.
 const BURIED: [u8; 3] = [255, 0, 0];
-/// The overlay text colour: opaque white.
+/// The overlay text colour: opaque white, the sheet's ink texel.
 const TEXT: [u8; 3] = [255, 255, 255];
-/// The overlay shadow colour as 8-bit unorm bytes: 0.05 of 255, rounded.
-const SHADOW: [u8; 3] = [13, 13, 13];
+/// The overlay shadow colour as 8-bit unorm bytes: the source's `(0xFFFFFFFF & 0x00FCFCFC) >> 2
+/// | 0xFF000000` is 0xFF3F3F3F, 63 per channel.
+const SHADOW: [u8; 3] = [63, 63, 63];
 /// The stone colour the block's vertices carry: multiplied by the white stand-in atlas's
 /// texel, so the block still reads as stone grey.
 const STONE_COLOUR: [f32; 3] = [0.5, 0.5, 0.5];
@@ -173,7 +174,10 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
 
     let mut overlay = OverlayPass::new(&device, format);
     overlay.set_size(&queue, SIZE as f32, SIZE as f32);
-    // Four vertical bars in one line: each is the middle column of its cell, so the glyph
+    overlay
+        .set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    // Four vertical bars in one line: each is the first column of its cell, so the glyph
     // pixels sit at known places along the line.
     overlay.upload_text(&device, &queue, &["||||".to_string()]);
 
@@ -189,13 +193,24 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
     let pixels = read_pixels(&device, &queue, &target);
     // The scene is still there behind the overlay.
     expect_pixel(&pixels, SIZE / 2, SIZE / 2, STONE, "the top face");
-    // The text margin is four pixels and the scale two, so the first cell's middle column is
-    // at x = 8; its top row is at y = 4 and its shadow sits one pixel down and right.
-    expect_pixel(&pixels, 8, 4, TEXT, "the first cell's first pixel");
-    expect_pixel(&pixels, 9, 5, TEXT, "the text over its own shadow");
-    expect_pixel(&pixels, 10, 5, SHADOW, "the shadow one pixel right");
-    // The fourth cell starts one advance further along: x = 4 + 3 * 6 * 2 + 2 * 2.
-    expect_pixel(&pixels, 44, 4, TEXT, "the fourth cell's first pixel");
+    // The text margin is four pixels and the scale two; the '|' cell inks only its first
+    // column and advances two font pixels, so the texture's ink lands four pixels apart and
+    // the shadow copy sits two pixels down and right.
+    expect_pixel(&pixels, 4, 4, TEXT, "the first cell's first textured texel");
+    expect_pixel(&pixels, 5, 19, TEXT, "the first cell's last textured row");
+    expect_pixel(&pixels, 6, 6, SHADOW, "the first cell's shadow");
+    // The gap between the first cell's ink and the second's is transparent sheet, so the
+    // frame's sky shows through; the stone face sits at the frame's centre.
+    expect_pixel(
+        &pixels,
+        7,
+        4,
+        SKY,
+        "the transparent gap before the second cell",
+    );
+    expect_pixel(&pixels, 8, 4, TEXT, "the second cell");
+    // The fourth cell starts three advances along: x = 4 + 3 * 2 * 2.
+    expect_pixel(&pixels, 16, 4, TEXT, "the fourth cell");
     expect_pixel(&pixels, 0, 0, SKY, "the corner above the text");
     let painted = (0..24)
         .flat_map(|y| (0..24).map(move |x| (x, y)))
@@ -205,6 +220,29 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
         })
         .count();
     assert!(painted > 0, "the overlay left no pixels in the top-left");
+}
+
+/// The synthetic overlay font sheet: a 128x128 grid whose `|` cell inks only its first column,
+/// so the glyph's advance is two font pixels and its ink and shadow land on known pixels.
+///
+/// Generated here; no asset store is read and no Mojang pixel is embedded.
+fn overlay_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    // '|' is code 124: column 12, row 7 of the grid.
+    let code = '|' as u32;
+    let cell_x = (code % 16) * CELL;
+    let cell_y = (code / 16) * CELL;
+    for row in 0..CELL {
+        let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+        rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
 }
 
 #[test]

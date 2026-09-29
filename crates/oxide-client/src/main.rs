@@ -11,14 +11,24 @@
 //! session's clock and sky reports become the frame's fog and sky parameters. When the
 //! session ends the client exits — a server that closed the connection cleanly is a normal
 //! exit, not an error.
+//!
+//! With `--server` the client also loads the asset store's extraction tree before the window
+//! opens ([`assets::ClientAssets`]) and hands the atlas, the font and the sky textures to the
+//! renderer once it exists. Without a server nothing is loaded and the M0 smoke path stands;
+//! the overlay then has no sheet and draws nothing. `--no-overlay` suppresses the overlay at
+//! startup and `--render-distance` sets the far plane, the fog distance and the view distance
+//! the client reports.
+
+mod assets;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use assets::ClientAssets;
 use clap::Parser;
 use crossbeam_channel::{Receiver, unbounded};
 use oxide_game::hud::{HudState, debug_lines};
-use oxide_game::session::{ClientEvent, Session, SessionConfig};
+use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
 use oxide_render::fog::{FogParams, fog_colour, linear_params};
@@ -34,9 +44,6 @@ use winit::window::{Window, WindowId};
 
 /// The frame count that bounds a smoke run, read from the environment.
 const MAX_FRAMES_VAR: &str = "OXIDECRAFT_MAX_FRAMES";
-
-/// The projection's far plane, in chunks; the plane itself is `far_chunks * 16 * √2`.
-const FAR_CHUNKS: f32 = 8.0;
 
 /// How many sections one column has.
 const SECTIONS_PER_COLUMN: u8 = 16;
@@ -55,6 +62,13 @@ struct Cli {
     /// Stop after this many presented frames.
     #[arg(long)]
     frames: Option<u64>,
+    /// Suppress the debug overlay at startup even when a session exists; F3 still toggles it.
+    #[arg(long)]
+    no_overlay: bool,
+    /// The render distance in chunks: the camera's far plane, the fog distance and the view
+    /// distance sent to the server.
+    #[arg(long, default_value_t = 8)]
+    render_distance: u8,
 }
 
 /// The frame count to stop after: the flag when given, the environment variable
@@ -119,6 +133,12 @@ struct ClientApp {
     stopped_on_error: bool,
     /// The session thread and the events it reports, when `--server` was given.
     session: Option<SessionLink>,
+    /// The client's assets, when `--server` was given: the mesh inputs the session shares,
+    /// the font and the sky textures the renderer uploads.
+    assets: Option<ClientAssets>,
+    /// The render distance in chunks: the camera's far plane, the fog's far plane and the
+    /// view distance sent to the server.
+    render_distance: u8,
     /// What the debug overlay reports, updated from the session's events.
     hud: HudState,
     /// The clock and the sky the session last reported.
@@ -176,10 +196,10 @@ fn frame_params(
     dimension: i8,
     eye_y: f64,
     void_y_factor: f32,
+    far_plane: f32,
     values: SkyValues,
     cloud_ticks: i64,
 ) -> (FogParams, SkyParams) {
-    let far_plane = FAR_CHUNKS * 16.0;
     let (start, end) = linear_params(far_plane);
     let colour = fog_colour(dimension, time_of_day as f32, eye_y, void_y_factor);
     let fog = FogParams {
@@ -209,24 +229,38 @@ fn void_y_factor(level_type: &str) -> f32 {
 }
 
 impl ClientApp {
-    /// Builds the handler, reads the smoke-run frame limit, and opens the
-    /// session when `--server` was given.
+    /// Builds the handler, reads the smoke-run frame limit, loads the assets when a session
+    /// was asked for, and opens the session.
     fn new(cli: Cli) -> anyhow::Result<Self> {
         let max_frames = frame_limit(cli.frames);
         if let Some(limit) = max_frames {
             tracing::info!(frames = limit, "a frame limit is set, exiting after it");
         }
+        // With a server the assets load before anything opens, so a store that is missing or
+        // malformed fails fast; the smoke path without one loads nothing.
+        let mut assets = None;
         let session = match cli.server {
             Some(address) => {
                 let (host, port) = parse_server_address(&address)?;
                 tracing::info!(server = %address, username = %cli.username, "joining the server");
-                Some(spawn_session(host, port, cli.username, address))
+                let loaded = ClientAssets::load(None)?;
+                let session = spawn_session(
+                    host,
+                    port,
+                    cli.username,
+                    address,
+                    cli.render_distance,
+                    Arc::clone(&loaded.mesh),
+                );
+                assets = Some(loaded);
+                Some(session)
             }
             None => None,
         };
-        // The overlay starts visible when a session exists, because there is
-        // something to report; the smoke path keeps it hidden until F3.
-        let overlay_visible = session.is_some();
+        // The overlay starts visible when a session exists and `--no-overlay` did not
+        // suppress it; the smoke path keeps it hidden until F3, and without a sheet it
+        // draws nothing.
+        let overlay_visible = session.is_some() && !cli.no_overlay;
         let server = session
             .as_ref()
             .map(|link| link.server.clone())
@@ -239,6 +273,8 @@ impl ClientApp {
             max_frames,
             stopped_on_error: false,
             session,
+            assets,
+            render_distance: cli.render_distance,
             hud: HudState {
                 fps: 0.0,
                 position: [0.0; 3],
@@ -291,7 +327,7 @@ impl ClientApp {
                 },
                 fov_degrees: DEFAULT_FOV,
                 near: NEAR_PLANE,
-                far_chunks: FAR_CHUNKS,
+                far_chunks: self.render_distance as f32,
             });
             // The counter M3's tick loop will advance once per tick; see the field's own note.
             self.cloud_ticks += 1;
@@ -301,6 +337,7 @@ impl ClientApp {
                     self.hud.dimension,
                     self.hud.position[1],
                     self.sky.void_y_factor,
+                    self.render_distance as f32 * 16.0,
                     values,
                     self.cloud_ticks,
                 );
@@ -372,18 +409,27 @@ struct SessionLink {
 /// window must keep drawing. It runs to completion, reports the failure in the
 /// log if it has one, and then reports [`ClientEvent::Disconnected`] whatever
 /// the outcome was, so the window can stop. A session that returned cleanly is
-/// a normal exit: the server closed the connection.
-fn spawn_session(host: String, port: u16, username: String, server: String) -> SessionLink {
+/// a normal exit: the server closed the connection. The client settings carry the
+/// command line's view distance, and the `mesh` assets are the bootstrap's.
+fn spawn_session(
+    host: String,
+    port: u16,
+    username: String,
+    server: String,
+    render_distance: u8,
+    mesh: Arc<MeshAssets>,
+) -> SessionLink {
     let (sender, receiver) = unbounded();
     std::thread::spawn(move || {
         let config = SessionConfig {
             host,
             port,
             username,
-            settings: ClientSettings::default(),
-            // The assets are the bootstrap's to hand in (Task 14); until then
-            // the session meshes every block as the atlas's fallback sprite.
-            mesh: None,
+            settings: ClientSettings {
+                view_distance: render_distance,
+                ..Default::default()
+            },
+            mesh: Some(mesh),
         };
         match Session::connect(&config) {
             Ok(session) => {
@@ -471,6 +517,8 @@ fn apply_session_event(
             cloud_colour,
             moon_phase,
         } => {
+            // The terrain lightmap follows the clock's own sun brightness.
+            renderer.set_lightmap(sun_brightness);
             sky.sky = Some(SkyValues {
                 celestial_angle,
                 colour,
@@ -568,6 +616,25 @@ impl ApplicationHandler for ClientApp {
                 event_loop.exit();
                 return;
             }
+        }
+        // The bootstrap's assets land once, before the first frame: the session's mesh
+        // inputs go to the session (they were handed in at startup) and the atlas, the font
+        // and the sky textures to the renderer here.
+        if let (Some(assets), Some(renderer)) = (&self.assets, self.renderer.as_mut()) {
+            tracing::debug!(
+                font_height = assets.font.height(),
+                "uploading the client's atlas, font and sky textures"
+            );
+            renderer.set_atlas(&assets.mesh.atlas);
+            if let Err(error) = renderer.set_font(&assets.sheet) {
+                // Unreachable after `ClientAssets::load` measured the same sheet; a sheet
+                // the overlay refuses is fatal rather than silently defaulted.
+                tracing::error!(error = ?error, "the font sheet was refused");
+                self.stopped_on_error = true;
+                event_loop.exit();
+                return;
+            }
+            renderer.set_sky_textures(assets.sky_textures.clone());
         }
         self.window = Some(window);
     }
@@ -694,6 +761,16 @@ mod tests {
         assert_eq!(cli.username, "OxideDev");
         assert!(cli.server.is_none());
         assert_eq!(cli.frames, None);
+        assert!(!cli.no_overlay);
+        assert_eq!(cli.render_distance, 8);
+    }
+
+    #[test]
+    fn the_comparison_flags_parse() {
+        let cli = Cli::try_parse_from(["oxide-client", "--no-overlay", "--render-distance", "12"])
+            .expect("the flags parse");
+        assert!(cli.no_overlay);
+        assert_eq!(cli.render_distance, 12);
     }
 
     #[test]
@@ -739,7 +816,7 @@ mod tests {
             cloud_colour: [1.0, 0.5, 0.25],
             moon_phase: 5,
         };
-        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, values, 7);
+        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 128.0, values, 7);
         // The Overworld's noon fog at the eye on the ground is the provider's base itself
         // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`), and the range is the
         // terrain's own for the eight-chunk far plane (`EntityRenderer.java:2014-2015`).

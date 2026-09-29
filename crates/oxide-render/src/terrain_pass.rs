@@ -375,6 +375,9 @@ pub struct TerrainPass {
     /// The lightmap's texture and sampler, and the group-2 bind group they are bound through;
     /// built with the pass and holding the image the client starts with.
     lightmap_bind_group: wgpu::BindGroup,
+    /// The lightmap's texture handle, kept so [`TerrainPass::set_lightmap`] can rewrite its
+    /// bytes when the sky's brightness changes; the bind group above holds a view of it.
+    lightmap_texture: wgpu::Texture,
     /// The atlas's texture and sampler, once one has been set; holding the texture keeps the
     /// view it is sampled through valid.
     atlas: Option<AtlasTexture>,
@@ -536,6 +539,7 @@ impl TerrainPass {
             fog_buffer,
             frame_bind_group,
             lightmap_bind_group,
+            lightmap_texture,
             atlas: None,
             atlas_bind_group: None,
             meshes: HashMap::new(),
@@ -580,6 +584,35 @@ impl TerrainPass {
     /// range; a pass that has never been given one keeps [`NO_FOG`] and draws unfogged.
     pub fn set_fog(&mut self, queue: &wgpu::Queue, params: FogParams) {
         queue.write_buffer(&self.fog_buffer, 0, &fog_bytes(params));
+    }
+
+    /// Rewrites the lightmap for a sky brightness.
+    ///
+    /// The image is [`lightmap_image`] of the Overworld's brightness table at `sun_brightness`
+    /// and [`GAMMA_DEFAULT`], the same call the pass was built with at
+    /// [`SUN_BRIGHTNESS_NOON`]: the client calls this from every sky event, so the terrain's
+    /// light follows the clock's sun. The bind group is untouched, because it holds a view of
+    /// the same texture.
+    pub fn set_lightmap(&mut self, queue: &wgpu::Queue, sun_brightness: f32) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.lightmap_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &lightmap_image(&BrightnessTable::overworld(), sun_brightness, GAMMA_DEFAULT),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(LIGHTMAP_SIZE * 4),
+                rows_per_image: Some(LIGHTMAP_SIZE),
+            },
+            wgpu::Extent3d {
+                width: LIGHTMAP_SIZE,
+                height: LIGHTMAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Adds or replaces a section's mesh on the GPU.

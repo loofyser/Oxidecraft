@@ -1,47 +1,65 @@
 //! The overlay pass: the debug text, drawn over the finished frame in physical pixels.
 //!
-//! The overlay's geometry is one quad per set pixel of the embedded font, positioned in
-//! physical pixels with `(0, 0)` at the window's top-left corner, and the pass draws it in a
-//! render pass with no depth attachment: the text is never hidden by the terrain, and wgpu
-//! rejects a pipeline with a depth state in such a pass, so the two cannot drift apart.
+//! The overlay's geometry is one textured quad per glyph of the jar's ascii font, positioned
+//! in physical pixels with `(0, 0)` at the window's top-left corner, and the pass draws it in
+//! a render pass with no depth attachment: the text is never hidden by the terrain, and wgpu
+//! rejects a pipeline with a depth state in such a pass, so the two cannot drift apart. The
+//! fragment stage multiplies the sampled sheet texel by the vertex colour and blends with the
+//! client's `src_alpha / one_minus_src_alpha` pair, so the sheet's transparent glyph margins
+//! draw nothing; the sheet is sampled nearest and clamp-to-edge, the GUI's own sampler.
+//!
+//! The pure layout — the quads, their shadow copies and the pen — lives in
+//! [`crate::debug_text`]. The pass draws nothing until [`OverlayPass::set_font`] gives it a
+//! sheet, and [`OverlayPass::upload_text`] is a no-op when the lines did not change since the
+//! last upload (the M1 backlog item 1's fix): the geometry buffers are reused and only
+//! recreated when a longer text needs more room.
 //!
 //! The scale and the margin are M1 stand-ins for the vanilla F3 layout, which M6 owns.
 
 use glam::Mat4;
 
-use crate::debug_text::{PixelQuad, block_quads};
+use oxide_assets::font::{Font, FontError};
+use oxide_assets::texture::Texture;
 
-/// The overlay shader: map physical pixels to clip space through the orthographic projection.
+use crate::debug_text::{GlyphVertex, glyph_geometry};
+
+/// The overlay shader: map physical pixels to clip space through the orthographic projection,
+/// sample the font sheet and multiply the texel by the vertex colour.
 ///
-/// The quads are opaque, so the fragment stage only has to hand the colour on.
+/// The sheet's alpha drives the blend, so a fully transparent texel leaves the frame alone.
 const SHADER: &str = r#"
 struct Overlay {
     ortho: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> overlay: Overlay;
+@group(1) @binding(0) var font_texture: texture_2d<f32>;
+@group(1) @binding(1) var font_sampler: sampler;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
-    @location(1) color: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec3<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
 };
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip_position = overlay.ortho * vec4<f32>(input.position, 0.0, 1.0);
+    output.uv = input.uv;
     output.color = input.color;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(input.color, 1.0);
+    return textureSample(font_texture, font_sampler, input.uv) * input.color;
 }
 "#;
 
@@ -51,58 +69,119 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 const TEXT_SCALE: f32 = 2.0;
 /// The margin between the text and the window's top-left corner, in physical pixels.
 const TEXT_MARGIN: f32 = 4.0;
-/// How far the shadow copy sits below and right of the text, in physical pixels.
-const SHADOW_OFFSET: f32 = 1.0;
 /// The text colour: opaque white.
-const TEXT_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
-/// The shadow colour: dark enough to stay legible over a bright sky.
-const SHADOW_COLOR: [f32; 3] = [0.05, 0.05, 0.05];
+const TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 /// The size of one overlay vertex in the byte stream the GPU receives.
-const OVERLAY_VERTEX_BYTES: usize = std::mem::size_of::<OverlayVertex>();
+const GLYPH_VERTEX_BYTES: usize = std::mem::size_of::<GlyphVertex>();
 /// The size of the projection uniform in bytes: one `mat4x4<f32>`.
 const UNIFORM_BYTES: usize = 64;
 
-/// The overlay vertex attributes: a position at offset 0, a colour at offset 8.
-static ATTRIBUTES: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+/// The overlay vertex attributes: a position at offset 0, a uv at 8 and an RGBA colour at 16.
+static ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
 
-/// One overlay vertex: a physical-pixel position and a colour.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct OverlayVertex {
-    /// The position in physical pixels, `(0, 0)` at the window's top-left corner.
-    position: [f32; 2],
-    /// The colour; overlay colours are opaque.
-    color: [f32; 3],
+/// The font sheet as the pass keeps it: the measured font, the sheet's size and the bind
+/// group the pipeline samples through.
+struct FontState {
+    /// The measured widths the layout advances with.
+    font: Font,
+    /// The sheet's size in texels, for the quads' uvs.
+    sheet_size: (u32, u32),
+    /// The sheet's view and sampler, bound at group 1 for the draw.
+    bind_group: wgpu::BindGroup,
 }
 
-/// The vertex and index buffers of one uploaded frame of text.
+/// The geometry of one uploaded text, with the buffers kept across uploads.
+#[derive(Default)]
 struct Geometry {
     /// The vertex buffer, filled with [`overlay_vertex_bytes`] output.
-    vertex_buffer: wgpu::Buffer,
+    vertex_buffer: Option<wgpu::Buffer>,
     /// The index buffer, `u32` indices as little-endian bytes.
-    index_buffer: wgpu::Buffer,
-    /// The number of indices in the index buffer.
+    index_buffer: Option<wgpu::Buffer>,
+    /// The vertex buffer's capacity in bytes; a longer text recreates it.
+    vertex_capacity: u64,
+    /// The index buffer's capacity in bytes; a longer text recreates it.
+    index_capacity: u64,
+    /// The number of indices to draw; zero draws nothing.
     index_count: u32,
+}
+
+impl Geometry {
+    /// Replaces the stored geometry with `vertices` and `indices`, reusing the buffers when
+    /// they are already large enough.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[GlyphVertex],
+        indices: &[u32],
+    ) {
+        let vertex_bytes = overlay_vertex_bytes(vertices);
+        let index_bytes = index_bytes(indices);
+        if self.vertex_capacity < vertex_bytes.len() as u64 {
+            self.vertex_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oxide overlay vertices"),
+                size: vertex_bytes.len() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.vertex_capacity = vertex_bytes.len() as u64;
+        }
+        if self.index_capacity < index_bytes.len() as u64 {
+            self.index_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("oxide overlay indices"),
+                size: index_bytes.len() as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.index_capacity = index_bytes.len() as u64;
+        }
+        if !vertex_bytes.is_empty() {
+            if let Some(buffer) = &self.vertex_buffer {
+                queue.write_buffer(buffer, 0, &vertex_bytes);
+            }
+        }
+        if !index_bytes.is_empty() {
+            if let Some(buffer) = &self.index_buffer {
+                queue.write_buffer(buffer, 0, &index_bytes);
+            }
+        }
+        self.index_count = indices.len() as u32;
+    }
+
+    /// Keeps the buffers but draws nothing until the next upload.
+    fn clear(&mut self) {
+        self.index_count = 0;
+    }
 }
 
 /// The overlay pipeline and the text it draws.
 pub struct OverlayPass {
-    /// The pipeline: no depth state, no culling, opaque colours.
+    /// The pipeline: no depth state, no culling, the sheet sampled and blended.
     pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the orthographic projection.
     ortho_buffer: wgpu::Buffer,
     /// The bind group the pipeline reads the projection through.
     ortho_bind_group: wgpu::BindGroup,
-    /// The geometry of the last uploaded text, or nothing while the overlay is hidden.
-    geometry: Option<Geometry>,
+    /// The layout the font sheet is bound through: built once, so every sheet's bind group
+    /// and the pipeline agree.
+    font_layout: wgpu::BindGroupLayout,
+    /// The font and its sheet, once [`OverlayPass::set_font`] has landed.
+    font: Option<FontState>,
+    /// The geometry of the last uploaded text.
+    geometry: Geometry,
+    /// The lines the last completed upload carried; equal lines make the next upload a no-op.
+    lines: Vec<String>,
 }
 
 impl OverlayPass {
     /// Builds the pipeline for colour attachments in `format`.
     ///
-    /// The pipeline has no depth-stencil state, no culling and no blending: it is meant for a
-    /// pass that attaches only the colour target the terrain pass has just drawn into, so
-    /// wgpu rejects it in a pass that offers a depth attachment.
+    /// The pipeline has no depth-stencil state and no culling: it is meant for a pass that
+    /// attaches only the colour target the terrain pass has just drawn into, so wgpu rejects
+    /// it in a pass that offers a depth attachment. Its fragment stage blends the sampled
+    /// sheet with `src_alpha / one_minus_src_alpha`, so a transparent glyph texel draws
+    /// nothing.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide overlay shader"),
@@ -121,6 +200,27 @@ impl OverlayPass {
                 count: None,
             }],
         });
+        let font_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("oxide overlay font layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         let ortho_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxide overlay ortho"),
             size: UNIFORM_BYTES as u64,
@@ -137,7 +237,7 @@ impl OverlayPass {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("oxide overlay pipeline layout"),
-            bind_group_layouts: &[&ortho_layout],
+            bind_group_layouts: &[&ortho_layout, &font_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -166,7 +266,10 @@ impl OverlayPass {
             pipeline,
             ortho_buffer,
             ortho_bind_group,
-            geometry: None,
+            font_layout,
+            font: None,
+            geometry: Geometry::default(),
+            lines: Vec::new(),
         }
     }
 
@@ -180,56 +283,150 @@ impl OverlayPass {
         queue.write_buffer(&self.ortho_buffer, 0, &matrix_bytes(ortho(width, height)));
     }
 
-    /// Replaces the drawn text with `lines`, laid out from the top-left margin.
+    /// Uploads `sheet` and measures it as the font every following text draws with.
     ///
-    /// Every set pixel becomes one `scale` × `scale` quad drawn twice: a shadow copy one pixel
-    /// down and right first, then the text copy over it. An empty line list removes the
-    /// geometry, which hides the overlay.
-    ///
-    /// [`OverlayPass::set_size`] must be called once before the first upload, so the
-    /// projection matches the surface the text is drawn on.
-    pub fn upload_text(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lines: &[String]) {
-        let quads = block_quads(lines, TEXT_MARGIN, TEXT_MARGIN, TEXT_SCALE);
-        let (vertices, indices) = overlay_geometry(&quads);
-        if indices.is_empty() {
-            self.geometry = None;
-            return;
-        }
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oxide overlay vertices"),
-            size: (vertices.len() * OVERLAY_VERTEX_BYTES) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+    /// The widths come from the sheet through [`Font::load`], so the geometry the next
+    /// upload lays out and the sheet the fragments sample cannot disagree. Until this is
+    /// called the pass draws nothing; the lines uploaded before it are laid out again with
+    /// the new sheet's metrics. A sheet that is not a 16x16 grid is
+    /// [`FontError`], and the pass keeps its previous font.
+    pub fn set_font(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sheet: &Texture,
+    ) -> Result<(), FontError> {
+        let font = Font::load(sheet, None)?;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("oxide overlay font sheet"),
+            size: wgpu::Extent3d {
+                width: sheet.width,
+                height: sheet.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
-        queue.write_buffer(&vertex_buffer, 0, &overlay_vertex_bytes(&vertices));
-        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oxide overlay indices"),
-            size: (indices.len() * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &sheet.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(sheet.width * 4),
+                rows_per_image: Some(sheet.height),
+            },
+            wgpu::Extent3d {
+                width: sheet.width,
+                height: sheet.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&font_sampler_descriptor());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oxide overlay font bind group"),
+            layout: &self.font_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
         });
-        queue.write_buffer(&index_buffer, 0, &index_bytes(&indices));
-        self.geometry = Some(Geometry {
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
+        self.font = Some(FontState {
+            font,
+            sheet_size: (sheet.width, sheet.height),
+            bind_group,
         });
+        // The lines the last upload carried were laid out with the previous sheet's metrics;
+        // clearing them makes the next upload rebuild whatever the caller draws.
+        self.lines.clear();
+        self.geometry.clear();
+        Ok(())
     }
 
-    /// Draws the uploaded text, or nothing when the overlay is hidden.
+    /// Replaces the drawn text with `lines`, laid out from the top-left margin.
     ///
-    /// The pass must attach the colour target the terrain pass drew into and no depth
-    /// attachment; the text is opaque, so it simply overwrites what is under it.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let Some(geometry) = &self.geometry else {
+    /// The shadow copies are laid out first and the text over them; see
+    /// [`crate::debug_text::glyph_geometry`]. An empty line list removes the geometry, which
+    /// hides the overlay. Calling this again with the same lines does nothing: the geometry
+    /// and the sheet bindings the last upload made stay as they are, and the buffers are
+    /// reused rather than recreated.
+    ///
+    /// [`OverlayPass::set_size`] must be called once before the first upload, so the
+    /// projection matches the surface the text is drawn on. Nothing is drawn until
+    /// [`OverlayPass::set_font`] has given the pass a sheet.
+    pub fn upload_text(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lines: &[String]) {
+        if !lines_changed(&self.lines, lines) {
+            return;
+        }
+        self.lines.clear();
+        self.lines.extend_from_slice(lines);
+        let Some(font) = &self.font else {
+            self.geometry.clear();
             return;
         };
+        if lines.is_empty() {
+            self.geometry.clear();
+            return;
+        }
+        let (vertices, indices) = glyph_geometry(
+            &font.font,
+            font.sheet_size,
+            lines,
+            [TEXT_MARGIN, TEXT_MARGIN],
+            TEXT_SCALE,
+            TEXT_COLOR,
+        );
+        self.geometry.upload(device, queue, &vertices, &indices);
+    }
+
+    /// Draws the uploaded text, or nothing when the overlay is hidden or has no font.
+    ///
+    /// The pass must attach the colour target the terrain pass drew into and no depth
+    /// attachment; the text blends over what is under it.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let Some(font) = &self.font else {
+            return;
+        };
+        let (Some(vertex_buffer), Some(index_buffer)) = (
+            self.geometry.vertex_buffer.as_ref(),
+            self.geometry.index_buffer.as_ref(),
+        ) else {
+            return;
+        };
+        if self.geometry.index_count == 0 {
+            return;
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.ortho_bind_group, &[]);
-        pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
-        pass.set_index_buffer(geometry.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..geometry.index_count, 0, 0..1);
+        pass.set_bind_group(1, &font.bind_group, &[]);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.geometry.index_count, 0, 0..1);
     }
+}
+
+/// Whether `incoming` differs from the lines the last upload carried.
+///
+/// This is the whole of the upload cache's decision, kept pure so the tests can pin the
+/// unchanged/unchanged/changed sequence without a GPU: equal lines mean the pass's geometry
+/// already is what the caller wants, so the upload must do nothing.
+pub fn lines_changed(uploaded: &[String], incoming: &[String]) -> bool {
+    uploaded != incoming
 }
 
 /// The orthographic projection from physical pixels to clip space.
@@ -242,10 +439,10 @@ fn ortho(width: f32, height: f32) -> Mat4 {
     Mat4::orthographic_rh(0.0, width, height, 0.0, 0.0, 1.0)
 }
 
-/// The vertex buffer layout the pipeline reads, tied to [`OVERLAY_VERTEX_BYTES`] by the tests.
+/// The vertex buffer layout the pipeline reads, tied to [`GLYPH_VERTEX_BYTES`] by the tests.
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: OVERLAY_VERTEX_BYTES as wgpu::BufferAddress,
+        array_stride: GLYPH_VERTEX_BYTES as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &ATTRIBUTES,
     }
@@ -261,50 +458,41 @@ fn primitive_state() -> wgpu::PrimitiveState {
     }
 }
 
-/// The colour target for one attachment in `format`: opaque, every channel written.
+/// The colour target for one attachment in `format`: the sheet's alpha blends over the frame
+/// with the client's own `src_alpha / one_minus_src_alpha` pair.
 fn color_target(format: wgpu::TextureFormat) -> Option<wgpu::ColorTargetState> {
     Some(wgpu::ColorTargetState {
         format,
-        blend: None,
+        blend: Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
         write_mask: wgpu::ColorWrites::ALL,
     })
 }
 
-/// Builds the vertices and indices of `quads`: the shadow copy first, then the text copy.
-///
-/// Both copies are one buffer's worth of geometry, so a single draw covers the line; the
-/// shadow comes first so the text always lands on top of it where the two overlap.
-fn overlay_geometry(quads: &[PixelQuad]) -> (Vec<OverlayVertex>, Vec<u32>) {
-    let mut vertices = Vec::with_capacity(quads.len() * 8);
-    let mut indices = Vec::with_capacity(quads.len() * 12);
-    for (offset, color) in [(SHADOW_OFFSET, SHADOW_COLOR), (0.0, TEXT_COLOR)] {
-        for quad in quads {
-            push_quad(quad, offset, color, &mut vertices, &mut indices);
-        }
+/// The sampler the font sheet is read through: nearest and clamp-to-edge, the GUI's own
+/// sampler, so a texel is never blended with its neighbour and a uv on the sheet's edge
+/// cannot wrap around to the opposite side.
+fn font_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("oxide overlay font sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
     }
-    (vertices, indices)
-}
-
-/// Appends one quad to `vertices` and `indices`: four corners, then two triangles.
-///
-/// The corners run left top, left bottom, right bottom, right top, which is the winding the
-/// mesher's faces use; the overlay culls nothing, so it only keeps the two consistent.
-fn push_quad(
-    quad: &PixelQuad,
-    offset: f32,
-    color: [f32; 3],
-    vertices: &mut Vec<OverlayVertex>,
-    indices: &mut Vec<u32>,
-) {
-    let base = vertices.len() as u32;
-    let left = quad.x + offset;
-    let top = quad.y + offset;
-    let right = left + quad.width;
-    let bottom = top + quad.height;
-    for position in [[left, top], [left, bottom], [right, bottom], [right, top]] {
-        vertices.push(OverlayVertex { position, color });
-    }
-    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 /// Packs a matrix into the 64 little-endian bytes of a WGSL `mat4x4<f32>`.
@@ -320,10 +508,13 @@ fn matrix_bytes(matrix: Mat4) -> [u8; UNIFORM_BYTES] {
 }
 
 /// Packs the vertices into the byte stream the vertex buffer holds.
-fn overlay_vertex_bytes(vertices: &[OverlayVertex]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vertices.len() * OVERLAY_VERTEX_BYTES);
+fn overlay_vertex_bytes(vertices: &[GlyphVertex]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vertices.len() * GLYPH_VERTEX_BYTES);
     for vertex in vertices {
         for component in vertex.position {
+            bytes.extend_from_slice(&component.to_le_bytes());
+        }
+        for component in vertex.uv {
             bytes.extend_from_slice(&component.to_le_bytes());
         }
         for component in vertex.color {
@@ -348,10 +539,9 @@ mod tests {
     use wgpu::{PrimitiveTopology, TextureFormat, VertexFormat};
 
     use super::{
-        OVERLAY_VERTEX_BYTES, SHADOW_COLOR, SHADOW_OFFSET, TEXT_COLOR, color_target, ortho,
-        overlay_geometry, primitive_state, vertex_layout,
+        GLYPH_VERTEX_BYTES, color_target, font_sampler_descriptor, ortho, primitive_state,
+        vertex_layout,
     };
-    use crate::debug_text::PixelQuad;
 
     #[test]
     fn the_ortho_matrix_maps_pixels_to_the_corners_of_the_ndc() {
@@ -369,52 +559,45 @@ mod tests {
     #[test]
     fn the_vertex_layout_matches_the_serialised_vertices() {
         let layout = vertex_layout();
-        assert_eq!(OVERLAY_VERTEX_BYTES, 20);
-        assert_eq!(layout.array_stride, OVERLAY_VERTEX_BYTES as u64);
+        assert_eq!(GLYPH_VERTEX_BYTES, 32);
+        assert_eq!(layout.array_stride, GLYPH_VERTEX_BYTES as u64);
         assert_eq!(layout.step_mode, wgpu::VertexStepMode::Vertex);
-        let [position, color] = layout.attributes else {
-            panic!("two attributes, a position and a colour");
+        let [position, uv, color] = layout.attributes else {
+            panic!("three attributes: a position, a uv and a colour");
         };
         assert_eq!(position.shader_location, 0);
         assert_eq!(position.format, VertexFormat::Float32x2);
         assert_eq!(position.offset, 0);
-        assert_eq!(color.shader_location, 1);
-        assert_eq!(color.format, VertexFormat::Float32x3);
-        assert_eq!(color.offset, 8);
-        assert_eq!(color.offset + 12, layout.array_stride);
+        assert_eq!(uv.shader_location, 1);
+        assert_eq!(uv.format, VertexFormat::Float32x2);
+        assert_eq!(uv.offset, 8);
+        assert_eq!(color.shader_location, 2);
+        assert_eq!(color.format, VertexFormat::Float32x4);
+        assert_eq!(color.offset, 16);
+        assert_eq!(color.offset + 16, layout.array_stride);
     }
 
     #[test]
-    fn the_pipeline_culls_nothing_and_writes_opaque_colours() {
+    fn the_pipeline_culls_nothing_and_blends_the_sheet_over_the_frame() {
         let primitive = primitive_state();
         assert_eq!(primitive.topology, PrimitiveTopology::TriangleList);
         assert_eq!(primitive.cull_mode, None, "both windings draw");
         let target = color_target(TextureFormat::Rgba8Unorm).expect("a colour target");
-        assert_eq!(target.blend, None, "overlay colours are opaque");
+        let blend = target.blend.expect("the sheet blends over the frame");
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::SrcAlpha);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(blend.alpha.src_factor, wgpu::BlendFactor::SrcAlpha);
+        assert_eq!(blend.alpha.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
     }
 
     #[test]
-    fn every_quad_is_drawn_twice_with_the_shadow_first() {
-        let quads = [PixelQuad {
-            x: 4.0,
-            y: 6.0,
-            width: 2.0,
-            height: 2.0,
-        }];
-        let (vertices, indices) = overlay_geometry(&quads);
-        assert_eq!(vertices.len(), 8);
-        assert_eq!(indices.len(), 12);
-        // The shadow copy comes first, one pixel down and right of the text copy.
-        let shadow = &vertices[..4];
-        assert!(shadow.iter().all(|vertex| vertex.color == SHADOW_COLOR));
-        assert_eq!(
-            shadow[0].position,
-            [4.0 + SHADOW_OFFSET, 6.0 + SHADOW_OFFSET]
-        );
-        // The text copy follows, and reuses the quad's indices shifted by four vertices.
-        let text = &vertices[4..];
-        assert!(text.iter().all(|vertex| vertex.color == TEXT_COLOR));
-        assert_eq!(text[0].position, [4.0, 6.0]);
-        assert_eq!(indices, [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+    fn the_font_sheet_is_sampled_nearest_and_clamped() {
+        let sampler = font_sampler_descriptor();
+        assert_eq!(sampler.mag_filter, wgpu::FilterMode::Nearest);
+        assert_eq!(sampler.min_filter, wgpu::FilterMode::Nearest);
+        assert_eq!(sampler.mipmap_filter, wgpu::FilterMode::Nearest);
+        assert_eq!(sampler.address_mode_u, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_v, wgpu::AddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_w, wgpu::AddressMode::ClampToEdge);
     }
 }

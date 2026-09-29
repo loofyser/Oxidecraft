@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use oxide_assets::font::Font;
 use oxide_assets::resources::{ResourceError, TextureSet};
 
 /// The four texels of the synthetic `blocks/stone` fixture, in row-major
@@ -277,6 +278,34 @@ fn the_real_extraction_tree_loads() {
         .animation("blocks/water_still")
         .expect("the water sidecar parsed");
     assert_eq!(water.frametime, 2, "the sidecar states frametime 2");
+}
+
+/// The real font sheet: `font/ascii` loads and the ink-column scan agrees with the width the
+/// store census recorded for `'A'`.
+///
+/// Ignored by default because it needs the user's own store, exactly like
+/// [`the_real_extraction_tree_loads`]: `OXIDECRAFT_STORE` must name the store root.
+#[test]
+#[ignore = "reads the real extraction tree; run it with OXIDECRAFT_STORE set and --ignored"]
+fn the_real_font_sheet_loads_and_measures() {
+    let store = std::env::var("OXIDECRAFT_STORE").expect(
+        "OXIDECRAFT_STORE must name the store root that holds extracted/ (for example \
+         ~/.local/share/oxidecraft); this test does not pass without a store",
+    );
+    let root = Path::new(&store).join("extracted").join("1.8.9");
+    let set = TextureSet::load(&root).expect("the real tree loads");
+
+    let sheet = set
+        .get("font/ascii")
+        .expect("font/ascii is in the real tree");
+    assert_eq!(
+        (sheet.width, sheet.height),
+        (128, 128),
+        "the ascii sheet is the 16x16 grid of 8-texel cells"
+    );
+    let font = Font::load(sheet, None).expect("the real sheet loads");
+    assert_eq!(font.advance('A'), 6, "the store-verified width of 'A'");
+    assert_eq!(font.height(), 9);
 }
 
 /// Every file under `dir`, recursively. The test's own walk, independent of

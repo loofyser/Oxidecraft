@@ -7,6 +7,8 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use oxide_assets::atlas::Atlas;
+use oxide_assets::font::FontError;
+use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
 use crate::fog::FogParams;
@@ -292,6 +294,25 @@ impl Renderer {
     /// than sampling an unbound texture. M6 re-uploads here when an animated sprite advances.
     pub fn set_atlas(&mut self, atlas: &Atlas) {
         self.terrain.set_atlas(&self.device, &self.queue, atlas);
+    }
+
+    /// Uploads the ascii font sheet the debug overlay draws with.
+    ///
+    /// The overlay measures the sheet as it uploads it, so the layout's widths and the
+    /// sampled texels cannot disagree; until this is called the overlay draws nothing. A
+    /// sheet that is not a 16x16 grid is [`FontError`] and the previous font stays.
+    pub fn set_font(&mut self, sheet: &Texture) -> Result<(), FontError> {
+        self.overlay.set_font(&self.device, &self.queue, sheet)
+    }
+
+    /// Rewrites the terrain lightmap for a sky brightness.
+    ///
+    /// The terrain pass is built with the lightmap at the noon brightness and the default
+    /// gamma ([`crate::lightmap::lightmap_image`]); a live client calls this when the
+    /// session's clock moves the sun, so the terrain's light follows it. M6 owns the
+    /// brightness interpolation between the clock's two samples.
+    pub fn set_lightmap(&mut self, sun_brightness: f32) {
+        self.terrain.set_lightmap(&self.queue, sun_brightness);
     }
 
     /// Sets the camera for the next frame.

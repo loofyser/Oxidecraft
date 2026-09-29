@@ -5,6 +5,7 @@ pub mod asset_index;
 pub mod atlas;
 pub mod extract;
 pub mod fetch;
+pub mod font;
 pub mod http;
 pub mod mcmeta;
 pub mod model;
