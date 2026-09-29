@@ -81,10 +81,14 @@ const PENDING_JOBS_CAP: usize = 4;
 
 /// How long the end-of-session drain waits for the pool's outstanding jobs.
 ///
-/// A clean stop reports its last meshes; the bound keeps a wedged build from
-/// holding the session's end forever. The pool is dropped when the session
+/// A clean stop reports its last meshes, and a build is pure CPU work with no
+/// IO to wait on: under load — other sessions' pools, or another test in the
+/// same suite — an outstanding build can take far longer than it does on an
+/// idle core, so the bound must be long enough to let those builds finish
+/// before their reports are dropped. It is still a bound, so a wedged build
+/// cannot hold the session's end forever. The pool is dropped when the session
 /// returns.
-const END_OF_SESSION_WAIT: Duration = Duration::from_millis(100);
+const END_OF_SESSION_WAIT: Duration = Duration::from_millis(2000);
 
 /// The login-state packet ids the client decodes. Anything else is skipped
 /// rather than refused, so the login survives a packet M1 does not know.
