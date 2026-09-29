@@ -10,7 +10,7 @@ specification and continue without asking questions that are already answered he
 
 - Stage: **milestone M2 (textured terrain) is in progress** — spec section 13 of
   `docs/specs/oxidecraft-v1-design.md` (v5), plan `docs/plans/2026-09-27-m2-textured-terrain.md`
-  (sixteen tasks, approved by the owner on 2026-09-27). Ten tasks are closed and independently
+  (sixteen tasks, approved by the owner on 2026-09-27). Thirteen tasks are closed and independently
   reviewed: Task 1 (`856cbec..864ffcd`) closed the M1 code backlog and added the bulk-column replay
   through the session; Task 2 (`864ffcd..e4f53e4`) added the PNG texture loader, the `.mcmeta` parser
   and `TextureSet`; Task 3 (`e4f53e4..46e4c5e`) added the blockstate and model loader with the 1.8
@@ -41,7 +41,24 @@ specification and continue without asking questions that are already answered he
   fallback cube's layer routing and the interim renderer-side shape adaptation — with one review
   (approved with minors) whose fix round closed all four findings and a scoped re-review that
   closed F1–F4 and the two records-hygiene findings; Task 9 carries no open Minor. Task 10 (`012d326`, with the pre-fix plan corrections `1edba03` and the fix round `c4cb3d6`) drew the terrain from the atlas — the per-layer textured pipelines (the translucent layer carrying the client's cull, depth-writes-off, alpha-test and blend states), the atlas upload with its mip chain, the frustum and per-section culling, the per-layer upload and removal and the per-section translucent order; its review's two Important findings were plan pins contradicting the source, ruled to the source with the plan corrected first, and the fix round's scoped re-review closed all six findings with no new breakage; Task 10 carries no open Minor bar the three ledgered notes.
-  Next is Task 11, the lightmap, the brightness pipeline, the colour-space policy and fog.
+  Task 11 (`0a0590f..4038579`) added the lightmap and brightness pipeline (`oxide-render`'s
+  `lightmap.rs`: the 16×16 byte table from the source's own arithmetic, the sun and gamma inputs, the
+  fixed non-sRGB colour-space policy), the linear fog (`fog.rs`, the pass's fog mix and the
+  fog-colour chain), the `(block, sky)` light-pair order correction across
+  `oxide-game`/`oxide-render`, and retired `docs/DIVERGENCES.md` entry 4 with the spec's C.1 policy
+  clause; one fix round closed its review's Important (the End fog blue) and seven minors. Task 12
+  (`7b77b32..2175ccc`) added the world clock (Time Update 0x03, `ClientEvent::Time`, the sign-kept
+  `time_of_day`), the sky pass (the band, the sun, the moon with its phase, the stars and the
+  celestial rotation, drawn from the eye frame with the source's fog states) and the flat cloud layer
+  (the drift chain, the client-local counter), with the session-only `ClientEvent::Sky` carrying the
+  world-derived sky values because the client may not reach `oxide-world` before Task 14; one fix
+  round closed its review's three Importants (the eye-frame origin, the void and below-plane fog, the
+  moon phase) and six minors. Task 13 (`2175ccc..1bde931`) moved meshing onto a per-session rayon
+  pool with the generation-tracked `MeshQueue` (the 4-job pump, the `try_recv`-only drain, the
+  bounded end drain) and closed the M1 caveats (an unload and an applied column re-mesh their loaded
+  neighbours through the queue; generations are monotonic); one fix round closed its review's two
+  Importants.
+  Next is Task 14, the asset bootstrap, the jar font, the overlay cache and the comparison flags.
   Every task's brief, report, review and every ruling live in the plan's ledger
   `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`. M1 is complete and tagged `m1` (the
   annotated tag marks the close-out commit `930ccab`; the reviewed code head is `854ca85` and its
@@ -58,9 +75,9 @@ specification and continue without asking questions that are already answered he
   the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
   with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
   overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
-- Tests: 412 passing workspace-wide, 15 ignored, zero failures (`cargo test --workspace`, 46 suites).
-  The ignored set is two live-endpoint metadata tests, nine GPU tests (eight in `pipeline_headless`,
-  one in `headless`; they pass locally with `-- --ignored`) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
+- Tests: 483 passing workspace-wide, 18 ignored, zero failures (`cargo test --workspace`, 50 suites).
+  The ignored set is two live-endpoint metadata tests, twelve GPU tests (eleven in `pipeline_headless`,
+  one in `headless`; they pass locally with `-- --ignored`, 11/11 on the T500) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
   store when `OXIDECRAFT_STORE` points at it (`~/.local/share/oxidecraft`).
 - Live evidence: the M0 ping and captures stand; M1's acceptance run — the join, 180 seconds of
   keep-alives, the mark and both screenshots, and the proxy capture of our client's own traffic — is
@@ -245,15 +262,16 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M2 (textured terrain) is the live milestone; its plan is
-`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–10 are closed and reviewed (head `c4cb3d6`).
+`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–13 are closed and reviewed (head `1bde931`).
 The M1 backlog that previously stood here rode into the plan: items 2–6 closed in Task 1, item 1 (the
 overlay's cached uploads) is Task 14's, and item 7 (the rig's log rotation) is Task 15's. The next
-work is **Task 11, the lightmap, the brightness pipeline, the colour-space policy and fog**
-(`oxide-render` + `oxide-game`) — then Tasks 12–16 in plan order. Parked for the milestone's
-final review: the seven deferred Minors from Task 2, the eight from Task 3, Task 4's remaining
-wording nits and Task 7's one carried Minor (the block-kind border read), each listed in the plan's ledger; Task 8 carried none (its two wording corrections landed in `0be1d8f` and its two coverage notes — the north/south/east orientation arrays and `Material::Web` — sit in `task-8-report.md`). Task 9 carried none either — its review's four findings closed (two in
-`64ccd4a`, two in the report) and the re-review's two records-hygiene items sit in
-`task-9-report.md` and `task-9-re-review-1.md`. Task 10 carried none beyond three ledgered notes: the `Aabb3::section` transpose hygiene, the pre-existing `Less`-vs-`LEQUAL` depth compare, and its brief's pre-ruling text. The milestone's acceptance (Task 15) runs the rig
+work is **Task 14, the asset bootstrap, the jar font, the overlay cache and the comparison flags**
+(`oxide-client` + `oxide-render` + `oxide-assets`) — then Tasks 15–16 in plan order. Parked for the
+milestone's final review: the per-task deferred Minors recorded in the plan's ledger (Tasks 2–10),
+Task 11's two evidence-precision minors (accepted as-is), Task 12's R17 (the flat-world horizon) and
+R18 (the celestial-angle decompiler artefact) with two re-review citation minutiae, and Task 13's
+three notes (the six-column test's name, the keepalive timing margin on a one-core pool, and the
+pre-existing Join Game queue-reset race). The milestone's acceptance (Task 15) runs the rig
 under `refs/rig/` against the store at `~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
 
 Then, as always: keep `docs/STATE.md` and `CHANGELOG.md` current and tag each milestone when it
@@ -283,6 +301,8 @@ M1 additions):
 | `tempfile` / `fs4` / `dirs` | 3.27.0 / 1.1.0 / 7.0.0 | |
 | `glam` | 0.32.1 | `oxide-render` (terrain vertices, the camera). Do not bump past 0.32 under `-D warnings`: `Mat4::perspective_rh`/`look_to_rh` are deprecated from 0.33.1 (migrating to `glam::camera` is mechanical but a deliberate change) |
 | `crossbeam-channel` | 0.5.17 | `oxide-game` and `oxide-client`, the session-to-window event channel |
+| `png` | 0.18.1 | `oxide-assets`, the PNG texture loader (M2 Task 2) |
+| `rayon` | 1.12.0 | `oxide-game`, the per-session mesh pool (M2 Task 13) |
 
 ## Environment facts (development machine)
 
