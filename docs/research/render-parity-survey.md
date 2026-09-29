@@ -158,12 +158,12 @@ Sources: `TextureMap.java`, `Stitcher.java`, `RenderItem.java` (MCP-919), <https
 | SGA sheet | `assets/minecraft/textures/font/ascii_sga.png`, 128×128 (galactic alphabet) |
 | Unicode pages | `assets/minecraft/textures/font/unicode_page_%02x.png`, **256×256** (16×16 grid of 16×16 cells). Present pages = 224 total incl. ascii/ascii_sga: `00–07, 09–d7, f9–ff`; **missing: `08`, `d8–df` (surrogates), `e0–f8`** |
 | Glyph widths | `assets/minecraft/font/glyph_sizes.bin`, one byte per BMP codepoint (65 536 bytes; read whole at `FontRenderer.java:216-217`, defaults to 255→64×64? see note). High nibble = start column, low nibble = end column of the 16×16 cell |
-| Char width (ASCII) | `charWidth[c] = 3 + glyphWidth(c)` for the 8×8 sheet (`FontRenderer.java:179`); i.e. glyph pixel width + 1 px spacing (space = 4 px) |
+| Char width (ASCII) | The ink-column scan: `i2` = the rightmost inked column + 1 (0 for a blank cell), `charWidth = (int)(0.5 + i2 × 8/cellWidth) + 1` (`FontRenderer.java:184-206`); on the 8×8 sheet that is the ink's right edge + 1 px spacing, verified against the store (`'A'` 6, `'i'` 2, `'l'` 3, `'!'` 2, `'8'` 6, `'.'` 2). The space's advance is 4 (`:177-179`, `:664-667`); the earlier `3 + glyphWidth` reading of this row held only for the space (corrected 2026-09-29, Task 14's pre-flight) |
 | Char width (unicode) | `charWidth[c] = (int)(0.5 + width * 0.5) + 1` — unicode glyphs are drawn at **half scale horizontally** (`FontRenderer.java:206`; `f1 = unicodeFlag ? 0.5F : 1.0F` at :479) |
 | Line height | `FONT_HEIGHT = 9` (`FontRenderer.java:35`) |
-| Shadow | a second copy of the glyph drawn **1 px down-right at 12.5 % of the glyph advance**, colours divided by 4 (`FontRenderer.java:415` + wiki) |
+| Shadow | a second copy of the glyph drawn **1 font pixel down-right** (`FontRenderer.java:349`), colours divided by 4 with the low two bits dropped first (`:589`: `(c & 0xFCFCFC) >> 2 \| alpha`; white's shadow byte is 63, not 63.75) |
 | Shadow colour | `(c & 0xFCFCFC) >> 2` per channel for coloured text; black shadow = ARGB `0x3F000000`-ish; title/heading text uses the same 1-px offset |
-| Alpha for shadows | rendered with `alpha < 0.25F` → shadow forced opaque-ish (see `:415-480` logic) |
+| Alpha for shadows | a colour whose alpha byte is below 4/255 (the top six bits zero) is forced opaque before the shadow rule applies (`FontRenderer.java:582-585`); the shadow keeps that alpha (`:589`) |
 | Positioned as | screen-space quads in the GUI ortho projection at 1 GUI px = `scale/`… (see §2.1) |
 
 Sources: <https://minecraft.wiki/w/Font>, `FontRenderer.java` (MCP-919), jar listing/dimensions.
@@ -172,7 +172,7 @@ Sources: <https://minecraft.wiki/w/Font>, `FontRenderer.java` (MCP-919), jar lis
 
 - GUI scale options: `Auto / Small / Normal / Large` (`GameSettings.java:57` `GUISCALES`), `guiScale = 0..3`.
 - `ScaledResolution` derives `scaleFactor` from `width/320, height/240` (auto) → `scaleFactor = max(1, min(scaleFactor, 3))`; all GUI coordinates are in *scaled* units, one scaled unit = `scaleFactor` physical px.
-- Text is drawn with (near-)integer translation then scaled; 1.8 quirk: shadow offset is in *scaled* units ⇒ a 1 px shadow can be *sub-pixel* relative to glyph edges. To match exactly, replicate the **12.5 % of advance** shadow rule (wiki), not "1 screen px".
+- Text is drawn with (near-)integer translation then scaled; the shadow copy sits at +1 **font** pixel (`FontRenderer.java:349`, so `scale` screen pixels at GUI scale > 1 — the wiki's "12.5 % of an 8-px cell" is the same number), not one screen pixel.
 
 ---
 
