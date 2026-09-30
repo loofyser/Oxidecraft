@@ -5,11 +5,14 @@
 //!
 //! `S03PacketTimeUpdate` carries two big-endian `i64`s: the world's age and its time of day
 //! (`S03PacketTimeUpdate.java:36-49`). The client stores both (`NetHandlerPlayClient.java:952-957`).
-//! A server that has stopped the day-night cycle negates the time before sending it (`:17-31`), so
-//! a negative `time_of_day` is the frozen-sun convention and every function here keeps its sign as
-//! received. `World.getCelestialAngle` and `World.getMoonPhase` both read `worldTime`
-//! (`World.java:1493-1501`), so `time_of_day` is the field that drives the sky; the age is carried
-//! for later work and takes no part in anything in this module.
+//! A server that has stopped the day-night cycle negates the time before sending it (`:17-31`),
+//! and the receiving client negates it back before the clock stores it: that is
+//! `WorldClient.setWorldTime`'s receive rule (`WorldClient.java:468-483`), so the value every
+//! function here reads — the client's `worldTime` — is the positive one the source renders from
+//! (the wire's `-6000` is the clock's `6000`, noon). `World.getCelestialAngle` and
+//! `World.getMoonPhase` both read `worldTime` (`World.java:1493-1501`), so `time_of_day` is the
+//! field that drives the sky; the age is carried for later work and takes no part in anything in
+//! this module.
 //!
 //! M2 has no client tick loop (M3's), so the sky renders from the last received update with
 //! `partial_ticks = 0`; every function below takes the partial tick anyway, because that is what
@@ -80,8 +83,10 @@ fn day_factor(celestial_angle: f32) -> f32 {
 ///
 /// The time wraps into its day first (`worldTime % 24000`), the wrapped value becomes the day's
 /// fraction, and the cosine turns that into the angle: zero at noon, `0.5` at midnight, the
-/// sunrise and sunset values in between. A negative (frozen) time wraps the same way, so `-6000`
-/// answers the same half day as `18000`.
+/// sunrise and sunset values in between. A frozen clock's wire value arrives here already
+/// negated by the receive rule (the module comment) — the wire's `-6000` is the `+6000` of noon
+/// — and the wrap is what keeps the arithmetic defined for values the negation leaves in place,
+/// the smallest `i64` included.
 ///
 /// The source's closing `f = f + (f - f) / 3.0F` adds zero for every input and is not written.
 pub fn celestial_angle(time_of_day: i64, partial_ticks: f32) -> f32 {
@@ -100,8 +105,9 @@ pub fn celestial_angle(time_of_day: i64, partial_ticks: f32) -> f32 {
 /// The moon's phase for a world time in ticks: `WorldProvider.getMoonPhase`
 /// (`WorldProvider.java:135-138`).
 ///
-/// One phase per day, eight phases in a cycle, wrapped positive so a negative (frozen) time
-/// answers a phase rather than a negative index: `-24000` is phase 7.
+/// One phase per day, eight phases in a cycle, wrapped positive so the answer is a phase index
+/// whatever `i64` the arithmetic meets: `-24000` is phase 7. A frozen clock's wire value arrives
+/// here already negated by the receive rule (the module comment), so it is read as its positive day.
 pub fn moon_phase(time_of_day: i64) -> i32 {
     ((time_of_day / DAY_TICKS) % 8 + 8) as i32 % 8
 }

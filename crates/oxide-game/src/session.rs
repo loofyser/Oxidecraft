@@ -223,13 +223,15 @@ pub enum ClientEvent {
     },
     /// Time Update arrived: the world's clock.
     ///
-    /// The time of day is the value the celestial angle and the moon phase are read from, and a
-    /// negative one is the frozen-sun convention (`S03PacketTimeUpdate.java:17-31`): the sign is
-    /// reported as received. The age is carried for later work.
+    /// The time of day is the value the celestial angle and the moon phase are read from, after
+    /// the receive rule's negation of the wire's frozen-sun sign
+    /// (`S03PacketTimeUpdate.java:17-31`, `WorldClient.java:468-483`): a stopped cycle's frame
+    /// reports the positive time its sky renders from — the wire's `-6000` is noon. The age is
+    /// carried for later work.
     Time {
         /// The world's age in ticks.
         world_age: i64,
-        /// The world's time of day in ticks; negative while the sun is frozen.
+        /// The world's time of day in ticks, after the receive rule's negation.
         time_of_day: i64,
     },
     /// The sky the session's world and view block produce, from the last clock.
@@ -473,12 +475,18 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 }
                 TimeUpdate::ID => {
                     let update = decoded(id, TimeUpdate::decode(body))?;
-                    clock = Some(update.time_of_day);
+                    // The frozen-sun convention: a stopped day-night cycle puts a negative
+                    // time on the wire (`S03PacketTimeUpdate.java:17-31`), and the client
+                    // negates it back before it becomes the world clock
+                    // (`WorldClient.setWorldTime`, `WorldClient.java:468-483`), so the
+                    // clock — and the sky built from it — is the value vanilla renders.
+                    let time_of_day = received_time_of_day(update.time_of_day);
+                    clock = Some(time_of_day);
                     report(
                         events,
                         ClientEvent::Time {
                             world_age: update.world_age,
-                            time_of_day: update.time_of_day,
+                            time_of_day,
                         },
                     );
                     report_sky(world.as_ref(), position, clock, events);
@@ -802,6 +810,19 @@ fn decoded<T>(id: i32, result: Result<T, PacketError>) -> Result<T, SessionError
 /// Reports one event; a window that stopped listening is not an error here.
 fn report(events: &Sender<ClientEvent>, event: ClientEvent) {
     let _ = events.send(event);
+}
+
+/// The client's receive rule for a Time Update's time of day: `WorldClient.setWorldTime`
+/// (`WorldClient.java:468-483`) negates a negative time — the frozen-sun convention on the wire
+/// (`S03PacketTimeUpdate.java:17-31`) — before the clock stores it, so the sky functions read
+/// the positive value the source renders from: the wire's `-6000` is the `6000` of noon.
+///
+/// The source's `-time` is a two's-complement negation, and `wrapping_abs` is that rule on
+/// every `i64`: the smallest one negates to itself rather than panicking the read loop. The
+/// same branch also toggles the source's local `doDaylightCycle` rule; M2 has no client tick
+/// for a rule to gate, so the session keeps the clock alone.
+fn received_time_of_day(time_of_day: i64) -> i64 {
+    time_of_day.wrapping_abs()
 }
 
 /// Reports the sky the clock and the view block produce, when both are known.

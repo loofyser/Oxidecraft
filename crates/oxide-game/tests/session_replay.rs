@@ -1217,16 +1217,18 @@ fn an_applied_column_refreshes_its_loaded_neighbours() {
 #[test]
 fn the_session_reports_the_clock_and_the_sky_it_moves() {
     // A join, a teleport into the column the script loads, the column whose biome array is
-    // plains, `/time set 6000`'s own frame, the same frame with the time negated — the frozen
-    // sun — a teleport inside that column, and a third day's frame. The clock comes back per
-    // update and the sky follows it and the view block, because the client cannot sample the
-    // world itself.
+    // plains, `/time set 6000`'s own frame, the same frame with the time negated — what a
+    // stopped day-night cycle puts on the wire — a teleport inside that column, and a third
+    // day's frame. The clock comes back per update; the receive rule negates the frozen
+    // frame's negative time back (`WorldClient.java:468-483`), so its clock and sky are the
+    // noon values. The sky follows the clock and the view block, because the client cannot
+    // sample the world itself.
     let (stream, _outgoing) = duplex(stream_with(&[
         join_game_frame(),
         position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
         chunk_data_frame(0, 0),
         time_update_frame(48_000, 6000),
-        time_update_frame(48_000, -6001),
+        time_update_frame(48_000, -6000),
         position_frame(12.5, 65.0, 4.5, 0.0, 0.0, 0),
         time_update_frame(48_000, 72_000),
     ]));
@@ -1249,8 +1251,8 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
         .collect();
     assert_eq!(
         clocks,
-        vec![(48_000, 6000), (48_000, -6001), (48_000, 72_000)],
-        "every Time Update is reported, the sign of the time kept as received"
+        vec![(48_000, 6000), (48_000, 6000), (48_000, 72_000)],
+        "every Time Update is reported, the frozen frame's time negated by the receive rule"
     );
 
     // The sky's shape carries the view-block colour and the other world-derived values.
@@ -1275,31 +1277,24 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
             _ => None,
         })
         .collect();
-    // The JVM harness's own frozen angle (`refs/m2-task-12/sky_literals.out`, `angle t=-6001`).
-    let midnight = 0.49993455;
-    let frozen = SkyReport {
-        celestial_angle: midnight,
-        colour: [0.0, 0.0, 0.0],
-        sun_brightness: 0.2,
-        star_brightness: 0.5,
-        cloud_colour: [0.1, 0.1, 0.15],
+    // The plains noon the loaded column's biome gives, reported by the plain frame and — the
+    // frozen frame's negative wire time negated back to `+6000` by the receive rule — by the
+    // frozen frame too, for the teleport that followed it as well.
+    let noon = SkyReport {
+        celestial_angle: 0.0,
+        colour: [120.0 / 255.0, 167.0 / 255.0, 1.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        cloud_colour: [1.0, 1.0, 1.0],
         moon_phase: 0,
     };
     assert_eq!(
         skies,
         vec![
-            // The plains noon the loaded column's biome gives.
-            SkyReport {
-                celestial_angle: 0.0,
-                colour: [120.0 / 255.0, 167.0 / 255.0, 1.0],
-                sun_brightness: 1.0,
-                star_brightness: 0.0,
-                cloud_colour: [1.0, 1.0, 1.0],
-                moon_phase: 0,
-            },
-            // The frozen midnight, reported again for the moved view block.
-            frozen,
-            frozen,
+            noon,
+            noon,
+            // The frozen frame's sky, reported again for the moved view block.
+            noon,
             // The third day's sunrise angle (`angle t=0` is the same day fraction), whose
             // `worldTime / 24000 % 8` is phase 3.
             SkyReport {
@@ -1324,5 +1319,86 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
     assert!(
         last_position < last_sky,
         "a moved view block reports the sky again: {events:?}"
+    );
+}
+
+/// The frozen-sun convention end to end: a server with the day-night cycle stopped negates
+/// the time it sends (`S03PacketTimeUpdate.java:17-31`), and the client negates a negative
+/// time back before it becomes the world clock (`WorldClient.setWorldTime`,
+/// `WorldClient.java:468-483`). Each frozen frame's reported clock and sky must equal the
+/// plain positive frame's — the noon the acceptance's `/time set 6000` means — not the night
+/// the raw negative value would answer.
+#[test]
+fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
+        chunk_data_frame(0, 0),
+        time_update_frame(48_000, -6000),
+        time_update_frame(48_000, 6000),
+        time_update_frame(48_000, -6001),
+        time_update_frame(48_000, 6001),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let session = Session::new(Conn::new(stream), config());
+    session
+        .run_over(&sender)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let clocks: Vec<(i64, i64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Time {
+                world_age,
+                time_of_day,
+            } => Some((*world_age, *time_of_day)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        clocks,
+        vec![
+            (48_000, 6000),
+            (48_000, 6000),
+            (48_000, 6001),
+            (48_000, 6001),
+        ],
+        "each frozen frame reports the clock its negation produces, not its wire sign"
+    );
+
+    let skies: Vec<SkyReport> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Sky {
+                celestial_angle,
+                colour,
+                sun_brightness,
+                star_brightness,
+                cloud_colour,
+                moon_phase,
+            } => Some(SkyReport {
+                celestial_angle: *celestial_angle,
+                colour: *colour,
+                sun_brightness: *sun_brightness,
+                star_brightness: *star_brightness,
+                cloud_colour: *cloud_colour,
+                moon_phase: *moon_phase,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(skies.len(), 4, "one sky per clock update: {events:?}");
+    assert_eq!(
+        skies[0].celestial_angle, 0.0,
+        "the frozen noon: `-6000` and `+6000` are the same half day"
+    );
+    assert_eq!(
+        skies[0], skies[1],
+        "the frozen -6000 frame's clock and sky are the plain 6000 frame's"
+    );
+    assert_eq!(
+        skies[2], skies[3],
+        "the same for the frozen -6001 frame against the plain 6001 frame"
     );
 }

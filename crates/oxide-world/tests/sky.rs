@@ -52,12 +52,13 @@ fn the_celestial_angle_wraps_over_a_day() {
     );
 }
 
-/// A frozen sun arrives as a negative time of day — the server negates `worldTime` to stop
-/// the cycle (`S03PacketTimeUpdate.java:17-31`) — and the sign is kept as received: the
-/// angle still wraps the value into its day, so `-6000` is the same half day as `18000`.
+/// A negative time of day wraps into its day before the cosine reads it, so `-6000` is the
+/// same half day as `18000`. A frozen clock's wire value is not what arrives here negative —
+/// the receive rule negates it back (`WorldClient.java:468-483`) — but the smallest `i64`,
+/// which negation leaves in place, still needs the wrap.
 #[test]
-fn a_negative_time_of_day_keeps_its_sign() {
-    assert_eq!(celestial_angle(-6000, 0.0), 0.5, "the frozen sun's angle");
+fn a_negative_time_of_day_wraps_into_its_day() {
+    assert_eq!(celestial_angle(-6000, 0.0), 0.5, "a negative half day");
     assert_eq!(celestial_angle(-6000, 0.0), celestial_angle(18000, 0.0));
     assert_eq!(celestial_angle(-12000, 0.0), celestial_angle(12000, 0.0));
 }
@@ -166,8 +167,9 @@ fn the_cloud_colour_follows_the_same_factor() {
 }
 
 /// The moon's phase: `worldTime / 24000 % 8`, wrapped positive
-/// (`WorldProvider.java:135-138`), so it steps once a day, wraps at eight and answers for
-/// negative (frozen) times.
+/// (`WorldProvider.java:135-138`), so it steps once a day, wraps at eight, and the wrap
+/// answers a phase index for a negative time of day as well — the receive rule
+/// (`WorldClient.java:468-483`) keeps a frozen clock positive before it is read.
 #[test]
 fn the_moon_phase_steps_once_a_day() {
     assert_eq!(moon_phase(0), 0, "the first day");
