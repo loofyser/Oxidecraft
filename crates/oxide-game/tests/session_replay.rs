@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
 use oxide_proto::conn::{Conn, DeadlineStream};
@@ -837,6 +837,92 @@ fn a_keepalive_behind_a_column_burst_is_answered() {
     assert!(cursor.is_empty(), "no further packets were sent");
 }
 
+#[test]
+fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
+    // The burst a live server sends on join is hundreds of column frames, and
+    // the first keepalive sits behind all of them on the wire. The server
+    // closes a session whose echo goes unanswered for about thirty seconds, so
+    // the loop must read the burst at frame-parse speed: the frames are read
+    // one after another and the meshes are handed to the pool only in the idle
+    // wait, so a stream that never idles is read without a single snapshot
+    // copy on the way. Every frame here carries work for the mesh queue — the
+    // frames re-send the few columns a busy server keeps updating, as its
+    // blocks change — so every frame finds the queue dirty, and each applied
+    // column's snapshot copy costs tens of milliseconds in a debug build: a
+    // loop that pumped between packets would need far longer than the deadline
+    // below for these 240 frames, and the diagnostic names how much of the
+    // burst was meshed while the echo went unanswered. The harness's stream has
+    // no idle wait, so the burst's meshes can only be reported after the
+    // stream ends: an echo answered here was answered while the burst was
+    // still unmeshed.
+    const BURST: i32 = 240;
+    // The columns the burst re-sends. Few enough that the meshes left for the
+    // end-of-session drain stay few — the drain pays their snapshot copies on
+    // this thread, so a large leftover set would slow the test down without
+    // pinning anything — and any path that pumps per frame hands several of
+    // them to the pool on every one of the 240 frames.
+    const COLUMNS: i32 = 8;
+    // Far above what reading 240 frames costs a loop that only parses them,
+    // and far below what meshing them between packets would cost.
+    const ECHO_DEADLINE: Duration = Duration::from_secs(4);
+
+    let mut script = Vec::new();
+    login_sequence(&mut script);
+    frame(&mut script, &join_game_frame(), SERVER_FRAMING);
+    for frame_index in 0..BURST {
+        frame(
+            &mut script,
+            &chunk_data_frame(frame_index % COLUMNS, 0),
+            SERVER_FRAMING,
+        );
+    }
+    frame(&mut script, &keep_alive_frame(97), SERVER_FRAMING);
+
+    let (stream, outgoing) = duplex(script);
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let started = Instant::now();
+    let session =
+        std::thread::spawn(move || Session::new(Conn::new(stream), config()).run_over(&sender));
+
+    let deadline = started + ECHO_DEADLINE;
+    let mut meshed = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(ClientEvent::KeepAlive { id: 97 }) => break,
+            Ok(ClientEvent::ChunkUpdated { .. }) => meshed += 1,
+            Ok(_) => {}
+            Err(error) => panic!(
+                "the echo went unanswered for {ECHO_DEADLINE:?} with {meshed} burst meshes \
+                 already reported: {error}"
+            ),
+        }
+    }
+    assert_eq!(
+        meshed, 0,
+        "the echo must be answered before any of the burst is meshed"
+    );
+    session
+        .join()
+        .expect("the session thread ends")
+        .expect("the session runs to the end of the stream");
+
+    // The echo is on the wire: it is the only packet the burst drew, right
+    // after the settings and the brand.
+    let written = outgoing.lock().unwrap().clone();
+    let mut cursor = &written[..];
+    client_frame(&mut cursor, Compression::Disabled); // handshake
+    client_frame(&mut cursor, Compression::Disabled); // login start
+    client_frame(&mut cursor, SERVER_FRAMING); // client settings
+    client_frame(&mut cursor, SERVER_FRAMING); // brand
+    assert_eq!(
+        client_frame(&mut cursor, SERVER_FRAMING),
+        [0x00, 0x61],
+        "the keepalive is the only packet the burst drew"
+    );
+    assert!(cursor.is_empty(), "no further packets were sent");
+}
+
 /// A duplex with a quiet stretch: after `head` is consumed, the stream reports
 /// nothing readable for `stalls` waits, then serves `tail`.
 struct GappedDuplex {
@@ -902,9 +988,13 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
     let stream = GappedDuplex {
         head: std::io::Cursor::new(head),
         tail: std::io::Cursor::new(tail),
-        // Three deadlines of quiet, so the pool has three tick windows to
-        // finish the mesh the chunk packet queued before the tail arrives.
-        stalls: 3,
+        // The queue's mesh is handed over in the first of these quiet
+        // windows — the loop reads frames first, so the copy and the spawn
+        // happen here, not between the head's frames — and the rest are the
+        // wall clock the pool's build needs (cold code, a loaded machine)
+        // before the tail arrives: twenty deadlines is a few hundred
+        // milliseconds of quiet.
+        stalls: 20,
         outgoing: Arc::clone(&outgoing),
     };
     let (sender, receiver) = crossbeam_channel::unbounded();

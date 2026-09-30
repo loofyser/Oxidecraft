@@ -14,11 +14,13 @@
 //! the session by sending something unexpected.
 //!
 //! The column meshes are built off this thread, on a per-session rayon pool:
-//! each applied column enters a dirty set with a generation, the loop copies
-//! its snapshot out of the store and hands the build to a worker, and the
-//! finished meshes come back as events. A burst of columns on join therefore
-//! cannot hold the read loop, and the server closes a session whose keepalive
-//! echo goes unanswered for about thirty seconds.
+//! each applied column enters a dirty set with a generation, the idle read
+//! copies its snapshot out of the store and hands the build to a worker, and
+//! the finished meshes come back as events. The snapshot copies happen only
+//! between frames — in the wait for the next one — never while frames are
+//! already readable, so a burst of columns on join cannot hold the read loop,
+//! and the server closes a session whose keepalive echo goes unanswered for
+//! about thirty seconds.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -75,20 +77,24 @@ const MESH_TICK: Duration = Duration::from_millis(20);
 /// How many queued columns one pump hands to the pool.
 ///
 /// The snapshot copy happens on the session's thread, so the cap is what
-/// bounds this thread's own work between two reads: at most this many copies
-/// before the next frame is read, whatever the burst behind it.
+/// bounds this thread's own work in one idle wait: at most this many copies
+/// per pump, whatever the burst behind them. The pump runs only when no frame
+/// has been readable for a whole [`MESH_TICK`], so those copies never sit
+/// between two frames that were already waiting.
 const PENDING_JOBS_CAP: usize = 4;
 
 /// How long the end-of-session drain waits for the pool's outstanding jobs.
 ///
-/// A clean stop reports its last meshes, and a build is pure CPU work with no
-/// IO to wait on: under load — other sessions' pools, or another test in the
-/// same suite — an outstanding build can take far longer than it does on an
-/// idle core, so the bound must be long enough to let those builds finish
-/// before their reports are dropped. It is still a bound, so a wedged build
+/// A clean stop reports its last meshes. The drain hands the queue's pending
+/// columns to the pool too, one snapshot copy each on this thread, so the
+/// bound covers the copies as well as the builds: a build is pure CPU work
+/// with no IO to wait on, and under load — other sessions' pools, or another
+/// test in the same suite — an outstanding build can take far longer than it
+/// does on an idle core, while a column's copy alone runs to tens of
+/// milliseconds in a debug build. It is still a bound, so a wedged build
 /// cannot hold the session's end forever. The pool is dropped when the session
 /// returns.
-const END_OF_SESSION_WAIT: Duration = Duration::from_millis(2000);
+const END_OF_SESSION_WAIT: Duration = Duration::from_millis(5000);
 
 /// The login-state packet ids the client decodes. Anything else is skipped
 /// rather than refused, so the login survives a packet M1 does not know.
@@ -335,12 +341,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
     /// Returns `Ok(())` when the server closed the connection or the stream
     /// ended. Malformed packets are reported as an error, never a panic.
     ///
-    /// The play loop reads with [`Conn::recv_or_idle`]; between frames, and
-    /// after every applied packet, it hands the mesh queue's next columns to
-    /// the pool and reports whatever builds have finished. A build never runs
-    /// on this thread and a drain never blocks, which is what keeps the
-    /// keepalive echo — and the teleport echo — answerable while a burst of
-    /// columns is arriving.
+    /// The play loop reads with [`Conn::recv_or_idle`]; when a wait for the
+    /// next frame times out — and only then — it hands the mesh queue's next
+    /// columns to the pool and reports whatever builds have finished. A frame
+    /// that is already readable is always read before any mesh work, and a
+    /// build never runs on this thread, which is what keeps the keepalive echo
+    /// — and the teleport echo — answerable while a burst of columns is
+    /// arriving.
     pub fn run_over(self, events: &Sender<ClientEvent>) -> Result<(), SessionError> {
         let Session {
             mut conn,
@@ -577,15 +584,6 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     );
                 }
             }
-            pump_meshes(
-                world.as_ref(),
-                &mut queue,
-                &pool,
-                &mesh,
-                &finished,
-                &results,
-                events,
-            );
         }
         finish_meshes(
             world.as_ref(),
@@ -884,12 +882,14 @@ fn mesh_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
 
 /// Hands the queue's next columns to the pool and reports every finished build.
 ///
-/// One pass spawns at most [`PENDING_JOBS_CAP`] builds. The snapshot copy
-/// happens here, on the session's thread — the world never leaves it — so the
-/// cap is what bounds this thread's own work between two reads; the build
-/// itself reads only the snapshot and the shared assets. The results are then
-/// taken with a non-blocking receive: a build that is not finished yet is
-/// picked up by a later pass, never waited for.
+/// Called when the read found nothing for a whole [`MESH_TICK`], so the work
+/// here never delays a frame that was already readable. One pass spawns at
+/// most [`PENDING_JOBS_CAP`] builds: the snapshot copy happens here, on the
+/// session's thread — the world never leaves it — and the cap is what bounds
+/// this thread's own work for one idle wait. The build itself reads only the
+/// snapshot and the shared assets. The results are then taken with a
+/// non-blocking receive: a build that is not finished yet is picked up by a
+/// later pass, never waited for.
 fn pump_meshes(
     world: Option<&World>,
     queue: &mut MeshQueue,
