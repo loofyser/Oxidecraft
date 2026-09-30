@@ -578,6 +578,40 @@ fn a_lone_stone_block_draws_six_faces() {
 }
 
 #[test]
+fn a_meshed_column_stands_at_its_own_chunk_in_the_world() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    // A column away from the origin on both axes, so a zero offset cannot hide
+    // a slip — and negative on z, so a dropped sign cannot pass either.
+    let world = world_of(&[(3, -2, flat(&[(3, 64, 7, state(STONE, 0))]))]);
+    let snapshot = ColumnSnapshot::from_world(&world, 3, -2);
+    let mesh = build_column_meshes(&snapshot, &ctx)
+        .into_iter()
+        .find_map(|(_, mesh)| mesh)
+        .expect("a loaded section");
+
+    // The vertices carry the world's own coordinates: the cell at the column's
+    // own (3, 64, 7) is the world's (51, 64, -25) — 3 × 16 + 3 and -2 × 16 + 7 —
+    // which is the frame the renderer projects and culls in, with no per-section
+    // offset of its own.
+    let planes = [
+        (1, 64.0),
+        (1, 65.0),
+        (2, -25.0),
+        (2, -24.0),
+        (0, 51.0),
+        (0, 52.0),
+    ];
+    for (quad, (axis, value)) in quads(&mesh).iter().zip(planes) {
+        assert!(
+            quad.iter().all(|vertex| vertex.position[axis] == value),
+            "quad at {value}"
+        );
+    }
+}
+
+#[test]
 fn adjacent_stone_culls_the_face_between_them() {
     let (models, atlas) = loaded();
     let maps = white_maps();

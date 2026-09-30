@@ -136,7 +136,10 @@ pub fn build_column_meshes(
 /// Builds one section's mesh, or `None` when it has no quads.
 ///
 /// `section` is the section index, 0..16; its cells are the column's cells at
-/// `y` 16 × `section` .. 16 × `section + 15`.
+/// `y` 16 × `section` .. 16 × `section + 15`. The vertices carry world-space
+/// positions — the column's own origin is added to the build's column-local
+/// ones — because that is the frame the renderer projects the vertices in and
+/// culls their sections by.
 pub fn build_section_mesh(
     snapshot: &ColumnSnapshot,
     section: usize,
@@ -151,7 +154,19 @@ pub fn build_section_mesh(
             }
         }
     }
-    let mesh = builder.finish();
+    let mut mesh = builder.finish();
+    // The build reads the snapshot in the column's own coordinates — the frame
+    // `ColumnSnapshot`'s own accessors are keyed in — and the vertices leave it
+    // in the world's: the column's origin is added once, after the translucent
+    // layer has been ordered in the build's own frame.
+    let origin_x = (snapshot.cx * SECTION_SIZE as i32) as f32;
+    let origin_z = (snapshot.cz * SECTION_SIZE as i32) as f32;
+    for layer in &mut mesh.layers {
+        for vertex in &mut layer.vertices {
+            vertex.position[0] += origin_x;
+            vertex.position[2] += origin_z;
+        }
+    }
     if mesh.is_empty() { None } else { Some(mesh) }
 }
 
