@@ -1,6 +1,6 @@
 # Oxidecraft — project state
 
-Updated: 2026-09-28
+Updated: 2026-10-01
 
 This file is the live state of the project. Keep it current before every handoff, long pause, and
 milestone boundary. Anyone picking the work up should be able to read this file plus the
@@ -10,7 +10,7 @@ specification and continue without asking questions that are already answered he
 
 - Stage: **milestone M2 (textured terrain) is in progress** — spec section 13 of
   `docs/specs/oxidecraft-v1-design.md` (v5), plan `docs/plans/2026-09-27-m2-textured-terrain.md`
-  (sixteen tasks, approved by the owner on 2026-09-27). Thirteen tasks are closed and independently
+  (sixteen tasks, approved by the owner on 2026-09-27). Fourteen tasks are closed and independently
   reviewed: Task 1 (`856cbec..864ffcd`) closed the M1 code backlog and added the bulk-column replay
   through the session; Task 2 (`864ffcd..e4f53e4`) added the PNG texture loader, the `.mcmeta` parser
   and `TextureSet`; Task 3 (`e4f53e4..46e4c5e`) added the blockstate and model loader with the 1.8
@@ -58,11 +58,28 @@ specification and continue without asking questions that are already answered he
   bounded end drain) and closed the M1 caveats (an unload and an applied column re-mesh their loaded
   neighbours through the queue; generations are monotonic); one fix round closed its review's two
   Importants.
-  Next is Task 14, the asset bootstrap, the jar font, the overlay cache and the comparison flags.
+  Task 14 (`17cf99d..ac607d4`) added the asset bootstrap, the jar font and the overlay's geometry
+  cache — the store loads at startup, the F3 overlay draws with the jar font, and `--no-overlay` /
+  `--render-distance` land — with a clean review (four minors deferred to the final review). Next is
+  Task 15, the parity metric and the acceptance baseline — in progress; see the 2026-10-01 update
+  bullet below.
   Every task's brief, report, review and every ruling live in the plan's ledger
   `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`. M1 is complete and tagged `m1` (the
   annotated tag marks the close-out commit `930ccab`; the reviewed code head is `854ca85` and its
   final whole-branch review returned ready to merge). M0 is complete and tagged `m0`.
+- **2026-10-01 update — Task 15 in progress; the fluids round stopped mid-run at the owner's
+  request.** The acceptance exposed five rendering defect classes; six scoped fix rounds are landed
+  and pushed: keepalive `6959280`, clock `14ca52f`, terrain origin `72526bf`, camera `bd83c0c`,
+  atmosphere fog `a6760bd` (review clean; 4 minors record-corrected) and the cloud at-or-above arm
+  `e919711` (review approved with findings; all record-corrected; the full-band mask is withdrawn).
+  The seventh round (fluids: the glass-walled liquid cells and the ground water colour) was stopped
+  mid-run ~45 minutes in, mid-GREEN; its RED evidence and WIP snapshots live under `refs/m2-fluids/`
+  (`wip-stopped.diff`, `wip-stopped-round.diff`) and the resume point is
+  `docs/handoff/2026-10-01-m2-fluids-stopped.md`. Next: resume ROUND 3 (fluids) → its scoped review
+  → continuation #3 (the full acceptance re-capture, all three pairs against the bar) → Task 15
+  close → Task 16 → the whole-branch review → tag `m2`. The working tree carries Task 15's trio
+  only (`crates/oxide-world/tests/behaviour.rs` modified — the `EXTRA_CELLS` list;
+  `scripts/parity-diff.py` and `docs/perf.md` untracked); keep them.
 - M0 delivered and verified: the eight-crate workspace with its enforced dependency graph; the
   VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
   and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
@@ -75,10 +92,14 @@ specification and continue without asking questions that are already answered he
   the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
   with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
   overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
-- Tests: 483 passing workspace-wide, 18 ignored, zero failures (`cargo test --workspace`, 50 suites).
-  The ignored set is two live-endpoint metadata tests, twelve GPU tests (eleven in `pipeline_headless`,
-  one in `headless`; they pass locally with `-- --ignored`, 11/11 on the T500) and four real-tree tests (three in `oxide-assets` and one in `oxide-game`) that run against the
-  store when `OXIDECRAFT_STORE` points at it (`~/.local/share/oxidecraft`).
+- Tests: 504 passing workspace-wide, 21 ignored, zero failures (`cargo test --workspace`; the
+  cloud-arm review's re-run at `e919711`; the 2026-10-01 stop's gate re-run: `GATE OK`,
+  `refs/m2-fluids/gate-pause.log`).
+  The ignored set is two live-endpoint metadata tests, thirteen GPU tests (twelve in `pipeline_headless`,
+  one in `headless`; they pass locally with `-- --ignored`, 13/13 on the T500), five store-dependent
+  tests (four in `oxide-assets`, one in `oxide-game`) that run when `OXIDECRAFT_STORE` points at the
+  store (`~/.local/share/oxidecraft`), and one rig helper (the sample-wall printer in `oxide-world`'s
+  `behaviour.rs`).
 - Live evidence: the M0 ping and captures stand; M1's acceptance run — the join, 180 seconds of
   keep-alives, the mark and both screenshots, and the proxy capture of our client's own traffic — is
   recorded under "M1 evidence" below, with the raw files under `refs/rig/evidence/m1/`.
@@ -262,16 +283,20 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M2 (textured terrain) is the live milestone; its plan is
-`docs/plans/2026-09-27-m2-textured-terrain.md` and Tasks 1–13 are closed and reviewed (head `1bde931`).
-The M1 backlog that previously stood here rode into the plan: items 2–6 closed in Task 1, item 1 (the
-overlay's cached uploads) is Task 14's, and item 7 (the rig's log rotation) is Task 15's. The next
-work is **Task 14, the asset bootstrap, the jar font, the overlay cache and the comparison flags**
-(`oxide-client` + `oxide-render` + `oxide-assets`) — then Tasks 15–16 in plan order. Parked for the
+`docs/plans/2026-09-27-m2-textured-terrain.md`. Tasks 1–14 are closed and reviewed; Task 15 (the
+parity metric and the acceptance baseline) is in progress — six scoped fix rounds are landed and
+pushed, and the seventh (fluids) was stopped mid-run at the owner's request on 2026-10-01; resume it
+from `docs/handoff/2026-10-01-m2-fluids-stopped.md`.
+The M1 backlog that stood here: items 2–6 closed in Task 1, item 1 (the overlay's cached uploads)
+closed in Task 14, item 7 (the rig's log rotation) is Task 15's. Then Task 16 in plan order, the
+whole-branch review and the `m2` tag. Parked for the
 milestone's final review: the per-task deferred Minors recorded in the plan's ledger (Tasks 2–10),
 Task 11's two evidence-precision minors (accepted as-is), Task 12's R17 (the flat-world horizon) and
 R18 (the celestial-angle decompiler artefact) with two re-review citation minutiae, and Task 13's
 three notes (the six-column test's name, the keepalive timing margin on a one-core pool, and the
-pre-existing Join Game queue-reset race). The milestone's acceptance (Task 15) runs the rig
+pre-existing Join Game queue-reset race), Task 14's four deferred minors, and the cloud-arm
+review's deferred set (the lateral-fixture comment's straight-down approximation and the
+`lightmap.rs` comment). The milestone's acceptance (Task 15) runs the rig
 under `refs/rig/` against the store at `~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
 
 Then, as always: keep `docs/STATE.md` and `CHANGELOG.md` current and tag each milestone when it
