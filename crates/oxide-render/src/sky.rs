@@ -64,9 +64,16 @@
 //! as a stand-in; two clients therefore show independent cloud phases, and the acceptance note
 //! records that masking rule.
 //!
-//! The layer draws only while the camera's eye is under it: the source's gate is
-//! `entity.posY + eyeHeight < 128.0` (`EntityRenderer.java:1364-1367`, [`cloud_under_layer`]).
-//! The at-or-above arm (`:1474-1478`) is the later scene work's.
+//! The layer draws twice, and the entity eye's height — the reported feet position plus
+//! `eyeHeight`, never an interpolated position and never the displaced first-person camera —
+//! picks the arm. The under-arm draws it before the terrain while that height is `< 128.0`
+//! (`EntityRenderer.java:1364-1367`, [`cloud_under_layer`]); the at-or-above arm draws the same
+//! layer after the translucent layer once it is `>= 128.0` (`:1474-1478`,
+//! [`cloud_at_or_above_layer`]). Both call the same `renderCloudsCheck`, which installs the
+//! layer's own `* 4` projection (`:1497`) and the terrain fog range (`setupFog(0)`, `:1500`)
+//! around the draw and disables the fog after it (`:1502`); the `disableFog()` the at-or-above
+//! call site runs first (`:1472`) is undone by that `setupFog(0)`, so both arms draw the deck
+//! fogged the same way.
 //!
 //! # Projections, the eye and the frame
 //!
@@ -275,10 +282,26 @@ pub fn cloud_layer_y(eye_y: f32) -> f32 {
     CLOUD_HEIGHT - eye_y + CLOUD_LIFT
 }
 
-/// Whether the camera's eye is under the cloud layer, the source's gate for drawing it
+/// The entity eye's height above the world origin: the basis both of the source's cloud gates
+/// read (`entity.posY + (double) entity.getEyeHeight()`, `EntityRenderer.java:1364`, `:1474`).
+///
+/// The basis is the entity's own eye — the reported feet position plus [`EYE_HEIGHT`]. The
+/// source's guards interpolate nothing and read the entity, not the first-person camera the
+/// view pulls a tenth of a block back along the view axis.
+fn entity_eye_y(camera: &Camera) -> f64 {
+    camera.pose.position[1] + f64::from(EYE_HEIGHT)
+}
+
+/// Whether the camera's eye is under the cloud layer, the source's gate for the first draw
 /// (`EntityRenderer.java:1364`, `entity.posY + eyeHeight < 128.0`).
 pub fn cloud_under_layer(camera: &Camera) -> bool {
-    camera.pose.position[1] + f64::from(EYE_HEIGHT) < f64::from(CLOUD_HEIGHT)
+    entity_eye_y(camera) < f64::from(CLOUD_HEIGHT)
+}
+
+/// Whether the camera's eye stands at or above the cloud layer, the source's gate for the
+/// second draw (`EntityRenderer.java:1474`, `entity.posY + eyeHeight >= 128.0`).
+pub fn cloud_at_or_above_layer(camera: &Camera) -> bool {
+    entity_eye_y(camera) >= f64::from(CLOUD_HEIGHT)
 }
 
 /// The void box's floor for an eye height: `-(d0 + 65)` with `d0 = eyeY - horizon`
@@ -1740,11 +1763,11 @@ mod tests {
 
     use super::{
         CLOUD_DRIFT_PER_TICK, CLOUD_UV_PER_BLOCK, KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend,
-        celestial_rotation, cloud_blend, cloud_drift, cloud_layer_y, cloud_under_layer, cloud_uv_x,
-        cloud_uv_z, grid_cell, moon_uv, sky_depth_state, sky_vertex_layout, star_field,
-        sun_quad_vertices, void_box_low,
+        celestial_rotation, cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_layer_y,
+        cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv, sky_depth_state,
+        sky_vertex_layout, star_field, sun_quad_vertices, void_box_low,
     };
-    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
+    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
 
     #[test]
     fn the_sky_vertex_layout_matches_the_byte_stream() {
@@ -1871,6 +1894,55 @@ mod tests {
         };
         assert!(cloud_under_layer(&under));
         assert_eq!(under.eye().y, 127.62);
+    }
+
+    #[test]
+    fn the_cloud_gates_split_at_the_entity_eye_at_the_layers_height() {
+        // The source's two guards are exact complements around the layer's 128: the under-arm
+        // while `entity.posY + entity.getEyeHeight() < 128.0` (`EntityRenderer.java:1364`) and
+        // the at-or-above arm once it is `>= 128.0` (`:1474`). The basis is the entity eye —
+        // the reported feet position plus EYE_HEIGHT — not the first-person camera the view
+        // pulls a tenth of a block back along the view axis.
+        let at = |feet_y: f64, pitch: f32| Camera {
+            pose: CameraPose {
+                position: [0.5, feet_y, 0.5],
+                yaw: 0.0,
+                pitch,
+            },
+            fov_degrees: DEFAULT_FOV,
+            near: NEAR_PLANE,
+            far_chunks: 8.0,
+        };
+        // The wall pose's feet 57.0: eye 58.62, under the layer.
+        let wall = at(57.0, 0.0);
+        assert!(cloud_under_layer(&wall));
+        assert!(!cloud_at_or_above_layer(&wall));
+        // The acceptance's mark pose: feet 150.0, eye 151.62, at or above the layer.
+        let mark = at(150.0, 20.0);
+        assert!(!cloud_under_layer(&mark));
+        assert!(cloud_at_or_above_layer(&mark));
+        // The boundary itself: the feet height whose eye is exactly the layer's own 128
+        // (`128.0 - EYE_HEIGHT`, the f32 widening included), which the source's `>=` draws
+        // the at-or-above arm for; a hundredth lower is still under the layer.
+        let at_layer = at(128.0 - f64::from(EYE_HEIGHT), 0.0);
+        assert_eq!(at_layer.eye().y, 128.0, "the boundary pose's eye");
+        assert!(!cloud_under_layer(&at_layer));
+        assert!(cloud_at_or_above_layer(&at_layer));
+        let last_under = at(126.37, 0.0);
+        assert!(cloud_under_layer(&last_under));
+        assert!(!cloud_at_or_above_layer(&last_under));
+        // The basis discriminator: looking 89 degrees up pulls the first-person camera below
+        // the layer while the entity eye stands above it, so a gate reading the view's origin
+        // instead of the entity eye would answer "under" here.
+        let lifted = at(126.43, -89.0);
+        let origin = lifted.view().inverse().transform_point3(Vec3::ZERO);
+        assert!(
+            origin.y < 128.0,
+            "the view origin sits below the layer: {}",
+            origin.y
+        );
+        assert!(cloud_at_or_above_layer(&lifted));
+        assert!(!cloud_under_layer(&lifted));
     }
 
     #[test]

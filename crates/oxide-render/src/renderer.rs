@@ -13,9 +13,46 @@ use oxide_assets::texture::Texture;
 use crate::camera::Camera;
 use crate::fog::FogParams;
 use crate::overlay::OverlayPass;
-use crate::sky::{CloudPass, SkyParams, SkyPass, SkyTextures, cloud_under_layer};
+use crate::sky::{
+    CloudPass, SkyParams, SkyPass, SkyTextures, cloud_at_or_above_layer, cloud_under_layer,
+};
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
+
+/// One draw of the scene pass, in the order the source issues it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneDraw {
+    /// The sky pass, the frame's first draw (`EntityRenderer.java:1351-1354`).
+    Sky,
+    /// The cloud layer through the source's under-layer arm, before the terrain
+    /// (`EntityRenderer.java:1364-1367`).
+    CloudsUnder,
+    /// The terrain's layers, the translucent one last (`EntityRenderer.java:1385-1396`,
+    /// `:1460`).
+    Terrain,
+    /// The cloud layer through the source's at-or-above arm, after the translucent layer
+    /// (`EntityRenderer.java:1474-1478`).
+    CloudsAtOrAbove,
+}
+
+/// The scene pass's draws for a camera, in the order the source issues them.
+///
+/// The sky draws first (`EntityRenderer.java:1351-1354`), then the terrain's layers
+/// (`:1385-1396`). The cloud layer draws exactly once; the entity eye's height picks the arm
+/// and with it the cloud's place in the order — the under-arm before the terrain while the eye
+/// is under the layer (`:1364-1367`), the at-or-above arm after the translucent layer once it
+/// is at or above it (`:1474-1478`).
+fn scene_draws(camera: &Camera) -> Vec<SceneDraw> {
+    let mut draws = vec![SceneDraw::Sky];
+    if cloud_under_layer(camera) {
+        draws.push(SceneDraw::CloudsUnder);
+    }
+    draws.push(SceneDraw::Terrain);
+    if cloud_at_or_above_layer(camera) {
+        draws.push(SceneDraw::CloudsAtOrAbove);
+    }
+    draws
+}
 
 /// The sky colour the window is cleared to when the frame has no fog, as vanilla 1.8.9 clears
 /// it.
@@ -80,8 +117,12 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 ///
 /// [`Renderer::render`] clears the window to the frame's fog colour — the sky the terrain fades
 /// towards, so the two agree where the terrain ends — and the depth buffer to the far plane,
-/// draws the sky through the sky pass, the cloud layer while the eye is under it, the section
-/// meshes through the terrain pass and the debug overlay over them, then presents the frame.
+/// draws the sky through the sky pass, the cloud layer, the section meshes through the terrain
+/// pass and the debug overlay over them, then presents the frame. The cloud layer draws exactly
+/// once, and the entity eye's height places it: the source's under-arm before the terrain while
+/// the eye is under the layer (`EntityRenderer.java:1364-1367`) and its at-or-above arm after
+/// the translucent layer once the eye is at or above it (`:1474-1478`); [`scene_draws`] is the
+/// order.
 /// Until [`Renderer::set_fog`] gives a frame its fog, the clear is [`SKY_COLOR`], and until
 /// [`Renderer::set_sky`] gives it its sky only the clear colour stands in for it. A frame
 /// with no camera set draws no terrain, sky or clouds — and neither does one with no atlas: the
@@ -379,11 +420,13 @@ impl Renderer {
     ///
     /// The colour and depth attachments are cleared in the frame's single scene pass: the colour
     /// to the frame's fog colour, so the sky behind the terrain is the colour the terrain fades
-    /// to, and the depth to the far plane. The sky pass draws first over that clear, then the
-    /// cloud layer while the camera's eye is under it, then every section mesh the frame's
-    /// frustum keeps when a camera and an atlas have both been set; the overlay pass then draws
-    /// the debug lines over the result, in a pass without a depth attachment, so no terrain can
-    /// hide the text.
+    /// to, and the depth to the far plane. The sky pass draws first over that clear, then every
+    /// section mesh the frame's frustum keeps when a camera and an atlas have both been set, and
+    /// the cloud layer once — through the source's under-layer arm before the terrain while the
+    /// entity eye is under the layer, or through its at-or-above arm after the terrain once the
+    /// eye is at or above it (`EntityRenderer.java:1364-1367`, `:1474-1478`; [`scene_draws`]).
+    /// The overlay pass then draws the debug lines over the result, in a pass without a depth
+    /// attachment, so no terrain can hide the text.
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
@@ -428,11 +471,15 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             if let Some(camera) = self.camera {
-                self.sky.draw(&mut pass);
-                if cloud_under_layer(&camera) {
-                    self.cloud.draw(&mut pass);
+                for draw in scene_draws(&camera) {
+                    match draw {
+                        SceneDraw::Sky => self.sky.draw(&mut pass),
+                        SceneDraw::CloudsUnder | SceneDraw::CloudsAtOrAbove => {
+                            self.cloud.draw(&mut pass);
+                        }
+                        SceneDraw::Terrain => self.terrain.draw(&mut pass),
+                    }
                 }
-                self.terrain.draw(&mut pass);
             }
         }
         {
@@ -554,8 +601,48 @@ mod tests {
 
     use wgpu::SurfaceError;
 
-    use super::{SKY_COLOR, SurfaceAction, block_on, classify_surface_error, clear_colour};
+    use super::{
+        SKY_COLOR, SceneDraw, SurfaceAction, block_on, classify_surface_error, clear_colour,
+        scene_draws,
+    };
+    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
     use crate::fog::{FogParams, fog_colour};
+
+    /// A camera at `feet_y` with no facing, for the scene order's own tests.
+    fn scene_camera(feet_y: f64) -> Camera {
+        Camera {
+            pose: CameraPose {
+                position: [0.5, feet_y, 0.5],
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            fov_degrees: DEFAULT_FOV,
+            near: NEAR_PLANE,
+            far_chunks: 8.0,
+        }
+    }
+
+    #[test]
+    fn the_scene_pass_draws_the_cloud_arm_the_entity_eye_selects() {
+        // The source draws the cloud layer twice and gates each arm on the entity eye
+        // (`entity.posY + entity.getEyeHeight()`): the under-arm before the terrain while the
+        // eye is under the layer (`EntityRenderer.java:1364-1367`) and the at-or-above arm
+        // after the translucent layer once the eye is at or above it (`:1474-1478`). The
+        // acceptance's mark pose stands at feet 150.0 — eye 151.62 — so its frame carries the
+        // second arm; the wall pose's feet 57.0 leaves the eye under the layer.
+        assert_eq!(
+            scene_draws(&scene_camera(57.0)),
+            [SceneDraw::Sky, SceneDraw::CloudsUnder, SceneDraw::Terrain]
+        );
+        assert_eq!(
+            scene_draws(&scene_camera(150.0)),
+            [
+                SceneDraw::Sky,
+                SceneDraw::Terrain,
+                SceneDraw::CloudsAtOrAbove
+            ]
+        );
+    }
 
     #[test]
     fn block_on_returns_the_output_of_a_ready_future() {

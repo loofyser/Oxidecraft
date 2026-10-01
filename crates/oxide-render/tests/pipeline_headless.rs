@@ -56,7 +56,9 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
 use oxide_assets::texture::Texture;
-use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
+use oxide_render::camera::{
+    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE,
+};
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
@@ -735,7 +737,7 @@ fn the_frames_fog_measures_the_radial_distance_from_the_eye() {
     // `sqrt(2.5^2 + 4^2) = 4.717` — past the halfway mark radially, while its planar depth of
     // four would read the exact half mix. The expected bytes below are the radial mix of the
     // lit `(252, 252, 252)` surface into the dusk fog colour `(102, 114, 139)`; the planar mix
-    // would be `(177, 183, 196)`, twenty to twenty-seven bytes away.
+    // reads `(177, 183, 195)`, twenty to twenty-seven bytes away.
     let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
     let fog = FogParams {
         colour,
@@ -761,7 +763,7 @@ fn the_frames_fog_measures_the_radial_distance_from_the_eye() {
         &frame,
         60,
         SIZE / 2,
-        [150, 158, 175],
+        [150, 159, 175],
         "the off-axis surface at the eye's radial distance",
     );
 }
@@ -970,6 +972,60 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         SIZE / 2,
         unorm_bytes(mixed),
         "the fogged below-horizon plane",
+    );
+
+    // The off-axis sample: the near-vertical one above sits where the eye-radial measure and a
+    // planar one agree, so it cannot tell them apart. This one is 30 degrees off the view axis,
+    // where they part: the below-horizon plane's grid corner under the eye, 40.33 blocks away,
+    // would read ten bytes darker per channel under an eye-space-depth measure. The camera
+    // stands high enough that the plane's drop below the eye is 40 blocks, and the celestial
+    // frame is turned a quarter turn so the sun and the moon are on the horizon, clear of a
+    // camera looking down.
+    let high = 100.0f32;
+    let down = 59.66f32;
+    let lateral = SkyParams {
+        celestial_angle: 0.25,
+        sky_colour: below_sky,
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        fog_colour: [1.0, 1.0, 1.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    let camera = sky_camera(f64::from(high), 0.0, down, DEFAULT_FOV);
+    let pixels = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: lateral,
+            camera,
+            clear: below_sky,
+            clouds: false,
+        },
+    );
+    // The corner of the plane's own grid that sits under the eye, in the pass's local frame:
+    // the grid's origin, lifted to `-(eyeY - HORIZON)` (`RenderGlobal.java:1404`). Its straight
+    // line from the eye the view is built with is the fog's measure.
+    let eye = Vec3::new(0.0, EYE_HEIGHT, 0.0) - FIRST_PERSON_OFFSET * camera.forward();
+    let plane_y = -((f64::from(high) + f64::from(EYE_HEIGHT)) - f64::from(HORIZON));
+    let distance = (Vec3::new(0.0, plane_y as f32, 0.0) - eye).length();
+    let factor = ((lateral.far_plane - distance) / lateral.far_plane).clamp(0.0, 1.0);
+    let mixed = std::array::from_fn(|channel| {
+        lateral.fog_colour[channel] + (below_colour[channel] - lateral.fog_colour[channel]) * factor
+    });
+    // The corner sits straight under the eye, so it projects onto the frame's centre column;
+    // the pitch puts it 30.34 degrees below the view axis, which is
+    // `tan(30.34 deg) / tan(35 deg) = 0.836` of the half-height below the centre, i.e. row 58.
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        58,
+        unorm_bytes(mixed),
+        "the off-axis below-horizon plane at the eye's radial distance",
     );
 
     // The cloud layer blended over the band: a white texel at the source's 0.8 alpha over the
