@@ -112,6 +112,45 @@ pub fn light_at(world: &World, x: i32, y: i32, z: i32) -> u8 {
         .max(chunk.block_light_at(lx, y, lz))
 }
 
+/// The light level a render-view position's brightness is read from: the level
+/// `World.getLightBrightness` (`World.java:845-848`) looks up in the provider's table.
+///
+/// The level is `World.getLightFromNeighbors`'s (`:621-624`), the combined light of
+/// `World.getLight` (`:626-679`). The neighbour-brightness term (`:630-657`) fires only for a
+/// block whose `getUseNeighborBrightness` is true, which nothing in the decompiled tree
+/// registers; the direct rule is the whole rule here: a y below zero answers zero (`:658-661`),
+/// a y at or above the build height reads the topmost cell (`:662-670`), and the cell's own
+/// value is the sky kind's nibble against the block kind's, greater one wins
+/// (`Chunk.getLightSubtracted`, `Chunk.java:818-841`, with the day-night sky subtraction at
+/// zero for the noon clock the acceptance captured).
+///
+/// A position no column holds answers the sky kind's default of 15
+/// (`World.getLightFor`, `World.java:789-803`, `EnumSkyBlock.SKY` at `EnumSkyBlock.java:5-12`),
+/// which is also what a held column answers where it carries no section
+/// (`Chunk.getLightSubtracted`'s absent-array arm, `Chunk.java:825-828`) — our store keeps the
+/// two apart and both answer 15 at noon.
+pub fn view_light_level(world: &World, x: i32, y: i32, z: i32) -> u8 {
+    let y = if y >= HEIGHT as i32 {
+        HEIGHT as i32 - 1
+    } else {
+        y
+    };
+    if y < 0 {
+        return 0;
+    }
+    let cx = x.div_euclid(SECTION_SIZE as i32);
+    let cz = z.div_euclid(SECTION_SIZE as i32);
+    let Some(chunk) = world.chunk(cx, cz) else {
+        return 15;
+    };
+    let lx = x.rem_euclid(SECTION_SIZE as i32) as usize;
+    let lz = z.rem_euclid(SECTION_SIZE as i32) as usize;
+    let y = y as usize;
+    chunk
+        .sky_light_at(lx, y, lz)
+        .max(chunk.block_light_at(lx, y, lz))
+}
+
 /// Recomputes both light kinds from scratch over the changed chunk column and
 /// its eight neighbours, full height.
 ///

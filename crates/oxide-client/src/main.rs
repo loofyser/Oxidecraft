@@ -181,27 +181,41 @@ struct SkyValues {
     cloud_colour: [f32; 3],
     /// The moon's phase in `0..8`.
     moon_phase: u8,
+    /// The light level at the view block, `0..15`: the chain's brightness factor reads it
+    /// (`EntityRenderer.java:362`).
+    light_level: u8,
 }
 
 /// The fog and the sky one frame draws with, from the session's clock and sky and the client's
 /// own frame state.
 ///
-/// The session owns the world, so the five world-derived values and the moon's phase come from
+/// The session owns the world, so the six world-derived values and the moon's phase come from
 /// its `Sky` event; the fog colour, the far plane and the cloud counter are the client's own.
 /// The far plane is the render distance in blocks — the source's `farPlaneDistance`, which the
 /// sky pass doubles and the cloud pass quadruples — and the fog's range comes from
-/// [`linear_params`] of it.
+/// [`linear_params`] of it. The render distance's chunk count also feeds the fog colour's sky
+/// mix and brightness factor (`EntityRenderer.java:1767-1768`, `:363-364`), so it travels
+/// alongside the far plane it derives rather than being recovered from it.
 fn frame_params(
     time_of_day: i64,
     dimension: i8,
     eye_y: f64,
     void_y_factor: f32,
-    far_plane: f32,
+    render_distance: u8,
     values: SkyValues,
     cloud_ticks: i64,
 ) -> (FogParams, SkyParams) {
+    let far_plane = f32::from(render_distance) * 16.0;
     let (start, end) = linear_params(far_plane);
-    let colour = fog_colour(dimension, time_of_day as f32, eye_y, void_y_factor);
+    let colour = fog_colour(
+        dimension,
+        time_of_day as f32,
+        eye_y,
+        void_y_factor,
+        values.colour,
+        render_distance,
+        values.light_level,
+    );
     let fog = FogParams {
         colour,
         start,
@@ -337,7 +351,7 @@ impl ClientApp {
                     self.hud.dimension,
                     self.hud.position[1],
                     self.sky.void_y_factor,
-                    self.render_distance as f32 * 16.0,
+                    self.render_distance,
                     values,
                     self.cloud_ticks,
                 );
@@ -516,6 +530,7 @@ fn apply_session_event(
             star_brightness,
             cloud_colour,
             moon_phase,
+            light_level,
         } => {
             // The terrain lightmap follows the clock's own sun brightness.
             renderer.set_lightmap(sun_brightness);
@@ -526,6 +541,7 @@ fn apply_session_event(
                 star_brightness,
                 cloud_colour,
                 moon_phase,
+                light_level,
             });
             false
         }
@@ -815,12 +831,18 @@ mod tests {
             star_brightness: 0.1,
             cloud_colour: [1.0, 0.5, 0.25],
             moon_phase: 5,
+            light_level: 15,
         };
-        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 128.0, values, 7);
-        // The Overworld's noon fog at the eye on the ground is the provider's base itself
-        // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`), and the range is the
-        // terrain's own for the eight-chunk far plane (`EntityRenderer.java:2014-2015`).
-        assert_eq!(fog.colour, [0.7529412, 0.84705883, 1.0]);
+        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7);
+        // The Overworld's noon fog at the eye on the ground starts from the provider's base
+        // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`) and takes the render
+        // distance's sky mix: 0.186711... of the way to the frame's own sky colour
+        // (`EntityRenderer.java:1767-1768`, `:1803-1805`), with a full-light block leaving the
+        // brightness factor at one (`:363-364`). The bytes are the frame's readout.
+        assert_eq!(
+            fog.colour.map(|channel| (channel * 255.0).round() as u8),
+            [180, 204, 241]
+        );
         assert_eq!((fog.start, fog.end, fog.far_plane), (96.0, 128.0, 128.0));
         assert_eq!(sky.celestial_angle, 0.25);
         assert_eq!(sky.sky_colour, [0.5, 0.6, 0.7]);

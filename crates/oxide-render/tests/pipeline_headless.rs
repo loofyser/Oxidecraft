@@ -637,14 +637,35 @@ fn unorm_bytes(colour: [f32; 3]) -> [u8; 3] {
     [channel(0), channel(1), channel(2)]
 }
 
+/// A small quad, a fifth of a block across, centred `depth` blocks ahead of the frame's eye and
+/// `x` blocks to its right. The eye the camera's own view uses sits a tenth of a block behind
+/// the origin (`crate::camera::FIRST_PERSON_OFFSET`), so the quad's plane is placed at
+/// `-(depth - 0.1)`: `depth` is the eye-space depth the source's planar measure would read, and
+/// the radial measure reads `sqrt(x^2 + depth^2)` on it. The sampled pixel sits within a couple
+/// of hundredths of a block of the quad's centre, so either measure reads the centre's own
+/// distance there.
+fn flat_quad(depth: f32, x: f32) -> [([f32; 3], [f32; 2]); 4] {
+    let z = -(depth - 0.1);
+    let [x0, x1] = [x - 0.1, x + 0.1];
+    [
+        ([x0, -0.1, z], [0.0, 1.0]),
+        ([x1, -0.1, z], [1.0, 1.0]),
+        ([x1, 0.1, z], [1.0, 0.0]),
+        ([x0, 0.1, z], [0.0, 0.0]),
+    ]
+}
+
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn the_frames_fog_fades_the_terrain_towards_its_colour() {
     // The Overworld's colour at dusk, and a frame whose fade starts two units from the eye and
     // reaches full strength at six. A quad at each distance shows the three states of the mix:
     // at the start the surface keeps its whole colour, at the end it is the fog colour, and
-    // between them it is the two mixed — `clamp((end - depth) / (end - start), 0, 1)`.
-    let colour = fog_colour(0, 14000.0, 64.0, 0.03125);
+    // between them it is the two mixed — `clamp((end - depth) / (end - start), 0, 1)`. The
+    // render distance sits at its thirty-two-chunk maximum so the colour is the dusk base
+    // itself, with no sky mix or brightness factor in the way (`EntityRenderer.java:1767-1768`,
+    // `:363-364`).
+    let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
     let fog = FogParams {
         colour,
         start: 2.0,
@@ -656,12 +677,7 @@ fn the_frames_fog_fades_the_terrain_towards_its_colour() {
 
     let frame = |depth: f32| -> Vec<u8> {
         let mut mesh = ChunkMesh::default();
-        push_quad(
-            &mut mesh,
-            Layer::Opaque,
-            covering_quad(depth, [[0.0, 0.0], [1.0, 1.0]]),
-            WHITE,
-        );
+        push_quad(&mut mesh, Layer::Opaque, flat_quad(depth, 0.0), WHITE);
         render_terrain_with_fog(
             &device,
             &queue,
@@ -704,6 +720,49 @@ fn the_frames_fog_fades_the_terrain_towards_its_colour() {
         SIZE / 2,
         unorm_bytes(mixed),
         "the surface halfway through the fade",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_frames_fog_measures_the_radial_distance_from_the_eye() {
+    // The source asks the driver for the eye-radial fog distance whenever the context carries
+    // `GL_NV_fog_distance` (`GL11.glFogi(GL_FOG_DISTANCE_MODE_NV, GL_EYE_RADIAL_NV)`,
+    // `EntityRenderer.java:2018-2021`; the rig's NVIDIA driver has it), so a fragment's distance
+    // is the straight line from the eye, not the eye-space depth a planar measure would use.
+    // The two part company off the view axis: this frame's fog runs from two units to six, and a
+    // fragment four units ahead of the eye and two and a half to the side sits at
+    // `sqrt(2.5^2 + 4^2) = 4.717` — past the halfway mark radially, while its planar depth of
+    // four would read the exact half mix. The expected bytes below are the radial mix of the
+    // lit `(252, 252, 252)` surface into the dusk fog colour `(102, 114, 139)`; the planar mix
+    // would be `(177, 183, 196)`, twenty to twenty-seven bytes away.
+    let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
+    let fog = FogParams {
+        colour,
+        start: 2.0,
+        end: 6.0,
+        far_plane: 8.0,
+    };
+    let (device, queue) = headless_device();
+    let mut mesh = ChunkMesh::default();
+    // The lateral quad, centred two and a half blocks to the right of the axis at four blocks'
+    // eye-space depth.
+    push_quad(&mut mesh, Layer::Opaque, flat_quad(4.0, 2.5), WHITE);
+    let frame = render_terrain_with_fog(
+        &device,
+        &queue,
+        &solid_atlas(4, [255, 255, 255, 255]),
+        &mesh,
+        Some(fog),
+    );
+    // The quad's centre projects to pixel x 60.6 at this fov (`x / depth / tan(35°)` with the
+    // eye's own offset folded into the plane), and the fragment there reads the radial mix.
+    expect_pixel(
+        &frame,
+        60,
+        SIZE / 2,
+        [150, 158, 175],
+        "the off-axis surface at the eye's radial distance",
     );
 }
 
@@ -862,10 +921,12 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         );
     }
 
-    // The under-horizon plane is fogged under the sky's own range: looking 45 degrees down at
-    // it, the fragment is the plane's darkened colour mixed towards the fog colour. The depth
-    // is the geometry's — the plane sits `d0 + EYE_HEIGHT` below the camera, so the planar
-    // depth is that drop over sin(45) — and the mix is the shader's own linear one.
+    // The under-horizon plane is fogged under the sky's own range: looking down at it, the
+    // fragment is the plane's darkened colour mixed towards the fog colour, the ray length
+    // being the plane's drop below the camera over sin(89 deg). The camera looks almost
+    // straight down, so the sample lands on a corner of the sky grid under the eye — a vertex
+    // of the grid — where the vertex-distance varying interpolates to the vertex's own value
+    // and the mix therefore reads the exact ray length.
     let below_sky = [0.0f32, 0.0, 0.0];
     let below = SkyParams {
         celestial_angle: 0.0,
@@ -879,7 +940,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         moon_phase: 0,
     };
     let feet = 65.0f32;
-    let pitch = 45.0f32;
+    let pitch = 89.0f32;
     let pixels = render_sky(
         &device,
         &queue,

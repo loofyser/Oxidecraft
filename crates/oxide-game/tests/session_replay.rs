@@ -364,6 +364,8 @@ struct SkyReport {
     cloud_colour: [f32; 3],
     /// The moon's phase.
     moon_phase: u8,
+    /// The view block's light level, which the fog colour's brightness factor reads.
+    light_level: u8,
 }
 
 /// The section slots of the first `ChunkUpdated` for a column, panicking when
@@ -1266,6 +1268,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
                 star_brightness,
                 cloud_colour,
                 moon_phase,
+                light_level,
             } => Some(SkyReport {
                 celestial_angle: *celestial_angle,
                 colour: *colour,
@@ -1273,6 +1276,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
                 star_brightness: *star_brightness,
                 cloud_colour: *cloud_colour,
                 moon_phase: *moon_phase,
+                light_level: *light_level,
             }),
             _ => None,
         })
@@ -1287,6 +1291,9 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
         star_brightness: 0.0,
         cloud_colour: [1.0, 1.0, 1.0],
         moon_phase: 0,
+        // The script's column carries full sky light at the view block, the value the fog's
+        // brightness factor reads as one.
+        light_level: 15,
     };
     assert_eq!(
         skies,
@@ -1304,6 +1311,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
                 star_brightness: 0.0,
                 cloud_colour: [1.0, 1.0, 1.0],
                 moon_phase: 3,
+                light_level: 15,
             },
         ],
         "the sky colour follows the clock and the biome under the player"
@@ -1377,6 +1385,7 @@ fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
                 star_brightness,
                 cloud_colour,
                 moon_phase,
+                light_level,
             } => Some(SkyReport {
                 celestial_angle: *celestial_angle,
                 colour: *colour,
@@ -1384,6 +1393,7 @@ fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
                 star_brightness: *star_brightness,
                 cloud_colour: *cloud_colour,
                 moon_phase: *moon_phase,
+                light_level: *light_level,
             }),
             _ => None,
         })

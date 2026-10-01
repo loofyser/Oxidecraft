@@ -569,9 +569,10 @@ mod tests {
 
     #[test]
     fn a_frame_with_a_fog_clears_to_the_fogs_own_colour() {
-        // The Overworld's colour at noon and the eye on the ground: the base exactly, as
-        // `World.getFogColor` hands it over (`fog_colour`'s own test pins the value).
-        let colour = fog_colour(0, 6000.0, 64.0, 0.03125);
+        // The Overworld's colour at noon, the eye on the ground and the render distance at its
+        // thirty-two-chunk maximum, where the sky mix contributes nothing and the full-light
+        // brightness factor is one (`fog_colour`'s own tests pin the steps).
+        let colour = fog_colour(0, 6000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
         let clear = clear_colour(Some(FogParams {
             colour,
             start: 24.0,

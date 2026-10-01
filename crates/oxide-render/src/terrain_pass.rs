@@ -49,12 +49,14 @@
 //! carry, in its non-sRGB colour space (`docs/DIVERGENCES.md` records the policy). The same
 //! stage then fades the result towards the frame's fog colour
 //! ([`crate::fog::FogParams`]) over the distance from the eye:
-//! `clamp((end - depth) / (end - start), 0, 1)` mixed in, with `depth` the fragment's
-//! eye-space depth. That distance is the fixed-function fog's planar default; the source asks
-//! the driver for radial distance when `GL_NV_fog_distance` is present
-//! (`EntityRenderer.java:2018-2021`), which the acceptance rig checks rather than this pass.
-//! A frame that has set no fog draws unfogged: the pass starts with a range that does not run
-//! forwards, and such a range cannot fog anything.
+//! `clamp((end - distance) / (end - start), 0, 1)` mixed in, with `distance` the straight-line
+//! distance from the eye to the fragment. The source's fog is radial whenever the context
+//! carries `GL_NV_fog_distance` — the terrain arm asks the driver for
+//! `GL_FOG_DISTANCE_MODE_NV` = `GL_EYE_RADIAL_NV` (`EntityRenderer.java:2018-2021`), and the
+//! acceptance rig's NVIDIA driver has it — so the varying is the radial distance, not the
+//! eye-space depth the perspective divide's denominator carries. A frame that has set no fog
+//! draws unfogged: the pass starts with a range that does not run forwards, and such a range
+//! cannot fog anything.
 //!
 //! Nothing draws until both a camera and an atlas have been set: the pipelines bind the atlas
 //! at group 1 and sample it in every layer, so a draw without one would be a validation error
@@ -66,7 +68,7 @@ use std::collections::HashMap;
 use glam::{Mat4, Vec3};
 
 use crate::atlas_texture::AtlasTexture;
-use crate::camera::Camera;
+use crate::camera::{Camera, FIRST_PERSON_OFFSET};
 use crate::fog::FogParams;
 use crate::frustum::{Aabb3, Frustum};
 use crate::lightmap::{BrightnessTable, lightmap_image};
@@ -90,6 +92,8 @@ fn shader_source() -> String {
         r#"
 struct Camera {{
     view_projection: mat4x4<f32>,
+    // x, y, z: the eye's world position; the fourth component is unused.
+    eye: vec4<f32>,
 }};
 
 // The frame's fog: the colour the terrain fades to and the range it fades over — the distance
@@ -123,16 +127,16 @@ struct VertexOutput {{
     @location(0) uv: vec2<f32>,
     @location(1) light: vec2<f32>,
     @location(2) colour: vec4<f32>,
-    @location(3) depth: f32,
-}};
+    @location(3) distance: f32,
+}}
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {{
     var output: VertexOutput;
     output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
-    // The perspective divide's denominator is the eye-space depth of the vertex, so the
-    // interpolated varying is the fragment's own depth: the distance the fog is measured over.
-    output.depth = output.clip_position.w;
+    // The interpolated varying is the vertex's own distance from the eye — the fog's radial
+    // measure, the straight line the source's `GL_EYE_RADIAL_NV` mode uses.
+    output.distance = length(input.position - camera.eye.xyz);
     output.uv = input.uv;
     output.light = vec2<f32>(f32(input.light.x), f32(input.light.y));
     output.colour = input.colour;
@@ -142,34 +146,34 @@ fn vs_main(input: VertexInput) -> VertexOutput {{
 // The client's block fragment: the atlas texel times the vertex colour times the lightmap's
 // texel, then the fog mix. The lightmap's own alpha is one, so the fragment's alpha comes from
 // the atlas and the vertex colour alone.
-fn shade(uv: vec2<f32>, light: vec2<f32>, colour: vec4<f32>, depth: f32) -> vec4<f32> {{
+fn shade(uv: vec2<f32>, light: vec2<f32>, colour: vec4<f32>, distance: f32) -> vec4<f32> {{
     let texel = textureSample(atlas, atlas_sampler, uv)
         * colour
         * textureSample(lightmap, lightmap_sampler, light / 256.0);
-    return fogged(texel, depth);
+    return fogged(texel, distance);
 }}
 
 // The linear fog: the factor is one at the fade's start and zero at its end, and the colour is
 // mixed towards the fog colour as the source's fixed-function fog does — the alpha is left as
-// the fragment wrote it. A range that does not run forwards leaves the colour alone: that is
-// the state a frame with no fog set draws in.
-fn fogged(colour: vec4<f32>, depth: f32) -> vec4<f32> {{
+// the fragment wrote it. The distance is the eye's radial one. A range that does not run
+// forwards leaves the colour alone: that is the state a frame with no fog set draws in.
+fn fogged(colour: vec4<f32>, distance: f32) -> vec4<f32> {{
     let span = fog.params.y - fog.params.x;
     if (span <= 0.0) {{
         return colour;
     }}
-    let factor = clamp((fog.params.y - depth) / span, 0.0, 1.0);
+    let factor = clamp((fog.params.y - distance) / span, 0.0, 1.0);
     return vec4<f32>(mix(fog.colour.rgb, colour.rgb, factor), colour.a);
 }}
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {{
-    return shade(input.uv, input.light, input.colour, input.depth);
+    return shade(input.uv, input.light, input.colour, input.distance);
 }}
 
 @fragment
 fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {{
-    let colour = shade(input.uv, input.light, input.colour, input.depth);
+    let colour = shade(input.uv, input.light, input.colour, input.distance);
     if (colour.a < CUTOUT_ALPHA) {{
         discard;
     }}
@@ -201,8 +205,8 @@ const CUTOUT_ALPHA: f32 = 0.1;
 /// plane to depth 1, as [`wgpu::CompareFunction::Less`] over a 0..1 range expects.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// The size of the camera uniform in bytes: one `mat4x4<f32>`.
-const CAMERA_BYTES: usize = 64;
+/// The size of the camera uniform in bytes: one `mat4x4<f32>` and the eye's `vec4<f32>`.
+const CAMERA_BYTES: usize = 64 + 16;
 
 /// The binding the fog uniform occupies in group 0, next to the camera as the frame's other
 /// uniform.
@@ -563,15 +567,20 @@ impl TerrainPass {
         self.atlas_bind_group = Some(bind_group);
     }
 
-    /// Writes the camera's view-projection matrix and derives the frame's cull state.
+    /// Writes the camera's view-projection matrix and the eye's position, and derives the
+    /// frame's cull state.
     ///
-    /// The matrix reaches the shader as it is; nothing is transformed on the CPU. The renderer
-    /// calls this once per frame with the surface's current aspect ratio, so a resize cannot
-    /// leave a stale projection behind, and the frustum and the eye position derived here are
-    /// what the next [`TerrainPass::draw`] culls and orders with.
+    /// The matrix reaches the shader as it is; nothing is transformed on the CPU. The eye's
+    /// position is what the shader measures the fog's radial distance from
+    /// (`GL_EYE_RADIAL_NV`). The renderer calls this once per frame with the surface's current
+    /// aspect ratio, so a resize cannot leave a stale projection behind, and the frustum and the
+    /// eye position derived here are what the next [`TerrainPass::draw`] culls and orders with.
     pub fn set_camera(&mut self, queue: &wgpu::Queue, camera: Camera, aspect: f32) {
         let view_projection = camera.view_projection(aspect);
-        queue.write_buffer(&self.camera_buffer, 0, &matrix_bytes(view_projection));
+        // The shader measures the fog's radial distance from the eye the view is built with:
+        // the camera's eye less the first-person offset (`crate::camera::FIRST_PERSON_OFFSET`).
+        let eye = camera.eye() - FIRST_PERSON_OFFSET * camera.forward();
+        queue.write_buffer(&self.camera_buffer, 0, &camera_bytes(view_projection, eye));
         self.frame = Some(FrameState {
             frustum: Frustum::from_view_projection(view_projection),
             eye: camera.eye(),
@@ -798,14 +807,20 @@ fn color_target(
     })
 }
 
-/// Packs a matrix into the 64 little-endian bytes of a WGSL `mat4x4<f32>`.
+/// Packs a matrix and an eye position into the little-endian bytes of the shader's camera
+/// uniform.
 ///
 /// WGSL lays a uniform matrix out as four columns of four `f32`, which is the order
-/// [`Mat4::to_cols_array`] returns, so the components go out as they are.
-fn matrix_bytes(matrix: Mat4) -> [u8; CAMERA_BYTES] {
+/// [`Mat4::to_cols_array`] returns, so the components go out as they are; the eye follows as a
+/// `vec4` whose first three components are its position and whose fourth is unused.
+fn camera_bytes(matrix: Mat4, eye: Vec3) -> [u8; CAMERA_BYTES] {
     let mut bytes = [0u8; CAMERA_BYTES];
     for (index, component) in matrix.to_cols_array().iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&component.to_le_bytes());
+    }
+    for (index, component) in [eye.x, eye.y, eye.z, 0.0].iter().enumerate() {
+        let offset = 64 + index * 4;
+        bytes[offset..offset + 4].copy_from_slice(&component.to_le_bytes());
     }
     bytes
 }
@@ -1072,7 +1087,7 @@ mod tests {
         // colour and the lightmap texel — and the discarding one tests the alpha it returns.
         assert_eq!(
             shader
-                .matches("shade(input.uv, input.light, input.colour, input.depth)")
+                .matches("shade(input.uv, input.light, input.colour, input.distance)")
                 .count(),
             2,
             "both entries run the shared shade"

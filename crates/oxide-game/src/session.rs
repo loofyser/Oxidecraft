@@ -46,6 +46,7 @@ use oxide_proto_v47::serverbound::{
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
 use oxide_world::biome::{ColorMap, TintMaps};
+use oxide_world::light::view_light_level;
 use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
 };
@@ -253,6 +254,10 @@ pub enum ClientEvent {
         cloud_colour: [f32; 3],
         /// The moon's phase in `0..8`, from the world time.
         moon_phase: u8,
+        /// The light level at the view block, 0..15: the fog colour's brightness factor reads
+        /// it (`EntityRenderer.java:362`), and the client's renderer builds the table
+        /// (`oxide-world`'s `light::view_light_level`).
+        light_level: u8,
     },
     /// A column's meshes were (re)built; `None` means the section now draws
     /// nothing.
@@ -828,10 +833,12 @@ fn received_time_of_day(time_of_day: i64) -> i64 {
 /// Reports the sky the clock and the view block produce, when both are known.
 ///
 /// The angle and the colours come from the world clock; the block is the render-view entity's
-/// own, floored exactly as `World.getSkyColor` floors it (`World.java:1437-1443`). M2 has no
-/// client tick loop, so the partial tick is zero, and no weather is decoded, so the rain
-/// strength is zero; both are recorded in the module docs and the report. A session with no
-/// clock yet — or no world, as before Join Game — has no sky to report.
+/// own, floored exactly as `World.getSkyColor` floors it (`World.java:1437-1443`), and the
+/// light level is that same block's (`EntityRenderer.java:362` reads
+/// `World.getLightBrightness(new BlockPos(viewEntity))`). M2 has no client tick loop, so the
+/// partial tick is zero, and no weather is decoded, so the rain strength is zero; both are
+/// recorded in the module docs and the report. A session with no clock yet — or no world, as
+/// before Join Game — has no sky to report.
 fn report_sky(
     world: Option<&World>,
     position: Position,
@@ -846,13 +853,13 @@ fn report_sky(
     /// No weather packets are decoded yet, so the rain strength is zero.
     const RAIN_STRENGTH: f32 = 0.0;
     let angle = celestial_angle(time_of_day, PARTIAL_TICKS);
-    let colour = sky_colour(
-        world,
-        position.x.floor() as i32,
-        position.y.floor() as i32,
-        position.z.floor() as i32,
-        angle,
-    );
+    let x = position.x.floor() as i32;
+    let y = position.y.floor() as i32;
+    let z = position.z.floor() as i32;
+    let colour = sky_colour(world, x, y, z, angle);
+    // The fog's brightness factor reads the view block's own light, with the source's
+    // defaults for a position no column holds (`EntityRenderer.java:362-365`).
+    let light_level = view_light_level(world, x, y, z);
     report(
         events,
         ClientEvent::Sky {
@@ -863,6 +870,7 @@ fn report_sky(
             cloud_colour: cloud_colour(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
             // `moon_phase` answers `0..8`, so the narrowing cannot lose a case.
             moon_phase: moon_phase(time_of_day) as u8,
+            light_level,
         },
     );
 }

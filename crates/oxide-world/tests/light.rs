@@ -27,7 +27,7 @@
 
 use oxide_proto_v47::column::{ColumnData, SectionData, block_index};
 use oxide_world::chunk::{Chunk, SECTION_COUNT, SECTION_SIZE, Section};
-use oxide_world::light::{light_at, recompute, recompute_column};
+use oxide_world::light::{light_at, recompute, recompute_column, view_light_level};
 use oxide_world::world::World;
 
 /// Air.
@@ -996,4 +996,68 @@ fn the_chunk_setter_is_a_no_op_without_the_section() {
     chunk.set_sky_light(0, 0, 0, 5);
     assert_eq!(chunk.block_light_at(0, 0, 0), 0, "nowhere to store it");
     assert_eq!(chunk.sky_light_at(0, 0, 0), 15, "and nothing changed");
+}
+
+// ---------------------------------------------------------------------------
+// The view block's level.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_view_level_is_the_greater_kind_at_the_cell() {
+    // The acceptance's ground pose stands at (15, 71, 178), whose sky nibble is 8 and whose
+    // block nibble is zero: the level `World.getLightBrightness` reads there is 8
+    // (`World.java:626-679` against `Chunk.getLightSubtracted`, `Chunk.java:831-840`). The
+    // fixture holds the chunks around the origin only, so the probe uses the held cell
+    // (15, 71, 8), which carries the same nibble pair.
+    let world = world_of(3, |_, _| column_of(0, 8, |_, _, _| AIR));
+    assert_eq!(view_light_level(&world, 15, 71, 8), 8);
+    // Block light wins when it is greater: a torch's 14 over a sky's 8.
+    let lit = world_of(3, |_, _| column_of(14, 8, |_, _, _| AIR));
+    assert_eq!(view_light_level(&lit, 15, 71, 8), 14);
+}
+
+#[test]
+fn the_view_level_falls_back_to_the_sky_default_off_the_loaded_area() {
+    // A position no column holds answers the sky kind's default of 15
+    // (`World.getLightFor`, `World.java:789-803`), not zero: the fog's brightness factor must
+    // not read an unloaded column as a dark one. The fixture holds the chunks around the
+    // origin only, so the held probe sits at (15, 71, 8).
+    let world = world_of(1, |_, _| column_of(0, 4, |_, _, _| AIR));
+    assert_eq!(view_light_level(&world, 15, 71, 8), 4, "inside the column");
+    assert_eq!(
+        view_light_level(&world, 150, 71, 178),
+        15,
+        "ten columns out, nothing is held"
+    );
+}
+
+#[test]
+fn the_view_level_clamps_the_build_height_and_the_floor() {
+    // `World.getLight`'s own guards (`World.java:604-624`, `:658-670`): a y at or above the
+    // build height reads the topmost cell, and a y below zero answers zero. The topmost
+    // section carries a different nibble so the clamp is falsifiable.
+    let mut data = ColumnData::empty();
+    for section in 0..SECTION_COUNT - 1 {
+        data.sections[section] = Some(section_of(true, 0, 5, |_, _, _| AIR));
+        data.mask |= 1u16 << section;
+    }
+    data.sections[SECTION_COUNT - 1] = Some(section_of(true, 0, 12, |_, _, _| AIR));
+    data.mask |= 1u16 << (SECTION_COUNT - 1);
+    let world = world_of(1, |_, _| data.clone());
+
+    assert_eq!(
+        view_light_level(&world, 0, 64, 0),
+        5,
+        "far below the ceiling"
+    );
+    assert_eq!(
+        view_light_level(&world, 0, 300, 0),
+        12,
+        "at or above 256 the topmost cell answers"
+    );
+    assert_eq!(
+        view_light_level(&world, 0, -1, 0),
+        0,
+        "below the world, dark"
+    );
 }

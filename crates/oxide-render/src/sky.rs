@@ -82,8 +82,10 @@
 //! `GlStateManager.translate(0.0F, -f, 0.0F)` with `f = getEyeHeight()` (`EntityRenderer.java:738`),
 //! so the local geometry — the band's `+16`, the sun's `+100`, the grids' `±384`, the box's `-1`
 //! — is measured from the ground the entity stands on and the camera sits `EYE_HEIGHT` above the
-//! frame's origin. The sky pass builds its view with the origin at `(0, EYE_HEIGHT, 0)`, which is
-//! that translation; the below-plane lift and the void floor already carry the absolute eye.
+//! frame's origin. The sky pass builds its view with the eye at `(0, EYE_HEIGHT, 0)` less the
+//! first-person backward offset the source's camera transform carries
+//! (`GlStateManager.translate(0.0F, 0.0F, -0.1F)`, `:720`, which the terrain's own view has too);
+//! the below-plane lift and the void floor already carry the absolute eye.
 //!
 //! The sky's pipelines write no depth, matching `depthMask(false)` (`:1230`) and the restore at
 //! `:1416`; the depth test is off as the brief specifies, which is what the source's test
@@ -99,7 +101,7 @@ use glam::{Mat4, Vec3};
 
 use oxide_assets::texture::Texture;
 
-use crate::camera::{Camera, EYE_HEIGHT};
+use crate::camera::{Camera, EYE_HEIGHT, FIRST_PERSON_OFFSET};
 use crate::fog::FogParams;
 use crate::terrain_pass::DEPTH_FORMAT;
 
@@ -506,9 +508,9 @@ static CLOUD_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0
 /// colours and the two parameter `vec4`s.
 const SKY_UNIFORM_BYTES: usize = (16 + 16 + 4 + 4 + 4 + 4 + 4) * 4;
 
-/// The cloud frame uniform: the view-projection, the colour, the origin and uv offset, and the
-/// fog's colour and range.
-const CLOUD_UNIFORM_BYTES: usize = (16 + 4 + 4 + 4 + 4) * 4;
+/// The cloud frame uniform: the view-projection, the colour, the origin and uv offset, the
+/// fog's colour and range, and the eye.
+const CLOUD_UNIFORM_BYTES: usize = (16 + 4 + 4 + 4 + 4 + 4) * 4;
 
 /// One byte-packing helper: the floats little-endian, in order.
 fn f32_bytes(values: &[f32], bytes: &mut [u8]) {
@@ -527,7 +529,8 @@ struct Sky {
     fog_colour: vec4<f32>,
     // x: the fog's start, y: its end, z: the below plane's lift, w: the void box's floor.
     fog_range: vec4<f32>,
-    // x: the stars' brightness.
+    // x: the stars' brightness, y/z/w: the eye's position in the frame's local coordinates, the
+    // point the fog's radial distance is measured from (`GL_EYE_RADIAL_NV`).
     params: vec4<f32>,
 };
 
@@ -546,7 +549,7 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) colour: vec4<f32>,
-    @location(2) depth: f32,
+    @location(2) distance: f32,
     @location(3) @interpolate(flat) kind: u32,
 };
 
@@ -568,9 +571,10 @@ fn vs_main(input: VertexInput) -> VertexOutput {
         position = sky.celestial * position;
     }
     output.clip_position = sky.view_projection * position;
-    // The perspective divide's denominator is the fragment's eye-space depth, the fog's own
-    // distance.
-    output.depth = output.clip_position.w;
+    // The interpolated varying is the vertex's own distance from the eye in the frame's local
+    // coordinates — the fog's radial measure, the straight line the source's `GL_EYE_RADIAL_NV`
+    // mode uses.
+    output.distance = length(local - sky.params.yzw);
     output.uv = input.uv;
     output.colour = input.colour;
     output.kind = input.kind;
@@ -598,13 +602,14 @@ fn base(input: VertexOutput) -> vec4<f32> {
     }
 }
 
-// The linear fog every ground-facing sky surface mixes in, the same mix the terrain uses.
-fn fogged(colour: vec4<f32>, depth: f32) -> vec4<f32> {
+// The linear fog every ground-facing sky surface mixes in, the same mix the terrain uses: the
+// distance is the eye's radial one.
+fn fogged(colour: vec4<f32>, distance: f32) -> vec4<f32> {
     let span = sky.fog_range.y - sky.fog_range.x;
     if (span <= 0.0) {
         return colour;
     }
-    let factor = clamp((sky.fog_range.y - depth) / span, 0.0, 1.0);
+    let factor = clamp((sky.fog_range.y - distance) / span, 0.0, 1.0);
     return vec4<f32>(mix(sky.fog_colour.rgb, colour.rgb, factor), colour.a);
 }
 
@@ -616,7 +621,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // geometry (`:1349`). The sun, the moon and the stars draw between those two with fog
     // disabled (`:1248`), so kinds 4 and 5 are left alone.
     if (input.kind <= 3u) {
-        return fogged(colour, input.depth);
+        return fogged(colour, input.distance);
     }
     return colour;
 }
@@ -634,6 +639,9 @@ struct Cloud {{
     fog_colour: vec4<f32>,
     // x: the fog's start, y: its end.
     fog_range: vec4<f32>,
+    // x, y, z: the eye's world position, the point the fog's radial distance is measured from;
+    // the fourth component is unused.
+    eye: vec4<f32>,
 }};
 
 @group(0) @binding(0) var<uniform> cloud: Cloud;
@@ -654,7 +662,7 @@ struct VertexInput {{
 struct VertexOutput {{
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) depth: f32,
+    @location(1) distance: f32,
 }};
 
 @vertex
@@ -667,7 +675,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {{
         input.position.z + cloud.origin.y,
     );
     output.clip_position = cloud.view_projection * vec4<f32>(world, 1.0);
-    output.depth = output.clip_position.w;
+    // The fog's radial measure: the straight line from the eye to the vertex.
+    output.distance = length(world - cloud.eye.xyz);
     output.uv = vec2<f32>(input.position.x, input.position.z) * CLOUD_UV_PER_BLOCK
         + cloud.origin.zw;
     return output;
@@ -681,7 +690,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {{
     if (span <= 0.0) {{
         return colour;
     }}
-    let factor = clamp((cloud.fog_range.y - input.depth) / span, 0.0, 1.0);
+    let factor = clamp((cloud.fog_range.y - input.distance) / span, 0.0, 1.0);
     return vec4<f32>(mix(cloud.fog_colour.rgb, colour.rgb, factor), colour.a);
 }}
 "#,
@@ -1351,10 +1360,12 @@ impl SkyPass {
     /// Stores the camera and the surface aspect the next draw is built with, and refreshes the
     /// uniform.
     ///
-    /// The view is the camera's pose with the camera at `(0, EYE_HEIGHT, 0)`: the sky's geometry
-    /// is measured from the ground the entity stands on, as the source's own modelview makes it
-    /// (`GlStateManager.translate(0.0F, -f, 0.0F)`, `EntityRenderer.java:738`), so the camera
-    /// sits an eye's height above the frame's origin.
+    /// The view is the camera's pose with the eye at `(0, EYE_HEIGHT, 0)` less
+    /// [`FIRST_PERSON_OFFSET`] along the view axis: the sky's geometry is measured from the
+    /// ground the entity stands on, as the source's own modelview makes it
+    /// (`GlStateManager.translate(0.0F, -f, 0.0F)`, `EntityRenderer.java:738`), and every
+    /// normally-played pass sits the offset's own distance behind the eye
+    /// (`GlStateManager.translate(0.0F, 0.0F, -0.1F)`, `:720`).
     pub fn set_camera(&mut self, queue: &wgpu::Queue, camera: Camera, aspect: f32) {
         self.camera = Some(camera);
         self.aspect = aspect;
@@ -1384,19 +1395,18 @@ impl SkyPass {
         };
         let aspect = self.aspect.max(0.01);
         let far_plane = params.far_plane * SKY_FAR_MULTIPLIER;
+        // The eye the source's camera transform puts the sky at: the local frame's origin plus
+        // the eye height (`EntityRenderer.java:738`'s closing `translate(0.0F, -f, 0.0F)`), less
+        // the first-person backward offset every normally-played pass carries
+        // (`EntityRenderer.setupCameraTransform`'s `translate(0.0F, 0.0F, -0.1F)`, `:720`) — the
+        // same offset the terrain's own view has (`crate::camera::FIRST_PERSON_OFFSET`).
+        let eye = Vec3::new(0.0, EYE_HEIGHT, 0.0) - FIRST_PERSON_OFFSET * camera.forward();
         let view_projection = Mat4::perspective_rh(
             camera.fov_degrees.to_radians(),
             aspect,
             camera.near,
             far_plane,
-        ) * Mat4::look_to_rh(
-            // The source's modelview ends with the eye-height translation
-            // (`EntityRenderer.java:738`), so the camera sits an eye's height above the frame
-            // the local geometry is measured in.
-            Vec3::new(0.0, EYE_HEIGHT, 0.0),
-            camera.forward(),
-            Vec3::Y,
-        );
+        ) * Mat4::look_to_rh(eye, camera.forward(), Vec3::Y);
         let celestial = celestial_rotation(params.celestial_angle);
         let eye_y = camera.eye().y;
         let below_lift = 16.0 - (eye_y - HORIZON);
@@ -1424,7 +1434,7 @@ impl SkyPass {
             1.0,
         ]);
         values.extend_from_slice(&[0.0, params.far_plane, below_lift, void_box_low(eye_y)]);
-        values.extend_from_slice(&[params.star_brightness, 0.0, 0.0, 0.0]);
+        values.extend_from_slice(&[params.star_brightness, eye.x, eye.y, eye.z]);
         let mut bytes = [0u8; SKY_UNIFORM_BYTES];
         f32_bytes(&values, &mut bytes);
         queue.write_buffer(&self.frame_buffer, 0, &bytes);
@@ -1695,6 +1705,10 @@ impl CloudPass {
             1.0,
         ]);
         values.extend_from_slice(&[self.fog.start, self.fog.end, self.fog.far_plane, 0.0]);
+        // The cloud's view is the world view (`camera.view()`), whose origin is the eye less the
+        // first-person offset; the fog's radial distance is measured from the same point.
+        let eye = camera.eye() - FIRST_PERSON_OFFSET * camera.forward();
+        values.extend_from_slice(&[eye.x, eye.y, eye.z, 0.0]);
         let mut bytes = [0u8; CLOUD_UNIFORM_BYTES];
         f32_bytes(&values, &mut bytes);
         queue.write_buffer(&self.frame_buffer, 0, &bytes);
