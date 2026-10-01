@@ -46,15 +46,16 @@ compatibility) starts only after v1.
   at-or-above arm `e919711` (review: compliant/approved with findings — 3 Important/4 Minor, all
   record-corrected; the full-band mark mask is **withdrawn**; the honest conservative reading is
   0.0484/0.0175, a fail that is the round's recorded finding).
-- **The seventh round (fluids) was stopped mid-run on 2026-10-01 at ~02:10 CDT**, ~45 minutes in,
-  mid-GREEN. At stop it had: found a candidate defect — the liquid and model quad UVs map into an
+- **The seventh round (fluids) was stopped mid-run on 2026-10-01 at ~02:10 CDT**, ~45 minutes in —
+  just after its mesher tests reached GREEN and its gate re-ran clean. At stop it had: found a candidate defect — the liquid and model quad UVs map into an
   animated sprite's whole strip instead of the current frame's rect (the mesher maps a v span of
   0.25 where the frame's rect is 0.125); captured RED evidence (`refs/m2-fluids/red.log`: two
   failing `mesher_liquids` tests plus one failing `mesher` test); written a WIP fix over six files
   (`crates/oxide-assets/src/atlas.rs` and its tests; `crates/oxide-game/src/mesher.rs` and
   `mesher/liquid.rs`; `mesher.rs`'s and `mesher_liquids.rs`'s tests; snapshot at
-  `refs/m2-fluids/wip-stopped-round.diff`) that had **not converged** — two liquid tests still
-  failed on a v-offset when stopped. **No rig run happened; no commit was made; nothing was
+  `refs/m2-fluids/wip-stopped-round.diff`) that **converged to GREEN by the stop** (16/16 in
+  `mesher_liquids`; `refs/m2-fluids/green.log`), with `cargo fmt` applied and the full gate re-run to
+  `GATE OK` (`refs/m2-fluids/gate.log`); it was starting the ignored render tests when stopped. **No rig run happened; no commit was made; nothing was
   pushed.** Whether the candidate defect explains both acceptance symptoms (the glass-walled cells
   invisible; the ground water colour) was not yet established — the next round re-verifies the cause
   against the source before fixing.
@@ -66,8 +67,9 @@ compatibility) starts only after v1.
   `EXTRA_CELLS` list, Task 15 Step 3's), `scripts/parity-diff.py` and `docs/perf.md` untracked.
   **Keep them; never commit or revert them separately.** The rig is stopped; ports 25565/25566
   free; no leftover processes.
-- Tests / gate at this stop: the six-command gate was re-run on the reset tree before the `docs:`
-  commit (`refs/m2-fluids/gate-pause.log`). The last full numbers before the stop (the cloud-arm
+- Tests / gate at this stop: the round's own gate run was `GATE OK` (`refs/m2-fluids/gate.log`),
+  and the six-command gate was re-run on the reset tree before the stop's `docs:` commit (`GATE OK`;
+  `refs/m2-fluids/gate-pause.log`). The last full numbers before the stop (the cloud-arm
   review's re-run): workspace 504 passing / 0 failed / 21 ignored; the GPU ignored suite 13/13
   across its two suites.
 - Known broken or unfinished: the fluids round (above); continuation #3 (the full re-capture) not
@@ -86,8 +88,9 @@ attempt's findings:
    vanilla (57,69,126)) **plus** the stopped attempt's candidate cause, RED evidence and snapshots,
    and the instruction to re-verify the cause against `refs/_src/MCP-919`
    (`BlockFluidRenderer`/`BlockLiquid`/`Block.java:468-471`/`BlockBreakable.java:52`) before fixing.
-   Decide adopt-vs-clean: `git apply refs/m2-fluids/wip-stopped-round.diff` to adopt the WIP's
-   tests, or start from HEAD.
+   Decide adopt-vs-clean: `git apply refs/m2-fluids/wip-stopped-round.diff` to adopt the WIP (it is
+   GREEN and gate-clean; if adopted, confirm its tests against the source, then finish the round:
+   the ignored-suite run, the live captures + metric, the report, the commit), or start from HEAD.
 2. Then: RED→GREEN at the mesher layer; live wall+ground captures (both clients; `/weather clear`
    immediately before every capture; our soak ≥ 8–10 min; the vanilla reference soaked past the
    ~376 s mesh drain; capture rect checked clear of the overlay window at screen (1720-1919,

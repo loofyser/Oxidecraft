@@ -73,7 +73,9 @@ specification and continue without asking questions that are already answered he
   atmosphere fog `a6760bd` (review clean; 4 minors record-corrected) and the cloud at-or-above arm
   `e919711` (review approved with findings; all record-corrected; the full-band mask is withdrawn).
   The seventh round (fluids: the glass-walled liquid cells and the ground water colour) was stopped
-  mid-run ~45 minutes in, mid-GREEN; its RED evidence and WIP snapshots live under `refs/m2-fluids/`
+  mid-run ~45 minutes in, just after its mesher tests reached GREEN and its gate re-ran clean
+  (`refs/m2-fluids/green.log`, `gate.log`); its RED evidence and WIP snapshots live under
+  `refs/m2-fluids/`
   (`wip-stopped.diff`, `wip-stopped-round.diff`) and the resume point is
   `docs/handoff/2026-10-01-m2-fluids-stopped.md`. Next: resume ROUND 3 (fluids) → its scoped review
   → continuation #3 (the full acceptance re-capture, all three pairs against the bar) → Task 15
