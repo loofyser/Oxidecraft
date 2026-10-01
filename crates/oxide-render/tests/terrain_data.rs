@@ -1,6 +1,8 @@
 //! Tests for the vertex layout and the camera maths. No GPU is involved.
 
-use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
+use oxide_render::camera::{
+    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE,
+};
 use oxide_render::terrain::{VERTEX_BYTES, Vertex, vertex_bytes};
 
 #[test]
@@ -123,8 +125,12 @@ fn a_point_ahead_projects_to_the_centre_and_near_maps_to_zero_depth() {
         far_chunks: 8.0,
     };
     let view_projection = camera.view_projection(16.0 / 9.0);
-    // Ten blocks ahead along +Z, at eye height.
-    let ahead = view_projection * glam::Vec4::new(0.0, camera.eye().y, 10.0, 1.0);
+    // The camera sits FIRST_PERSON_OFFSET blocks behind the eye on the view axis
+    // (the offset `Camera::view` applies), so a probe `d` blocks in front of the
+    // camera sits at world z = d - FIRST_PERSON_OFFSET under this yaw-0 pose.
+    let from_camera = |d: f32| d - FIRST_PERSON_OFFSET;
+    // Ten blocks ahead of the camera along +Z, at eye height.
+    let ahead = view_projection * glam::Vec4::new(0.0, camera.eye().y, from_camera(10.0), 1.0);
     let ndc = ahead.truncate() / ahead.w;
     assert!(
         ndc.x.abs() < 1e-4 && ndc.y.abs() < 1e-4,
@@ -138,31 +144,27 @@ fn a_point_ahead_projects_to_the_centre_and_near_maps_to_zero_depth() {
     // Just beyond the near plane: depth is almost zero. With the near plane at 0.05 and a
     // 0..1 depth range, a sample 0.0001 blocks past the plane lands at roughly 0.002.
     let near_point = view_projection
-        * glam::Vec4::new(
-            0.0,
-            camera.eye().y,
-            (NEAR_PLANE as f64 + 0.0001) as f32,
-            1.0,
-        );
+        * glam::Vec4::new(0.0, camera.eye().y, from_camera(NEAR_PLANE + 0.0001), 1.0);
     let near_ndc = near_point.truncate() / near_point.w;
     assert!(near_ndc.z.abs() < 0.01, "near maps to zero: {near_ndc:?}");
 
     // The far plane is far_chunks * 16 * SQRT_2 = 181.019 blocks away here: a point at that
     // distance reaches depth 1, and a point twice as far lies beyond the plane.
     let far = 8.0 * 16.0 * std::f32::consts::SQRT_2;
-    let at_far = view_projection * glam::Vec4::new(0.0, camera.eye().y, far, 1.0);
+    let at_far = view_projection * glam::Vec4::new(0.0, camera.eye().y, from_camera(far), 1.0);
     let at_far_ndc = at_far.truncate() / at_far.w;
     assert!(
         (at_far_ndc.z - 1.0).abs() < 1e-5,
         "far maps to one: {at_far_ndc:?}"
     );
-    let past_far = view_projection * glam::Vec4::new(0.0, camera.eye().y, 2.0 * far, 1.0);
+    let past_far =
+        view_projection * glam::Vec4::new(0.0, camera.eye().y, from_camera(2.0 * far), 1.0);
     let past_far_ndc = past_far.truncate() / past_far.w;
     assert!(past_far_ndc.z > 1.0, "beyond far: {past_far_ndc:?}");
 
     // Yaw 0 faces +Z, so a point one block east of the eye sits on the left of the view: its
     // x lands near -0.080 under a right-handed basis (a mirrored basis would land at +0.080).
-    let east = view_projection * glam::Vec4::new(1.0, camera.eye().y, 10.0, 1.0);
+    let east = view_projection * glam::Vec4::new(1.0, camera.eye().y, from_camera(10.0), 1.0);
     let east_ndc = east.truncate() / east.w;
     assert!(
         (east_ndc.x + 0.080).abs() < 1e-3,
