@@ -417,16 +417,16 @@ fn take_ambient_occlusion(ctx: &MeshContext<'_>, emission: u8, model: &BakedMode
 }
 
 /// The atlas uv of a quad's four corners: the model's own sprite coordinates
-/// mapped into the sprite's content rect.
+/// mapped into the drawn sprite's content rect.
 ///
-/// The rect is [`Atlas::uv`]'s answer, already inside the level-0 image and
-/// inside the one-texel padding; a texture the tree never stitched falls back to
-/// the fallback sprite's rect, exactly as the missing model does.
+/// The rect is [`Atlas::drawn`]'s answer — an animated strip's first frame,
+/// whose rect the source's uv methods divide by
+/// (`TextureAtlasSprite.java:289-294`), so a quad never spans a strip — already
+/// inside the level-0 image and inside the one-texel padding; a texture the
+/// tree never stitched falls back to the fallback sprite's rect, exactly as the
+/// missing model does.
 fn atlas_uv(ctx: &MeshContext<'_>, quad: &BakedQuad) -> [[f32; 2]; 4] {
-    let [min, max] = match ctx.atlas.sprites.get(&quad.texture) {
-        Some(sprite) => ctx.atlas.uv(sprite),
-        None => ctx.atlas.uv(&ctx.atlas.missing),
-    };
+    let [min, max] = ctx.atlas.uv(ctx.atlas.drawn(&quad.texture));
     std::array::from_fn(|corner| {
         [
             min[0] + quad.uv[corner][0] * (max[0] - min[0]),

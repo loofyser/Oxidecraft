@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
+use oxide_assets::atlas::{AnimatedSprite, Atlas, AtlasLevel, AtlasSprite, SpriteRect};
 use oxide_assets::model::ModelSource;
 use oxide_game::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
@@ -46,6 +46,7 @@ const LAVA_STILL: u16 = 11;
 const LEAVES: u16 = 18;
 const TALLGRASS: u16 = 31;
 const STONE: u16 = 1;
+const GLASS: u16 = 20;
 const ICE: u16 = 79;
 
 // -- the source's own float shapes, as literals ------------------------------
@@ -1319,4 +1320,258 @@ fn a_stable_sort_keeps_the_visit_order_on_ties() {
         }
     }
     assert_eq!(ties, 9, "nine of the eleven pairs tie to the bit");
+}
+
+// -- the animated strips -----------------------------------------------------
+
+/// The content rect of one liquid strip in [`strip_atlas`], as its min and
+/// max uv corner: the whole strip and its first frame. The atlas is 128 x 128
+/// and each strip sits at its cell's top-left corner, as the stitcher places
+/// content.
+const STRIP_STILL: ([f32; 2], [f32; 2]) = ([0.5, 0.0], [0.625, 0.25]);
+const FRAME_STILL: ([f32; 2], [f32; 2]) = ([0.5, 0.0], [0.625, 0.125]);
+const STRIP_FLOW: ([f32; 2], [f32; 2]) = ([0.75, 0.0], [1.0, 0.5]);
+const FRAME_FLOW: ([f32; 2], [f32; 2]) = ([0.75, 0.0], [1.0, 0.25]);
+const STRIP_LAVA_STILL: ([f32; 2], [f32; 2]) = ([0.5, 0.5], [0.625, 0.75]);
+const FRAME_LAVA_STILL: ([f32; 2], [f32; 2]) = ([0.5, 0.5], [0.625, 0.625]);
+const STRIP_LAVA_FLOW: ([f32; 2], [f32; 2]) = ([0.75, 0.5], [1.0, 1.0]);
+const FRAME_LAVA_FLOW: ([f32; 2], [f32; 2]) = ([0.75, 0.5], [1.0, 0.75]);
+
+/// The atlas these strip tests mesh with: the fallback and the three probe
+/// sprites as in [`test_atlas`], and the four liquid sprites as animated
+/// strips — the still pair two 16 x 16 rows over a 16 x 32 content, the
+/// flowing pair two 32 x 32 rows over a 32 x 64 content — each inside its own
+/// cell, its content at the cell's top-left corner.
+///
+/// The strip's content rect is taller than one frame, so its uv pair differs
+/// from the frame's on the v axis alone; a mesher that maps a quad into the
+/// strip draws a band of both frames where the source draws one.
+fn strip_atlas() -> Atlas {
+    let mut atlas = atlas(&[
+        "missingno",
+        "blocks/probe",
+        "blocks/probe_overlay",
+        "blocks/probe_cross",
+    ]);
+    let strips = [
+        ("blocks/water_still", 64u32, 0u32, 16u32, 32u32),
+        ("blocks/water_flow", 96, 0, 32, 64),
+        ("blocks/lava_still", 64, 64, 16, 32),
+        ("blocks/lava_flow", 96, 64, 32, 64),
+    ];
+    for (name, x, y, side, height) in strips {
+        let region = SpriteRect {
+            x,
+            y,
+            w: side,
+            h: height,
+        };
+        let content = SpriteRect {
+            x,
+            y,
+            w: side,
+            h: 2 * side,
+        };
+        atlas
+            .sprites
+            .insert(name.to_string(), AtlasSprite { region, content });
+        atlas.animated.insert(
+            name.to_string(),
+            AnimatedSprite {
+                frames: (0..2)
+                    .map(|row| AtlasSprite {
+                        region,
+                        content: SpriteRect {
+                            x,
+                            y: y + row * side,
+                            w: side,
+                            h: side,
+                        },
+                    })
+                    .collect(),
+                times: vec![2, 2],
+                interpolate: false,
+            },
+        );
+    }
+    atlas
+}
+
+#[test]
+fn a_liquid_between_glass_panes_draws_the_sprite_frame_and_the_doubled_faces() {
+    let (models, _) = loaded();
+    let atlas = strip_atlas();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off, true);
+    // One still water source with glass before and behind it and stone on
+    // every other side: the sample wall's own shape for its four cells.
+    let world = daylight(&[
+        (1, 64, 1, state(WATER_STILL, 0)),
+        (1, 64, 0, state(GLASS, 0)),
+        (1, 64, 2, state(GLASS, 0)),
+        (0, 64, 1, state(STONE, 0)),
+        (2, 64, 1, state(STONE, 0)),
+        (1, 63, 1, state(STONE, 0)),
+        (1, 65, 1, state(STONE, 0)),
+    ]);
+    // The floor stone below the liquid puts its own faces in section 3, so
+    // the liquid's are read from the section that holds y = 64.
+    let mesh = meshes(&world, &ctx)
+        .into_iter()
+        .find_map(|(index, mesh)| (index == 4).then_some(mesh).flatten())
+        .expect("the liquid's own section");
+
+    // Glass is a full cube but not an opaque one: the base rule's
+    // `!isOpaqueCube()` arm (`BlockLiquid.java:96-99`) draws the liquid's own
+    // face against it, and `BlockBreakable.shouldSideBeRendered` (`:52`)
+    // draws the glass's face back. The four panes' faces are the glass
+    // model's; the liquid's own are the six here: the surface's two passes
+    // and one face against each pane, doubled as the source doubles them.
+    let quads = quads(&mesh, Layer::Translucent);
+    let cell = cell_quads(&quads, [1.0, 64.0, 1.0]);
+    assert_eq!(cell.len(), 6, "the surface twice, each pane's face twice");
+    assert_eq!(mesh.layer(Layer::Translucent).vertices.len(), 24);
+    assert_eq!(mesh.layer(Layer::Translucent).indices.len(), 36);
+
+    // The surface: one height all round — the pane and the wall's stone are
+    // both solid samples the height average drops, so the cell's corner is
+    // [`POOL_SURFACE`] — the still sprite's first frame, and the reverse pass
+    // behind it.
+    let y = surface_y(64.0, POOL_SURFACE);
+    let top = quads_at(&cell, [1.0, y, 1.0]);
+    assert_eq!(top.len(), 2);
+    let frame = rect_corners(FRAME_STILL);
+    assert_eq!(
+        uvs(top[0]),
+        frame,
+        "the surface maps into the still frame, not the strip"
+    );
+    assert_eq!(uvs(top[1]), [frame[0], frame[3], frame[2], frame[1]]);
+    assert_ne!(
+        uvs(top[0])[2][1],
+        STRIP_STILL.1[1],
+        "the surface does not reach the strip's second frame"
+    );
+    // The surface's shade over the plains water multiplier: white, one
+    // sample per vertex, and the cell's own daylight.
+    assert!(
+        top.iter()
+            .flat_map(|quad| quad.iter())
+            .all(|vertex| vertex.colour == [255, 255, 255, 255])
+    );
+    assert!(
+        top.iter()
+            .flat_map(|quad| quad.iter())
+            .all(|vertex| vertex.light == [8, 248])
+    );
+
+    // Each pane's face: the flowing sprite's first frame, the face's half of
+    // its u span, and the two heights' v coordinates over the frame. The
+    // fractions are the lone-cell test's own — `(1 - height) * 16 * 0.5` and
+    // `8.0` of `getInterpolatedV`'s sixteen — carried over a quarter of the
+    // atlas instead of a sixteenth, with the pool's corner height.
+    let (flow_min, flow_max) = FRAME_FLOW;
+    let span = flow_max[1] - flow_min[1];
+    let v_top = span * (((1.0 - POOL_SURFACE) * 16.0 * 0.5) / 16.0);
+    let v_bottom = span * (8.0 / 16.0);
+    let u_mid = flow_min[0] + (flow_max[0] - flow_min[0]) * (8.0 / 16.0);
+    let expected = [
+        [flow_min[0], v_top],
+        [u_mid, v_top],
+        [u_mid, v_bottom],
+        [flow_min[0], v_bottom],
+    ];
+    let north = quads_at(&cell, [1.0, y, 1.001]);
+    assert_eq!(north.len(), 1);
+    assert_eq!(uvs(north[0]), expected, "the north face's frame corners");
+    assert_ne!(
+        uvs(north[0])[2][1],
+        STRIP_FLOW.1[1],
+        "the face does not reach the strip's second frame"
+    );
+    let behind = quads_at(&cell, [1.0, 64.0, 1.001]);
+    assert_eq!(behind.len(), 1, "the doubled face behind the first");
+    assert_eq!(
+        uvs(behind[0]),
+        [expected[3], expected[2], expected[1], expected[0]]
+    );
+    let south = quads_at(&cell, [2.0, y, 1.999]);
+    assert_eq!(south.len(), 1);
+    assert_eq!(uvs(south[0]), expected, "the south face's frame corners");
+    assert_eq!(quads_at(&cell, [2.0, 64.0, 1.999]).len(), 1);
+    for quad in [north[0], behind[0], south[0]] {
+        // The side shade over white, and the pane's own daylight.
+        assert!(
+            quad.iter()
+                .all(|vertex| vertex.colour == [204, 204, 204, 255])
+        );
+        assert!(quad.iter().all(|vertex| vertex.light == [8, 248]));
+    }
+}
+
+#[test]
+fn a_flowing_liquid_strip_draws_the_flowing_frame() {
+    let (models, _) = loaded();
+    let atlas = strip_atlas();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off, true);
+    // A lava source in the wall's own row: glass before and behind it, stone
+    // on every other side. Lava draws in the opaque layer.
+    let world = daylight(&[
+        (1, 64, 1, state(LAVA_STILL, 0)),
+        (1, 64, 0, state(GLASS, 0)),
+        (1, 64, 2, state(GLASS, 0)),
+        (0, 64, 1, state(STONE, 0)),
+        (2, 64, 1, state(STONE, 0)),
+        (1, 63, 1, state(STONE, 0)),
+        (1, 65, 1, state(STONE, 0)),
+    ]);
+    let mesh = meshes(&world, &ctx)
+        .into_iter()
+        .find_map(|(index, mesh)| (index == 4).then_some(mesh).flatten())
+        .expect("the liquid's own section");
+
+    let quads = quads(&mesh, Layer::Opaque);
+    let cell = cell_quads(&quads, [1.0, 64.0, 1.0]);
+    // The opaque layer also carries the neighbouring stone's faces, which sit
+    // on the cell's own planes; the lava's are the ones that map into the
+    // lava strip's cells, the stone's into the probe sprite's.
+    let lava: Vec<&[Vertex]> = cell
+        .into_iter()
+        .filter(|quad| {
+            quad.iter()
+                .all(|vertex| vertex.uv[0] >= STRIP_LAVA_STILL.0[0])
+        })
+        .collect();
+    assert_eq!(lava.len(), 6, "the surface twice, each pane's face twice");
+    let y = surface_y(64.0, POOL_SURFACE);
+    let top = quads_at(&lava, [1.0, y, 1.0]);
+    assert_eq!(top.len(), 2);
+    let frame = rect_corners(FRAME_LAVA_STILL);
+    assert_eq!(uvs(top[0]), frame, "the still frame, not the lava strip");
+    assert_ne!(
+        uvs(top[0])[2][1],
+        STRIP_LAVA_STILL.1[1],
+        "the surface does not reach the strip's second frame"
+    );
+    let north = quads_at(&lava, [1.0, y, 1.001]);
+    let (flow_min, flow_max) = FRAME_LAVA_FLOW;
+    let span = flow_max[1] - flow_min[1];
+    let v_top = flow_min[1] + span * (((1.0 - POOL_SURFACE) * 16.0 * 0.5) / 16.0);
+    let u_mid = flow_min[0] + (flow_max[0] - flow_min[0]) * (8.0 / 16.0);
+    assert_eq!(
+        uvs(north[0]),
+        [
+            [flow_min[0], v_top],
+            [u_mid, v_top],
+            [u_mid, flow_min[1] + span * (8.0 / 16.0)],
+            [flow_min[0], flow_min[1] + span * (8.0 / 16.0)],
+        ],
+        "the flowing frame, not the lava strip"
+    );
+    assert_ne!(
+        uvs(north[0])[2][1],
+        STRIP_LAVA_FLOW.1[1],
+        "the face does not reach the strip's second frame"
+    );
 }

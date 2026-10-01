@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
+use oxide_assets::atlas::{AnimatedSprite, Atlas, AtlasLevel, AtlasSprite, SpriteRect};
 use oxide_assets::model::ModelSource;
 use oxide_game::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, ModelChoice, SmoothLighting, blockstate_target,
@@ -181,6 +181,53 @@ fn test_atlas() -> Atlas {
         "blocks/probe_overlay",
         "blocks/probe_cross",
     ])
+}
+
+/// The atlas with the probe cube's own texture as an animated strip: the
+/// strip is a 16 x 32 content rect (two 16 x 16 frames) in its own 32 x 32
+/// cell at (64, 0), past the still sprites' cells, with the fallback first.
+///
+/// The strip's v pair is twice the frame's, so a model quad that maps into
+/// the strip spans both frames where the source spans one.
+fn strip_probe_atlas() -> Atlas {
+    let mut atlas = atlas(&["missingno", "blocks/probe_overlay", "blocks/probe_cross"]);
+    let region = SpriteRect {
+        x: 64,
+        y: 0,
+        w: 32,
+        h: 32,
+    };
+    atlas.sprites.insert(
+        "blocks/probe".to_string(),
+        AtlasSprite {
+            region,
+            content: SpriteRect {
+                x: 64,
+                y: 0,
+                w: 16,
+                h: 32,
+            },
+        },
+    );
+    atlas.animated.insert(
+        "blocks/probe".to_string(),
+        AnimatedSprite {
+            frames: (0..2)
+                .map(|row| AtlasSprite {
+                    region,
+                    content: SpriteRect {
+                        x: 64,
+                        y: row * 16,
+                        w: 16,
+                        h: 16,
+                    },
+                })
+                .collect(),
+            times: vec![2, 2],
+            interpolate: false,
+        },
+    );
+    atlas
 }
 
 /// One sprite's content rect inside [`test_atlas`], as its two uv corners.
@@ -574,6 +621,38 @@ fn a_lone_stone_block_draws_six_faces() {
                 "quad {normal:?} winds the other way"
             );
         }
+    }
+}
+
+#[test]
+fn a_model_quad_samples_the_animated_sprite_frame() {
+    let (models, _) = loaded();
+    let atlas = strip_probe_atlas();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    let world = daylight(&[(3, 64, 7, state(STONE, 0))]);
+    let mesh = mesh_of(&world, &ctx);
+
+    // The stone's texture is an animated strip: its quads map into the
+    // strip's first frame — `TextureAtlasSprite.loadSprite` sets the sprite's
+    // height to its width for an animation (`:289-294`), so the rect is one
+    // frame's — and never the strip's taller content. The frame sits at
+    // (64, 0) and is 16 x 16 inside the 128 x 128 atlas; the strip is 16 x 32
+    // from the same corner.
+    let frame = [[0.5, 0.0], [0.625, 0.125]];
+    let strip = [[0.5, 0.0], [0.625, 0.25]];
+    let corners = [
+        [frame[0][0], frame[0][1]],
+        [frame[0][0], frame[1][1]],
+        [frame[1][0], frame[1][1]],
+        [frame[1][0], frame[0][1]],
+    ];
+    for (index, vertex) in vertices(&mesh).into_iter().enumerate() {
+        assert_eq!(vertex.uv, corners[index % 4], "vertex {index}");
+        assert!(
+            vertex.uv[1] <= strip[1][1],
+            "vertex {index} maps past the frame into the strip"
+        );
     }
 }
 

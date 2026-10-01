@@ -559,12 +559,16 @@ struct Sprites {
 
 impl Sprites {
     /// The pair for one liquid, water or lava (`:37`).
+    ///
+    /// Each path resolves through [`Atlas::drawn`], so an animated strip's
+    /// pair is its first frame's — the rect the source's uv methods divide
+    /// by (`TextureAtlasSprite.java:289-294`), never the whole strip.
     fn resolve(atlas: &Atlas, kind: LiquidKind) -> Sprites {
         let (still, flowing) = match kind {
             LiquidKind::Water => ("blocks/water_still", "blocks/water_flow"),
             LiquidKind::Lava => ("blocks/lava_still", "blocks/lava_flow"),
         };
-        let rect = |name: &str| atlas.uv(atlas.sprites.get(name).unwrap_or(&atlas.missing));
+        let rect = |name: &str| atlas.uv(atlas.drawn(name));
         Sprites {
             still: rect(still),
             flowing: rect(flowing),

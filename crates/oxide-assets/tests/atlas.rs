@@ -319,10 +319,10 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
     // Pure red and pure blue, both 16x16, beside a padded 16x32 sprite
     // whose 32x32 cell leaves a whole column of padding a whole-level
     // reduction would have its chance to bleed into, and an animated strip
-    // whose cell must stay empty at levels 1 and up: it is where a
-    // reduction over the whole stitched image, rather than each sprite's
-    // own content, becomes visible. The packer lays the red and blue cells
-    // edge to edge.
+    // whose drawn frame must reduce at its own place inside its cell while
+    // the rest of the cell stays empty: a reduction over the whole stitched
+    // image, or over the whole strip, would show there. The packer lays the
+    // red and blue cells edge to edge.
     let tree = Tree::new();
     tree.write(
         "assets/minecraft/textures/blocks/padded.png",
@@ -374,6 +374,7 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
         let blue_rect = shift(blue, level);
         let red_rect = shift(red, level);
         let padded_rect = shift(padded.content, level);
+        let strip_frame = shift(atlas.drawn("blocks/strip").content, level);
         assert_rect_is(image, blue_rect, BLUE, &format!("blue at level {level}"));
         assert_rect_is(image, red_rect, RED, &format!("red at level {level}"));
         assert_rect_is(
@@ -381,6 +382,12 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
             padded_rect,
             GREEN,
             &format!("the padded sprite at level {level}"),
+        );
+        assert_rect_is(
+            image,
+            strip_frame,
+            YELLOW,
+            &format!("the strip's drawn frame at level {level}"),
         );
 
         // The texels that touch the shared edge are the first candidates.
@@ -426,12 +433,13 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
         }
 
         // Outside the sprites' own reduced content every texel of the level
-        // is zero: the generator writes each still sprite's own content and
+        // is zero: the generator writes each sprite's own content — each
+        // still sprite's, and each animated strip's drawn frame — and
         // nothing else, so no cell's padding and no gap ever carries a
         // blend. A reduction over the whole stitched image would leave
         // marks here even where its content-side texels happen to come out
         // equal, which is what makes the rule testable.
-        let written = [blue_rect, red_rect, padded_rect, fallback];
+        let written = [blue_rect, red_rect, padded_rect, strip_frame, fallback];
         for y in 0..image.height {
             for x in 0..image.width {
                 if written.iter().any(|rect| inside(*rect, x, y)) {
@@ -531,20 +539,124 @@ fn the_strip_frames_follow_the_playback_list_with_effective_times() {
         }
     }
 
-    // Animated sprites carry level 0 only: their reduced levels are empty.
+    // The strip draws its first playback entry, and its reduced levels
+    // carry that frame's own pixels at the frame's place; the row the
+    // strip does not draw stays out of them.
     for level in 1..atlas.level_count {
         let image = &atlas.levels[level as usize];
         let frame = shift(reversed.frames[0].content, level);
-        for y in frame.y..frame.y + frame.h {
-            for x in frame.x..frame.x + frame.w {
-                assert_eq!(
+        assert_rect_is(
+            image,
+            frame,
+            PURPLE,
+            &format!("the drawn frame at level {level}"),
+        );
+        let other = shift(reversed.frames[1].content, level);
+        for y in other.y..other.y + other.h {
+            for x in other.x..other.x + other.w {
+                assert_ne!(
                     texel(&image.rgba, image.width, x, y),
-                    [0, 0, 0, 0],
-                    "level {level} leaves the animated sprite empty at ({x}, {y})"
+                    ORANGE,
+                    "level {level} carries the row the strip does not draw at ({x}, {y})"
                 );
             }
         }
     }
+}
+
+#[test]
+fn the_drawn_frame_of_a_strip_reduces_at_its_own_place() {
+    let tree = stitching_tree();
+    let set = TextureSet::load(tree.root()).expect("the tree loads");
+    let atlas = build_atlas(&set, &paths(&["blocks/strip", "blocks/reversed"]), 4)
+        .expect("the strips stitch");
+
+    // Each strip reduces the frame it draws — the first playback entry —
+    // at the frame's own place: the clone generates every sprite's mipmaps
+    // from its frames (`TextureMap.loadTextureAtlas`, `TextureMap.java:179`,
+    // `TextureAtlasSprite.generateMipmaps` `:330-374`) and uploads the
+    // first frame's chain (`:235`), so a minified liquid samples its
+    // frame's own averaging rather than an empty cell. The row the strip
+    // does not draw must stay out of its frame's cell.
+    for (path, drawn_colour, other_colour) in [
+        ("blocks/strip", YELLOW, CYAN),
+        ("blocks/reversed", PURPLE, ORANGE),
+    ] {
+        let cell = atlas.sprites[path].region;
+        let frame = atlas.drawn(path).content;
+        assert_eq!(frame.w, frame.h, "{path}: the drawn frame is square");
+        for level in 1..atlas.level_count {
+            let image = &atlas.levels[level as usize];
+            assert_rect_is(
+                image,
+                shift(frame, level),
+                drawn_colour,
+                &format!("{path}: the drawn frame at level {level}"),
+            );
+            let reduced_cell = shift(cell, level);
+            for y in reduced_cell.y..reduced_cell.y + reduced_cell.h {
+                for x in reduced_cell.x..reduced_cell.x + reduced_cell.w {
+                    assert_ne!(
+                        texel(&image.rgba, image.width, x, y),
+                        other_colour,
+                        "{path}: the row the strip does not draw reaches level {level} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_drawn_sprite_of_a_strip_is_its_first_frame() {
+    let tree = stitching_tree();
+    let set = TextureSet::load(tree.root()).expect("the tree loads");
+    let atlas = build_atlas(
+        &set,
+        &paths(&["blocks/red", "blocks/strip", "blocks/reversed"]),
+        4,
+    )
+    .expect("the tree stitches");
+
+    // A still path draws from its stitched sprite.
+    assert_eq!(atlas.drawn("blocks/red"), &atlas.sprites["blocks/red"]);
+
+    // An animated path draws from its first frame, never the strip:
+    // `TextureAtlasSprite.loadSprite` sets the sprite's height to its width
+    // for an animation (`:289-294`), so every quad's rect is one frame's, and
+    // the strip's taller content rect reaches no quad.
+    let strip = atlas.sprites["blocks/strip"];
+    let frames = &atlas.animated["blocks/strip"].frames;
+    assert_eq!(atlas.drawn("blocks/strip"), &frames[0]);
+    assert_eq!(
+        atlas.drawn("blocks/strip").content,
+        SpriteRect {
+            x: strip.content.x,
+            y: strip.content.y,
+            w: 16,
+            h: 16
+        },
+        "the drawn rect is the strip's first row, one frame tall"
+    );
+    assert_ne!(
+        atlas.uv(atlas.drawn("blocks/strip")),
+        atlas.uv(&strip),
+        "the frame's uv pair is not the whole strip's"
+    );
+
+    // The out-of-order strip draws its own first playback entry — the
+    // strip's second row — so the answer follows the frame list, not the
+    // strip's pixel order.
+    let reversed = &atlas.animated["blocks/reversed"].frames;
+    assert_eq!(atlas.drawn("blocks/reversed"), &reversed[0]);
+    assert_eq!(
+        atlas.drawn("blocks/reversed").content.y,
+        atlas.sprites["blocks/reversed"].content.y + 16,
+        "the reversed strip's first frame is its second row"
+    );
+
+    // A path the atlas never stitched falls back to the missing sprite.
+    assert_eq!(atlas.drawn("blocks/absent"), &atlas.missing);
 }
 
 #[test]

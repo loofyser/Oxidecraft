@@ -25,8 +25,12 @@
 //! the client's generator itself allocates (`TextureUtil.java:51`) and
 //! uploads (`:208-210`). Levels are generated per sprite from that sprite's
 //! own content with the client's own gamma-space blend (`:98-156`), so a
-//! reduction never blends two neighbouring sprites; animated strips are
-//! nearest sampled and stay level-0 only.
+//! reduction never blends two neighbouring sprites; an animated strip draws
+//! one frame — its first playback entry — and its reductions are that
+//! frame's own pixels at the frame's place, matching the clone, which
+//! generates a sprite's mipmaps from its frames (`TextureMap.java:179`,
+//! `TextureAtlasSprite.generateMipmaps :330-374`) and uploads the first
+//! frame's chain (`:235`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -155,6 +159,27 @@ impl Atlas {
             w: sprite.content.w >> level,
             h: sprite.content.h >> level,
         }
+    }
+
+    /// The sprite a texture path draws from: the one a quad's uv pair comes
+    /// from.
+    ///
+    /// An animated strip's sprite is one frame, never the strip.
+    /// `TextureAtlasSprite.loadSprite` sets the sprite's height to its width
+    /// when its `.mcmeta` asks for an animation (`:289-294`), and its uv
+    /// methods divide by that height — so every uv a quad carries covers a
+    /// single frame, and the animation's own frames are the sprite's pixels,
+    /// re-uploaded in place as it advances (`TextureAtlasSprite.java:170-191`).
+    /// This atlas keeps the strip whole at level 0 and its frames in
+    /// [`Atlas::animated`]; with the frame advance parked, the drawn frame is
+    /// the first playback entry. A path with no animation is its stitched
+    /// sprite, and a path the atlas never stitched is the fallback.
+    pub fn drawn(&self, path: &str) -> &AtlasSprite {
+        self.animated
+            .get(path)
+            .and_then(|animated| animated.frames.first())
+            .or_else(|| self.sprites.get(path))
+            .unwrap_or(&self.missing)
     }
 
     /// The stand-in atlas: the procedural fallback sprite alone.
@@ -360,19 +385,41 @@ pub fn build_atlas(
         );
     }
 
-    // Levels 1..: each still sprite reduced from its own content, so
-    // neighbouring cells never blend. Animated strips stay at level 0.
+    // Levels 1..: each sprite reduced from its own drawn content, so
+    // neighbouring cells never blend. An animated strip's drawn content is
+    // one frame — its first playback entry — and its reductions are that
+    // frame's own pixels at the frame's place: the clone generates every
+    // sprite's mipmaps from its frames (`TextureMap.java:179`) and uploads
+    // the first frame's chain (`:235`), so a minified liquid samples its
+    // frame's averaging rather than an empty cell.
     let mut mips: Vec<Mip> = plans
         .iter()
         .zip(&regions)
-        .filter(|(plan, _)| plan.playback.is_none())
-        .map(|(plan, region)| Mip {
-            x: region.x,
-            y: region.y,
-            w: plan.width,
-            h: plan.height,
-            rgba: plan.pixels.to_vec(),
-            transparent: plan.pixels.chunks_exact(4).any(|texel| texel[3] == 0),
+        .map(|(plan, region)| match &plan.playback {
+            None => Mip {
+                x: region.x,
+                y: region.y,
+                w: plan.width,
+                h: plan.height,
+                rgba: plan.pixels.to_vec(),
+                transparent: plan.pixels.chunks_exact(4).any(|texel| texel[3] == 0),
+            },
+            Some(playback) => {
+                // The drawn frame's row of the strip; playback is never
+                // empty.
+                let row = playback.first().map_or(0, |(row, _)| *row);
+                let side = plan.width as usize * plan.width as usize * 4;
+                let at = row as usize * side;
+                let rgba = plan.pixels[at..at + side].to_vec();
+                Mip {
+                    x: region.x,
+                    y: region.y + row * plan.width,
+                    w: plan.width,
+                    h: plan.width,
+                    transparent: rgba.chunks_exact(4).any(|texel| texel[3] == 0),
+                    rgba,
+                }
+            }
         })
         .collect();
     for rank in 1..count {
