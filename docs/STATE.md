@@ -117,8 +117,8 @@ specification and continue without asking questions that are already answered he
   run `35873490870` (six jobs; the release build was added after the tag). The M1 reviewed head
   `854ca85` is green in run `36288859598` (all seven jobs), and the M1 close-out commit `930ccab`
   (the commit the `m1` tag marks) is green in run `36300166552` (all seven jobs). The M2 reviewed
-  head `38ac081` is green in run `36999029133` (all seven jobs); the M2 close-out commit's run is
-  recorded below. Caveat from the run: between 2026-09-27 and 2026-10-02 main was red (the runner's
+  head `38ac081` is green in run `36999029133` (all seven jobs), and the M2 close-out commit
+  `e90a30d` (the commit the `m2` tag marks) is green in run `36999837908` (all seven jobs). Caveat from the run: between 2026-09-27 and 2026-10-02 main was red (the runner's
   newer stable clippy, `for_kv_map` at `crates/oxide-assets/tests/atlas.rs:178`; the local stable
   was six releases behind) — fixed by `38ac081`; keep the local stable current. Caveats to carry forward:
   `aarch64-apple-darwin` is not checked on Linux runners because its C dependencies need the macOS
