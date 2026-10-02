@@ -66,8 +66,10 @@ use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
 };
+use crate::physics;
 use crate::player::Player;
 use crate::ticker::Ticker;
+use crate::world_view::WorldView;
 
 /// The plugin channel a vanilla client announces itself on.
 const BRAND_CHANNEL: &str = "MC|Brand";
@@ -902,6 +904,11 @@ fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
 /// A tick that moved the clock also reports the sky it moved: the sun should
 /// travel at the tick rate, not at the Time Update rate. A frozen clock moves
 /// nothing, so it reports nothing.
+///
+/// The movement model runs within the tick, against the world as it stands
+/// ([`physics::step`]): the fluid probe, the jump cooldown, the drag and the
+/// collision walk all happen here, and the tick's report carries where the
+/// step left the player.
 fn step_tick(
     player: &mut Player,
     input: &Intent,
@@ -915,6 +922,14 @@ fn step_tick(
     player.sneaking = input.sneak;
     let sprinting = player.sprinting;
     player.sprinting = player.sprint_tap.update(input, sprinting, player.on_ground);
+
+    // The movement model runs one step against the world as it stands: the
+    // fluid probe, the jump cooldown, the drag and the collision walk move the
+    // player, and the report below carries where the step left it. Before Join
+    // Game there is no world to move against and the step is skipped.
+    if let Some(world) = world {
+        physics::step(player, input, &WorldView(world));
+    }
 
     let mut advanced = false;
     if let Some(clock) = clock.as_mut() {

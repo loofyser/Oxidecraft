@@ -2,7 +2,8 @@
 //! the name, the metadata layout, the light columns, the two cube predicates
 //! (**`full_cube` from `isFullCube()` and `occludes` from `isOpaqueCube()`**,
 //! which the cull rule reads and which are not the same column), the material,
-//! the render layer, the tint kind and the render path the rest of the
+//! the render layer, the tint kind, the render path and the movement columns
+//! (`collision`, `hardness`, `climbable`, `slipperiness`) the rest of the
 //! milestone consumes.
 //!
 //! # Scope
@@ -45,6 +46,13 @@
 //!   `west`, `east`) and the horizontal order (`south`, `west`, `north`, `east`)
 //!   the facing properties are packed through.
 //! * `init/Blocks.java` — the registration names the client resolves blocks by.
+//! * `block/Block.java` and the block classes — the movement columns: the
+//!   registration lines' `setHardness`/`setBlockUnbreakable` and the classes'
+//!   own constructors for the hardness, `EntityLivingBase.isOnLadder`'s test
+//!   for the climbable flag, the classes' `slipperiness` assignments, and
+//!   each class's `addCollisionBoxesToList`/`getCollisionBoundingBox` for the
+//!   collision class (the boxes are the pure shape functions in
+//!   `crate::collision`).
 //! * `client/renderer/BlockModelShapes.java` — the state mapper that picks the
 //!   blockstate file and the variant key per state, and the built-in blocks that
 //!   have neither.
@@ -196,6 +204,27 @@ impl Material {
         self.blocks_light() && !matches!(self, Material::Liquid)
     }
 
+    /// `Material.isOpaque()`: whether the material reads opaque to the
+    /// connection rules a fence, wall or pane resolves.
+    ///
+    /// `isTranslucent ? false : blocksMovement()` (`block/material/Material.java:170-173`);
+    /// the six materials that call `setTranslucent()` — leaves, glass, tnt,
+    /// ice, snow, cactus (`Material.java:14,23,25,27,29,33`) — answer false
+    /// whatever their movement, and the rest read [`Material::blocks_movement`].
+    /// The predicate is `BlockFence.canConnectTo`'s (`BlockFence.java:161`)
+    /// and `BlockWall.canConnectTo`'s (`BlockWall.java:122`).
+    pub fn is_opaque(self) -> bool {
+        !matches!(
+            self,
+            Material::Leaves
+                | Material::Glass
+                | Material::Tnt
+                | Material::Ice
+                | Material::Snow
+                | Material::Cactus
+        ) && self.blocks_movement()
+    }
+
     /// `Material.isSolid()`: whether a block of this material counts as solid
     /// ground, the flag the fluid-height predicate reads.
     ///
@@ -247,6 +276,66 @@ pub enum RenderKind {
     /// itself (their elements carry `"shade": false`); this value is the
     /// table's own bookkeeping of which blocks are those plants.
     Cross,
+}
+
+/// The collision shape class a block's id resolves through.
+///
+/// Every class is the box or boxes the source's block class answers from its
+/// `addCollisionBoxesToList`/`getCollisionBoundingBox` overrides; the shapes
+/// are the pure functions in [`crate::collision`], and the classes that read
+/// their neighbours are resolved by the view (`oxide-game`'s `WorldView`).
+/// A class with no covered id today (the snow layer, the cobblestone wall)
+/// is declared all the same: later milestones add the ids, and the movement
+/// model should not learn a new vocabulary then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionShape {
+    /// No collision box: the liquids (`BlockLiquid.java:121-124`), the cross
+    /// plants (`BlockBush.java:76-79`, inherited by the flowers, mushrooms,
+    /// crops, double plant, tall grass and dead bush; `BlockTorch.java:40-43`;
+    /// `BlockReed.java:116-119`) and the pressure plate
+    /// (`BlockBasePressurePlate.java:57-60`) answer a null box.
+    None,
+    /// The block's own unit cube: `Block.getCollisionBoundingBox`'s default
+    /// (`block/Block.java:499-502`).
+    Full,
+    /// A slab: the named half, or the full cube for the double variant
+    /// ([`crate::collision::slab_boxes`]; `BlockSlab.java:28-35`, `:45-67`).
+    Slab {
+        /// Whether the double-slab variant fills its cell
+        /// (`BlockSlab.java:28-31`); the one covered id is 43, whose id names
+        /// the double slab alone.
+        double: bool,
+    },
+    /// A stair: the base half plus the step and corner boxes
+    /// ([`crate::collision::stairs_boxes`]; `BlockStairs.java:533-546`).
+    Stairs,
+    /// A snow layer: the full footprint at its counted height
+    /// ([`crate::collision::snow_layer_box`]; `BlockSnow.java:43-48`).
+    SnowLayers,
+    /// A cactus: the 1/16 inset ([`crate::collision::cactus_box`];
+    /// `BlockCactus.java:63-68`).
+    Cactus,
+    /// A fence: its post and arms ([`crate::collision::fence_boxes`];
+    /// `BlockFence.java:50-107`).
+    Fence,
+    /// A cobblestone wall: its post and arms, 1.5 high
+    /// ([`crate::collision::wall_box`]; `BlockWall.java:115-120`).
+    Wall,
+    /// A pane: the two axis plates ([`crate::collision::pane_boxes`];
+    /// `BlockPane.java:75-122`).
+    Pane,
+    /// A chest: the 14/16 box ([`crate::collision::chest_box`];
+    /// `BlockChest.java:42`, `:66-88`).
+    Chest,
+    /// A door: the 3/16 plate ([`crate::collision::door_box`];
+    /// `BlockDoor.java:72-76`, `:83-154`).
+    Door,
+    /// A ladder: the 1/8 plate on its attached face
+    /// ([`crate::collision::ladder_box`]; `BlockLadder.java:28-32`, `:40-66`).
+    Ladder,
+    /// A soul sand block: the full footprint, its top at 7/8
+    /// ([`crate::collision::soul_sand_box`]; `BlockSoulSand.java:20-24`).
+    SoulSand,
 }
 
 /// The offset of a property that the metadata does not carry.
@@ -354,6 +443,36 @@ pub struct BlockBehaviour {
     pub liquid: Option<LiquidKind>,
     /// How the block's geometry is produced.
     pub render: RenderKind,
+    /// The collision shape class, resolved per state (see [`CollisionShape`]).
+    pub collision: CollisionShape,
+    /// `Block.getBlockHardness()`: the source's `blockHardness`
+    /// (`block/Block.java:115`, set by `setHardness` at `:395-398` and by
+    /// `setBlockUnbreakable` at `:407-409`, which is `-1.0`).
+    pub hardness: f32,
+    /// `EntityLivingBase.isOnLadder()`: whether the movement model climbs a
+    /// block of this id. The source tests the block itself —
+    /// `block == Blocks.ladder || block == Blocks.vine`
+    /// (`entity/EntityLivingBase.java:1134-1141`) — and of the covered ids
+    /// only the ladder (65) is admitted.
+    pub climbable: bool,
+    /// `Block.slipperiness`: the friction multiplier (`block/Block.java:291`
+    /// sets the `0.6` default; `BlockIce.java:23` the one `0.98`).
+    pub slipperiness: f32,
+}
+
+impl BlockBehaviour {
+    /// `Block.isFullBlock()`: whether the block fills its cell for the
+    /// connection rules a pane reads (`BlockPane.java:177`).
+    ///
+    /// The source sets `fullBlock` once, at construction, from
+    /// `isOpaqueCube()` (`block/Block.java:295`) — this table's `occludes`
+    /// column — and only the double slab moves it afterwards
+    /// (`BlockSlab.java:28-31`). The leaves' `isOpaqueCube()` is a runtime
+    /// graphics read (`BlockLeaves.java:278-281`); the column carries M2's
+    /// Fast-graphics value, as it does everywhere else in the row.
+    pub fn is_full_block(&self) -> bool {
+        self.occludes || matches!(self.collision, CollisionShape::Slab { double: true })
+    }
 }
 
 /// The ids the table covers, sorted.
@@ -740,6 +859,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 1.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockGrass: SNOWY (BlockGrass.java:21); the metadata packs the flag away
     // (getMetaFromState returns 0), so the meta-derived state is never snowy.
@@ -759,6 +882,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::GrassSideOverlay,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.6,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockDirt: VARIANT + SNOWY (BlockDirt.java:22-23); only the variant is
     // packed.
@@ -786,6 +913,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // Plain rock and wood blocks with no properties: Block.java's registerBlock
     // lines 4, 7, 13-16, 21, 41, 42, 45, 47-49, 56-58, 73, 82, 87, 88, 129.
@@ -803,6 +934,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockPlanks: VARIANT (BlockPlanks.java:16-17), all six wood types.
     BlockBehaviour {
@@ -826,6 +961,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 7,
@@ -841,6 +980,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: -1.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockDynamicLiquid / BlockStaticLiquid with Material.water
     // (Block.java:1261-1262): registration opacity 3, translucent layer.
@@ -858,6 +1001,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Water,
         liquid: Some(LiquidKind::Water),
         render: RenderKind::Liquid,
+        collision: CollisionShape::None,
+        hardness: 100.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 9,
@@ -873,6 +1020,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Water,
         liquid: Some(LiquidKind::Water),
         render: RenderKind::Liquid,
+        collision: CollisionShape::None,
+        hardness: 100.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockDynamicLiquid / BlockStaticLiquid with Material.lava
     // (Block.java:1263-1264): no opacity is set, the ctor rule gives 0, and the
@@ -891,6 +1042,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: Some(LiquidKind::Lava),
         render: RenderKind::Liquid,
+        collision: CollisionShape::None,
+        hardness: 100.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 11,
@@ -906,6 +1061,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: Some(LiquidKind::Lava),
         render: RenderKind::Liquid,
+        collision: CollisionShape::None,
+        hardness: 100.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockSand: VARIANT (BlockSand.java:16-17), sand and red sand.
     BlockBehaviour {
@@ -929,6 +1088,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockGravel falls through BlockFalling to Material.sand (BlockFalling.java:16-19).
     BlockBehaviour {
@@ -945,6 +1108,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.6,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockOre, material rock: gold, iron, coal, lapis, diamond, emerald and quartz ore.
     BlockBehaviour {
@@ -961,6 +1128,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 15,
@@ -976,6 +1147,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 16,
@@ -991,6 +1166,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockOldLog: VARIANT + LOG_AXIS (BlockOldLog.java:16-22, 77-100, 107-132);
     // the variant's low two bits and the axis's high two bits, y first.
@@ -1025,6 +1204,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockOldLeaf: VARIANT + CHECK_DECAY + DECAYABLE (BlockOldLeaf.java:103-137);
     // leaves carry opacity 1 (BlockLeaves.java:33) and the Fast layer (SOLID).
@@ -1063,6 +1246,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Foliage,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.2,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockGlass (Material.glass): non-opaque, cutout, full-cube false.
     BlockBehaviour {
@@ -1079,6 +1266,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.3,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 21,
@@ -1094,6 +1285,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockSandStone: TYPE (BlockSandStone.java:17), three values packed whole.
     BlockBehaviour {
@@ -1117,6 +1312,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.8,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockTallGrass: TYPE (BlockTallGrass.java:26, 152-168), Material.vine; the
     // grass and fern models carry a tint index (BlockModelRenderer.java:142-144),
@@ -1142,6 +1341,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Grass,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockDeadBush: no properties (BlockDeadBush.java:19-24); its cross model
     // carries no tint index.
@@ -1159,6 +1362,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockColored: COLOR (BlockColored.java:17, 57-73), the sixteen dye colours.
     BlockBehaviour {
@@ -1182,6 +1389,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.8,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockYellowFlower / BlockRedFlower through BlockFlower: TYPE
     // (BlockFlower.java:50-87), Material.plants; the cross model is untinted.
@@ -1206,6 +1417,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 38,
@@ -1228,6 +1443,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockMushroom through BlockBush: no properties; the brown mushroom's
     // registration sets the light level 0.125, which is the emission 1
@@ -1246,6 +1465,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 40,
@@ -1261,6 +1484,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // The metal blocks, Material.iron.
     BlockBehaviour {
@@ -1277,6 +1504,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 42,
@@ -1292,6 +1523,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 5.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockStoneSlab's states are meta-derived for the double slab only: id 43
     // carries SEAMLESS + VARIANT (BlockStoneSlab.java:94-136), and the short
@@ -1324,6 +1559,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Slab { double: true },
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 45,
@@ -1339,6 +1578,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockTNT: EXPLODE (BlockTNT.java:23, 144-160), Material.tnt.
     BlockBehaviour {
@@ -1355,6 +1598,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 47,
@@ -1370,6 +1617,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 1.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 48,
@@ -1385,6 +1636,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 49,
@@ -1400,6 +1655,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 50.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockTorch: FACING (BlockTorch.java:24-30, 244-311), Material.circuits,
     // registration light level 0.9375 which is the emission 14 (Block.java:1307).
@@ -1424,6 +1683,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockMobSpawner: no properties, non-opaque (BlockMobSpawner.java:57-60
     // overrides only isOpaqueCube), still a full cube — the default it keeps
@@ -1443,6 +1706,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 5.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockStairs: FACING + HALF + SHAPE (BlockStairs.java:30-32, 726-747,
     // 791-794); the light opacity 255 is set in the constructor
@@ -1487,6 +1754,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Stairs,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockChest: FACING (BlockChest.java:31, 585-608), Material.wood, and a
     // built-in block: the client's registerBuiltInBlocks names it, so it has no
@@ -1514,6 +1785,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Chest,
+        hardness: 2.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 56,
@@ -1529,6 +1804,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 57,
@@ -1544,6 +1823,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 5.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockWorkbench: Material.wood, a plain full cube.
     BlockBehaviour {
@@ -1560,6 +1843,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockCrops: AGE, a PropertyInteger 0..7 (BlockCrops.java:19, 203-219); the
     // crop model carries no tint index, so the block is untinted.
@@ -1584,6 +1871,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockFarmland: MOISTURE 0..7 (BlockFarmland.java:22, 160-176); the
     // constructor sets the light opacity 255 (BlockFarmland.java:30).
@@ -1608,6 +1899,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.6,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockFurnace: FACING (BlockFurnace.java:26, 248-271); the lit variant's
     // registration sets the light level 0.875, the emission 13 (Block.java:1320).
@@ -1632,6 +1927,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 62,
@@ -1654,6 +1953,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockDoor with Material.wood: HALF + FACING + OPEN + HINGE + POWERED
     // (BlockDoor.java:28-38, 367-444), the cutout layer (BlockDoor.java:331).
@@ -1704,6 +2007,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Door,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockLadder: FACING (BlockLadder.java:140-163), Material.circuits, cutout.
     BlockBehaviour {
@@ -1727,6 +2034,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Ladder,
+        hardness: 0.4,
+        climbable: true,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 67,
@@ -1767,6 +2078,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Stairs,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockPressurePlate with Material.wood: POWERED (BlockPressurePlate.java:17,
     // 73-89), the pressure plate geometry non-opaque; only metadata 1 reads as
@@ -1793,6 +2108,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::None,
+        hardness: 0.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockRedstoneOre: no properties; the unlit registration sets no light and
     // the lit one is a different id outside the covered set.
@@ -1810,6 +2129,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockIce: translucent with the registration's opacity 3 (Block.java:1337).
     BlockBehaviour {
@@ -1826,6 +2149,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.5,
+        climbable: false,
+        slipperiness: 0.98,
     },
     // BlockSnowBlock: no properties, Material.craftedSnow.
     BlockBehaviour {
@@ -1842,6 +2169,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.2,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockCactus: AGE, a PropertyInteger 0..15 (BlockCactus.java:21, 134-151),
     // Material.cactus, non-opaque, cutout.
@@ -1866,6 +2197,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Cactus,
+        hardness: 0.4,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockClay: Material.clay, a plain full cube.
     BlockBehaviour {
@@ -1882,6 +2217,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.6,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockReed: AGE 0..15 (BlockReed.java:21, 160-176), Material.plants; the
     // reeds model inherits `block/tallgrass`, whose faces carry a tint index,
@@ -1907,6 +2246,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Grass,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockFence with Material.wood: NORTH + EAST + WEST + SOUTH
     // (BlockFence.java:24-33, 180-197); the connections are world-contextual.
@@ -1924,6 +2267,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Fence,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockPumpkin: FACING (BlockPumpkin.java:133-149), Material.gourd.
     BlockBehaviour {
@@ -1947,6 +2294,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 1.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 87,
@@ -1962,6 +2313,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.4,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockSoulSand: Material.sand.
     BlockBehaviour {
@@ -1978,6 +2333,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::SoulSand,
+        hardness: 0.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockGlowstone with Material.glass: opaque cube, registration light level
     // 1.0, the emission 15 (Block.java:1348).
@@ -1995,6 +2354,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.3,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockStoneBrick: VARIANT (BlockStoneBrick.java:16, 52-68).
     BlockBehaviour {
@@ -2018,6 +2381,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 1.5,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockHugeMushroom with Material.wood: VARIANT (BlockHugeMushroom.java:19,
     // 83-99); its lookup has sixteen slots, three of them unset.
@@ -2042,6 +2409,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.2,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 100,
@@ -2064,6 +2435,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.2,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockPane with Material.glass: NORTH + EAST + WEST + SOUTH
     // (BlockPane.java:23-35, 195-203), non-opaque, the cutout-mipped layer.
@@ -2081,6 +2456,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Pane,
+        hardness: 0.3,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockMycelium: SNOWY, Material.grass (BlockMycelium.java:20-28, 89-97).
     BlockBehaviour {
@@ -2097,6 +2476,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.6,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 129,
@@ -2112,6 +2495,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockCarrot and BlockPotato through BlockCrops: AGE 0..7.
     BlockBehaviour {
@@ -2135,6 +2522,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     BlockBehaviour {
         id: 142,
@@ -2157,6 +2548,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockQuartz: VARIANT (BlockQuartz.java:21, 94-110).
     BlockBehaviour {
@@ -2180,6 +2575,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.8,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockNewLeaf: VARIANT + CHECK_DECAY + DECAYABLE (BlockNewLeaf.java:77-111),
     // the last two wood types.
@@ -2218,6 +2617,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Foliage,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 0.2,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockNewLog: VARIANT + LOG_AXIS (BlockNewLog.java:69-124).
     BlockBehaviour {
@@ -2251,6 +2654,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
     // BlockDoublePlant: HALF + VARIANT + FACING (BlockDoublePlant.java:28-39,
     // 281-316), Material.vine. The source tints the grass and fern variants with
@@ -2298,6 +2705,10 @@ const TABLE: &[BlockBehaviour] = &[
         tint: TintKind::Grass,
         liquid: None,
         render: RenderKind::Cross,
+        collision: CollisionShape::None,
+        hardness: 0.0,
+        climbable: false,
+        slipperiness: 0.60,
     },
 ];
 
@@ -2326,6 +2737,16 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::collision::{
+        CollisionBox, Connections, Facing, SlabHalf, cactus_box, chest_box, door_box, fence_boxes,
+        ladder_box, pane_boxes, slab_boxes, snow_layer_box, soul_sand_box, stairs_boxes, wall_box,
+    };
+
+    /// The row for a covered id.
+    fn block(id: u16) -> &'static BlockBehaviour {
+        behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"))
+    }
 
     #[test]
     fn the_table_is_sorted_and_unique() {
@@ -2377,5 +2798,235 @@ mod tests {
         let mushroom = behaviour(99).expect("mushroom");
         assert_eq!(variant_key(mushroom, 11), "variant=all_inside");
         assert_eq!(variant_key(mushroom, 15), "variant=all_stem");
+    }
+
+    #[test]
+    fn the_movement_columns_name_the_sources_classes() {
+        // Every covered id's collision class, from its source block class'
+        // overrides. The ids that are not the full cube:
+        let classes: [(u16, CollisionShape); 27] = [
+            (8, CollisionShape::None),
+            (9, CollisionShape::None),
+            (10, CollisionShape::None),
+            (11, CollisionShape::None),
+            (31, CollisionShape::None),
+            (32, CollisionShape::None),
+            (37, CollisionShape::None),
+            (38, CollisionShape::None),
+            (39, CollisionShape::None),
+            (40, CollisionShape::None),
+            (43, CollisionShape::Slab { double: true }),
+            (50, CollisionShape::None),
+            (53, CollisionShape::Stairs),
+            (54, CollisionShape::Chest),
+            (59, CollisionShape::None),
+            (64, CollisionShape::Door),
+            (65, CollisionShape::Ladder),
+            (67, CollisionShape::Stairs),
+            (72, CollisionShape::None),
+            (81, CollisionShape::Cactus),
+            (83, CollisionShape::None),
+            (85, CollisionShape::Fence),
+            (88, CollisionShape::SoulSand),
+            (102, CollisionShape::Pane),
+            (141, CollisionShape::None),
+            (142, CollisionShape::None),
+            (175, CollisionShape::None),
+        ];
+        for &id in covered_ids() {
+            let entry = behaviour(id).expect("covered");
+            let expected = classes
+                .iter()
+                .find(|(class_id, _)| *class_id == id)
+                .map_or(CollisionShape::Full, |(_, shape)| *shape);
+            assert_eq!(entry.collision, expected, "id {id}'s collision class");
+        }
+    }
+
+    #[test]
+    fn the_shape_functions_carry_the_sources_boxes() {
+        // A slab's halves and the double variant's cube (`BlockSlab.java:34`,
+        // `:49`, `:57-64`).
+        assert_eq!(
+            slab_boxes(false, SlabHalf::Bottom)[0],
+            CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.5, 1.0])
+        );
+        assert_eq!(
+            slab_boxes(false, SlabHalf::Top)[0],
+            CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 1.0])
+        );
+        assert_eq!(slab_boxes(true, SlabHalf::Bottom)[0], CollisionBox::full());
+
+        // A lone stair's base half and step box per facing
+        // (`BlockStairs.java:80-90`, `:292-406`).
+        let base_bottom = CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.5, 1.0]);
+        let base_top = CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 1.0]);
+        for (facing, step) in [
+            (
+                Facing::North,
+                CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 0.5]),
+            ),
+            (
+                Facing::South,
+                CollisionBox::of([0.0, 0.5, 0.5], [1.0, 1.0, 1.0]),
+            ),
+            (
+                Facing::West,
+                CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 1.0]),
+            ),
+            (
+                Facing::East,
+                CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 1.0]),
+            ),
+        ] {
+            let lower = stairs_boxes(facing, SlabHalf::Bottom, |_| None);
+            assert_eq!(lower, vec![base_bottom, step], "a bottom stair, {facing:?}");
+            let top = stairs_boxes(facing, SlabHalf::Top, |_| None);
+            assert_eq!(top[0], base_top, "a top stair's base, {facing:?}");
+            assert_eq!(top[1].min[1], 0.0, "a top stair's step is low, {facing:?}");
+        }
+
+        // The fence's post and arms (`BlockFence.java:50-107`).
+        assert_eq!(
+            fence_boxes(Connections::default()),
+            vec![CollisionBox::of([0.375, 0.0, 0.375], [0.625, 1.5, 0.625])]
+        );
+        assert_eq!(
+            fence_boxes(Connections {
+                north: true,
+                south: true,
+                west: true,
+                east: true,
+            }),
+            vec![
+                CollisionBox::of([0.375, 0.0, 0.0], [0.625, 1.5, 1.0]),
+                CollisionBox::of([0.0, 0.0, 0.375], [1.0, 1.5, 0.625]),
+            ]
+        );
+
+        // The cactus' inset (`BlockCactus.java:63-68`).
+        assert_eq!(
+            cactus_box(),
+            CollisionBox::of([0.0625, 0.0, 0.0625], [0.9375, 0.9375, 0.9375])
+        );
+
+        // The snow layer heights, one per layer: the property runs 1..=8 and
+        // the top stands (layers - 1)/8 above the block's base
+        // (`BlockSnow.java:43-48`, `:71-80`).
+        let heights = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875];
+        for (index, height) in heights.iter().enumerate() {
+            let layers = index as u8 + 1;
+            assert_eq!(
+                snow_layer_box(layers),
+                CollisionBox::of([0.0, 0.0, 0.0], [1.0, *height, 1.0]),
+                "{layers} layers"
+            );
+        }
+
+        // The wall's post, arms and 1.5 collision height
+        // (`BlockWall.java:67-120`).
+        assert_eq!(
+            wall_box(Connections {
+                north: true,
+                east: true,
+                ..Connections::default()
+            }),
+            CollisionBox::of([0.25, 0.0, 0.0], [1.0, 1.5, 0.75])
+        );
+
+        // The ladder's plate. The task brief pinned this class as `NONE`; the
+        // source's `getCollisionBoundingBox` answers a 1/8 plate on the
+        // attached face (`BlockLadder.java:28-32`, `:40-66`), so the pin is
+        // refuted and the plate is pinned here.
+        assert_eq!(
+            ladder_box(Facing::North),
+            CollisionBox::of([0.0, 0.0, 0.875], [1.0, 1.0, 1.0])
+        );
+
+        // Soul sand's top (`BlockSoulSand.java:20-24`).
+        assert_eq!(
+            soul_sand_box(),
+            CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.875, 1.0])
+        );
+
+        // The chest box and its merge toward a same-block neighbour
+        // (`BlockChest.java:42`, `:66-88`).
+        assert_eq!(
+            chest_box(false, false, false, false),
+            CollisionBox::of([0.0625, 0.0, 0.0625], [0.9375, 0.875, 0.9375])
+        );
+        assert_eq!(chest_box(true, false, false, false).min[2], 0.0);
+        assert_eq!(chest_box(false, false, false, true).max[0], 1.0);
+
+        // The door's closed plate and its open swing (`BlockDoor.java:83-154`).
+        assert_eq!(
+            door_box(Facing::North, false, false),
+            CollisionBox::of([0.0, 0.0, 0.8125], [1.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            door_box(Facing::North, true, false),
+            CollisionBox::of([0.0, 0.0, 0.0], [0.1875, 1.0, 1.0])
+        );
+
+        // The pane's cross alone, and the single plate a one-sided connection
+        // yields (`BlockPane.java:75-122`).
+        assert_eq!(pane_boxes(Connections::default()).len(), 2);
+        assert_eq!(
+            pane_boxes(Connections {
+                west: true,
+                ..Connections::default()
+            })
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_hardness_column_carries_the_sources_values() {
+        // The registration lines (`block/Block.java`), the classes' own
+        // constructors (logs and leaves through `BlockLog.java:21` and
+        // `BlockLeaves.java:32`, the crops through `BlockCrops.java:28`, the
+        // double plant through `BlockDoublePlant.java:36`) and the stairs'
+        // model copy (`BlockStairs.java:45`).
+        assert_eq!(block(1).hardness, 1.5); // stone, Block.java:1252
+        assert_eq!(block(3).hardness, 0.5); // dirt, :1254
+        assert_eq!(block(7).hardness, -1.0); // bedrock's setBlockUnbreakable, :1260
+        assert_eq!(block(9).hardness, 100.0); // water, :1262
+        assert_eq!(block(17).hardness, 2.0); // log, BlockLog.java:21
+        assert_eq!(block(18).hardness, 0.2); // leaves, BlockLeaves.java:32
+        assert_eq!(block(20).hardness, 0.3); // glass, :1273
+        assert_eq!(block(35).hardness, 0.8); // wool, :1289
+        assert_eq!(block(49).hardness, 50.0); // obsidian, :1306
+        assert_eq!(block(53).hardness, 2.0); // oak stairs' planks model, :1310 and :1258
+        assert_eq!(block(59).hardness, 0.0); // wheat, BlockCrops.java:28
+        assert_eq!(block(67).hardness, 2.0); // stone stairs' model, :1325 and :1256
+        assert_eq!(block(88).hardness, 0.5); // soul sand, :1347
+        assert_eq!(block(102).hardness, 0.3); // glass pane, :1362
+        assert_eq!(block(141).hardness, 0.0); // carrots, BlockCrops.java:28
+        assert_eq!(block(142).hardness, 0.0); // potatoes, BlockCrops.java:28
+        assert_eq!(block(161).hardness, 0.2); // leaves2, BlockLeaves.java:32
+        assert_eq!(block(162).hardness, 2.0); // log2, BlockLog.java:21
+        assert_eq!(block(175).hardness, 0.0); // double plant, BlockDoublePlant.java:36
+    }
+
+    #[test]
+    fn the_movement_metadata_is_the_source_default_everywhere_but_its_overrides() {
+        for &id in covered_ids() {
+            let entry = behaviour(id).expect("covered");
+            assert_eq!(
+                entry.climbable,
+                id == 65,
+                "id {id}: only the ladder passes isOnLadder's test"
+            );
+            assert_eq!(
+                entry.slipperiness,
+                if id == 79 { 0.98 } else { 0.6 },
+                "id {id}: Block.java:291's default, BlockIce.java:23's ice"
+            );
+            assert!(
+                entry.hardness >= -1.0 && entry.hardness.is_finite(),
+                "id {id}: a hardness above the unbreakable sentinel"
+            );
+        }
     }
 }

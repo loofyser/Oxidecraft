@@ -9,3 +9,4 @@ pub mod physics;
 pub mod player;
 pub mod session;
 pub mod ticker;
+pub mod world_view;

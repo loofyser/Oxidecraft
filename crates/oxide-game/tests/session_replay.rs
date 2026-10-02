@@ -1978,3 +1978,93 @@ fn the_pitch_look_clamps_at_ninety_degrees_each_way() {
         "a delta far up clamps the pitch at -90"
     );
 }
+
+/// One ground-up column whose section 3 is solid stone: the floor's top
+/// surface at y 64, air above and below the sent sections.
+fn floor_column_frame(cx: i32, cz: i32) -> Vec<u8> {
+    let mut section = vec![0u8; 8192];
+    for cell in section.chunks_exact_mut(2) {
+        cell.copy_from_slice(&0x0010u16.to_le_bytes());
+    }
+    let mut payload = section;
+    payload.extend_from_slice(&[0u8; 2048]); // block light
+    payload.extend_from_slice(&[0xFFu8; 2048]); // sky light
+    payload.extend_from_slice(&[1u8; 256]); // biomes
+    column_frame(cx, cz, true, 0x0008, &payload)
+}
+
+#[test]
+fn a_held_key_walks_the_player_over_the_floor() {
+    // The first live-movement session test: a join carrying a stone floor, the
+    // player teleported onto its surface facing south (yaw 0), and a quiet
+    // stretch with the forward key held. Every due tick steps the movement
+    // model against the world — the player walks along the floor, the height
+    // and the ground contact hold, and the walk keeps its heading.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(Vec::new()),
+        // Half a second of quiet: enough whole steps for the walk to show.
+        stalls: 24,
+        tail_stalls: 0,
+        outgoing: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    input_tx
+        .send(InputEvent::Key {
+            key: Key::W,
+            pressed: true,
+        })
+        .expect("the input channel is open");
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, input_rx)
+        .expect("the session runs to the end of the stream");
+
+    let walks: Vec<(f64, f64, f64, bool)> = receiver
+        .try_iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                x,
+                y,
+                z,
+                on_ground,
+                snapped: false,
+                ..
+            } => Some((x, y, z, on_ground)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        walks.len() >= 4,
+        "the quiet stretch owes whole steps: {walks:?}"
+    );
+    // The floor carries the walk: the feet stay on its surface, never sink.
+    assert!(
+        walks.iter().all(|(_, y, _, _)| (*y - 64.0).abs() < 1e-9),
+        "the floor holds the height: {walks:?}"
+    );
+    // The forward key walks south (+Z at yaw 0): every step gains ground.
+    assert!(
+        walks.windows(2).all(|pair| pair[1].2 > pair[0].2),
+        "every step walks south: {walks:?}"
+    );
+    // The heading holds: no drift across the floor.
+    assert!(
+        walks.iter().all(|(x, _, _, _)| (*x - 0.5).abs() < 1e-9),
+        "the walk keeps its heading: {walks:?}"
+    );
+    assert!(
+        walks.last().expect("steps").3,
+        "the last step is on the ground: {walks:?}"
+    );
+}
