@@ -38,6 +38,12 @@ pub struct Player {
     pub flying: bool,
     /// Whether the player is in water.
     pub in_water: bool,
+    /// Ticks left before the held jump may fire again.
+    ///
+    /// `EntityLivingBase.onLivingUpdate:1949-1952` counts `jumpTicks` down and
+    /// the held-jump rule (`:2007-2027`) fires only at zero, then sets it to
+    /// ten: Space held makes the player jump once per ten ticks.
+    pub jump_ticks: i32,
     /// Ticks since the session started.
     pub tick: u64,
     /// The double-tap window the sprint binding keeps across ticks.
@@ -58,6 +64,7 @@ impl Player {
             sneaking: false,
             flying: false,
             in_water: false,
+            jump_ticks: 0,
             tick: 0,
             sprint_tap: SprintTap::default(),
         }
@@ -91,6 +98,7 @@ mod tests {
         assert_eq!(player.last_tick_position, [0.0, 0.0, 0.0]);
         assert_eq!(player.motion, [0.0, 0.0, 0.0]);
         assert_eq!(player.tick, 0);
+        assert_eq!(player.jump_ticks, 0);
         assert!(!player.on_ground);
         assert!(!player.sprinting);
         assert!(!player.sneaking);

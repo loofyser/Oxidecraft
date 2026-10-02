@@ -5,6 +5,7 @@ pub mod input;
 pub mod mesh_queue;
 pub mod mesher;
 pub mod palette;
+pub mod physics;
 pub mod player;
 pub mod session;
 pub mod ticker;
