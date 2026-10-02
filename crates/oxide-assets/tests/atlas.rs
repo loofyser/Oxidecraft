@@ -175,7 +175,7 @@ fn uv_and_level_rect_read_the_content_rect() {
     );
 
     // A level rect is the level-0 content rect shifted right by the level.
-    for (path, _) in atlas.sprites.iter() {
+    for path in atlas.sprites.keys() {
         let sprite = &atlas.sprites[path];
         assert_eq!(atlas.level_rect(sprite, 0), sprite.content);
         for level in 1..atlas.level_count {
