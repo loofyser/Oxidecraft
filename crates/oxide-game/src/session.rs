@@ -68,6 +68,7 @@ use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
 use crate::input::{InputEvent, Intent, look_delta};
+use crate::interaction::{Aim, look_vector, raycast, reach};
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
@@ -296,6 +297,17 @@ pub enum ClientEvent {
         /// Whether a server correction produced this tick.
         snapped: bool,
     },
+    /// The aimed block changed.
+    ///
+    /// The session recomputes the aim after look input and on every tick —
+    /// from the pose eye, along the look vector, for the gamemode's reach —
+    /// and reports only a change, `None` included: a look that leaves every
+    /// block clears the aim. The window's outline and crack passes draw from
+    /// it, and the click paths act on it.
+    Aim {
+        /// The block the interaction ray meets, or `None` when it meets none.
+        aim: Option<Aim>,
+    },
     /// Time Update arrived: the world's clock.
     ///
     /// The time of day is the value the celestial angle and the moon phase are read from, after
@@ -471,17 +483,31 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut clock: Option<Clock> = None;
         let mut ticker = Ticker::new(TICK_PERIOD);
         let mut intent = Intent::neutral();
+        // The gamemode the reach reads, from the last Join Game
+        // (`PlayerControllerMP.getBlockReachDistance`, `:344-346`); the
+        // controller's own default until one arrives is survival
+        // (`PlayerControllerMP.java:59`).
+        let mut gamemode: u8 = 0;
+        // The aim the last recompute left; only a change is reported.
+        let mut aim: Option<Aim> = None;
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
             // the backlog drains across passes — and the bound keeps one pass'
             // work finite however far the window runs ahead.
+            let mut looked = false;
             for _ in 0..INPUTS_PER_PASS {
                 match inputs.try_recv() {
-                    Ok(event) => apply_input(event, &mut intent, &mut player),
+                    Ok(event) => looked |= apply_input(event, &mut intent, &mut player),
                     Err(_) => break,
                 }
+            }
+            // A look moves the aim at once — the mouse is polled between
+            // ticks (`EntityRenderer.updateMouse:1094-1123`) — and only a
+            // change is reported.
+            if looked {
+                update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
             }
 
             // One frame, or one idle wait. A frame that is already readable is
@@ -516,6 +542,10 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // (`EntityPlayerSP.onUpdate:170`), and the action edges
                             // carry the id.
                             player.entity_id = Some(join.entity_id);
+                            // The gamemode the reach reads: `getBlockReachDistance`
+                            // takes creative from the controller's game type
+                            // (`PlayerControllerMP.java:344-346`).
+                            gamemode = join.gamemode;
                             let settings =
                                 payload_of(|out| write_client_settings(out, &config.settings))?;
                             send_reply(&mut conn, &settings)?;
@@ -782,6 +812,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 {
                     send_reply(&mut conn, &payload)?;
                 }
+                // The aim follows the tick's own state: a step that moved the
+                // player, and any world change behind it, is read here.
+                update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
             }
         }
         finish_meshes(
@@ -893,25 +926,65 @@ struct Clock {
     frozen: bool,
 }
 
-/// Applies one window event to the held input and the player's look.
+/// Recomputes the aim and reports it when it changed.
+///
+/// The aim is the block the interaction ray meets: from the pose eye —
+/// `position + eye_height()`, with no displacement — along the look vector,
+/// for the gamemode's reach. A session with no world yet aims at nothing.
+fn update_aim(
+    world: Option<&World>,
+    player: &Player,
+    gamemode: u8,
+    aim: &mut Option<Aim>,
+    events: &Sender<ClientEvent>,
+) {
+    let next = world.and_then(|world| {
+        let eye = [
+            player.position[0],
+            player.position[1] + player.eye_height(),
+            player.position[2],
+        ];
+        raycast(
+            &WorldView(world),
+            eye,
+            look_vector(player.yaw, player.pitch),
+            reach(gamemode),
+        )
+    });
+    if next != *aim {
+        *aim = next;
+        report(events, ClientEvent::Aim { aim: next });
+    }
+}
+
+/// Applies one window event to the held input and the player's look, and
+/// answers whether the look moved.
 ///
 /// The mouse delta turns the player where the source turns it — when the
 /// mouse is polled, in `EntityRenderer.updateMouse` (`:1094-1123`), not on the
 /// tick — with the pitch clamped as `Entity.setAngles` clamps it
 /// (`Entity.java:395`). A focus loss releases every held key, so a window that
-/// stops receiving leaves nothing held.
-fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) {
+/// stops receiving leaves nothing held. A moved look asks for the aim to be
+/// recomputed before the next tick.
+fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> bool {
     match event {
-        InputEvent::Key { key, pressed } => intent.apply_key(key, pressed),
+        InputEvent::Key { key, pressed } => {
+            intent.apply_key(key, pressed);
+            false
+        }
         InputEvent::MouseDelta { dx, dy } => {
             let (d_yaw, d_pitch) = look_delta(dx, dy, MOUSE_SENSITIVITY);
             player.yaw += d_yaw;
             player.pitch = (player.pitch + d_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            true
         }
         // The buttons belong to interaction, not movement; the held intent
         // has no use for them.
-        InputEvent::MouseButton { .. } => {}
-        InputEvent::FocusLost => intent.release_all(),
+        InputEvent::MouseButton { .. } => false,
+        InputEvent::FocusLost => {
+            intent.release_all();
+            false
+        }
     }
 }
 

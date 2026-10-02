@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use oxide_game::input::{InputEvent, Key, MouseButton};
+use oxide_game::interaction::Face;
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
 use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
@@ -2839,5 +2840,159 @@ fn a_correction_quiets_the_reporters_and_a_move_reports_the_position() {
     assert!(
         z > 4.5 && z < 4.8,
         "the small move is reported from the corrected position: {z}"
+    );
+}
+
+/// Join Game with the given gamemode byte: entity 20, the overworld, difficulty
+/// 1, 20 players, the `default` level type.
+fn join_game_frame_as(gamemode: u8) -> Vec<u8> {
+    let mut join = vec![0x01];
+    join.extend_from_slice(&20i32.to_be_bytes());
+    join.extend_from_slice(&[gamemode, 0, 1, 20, 7]);
+    join.extend_from_slice(b"default");
+    join.push(0);
+    join
+}
+
+/// A join carrying the stone floor, a teleport onto its surface at
+/// (0.5, 64, 0.5) facing south, and a stone placed two cells south at
+/// (0, 65, 2): the block the aim finds.
+fn aim_head() -> Vec<u8> {
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 2, STONE),
+        SERVER_FRAMING,
+    );
+    head
+}
+
+#[test]
+fn a_rotation_change_emits_a_new_aim_between_ticks() {
+    // The player faces a stone block; a mouse turn to the west leaves every
+    // block. The turn's aim is reported before the next tick — the look path
+    // recomputes it — and it is the last aim reported: no tick follows it.
+    let flip = InputEvent::MouseDelta { dx: 600.0, dy: 0.0 };
+    let (events, _frames) = flip_session(aim_head(), Vec::new(), 12, 0, vec![(12, flip)]);
+
+    let aims: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, ClientEvent::Aim { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(aims.len(), 2, "the aim appears and leaves: {events:?}");
+    match &events[aims[0]] {
+        ClientEvent::Aim { aim: Some(aim) } => {
+            assert_eq!(
+                (aim.x, aim.y, aim.z, aim.face),
+                (0, 65, 2, Face::North),
+                "the stone the player faces"
+            );
+            assert!(
+                (aim.hit[0] - 0.5).abs() < 1e-9
+                    && (aim.hit[1] - 65.62).abs() < 1e-9
+                    && (aim.hit[2] - 2.0).abs() < 1e-9,
+                "the hit point on the north face: {aim:?}"
+            );
+        }
+        other => panic!("expected the stone the player faces, got {other:?}"),
+    }
+    let last = *aims.last().expect("an aim");
+    assert!(
+        matches!(&events[last], ClientEvent::Aim { aim: None }),
+        "the turn left every block: {:?}",
+        events[last]
+    );
+    assert!(
+        events[..last]
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PlayerTick { snapped: false, .. })),
+        "a tick ran before the turn: {events:?}"
+    );
+    assert!(
+        events[last + 1..]
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::PlayerTick { .. })),
+        "the turn was reported before any further tick: {events:?}"
+    );
+}
+
+#[test]
+fn a_tick_over_a_changed_world_re_emits_the_aim() {
+    // The stone the player faces is removed by a block change; the first tick
+    // that steps the changed world reports the new aim — `None` — right after
+    // its own tick event.
+    let head = aim_head();
+    let mut tail = Vec::new();
+    frame(&mut tail, &block_change_frame(0, 65, 2, 0), SERVER_FRAMING);
+    let (events, _frames) = flip_session(head, tail, 12, 6, Vec::new());
+
+    let first = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Aim { aim: Some(_), .. }))
+        .expect("the stone was aimed before the change");
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("the aim changed");
+    assert!(last > first, "the change moved the aim: {events:?}");
+    assert!(
+        matches!(&events[last], ClientEvent::Aim { aim: None }),
+        "the stone is gone: {:?}",
+        events[last]
+    );
+    assert!(
+        matches!(
+            events[last - 1],
+            ClientEvent::PlayerTick { snapped: false, .. }
+        ),
+        "the tick that stepped the changed world re-emitted the aim: {:?}",
+        events[last - 1]
+    );
+}
+
+#[test]
+fn the_aim_uses_the_gamemodes_reach() {
+    // A stone whose north face is 4.55 from the eye: inside the creative 5.0
+    // reach and beyond the survival 4.5 one. The same script aims it under a
+    // creative Join Game and never aims it under a survival one.
+    let script = |gamemode: u8| {
+        let mut head = Vec::new();
+        login_sequence(&mut head);
+        frame(&mut head, &join_game_frame_as(gamemode), SERVER_FRAMING);
+        frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+        frame(
+            &mut head,
+            &position_frame(0.5, 64.0, 0.45, 0.0, 0.0, 0),
+            SERVER_FRAMING,
+        );
+        frame(
+            &mut head,
+            &block_change_frame(0, 65, 5, STONE),
+            SERVER_FRAMING,
+        );
+        head
+    };
+    let (creative, _frames) = flip_session(script(1), Vec::new(), 12, 0, Vec::new());
+    let aimed = creative
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::Aim { aim: Some(aim) } => Some(*aim),
+            _ => None,
+        })
+        .expect("the creative reach aims the stone");
+    assert_eq!(
+        (aimed.x, aimed.y, aimed.z, aimed.face),
+        (0, 65, 5, Face::North),
+        "the block 4.55 away"
+    );
+
+    let (survival, _frames) = flip_session(script(0), Vec::new(), 12, 0, Vec::new());
+    assert!(
+        survival
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_), .. })),
+        "4.55 is beyond the survival reach: {survival:?}"
     );
 }

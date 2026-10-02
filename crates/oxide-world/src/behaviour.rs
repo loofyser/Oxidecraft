@@ -60,6 +60,18 @@
 //!   — the liquid surface height and the tint-index rule.
 //!
 //! Only names and values are carried over; no source text is reproduced.
+//!
+//! # Notes
+//!
+//! The interaction reach is per gamemode, not per block, so it has no row of
+//! its own; the design's interaction section asks for it to be recorded here.
+//! `PlayerControllerMP.getBlockReachDistance` returns
+//! `this.currentGameType.isCreative() ? 5.0F : 4.5F`
+//! (`client/multiplayer/PlayerControllerMP.java:344-346`): `5.0` in creative
+//! and `4.5` in every other gamemode. The gamemode the client reads is Join
+//! Game's byte with the hardcore bit masked (`S01PacketJoinGame.java:44-47`);
+//! `oxide-game`'s `interaction::reach` applies the rule and its tests pin both
+//! literals.
 
 /// Where a block's texture colours take their tint from.
 ///

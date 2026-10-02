@@ -2,6 +2,7 @@
 
 pub mod hud;
 pub mod input;
+pub mod interaction;
 pub mod mesh_queue;
 pub mod mesher;
 pub mod palette;

@@ -41,6 +41,7 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton};
+use oxide_game::interaction::Aim;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
@@ -371,6 +372,13 @@ struct ClientApp {
     player: PlayerState,
     /// Whether F3 has the overlay showing.
     overlay_visible: bool,
+    /// The latest aim the session reported, or `None` when the interaction ray
+    /// meets no block.
+    ///
+    /// The window keeps it for the outline and crack passes to draw from and
+    /// the click paths to act on; a report that clears the aim stops the
+    /// outline.
+    aim: Option<Aim>,
     /// The pointer-capture rules.
     capture: Capture,
     /// The `--input-script` replay, when the flag was given.
@@ -579,6 +587,7 @@ impl ClientApp {
             },
             sky: SkyState::default(),
             player: PlayerState::default(),
+            aim: None,
             overlay_visible,
             capture: Capture::default(),
             script,
@@ -633,6 +642,7 @@ impl ClientApp {
                 &mut self.hud,
                 &mut self.sky,
                 &mut self.player,
+                &mut self.aim,
                 event,
             );
         }
@@ -892,9 +902,21 @@ fn spawn_session(
     }
 }
 
+/// Stores the aim a session report carries, and answers whether it moved.
+///
+/// The window's outline and crack passes draw from the stored aim and the
+/// click paths act on it; a report that clears the aim is stored as `None`, so
+/// a look that leaves every block stops the outline.
+fn store_aim(aim: &mut Option<Aim>, report: Option<Aim>) -> bool {
+    let moved = *aim != report;
+    *aim = report;
+    moved
+}
+
 /// Applies one event the session reported: meshes go to the renderer, the pose
 /// to the view state and the overlay, the join parameters to the overlay state,
-/// and the clock and the sky to the frame's parameters.
+/// the clock and the sky to the frame's parameters, and the aim to the
+/// window's own copy.
 ///
 /// Returns whether the session ended, which stops the client. The session
 /// returns `Ok(())` when the server closed the connection, so its end is a
@@ -904,6 +926,7 @@ fn apply_session_event(
     hud: &mut HudState,
     sky: &mut SkyState,
     player: &mut PlayerState,
+    aim: &mut Option<Aim>,
     event: ClientEvent,
 ) -> bool {
     match event {
@@ -947,6 +970,12 @@ fn apply_session_event(
             hud.yaw = yaw;
             hud.pitch = pitch;
             player.observe(tick, [x, y, z], yaw, pitch, snapped);
+            false
+        }
+        ClientEvent::Aim { aim: report } => {
+            if store_aim(aim, report) {
+                tracing::debug!(?report, "the aim moved");
+            }
             false
         }
         ClientEvent::Time {
@@ -1288,13 +1317,14 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Capture, CaptureStep, Cli, ClientApp, Directive, Key, MouseButton, PlayerState,
+        Aim, Capture, CaptureStep, Cli, ClientApp, Directive, Key, MouseButton, PlayerState,
         ScriptDriver, SkyValues, bound_mouse_button, frame_params, gameplay_key, is_escape_press,
-        is_f3_press, parse_script, parse_server_address, void_y_factor,
+        is_f3_press, parse_script, parse_server_address, store_aim, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
     use oxide_game::input::InputEvent;
+    use oxide_game::interaction::Face;
     use std::path::PathBuf;
     use winit::event::{ElementState, MouseButton as WinitMouseButton};
     use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
@@ -1843,5 +1873,33 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_aim_is_stored_and_cleared() {
+        // The session reports the aim when it changes; the window keeps the
+        // latest report for the outline and crack passes to draw from, `None`
+        // included, and a repeat of the same report is no move.
+        let block = Aim {
+            x: 1,
+            y: 64,
+            z: -3,
+            face: Face::North,
+            hit: [1.5, 64.5, -3.0],
+        };
+        let mut aim = None;
+        assert!(
+            store_aim(&mut aim, Some(block)),
+            "the first report moves it"
+        );
+        assert_eq!(aim, Some(block), "the block is stored");
+        assert!(
+            !store_aim(&mut aim, Some(block)),
+            "the same block is no move"
+        );
+        assert_eq!(aim, Some(block), "and it is still stored");
+        assert!(store_aim(&mut aim, None), "the clearing report moves it");
+        assert_eq!(aim, None, "the aim is cleared");
+        assert!(!store_aim(&mut aim, None), "there is nothing left to clear");
     }
 }
