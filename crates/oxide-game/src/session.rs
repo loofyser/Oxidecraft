@@ -14,7 +14,10 @@
 //! window's input, the clock's and the cloud counter's advance, and the
 //! per-tick report — while the read loop's discipline holds: ticks are
 //! deadline-polled and capped (`Ticker`), and a readable frame is always read
-//! before any further tick work.
+//! before any further tick work. Every tick also sends the packets a server
+//! expects from a moving player: the walking report (0x03–0x06) under the
+//! source's own rule, the sprint and sneak edges (0x0B), and the ability
+//! flips the double-tap flight toggle and a landing produce (0x13).
 //!
 //! A packet the client has no use for is skipped, and one whose id it cannot
 //! even name is not fatal (spec S2), so a proxy or a modded server cannot end
@@ -43,12 +46,14 @@ use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
     self, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk, PlayDisconnect,
-    PlayerListItem, PlayerPositionAndLook, PluginMessage, TimeUpdate, read_packet_id,
+    PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage, TimeUpdate,
+    read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
-    ClientSettings, write_client_settings, write_keep_alive, write_login_start,
-    write_player_position_and_look, write_plugin_message,
+    ClientSettings, EntityAction, write_client_settings, write_entity_action, write_keep_alive,
+    write_login_start, write_player, write_player_abilities, write_player_look,
+    write_player_position, write_player_position_and_look, write_plugin_message,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
@@ -67,7 +72,7 @@ use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
 };
 use crate::physics;
-use crate::player::Player;
+use crate::player::{Abilities, Player};
 use crate::ticker::Ticker;
 use crate::world_view::WorldView;
 
@@ -112,6 +117,15 @@ const MOUSE_SENSITIVITY: f32 = 0.5;
 /// The pitch clamp, in degrees: `MathHelper.clamp_float(this.rotationPitch,
 /// -90.0F, 90.0F)` (`Entity.setAngles`, `Entity.java:395`).
 const PITCH_LIMIT: f32 = 90.0;
+
+/// The squared-distance threshold above which one tick reports its position:
+/// `d0 * d0 + d1 * d1 + d2 * d2 > 9.0E-4D`
+/// (`EntityPlayerSP.onUpdateWalkingPlayer`, `EntityPlayerSP.java:230`).
+const POSITION_EPSILON: f64 = 9.0e-4;
+
+/// Ticks after which a quiet player still reports its position:
+/// `this.positionUpdateTicks >= 20` (`EntityPlayerSP.java:230`).
+const POSITION_STALE_TICKS: i32 = 20;
 
 /// How many queued columns one pump hands to the pool.
 ///
@@ -495,6 +509,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // completes stale and builds against the new one.
                             world = Some(World::new(join.dimension == 0));
                             queue = MeshQueue::new();
+                            // The player's own entity id is named here. It gates this
+                            // client's tick sends: the source's tick is gated on the
+                            // player standing in a loaded world
+                            // (`EntityPlayerSP.onUpdate:170`), and the action edges
+                            // carry the id.
+                            player.entity_id = Some(join.entity_id);
                             let settings =
                                 payload_of(|out| write_client_settings(out, &config.settings))?;
                             send_reply(&mut conn, &settings)?;
@@ -514,9 +534,34 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 },
                             );
                         }
+                        PlayerAbilities::ID => {
+                            let packet = decoded(id, PlayerAbilities::decode(body))?;
+                            debug!(
+                                flying = packet.flying,
+                                allow_flying = packet.allow_flying,
+                                creative = packet.creative,
+                                "the server set the abilities"
+                            );
+                            // The packet's own flying value is taken in either
+                            // direction (`NetHandlerPlayClient.handlePlayerAbilities`).
+                            player.apply_abilities(Abilities {
+                                flying: packet.flying,
+                                allow_flying: packet.allow_flying,
+                                creative: packet.creative,
+                                invulnerable: packet.invulnerable,
+                                fly_speed: packet.fly_speed,
+                                walk_speed: packet.walk_speed,
+                            });
+                        }
                         PlayerPositionAndLook::ID => {
                             let teleport = decoded(id, PlayerPositionAndLook::decode(body))?;
                             apply_correction(&mut player, &teleport);
+                            // The echo below is the position report that reconciles the
+                            // correction, so the walking reporters start from the corrected
+                            // pose: the tick after the correction reports nothing of the
+                            // pre-correction displacement, and the staleness clock measures
+                            // from the report that was actually sent.
+                            reset_reporters(&mut player);
                             let echo = payload_of(|out| {
                                 write_player_position_and_look(
                                     out,
@@ -691,9 +736,15 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
 
             // The ticks that have come due. The frame above — or the idle wait
             // before this batch — was handled first, and the ticker caps a
-            // catch-up, so a long pause cannot snowball into a long pass.
+            // catch-up, so a long pause cannot snowball into a long pass. A
+            // tick's packets go out in the order the source sends them, each
+            // as soon as the tick produced it.
             for _ in 0..ticker.due(Instant::now()) {
-                step_tick(&mut player, &intent, clock.as_mut(), world.as_ref(), events);
+                for payload in
+                    step_tick(&mut player, &intent, clock.as_mut(), world.as_ref(), events)
+                {
+                    send_reply(&mut conn, &payload)?;
+                }
             }
         }
         finish_meshes(
@@ -909,13 +960,19 @@ fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
 /// ([`physics::step`]): the fluid probe, the jump cooldown, the drag and the
 /// collision walk all happen here, and the tick's report carries where the
 /// step left the player.
+///
+/// The tick's sends are the source's own, in its order: the flight toggle's
+/// 0x13 (`EntityPlayerSP.onLivingUpdate:836-845`) and the landing cancel's
+/// 0x13 (`:904-908`), then the sprint and sneak edges
+/// (`onUpdateWalkingPlayer:189-221`) and the walking report (`:215-274`).
+/// They return to the caller, which writes each one as the tick produced it.
 fn step_tick(
     player: &mut Player,
     input: &Intent,
     mut clock: Option<&mut Clock>,
     world: Option<&World>,
     events: &Sender<ClientEvent>,
-) {
+) -> Vec<Vec<u8>> {
     player.last_tick_position = player.position;
     player.tick += 1;
     // The sneak flag is the held key, and the sprint rule runs once per tick.
@@ -923,12 +980,88 @@ fn step_tick(
     let sprinting = player.sprinting;
     player.sprinting = player.sprint_tap.update(input, sprinting, player.on_ground);
 
+    // The double-tap flight toggle (`EntityPlayerSP.onLivingUpdate:823-845`)
+    // runs before the movement model consumes `flying`, and its 0x13 goes out
+    // at once — the source sends it inline.
+    let mut sends = Vec::new();
+    if player.update_flight(input.jump) {
+        sends.push(abilities_payload(player));
+    }
+
     // The movement model runs one step against the world as it stands: the
     // fluid probe, the jump cooldown, the drag and the collision walk move the
     // player, and the report below carries where the step left it. Before Join
     // Game there is no world to move against and the step is skipped.
     if let Some(world) = world {
         physics::step(player, input, &WorldView(world));
+    }
+
+    // Landing cancels flight (`EntityPlayerSP.onLivingUpdate:904-908`): the
+    // source checks it after the move, at the end of its living tick, and
+    // sends the abilities packet itself.
+    if player.on_ground && player.flying {
+        player.set_flying(false);
+        sends.push(abilities_payload(player));
+    }
+
+    // The walking report and the action edges are the tick's own, and they
+    // begin where this client enters a world — at Join Game, which also names
+    // the entity id they carry. The source's tick is gated the same way, on
+    // the block under the player being loaded (`EntityPlayerSP.onUpdate:170`).
+    if let Some(entity_id) = player.entity_id {
+        // One packet per change (`EntityPlayerSP.onUpdateWalkingPlayer:189-221`):
+        // a stable state sends nothing, so the server hears exactly the edges.
+        if player.sprinting != player.server_sprint_state {
+            let action = if player.sprinting {
+                EntityAction::StartSprinting
+            } else {
+                EntityAction::StopSprinting
+            };
+            sends.push(tick_payload(|out| {
+                write_entity_action(out, entity_id, action, 0)
+            }));
+            player.server_sprint_state = player.sprinting;
+        }
+        if player.sneaking != player.server_sneak_state {
+            let action = if player.sneaking {
+                EntityAction::StartSneaking
+            } else {
+                EntityAction::StopSneaking
+            };
+            sends.push(tick_payload(|out| {
+                write_entity_action(out, entity_id, action, 0)
+            }));
+            player.server_sneak_state = player.sneaking;
+        }
+        // The walking report, built after the edges so a tick's packets keep
+        // the source's order.
+        let report_kind = walking_report(player);
+        sends.push(match report_kind {
+            WalkingReport::Player => tick_payload(|out| write_player(out, player.on_ground)),
+            WalkingReport::Position => tick_payload(|out| {
+                write_player_position(
+                    out,
+                    player.position[0],
+                    player.position[1],
+                    player.position[2],
+                    player.on_ground,
+                )
+            }),
+            WalkingReport::Look => tick_payload(|out| {
+                write_player_look(out, player.yaw, player.pitch, player.on_ground)
+            }),
+            WalkingReport::PositionAndLook => tick_payload(|out| {
+                write_player_position_and_look(
+                    out,
+                    player.position[0],
+                    player.position[1],
+                    player.position[2],
+                    player.yaw,
+                    player.pitch,
+                    player.on_ground,
+                )
+            }),
+        });
     }
 
     let mut advanced = false;
@@ -943,6 +1076,102 @@ fn step_tick(
         report_sky(world, player.position, clock.as_deref(), events);
     }
     report(events, player_tick(player, false));
+    sends
+}
+
+/// Which of the four player packets one walking tick reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkingReport {
+    /// 0x03: the ground state alone — neither position nor rotation moved.
+    Player,
+    /// 0x04: the position alone.
+    Position,
+    /// 0x05: the rotation alone.
+    Look,
+    /// 0x06: both.
+    PositionAndLook,
+}
+
+/// One tick of the source's walking report rule, quoted:
+///
+/// ```text
+/// double d0 = this.posX - this.lastReportedPosX;
+/// double d1 = this.getEntityBoundingBox().minY - this.lastReportedPosY;
+/// double d2 = this.posZ - this.lastReportedPosZ;
+/// double d3 = (double)(this.rotationYaw - this.lastReportedYaw);
+/// double d4 = (double)(this.rotationPitch - this.lastReportedPitch);
+/// boolean flag2 = d0 * d0 + d1 * d1 + d2 * d2 > 9.0E-4D || this.positionUpdateTicks >= 20;
+/// boolean flag3 = d3 != 0.0D || d4 != 0.0D;
+/// ```
+///
+/// The two flags then choose the packet (`EntityPlayerSP.java:225-274`): both
+/// send the position and the rotation, the position alone, the rotation
+/// alone, and neither sends the ground byte alone. The reporters update with
+/// their own flag and the counter restarts with the position flag
+/// (`:258-273`); a tick with no position report still counts, which is what
+/// re-sends a quiet player's position once the counter reaches twenty. The
+/// riding branch (`:255-258`) has no counterpart here: nothing rides in M3.
+fn walking_report(player: &mut Player) -> WalkingReport {
+    let dx = player.position[0] - player.last_reported_position[0];
+    let dy = player.position[1] - player.last_reported_position[1];
+    let dz = player.position[2] - player.last_reported_position[2];
+    let moved = dx * dx + dy * dy + dz * dz > POSITION_EPSILON
+        || player.position_update_ticks >= POSITION_STALE_TICKS;
+    let looked =
+        player.yaw != player.last_reported_yaw || player.pitch != player.last_reported_pitch;
+    let report_kind = match (moved, looked) {
+        (true, true) => WalkingReport::PositionAndLook,
+        (true, false) => WalkingReport::Position,
+        (false, true) => WalkingReport::Look,
+        (false, false) => WalkingReport::Player,
+    };
+    player.position_update_ticks += 1;
+    if moved {
+        player.last_reported_position = player.position;
+        player.position_update_ticks = 0;
+    }
+    if looked {
+        player.last_reported_yaw = player.yaw;
+        player.last_reported_pitch = player.pitch;
+    }
+    report_kind
+}
+
+/// Resets the walking reporters to where a correction settled the player.
+///
+/// The source's teleport handler echoes the corrected pose itself and leaves
+/// its `lastReported*` fields alone
+/// (`NetHandlerPlayClient.handlePlayerPosLook:669-707`), so its next tick
+/// replays the corrected pose as a move. This client keeps the reporters at
+/// the echo instead: the echo is the position report that reconciles the
+/// correction, and the tick after it reports nothing of the pre-correction
+/// displacement. `position_update_ticks` restarts with the echo, so the
+/// staleness clock measures from the report that was sent.
+fn reset_reporters(player: &mut Player) {
+    player.last_reported_position = player.position;
+    player.last_reported_yaw = player.yaw;
+    player.last_reported_pitch = player.pitch;
+    player.position_update_ticks = 0;
+}
+
+/// The 0x13 payload for the player's abilities.
+fn abilities_payload(player: &Player) -> Vec<u8> {
+    tick_payload(|out| {
+        write_player_abilities(
+            out,
+            player.abilities.flags(),
+            player.abilities.fly_speed,
+            player.abilities.walk_speed,
+        )
+    })
+}
+
+/// Builds a payload whose writer cannot fail.
+///
+/// Writing to a `Vec` is total, and the fields the tick writes are bounded by
+/// the packets' own layout, so the `expect` cannot fire.
+fn tick_payload(build: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> Vec<u8> {
+    payload_of(build).expect("writing to a Vec cannot fail")
 }
 
 /// Reads the next frame; `None` means the stream ended.

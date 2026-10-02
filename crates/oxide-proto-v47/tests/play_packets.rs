@@ -5,12 +5,15 @@ use std::io::{Cursor, ErrorKind};
 use oxide_proto::codec::CodecError;
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, JoinGame, KeepAlive, PlayDisconnect, PlayerListItem, PlayerPositionAndLook, TimeUpdate,
+    self, JoinGame, KeepAlive, PlayDisconnect, PlayerAbilities, PlayerListItem,
+    PlayerPositionAndLook, TimeUpdate,
 };
 use oxide_proto_v47::serverbound::{
-    ClientSettings, ClientStatusAction, client_settings_payload, player_position_and_look_payload,
-    write_client_settings, write_client_status, write_keep_alive, write_player_position_and_look,
-    write_plugin_message,
+    ClientSettings, ClientStatusAction, ENTITY_ACTION_ID, EntityAction, PLAYER_ABILITIES_ID,
+    PLAYER_ID, PLAYER_LOOK_ID, PLAYER_POSITION_ID, client_settings_payload,
+    player_position_and_look_payload, write_client_settings, write_client_status,
+    write_entity_action, write_keep_alive, write_player, write_player_abilities, write_player_look,
+    write_player_position, write_player_position_and_look, write_plugin_message,
 };
 
 /// Reads the next eight bytes from a test cursor.
@@ -19,6 +22,15 @@ fn cursor_read8(cursor: &mut Cursor<&[u8]>) -> [u8; 8] {
 
     let mut bytes = [0u8; 8];
     cursor.read_exact(&mut bytes).expect("eight bytes");
+    bytes
+}
+
+/// Reads the next four bytes from a test cursor.
+fn cursor_read4(cursor: &mut Cursor<&[u8]>) -> [u8; 4] {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 4];
+    cursor.read_exact(&mut bytes).expect("four bytes");
     bytes
 }
 
@@ -363,4 +375,184 @@ fn the_writer_refuses_the_locale_the_payload_helper_truncates() {
     let error = write_client_settings(&mut out, &settings).expect_err("nine bytes is past the cap");
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
     assert!(out.is_empty(), "a refusal writes nothing");
+}
+
+#[test]
+fn a_player_tick_reports_the_ground_flag_alone() {
+    // 0x03's one field: `C03PacketPlayer.writePacketData` writes the ground
+    // byte and nothing else (`C03PacketPlayer.java:55-58`), the "nothing
+    // changed" tick a vanilla server still accepts once per tick.
+    let mut out = Vec::new();
+    write_player(&mut out, true).expect("write");
+    assert_eq!(out, [0x03, 0x01]);
+    let mut out = Vec::new();
+    write_player(&mut out, false).expect("write");
+    assert_eq!(out, [0x03, 0x00]);
+}
+
+#[test]
+fn a_player_position_writes_the_id_then_x_feet_y_z_and_ground() {
+    // `C03PacketPlayer.C04PacketPlayerPosition`'s field order
+    // (`C03PacketPlayer.java:87-96`): the three doubles, then the ground byte.
+    let mut out = Vec::new();
+    write_player_position(&mut out, 1.5, 64.0, -2.25, true).expect("write");
+    assert_eq!(out[0], 0x04, "the id");
+    let mut cursor = Cursor::new(&out[1..]);
+    assert_eq!(
+        f64::from_be_bytes(cursor_read8(&mut cursor)),
+        1.5,
+        "x first"
+    );
+    assert_eq!(
+        f64::from_be_bytes(cursor_read8(&mut cursor)),
+        64.0,
+        "the feet y second"
+    );
+    assert_eq!(
+        f64::from_be_bytes(cursor_read8(&mut cursor)),
+        -2.25,
+        "z third"
+    );
+    assert_eq!(
+        cursor.position(),
+        24,
+        "three doubles come before the ground byte"
+    );
+    assert_eq!(out[25], 1, "on ground is the last byte");
+    assert_eq!(out.len(), 26);
+}
+
+#[test]
+fn a_player_look_writes_the_id_then_yaw_pitch_and_ground() {
+    // `C03PacketPlayer.C05PacketPlayerLook`'s field order
+    // (`C03PacketPlayer.java:99-107`): yaw, then pitch, then the ground byte.
+    let mut out = Vec::new();
+    write_player_look(&mut out, 90.0, -30.0, true).expect("write");
+    assert_eq!(out[0], 0x05, "the id");
+    let mut cursor = Cursor::new(&out[1..]);
+    assert_eq!(
+        f32::from_be_bytes(cursor_read4(&mut cursor)),
+        90.0,
+        "yaw first"
+    );
+    assert_eq!(
+        f32::from_be_bytes(cursor_read4(&mut cursor)),
+        -30.0,
+        "pitch second"
+    );
+    assert_eq!(out[9], 1, "the ground byte is last");
+    assert_eq!(out.len(), 10);
+}
+
+#[test]
+fn an_entity_action_writes_the_eid_the_action_and_the_boost() {
+    // 0x0B: the entity id, the action id and the jump boost, all VarInts
+    // (`C0BPacketEntityAction.java:39-44`).
+    let mut out = Vec::new();
+    write_entity_action(&mut out, 20, EntityAction::StartSprinting, 0).expect("write");
+    assert_eq!(out, [0x0B, 0x14, 0x03, 0x00]);
+    // A multi-byte entity id and a non-zero boost keep the three fields
+    // provably apart: 300 is the two-byte VarInt `AC 02`.
+    let mut out = Vec::new();
+    write_entity_action(&mut out, 300, EntityAction::StartSneaking, 100).expect("write");
+    assert_eq!(out, [0x0B, 0xAC, 0x02, 0x00, 0x64]);
+}
+
+#[test]
+fn the_entity_action_ids_are_the_sources_ordinals() {
+    // `C0BPacketEntityAction.Action`'s declaration order
+    // (`C0BPacketEntityAction.java:63-71`), which is the id on the wire.
+    assert_eq!(EntityAction::StartSneaking as i32, 0);
+    assert_eq!(EntityAction::StopSneaking as i32, 1);
+    assert_eq!(EntityAction::StopSleeping as i32, 2);
+    assert_eq!(EntityAction::StartSprinting as i32, 3);
+    assert_eq!(EntityAction::StopSprinting as i32, 4);
+    assert_eq!(EntityAction::RidingJump as i32, 5);
+    assert_eq!(EntityAction::OpenInventory as i32, 6);
+}
+
+#[test]
+fn player_abilities_writes_the_flags_and_both_speeds() {
+    // 0x13's field order: the flags byte, then the fly speed and the walk
+    // speed (`C13PacketPlayerAbilities.java:64-75`). The flags byte here
+    // carries the allow-flying bit 0x04 and the creative bit 0x08.
+    let mut out = Vec::new();
+    write_player_abilities(&mut out, 0x0C, 0.05, 0.1).expect("write");
+    assert_eq!(out[0], 0x13, "the id");
+    assert_eq!(
+        out[1], 0x0C,
+        "the flags byte: allow flying 0x04 | creative 0x08"
+    );
+    let mut cursor = Cursor::new(&out[2..]);
+    assert_eq!(
+        f32::from_be_bytes(cursor_read4(&mut cursor)),
+        0.05,
+        "the fly speed second"
+    );
+    assert_eq!(
+        f32::from_be_bytes(cursor_read4(&mut cursor)),
+        0.1,
+        "the walk speed third"
+    );
+    assert_eq!(out.len(), 10);
+}
+
+#[test]
+fn player_abilities_decodes_the_flags_byte_and_both_speeds() {
+    // 0x39 shares 0x13's layout (`S39PacketPlayerAbilities.java:35-44`): the
+    // flags byte's four bits, then the two floats.
+    let mut body = vec![0x39, 0x0F];
+    body.extend_from_slice(&0.05f32.to_be_bytes());
+    body.extend_from_slice(&0.1f32.to_be_bytes());
+    let abilities = PlayerAbilities::decode(&body[1..]).expect("decode");
+    assert!(abilities.invulnerable, "bit 0x01");
+    assert!(abilities.flying, "bit 0x02");
+    assert!(abilities.allow_flying, "bit 0x04");
+    assert!(abilities.creative, "bit 0x08");
+    assert_eq!((abilities.fly_speed, abilities.walk_speed), (0.05, 0.1));
+    // The creative bit alone: a bit must not smear into its neighbours.
+    let mut body = vec![0x39, 0x08];
+    body.extend_from_slice(&0.05f32.to_be_bytes());
+    body.extend_from_slice(&0.1f32.to_be_bytes());
+    let abilities = PlayerAbilities::decode(&body[1..]).expect("decode");
+    assert!(abilities.creative);
+    assert!(!abilities.invulnerable);
+    assert!(!abilities.flying);
+    assert!(!abilities.allow_flying);
+}
+
+#[test]
+fn the_abilities_flag_bits_are_the_spec_bits() {
+    // `S39PacketPlayerAbilities.readPacketData`'s masks (`:37-41`).
+    assert_eq!(PlayerAbilities::FLAG_INVULNERABLE, 0x01);
+    assert_eq!(PlayerAbilities::FLAG_FLYING, 0x02);
+    assert_eq!(PlayerAbilities::FLAG_ALLOW_FLYING, 0x04);
+    assert_eq!(PlayerAbilities::FLAG_CREATIVE, 0x08);
+}
+
+#[test]
+fn a_player_abilities_with_extra_bytes_is_refused() {
+    // The trailing check keeps the three fields honest.
+    let mut body = vec![0x39, 0x00];
+    body.extend_from_slice(&0.05f32.to_be_bytes());
+    body.extend_from_slice(&0.1f32.to_be_bytes());
+    let decoded = PlayerAbilities::decode(&body[1..]).expect("decode");
+    assert_eq!(decoded.fly_speed, 0.05);
+    body.push(0);
+    assert!(
+        PlayerAbilities::decode(&body[1..]).is_err(),
+        "an extra byte is refused"
+    );
+}
+
+#[test]
+fn the_serverbound_movement_ids_match_the_spec() {
+    // The reference's serverbound rows (`protocol-47-reference.md`): 0x03
+    // Player, 0x04 Player Position, 0x05 Player Look, 0x0B Entity Action,
+    // 0x13 Player Abilities.
+    assert_eq!(PLAYER_ID, 0x03);
+    assert_eq!(PLAYER_POSITION_ID, 0x04);
+    assert_eq!(PLAYER_LOOK_ID, 0x05);
+    assert_eq!(ENTITY_ACTION_ID, 0x0B);
+    assert_eq!(PLAYER_ABILITIES_ID, 0x13);
 }

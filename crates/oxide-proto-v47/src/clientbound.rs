@@ -303,6 +303,61 @@ impl PlayerPositionAndLook {
     }
 }
 
+/// Clientbound Player Abilities (play id 0x39).
+///
+/// The flags byte's bits are `0x01` invulnerable, `0x02` flying, `0x04` allow
+/// flying and `0x08` creative; the two floats are the fly speed and the walk
+/// speed (`S39PacketPlayerAbilities.java:35-44`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerAbilities {
+    /// Whether damage is disabled (`disableDamage`).
+    pub invulnerable: bool,
+    /// Whether the player is flying (`isFlying`).
+    pub flying: bool,
+    /// Whether flight may be toggled (`allowFlying`).
+    pub allow_flying: bool,
+    /// Whether creative mode is on (`isCreativeMode`).
+    pub creative: bool,
+    /// The flight speed (`PlayerCapabilities.getFlySpeed`, `0.05F` by default).
+    pub fly_speed: f32,
+    /// The walking speed (`PlayerCapabilities.getWalkSpeed`, `0.1F` by default).
+    pub walk_speed: f32,
+}
+
+impl PlayerAbilities {
+    /// The packet id.
+    pub const ID: i32 = 0x39;
+
+    /// Flags bit: damage is disabled (`S39PacketPlayerAbilities.java:38`).
+    pub const FLAG_INVULNERABLE: u8 = 0x01;
+
+    /// Flags bit: the player is flying (`:39`).
+    pub const FLAG_FLYING: u8 = 0x02;
+
+    /// Flags bit: flight may be toggled (`:40`).
+    pub const FLAG_ALLOW_FLYING: u8 = 0x04;
+
+    /// Flags bit: creative mode is on (`:41`).
+    pub const FLAG_CREATIVE: u8 = 0x08;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let flags = codec::read_u8(&mut cursor)?;
+        let fly_speed = codec::read_f32(&mut cursor)?;
+        let walk_speed = codec::read_f32(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            invulnerable: flags & Self::FLAG_INVULNERABLE != 0,
+            flying: flags & Self::FLAG_FLYING != 0,
+            allow_flying: flags & Self::FLAG_ALLOW_FLYING != 0,
+            creative: flags & Self::FLAG_CREATIVE != 0,
+            fly_speed,
+            walk_speed,
+        })
+    }
+}
+
 /// Clientbound Plugin Message (play id 0x3F).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginMessage {

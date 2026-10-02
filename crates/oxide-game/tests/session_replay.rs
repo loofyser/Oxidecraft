@@ -559,8 +559,10 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
     let echo = client_frame(&mut cursor, SERVER_FRAMING);
     assert_eq!(echo[0], 0x06);
     let keep_alive = client_frame(&mut cursor, SERVER_FRAMING);
-    assert_eq!(keep_alive, [0x00, 0x07]);
-    assert!(cursor.is_empty(), "no further packets were sent");
+    assert_eq!(keep_alive, [0x00, 0x07], "the keepalive echo");
+    // The ticks that ran while the script was read sent their walking reports
+    // after it; nothing else follows the preamble.
+    tail_reports(&mut cursor);
 }
 
 #[test]
@@ -851,20 +853,9 @@ fn packets_m1_does_not_use_are_skipped_not_fatal() {
         matches!(keepalive, ClientEvent::KeepAlive { id: 11 }),
         "expected keepalive 11, got {keepalive:?}"
     );
-    // Nothing was sent for the skipped packets: the keepalive echo is the
-    // fifth packet, right after the settings and the brand.
-    let written = outgoing.lock().unwrap().clone();
-    let mut cursor = &written[..];
-    client_frame(&mut cursor, Compression::Disabled); // handshake
-    client_frame(&mut cursor, Compression::Disabled); // login start
-    client_frame(&mut cursor, SERVER_FRAMING); // client settings
-    client_frame(&mut cursor, SERVER_FRAMING); // brand
-    assert_eq!(
-        client_frame(&mut cursor, SERVER_FRAMING),
-        [0x00, 0x0b],
-        "the keepalive is the only packet those skips drew"
-    );
-    assert!(cursor.is_empty(), "no further packets were sent");
+    // Nothing was sent for the skipped packets: the keepalive echo is on the
+    // wire once, among the walking reports the ticks sent around it.
+    tail_with_echo(&outgoing, 11);
 }
 
 #[test]
@@ -892,18 +883,9 @@ fn player_list_updates_do_not_end_the_session() {
         matches!(keepalive, ClientEvent::KeepAlive { id: 12 }),
         "expected keepalive 12, got {keepalive:?}"
     );
-    let written = outgoing.lock().unwrap().clone();
-    let mut cursor = &written[..];
-    client_frame(&mut cursor, Compression::Disabled); // handshake
-    client_frame(&mut cursor, Compression::Disabled); // login start
-    client_frame(&mut cursor, SERVER_FRAMING); // client settings
-    client_frame(&mut cursor, SERVER_FRAMING); // brand
-    assert_eq!(
-        client_frame(&mut cursor, SERVER_FRAMING),
-        [0x00, 0x0c],
-        "the keepalive is the only packet the player list drew"
-    );
-    assert!(cursor.is_empty(), "no further packets were sent");
+    // The keepalive echo is on the wire once, among the walking reports the
+    // ticks sent around it; the player list drew nothing else.
+    tail_with_echo(&outgoing, 12);
 }
 
 #[test]
@@ -951,20 +933,9 @@ fn a_keepalive_behind_a_column_burst_is_answered() {
         answered < last_mesh,
         "the echo was answered before the burst's last meshes, not after them: {events:?}"
     );
-    // The echo is written: it is the only packet the burst drew, right after
-    // the settings and the brand.
-    let written = outgoing.lock().unwrap().clone();
-    let mut cursor = &written[..];
-    client_frame(&mut cursor, Compression::Disabled); // handshake
-    client_frame(&mut cursor, Compression::Disabled); // login start
-    client_frame(&mut cursor, SERVER_FRAMING); // client settings
-    client_frame(&mut cursor, SERVER_FRAMING); // brand
-    assert_eq!(
-        client_frame(&mut cursor, SERVER_FRAMING),
-        [0x00, 0x15],
-        "the keepalive is the only packet the burst drew"
-    );
-    assert!(cursor.is_empty(), "no further packets were sent");
+    // The echo is written once, among the walking reports the ticks sent while
+    // the burst was read.
+    tail_with_echo(&outgoing, 21);
 }
 
 #[test]
@@ -1038,20 +1009,13 @@ fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
         .expect("the session thread ends")
         .expect("the session runs to the end of the stream");
 
-    // The echo is on the wire: it is the only packet the burst drew, right
-    // after the settings and the brand.
-    let written = outgoing.lock().unwrap().clone();
-    let mut cursor = &written[..];
-    client_frame(&mut cursor, Compression::Disabled); // handshake
-    client_frame(&mut cursor, Compression::Disabled); // login start
-    client_frame(&mut cursor, SERVER_FRAMING); // client settings
-    client_frame(&mut cursor, SERVER_FRAMING); // brand
-    assert_eq!(
-        client_frame(&mut cursor, SERVER_FRAMING),
-        [0x00, 0x61],
-        "the keepalive is the only packet the burst drew"
+    // The echo is on the wire once — the burst drew it, plus whatever walking
+    // reports the ticks sent during the burst — and nothing else.
+    let frames = tail_with_echo(&outgoing, 97);
+    assert!(
+        frames.iter().any(|frame| *frame == [0x00, 0x61]),
+        "the keepalive is answered"
     );
-    assert!(cursor.is_empty(), "no further packets were sent");
 }
 
 /// A duplex with a quiet stretch: after `head` is consumed, the stream reports
@@ -1517,18 +1481,9 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
             .any(|event| matches!(event, ClientEvent::KeepAlive { id: 41 })),
         "the keepalive is answered: {events:?}"
     );
-    let written = outgoing.lock().unwrap().clone();
-    let mut cursor = &written[..];
-    client_frame(&mut cursor, Compression::Disabled); // handshake
-    client_frame(&mut cursor, Compression::Disabled); // login start
-    client_frame(&mut cursor, SERVER_FRAMING); // client settings
-    client_frame(&mut cursor, SERVER_FRAMING); // brand
-    assert_eq!(
-        client_frame(&mut cursor, SERVER_FRAMING),
-        [0x00, 0x29],
-        "the keepalive echo is the only packet the bulk frame drew"
-    );
-    assert!(cursor.is_empty(), "no further packets were sent");
+    // The keepalive echo is on the wire once, among the walking reports the
+    // ticks sent around it; the bulk frame drew nothing else.
+    tail_with_echo(&outgoing, 41);
 
     // Both columns are handed to the pool and each is reported once, with all
     // sixteen section slots; the results arrive in no fixed order, so the
@@ -1630,20 +1585,9 @@ fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
             "({cx}, {cz}) draws its stone block"
         );
     }
-    // The keepalive echo is the only packet the burst drew, after the settings
-    // and the brand.
-    let written = outgoing.lock().unwrap().clone();
-    let mut cursor = &written[..];
-    client_frame(&mut cursor, Compression::Disabled); // handshake
-    client_frame(&mut cursor, Compression::Disabled); // login start
-    client_frame(&mut cursor, SERVER_FRAMING); // client settings
-    client_frame(&mut cursor, SERVER_FRAMING); // brand
-    assert_eq!(
-        client_frame(&mut cursor, SERVER_FRAMING),
-        [0x00, 0x3d],
-        "the keepalive echo is the only packet the six columns drew"
-    );
-    assert!(cursor.is_empty(), "no further packets were sent");
+    // The keepalive echo is on the wire once, among the walking reports the
+    // ticks sent around it; the six columns drew nothing else.
+    tail_with_echo(&outgoing, 61);
 }
 
 #[test]
@@ -2066,5 +2010,720 @@ fn a_held_key_walks_the_player_over_the_floor() {
     assert!(
         walks.last().expect("steps").3,
         "the last step is on the ground: {walks:?}"
+    );
+}
+
+/// A duplex with scheduled input flips: it wraps a [`GappedDuplex`] and, after
+/// the `after`-th idle wait, sends one input event on the session's channel.
+///
+/// A flip lands by idle-wait count because that is where the script can reach
+/// the channel: the session drains its input at the top of a pass, so an event
+/// queued before the run would be held from the first tick on, and only a
+/// quiet stretch lets a key go down — or come back up — mid-session.
+struct FlipDuplex {
+    inner: GappedDuplex,
+    waits: usize,
+    flips: Vec<(usize, InputEvent)>,
+    input_tx: crossbeam_channel::Sender<InputEvent>,
+}
+
+impl Read for FlipDuplex {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(out)
+    }
+}
+
+impl Write for FlipDuplex {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(data)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl DeadlineStream for FlipDuplex {
+    fn wait_readable(&mut self, timeout: Duration) -> std::io::Result<bool> {
+        let readable = self.inner.wait_readable(timeout)?;
+        if !readable {
+            self.waits += 1;
+            for (after, event) in &self.flips {
+                if *after == self.waits {
+                    let _ = self.input_tx.send(*event);
+                }
+            }
+        }
+        Ok(readable)
+    }
+}
+
+/// Reads the client's remaining frames and checks each is a walking report
+/// (0x03–0x06): the only packet a live tick sends on its own.
+fn tail_reports(cursor: &mut &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while !cursor.is_empty() {
+        let packet = client_frame(cursor, SERVER_FRAMING);
+        assert!(
+            matches!(packet[0], 0x03..=0x06),
+            "only walking reports follow: {packet:?}"
+        );
+        frames.push(packet);
+    }
+    frames
+}
+
+/// Reads the client's frames after the preamble, asserts the keepalive echo is
+/// among them exactly once and that every other frame is a walking report
+/// (0x03–0x06) — the only packet a live tick sends on its own — and returns
+/// the frames.
+fn tail_with_echo(outgoing: &Arc<Mutex<Vec<u8>>>, id: i32) -> Vec<Vec<u8>> {
+    let written = outgoing.lock().unwrap().clone();
+    let mut cursor = &written[..];
+    client_frame(&mut cursor, Compression::Disabled); // handshake
+    client_frame(&mut cursor, Compression::Disabled); // login start
+    client_frame(&mut cursor, SERVER_FRAMING); // client settings
+    client_frame(&mut cursor, SERVER_FRAMING); // brand
+    let echo = [0x00, u8::try_from(id).expect("a one-byte keepalive id")];
+    let mut frames = Vec::new();
+    let mut echoes = 0;
+    while !cursor.is_empty() {
+        let packet = client_frame(&mut cursor, SERVER_FRAMING);
+        if packet == echo {
+            echoes += 1;
+        } else {
+            assert!(
+                matches!(packet[0], 0x03..=0x06),
+                "only the keepalive echo and the walking reports follow the preamble: {packet:?}"
+            );
+        }
+        frames.push(packet);
+    }
+    assert_eq!(echoes, 1, "the keepalive echo is on the wire: {frames:?}");
+    frames
+}
+
+/// The frames the client wrote after the preamble — the handshake, Login
+/// Start, Client Settings and the brand — as payloads.
+fn client_payloads(outgoing: &Arc<Mutex<Vec<u8>>>) -> Vec<Vec<u8>> {
+    let written = outgoing.lock().unwrap().clone();
+    let mut cursor = &written[..];
+    client_frame(&mut cursor, Compression::Disabled); // handshake
+    client_frame(&mut cursor, Compression::Disabled); // login start
+    client_frame(&mut cursor, SERVER_FRAMING); // client settings
+    client_frame(&mut cursor, SERVER_FRAMING); // brand
+    let mut frames = Vec::new();
+    while !cursor.is_empty() {
+        frames.push(client_frame(&mut cursor, SERVER_FRAMING));
+    }
+    frames
+}
+
+/// Runs one scripted session with flips scheduled at idle-wait counts, and
+/// returns every event it reported and every frame it wrote after the
+/// preamble.
+fn flip_session(
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    stalls: usize,
+    tail_stalls: usize,
+    flips: Vec<(usize, InputEvent)>,
+) -> (Vec<ClientEvent>, Vec<Vec<u8>>) {
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    let stream = FlipDuplex {
+        inner: GappedDuplex {
+            head: std::io::Cursor::new(head),
+            tail: std::io::Cursor::new(tail),
+            stalls,
+            tail_stalls,
+            outgoing: Arc::clone(&outgoing),
+        },
+        waits: 0,
+        flips,
+        input_tx,
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, input_rx)
+        .expect("the session runs to the end of the stream");
+    (receiver.try_iter().collect(), client_payloads(&outgoing))
+}
+
+/// The unsnapped ticks a session reported, as (y, on_ground, flying).
+fn tick_states(events: &[ClientEvent]) -> Vec<(f64, bool, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                y,
+                on_ground,
+                flying,
+                snapped: false,
+                ..
+            } => Some((*y, *on_ground, *flying)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The index of the `n`-th frame whose id is `id`.
+fn nth_frame(frames: &[Vec<u8>], id: u8, n: usize) -> usize {
+    frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame[0] == id)
+        .nth(n)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| panic!("frame {id:#04x} #{n} is on the wire: {frames:?}"))
+}
+
+/// A join carrying the stone floor, then a teleport onto its surface at
+/// (0.5, 64, 0.5) facing south.
+fn floor_head() -> Vec<u8> {
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    head
+}
+
+/// The Player Abilities payload a scripted server sends: `flags` and the two
+/// speeds.
+fn abilities_frame(flags: u8, fly_speed: f32, walk_speed: f32) -> Vec<u8> {
+    let mut abilities = vec![0x39, flags];
+    abilities.extend_from_slice(&fly_speed.to_be_bytes());
+    abilities.extend_from_slice(&walk_speed.to_be_bytes());
+    abilities
+}
+
+/// The 0x13 payload the abilities `flags` and speeds produce.
+fn abilities_echo(flags: u8, fly_speed: f32, walk_speed: f32) -> Vec<u8> {
+    let mut echo = vec![0x13, flags];
+    echo.extend_from_slice(&fly_speed.to_be_bytes());
+    echo.extend_from_slice(&walk_speed.to_be_bytes());
+    echo
+}
+
+#[test]
+fn the_quiet_tick_reports_the_ground_only() {
+    // A stationary player on the floor: every tick's walking report is the
+    // ground byte alone (0x03) — neither position nor rotation moved, so
+    // `EntityPlayerSP.onUpdateWalkingPlayer:225-247` sends the one packet that
+    // carries nothing. The correction's echo (0x06) leads them.
+    let (events, frames) = flip_session(floor_head(), Vec::new(), 16, 0, Vec::new());
+    let echo = nth_frame(&frames, 0x06, 0);
+    let reports = &frames[echo + 1..];
+    assert!(
+        reports.len() >= 3,
+        "the quiet stretch owes ticks: {frames:?}"
+    );
+    // The form is the pin: the ground byte alone. The byte's value is the
+    // physics's own (the first tick after a teleport has not probed the floor
+    // yet), so only the last report is checked for the settled flag.
+    assert!(
+        reports
+            .iter()
+            .all(|frame| frame[0] == 0x03 && frame.len() == 2),
+        "every tick reports the ground alone: {reports:?}"
+    );
+    assert_eq!(
+        reports.last(),
+        Some(&vec![0x03, 0x01]),
+        "the ground settles onto the floor: {reports:?}"
+    );
+    let ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { snapped: false, .. }))
+        .count();
+    assert!(
+        reports.len() <= ticks,
+        "one walking report per tick at most: {frames:?}"
+    );
+}
+
+#[test]
+fn a_look_change_reports_the_rotation_only() {
+    // The mouse turns the player (10 px right at the fixed 0.5 sensitivity is
+    // 1.5°) with no step of its own; the next tick's report is the rotation
+    // alone (0x05) with the position untouched, and the ticks after it settle
+    // back to the ground byte alone.
+    let flips = vec![(2, InputEvent::MouseDelta { dx: 10.0, dy: 0.0 })];
+    let (events, frames) = flip_session(floor_head(), Vec::new(), 16, 0, flips);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PlayerTick { yaw, .. } if (*yaw - 1.5).abs() < 1e-4)),
+        "the turn reached the tick: {events:?}"
+    );
+    let turn = nth_frame(&frames, 0x05, 0);
+    let mut expected = vec![0x05];
+    expected.extend_from_slice(&1.5f32.to_be_bytes());
+    expected.extend_from_slice(&0.0f32.to_be_bytes());
+    assert_eq!(
+        frames[turn][..9],
+        expected,
+        "the rotation report, byte for byte"
+    );
+    assert_eq!(frames[turn].len(), 10, "and its ground byte");
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x06).count(),
+        1,
+        "only the correction's echo carries a position: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x04),
+        "nothing moved, so no position report: {frames:?}"
+    );
+    assert!(
+        frames[turn + 1..]
+            .iter()
+            .all(|frame| frame == &[0x03, 0x01]),
+        "the ticks after the turn report the ground alone: {frames:?}"
+    );
+}
+
+#[test]
+fn a_move_reports_the_position_only() {
+    // The forward key walks the player south with no turn; the first tick past
+    // the source's 9.0E-4 threshold reports the position alone (0x04), the
+    // feet on the floor and the heading held, and no rotation report follows.
+    let flips = vec![(
+        2,
+        InputEvent::Key {
+            key: Key::W,
+            pressed: true,
+        },
+    )];
+    let (_events, frames) = flip_session(floor_head(), Vec::new(), 24, 0, flips);
+    let echo = nth_frame(&frames, 0x06, 0);
+    let first_move = nth_frame(&frames, 0x04, 0);
+    assert!(
+        first_move > echo,
+        "the walk is reported after the correction: {frames:?}"
+    );
+    let moved = &frames[first_move];
+    assert_eq!(moved[0], 0x04, "the position report's id");
+    let x = f64::from_be_bytes(moved[1..9].try_into().expect("eight bytes"));
+    let y = f64::from_be_bytes(moved[9..17].try_into().expect("eight bytes"));
+    let z = f64::from_be_bytes(moved[17..25].try_into().expect("eight bytes"));
+    assert_eq!(x, 0.5, "the heading holds: no x drift");
+    assert!((y - 64.0).abs() < 1e-9, "the floor holds the height: {y}");
+    assert!(z > 0.5 && z < 0.8, "the first reported step is small: {z}");
+    assert_eq!(moved[25], 0x01, "the feet are on the ground");
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x06).count(),
+        1,
+        "only the correction's echo carries a rotation: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x05),
+        "nothing turned, so no rotation report: {frames:?}"
+    );
+}
+
+#[test]
+fn a_move_and_a_look_in_one_tick_report_both() {
+    // A falling player whose mouse turns mid-fall: the tick that both moved
+    // and looked sends 0x06, the position and the rotation in one packet.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 90.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let flips = vec![(8, InputEvent::MouseDelta { dx: 10.0, dy: 0.0 })];
+    let (_events, frames) = flip_session(head, Vec::new(), 16, 0, flips);
+    let both = nth_frame(&frames, 0x06, 1); // the echo is the first 0x06
+    assert!(
+        both > nth_frame(&frames, 0x06, 0),
+        "the combined report follows the echo: {frames:?}"
+    );
+    let frame = &frames[both];
+    let x = f64::from_be_bytes(frame[1..9].try_into().expect("eight bytes"));
+    let y = f64::from_be_bytes(frame[9..17].try_into().expect("eight bytes"));
+    let z = f64::from_be_bytes(frame[17..25].try_into().expect("eight bytes"));
+    let yaw = f32::from_be_bytes(frame[25..29].try_into().expect("four bytes"));
+    let pitch = f32::from_be_bytes(frame[29..33].try_into().expect("four bytes"));
+    assert_eq!((x, z), (0.5, 0.5), "the fall keeps the column");
+    assert!(y < 90.0 && y > 88.0, "the tick fell: {y}");
+    assert!((yaw - 1.5).abs() < 1e-4, "the turn is in the packet: {yaw}");
+    assert_eq!(pitch, 0.0, "no vertical mouse movement");
+    assert_eq!(frame[33], 0x00, "the fall is airborne");
+}
+
+#[test]
+fn the_stale_tick_reports_the_position_unchanged() {
+    // A quiet player is still re-sent: the counter reaches the source's twenty
+    // (`EntityPlayerSP.java:230`), and the twenty-first tick after the
+    // correction echoes the unchanged position (0x04). The correction reset
+    // the counter with its echo, so the count starts there.
+    let (events, frames) = flip_session(floor_head(), Vec::new(), 70, 0, Vec::new());
+    let echo = nth_frame(&frames, 0x06, 0);
+    let reports = &frames[echo + 1..];
+    assert!(
+        reports.len() >= 22,
+        "the stretch owes more than twenty-one ticks: {}",
+        reports.len()
+    );
+    assert!(
+        reports[..20]
+            .iter()
+            .all(|frame| frame[0] == 0x03 && frame.len() == 2),
+        "the first twenty ticks report the ground alone: {:?}",
+        &reports[..20]
+    );
+    let stale = &reports[20];
+    assert_eq!(stale[0], 0x04, "the twenty-first tick reports the position");
+    let x = f64::from_be_bytes(stale[1..9].try_into().expect("eight bytes"));
+    let y = f64::from_be_bytes(stale[9..17].try_into().expect("eight bytes"));
+    let z = f64::from_be_bytes(stale[17..25].try_into().expect("eight bytes"));
+    assert_eq!(
+        (x, y, z),
+        (0.5, 64.0, 0.5),
+        "the stale report carries the unchanged position"
+    );
+    assert!(
+        reports[21..]
+            .iter()
+            .all(|frame| frame[0] == 0x03 && frame.len() == 2),
+        "the counter restarts with the report: {:?}",
+        &reports[21..]
+    );
+    let ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { snapped: false, .. }))
+        .count();
+    assert!(
+        reports.len() <= ticks,
+        "one report per tick at most: {frames:?}"
+    );
+}
+
+#[test]
+fn the_sprint_and_sneak_edges_are_sent_once_per_change() {
+    // The crouch goes down and comes back up, then the player walks and starts
+    // sprinting with the control key and stops when the walk ends: each change
+    // sends one Entity Action (0x0B) with the player's own entity id (20) and
+    // the action's ordinal, and a stable state sends nothing.
+    let flips = vec![
+        (
+            4,
+            InputEvent::Key {
+                key: Key::ShiftLeft,
+                pressed: true,
+            },
+        ),
+        (
+            8,
+            InputEvent::Key {
+                key: Key::ShiftLeft,
+                pressed: false,
+            },
+        ),
+        (
+            12,
+            InputEvent::Key {
+                key: Key::W,
+                pressed: true,
+            },
+        ),
+        (
+            14,
+            InputEvent::Key {
+                key: Key::ControlLeft,
+                pressed: true,
+            },
+        ),
+        (
+            20,
+            InputEvent::Key {
+                key: Key::W,
+                pressed: false,
+            },
+        ),
+    ];
+    let (events, frames) = flip_session(floor_head(), Vec::new(), 30, 0, flips);
+    let actions: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x0B).collect();
+    assert_eq!(
+        actions,
+        vec![
+            &vec![0x0B, 0x14, 0x00, 0x00], // Start Sneaking (0)
+            &vec![0x0B, 0x14, 0x01, 0x00], // Stop Sneaking (1)
+            &vec![0x0B, 0x14, 0x03, 0x00], // Start Sprinting (3)
+            &vec![0x0B, 0x14, 0x04, 0x00], // Stop Sprinting (4)
+        ],
+        "one action per change, in order: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame[0] == 0x0B || matches!(frame[0], 0x03..=0x06)),
+        "only the actions and the walking report are sent: {frames:?}"
+    );
+    let sprints: Vec<bool> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                sprinting,
+                snapped: false,
+                ..
+            } => Some(*sprinting),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        sprints.contains(&true) && !*sprints.last().expect("ticks"),
+        "the ticks show the sprint on and off: {sprints:?}"
+    );
+}
+
+#[test]
+fn a_lone_fresh_press_only_arms_the_flight_toggle() {
+    // One fresh jump press in the air does not flip flight: it arms the
+    // seven-tick window (`EntityPlayerSP.java:834-838`), so no abilities
+    // packet goes out and the player keeps falling.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &abilities_frame(0x0C, 0.05, 0.1), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 90.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let flips = vec![
+        (
+            4,
+            InputEvent::Key {
+                key: Key::Space,
+                pressed: true,
+            },
+        ),
+        (
+            8,
+            InputEvent::Key {
+                key: Key::Space,
+                pressed: false,
+            },
+        ),
+    ];
+    let (events, frames) = flip_session(head, Vec::new(), 30, 0, flips);
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x13),
+        "arming sends nothing: {frames:?}"
+    );
+    assert!(
+        tick_states(&events).iter().all(|(_, _, flying)| !flying),
+        "flight never flips: {:?}",
+        tick_states(&events)
+    );
+}
+
+#[test]
+fn the_flight_toggle_flips_anywhere_and_lifts_the_flyer() {
+    // Two fresh jump presses inside the window flip flight — anywhere, with no
+    // ground under the player (`EntityPlayerSP.java:833-845`) — and the 0x13
+    // goes out at once with the flags the server set (allow flying and
+    // creative, so 0x0E with the flying bit). The movement model then flies:
+    // with jump held the flyer stops falling and climbs.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &abilities_frame(0x0C, 0.05, 0.1), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 90.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let space = |pressed| InputEvent::Key {
+        key: Key::Space,
+        pressed,
+    };
+    let flips = vec![(4, space(true)), (8, space(false)), (12, space(true))];
+    let (events, frames) = flip_session(head, Vec::new(), 40, 0, flips);
+    let abilities: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x13).collect();
+    assert_eq!(
+        abilities,
+        vec![&abilities_echo(0x0E, 0.05, 0.1)],
+        "one abilities packet, with the server's flags and the flying bit: {frames:?}"
+    );
+    let states = tick_states(&events);
+    let flipped = states
+        .iter()
+        .position(|(_, _, flying)| *flying)
+        .expect("the toggle flips flight");
+    assert!(
+        states[..flipped].iter().all(|(_, on_ground, _)| !on_ground),
+        "the toggle happens in the air: {states:?}"
+    );
+    assert!(
+        states[flipped..].iter().all(|(_, _, flying)| *flying),
+        "flight holds after the toggle: {states:?}"
+    );
+    assert!(
+        states[flipped..]
+            .windows(2)
+            .any(|pair| pair[1].0 > pair[0].0),
+        "the flyer climbs with jump held: {states:?}"
+    );
+}
+
+#[test]
+fn landing_cancels_flight() {
+    // The player jumps (the first fresh press), toggles flight at the top of
+    // the jump, and then descends with the sneak key: the landing cancels
+    // flight (`EntityPlayerSP.java:904-908`) and the cancel's own 0x13 carries
+    // the flying bit cleared.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &abilities_frame(0x0C, 0.05, 0.1), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let space = |pressed| InputEvent::Key {
+        key: Key::Space,
+        pressed,
+    };
+    let flips = vec![
+        (3, space(true)),
+        (6, space(false)),
+        (9, space(true)),
+        (12, space(false)),
+        (
+            15,
+            InputEvent::Key {
+                key: Key::ShiftLeft,
+                pressed: true,
+            },
+        ),
+    ];
+    let (events, frames) = flip_session(head, Vec::new(), 60, 0, flips);
+    let abilities: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x13).collect();
+    assert_eq!(
+        abilities,
+        vec![
+            &abilities_echo(0x0E, 0.05, 0.1),
+            &abilities_echo(0x0C, 0.05, 0.1),
+        ],
+        "the toggle's packet, then the landing cancel's: {frames:?}"
+    );
+    let states = tick_states(&events);
+    let flipped = states
+        .iter()
+        .position(|(_, _, flying)| *flying)
+        .expect("the toggle flips flight");
+    assert!(
+        states[flipped..].iter().any(|(_, _, flying)| !flying),
+        "the landing flips it back: {states:?}"
+    );
+    let landed = states
+        .iter()
+        .rposition(|(_, _, flying)| *flying)
+        .expect("flight ran");
+    assert!(
+        states[landed + 1..]
+            .iter()
+            .all(|(_, on_ground, flying)| *on_ground && !flying),
+        "the flyer lands and stays down: {states:?}"
+    );
+}
+
+#[test]
+fn the_servers_abilities_set_flight_without_an_echo() {
+    // A 0x39 with the flying bit on: the handler takes the packet's own flying
+    // value (`NetHandlerPlayClient.java:1674-1683`) and the movement model
+    // flies at once — an airborne player holds its altitude instead of
+    // falling. Applying abilities is not itself a change this client makes,
+    // so no 0x13 is sent for the packet.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &abilities_frame(0x0F, 0.05, 0.1), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 90.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let (events, frames) = flip_session(head, Vec::new(), 16, 0, Vec::new());
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x13),
+        "applying abilities sends nothing: {frames:?}"
+    );
+    let states = tick_states(&events);
+    assert!(
+        states.len() >= 3 && states.iter().all(|(_, _, flying)| *flying),
+        "the server's flying bit holds: {states:?}"
+    );
+    assert!(
+        states.iter().all(|(y, _, _)| (*y - 90.0).abs() < 1e-9),
+        "the flyer holds its altitude instead of falling: {states:?}"
+    );
+    let echo = nth_frame(&frames, 0x06, 0);
+    assert!(
+        frames[echo + 1..]
+            .iter()
+            .all(|frame| frame == &[0x03, 0x00]),
+        "the hovering flyer's reports carry the ground byte alone: {frames:?}"
+    );
+}
+
+#[test]
+fn a_correction_quiets_the_reporters_and_a_move_reports_the_position() {
+    // The second correction (the tail's 0x08) echoes the corrected pose and
+    // resets the walking reporters with it: the tick after the echo reports
+    // nothing of the four blocks the correction moved the player, and the walk
+    // that starts afterwards reports the small move (0x04) from the corrected
+    // position.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &position_frame(0.5, 64.0, 4.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let flips = vec![(
+        28, // four idle waits into the tail's own quiet stretch
+        InputEvent::Key {
+            key: Key::W,
+            pressed: true,
+        },
+    )];
+    let (_events, frames) = flip_session(floor_head(), tail, 24, 20, flips);
+    let echo = nth_frame(&frames, 0x06, 1); // the tail correction's echo
+    let mut expected = vec![0x06];
+    expected.extend_from_slice(&0.5f64.to_be_bytes());
+    expected.extend_from_slice(&64.0f64.to_be_bytes());
+    expected.extend_from_slice(&4.5f64.to_be_bytes());
+    expected.extend_from_slice(&0.0f32.to_be_bytes());
+    expected.extend_from_slice(&0.0f32.to_be_bytes());
+    expected.push(0x00);
+    assert_eq!(frames[echo], expected, "the echo, byte for byte");
+    let quiet = &frames[echo + 1..];
+    let moved = quiet
+        .iter()
+        .position(|frame| frame[0] == 0x04)
+        .expect("the walk is reported");
+    assert!(
+        quiet[..moved].iter().all(|frame| frame == &[0x03, 0x01]),
+        "the ticks between the echo and the walk report the ground alone: {quiet:?}"
+    );
+    assert!(
+        moved >= 1,
+        "the tick after the echo reports nothing: {quiet:?}"
+    );
+    let z = f64::from_be_bytes(quiet[moved][17..25].try_into().expect("eight bytes"));
+    assert!(
+        z > 4.5 && z < 4.8,
+        "the small move is reported from the corrected position: {z}"
     );
 }
