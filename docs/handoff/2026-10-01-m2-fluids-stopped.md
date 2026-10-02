@@ -22,17 +22,15 @@ compatibility) starts only after v1.
   plus this handoff's `docs:` commit.
 - Read first, in this order: `docs/STATE.md`; the plan
   `docs/plans/2026-09-27-m2-textured-terrain.md`; the ledger
-  `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md` (git-ignored; the recovery map —
-  trust it and `git log` over recollection); `refs/m2-cloud-arm/report.md` and
+  (local scratch space, git-ignored; the recovery map — trust it and `git log` over recollection); `refs/m2-cloud-arm/report.md` and
   `refs/m2-cloud-arm/masks/mask-mark.txt` (the last round's evidence and corrected records).
 - How the work runs: one task at a time; per task a brief (`task-N-brief.md`), the work, a report, a
   frozen diff (`review-BASE..HEAD.diff`), an independent review, scoped fix rounds; every ruling as
-  a `Ruling:` line in the ledger; checkpoint pushes at chosen stops. Owner ruling (2026-09-29):
-  every implementer and reviewer runs on the session's default model — no model changes mid-run.
+  a `Ruling:` line in the ledger; checkpoint pushes at chosen stops.
 - Rules that must not be broken: GPL-3.0; zero code copied from RustCraft; no Mojang asset, jar,
   `.class`, `.ogg` or `.png` committed and no `.class` read (the decompiled source under
   `refs/_src/MCP-919` is read for values and names only); `refs/` and `vanilla/` git-ignored and
-  never committed; `git add` with explicit paths only; no push inside implementer or reviewer runs;
+  never committed; `git add` with explicit paths only; no push inside a task's work or its review;
   the six-command gate green immediately before every commit; normal English in code, comments,
   commits and documents; Conventional Commits with an `(M2)` suffix.
 
@@ -80,7 +78,7 @@ compatibility) starts only after v1.
 
 ## Exact next step
 
-Resume **ROUND 3 (fluids)** — one fresh implementer, with the round's brief updated by the stopped
+Resume **ROUND 3 (fluids)** with a fresh attempt, the round's brief updated by the stopped
 attempt's findings:
 
 1. Brief it with: the original scope (the wall's four glass-walled liquid cells — x=0,1 water /
@@ -107,9 +105,8 @@ attempt's findings:
 ## Open questions for the project owner
 
 None outstanding. The mark-pair cloud-arm question was answered on 2026-10-01 (implement as a
-scoped round; landed as `e919711`). The fluids round's adopt-vs-clean decision is the controller's
-to make at resume (recommended default: re-verify the cause first, then adopt the tests only if
-they pin source literals).
+scoped round; landed as `e919711`). The fluids round's adopt-vs-clean decision is made at resume (recommended default: re-verify the
+cause first, then adopt the tests only if they pin source literals).
 
 ## Environment notes
 

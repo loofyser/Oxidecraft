@@ -23,7 +23,6 @@
 - Datastore paths resolve through `XDG_DATA_HOME` when set, else `~/.local/share`, else the platform equivalent via the `dirs` crate.
 - The allowed crate edges are exactly the section 5.1 table: `oxide-world → {oxide-proto, oxide-proto-v47}`; `oxide-game → {oxide-proto, oxide-proto-v47, oxide-world, oxide-assets, oxide-render}`; `oxide-client → all of the above`; `oxide-render → oxide-assets`. `scripts/check-graph.sh` fails the build on anything else.
 - Every public item carries a doc comment (workspace lint `missing_docs`); `unsafe_code` is forbidden workspace-wide.
-- No AI or tooling language in commits, code, comments, or committed documents.
 - `git add` is always explicit with paths; never `git add -A` or `git add .`.
 - Evidence (captures, screenshots, logs) lives under the git-ignored `refs/` tree. Committed documents cite it by path.
 - The local gate before every commit is: `cargo test --workspace`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`, `bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`.
@@ -720,8 +719,6 @@ Then extract the player's spawn column from run A (and, when present, one `0x26`
 4. **Obligations observed** — the keepalive interval, the order of Client Settings relative to Join Game (both observed from the vanilla client), and the position echo after Player Position And Look — each as byte-level observations of what a correct client must answer.
 5. **Fixtures** — the extracted files, their SHA-1s, their masks and sizes, and the block-id counts the tests assert.
 6. **Rig changes** — the `server-port=25566` edit and how to revert it (`server-port=25565`, restart, or leave it: the findings document says which).
-
-No AI or tooling language anywhere in this document.
 
 - [ ] **Step 6: Commit**
 

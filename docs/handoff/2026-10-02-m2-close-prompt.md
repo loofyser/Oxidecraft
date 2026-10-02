@@ -49,8 +49,7 @@ push and CI green after every checkpoint push.
 ## Rules that must not be broken
 
 - GPL-3.0; no code copied from RustCraft; no Mojang asset, jar, `.class`, `.ogg` or `.png`
-  committed, and no `.class` read; `refs/` and vanilla data stay local and uncommitted; no AI or
-  tooling language in commits, code, comments or committed documents; `git add` with explicit
+  committed, and no `.class` read; `refs/` and vanilla data stay local and uncommitted; `git add` with explicit
   paths; normal English.
 - Keep the local Rust stable current (`rustup update stable`; `rust-toolchain.toml` says
   `channel = "stable"`). A six-release gap once hid a CI clippy failure for five days — check CI

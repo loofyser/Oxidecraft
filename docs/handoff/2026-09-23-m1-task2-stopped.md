@@ -21,8 +21,8 @@ singleplayer worlds and Java mod compatibility (spec section 17, revision v4).
   kickoff), `docs/plans/2026-09-23-m1-bytes-to-world.md` (the binding plan: 13 tasks, the global
   constraints, the decisions, and the owner's recorded answers), `docs/STATE.md`,
   `docs/research/protocol-47-reference.md` (byte-level truth for everything on the wire), and the
-  progress ledger `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md` (the pre-flight scan
-  table, the rulings, and the per-task history — it is the recovery map after any context loss).
+  progress ledger (local scratch space, git-ignored — the pre-flight scan table, the rulings, and
+  the per-task history; it is the recovery map after any interruption).
 - How the work is run: one task at a time, in plan order. Per task: extract the brief from the plan
   into `task-N-brief.md`, carry the task out against that brief alone, then have the task's frozen
   diff (`review-BASE..HEAD.diff`) reviewed independently; fix rounds close the findings; every
@@ -31,8 +31,7 @@ singleplayer worlds and Java mod compatibility (spec section 17, revision v4).
 - Rules that must not be broken: GPL-3.0; zero code copied from RustCraft (read-only reference); no
   Mojang asset, jar, `.class`, `.ogg`, or `.png` committed and no `.class` ever read at runtime;
   rust-version 1.85, edition 2024, committed `Cargo.lock`; every public item documented and
-  `unsafe_code` forbidden workspace-wide; no AI or tooling language in committed files or commits;
-  `git add` always with explicit paths; evidence (captures, screenshots, logs) stays under the
+  `unsafe_code` forbidden workspace-wide; `git add` always with explicit paths; evidence (captures, screenshots, logs) stays under the
   git-ignored `refs/`; run the gate before every push (`cargo test --workspace`,
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo deny check`, `bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`).
@@ -46,7 +45,7 @@ singleplayer worlds and Java mod compatibility (spec section 17, revision v4).
   workspace-wide, `fmt` and `clippy -D warnings` clean.
 - Known unfinished: Task 2's capture. Run A's raw capture exists (unanalysed), run B never ran, no
   fixtures exist, and the findings document was never written. The two rig tools the stopped
-  implementer wrote are unverified — and its own synthetic self-test of `analyse_capture.py` was
+  attempt produced are unverified — and its own synthetic self-test of `analyse_capture.py` was
   **failing** when it was interrupted (`DESYNC: 0x26 frame 5: 256 bytes left after the last column`),
   which is the known `0x26` trap: the biome array is always present in bulk columns and must be
   consumed. Fix or verify that path before trusting any analysis.

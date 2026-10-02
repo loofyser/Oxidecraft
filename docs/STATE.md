@@ -67,8 +67,8 @@ specification and continue without asking questions that are already answered he
   (`f366236..82d3090` chain) added the parity metric (`scripts/parity-diff.py`), the acceptance
   baseline (`docs/perf.md`) and the sample-wall cells, and ran the full acceptance against the
   three scene pairs; Task 16 closed the milestone out. See the 2026-10-02 update bullet below.
-  Every task's brief, report, review and every ruling live in the plan's ledger
-  `.superpowers/sdd/2026-09-27-m2-textured-terrain/progress.md`. M1 is complete and tagged `m1` (the
+  Every task's brief, report, review and every ruling live in the plan's ledger (local,
+  git-ignored). M1 is complete and tagged `m1` (the
   annotated tag marks the close-out commit `930ccab`; the reviewed code head is `854ca85` and its
   final whole-branch review returned ready to merge). M0 is complete and tagged `m0`.
 - **2026-10-02 update — M2 closed.** After the stop, the fluids round resumed and closed
@@ -127,8 +127,8 @@ specification and continue without asking questions that are already answered he
   closed: both guards carry `--self-test` modes since `854ca85`, and CI runs each one before its
   normal check.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding; the
-  M1 per-task reviews and the final whole-branch review are in the milestone ledger
-  `.superpowers/sdd/2026-09-23-m1-bytes-to-world/progress.md`.
+  M1 per-task reviews and the final whole-branch review are in the milestone ledger (local,
+  git-ignored).
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
