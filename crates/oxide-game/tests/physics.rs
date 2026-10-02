@@ -1,16 +1,17 @@
 //! The movement model's vectors and cases, driven against a synthetic view.
 //!
 //! The five exit vectors — `walk_speed`, `sprint_speed`, `sneak_speed`,
-//! `jump_apex`, `terminal_velocity` — are the numbers Task 13 measures live.
-//! Their literals come from the milestone's sources: the brief's pins, the
-//! research report (`docs/research/render-parity-survey.md` §5.4) and the
-//! decompiled 1.8.9 client under `refs/_src/MCP-919/`, whose file and line
-//! each derivation cites. A literal the source refutes is corrected here and
-//! named in the task report.
+//! `jump_apex`, `terminal_velocity` — are the numbers the live acceptance
+//! measures. Their literals come from the recorded research
+//! (`docs/research/render-parity-survey.md` §5.4) and the decompiled 1.8.9
+//! client under `refs/_src/MCP-919/`, whose file and line each derivation
+//! cites. A literal the source refutes is corrected here, with the
+//! refutation in its own doc comment.
 //!
 //! The fixtures are synthetic by rule: every block is a class the movement
-//! model branches on — a full cube, a half-height step, a ladder, water and
-//! lava — and no fixture reads anything from the user's store.
+//! model branches on — a full cube, a half-height step, a chest-high box, a
+//! ladder, water and lava — and no fixture reads anything from the user's
+//! store.
 
 use std::collections::HashMap;
 
@@ -32,6 +33,9 @@ enum Block {
     Water,
     /// A lava source.
     Lava,
+    /// A soul sand: the full footprint topped 0.875 high — a chest-high step
+    /// the collision walk refuses (`BlockSoulSand.java:20-23`).
+    SoulSand,
 }
 
 /// The synthetic view: a block map, keyed by cell.
@@ -82,6 +86,11 @@ impl CollisionView for TestView {
             Some(Block::Full) => out.push(at(CollisionBox::full())),
             // `BlockSlab.java:34`: `setBlockBounds(0.0F, 0.0F, 0.0F, 1.0F, 0.5F, 1.0F)`.
             Some(Block::Half) => out.push(at(CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.5, 1.0]))),
+            // `BlockSoulSand.java:20-23`: `(1.0F - 0.125F)`, so the top sits
+            // at 0.875 — above the step probe's 0.6.
+            Some(Block::SoulSand) => {
+                out.push(at(CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.875, 1.0])))
+            }
             _ => {}
         }
     }
@@ -209,7 +218,7 @@ fn sneak_speed() {
 
 /// The jump vector: the standing jump's apex.
 ///
-/// The pin corrected: the brief's literal 1.25220 is the apex of a source
+/// The corrected pin: 1.25220 is the apex of a source
 /// that keeps the motion after the clamp; 1.8.9 clamps `motionY` to zero at
 /// 0.005 *before* the move (`EntityLivingBase.java:1974-1987`) and the
 /// achieved apex is 1.24919. The recurrence, `jump()`'s `0.42F` widened
@@ -380,7 +389,7 @@ fn sneaking_holds_the_player_at_a_platform_edge() {
 }
 
 /// Water drag: the terminal descent is 0.1 blocks a tick, `0.02 / (1 - 0.8)`
-/// from `EntityLivingBase.java:1726-1737` — far below the air's 3.92.
+/// from `EntityLivingBase.java:1725-1728` — far below the air's 3.92.
 #[test]
 fn water_drag_slows_the_descent() {
     let mut view = TestView::new();
@@ -418,7 +427,7 @@ fn water_drag_slows_the_descent() {
 }
 
 /// Lava drag: the terminal descent is 0.04 blocks a tick, `0.02 / (1 - 0.5)`
-/// from `EntityLivingBase.java:1693-1698` — the liquid branch the fixtures
+/// from `EntityLivingBase.java:1689-1692` — the liquid branch the fixtures
 /// must enter for it to be falsifiable.
 #[test]
 fn lava_sinks_slower_than_water() {
@@ -546,7 +555,7 @@ fn level_flight_holds_the_derived_speed() {
 
 /// Sneak-flying descends at the derived speed: the vertical input
 /// `0.05F × 3.0F` (`EntityPlayerSP.java:848-859`) and the retention `d3 * 0.6`
-/// (`EntityPlayer.java:1802-1803`) settle at `2.5 × 0.15000000596046448` =
+/// (`EntityPlayer.java:1800`) settle at `2.5 × 0.15000000596046448` =
 /// 0.37500001·… blocks a tick.
 #[test]
 fn sneak_flying_descends_at_the_derived_speed() {
@@ -565,5 +574,347 @@ fn sneak_flying_descends_at_the_derived_speed() {
         (-d[1] - 2.5 * f64::from(0.05f32 * 3.0)).abs() < 1e-9,
         "descent does not match the derived chain: {}",
         -d[1]
+    );
+}
+
+/// The swim-up nudge needs a horizontal collision: rising in a wall-less
+/// one-deep pond never leaves the held jump's own chain. The source gates
+/// `motionY = 0.30000001192092896D` on `isCollidedHorizontally`
+/// (`EntityLivingBase.java:1730-1732`, water; `:1694-1696`, lava); without
+/// the clause the nudge fires as soon as the offset probe finds open space
+/// and the rise jumps from ~0.1 to 0.34.
+#[test]
+fn swim_up_needs_a_horizontal_collision() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 4);
+    for x in -2..=2 {
+        for z in -2..=1 {
+            view.put(x, 0, z, Block::Water);
+        }
+    }
+    let mut player = standing_at(0.5, 1.699999988079071);
+    let intent = held(&[Key::Space]);
+    let mut max_rise = 0.0f64;
+    let mut max_motion = 0.0f64;
+    for _ in 0..150 {
+        let d = tick_displacement(&mut player, &intent, &view);
+        max_rise = max_rise.max(d[1]);
+        max_motion = max_motion.max(player.motion[1]);
+    }
+    // The held jump's chain: `motionY` settles at `0.8 × (s + 0.04) - 0.02`
+    // ≈ 0.06 and each tick rises `s + 0.04` ≈ 0.1.
+    assert!(max_rise > 0.05, "never rose: {max_rise}");
+    assert!(max_motion > 0.04, "the chain never built: {max_motion}");
+    assert!(max_rise < 0.11, "rise took the swim-up nudge: {max_rise}");
+    assert!(
+        max_motion < 0.11,
+        "motion took the swim-up nudge: {max_motion}"
+    );
+}
+
+/// The same pond with a wall at the edge: the collision clause holds, so the
+/// nudge fires and the rise runs at `0.30000001192092896 + 0.03999999910593033`
+/// a tick (`EntityLivingBase.java:1730-1732`).
+#[test]
+fn swim_up_kicks_against_a_wall() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 4);
+    for x in -2..=2 {
+        for z in -2..=1 {
+            view.put(x, 0, z, Block::Water);
+        }
+    }
+    for x in -2..=2 {
+        view.column(x, 2, 0, 4, Block::Full);
+    }
+    let mut player = standing_at(0.5, 1.699999988079071);
+    let intent = held(&[Key::W, Key::Space]);
+    let mut max_rise = 0.0f64;
+    for _ in 0..150 {
+        let d = tick_displacement(&mut player, &intent, &view);
+        max_rise = max_rise.max(d[1]);
+    }
+    assert!(
+        (max_rise - 0.3400000110268593).abs() < 1e-6,
+        "the kick chain never fired: {max_rise}"
+    );
+}
+
+/// The lava branch carries the same clause (`EntityLivingBase.java:1694-1696`):
+/// rising in wall-less lava never kicks either.
+#[test]
+fn swim_up_needs_a_horizontal_collision_in_lava() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 4);
+    for x in -2..=2 {
+        for z in -2..=1 {
+            view.put(x, 0, z, Block::Lava);
+        }
+    }
+    let mut player = standing_at(0.5, 1.699999988079071);
+    let intent = held(&[Key::Space]);
+    let mut max_rise = 0.0f64;
+    for _ in 0..150 {
+        let d = tick_displacement(&mut player, &intent, &view);
+        max_rise = max_rise.max(d[1]);
+    }
+    // The lava chain: `0.5 × (s + 0.04) - 0.02`, a rise of 0.04 a tick.
+    assert!(max_rise > 0.03, "never rose: {max_rise}");
+    assert!(max_rise < 0.11, "rise took the swim-up nudge: {max_rise}");
+}
+
+/// A 0.875-high box is not stepped up: the walk stops at its face like a
+/// wall's, while a jump gets the walker on top. `stepHeight = 0.6F`
+/// (`EntityLivingBase.java:208`) makes the step probe blind to anything
+/// above `y = 0.6` (`Entity.java:721-813`).
+#[test]
+fn a_soul_sand_box_needs_a_jump() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 30);
+    for x in -1..=1 {
+        view.put(x, 0, 4, Block::SoulSand);
+    }
+
+    let mut walker = standing_at(0.5, 0.5);
+    let walk = held(&[Key::W]);
+    for _ in 0..120 {
+        step(&mut walker, &walk, &view);
+    }
+    assert!(
+        (walker.position[2] - 3.7).abs() < 1e-6,
+        "did not stop at the face: {}",
+        walker.position[2]
+    );
+    assert!(
+        walker.position[1].abs() < 1e-9,
+        "stepped up: {}",
+        walker.position[1]
+    );
+
+    let mut jumper = standing_at(0.5, 0.5);
+    let jump_and_walk = held(&[Key::W, Key::Space]);
+    let mut on_box = false;
+    for _ in 0..120 {
+        step(&mut jumper, &jump_and_walk, &view);
+        if (4.0..5.0).contains(&jumper.position[2]) && (jumper.position[1] - 0.875).abs() < 1e-9 {
+            on_box = true;
+        }
+    }
+    assert!(on_box, "never stood on the box");
+    assert!(
+        jumper.position[2] > 5.0,
+        "did not cross: {}",
+        jumper.position[2]
+    );
+}
+
+/// The airborne walk control: the air acceleration is `speedInAir = 0.02F`
+/// (`EntityPlayer.java:164`) and the air friction the bare `0.91F`
+/// (`EntityLivingBase.java:1610-1614`), with `a = 0.98 × 0.02F` widened
+/// through `moveFlying` (`EntityLivingBase.java:1629`): the horizontal
+/// motion settles at `a / (1 - 0.9100000262260437)` = 0.21777784·… a tick.
+#[test]
+fn air_control_matches_the_speed_in_air() {
+    let view = TestView::new();
+    let mut player = Player::new();
+    player.position = [0.5, 300.0, 0.5];
+    player.on_ground = false;
+    let intent = held(&[Key::W]);
+    for _ in 0..300 {
+        step(&mut player, &intent, &view);
+    }
+    let d = tick_displacement(&mut player, &intent, &view);
+    assert!(!player.on_ground);
+    assert!(
+        (d[2] - 0.21777784382111293).abs() < 1e-9,
+        "air walk per tick: {}",
+        d[2]
+    );
+}
+
+/// The sprinting air control: `jumpMovementFactor` becomes
+/// `0.02F + 0.02F × 0.3` widened (`EntityPlayer.java:627-631`), so the
+/// airborne sprint settles at 0.28311117627138355 a tick.
+#[test]
+fn sprint_air_control_matches_the_boosted_speed() {
+    let view = TestView::new();
+    let mut player = Player::new();
+    player.position = [0.5, 300.0, 0.5];
+    player.sprinting = true;
+    let intent = held(&[Key::W]);
+    for _ in 0..300 {
+        step(&mut player, &intent, &view);
+    }
+    let d = tick_displacement(&mut player, &intent, &view);
+    assert!(
+        (d[2] - 0.28311117627138355).abs() < 1e-9,
+        "air sprint per tick: {}",
+        d[2]
+    );
+}
+
+/// The water acceleration drives the swim: `moveFlying(..., 0.02F)` with the
+/// `0.8` drags (`EntityLivingBase.java:1703-1704`, `:1723-1728`) settles the
+/// horizontal motion at 0.09800000700354615 a tick.
+#[test]
+fn water_acceleration_sets_the_horizontal_speed() {
+    let mut view = TestView::new();
+    for x in -2..=2 {
+        for z in -2..=40 {
+            view.column(x, z, -30, 8, Block::Water);
+        }
+    }
+    let mut player = Player::new();
+    player.position = [0.5, 6.0, 0.5];
+    player.on_ground = false;
+    let intent = held(&[Key::W]);
+    for _ in 0..300 {
+        step(&mut player, &intent, &view);
+    }
+    let d = tick_displacement(&mut player, &intent, &view);
+    assert!(player.in_water, "left the water at {}", player.position[1]);
+    assert!(
+        (d[2] - 0.09800000700354615).abs() < 1e-9,
+        "water swim per tick: {}",
+        d[2]
+    );
+}
+
+/// Jumping in deep water rises at the liquid-jump chain: the held jump adds
+/// `motionY += 0.03999999910593033D` (`EntityLivingBase.java:1589-1596`)
+/// before the move and the `0.8` drags after, so the rise settles just past
+/// `5 × 0.03999999910593033 - 0.1` = 0.1 a tick — the widened drags put the
+/// fixed point at 0.10000000148994004.
+#[test]
+fn jump_held_in_water_rises_at_the_liquid_jump_rate() {
+    let mut view = TestView::new();
+    for x in -2..=2 {
+        for z in -2..=2 {
+            view.column(x, z, -30, 30, Block::Water);
+        }
+    }
+    let mut player = standing_at(0.5, 0.5);
+    let intent = held(&[Key::Space]);
+    for _ in 0..120 {
+        step(&mut player, &intent, &view);
+    }
+    let d = tick_displacement(&mut player, &intent, &view);
+    assert!(player.in_water);
+    assert!(
+        (d[1] - 0.10000000148994004).abs() < 1e-9,
+        "liquid jump rise: {}",
+        d[1]
+    );
+}
+
+/// The lava acceleration: `moveFlying(..., 0.02F)` with the `0.5` drags
+/// (`EntityLivingBase.java:1687-1692`) settles the horizontal motion at
+/// 0.03920000046491623 a tick — `2a` against water's `5a`.
+#[test]
+fn lava_acceleration_sets_the_horizontal_speed() {
+    let mut view = TestView::new();
+    for x in -2..=2 {
+        for z in -2..=40 {
+            view.column(x, z, -30, 8, Block::Lava);
+        }
+    }
+    let mut player = Player::new();
+    player.position = [0.5, 6.0, 0.5];
+    player.on_ground = false;
+    let intent = held(&[Key::W]);
+    for _ in 0..200 {
+        step(&mut player, &intent, &view);
+    }
+    let d = tick_displacement(&mut player, &intent, &view);
+    assert!(
+        (d[2] - 0.03920000046491623).abs() < 1e-9,
+        "lava swim per tick: {}",
+        d[2]
+    );
+}
+
+/// Crossing a ladder strip clamps the horizontal motion to `(double)0.15F`
+/// = 0.15000000596046448 (`EntityLivingBase.java:1639-1641`): a sprinted
+/// crossing advances exactly the clamp each tick while the approach on open
+/// ground keeps the sprint's ~0.28.
+#[test]
+fn the_ladder_clamp_caps_the_horizontal_speed() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 40);
+    for z in 10..=30 {
+        view.put(0, 0, z, Block::Ladder);
+    }
+    let mut player = standing_at(0.5, 0.5);
+    player.sprinting = true;
+    let intent = held(&[Key::W, Key::ControlLeft]);
+    let mut clamped = 0;
+    let mut fastest = 0.0f64;
+    for _ in 0..200 {
+        let before = player.position[2];
+        let cell = before.floor() as i32;
+        step(&mut player, &intent, &view);
+        let d = player.position[2] - before;
+        if (10..=30).contains(&cell) {
+            assert!(
+                (d - 0.15000000596046448).abs() < 1e-9,
+                "a clamped tick moved {d}"
+            );
+            clamped += 1;
+        } else if cell < 10 {
+            fastest = fastest.max(d);
+        }
+    }
+    assert!(
+        clamped >= 30,
+        "the run was clamped for only {clamped} ticks"
+    );
+    assert!(fastest > 0.25, "the sprint never ran: {fastest}");
+}
+
+/// The ladder's descent clamp: a fall touching a ladder column slides at
+/// `-0.15` — the double literal (`EntityLivingBase.java:1644-1646`) — rather
+/// than accelerating toward the terminal fall.
+#[test]
+fn the_ladder_descent_clamp_caps_the_slide() {
+    let mut view = TestView::new();
+    for y in 20..=41 {
+        view.put(0, y, 0, Block::Ladder);
+    }
+    let mut player = Player::new();
+    player.position = [0.5, 40.0, 0.5];
+    let intent = Intent::neutral();
+    for _ in 0..40 {
+        step(&mut player, &intent, &view);
+    }
+    let d = tick_displacement(&mut player, &intent, &view);
+    assert!((d[1] + 0.15).abs() < 1e-9, "ladder slide: {}", d[1]);
+}
+
+/// A sprinting jump shoves the player along the facing: `jump()` adds
+/// `± 0.2F` to `motionX`/`motionZ` (`EntityLivingBase.java:1576-1581`), so
+/// the jump tick advances 0.20000000298023224 past the settled sprint tick.
+#[test]
+fn a_sprint_jump_shoves_the_player_along_the_facing() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 60);
+    let mut player = standing_at(0.5, 0.5);
+    player.sprinting = true;
+    let run = held(&[Key::W, Key::ControlLeft]);
+    for _ in 0..199 {
+        step(&mut player, &run, &view);
+    }
+    let before = tick_displacement(&mut player, &run, &view);
+    let jump = held(&[Key::W, Key::ControlLeft, Key::Space]);
+    let d = tick_displacement(&mut player, &jump, &view);
+    assert!(
+        (d[2] - (before[2] + 0.20000000298023224)).abs() < 1e-9,
+        "jump tick {} against the settled {}",
+        d[2],
+        before[2]
+    );
+    assert!(
+        (d[1] - 0.41999998688697815).abs() < 1e-9,
+        "jump rise: {}",
+        d[1]
     );
 }

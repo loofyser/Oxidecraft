@@ -37,10 +37,17 @@
 //!   [`crate::input::SprintTap`] documents leaving it out. `step` reads
 //!   `player.sprinting` and never sets it.
 //! * Fall damage (`Entity.updateFallState`), the riding branches, the
-//!   entity-push and the walking stats: the milestone's later tasks own them.
+//!   entity-push and the walking stats are not modelled.
+//! * The depth-strider scaling of the water branch
+//!   (`EntityLivingBase.java:1705-1721`), the water-current push
+//!   (`World.handleMaterialAcceleration`, `World.java:2120-2127`) and the
+//!   unloaded-chunk motion guard (`EntityLivingBase.java:1664-1674`) are not
+//!   carried.
 //! * The source's sine table (`MathHelper.SIN_TABLE`, a 65536-entry lookup)
-//!   is replaced by the platform's `sin`/`cos`: the difference is below
-//!   1e-7 for the movement rules' inputs, and no pinned vector depends on it.
+//!   is replaced by the platform's `sin`/`cos`: the table truncates each
+//!   angle to one of its 65536 steps, so the difference is bounded by about
+//!   one step (9.6e-5) at general angles and vanishes at the pinned vectors'
+//!   yaw-0 and 45° inputs; no pinned vector depends on it.
 
 use oxide_world::collision::CollisionBox;
 
@@ -77,8 +84,9 @@ const DRAG_Y: f64 = 0.9800000190734863;
 /// `float f4 = 0.91F` (`EntityLivingBase.java:1610`, `:1630`).
 const FRICTION_BASE: f32 = 0.91;
 
-/// The ground acceleration's normalisation: `0.16277136F` is (0.6F)^-3, the
-/// source's hard-coded scale of the movement speed attribute
+/// The ground acceleration's normalisation: `0.16277136F` is the cube of the
+/// default ground friction `0.6F * 0.91F` = `0.546F` — about `0.162771336` —
+/// so the division cancels it on default ground
 /// (`EntityLivingBase.java:1617`).
 const GROUND_ACCEL_FACTOR: f32 = 0.16277136;
 
@@ -136,29 +144,29 @@ const SPRINT_JUMP_BOOST: f32 = 0.2;
 /// (`EntityLivingBase.java:1589-1596`) — (double)0.04F.
 const LIQUID_JUMP: f64 = 0.03999999910593033;
 
-/// Water: `float f1 = 0.8F; float f2 = 0.02F`, `motionY *= 0.800000011920929D`,
-/// `motionY -= 0.02D` (`EntityLivingBase.java:1726-1737`).
+/// Water: `float f1 = 0.8F; float f2 = 0.02F` (`EntityLivingBase.java:1703-1704`),
+/// `motionY *= 0.800000011920929D`, `motionY -= 0.02D` (`:1725-1728`).
 const WATER_DRAG: f64 = 0.800000011920929;
-/// Water's acceleration handed to `moveFlying` (`:1740`).
+/// Water's acceleration handed to `moveFlying` (`:1723`).
 const WATER_ACCEL: f32 = 0.02;
-/// Water's sink per tick (`:1729`).
+/// Water's sink per tick (`:1728`).
 const WATER_SINK: f64 = 0.02;
 
 /// Lava: `motionX *= 0.5D` and `motionY -= 0.02D`
-/// (`EntityLivingBase.java:1693-1698`), `moveFlying(..., 0.02F)` (`:1692`).
+/// (`EntityLivingBase.java:1689-1692`), `moveFlying(..., 0.02F)` (`:1687`).
 const LAVA_DRAG: f64 = 0.5;
-/// Lava's acceleration handed to `moveFlying` (`:1692`).
+/// Lava's acceleration handed to `moveFlying` (`:1687`).
 const LAVA_ACCEL: f32 = 0.02;
-/// Lava's sink per tick (`:1697`).
+/// Lava's sink per tick (`:1692`).
 const LAVA_SINK: f64 = 0.02;
 
 /// The swim-up nudge when a horizontal collision meets free liquid:
-/// `motionY = 0.30000001192092896D` (`EntityLivingBase.java:1703-1707`, water;
-/// `:1715-1719`, lava).
+/// `motionY = 0.30000001192092896D` (`EntityLivingBase.java:1730-1732`, water;
+/// `:1694-1696`, lava).
 const SWIM_UP: f64 = 0.30000001192092896;
 
 /// The fly branch's vertical retention: `this.motionY = d3 * 0.6D`
-/// (`EntityPlayer.java:1802-1803`).
+/// (`EntityPlayer.java:1800`).
 const FLY_VERTICAL_RETAIN: f64 = 0.6;
 
 /// The fluid a block holds, as the movement rules see it.
@@ -185,9 +193,9 @@ pub enum FluidKind {
 ///
 /// One tick reads four things: the slipperiness of the block underfoot, the
 /// collision boxes a cell reports, the fluid in a cell and whether a cell
-/// climbs (`Block.isLadder`, `block/Block.java:1428-1432`). The world — and,
-/// until Task 3 supplies it, a test fixture — answers without the model
-/// knowing how any of it is stored.
+/// climbs (`EntityLivingBase.isOnLadder`,
+/// `entity/EntityLivingBase.java:1134-1141`). The world — or a test fixture —
+/// answers without the model knowing how any of it is stored.
 pub trait CollisionView {
     /// The block's slipperiness: `Block.slipperiness`, `0.6F` by default
     /// (`block/Block.java:147`, `:291`), `0.98F` for ice.
@@ -196,14 +204,15 @@ pub trait CollisionView {
     /// Pushes the collision boxes of the block at the cell into `out`.
     ///
     /// `out` is appended to, not cleared: the caller hands a scratch vector
-    /// per query. Blocks without a collision box (air, fluids, ladders, most
+    /// per query. Blocks without a collision box (air, fluids, most
     /// plants) push nothing.
     fn collision_boxes(&self, x: i32, y: i32, z: i32, out: &mut Vec<CollisionBox>);
 
     /// The fluid at the cell, if the block holds one.
     fn fluid(&self, x: i32, y: i32, z: i32) -> Option<Fluid>;
 
-    /// Whether the block climbs (`Block.isLadder`).
+    /// Whether the block climbs (`EntityLivingBase.isOnLadder`,
+    /// `entity/EntityLivingBase.java:1134-1141`).
     fn climbable(&self, x: i32, y: i32, z: i32) -> bool;
 }
 
@@ -214,7 +223,7 @@ pub trait CollisionView {
 /// (`MovementInputFromOptions.java:42-46`) — and the world view. The step
 /// owns the position, the motion, the ground state, the sneak flag and the
 /// in-water flag; the sprint state machine and the flight toggle stay with
-/// the input layer and Task 5, and `step` only reads `player.sprinting` and
+/// the input layer, and `step` only reads `player.sprinting` and
 /// `player.flying`.
 pub fn step(player: &mut Player, input: &Intent, view: &dyn CollisionView) {
     // The held sneak state the collision walk reads; `EntityPlayerSP` sets it
@@ -418,16 +427,16 @@ fn land_or_air(
     player.motion[2] *= f64::from(f4);
 }
 
-/// Water (`EntityLivingBase.java:1720-1745`).
+/// Water (`EntityLivingBase.java:1700-1734`).
 fn water(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView) {
     let d0 = player.position[1];
     move_flying(player, strafe, forward, WATER_ACCEL);
-    let _ = move_entity(player, view);
+    let collided_horizontally = move_entity(player, view);
     player.motion[0] *= WATER_DRAG;
     player.motion[1] *= WATER_DRAG;
     player.motion[2] *= WATER_DRAG;
     player.motion[1] -= WATER_SINK;
-    if player.motion[1] + 0.6000000238418579 - player.position[1] + d0 > f64::MIN
+    if collided_horizontally
         && is_offset_position_in_liquid(
             player,
             view,
@@ -440,22 +449,24 @@ fn water(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionVie
     }
 }
 
-/// Lava (`EntityLivingBase.java:1687-1719`).
+/// Lava (`EntityLivingBase.java:1684-1698`).
 fn lava(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView) {
     let d1 = player.position[1];
     move_flying(player, strafe, forward, LAVA_ACCEL);
-    let _ = move_entity(player, view);
+    let collided_horizontally = move_entity(player, view);
     player.motion[0] *= LAVA_DRAG;
     player.motion[1] *= LAVA_DRAG;
     player.motion[2] *= LAVA_DRAG;
     player.motion[1] -= LAVA_SINK;
-    if is_offset_position_in_liquid(
-        player,
-        view,
-        player.motion[0],
-        player.motion[1] + 0.6000000238418579 - player.position[1] + d1,
-        player.motion[2],
-    ) {
+    if collided_horizontally
+        && is_offset_position_in_liquid(
+            player,
+            view,
+            player.motion[0],
+            player.motion[1] + 0.6000000238418579 - player.position[1] + d1,
+            player.motion[2],
+        )
+    {
         player.motion[1] = SWIM_UP;
     }
 }
@@ -816,7 +827,9 @@ fn on_ladder(player: &Player, view: &dyn CollisionView) -> bool {
 }
 
 /// `Entity.handleWaterMovement` (`Entity.java:1111-1130`): the feet box
-/// expanded 0.4 down and contracted by 0.001.
+/// shrunk 0.4 at the top and bottom — the source's `expand` with a negative
+/// amount gives the mid-band `[feet + 0.4, feet + 1.4]` — and contracted by
+/// 0.001.
 fn in_water(player: &Player, view: &dyn CollisionView) -> bool {
     let bb = contract(
         expand(player_box(player), 0.0, -0.4000000059604645, 0.0),
@@ -875,7 +888,7 @@ fn liquid_in_bb(view: &dyn CollisionView, bb: CollisionBox, kind: FluidKind) -> 
 }
 
 /// `BlockLiquid.getLiquidHeightPercent` (`BlockLiquid.java:48-56`) and the
-/// surface arithmetic of `handleMaterialAcceleration` (`World.java:2105`):
+/// surface arithmetic of `handleMaterialAcceleration` (`World.java:2106-2110`):
 /// the float `(level + 1) / 9` is subtracted from the cell's top edge, 8 or
 /// more reading as a source block.
 fn liquid_surface(y: i32, level: u8) -> f64 {
@@ -899,7 +912,7 @@ fn any_liquid_in_bb(view: &dyn CollisionView, bb: CollisionBox) -> bool {
     false
 }
 
-/// `Entity.isOffsetPositionInLiquid` (`Entity.java:2054-2061`): the box moved
+/// `Entity.isOffsetPositionInLiquid` (`Entity.java:581-592`): the box moved
 /// by the offset touches no collision box and no liquid — the free space the
 /// swim-up nudge needs.
 fn is_offset_position_in_liquid(
@@ -933,7 +946,7 @@ mod tests {
 
     #[test]
     fn the_liquid_surface_is_the_sources_float_arithmetic() {
-        // `BlockLiquid.java:48-56` and `World.java:2105`: `(level + 1) / 9` is
+        // `BlockLiquid.java:48-56` and `World.java:2106-2110`: `(level + 1) / 9` is
         // a float, subtracted from the cell's top edge in float.
         assert_eq!(liquid_surface(0, 0), f64::from(1.0f32 - 1.0f32 / 9.0f32));
         assert_eq!(liquid_surface(4, 7), f64::from(5.0f32 - 8.0f32 / 9.0f32));
