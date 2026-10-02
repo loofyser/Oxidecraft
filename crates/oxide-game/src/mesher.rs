@@ -269,10 +269,18 @@ fn append_block(
         }
         return;
     }
-    match ctx
-        .models
-        .model(id, meta, position.0, position.1, position.2)
-    {
+    // The alternative pick hashes the position the block renders at: the
+    // source's chunk compiler walks the chunk's absolute box
+    // (`RenderChunk.java:119-120`) and hands each block's world `BlockPos` to
+    // the dispatcher (`:187`, `BlockRendererDispatcher.java:100-102`). The
+    // snapshot's own reads stay in the column's frame, so the cell is widened
+    // to the world before the lookup.
+    let world = (
+        snapshot.cx * SECTION_SIZE as i32 + position.0,
+        position.1,
+        snapshot.cz * SECTION_SIZE as i32 + position.2,
+    );
+    match ctx.models.model(id, meta, world.0, world.1, world.2) {
         ModelChoice::Model(model) => append_model(builder, snapshot, position, block, model, ctx),
         ModelChoice::Missing => append_fallback(builder, snapshot, position, layer, ctx),
     }

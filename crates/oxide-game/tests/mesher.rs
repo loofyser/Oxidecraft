@@ -1417,6 +1417,33 @@ fn weighted_alternatives_follow_the_positions_hash() {
 }
 
 #[test]
+fn weighted_alternatives_read_the_world_position_not_the_columns() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+
+    // The source hashes the position the block renders at: the chunk compiler
+    // walks the chunk's absolute box (`RenderChunk.java:119-120`) and hands
+    // each block's world `BlockPos` to the dispatcher (`:187`), which picks the
+    // alternative with it (`BlockRendererDispatcher.java:100-102`). A column's
+    // build reads its cells in the column's own frame, so the pick must widen
+    // the cell to the world before hashing it. The column (2, 3) cell
+    // (2, 64, 3) is the world (34, 64, 51): its hash picks index 1 — the
+    // double, twelve quads — where the cell's own hash picks 3, the cube's six.
+    let world = world_of(&[(2, 3, flat(&[(2, 64, 3, state(PLANKS, 0))]))]);
+    let snapshot = ColumnSnapshot::from_world(&world, 2, 3);
+    let mesh = build_column_meshes(&snapshot, &ctx)
+        .into_iter()
+        .find_map(|(_, mesh)| mesh)
+        .expect("a loaded section");
+    assert_eq!(
+        quads(&mesh).len(),
+        12,
+        "the world position's pick, the double"
+    );
+}
+
+#[test]
 fn the_state_mapper_names_literals() {
     // Every arm the mapper answers with a file of its own, pinned to the
     // literal `(file, key)` the client's state mapper registers. A wrong name
