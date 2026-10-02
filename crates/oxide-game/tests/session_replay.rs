@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::Face;
-use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
+use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError, recompute_passes};
 use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
@@ -908,6 +908,58 @@ fn a_multi_block_change_applies_every_record_in_a_negative_chunk() {
     let mesh = slots[0].1.as_ref().expect("section 0 draws its blocks");
     assert_eq!(mesh.vertex_count(), 72, "three blocks, six faces each");
     assert_relit(mesh);
+}
+
+#[test]
+fn a_multi_block_change_with_an_extreme_chunk_coordinate_is_refused() {
+    // The chunk coordinate is a raw i32 off the wire and the world position
+    // composes as `chunk * 16 + local`: i32::MAX and i32::MIN overflow that
+    // composition, which a checked build panics on. The handler refuses the
+    // packet instead — an error, never a panic.
+    for chunk_x in [i32::MAX, i32::MIN] {
+        let (stream, _outgoing) = duplex(stream_with(&[
+            join_game_frame(),
+            lit_column_frame(0, 0, &[0], 15, 0, true),
+            multi_block_change_frame(chunk_x, 0, &[(0x4101, STONE)]),
+        ]));
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let error = Session::new(Conn::new(stream), config())
+            .run_over(&sender, silent_inputs())
+            .expect_err("an extreme chunk coordinate must be refused");
+        assert!(
+            matches!(error, SessionError::Packet(_)),
+            "chunk_x {chunk_x}: error: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_multi_block_change_runs_one_light_pass_for_the_whole_packet() {
+    // The packet's records all compose into its own chunk, so their recompute
+    // regions coincide and one pass covers the union of them. The count comes
+    // from the session's own pass counter, read around the run.
+    let before = recompute_passes();
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        lit_column_frame(0, 0, &[0], 15, 0, true),
+        multi_block_change_frame(0, 0, &[(0x4101, STONE), (0x6203, STONE), (0x8305, STONE)]),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+
+    let passes = recompute_passes() - before;
+    assert_eq!(
+        passes, 1,
+        "three records in one chunk are one region: one pass, not one per record"
+    );
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert_eq!(
+        updated_columns(&events),
+        BTreeSet::from([(0, 0)]),
+        "the packet's column is invalidated: {events:?}"
+    );
 }
 
 #[test]

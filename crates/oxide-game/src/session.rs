@@ -32,6 +32,7 @@
 //! and the server closes a session whose keepalive echo goes unanswered for
 //! about thirty seconds.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -40,14 +41,15 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use oxide_assets::atlas::Atlas;
+use oxide_proto::codec::CodecError;
 use oxide_proto::conn::{Conn, DeadlineStream, RecvOutcome};
 use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, BlockChange, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange,
-    PlayDisconnect, PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage,
-    TimeUpdate, read_packet_id,
+    self, BlockChange, BlockUpdate, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk,
+    MultiBlockChange, PlayDisconnect, PlayerAbilities, PlayerListItem, PlayerPositionAndLook,
+    PluginMessage, TimeUpdate, read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -705,16 +707,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         MultiBlockChange::ID => match world.as_mut() {
                             Some(store) => {
                                 let change = decoded(id, MultiBlockChange::decode(body))?;
-                                for update in &change.updates {
-                                    apply_block_change(
-                                        store,
-                                        &mut queue,
-                                        change.chunk_x * SECTION_SIZE as i32 + update.x,
-                                        update.y,
-                                        change.chunk_z * SECTION_SIZE as i32 + update.z,
-                                        update.value,
-                                    );
-                                }
+                                apply_multi_block_change(
+                                    store,
+                                    &mut queue,
+                                    change.chunk_x,
+                                    change.chunk_z,
+                                    &change.updates,
+                                )?;
                             }
                             None => {
                                 warn!(
@@ -1447,6 +1446,47 @@ fn mark_column_changed(store: &World, queue: &mut MeshQueue, cx: i32, cz: i32) {
     }
 }
 
+/// Marks every loaded column a recompute over `(cx, cz)` rewrote dirty.
+///
+/// The region is the changed column and its eight neighbours, so this is
+/// [`mark_column_changed`] plus the four diagonal columns: their light is
+/// rewritten too, even though no collar reads the changed column, so their
+/// meshes go stale as well.
+fn mark_recompute_region(store: &World, queue: &mut MeshQueue, cx: i32, cz: i32) {
+    mark_column_changed(store, queue, cx, cz);
+    for (dx, dz) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
+        if store.chunk(cx + dx, cz + dz).is_some() {
+            queue.mark_dirty(cx + dx, cz + dz);
+        }
+    }
+}
+
+thread_local! {
+    /// The light recompute passes the sessions on this thread have run.
+    static RECOMPUTE_PASSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The number of light recompute passes this thread's sessions have run.
+///
+/// A session runs its light work on the thread that drives it; the count is
+/// per thread and monotonic, so a caller reads it around a run to see how many
+/// passes that run cost, and sessions running in parallel do not see each
+/// other's work. The replay tests read it to pin the block-change pipeline's
+/// pass count.
+pub fn recompute_passes() -> u64 {
+    RECOMPUTE_PASSES.with(Cell::get)
+}
+
+/// Runs one light recompute pass over the changed column, counting it for
+/// [`recompute_passes`].
+///
+/// This is the session's only route to [`light::recompute`], so the count and
+/// the engine's own work cannot drift apart.
+fn recompute_light(store: &mut World, x: i32, y: i32, z: i32) {
+    RECOMPUTE_PASSES.with(|passes| passes.set(passes.get() + 1));
+    light::recompute(store, x, y, z);
+}
+
 /// Applies one block change locally: the world write, the light it needs and
 /// the mesh invalidation of every column the recompute rewrote.
 ///
@@ -1456,9 +1496,9 @@ fn mark_column_changed(store: &World, queue: &mut MeshQueue, cx: i32, cz: i32) {
 /// defaults), the light recompute over the changed column and its eight
 /// neighbours ([`light::recompute`], the region the source's `checkLightFor`
 /// neighbourhood derives), and the invalidation of every loaded column of
-/// that region — the light of all nine can change, and the changed column's
-/// four orthogonal neighbours' meshes also read its blocks through their
-/// collar, which [`mark_column_changed`] covers.
+/// that region ([`mark_recompute_region`] — the light of all nine can change,
+/// and the changed column's four orthogonal neighbours' meshes also read its
+/// blocks through their collar).
 ///
 /// A write that does not land — an unloaded column, a y outside the build
 /// range — changes nothing, so there is no light to recompute and no mesh to
@@ -1474,18 +1514,82 @@ fn apply_block_change(
     if store.set_block(x, y, z, value).is_none() {
         return;
     }
-    light::recompute(store, x, y, z);
+    recompute_light(store, x, y, z);
     let cx = x.div_euclid(SECTION_SIZE as i32);
     let cz = z.div_euclid(SECTION_SIZE as i32);
-    mark_column_changed(store, queue, cx, cz);
-    // The light recompute also rewrites the four diagonal columns of its
-    // region, so their own light can change even though no collar reads the
-    // changed column: they are marked too.
-    for (dx, dz) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
-        if store.chunk(cx + dx, cz + dz).is_some() {
-            queue.mark_dirty(cx + dx, cz + dz);
+    mark_recompute_region(store, queue, cx, cz);
+}
+
+/// The refusal a Multi Block Change coordinate that cannot compose a block
+/// position is answered with.
+///
+/// The chunk coordinate is a raw `i32` off the wire and the composition
+/// `chunk * 16 + local` must not wrap (release) or panic (a checked build), so
+/// a value outside the composition's range refuses the packet as a malformed
+/// one, on the error shape the decoders refuse their own fields with.
+fn coordinate_refusal(chunk_x: i32, chunk_z: i32) -> SessionError {
+    warn!(
+        chunk_x = chunk_x,
+        chunk_z = chunk_z,
+        "a multi block change's chunk coordinate cannot compose a block position"
+    );
+    SessionError::Packet(PacketError::Codec(CodecError::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("chunk coordinate ({chunk_x}, {chunk_z}) cannot compose a block position"),
+    ))))
+}
+
+/// Applies one Multi Block Change: every record's write, then a single light
+/// pass over the union of the changed cells' recompute regions, then the mesh
+/// invalidation that pass forces.
+///
+/// Every record composes into the packet's own chunk — the decoder masks each
+/// record's local coordinates to 0..16 — so the regions the records' changes
+/// own coincide, and one pass over the packet's region is the union of them. A
+/// from-scratch pass depends only on the final blocks, so the batch leaves the
+/// light a pass sequence per record would leave, at one pass instead of one
+/// per record. The invalidation is the same union: [`mark_recompute_region`]
+/// for the changed column, its loaded orthogonal neighbours and the region's
+/// loaded diagonals.
+///
+/// The composition is checked: a record whose coordinate cannot compose a
+/// block position refuses the packet ([`coordinate_refusal`]) rather than
+/// wrapping or panicking. A record whose write does not land — an unloaded
+/// column, a y outside the build range — changes nothing, exactly as it does
+/// through [`apply_block_change`].
+fn apply_multi_block_change(
+    store: &mut World,
+    queue: &mut MeshQueue,
+    chunk_x: i32,
+    chunk_z: i32,
+    updates: &[BlockUpdate],
+) -> Result<(), SessionError> {
+    let Some(base_x) = chunk_x.checked_mul(SECTION_SIZE as i32) else {
+        return Err(coordinate_refusal(chunk_x, chunk_z));
+    };
+    let Some(base_z) = chunk_z.checked_mul(SECTION_SIZE as i32) else {
+        return Err(coordinate_refusal(chunk_x, chunk_z));
+    };
+    // The writes first: the one pass below reads the batch's final blocks,
+    // which is what lets it cover every record at once.
+    let mut changed: Option<(i32, i32, i32)> = None;
+    for update in updates {
+        let (Some(x), Some(z)) = (base_x.checked_add(update.x), base_z.checked_add(update.z))
+        else {
+            return Err(coordinate_refusal(chunk_x, chunk_z));
+        };
+        if store.set_block(x, update.y, z, update.value).is_some() && changed.is_none() {
+            changed = Some((x, update.y, z));
         }
     }
+    let Some((x, y, z)) = changed else {
+        return Ok(());
+    };
+    recompute_light(store, x, y, z);
+    let cx = x.div_euclid(SECTION_SIZE as i32);
+    let cz = z.div_euclid(SECTION_SIZE as i32);
+    mark_recompute_region(store, queue, cx, cz);
+    Ok(())
 }
 
 /// Builds the session's mesh pool: one worker fewer than the machine's
