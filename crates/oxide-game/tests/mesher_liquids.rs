@@ -1137,19 +1137,22 @@ fn the_fast_leaves_rule_culls_between_leaves_and_draws_in_the_opaque_layer() {
 }
 
 #[test]
-fn the_fancy_leaves_rule_moves_every_leaf_quad_to_the_cutout_layer() {
+fn the_fancy_leaves_rule_moves_every_leaf_quad_to_the_mipped_cutout_layer() {
     let (models, atlas) = loaded();
     let maps = white_maps();
     let ctx = context(&models, &atlas, &maps, SmoothLighting::Off, false);
     let world = daylight(&[(0, 64, 0, state(LEAVES, 0)), (1, 64, 0, state(LEAVES, 0))]);
     let mesh = mesh_of(&world, &ctx);
 
-    // Fancy graphics names the other column of the leaves pair: the cutout
-    // layer, and no occlusion — so the shared pair draws on both cells and
-    // every leaf quad has left the opaque bucket.
+    // Fancy graphics names the other column of the leaves pair: `CUTOUT_MIPPED`
+    // (`BlockLeaves.getBlockLayer`, `BlockLeaves.java:293-296`), and no
+    // occlusion — so the shared pair draws on both cells and every leaf quad
+    // has left the opaque bucket. The plain cutout stays empty: it is the
+    // plants' layer, drawn with the atlas's level-0 sampler.
     assert!(mesh.layer(Layer::Opaque).is_empty());
+    assert!(mesh.layer(Layer::Cutout).is_empty());
     assert!(mesh.layer(Layer::Translucent).is_empty());
-    let quads = quads(&mesh, Layer::Cutout);
+    let quads = quads(&mesh, Layer::CutoutMipped);
     assert_eq!(quads.len(), 12, "six faces apiece");
     assert_eq!(
         plane_quads(&quads, 0, 1.0).len(),

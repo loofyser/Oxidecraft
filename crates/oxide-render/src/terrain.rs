@@ -54,9 +54,10 @@ pub fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 /// A section's geometry, ready to be uploaded: one buffer per render layer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChunkMesh {
-    /// The three layers, indexed by [`Layer::index`] — opaque, cutout,
-    /// translucent, which is also the order the client draws them in.
-    pub layers: [LayerMesh; 3],
+    /// The four layers, indexed by [`Layer::index`] — opaque, mipped cutout,
+    /// plain cutout, translucent, which is also the order the client draws
+    /// them in.
+    pub layers: [LayerMesh; 4],
 }
 
 impl ChunkMesh {
@@ -101,17 +102,24 @@ impl LayerMesh {
 /// A terrain render layer: the client's `RenderLayer` buckets, one draw pass
 /// each.
 ///
-/// The client's four layers collapse to three buckets here: `CUTOUT` and
-/// `CUTOUT_MIPPED` differ only in whether the pass mipmaps its textures
-/// (`RenderLayer.java:43-77`), and both draw in the same pass with an alpha
-/// test. The variants are declared in the pass order the client draws them
+/// The client's four layers keep four buckets here, because the two cutouts
+/// differ in more than their mesh: between the `CUTOUT_MIPPED` and `CUTOUT`
+/// passes the client switches the block atlas's sampler to
+/// `setBlurMipmap(false, false)` — `GL_NEAREST`, mip level 0 only — and
+/// restores it after (`EntityRenderer.java:1386-1390`), so the plain cutout
+/// samples a different texture state than every other layer and is its own
+/// pass. The variants are declared in the pass order the client draws them
 /// (`EntityRenderer`'s pass list), which is also the order
 /// [`ChunkMesh::layers`] is indexed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     /// The solid pass: `RenderLayer.SOLID`.
     Opaque,
-    /// The cutout pass: `RenderLayer.CUTOUT` and `RenderLayer.CUTOUT_MIPPED`.
+    /// The mipped cutout pass: `RenderLayer.CUTOUT_MIPPED`, drawn with the
+    /// atlas's mip chain live.
+    CutoutMipped,
+    /// The plain cutout pass: `RenderLayer.CUTOUT`, drawn with the level-0
+    /// sampler (`EntityRenderer.java:1389`).
     Cutout,
     /// The translucent pass: `RenderLayer.TRANSLUCENT`.
     Translucent,
@@ -119,7 +127,12 @@ pub enum Layer {
 
 impl Layer {
     /// Every layer, in the order the client draws them.
-    pub const ALL: [Layer; 3] = [Layer::Opaque, Layer::Cutout, Layer::Translucent];
+    pub const ALL: [Layer; 4] = [
+        Layer::Opaque,
+        Layer::CutoutMipped,
+        Layer::Cutout,
+        Layer::Translucent,
+    ];
 
     /// The layer's slot in [`ChunkMesh::layers`].
     pub fn index(self) -> usize {
@@ -129,3 +142,26 @@ impl Layer {
 
 /// Identifies one section's mesh: chunk x, chunk z, section index.
 pub type SectionKey = (i32, i32, u8);
+
+#[cfg(test)]
+mod tests {
+    use super::Layer;
+
+    #[test]
+    fn the_mipped_and_plain_cutouts_are_two_passes() {
+        // The client draws `CUTOUT_MIPPED` and `CUTOUT` as two passes apart,
+        // with a sampler change between them (`EntityRenderer.java:1388-1390`:
+        // the mipped pass, then `setBlurMipmap(false, false)` before the plain
+        // one), so the two buckets must not collapse into one.
+        assert_eq!(
+            Layer::ALL.len(),
+            4,
+            "opaque, mipped cutout, plain cutout and translucent are four buckets"
+        );
+        assert_eq!(
+            Layer::ALL[3],
+            Layer::Translucent,
+            "the client draws translucent last"
+        );
+    }
+}

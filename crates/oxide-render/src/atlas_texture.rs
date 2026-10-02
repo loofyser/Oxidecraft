@@ -1,5 +1,6 @@
-//! The block atlas on the GPU: the mip chain, the view and the sampler the terrain pipelines
-//! read it through.
+//! The block atlas on the GPU: the mip chain, the view and the two samplers the terrain
+//! pipelines read it through — the mipped pair every layer but the plain cutout draws with,
+//! and the level-0 pair the plain cutout draws with.
 //!
 //! [`AtlasTexture::upload`] copies the stitched atlas's mip chain in order — level 0 is
 //! `atlas.width` x `atlas.height` texels and each later level halves that, floored at one,
@@ -24,6 +25,15 @@
 //! to the atlas's far edge, where the clamp is the safe side (it repeats the edge texel where
 //! a wrapped sample would jump to the atlas's opposite edge).
 //!
+//! The second sampler is the plain cutout's. The client switches the block atlas to
+//! `setBlurMipmap(false, false)` before its `CUTOUT` pass and restores the mipped pair after
+//! (`EntityRenderer.java:1389`, `:1391`); with both flags false the switch directs the two
+//! filters to `GL_NEAREST` (`AbstractTexture.java:27-28`, `:31-32`), so no mipmap minification
+//! filter is live either and the pass samples mip level 0 alone. wgpu's samplers always carry
+//! a mipmap filter, so [`plain_sampler_descriptor`] states the level-0-only switch with the
+//! level-of-detail clamp instead ([`AtlasTexture::plain_sampler`] records the reasoning the
+//! client's state is translated by).
+//!
 //! The draw-order rules that pair with the texture (opaque and cutout first, translucent
 //! last, sorted back to front) live in [`crate::terrain_pass::TerrainPass::draw`].
 
@@ -46,8 +56,12 @@ pub const SAMPLER_BINDING: u32 = 1;
 pub struct AtlasTexture {
     /// A view of the whole mip chain, as the bind group's texture binding needs.
     view: wgpu::TextureView,
-    /// The sampler every terrain layer reads the atlas through.
+    /// The sampler every mipped terrain layer reads the atlas through.
     sampler: wgpu::Sampler,
+    /// The level-0 sampler the plain cutout pass reads the atlas through: the state
+    /// `setBlurMipmap(false, false)` installs (`GL_NEAREST`, no mips),
+    /// stated with the level-of-detail clamp.
+    plain_sampler: wgpu::Sampler,
 }
 
 impl AtlasTexture {
@@ -106,7 +120,12 @@ impl AtlasTexture {
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&sampler_descriptor());
-        AtlasTexture { view, sampler }
+        let plain_sampler = device.create_sampler(&plain_sampler_descriptor());
+        AtlasTexture {
+            view,
+            sampler,
+            plain_sampler,
+        }
     }
 
     /// The bind-group layout the atlas is bound through: group 1, binding [`ATLAS_BINDING`]
@@ -140,11 +159,36 @@ impl AtlasTexture {
         })
     }
 
-    /// Builds the atlas's bind group under `layout`.
+    /// Builds the atlas's bind group under `layout`: the mipped pair the opaque, mipped
+    /// cutout and translucent layers draw with.
     pub fn bind_group(
         &self,
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::BindGroup {
+        self.bind_group_with(device, layout, &self.sampler)
+    }
+
+    /// Builds the atlas's bind group under `layout` with the level-0 sampler: the pair the
+    /// plain cutout layer draws with.
+    ///
+    /// The same texture view, so the two bind groups differ in the sampler alone — the two
+    /// texture states the client's pass list puts the atlas through
+    /// (`EntityRenderer.java:1389`, `:1391`).
+    pub fn plain_bind_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::BindGroup {
+        self.bind_group_with(device, layout, &self.plain_sampler)
+    }
+
+    /// Builds one of the atlas's bind groups: its texture view with one of its two samplers.
+    fn bind_group_with(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("oxide terrain atlas bind group"),
@@ -156,7 +200,7 @@ impl AtlasTexture {
                 },
                 wgpu::BindGroupEntry {
                     binding: SAMPLER_BINDING,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         })
@@ -167,9 +211,14 @@ impl AtlasTexture {
         &self.view
     }
 
-    /// The sampler the terrain layers read the atlas through.
+    /// The sampler every mipped terrain layer reads the atlas through.
     pub fn sampler(&self) -> &wgpu::Sampler {
         &self.sampler
+    }
+
+    /// The level-0 sampler the plain cutout layer reads the atlas through.
+    pub fn plain_sampler(&self) -> &wgpu::Sampler {
+        &self.plain_sampler
     }
 }
 
@@ -195,7 +244,8 @@ fn texture_descriptor(width: u32, height: u32, levels: u32) -> wgpu::TextureDesc
     }
 }
 
-/// The sampler descriptor: the client's `NEAREST_MIPMAP_LINEAR` pair, clamped on every axis.
+/// The mipped sampler descriptor: the client's `NEAREST_MIPMAP_LINEAR` pair, clamped on every
+/// axis.
 ///
 /// [`AtlasTexture::upload`]'s module doc records the clamp as the declared divergence from the
 /// source's `GL_REPEAT`; the filters themselves are the source's own.
@@ -208,6 +258,33 @@ fn sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
         mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    }
+}
+
+/// The plain cutout's sampler descriptor: `GL_NEAREST` on every filter, mip level 0 alone.
+///
+/// The source's claim on this sampler is negative: between its `CUTOUT_MIPPED` and `CUTOUT`
+/// passes it switches the atlas to `setBlurMipmap(false, false)` and restores the mipped pair
+/// after (`EntityRenderer.java:1389`, `:1391`). With both flags false,
+/// `AbstractTexture.setBlurMipmapDirect` lands on `GL_NEAREST` for the min and the mag filter
+/// (`AbstractTexture.java:27-28`, installed at `:31-32`), and no mipmap minification filter is
+/// set either — the mip chain exists but nothing selects it, so the pass samples mip level 0
+/// alone. wgpu has no mipmap-less sampler state, so the level-0-only switch is stated with the
+/// level-of-detail clamp: `lod_max_clamp` at zero pins every sample to level 0, and the
+/// nearest filters keep the sample an exact texel like the source's. The clamp on every axis
+/// is the same declared divergence [`sampler_descriptor`] records.
+fn plain_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("oxide terrain atlas plain sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        lod_min_clamp: 0.0,
+        lod_max_clamp: 0.0,
         ..Default::default()
     }
 }
@@ -227,7 +304,8 @@ fn mip_size(width: u32, height: u32, level: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATLAS_BINDING, SAMPLER_BINDING, mip_limit, mip_size, sampler_descriptor, texture_descriptor,
+        ATLAS_BINDING, SAMPLER_BINDING, mip_limit, mip_size, plain_sampler_descriptor,
+        sampler_descriptor, texture_descriptor,
     };
     use wgpu::{AddressMode, FilterMode, TextureDimension, TextureFormat, TextureUsages};
 
@@ -258,6 +336,23 @@ mod tests {
         assert_eq!(sampler.mag_filter, FilterMode::Nearest);
         assert_eq!(sampler.min_filter, FilterMode::Nearest);
         assert_eq!(sampler.mipmap_filter, FilterMode::Linear);
+        assert_eq!(sampler.address_mode_u, AddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_v, AddressMode::ClampToEdge);
+        assert_eq!(sampler.address_mode_w, AddressMode::ClampToEdge);
+    }
+
+    #[test]
+    fn the_plain_sampler_is_the_clients_nearest_level_zero_pair_clamped() {
+        // `setBlurMipmap(false, false)`'s state (`EntityRenderer.java:1389`): both filters
+        // `GL_NEAREST` (`AbstractTexture.java:27-28`) with no mipmap minification filter
+        // live, so the sample stays on level 0. wgpu's samplers always carry a mipmap
+        // filter, so the level-0-only switch is stated with the level-of-detail clamp.
+        let sampler = plain_sampler_descriptor();
+        assert_eq!(sampler.mag_filter, FilterMode::Nearest);
+        assert_eq!(sampler.min_filter, FilterMode::Nearest);
+        assert_eq!(sampler.mipmap_filter, FilterMode::Nearest);
+        assert_eq!(sampler.lod_min_clamp, 0.0);
+        assert_eq!(sampler.lod_max_clamp, 0.0, "mip level 0 alone");
         assert_eq!(sampler.address_mode_u, AddressMode::ClampToEdge);
         assert_eq!(sampler.address_mode_v, AddressMode::ClampToEdge);
         assert_eq!(sampler.address_mode_w, AddressMode::ClampToEdge);

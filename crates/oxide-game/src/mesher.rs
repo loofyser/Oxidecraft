@@ -177,7 +177,7 @@ pub fn build_section_mesh(
 /// the section is in.
 struct SectionBuilder {
     /// The layers' quads, indexed by [`Layer::index`], four vertices each.
-    quads: [Vec<[Vertex; 4]>; 3],
+    quads: [Vec<[Vertex; 4]>; 4],
     /// The section's centre, in the column's own coordinates:
     /// `(8, base + 8, 8)`, the middle of the section.
     centre: [f32; 3],
@@ -291,24 +291,25 @@ fn append_block(
 /// The block's render layer, the client's `getBlockLayer`
 /// (`block/Block.java:516-519`) as the table carries it, with the leaves'
 /// graphics-level exception: the table stores their Fast row, and Fancy
-/// graphics name the other layer — `CUTOUT_MIPPED`, this project's cutout
-/// bucket (`BlockLeaves.getBlockLayer`, `block/BlockLeaves.java:293-296`).
-/// Air, and an id outside the table, draw in the opaque layer, as does the
-/// fallback cube for an id with no row.
+/// graphics name the other layer — `CUTOUT_MIPPED` (`BlockLeaves.getBlockLayer`,
+/// `block/BlockLeaves.java:293-296`). Air, and an id outside the table, draw in
+/// the opaque layer, as does the fallback cube for an id with no row.
 fn layer_of(block: Option<&BlockBehaviour>, graphics_fast: bool) -> Layer {
     match block {
-        Some(entry) if entry.material == Material::Leaves && !graphics_fast => Layer::Cutout,
+        Some(entry) if entry.material == Material::Leaves && !graphics_fast => Layer::CutoutMipped,
         Some(entry) => bucket(entry.render_layer),
         None => Layer::Opaque,
     }
 }
 
-/// One render layer's bucket: `CUTOUT` and `CUTOUT_MIPPED` share the cutout
-/// pass, and the other two stand alone.
+/// One render layer's bucket: the two cutouts stay apart — the plain one is a
+/// separate pass with the atlas's level-0 sampler (`EntityRenderer.java:1389`)
+/// — and the other two stand alone.
 fn bucket(layer: RenderLayer) -> Layer {
     match layer {
         RenderLayer::Solid => Layer::Opaque,
-        RenderLayer::CutoutMipped | RenderLayer::Cutout => Layer::Cutout,
+        RenderLayer::CutoutMipped => Layer::CutoutMipped,
+        RenderLayer::Cutout => Layer::Cutout,
         RenderLayer::Translucent => Layer::Translucent,
     }
 }
@@ -1047,3 +1048,30 @@ const VERTEX_SLOTS: [[usize; 4]; 6] = [
     [3, 0, 1, 2],
     [1, 2, 3, 0],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::layer_of;
+    use oxide_world::behaviour::behaviour;
+
+    #[test]
+    fn the_plants_and_the_mipped_cutout_do_not_share_a_layer() {
+        // The grass block draws in `CUTOUT_MIPPED` (`BlockGrass.java:159`) and
+        // the tallgrass and the flowers in `CUTOUT` (`BlockBush.java:94-96`);
+        // the client samples `CUTOUT` with `setBlurMipmap(false, false)`
+        // (`EntityRenderer.java:1389-1390`) — `GL_NEAREST`, mip level 0 only.
+        // The two must land in different layers, so the plain one can be drawn
+        // with the level-0 sampler.
+        let grass = layer_of(behaviour(2), true);
+        let tallgrass = layer_of(behaviour(31), true);
+        let dandelion = layer_of(behaviour(37), true);
+        assert_ne!(
+            grass, tallgrass,
+            "the grass block is mipped; the tallgrass must draw in the plain cutout"
+        );
+        assert_ne!(
+            grass, dandelion,
+            "the grass block is mipped; the flowers must draw in the plain cutout"
+        );
+    }
+}

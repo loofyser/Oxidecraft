@@ -9,16 +9,22 @@
 //! supplies the texture. The vertex stage hands the uv, the colour and the light pair (as two
 //! floats) to the fragment stage; the light is what the M2 light ramp will read next.
 //!
-//! The three layers differ only where the client's own block-layer state differs. Opaque
-//! draws solid geometry: no blending, back faces culled, the depth test and write on. Cutout
-//! is the same with the client's alpha test — a fragment whose alpha is below
+//! The four layers differ only where the client's own block-layer state differs. Opaque
+//! draws solid geometry: no blending, back faces culled, the depth test and write on. The two
+//! cutout layers are the same with the client's alpha test — a fragment whose alpha is below
 //! [`CUTOUT_ALPHA`] is discarded (`GlStateManager.alphaFunc(516, 0.1F)`, `Minecraft.java:542`,
 //! set for the block layers at `EntityRenderer.java:1393`) — which punches leaves-like holes
-//! through the texture. Translucent carries the client's state as it stands at the translucent
-//! draw (`EntityRenderer.java:1467`): the same alpha test (`:1460`), blending
-//! `src_alpha / one_minus_src_alpha` with the separate alpha pair `(1, 0)` (`:1459`), back
-//! faces culled (`GlStateManager.enableCull()`, `:1458`) and depth writes off
-//! (`GlStateManager.depthMask(false)`, `:1463`, restored at `:1469`). It draws last.
+//! through the texture; they differ in the atlas sampler alone, because between the client's
+//! `CUTOUT_MIPPED` and `CUTOUT` passes it switches the block atlas to
+//! `setBlurMipmap(false, false)` — `GL_NEAREST`, mip level 0, no mips — and restores the
+//! mipped pair after (`EntityRenderer.java:1389-1391`). The mipped cutout draws through the
+//! atlas's mipped sampler; the plain cutout through [`AtlasTexture::plain_sampler`], which
+//! [`TerrainPass::draw`] binds for that layer alone. Translucent carries the client's state as
+//! it stands at the translucent draw (`EntityRenderer.java:1467`): the same alpha test
+//! (`:1460`), blending `src_alpha / one_minus_src_alpha` with the separate alpha pair
+//! `(1, 0)` (`:1459`), back faces culled (`GlStateManager.enableCull()`, `:1458`) and depth
+//! writes off (`GlStateManager.depthMask(false)`, `:1463`, restored at `:1469`). It draws
+//! last.
 //!
 //! Depth: the camera's projection maps the near plane to 0 and the far plane to 1, and the
 //! test over that range is the client's own depth function, `GlStateManager.depthFunc(515)` —
@@ -285,7 +291,12 @@ fn layer_plan(layer: Layer) -> LayerPlan {
             cull: Some(wgpu::Face::Back),
             depth_write: true,
         },
-        Layer::Cutout => LayerPlan {
+        // The two cutout layers share their pipeline state — the same discarding fragment, the
+        // same cull and depth write; they differ in the atlas sampler alone, which [`draw`]
+        // picks per layer.
+        //
+        // [`draw`]: TerrainPass::draw
+        Layer::CutoutMipped | Layer::Cutout => LayerPlan {
             fragment: FRAGMENT_CUTOUT,
             blend: None,
             cull: Some(wgpu::Face::Back),
@@ -297,6 +308,29 @@ fn layer_plan(layer: Layer) -> LayerPlan {
             cull: Some(wgpu::Face::Back),
             depth_write: false,
         },
+    }
+}
+
+/// The atlas sampler one layer's pass draws through.
+///
+/// Every layer but the plain cutout keeps the atlas's mipped pair live; the plain cutout is
+/// the pass between the client's `setBlurMipmap(false, false)` and
+/// `restoreLastBlurMipmap()` calls (`EntityRenderer.java:1389`, `:1391`) and draws through the
+/// level-0 sampler. A value rather than an inline condition, so [`TerrainPass::draw`]'s
+/// binding choice is a mapping the unit tests pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtlasSampler {
+    /// The atlas's mip chain live: `NEAREST_MIPMAP_LINEAR` minification.
+    Mipped,
+    /// `GL_NEAREST` at mip level 0 alone.
+    LevelZero,
+}
+
+/// Which atlas sampler `layer`'s pass draws through.
+fn atlas_sampler(layer: Layer) -> AtlasSampler {
+    match layer {
+        Layer::Opaque | Layer::CutoutMipped | Layer::Translucent => AtlasSampler::Mipped,
+        Layer::Cutout => AtlasSampler::LevelZero,
     }
 }
 
@@ -328,6 +362,7 @@ fn translucent_blend() -> wgpu::BlendState {
 fn layer_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Opaque => "opaque",
+        Layer::CutoutMipped => "cutout_mipped",
         Layer::Cutout => "cutout",
         Layer::Translucent => "translucent",
     }
@@ -351,9 +386,9 @@ struct GpuMesh {
 /// One section's upload: one [`GpuMesh`] per non-empty layer.
 #[derive(Default)]
 struct SectionMesh {
-    /// The three layers, indexed by [`Layer::index`]; a layer the section draws nothing in
+    /// The four layers, indexed by [`Layer::index`]; a layer the section draws nothing in
     /// holds no buffers.
-    layers: [Option<GpuMesh>; 3],
+    layers: [Option<GpuMesh>; 4],
 }
 
 /// The frame state [`TerrainPass::set_camera`] derives for the next draw: where the boxes are
@@ -365,11 +400,11 @@ struct FrameState {
     eye: Vec3,
 }
 
-/// The three terrain pipelines, the frame's uniforms they read, the atlas and the lightmap
+/// The four terrain pipelines, the frame's uniforms they read, the atlas and the lightmap
 /// they sample and the meshes they draw.
 pub struct TerrainPass {
     /// One pipeline per layer, indexed by [`Layer::index`], built in the draw order.
-    pipelines: [wgpu::RenderPipeline; 3],
+    pipelines: [wgpu::RenderPipeline; 4],
     /// The layout group 1 binds the atlas through: built once, and the same object the atlas's
     /// bind groups are created with, so the two cannot drift apart.
     atlas_layout: wgpu::BindGroupLayout,
@@ -386,12 +421,15 @@ pub struct TerrainPass {
     /// The lightmap's texture handle, kept so [`TerrainPass::set_lightmap`] can rewrite its
     /// bytes when the sky's brightness changes; the bind group above holds a view of it.
     lightmap_texture: wgpu::Texture,
-    /// The atlas's texture and sampler, once one has been set; holding the texture keeps the
+    /// The atlas's texture and samplers, once one has been set; holding the texture keeps the
     /// view it is sampled through valid.
     atlas: Option<AtlasTexture>,
-    /// The bind group the pipelines read the atlas through; set with the atlas and replaced
-    /// with it.
+    /// The bind group the mipped layers read the atlas through; set with the atlas and
+    /// replaced with it.
     atlas_bind_group: Option<wgpu::BindGroup>,
+    /// The bind group the plain cutout layer reads the atlas through — the same view with the
+    /// level-0 sampler; set with the atlas and replaced with it.
+    atlas_bind_group_plain: Option<wgpu::BindGroup>,
     /// Every section's mesh, keyed by section.
     meshes: HashMap<SectionKey, SectionMesh>,
     /// The frame the next draw culls with, once a camera has been set.
@@ -550,6 +588,7 @@ impl TerrainPass {
             lightmap_texture,
             atlas: None,
             atlas_bind_group: None,
+            atlas_bind_group_plain: None,
             meshes: HashMap::new(),
             frame: None,
         };
@@ -559,16 +598,21 @@ impl TerrainPass {
 
     /// Uploads `atlas` and binds it for the frames that follow, replacing any earlier atlas.
     ///
-    /// The upload copies the atlas's mip chain as it is ([`AtlasTexture::upload`]) and the old
-    /// texture, its view and the old bind group are dropped with the replacement. Until an
-    /// atlas is set [`TerrainPass::draw`] issues no draw calls: every layer samples the atlas,
-    /// so a draw without one can only be wrong. M6 re-uploads here whenever an animated
-    /// sprite's frame changes; M2 calls it once when the client's bootstrap has an atlas.
+    /// The upload copies the atlas's mip chain as it is ([`AtlasTexture::upload`]) and both of
+    /// the atlas's bind groups are built from it against the one atlas layout: the mipped pair
+    /// every layer but the plain cutout draws through, and the pair with the level-0 sampler
+    /// the plain cutout draws through (`EntityRenderer.java:1389-1391`). The old texture, its
+    /// view and the old bind groups are dropped with the replacement. Until an atlas is set
+    /// [`TerrainPass::draw`] issues no draw calls: every layer samples the atlas, so a draw
+    /// without one can only be wrong. M6 re-uploads here whenever an animated sprite's frame
+    /// changes; M2 calls it once when the client's bootstrap has an atlas.
     pub fn set_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) {
         let texture = AtlasTexture::upload(device, queue, atlas);
         let bind_group = texture.bind_group(device, &self.atlas_layout);
+        let plain_bind_group = texture.plain_bind_group(device, &self.atlas_layout);
         self.atlas = Some(texture);
         self.atlas_bind_group = Some(bind_group);
+        self.atlas_bind_group_plain = Some(plain_bind_group);
     }
 
     /// Writes the camera's view-projection matrix and the eye's position, and derives the
@@ -672,16 +716,20 @@ impl TerrainPass {
     /// The opaque and cutout layers draw in the table's order — the table is a hash map, and
     /// every surface there is opaque and depth-tested, so the order cannot change the picture
     /// — and the translucent layer draws last, sorted back to front by the distance from the
-    /// eye to the section's centre. Sections whose box lies fully outside the frame's frustum
-    /// are skipped, both for their draw and for the translucent order.
+    /// eye to the section's centre. Each layer binds the atlas through the sampler its pass
+    /// draws with: the plain cutout through the level-0 bind group, every other layer through
+    /// the mipped one (`EntityRenderer.java:1389-1391`). Sections whose box lies fully outside
+    /// the frame's frustum are skipped, both for their draw and for the translucent order.
     ///
     /// Nothing draws until a camera and an atlas have both been set: with no atlas the layers
     /// would sample an unbound texture, so the whole draw is skipped, and with no camera there
     /// is no frame to cull or order with.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let (Some(atlas_bind_group), Some(frame)) =
-            (self.atlas_bind_group.as_ref(), self.frame.as_ref())
-        else {
+        let (Some(atlas_bind_group), Some(atlas_bind_group_plain), Some(frame)) = (
+            self.atlas_bind_group.as_ref(),
+            self.atlas_bind_group_plain.as_ref(),
+            self.frame.as_ref(),
+        ) else {
             return;
         };
         for layer in Layer::ALL {
@@ -689,9 +737,16 @@ impl TerrainPass {
             if draws.is_empty() {
                 continue;
             }
+            // The pass picks its texture state with the layer: the plain cutout samples the
+            // atlas at level 0, every other layer through the mip chain
+            // (`EntityRenderer.java:1389-1391`).
+            let atlas_group = match atlas_sampler(layer) {
+                AtlasSampler::Mipped => atlas_bind_group,
+                AtlasSampler::LevelZero => atlas_bind_group_plain,
+            };
             pass.set_pipeline(&self.pipelines[layer.index()]);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
-            pass.set_bind_group(1, atlas_bind_group, &[]);
+            pass.set_bind_group(1, atlas_group, &[]);
             pass.set_bind_group(2, &self.lightmap_bind_group, &[]);
             for (_, mesh) in draws {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -939,11 +994,11 @@ mod tests {
     };
 
     use super::{
-        CUTOUT_ALPHA, DEPTH_FORMAT, FOG_BINDING, FOG_BYTES, FRAGMENT_CUTOUT, FRAGMENT_MAIN,
-        GAMMA_DEFAULT, LIGHTMAP_BINDING, LIGHTMAP_SAMPLER_BINDING, LIGHTMAP_SIZE, NO_FOG,
-        SUN_BRIGHTNESS_NOON, VS_ENTRY, color_target, depth_state, fog_bytes, layer_plan,
-        lightmap_sampler_descriptor, lightmap_texture_descriptor, primitive_state, shader_source,
-        vertex_layout,
+        AtlasSampler, CUTOUT_ALPHA, DEPTH_FORMAT, FOG_BINDING, FOG_BYTES, FRAGMENT_CUTOUT,
+        FRAGMENT_MAIN, GAMMA_DEFAULT, LIGHTMAP_BINDING, LIGHTMAP_SAMPLER_BINDING, LIGHTMAP_SIZE,
+        NO_FOG, SUN_BRIGHTNESS_NOON, VS_ENTRY, atlas_sampler, color_target, depth_state, fog_bytes,
+        layer_plan, lightmap_sampler_descriptor, lightmap_texture_descriptor, primitive_state,
+        shader_source, vertex_layout,
     };
     use crate::atlas_texture::{ATLAS_BINDING, SAMPLER_BINDING};
     use crate::fog::FogParams;
@@ -995,6 +1050,13 @@ mod tests {
             "the cutout layer writes depth too"
         );
         assert_eq!(cutout.depth_compare, solid.depth_compare);
+        let mipped = depth_state(layer_plan(Layer::CutoutMipped).depth_write);
+        assert_eq!(mipped.format, solid.format);
+        assert!(
+            mipped.depth_write_enabled,
+            "the mipped cutout layer writes depth too"
+        );
+        assert_eq!(mipped.depth_compare, solid.depth_compare);
         // The translucent layer's own state: the same format and test, the client's depth
         // mask off.
         let translucent = depth_state(layer_plan(Layer::Translucent).depth_write);
@@ -1010,7 +1072,8 @@ mod tests {
     fn every_layer_culls_the_back_faces() {
         for (layer, what) in [
             (Layer::Opaque, "the opaque layer"),
-            (Layer::Cutout, "the cutout layer"),
+            (Layer::CutoutMipped, "the mipped cutout layer"),
+            (Layer::Cutout, "the plain cutout layer"),
             (Layer::Translucent, "the translucent layer"),
         ] {
             let primitive = primitive_state(layer_plan(layer).cull);
@@ -1026,7 +1089,7 @@ mod tests {
 
     #[test]
     fn the_opaque_and_cutout_layers_replace_and_the_translucent_one_blends() {
-        for layer in [Layer::Opaque, Layer::Cutout] {
+        for layer in [Layer::Opaque, Layer::CutoutMipped, Layer::Cutout] {
             let target = color_target(TextureFormat::Rgba8Unorm, layer_plan(layer).blend)
                 .expect("a colour target");
             assert_eq!(target.format, TextureFormat::Rgba8Unorm);
@@ -1052,6 +1115,7 @@ mod tests {
     #[test]
     fn the_cutout_and_translucent_layers_run_the_discarding_fragment_entry() {
         assert_eq!(layer_plan(Layer::Opaque).fragment, FRAGMENT_MAIN);
+        assert_eq!(layer_plan(Layer::CutoutMipped).fragment, FRAGMENT_CUTOUT);
         assert_eq!(layer_plan(Layer::Cutout).fragment, FRAGMENT_CUTOUT);
         assert_eq!(layer_plan(Layer::Translucent).fragment, FRAGMENT_CUTOUT);
         // The entries the pipelines name are the entries the shader declares, and the
@@ -1069,6 +1133,17 @@ mod tests {
             "the shader's own threshold is the client's tenth"
         );
         assert_eq!(CUTOUT_ALPHA, 0.1);
+    }
+
+    #[test]
+    fn the_plain_cutout_alone_draws_through_the_level_zero_sampler() {
+        // The sampler switch the client makes between its `CUTOUT_MIPPED` and `CUTOUT`
+        // passes (`EntityRenderer.java:1389-1391`): only the plain cutout draws with the
+        // atlas at level 0; every other layer keeps the mipped pair.
+        assert_eq!(atlas_sampler(Layer::Opaque), AtlasSampler::Mipped);
+        assert_eq!(atlas_sampler(Layer::CutoutMipped), AtlasSampler::Mipped);
+        assert_eq!(atlas_sampler(Layer::Cutout), AtlasSampler::LevelZero);
+        assert_eq!(atlas_sampler(Layer::Translucent), AtlasSampler::Mipped);
     }
 
     #[test]
