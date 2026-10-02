@@ -372,6 +372,10 @@ list is in `refs/m2-final-review/review-report.md`):
 6. `set_lightmap` rewrite/buffer coverage with the next GPU-test pass.
 7. Watch CI's behaviour on the keepalive margin.
 
+The owner accepted the close recommendations on 2026-10-02: no acceptance-residue class becomes
+M3 scope; CI keeps tracking the runner's stable (the local stable is kept current); backlog item 1
+folds into M3's light work and the rest carry as task-scoped notes.
+
 The milestone's acceptance evidence lives under `refs/rig/evidence/m2/`; the rig runs against the
 store at `~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
 

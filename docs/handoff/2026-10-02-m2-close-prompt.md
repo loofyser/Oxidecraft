@@ -82,16 +82,18 @@ cargo test --workspace -- --ignored
 gh run list --limit 5
 ```
 
-## Open questions for the owner
+## Decisions taken (2026-10-02)
 
-1. Should any acceptance-residue class become M3 scope? (Recommended: no — they are documented and
-   owned elsewhere: the cloud band and the fluids phase ride M6's sky and weather work, the slope
-   edge gets re-measured when M6 touches the cloud layer, and the chest cell is the missing
-   tile-entity path with no M3 interaction.)
-2. Keep CI tracking the runner's stable toolchain, or pin it? (Recommended: keep stable — it
-   caught a real lint; the compensating control is keeping the local stable current.)
-3. Fold the seven backlog items up front, or task-scoped? (Recommended: fold item 1 — the
-   block-kind border read — into M3's light work, and carry the rest as task-scoped notes.)
+The owner accepted the close recommendations on 2026-10-02:
+
+1. No acceptance-residue class becomes M3 scope — the classes stay documented and owned by the
+   later milestones: the cloud band and the fluids phase ride M6's sky and weather work, the slope
+   edge is re-measured when M6 touches the cloud layer, and the chest cell is the missing
+   tile-entity path with no M3 interaction.
+2. CI keeps tracking the runner's stable toolchain, and the local stable is kept current (a
+   six-release gap once hid a clippy failure for five days).
+3. The M3 plan folds backlog item 1 — the block-kind border read — into the milestone's light work;
+   the other six items carry as task-scoped notes.
 
 ## Pitfalls
 
