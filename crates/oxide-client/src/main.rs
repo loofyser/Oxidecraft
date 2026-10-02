@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 
 use assets::ClientAssets;
 use clap::Parser;
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_game::hud::{HudState, debug_lines};
+use oxide_game::input::InputEvent;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
@@ -143,13 +144,13 @@ struct ClientApp {
     hud: HudState,
     /// The clock and the sky the session last reported.
     sky: SkyState,
-    /// The cloud counter M2 advances once per rendered frame.
+    /// The latest pose the session reported, the pose before it, and the session's tick.
     ///
-    /// The source's counter is client-local and advances once per client tick
-    /// (`RenderGlobal.updateClouds`, `RenderGlobal.java:1138-1142`, from `Minecraft.runTick`,
-    /// `Minecraft.java:2193-2196`); M2 has no tick loop until M3, so the frame stands in for
-    /// the tick and the two clients' cloud phases are independent.
-    cloud_ticks: i64,
+    /// A regular `PlayerTick` slides the current pose into the previous one, so a later
+    /// frame can interpolate between them; a snapped one — a server correction — collapses
+    /// the two, so nothing interpolates across the jump. The tick is the session's own
+    /// 20 Hz clock, and it is what the cloud offset advances from.
+    player: PlayerState,
     /// Whether F3 has the overlay showing.
     overlay_visible: bool,
 }
@@ -184,6 +185,52 @@ struct SkyValues {
     /// The light level at the view block, `0..15`: the chain's brightness factor reads it
     /// (`EntityRenderer.java:362`).
     light_level: u8,
+}
+
+/// The pose the session last reported and the pose before it, plus the session's tick count.
+///
+/// A regular tick slides current into previous so a later frame can interpolate between
+/// them; a snapped tick — a server correction — collapses the pair so nothing interpolates
+/// across the jump.
+#[derive(Debug, Default)]
+struct PlayerState {
+    /// The pose the previous `PlayerTick` reported.
+    previous: Pose,
+    /// The pose the latest `PlayerTick` reported.
+    current: Pose,
+    /// The tick the latest report carried: the session's 20 Hz clock.
+    tick: u64,
+}
+
+/// One `PlayerTick`'s pose: the player's feet and where they look.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Pose {
+    /// The feet's x, y and z in blocks.
+    position: [f64; 3],
+    /// The yaw in degrees.
+    yaw: f32,
+    /// The pitch in degrees.
+    pitch: f32,
+}
+
+impl PlayerState {
+    /// Folds one `PlayerTick` into the state.
+    ///
+    /// The pose it carries becomes current and the old current slides into previous —
+    /// unless the report is snapped, which sets previous to current as well so nothing
+    /// interpolates across a correction. The tick always advances.
+    fn observe(&mut self, tick: u64, position: [f64; 3], yaw: f32, pitch: f32, snapped: bool) {
+        self.previous = self.current;
+        self.current = Pose {
+            position,
+            yaw,
+            pitch,
+        };
+        if snapped {
+            self.previous = self.current;
+        }
+        self.tick = tick;
+    }
 }
 
 /// The fog and the sky one frame draws with, from the session's clock and sky and the client's
@@ -299,7 +346,7 @@ impl ClientApp {
                 entity_id: 0,
             },
             sky: SkyState::default(),
-            cloud_ticks: 0,
+            player: PlayerState::default(),
             overlay_visible,
         })
     }
@@ -322,38 +369,42 @@ impl ClientApp {
         };
         let mut session_ended = false;
         for event in events {
-            session_ended |= apply_session_event(renderer, &mut self.hud, &mut self.sky, event);
+            session_ended |= apply_session_event(
+                renderer,
+                &mut self.hud,
+                &mut self.sky,
+                &mut self.player,
+                event,
+            );
         }
         if session_ended {
             tracing::info!("the session ended, exiting");
             event_loop.exit();
             return;
         }
-        // The camera follows the pose the server last reported. The smoke path
+        // The camera follows the pose the session last reported. The smoke path
         // without a session stays as M0 left it: no camera, so the frame is the
         // sky clear.
         if self.session.is_some() {
             renderer.set_camera(Camera {
                 pose: CameraPose {
-                    position: self.hud.position,
-                    yaw: self.hud.yaw,
-                    pitch: self.hud.pitch,
+                    position: self.player.current.position,
+                    yaw: self.player.current.yaw,
+                    pitch: self.player.current.pitch,
                 },
                 fov_degrees: DEFAULT_FOV,
                 near: NEAR_PLANE,
                 far_chunks: self.render_distance as f32,
             });
-            // The counter M3's tick loop will advance once per tick; see the field's own note.
-            self.cloud_ticks += 1;
             if let (Some(time_of_day), Some(values)) = (self.sky.time_of_day, self.sky.sky) {
                 let (fog, sky) = frame_params(
                     time_of_day,
                     self.hud.dimension,
-                    self.hud.position[1],
+                    self.player.current.position[1],
                     self.sky.void_y_factor,
                     self.render_distance,
                     values,
-                    self.cloud_ticks,
+                    self.player.tick as i64,
                 );
                 renderer.set_fog(fog);
                 renderer.set_sky(sky);
@@ -415,6 +466,14 @@ struct SessionLink {
     server: String,
     /// The events the session thread reports, drained once per frame.
     events: Receiver<ClientEvent>,
+    /// The window's end of the input channel; the session thread drains the other
+    /// end.
+    ///
+    /// Nothing sends here until the window's events are translated — that wiring
+    /// is the task after this one — but the link owns the sender so the channel
+    /// lives as long as the session does.
+    #[allow(dead_code)]
+    input_tx: Sender<InputEvent>,
 }
 
 /// Opens a session on its own thread and returns the link the window drains.
@@ -424,7 +483,9 @@ struct SessionLink {
 /// log if it has one, and then reports [`ClientEvent::Disconnected`] whatever
 /// the outcome was, so the window can stop. A session that returned cleanly is
 /// a normal exit: the server closed the connection. The client settings carry the
-/// command line's view distance, and the `mesh` assets are the bootstrap's.
+/// command line's view distance, and the `mesh` assets are the bootstrap's. The
+/// input channel is opened here too: the thread drains the receiver, the link
+/// keeps the sender.
 fn spawn_session(
     host: String,
     port: u16,
@@ -434,6 +495,7 @@ fn spawn_session(
     mesh: Arc<MeshAssets>,
 ) -> SessionLink {
     let (sender, receiver) = unbounded();
+    let (input_tx, input_rx) = unbounded();
     std::thread::spawn(move || {
         let config = SessionConfig {
             host,
@@ -447,7 +509,7 @@ fn spawn_session(
         };
         match Session::connect(&config) {
             Ok(session) => {
-                if let Err(error) = session.run(&sender) {
+                if let Err(error) = session.run(&sender, input_rx) {
                     tracing::error!(error = ?error, "the session ended with an error");
                 }
             }
@@ -460,12 +522,13 @@ fn spawn_session(
     SessionLink {
         server,
         events: receiver,
+        input_tx,
     }
 }
 
 /// Applies one event the session reported: meshes go to the renderer, the pose
-/// and the join parameters to the overlay state, and the clock and the sky to
-/// the frame's parameters.
+/// to the view state and the overlay, the join parameters to the overlay state,
+/// and the clock and the sky to the frame's parameters.
 ///
 /// Returns whether the session ended, which stops the client. The session
 /// returns `Ok(())` when the server closed the connection, so its end is a
@@ -474,6 +537,7 @@ fn apply_session_event(
     renderer: &mut Renderer,
     hud: &mut HudState,
     sky: &mut SkyState,
+    player: &mut PlayerState,
     event: ClientEvent,
 ) -> bool {
     match event {
@@ -503,16 +567,20 @@ fn apply_session_event(
             sky.void_y_factor = void_y_factor(&level_type);
             false
         }
-        ClientEvent::PlayerPosition {
+        ClientEvent::PlayerTick {
             x,
             y,
             z,
             yaw,
             pitch,
+            tick,
+            snapped,
+            ..
         } => {
             hud.position = [x, y, z];
             hud.yaw = yaw;
             hud.pitch = pitch;
+            player.observe(tick, [x, y, z], yaw, pitch, snapped);
             false
         }
         ClientEvent::Time {
@@ -721,7 +789,7 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Cli, ClientApp, SkyValues, frame_params, is_escape_press, is_f3_press,
+        Cli, ClientApp, PlayerState, SkyValues, frame_params, is_escape_press, is_f3_press,
         parse_server_address, void_y_factor,
     };
     use clap::Parser;
@@ -820,6 +888,46 @@ mod tests {
     fn only_a_flat_world_asks_for_the_full_void_fog_factor() {
         assert_eq!(void_y_factor("flat"), 1.0);
         assert_eq!(void_y_factor("default"), 0.03125);
+    }
+
+    #[test]
+    fn the_pose_state_slides_a_regular_tick_and_collapses_a_snapped_one() {
+        let mut player = PlayerState::default();
+        player.observe(1, [0.0, 64.0, 0.0], 0.0, 0.0, false);
+        player.observe(2, [1.5, 64.0, -2.0], 10.0, -5.0, false);
+        assert_eq!(
+            player.previous.position,
+            [0.0, 64.0, 0.0],
+            "the previous pose slides into previous"
+        );
+        assert_eq!(player.current.position, [1.5, 64.0, -2.0]);
+        assert_eq!(player.tick, 2);
+        player.observe(3, [9.0, 70.0, 9.0], 90.0, 45.0, true);
+        assert_eq!(
+            player.previous, player.current,
+            "a snapped tick collapses the pair: nothing interpolates across a correction"
+        );
+        assert_eq!(player.current.position, [9.0, 70.0, 9.0]);
+        assert_eq!(player.tick, 3, "the tick advances even when snapped");
+    }
+
+    #[test]
+    fn the_cloud_offset_is_the_tick_the_session_last_reported() {
+        // The client's cloud phase is the session's 20 Hz clock, not a frame counter:
+        // the offset a frame draws with is the tick the last PlayerTick carried.
+        let mut player = PlayerState::default();
+        player.observe(41, [0.0, 64.0, 0.0], 0.0, 0.0, false);
+        let values = SkyValues {
+            celestial_angle: 0.25,
+            colour: [0.5, 0.6, 0.7],
+            sun_brightness: 0.9,
+            star_brightness: 0.1,
+            cloud_colour: [1.0, 0.5, 0.25],
+            moon_phase: 5,
+            light_level: 15,
+        };
+        let (_, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, player.tick as i64);
+        assert_eq!(sky.cloud_offset_ticks, 41);
     }
 
     #[test]

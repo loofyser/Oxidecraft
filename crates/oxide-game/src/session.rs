@@ -9,6 +9,13 @@
 //! view block produce is computed here and reported with it, because the
 //! window's own crate may not reach the world store.
 //!
+//! The session thread is also the tick thread (plan Decision 1): a fixed
+//! 20 Hz step scheduled inside the play loop drives the player state — the
+//! window's input, the clock's and the cloud counter's advance, and the
+//! per-tick report — while the read loop's discipline holds: ticks are
+//! deadline-polled and capped (`Ticker`), and a readable frame is always read
+//! before any further tick work.
+//!
 //! A packet the client has no use for is skipped, and one whose id it cannot
 //! even name is not fatal (spec S2), so a proxy or a modded server cannot end
 //! the session by sending something unexpected.
@@ -54,10 +61,13 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
+use crate::input::{InputEvent, Intent, look_delta};
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
 };
+use crate::player::Player;
+use crate::ticker::Ticker;
 
 /// The plugin channel a vanilla client announces itself on.
 const BRAND_CHANNEL: &str = "MC|Brand";
@@ -74,6 +84,32 @@ const BRAND_PAYLOAD: &[u8] = b"\x07vanilla";
 /// bytes are readable. One mesh batch is bounded by this wait plus the pump
 /// itself, which is what keeps the echo well inside the server's timeout.
 const MESH_TICK: Duration = Duration::from_millis(20);
+
+/// The session's tick period: twenty ticks per second.
+///
+/// The source runs its game ticks from `new Timer(20.0F)`
+/// (`Minecraft.java:223`), one tick every 50 ms of real time while the window
+/// keeps up; the session schedules the same period.
+const TICK_PERIOD: Duration = Duration::from_millis(50);
+
+/// How many of the window's input events one pass drains.
+///
+/// This bound is the plan's own — the source has no counterpart, because its
+/// input arrives from the window it already owns. The backlog drains across
+/// passes and nothing is dropped; the bound only keeps one pass' work finite
+/// when the window outruns the session.
+const INPUTS_PER_PASS: usize = 32;
+
+/// The mouse sensitivity the look mapping runs with.
+///
+/// `GameSettings.mouseSensitivity`'s own default, 0.5
+/// (`GameSettings.java:65`); the options screen that would change it arrives
+/// with M6.
+const MOUSE_SENSITIVITY: f32 = 0.5;
+
+/// The pitch clamp, in degrees: `MathHelper.clamp_float(this.rotationPitch,
+/// -90.0F, 90.0F)` (`Entity.setAngles`, `Entity.java:395`).
+const PITCH_LIMIT: f32 = 90.0;
 
 /// How many queued columns one pump hands to the pool.
 ///
@@ -209,18 +245,39 @@ pub enum ClientEvent {
         /// Level type, for example `default`.
         level_type: String,
     },
-    /// The server placed or moved the player.
-    PlayerPosition {
-        /// Absolute x, after the relative flags were resolved.
+    /// The session ticked the player: the state one 20 Hz step leaves.
+    ///
+    /// Reported every tick, and immediately — with `snapped: true` — when a
+    /// server correction (clientbound 0x08) moved the player: a snapped tick
+    /// resets the window's interpolation rather than sliding to the pose. The
+    /// `tick` count is the session's own, gap-free, and it is what the cloud
+    /// offset advances from (the source's `cloudTickCounter` advances once
+    /// per tick, `RenderGlobal.updateClouds`, `RenderGlobal.java:1138-1146`).
+    PlayerTick {
+        /// Absolute x of the feet.
         x: f64,
-        /// Absolute y, after the relative flags were resolved.
+        /// Absolute y of the feet.
         y: f64,
-        /// Absolute z, after the relative flags were resolved.
+        /// Absolute z of the feet.
         z: f64,
         /// Absolute yaw in degrees.
         yaw: f32,
         /// Absolute pitch in degrees.
         pitch: f32,
+        /// Whether the player stands on something.
+        on_ground: bool,
+        /// Whether the player is sprinting.
+        sprinting: bool,
+        /// Whether the player is sneaking.
+        sneaking: bool,
+        /// Whether the player is flying.
+        flying: bool,
+        /// Whether the player is in water.
+        in_water: bool,
+        /// The tick this state belongs to.
+        tick: u64,
+        /// Whether a server correction produced this tick.
+        snapped: bool,
     },
     /// Time Update arrived: the world's clock.
     ///
@@ -351,11 +408,19 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
     /// The play loop reads with [`Conn::recv_or_idle`]; when a wait for the
     /// next frame times out — and only then — it hands the mesh queue's next
     /// columns to the pool and reports whatever builds have finished. A frame
-    /// that is already readable is always read before any mesh work, and a
-    /// build never runs on this thread, which is what keeps the keepalive echo
-    /// — and the teleport echo — answerable while a burst of columns is
+    /// that is already readable is always read before any mesh or tick work,
+    /// and a build never runs on this thread, which is what keeps the keepalive
+    /// echo — and the teleport echo — answerable while a burst of columns is
     /// arriving.
-    pub fn run_over(self, events: &Sender<ClientEvent>) -> Result<(), SessionError> {
+    ///
+    /// The window's input arrives on `inputs` and is drained into the held
+    /// intent; the ticks that have come due then run, with the player, the
+    /// clock and the sky reported as they move.
+    pub fn run_over(
+        self,
+        events: &Sender<ClientEvent>,
+        inputs: Receiver<InputEvent>,
+    ) -> Result<(), SessionError> {
         let Session {
             mut conn,
             config,
@@ -385,13 +450,225 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         }
 
         let mut world: Option<World> = None;
-        let mut position = Position::default();
-        let mut clock: Option<i64> = None;
+        let mut player = Player::new();
+        let mut clock: Option<Clock> = None;
+        let mut ticker = Ticker::new(TICK_PERIOD);
+        let mut intent = Intent::neutral();
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
 
         loop {
-            let payload = match conn.recv_or_idle(MESH_TICK) {
-                Ok(RecvOutcome::Frame(payload)) => payload,
+            // The window's input, drained up to a bound: nothing is dropped —
+            // the backlog drains across passes — and the bound keeps one pass'
+            // work finite however far the window runs ahead.
+            for _ in 0..INPUTS_PER_PASS {
+                match inputs.try_recv() {
+                    Ok(event) => apply_input(event, &mut intent, &mut player),
+                    Err(_) => break,
+                }
+            }
+
+            // One frame, or one idle wait. A frame that is already readable is
+            // read before any further work; the due ticks run after it.
+            match conn.recv_or_idle(MESH_TICK) {
+                Ok(RecvOutcome::Frame(payload)) => {
+                    let (id, body) = match read_packet_id(&payload) {
+                        Ok(read) => read,
+                        Err(error) => {
+                            warn!(error = %error, packet = "play", "the packet id did not read");
+                            return Err(SessionError::Packet(error));
+                        }
+                    };
+                    match id {
+                        KeepAlive::ID => {
+                            let keep_alive = decoded(id, KeepAlive::decode(body))?;
+                            let reply = payload_of(|out| write_keep_alive(out, keep_alive.id))?;
+                            send_reply(&mut conn, &reply)?;
+                            report(events, ClientEvent::KeepAlive { id: keep_alive.id });
+                        }
+                        JoinGame::ID => {
+                            let join = decoded(id, JoinGame::decode(body))?;
+                            // The dimension decides whether columns carry sky light. A
+                            // re-sent Join Game starts the column set over: the queue's
+                            // columns belong to the old world, and any job still out
+                            // completes stale and builds against the new one.
+                            world = Some(World::new(join.dimension == 0));
+                            queue = MeshQueue::new();
+                            let settings =
+                                payload_of(|out| write_client_settings(out, &config.settings))?;
+                            send_reply(&mut conn, &settings)?;
+                            let brand = payload_of(|out| {
+                                write_plugin_message(out, BRAND_CHANNEL, BRAND_PAYLOAD)
+                            })?;
+                            send_reply(&mut conn, &brand)?;
+                            report(
+                                events,
+                                ClientEvent::Joined {
+                                    entity_id: join.entity_id,
+                                    gamemode: join.gamemode,
+                                    dimension: join.dimension,
+                                    difficulty: join.difficulty,
+                                    max_players: join.max_players,
+                                    level_type: join.level_type,
+                                },
+                            );
+                        }
+                        PlayerPositionAndLook::ID => {
+                            let teleport = decoded(id, PlayerPositionAndLook::decode(body))?;
+                            apply_correction(&mut player, &teleport);
+                            let echo = payload_of(|out| {
+                                write_player_position_and_look(
+                                    out,
+                                    player.position[0],
+                                    player.position[1],
+                                    player.position[2],
+                                    player.yaw,
+                                    player.pitch,
+                                    false,
+                                )
+                            })?;
+                            send_reply(&mut conn, &echo)?;
+                            // The correction settles at once: the window resets its interpolation
+                            // on a snapped tick rather than sliding to the pose.
+                            report(events, player_tick(&player, true));
+                            // The view block moved: the sky's colour is sampled at the player's own
+                            // block, so a correction can change it without a new clock.
+                            report_sky(world.as_ref(), player.position, clock.as_ref(), events);
+                        }
+                        TimeUpdate::ID => {
+                            let update = decoded(id, TimeUpdate::decode(body))?;
+                            // The frozen-sun convention: a stopped day-night cycle puts a negative
+                            // time on the wire (`S03PacketTimeUpdate.java:17-31`), and the client
+                            // negates it back before it becomes the world clock
+                            // (`WorldClient.setWorldTime`, `WorldClient.java:468-482`), so the
+                            // clock — and the sky built from it — is the value vanilla renders.
+                            // The sign the negation was read from is the source's own frozen-daylight
+                            // rule: `setWorldTime` stops the cycle for a negative time, and
+                            // `WorldClient.tick` then holds the time of day (`:71-74`).
+                            let time_of_day = received_time_of_day(update.time_of_day);
+                            clock = Some(Clock {
+                                world_age: update.world_age,
+                                time_of_day,
+                                frozen: update.time_of_day < 0,
+                            });
+                            report(
+                                events,
+                                ClientEvent::Time {
+                                    world_age: update.world_age,
+                                    time_of_day,
+                                },
+                            );
+                            report_sky(world.as_ref(), player.position, clock.as_ref(), events);
+                        }
+                        ChunkData::ID => match world.as_mut() {
+                            Some(store) => {
+                                let column = decoded(id, ChunkData::decode(body, store.has_sky()))?;
+                                if store.apply_chunk_data(&column) {
+                                    mark_column_changed(
+                                        store,
+                                        &mut queue,
+                                        column.chunk_x,
+                                        column.chunk_z,
+                                    );
+                                } else {
+                                    queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
+                                    report(
+                                        events,
+                                        ClientEvent::ChunkUnloaded {
+                                            cx: column.chunk_x,
+                                            cz: column.chunk_z,
+                                        },
+                                    );
+                                }
+                            }
+                            None => warn!("a column arrived before Join Game built the world"),
+                        },
+                        MapChunkBulk::ID => match world.as_mut() {
+                            Some(store) => {
+                                let bulk = decoded(id, MapChunkBulk::decode(body))?;
+                                store.apply_bulk(&bulk);
+                                for column in &bulk.columns {
+                                    if store.chunk(column.chunk_x, column.chunk_z).is_some() {
+                                        mark_column_changed(
+                                            store,
+                                            &mut queue,
+                                            column.chunk_x,
+                                            column.chunk_z,
+                                        );
+                                    } else {
+                                        queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
+                                        report(
+                                            events,
+                                            ClientEvent::ChunkUnloaded {
+                                                cx: column.chunk_x,
+                                                cz: column.chunk_z,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            None => warn!("a bulk column arrived before Join Game built the world"),
+                        },
+                        PlayerListItem::ID => {
+                            // The decoder takes the add action only, while a live
+                            // server sends latency, gamemode and display-name updates
+                            // as a matter of course. Reading the action first keeps
+                            // those out of the error path without guessing at the
+                            // decoder's fields.
+                            match read_varint(body) {
+                                Ok(PlayerListItem::ACTION_ADD) => {
+                                    let list = decoded(id, PlayerListItem::decode(body))?;
+                                    for entry in list.entries {
+                                        if let Some(name) = entry.name {
+                                            players.insert(entry.uuid, name);
+                                        }
+                                    }
+                                }
+                                Ok(action) => {
+                                    debug!(
+                                        action = action,
+                                        "skipping a Player List Item M1 has no use for"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(packet_id = id, error = %error, "the player list action did not read");
+                                    return Err(SessionError::Packet(error.into()));
+                                }
+                            }
+                        }
+                        PluginMessage::ID => {
+                            let message = decoded(id, PluginMessage::decode(body))?;
+                            debug!(channel = %message.channel, bytes = message.data.len(), "plugin message");
+                        }
+                        PlayDisconnect::ID => {
+                            let disconnect = decoded(id, PlayDisconnect::decode(body))?;
+                            finish_meshes(
+                                world.as_ref(),
+                                &mut queue,
+                                &pool,
+                                &mesh,
+                                &finished,
+                                &results,
+                                events,
+                            );
+                            report(
+                                events,
+                                ClientEvent::Disconnected {
+                                    reason: disconnect.reason,
+                                },
+                            );
+                            return Ok(());
+                        }
+                        PLAY_SET_COMPRESSION_ID => {
+                            warn!("ignoring a play-state Set Compression, which M1 does not apply");
+                        }
+                        other => {
+                            debug!(
+                                packet_id = other,
+                                "skipping a play packet M1 does not handle"
+                            );
+                        }
+                    }
+                }
                 Ok(RecvOutcome::Idle) => {
                     pump_meshes(
                         world.as_ref(),
@@ -402,200 +679,19 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         &results,
                         events,
                     );
-                    continue;
                 }
                 Err(error) if is_stream_end(&error) => {
                     debug!(error = %error, "the server closed the stream");
                     break;
                 }
                 Err(error) => return Err(SessionError::Frame(error)),
-            };
-            let (id, body) = match read_packet_id(&payload) {
-                Ok(read) => read,
-                Err(error) => {
-                    warn!(error = %error, packet = "play", "the packet id did not read");
-                    return Err(SessionError::Packet(error));
-                }
-            };
-            match id {
-                KeepAlive::ID => {
-                    let keep_alive = decoded(id, KeepAlive::decode(body))?;
-                    let reply = payload_of(|out| write_keep_alive(out, keep_alive.id))?;
-                    send_reply(&mut conn, &reply)?;
-                    report(events, ClientEvent::KeepAlive { id: keep_alive.id });
-                }
-                JoinGame::ID => {
-                    let join = decoded(id, JoinGame::decode(body))?;
-                    // The dimension decides whether columns carry sky light. A
-                    // re-sent Join Game starts the column set over: the queue's
-                    // columns belong to the old world, and any job still out
-                    // completes stale and builds against the new one.
-                    world = Some(World::new(join.dimension == 0));
-                    queue = MeshQueue::new();
-                    let settings = payload_of(|out| write_client_settings(out, &config.settings))?;
-                    send_reply(&mut conn, &settings)?;
-                    let brand =
-                        payload_of(|out| write_plugin_message(out, BRAND_CHANNEL, BRAND_PAYLOAD))?;
-                    send_reply(&mut conn, &brand)?;
-                    report(
-                        events,
-                        ClientEvent::Joined {
-                            entity_id: join.entity_id,
-                            gamemode: join.gamemode,
-                            dimension: join.dimension,
-                            difficulty: join.difficulty,
-                            max_players: join.max_players,
-                            level_type: join.level_type,
-                        },
-                    );
-                }
-                PlayerPositionAndLook::ID => {
-                    let teleport = decoded(id, PlayerPositionAndLook::decode(body))?;
-                    position = position.resolved(&teleport);
-                    let echo = payload_of(|out| {
-                        write_player_position_and_look(
-                            out,
-                            position.x,
-                            position.y,
-                            position.z,
-                            position.yaw,
-                            position.pitch,
-                            false,
-                        )
-                    })?;
-                    send_reply(&mut conn, &echo)?;
-                    report(
-                        events,
-                        ClientEvent::PlayerPosition {
-                            x: position.x,
-                            y: position.y,
-                            z: position.z,
-                            yaw: position.yaw,
-                            pitch: position.pitch,
-                        },
-                    );
-                    // The view block moved: the sky's colour is sampled at the player's own
-                    // block, so a teleport can change it without a new clock.
-                    report_sky(world.as_ref(), position, clock, events);
-                }
-                TimeUpdate::ID => {
-                    let update = decoded(id, TimeUpdate::decode(body))?;
-                    // The frozen-sun convention: a stopped day-night cycle puts a negative
-                    // time on the wire (`S03PacketTimeUpdate.java:17-31`), and the client
-                    // negates it back before it becomes the world clock
-                    // (`WorldClient.setWorldTime`, `WorldClient.java:468-483`), so the
-                    // clock — and the sky built from it — is the value vanilla renders.
-                    let time_of_day = received_time_of_day(update.time_of_day);
-                    clock = Some(time_of_day);
-                    report(
-                        events,
-                        ClientEvent::Time {
-                            world_age: update.world_age,
-                            time_of_day,
-                        },
-                    );
-                    report_sky(world.as_ref(), position, clock, events);
-                }
-                ChunkData::ID => {
-                    let Some(store) = world.as_mut() else {
-                        warn!("a column arrived before Join Game built the world");
-                        continue;
-                    };
-                    let column = decoded(id, ChunkData::decode(body, store.has_sky()))?;
-                    if store.apply_chunk_data(&column) {
-                        mark_column_changed(store, &mut queue, column.chunk_x, column.chunk_z);
-                    } else {
-                        queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
-                        report(
-                            events,
-                            ClientEvent::ChunkUnloaded {
-                                cx: column.chunk_x,
-                                cz: column.chunk_z,
-                            },
-                        );
-                    }
-                }
-                MapChunkBulk::ID => {
-                    let Some(store) = world.as_mut() else {
-                        warn!("a bulk column arrived before Join Game built the world");
-                        continue;
-                    };
-                    let bulk = decoded(id, MapChunkBulk::decode(body))?;
-                    store.apply_bulk(&bulk);
-                    for column in &bulk.columns {
-                        if store.chunk(column.chunk_x, column.chunk_z).is_some() {
-                            mark_column_changed(store, &mut queue, column.chunk_x, column.chunk_z);
-                        } else {
-                            queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
-                            report(
-                                events,
-                                ClientEvent::ChunkUnloaded {
-                                    cx: column.chunk_x,
-                                    cz: column.chunk_z,
-                                },
-                            );
-                        }
-                    }
-                }
-                PlayerListItem::ID => {
-                    // The decoder takes the add action only, while a live
-                    // server sends latency, gamemode and display-name updates
-                    // as a matter of course. Reading the action first keeps
-                    // those out of the error path without guessing at the
-                    // decoder's fields.
-                    match read_varint(body) {
-                        Ok(PlayerListItem::ACTION_ADD) => {
-                            let list = decoded(id, PlayerListItem::decode(body))?;
-                            for entry in list.entries {
-                                if let Some(name) = entry.name {
-                                    players.insert(entry.uuid, name);
-                                }
-                            }
-                        }
-                        Ok(action) => {
-                            debug!(
-                                action = action,
-                                "skipping a Player List Item M1 has no use for"
-                            );
-                        }
-                        Err(error) => {
-                            warn!(packet_id = id, error = %error, "the player list action did not read");
-                            return Err(SessionError::Packet(error.into()));
-                        }
-                    }
-                }
-                PluginMessage::ID => {
-                    let message = decoded(id, PluginMessage::decode(body))?;
-                    debug!(channel = %message.channel, bytes = message.data.len(), "plugin message");
-                }
-                PlayDisconnect::ID => {
-                    let disconnect = decoded(id, PlayDisconnect::decode(body))?;
-                    finish_meshes(
-                        world.as_ref(),
-                        &mut queue,
-                        &pool,
-                        &mesh,
-                        &finished,
-                        &results,
-                        events,
-                    );
-                    report(
-                        events,
-                        ClientEvent::Disconnected {
-                            reason: disconnect.reason,
-                        },
-                    );
-                    return Ok(());
-                }
-                PLAY_SET_COMPRESSION_ID => {
-                    warn!("ignoring a play-state Set Compression, which M1 does not apply");
-                }
-                other => {
-                    debug!(
-                        packet_id = other,
-                        "skipping a play packet M1 does not handle"
-                    );
-                }
+            }
+
+            // The ticks that have come due. The frame above — or the idle wait
+            // before this batch — was handled first, and the ticker caps a
+            // catch-up, so a long pause cannot snowball into a long pass.
+            for _ in 0..ticker.due(Instant::now()) {
+                step_tick(&mut player, &intent, clock.as_mut(), world.as_ref(), events);
             }
         }
         finish_meshes(
@@ -615,9 +711,14 @@ impl Session<TcpStream> {
     /// Connects and runs; the entry point the client thread calls.
     ///
     /// The connection itself is [`Session::connect`]'s, so this runs a session
-    /// that already exists, exactly as [`Session::run_over`] does.
-    pub fn run(self, events: &Sender<ClientEvent>) -> Result<(), SessionError> {
-        self.run_over(events)
+    /// that already exists, exactly as [`Session::run_over`] does, and takes
+    /// the window's input the same way.
+    pub fn run(
+        self,
+        events: &Sender<ClientEvent>,
+        inputs: Receiver<InputEvent>,
+    ) -> Result<(), SessionError> {
+        self.run_over(events, inputs)
     }
 }
 
@@ -683,57 +784,150 @@ fn login<S: Read + Write>(
     }
 }
 
-/// The absolute position the last teleport settled on.
+/// The session's copy of the world's clock: what `WorldClient` keeps and ticks.
 ///
-/// It is what the relative flags of the next teleport are applied to, and it is
-/// the camera as far as M1 is concerned: there is no movement of our own.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Position {
-    /// World x.
-    x: f64,
-    /// World y.
-    y: f64,
-    /// World z.
-    z: f64,
-    /// Look yaw in degrees.
-    yaw: f32,
-    /// Look pitch in degrees.
-    pitch: f32,
+/// `WorldClient.tick` advances the total world time every tick and the time of
+/// day only while the day-night cycle runs (`WorldClient.java:66-74`); the
+/// frozen-sun convention puts the cycle's state on the wire as the time's sign,
+/// which `WorldClient.setWorldTime` reads back, negating a negative time and
+/// stopping the cycle (`:468-482`). [`received_time_of_day`] does the negation
+/// here, and the sign it was read from is this clock's `frozen` flag, so the
+/// tick's advance is gated exactly where the source gates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Clock {
+    /// The world's age in ticks, advanced every tick (`WorldClient.tick`, `:69`).
+    world_age: i64,
+    /// The time of day in ticks, after the receive rule's negation.
+    time_of_day: i64,
+    /// Whether the day-night cycle is stopped: the wire's negative time.
+    frozen: bool,
 }
 
-impl Position {
-    /// Resolves a teleport into absolute values: a flagged axis is a delta on
-    /// the position the session holds, an unflagged one is already absolute.
-    fn resolved(self, teleport: &PlayerPositionAndLook) -> Self {
-        let flags = teleport.flags;
-        Self {
-            x: if flags & PlayerPositionAndLook::FLAG_X != 0 {
-                self.x + teleport.x
-            } else {
-                teleport.x
-            },
-            y: if flags & PlayerPositionAndLook::FLAG_Y != 0 {
-                self.y + teleport.y
-            } else {
-                teleport.y
-            },
-            z: if flags & PlayerPositionAndLook::FLAG_Z != 0 {
-                self.z + teleport.z
-            } else {
-                teleport.z
-            },
-            yaw: if flags & PlayerPositionAndLook::FLAG_YAW != 0 {
-                self.yaw + teleport.yaw
-            } else {
-                teleport.yaw
-            },
-            pitch: if flags & PlayerPositionAndLook::FLAG_PITCH != 0 {
-                self.pitch + teleport.pitch
-            } else {
-                teleport.pitch
-            },
+/// Applies one window event to the held input and the player's look.
+///
+/// The mouse delta turns the player where the source turns it — when the
+/// mouse is polled, in `EntityRenderer.updateMouse` (`:1094-1123`), not on the
+/// tick — with the pitch clamped as `Entity.setAngles` clamps it
+/// (`Entity.java:395`). A focus loss releases every held key, so a window that
+/// stops receiving leaves nothing held.
+fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) {
+    match event {
+        InputEvent::Key { key, pressed } => intent.apply_key(key, pressed),
+        InputEvent::MouseDelta { dx, dy } => {
+            let (d_yaw, d_pitch) = look_delta(dx, dy, MOUSE_SENSITIVITY);
+            player.yaw += d_yaw;
+            player.pitch = (player.pitch + d_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        }
+        // The buttons belong to interaction, which M3's later tasks add; the
+        // held intent has no use for them.
+        InputEvent::MouseButton { .. } => {}
+        InputEvent::FocusLost => intent.release_all(),
+    }
+}
+
+/// Applies a clientbound 0x08 teleport to the player.
+///
+/// A flagged axis is a delta on the state the session holds, an unflagged one
+/// is already absolute — the rule the source's flags state (the wire's flag
+/// byte through `S08PacketPlayerPosLook`, whose constants the codec carries).
+/// The motion is kept: an ordinary correction moves the player without
+/// zeroing velocity; a dimension respawn is what zeroes it.
+fn apply_correction(player: &mut Player, teleport: &PlayerPositionAndLook) {
+    let flags = teleport.flags;
+    let axis = |held: f64, arrives: f64, flag: u8| {
+        if flags & flag != 0 {
+            held + arrives
+        } else {
+            arrives
+        }
+    };
+    player.position = [
+        axis(
+            player.position[0],
+            teleport.x,
+            PlayerPositionAndLook::FLAG_X,
+        ),
+        axis(
+            player.position[1],
+            teleport.y,
+            PlayerPositionAndLook::FLAG_Y,
+        ),
+        axis(
+            player.position[2],
+            teleport.z,
+            PlayerPositionAndLook::FLAG_Z,
+        ),
+    ];
+    player.yaw = axis(
+        f64::from(player.yaw),
+        f64::from(teleport.yaw),
+        PlayerPositionAndLook::FLAG_YAW,
+    ) as f32;
+    player.pitch = axis(
+        f64::from(player.pitch),
+        f64::from(teleport.pitch),
+        PlayerPositionAndLook::FLAG_PITCH,
+    ) as f32;
+}
+
+/// The player's current state as the window's per-tick event.
+fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
+    ClientEvent::PlayerTick {
+        x: player.position[0],
+        y: player.position[1],
+        z: player.position[2],
+        yaw: player.yaw,
+        pitch: player.pitch,
+        on_ground: player.on_ground,
+        sprinting: player.sprinting,
+        sneaking: player.sneaking,
+        flying: player.flying,
+        in_water: player.in_water,
+        tick: player.tick,
+        snapped,
+    }
+}
+
+/// One 20 Hz step of the session's state.
+///
+/// The source's own per-tick order: an entity copies its previous position at
+/// the top of its tick (`Entity.onEntityUpdate`, `Entity.java:420-423`); the
+/// client tick reads the movement input into the sneak flag (`isSneaking`,
+/// `EntityPlayerSP.java:684-688`) and runs the sprint rule once
+/// (`onLivingUpdate`, `:801-820`); the clock advances as [`Clock`] describes.
+/// The tick count is the session's own and is the cloud offset's source (the
+/// source's `cloudTickCounter` advances once per tick, `RenderGlobal.updateClouds`,
+/// `RenderGlobal.java:1138-1146`), reported on every tick either way.
+///
+/// A tick that moved the clock also reports the sky it moved: the sun should
+/// travel at the tick rate, not at the Time Update rate. A frozen clock moves
+/// nothing, so it reports nothing.
+fn step_tick(
+    player: &mut Player,
+    input: &Intent,
+    mut clock: Option<&mut Clock>,
+    world: Option<&World>,
+    events: &Sender<ClientEvent>,
+) {
+    player.last_tick_position = player.position;
+    player.tick += 1;
+    // The sneak flag is the held key, and the sprint rule runs once per tick.
+    player.sneaking = input.sneak;
+    let sprinting = player.sprinting;
+    player.sprinting = player.sprint_tap.update(input, sprinting, player.on_ground);
+
+    let mut advanced = false;
+    if let Some(clock) = clock.as_mut() {
+        clock.world_age += 1;
+        if !clock.frozen {
+            clock.time_of_day += 1;
+            advanced = true;
         }
     }
+    if advanced {
+        report_sky(world, player.position, clock.as_deref(), events);
+    }
+    report(events, player_tick(player, false));
 }
 
 /// Reads the next frame; `None` means the stream ended.
@@ -824,8 +1018,9 @@ fn report(events: &Sender<ClientEvent>, event: ClientEvent) {
 ///
 /// The source's `-time` is a two's-complement negation, and `wrapping_abs` is that rule on
 /// every `i64`: the smallest one negates to itself rather than panicking the read loop. The
-/// same branch also toggles the source's local `doDaylightCycle` rule; M2 has no client tick
-/// for a rule to gate, so the session keeps the clock alone.
+/// same branch also toggles the source's local `doDaylightCycle` rule — the sign it read is
+/// kept on [`Clock`]'s `frozen` flag, which gates the tick's advance exactly as
+/// `WorldClient.tick` gates it (`WorldClient.java:71-74`).
 fn received_time_of_day(time_of_day: i64) -> i64 {
     time_of_day.wrapping_abs()
 }
@@ -835,27 +1030,29 @@ fn received_time_of_day(time_of_day: i64) -> i64 {
 /// The angle and the colours come from the world clock; the block is the render-view entity's
 /// own, floored exactly as `World.getSkyColor` floors it (`World.java:1437-1443`), and the
 /// light level is that same block's (`EntityRenderer.java:362` reads
-/// `World.getLightBrightness(new BlockPos(viewEntity))`). M2 has no client tick loop, so the
-/// partial tick is zero, and no weather is decoded, so the rain strength is zero; both are
-/// recorded in the module docs and the report. A session with no clock yet — or no world, as
-/// before Join Game — has no sky to report.
+/// `World.getLightBrightness(new BlockPos(viewEntity))`). The frame fraction is the renderer's
+/// own concern — the session reports whole ticks, and the window interpolates between them —
+/// so the partial tick is zero, and no weather is decoded, so the rain strength is zero; both
+/// are recorded in the module docs and the report. A session with no clock yet — or no world,
+/// as before Join Game — has no sky to report.
 fn report_sky(
     world: Option<&World>,
-    position: Position,
-    clock: Option<i64>,
+    view: [f64; 3],
+    clock: Option<&Clock>,
     events: &Sender<ClientEvent>,
 ) {
-    let (Some(world), Some(time_of_day)) = (world, clock) else {
+    let (Some(world), Some(clock)) = (world, clock) else {
         return;
     };
-    /// M2 renders from the last update with no tick to interpolate over.
+    let time_of_day = clock.time_of_day;
+    /// The session reports whole ticks; interpolation is the renderer's.
     const PARTIAL_TICKS: f32 = 0.0;
     /// No weather packets are decoded yet, so the rain strength is zero.
     const RAIN_STRENGTH: f32 = 0.0;
     let angle = celestial_angle(time_of_day, PARTIAL_TICKS);
-    let x = position.x.floor() as i32;
-    let y = position.y.floor() as i32;
-    let z = position.z.floor() as i32;
+    let x = view[0].floor() as i32;
+    let y = view[1].floor() as i32;
+    let z = view[2].floor() as i32;
     let colour = sky_colour(world, x, y, z, angle);
     // The fog's brightness factor reads the view block's own light, with the source's
     // defaults for a position no column holds (`EntityRenderer.java:362-365`).

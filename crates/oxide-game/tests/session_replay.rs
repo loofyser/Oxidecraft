@@ -6,7 +6,9 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError};
+use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
 use oxide_proto_v47::clientbound::{MapChunkBulk, PlayerPositionAndLook};
@@ -24,6 +26,12 @@ fn config() -> SessionConfig {
         settings: ClientSettings::default(),
         mesh: None,
     }
+}
+
+/// The input receiver a scripted session drains when the script sends no
+/// input: nothing is ever queued, and nothing is dropped.
+fn silent_inputs() -> crossbeam_channel::Receiver<InputEvent> {
+    crossbeam_channel::unbounded().1
 }
 
 /// The framing the scripted server switches to when it sends Set Compression.
@@ -368,6 +376,48 @@ struct SkyReport {
     light_level: u8,
 }
 
+/// The sky values a `Sky` event carries, when it is one.
+fn sky_report(event: &ClientEvent) -> Option<SkyReport> {
+    match event {
+        ClientEvent::Sky {
+            celestial_angle,
+            colour,
+            sun_brightness,
+            star_brightness,
+            cloud_colour,
+            moon_phase,
+            light_level,
+        } => Some(SkyReport {
+            celestial_angle: *celestial_angle,
+            colour: *colour,
+            sun_brightness: *sun_brightness,
+            star_brightness: *star_brightness,
+            cloud_colour: *cloud_colour,
+            moon_phase: *moon_phase,
+            light_level: *light_level,
+        }),
+        _ => None,
+    }
+}
+
+/// The skies the frames themselves report: each `Sky` directly preceded by the
+/// Time Update or the snapped tick that produced it. A tick that advances a
+/// running clock adds skies of its own between the frames — the sun travels at
+/// the tick rate — so the frame-driven reports are identified by their marker,
+/// not by position.
+fn frame_skies(events: &[ClientEvent]) -> Vec<SkyReport> {
+    events
+        .windows(2)
+        .filter(|pair| {
+            matches!(
+                pair[0],
+                ClientEvent::Time { .. } | ClientEvent::PlayerTick { snapped: true, .. }
+            )
+        })
+        .filter_map(|pair| sky_report(&pair[1]))
+        .collect()
+}
+
 /// The section slots of the first `ChunkUpdated` for a column, panicking when
 /// no event reports the column.
 fn updated_slots(events: &[ClientEvent], cx: i32, cz: i32) -> &[(usize, Option<ChunkMesh>)] {
@@ -434,10 +484,15 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
     let (sender, receiver) = crossbeam_channel::unbounded();
     let session = Session::new(Conn::new(stream), config());
     session
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
-    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    // The ticks the session's own clock adds are its own business here; the
+    // unsnapped ones are dropped so the frame-driven story reads as before.
+    let events: Vec<ClientEvent> = receiver
+        .try_iter()
+        .filter(|event| !matches!(event, ClientEvent::PlayerTick { snapped: false, .. }))
+        .collect();
     assert!(matches!(events[0], ClientEvent::LoggedIn { .. }));
     assert!(matches!(
         events[1],
@@ -447,7 +502,14 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
             ..
         }
     ));
-    assert!(matches!(events[2], ClientEvent::PlayerPosition { x, .. } if x == 0.5));
+    assert!(matches!(
+        events[2],
+        ClientEvent::PlayerTick {
+            x,
+            snapped: true,
+            ..
+        } if x == 0.5
+    ));
     assert!(matches!(events[3], ClientEvent::KeepAlive { id: 7 }));
     match &events[4] {
         ClientEvent::ChunkUpdated {
@@ -513,25 +575,31 @@ fn a_relative_teleport_is_answered_with_absolute_values() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    match events.last() {
-        Some(ClientEvent::PlayerPosition {
+    let corrected = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event, ClientEvent::PlayerTick { snapped: true, .. }))
+        .expect("the second teleport is reported");
+    match corrected {
+        ClientEvent::PlayerTick {
             x,
             y,
             z,
             yaw,
             pitch,
-        }) => {
+            ..
+        } => {
             assert_eq!(
                 (*x, *y, *z, *yaw, *pitch),
                 (10.5, 1.0, 17.5, 45.0, -10.0),
                 "the deltas are applied and the absolutes are taken as they arrived"
             );
         }
-        other => panic!("expected the second teleport, got {other:?}"),
+        other => panic!("expected the snapped tick, got {other:?}"),
     }
 
     // The echo carries the resolved position, not the deltas that arrived.
@@ -552,6 +620,56 @@ fn a_relative_teleport_is_answered_with_absolute_values() {
 }
 
 #[test]
+fn the_look_input_turns_the_player_and_a_correction_reports_it_on_a_snapped_tick() {
+    // The window's mouse deltas arrive on the input channel and are applied where the source
+    // applies them — when the mouse is polled, not on the tick — and the correction that
+    // follows reports the player immediately, on a snapped tick, carrying the input's
+    // rotation plus its own relative deltas. The sign chain is pinned end to end: a rightward
+    // delta raises the yaw (yaw 0 faces south and 90 faces west, so a right turn increases
+    // it), and a downward delta raises the pitch (positive pitch looks down,
+    // `Entity.getVectorForRotation`, `Entity.java:1476-1483`).
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    input_tx
+        .send(InputEvent::MouseDelta { dx: 10.0, dy: 5.0 })
+        .expect("the input channel is open");
+    input_tx
+        .send(InputEvent::MouseDelta { dx: -4.0, dy: 0.0 })
+        .expect("the input channel is open");
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        // The correction's yaw and pitch are deltas on what the session holds: the wire's
+        // relative-flag bits 0x08 and 0x10.
+        position_frame(0.5, 65.0, 4.5, 1.0, 0.5, 0x18),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, input_rx)
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let snapped = events
+        .iter()
+        .find(|event| matches!(event, ClientEvent::PlayerTick { snapped: true, .. }))
+        .expect("the correction reports a snapped tick");
+    match snapped {
+        ClientEvent::PlayerTick { yaw, pitch, .. } => {
+            // At the fixed 0.5 sensitivity 10 px right is 1.5°, the leftward 4 px take 0.6°
+            // back off, and the correction adds its own 1.0°: 1.9°. The 5 px fall is 0.75°,
+            // the correction adds 0.5°: 1.25°.
+            assert!(
+                (*yaw - 1.9).abs() < 1e-4,
+                "the yaw carries the input's turn plus the correction's delta: {yaw}"
+            );
+            assert!(
+                (*pitch - 1.25).abs() < 1e-4,
+                "the pitch carries the input's fall plus the correction's delta: {pitch}"
+            );
+        }
+        other => panic!("expected the snapped tick, got {other:?}"),
+    }
+}
+
+#[test]
 fn an_unload_packet_removes_the_column_and_remeshes_its_neighbours() {
     // The unloaded column and its four neighbours are loaded first; then the
     // server unloads the column in the middle. The unload is reported as its
@@ -568,7 +686,7 @@ fn an_unload_packet_removes_the_column_and_remeshes_its_neighbours() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -650,7 +768,7 @@ fn a_section_update_carries_its_light_and_keeps_unlisted_sections() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -683,7 +801,7 @@ fn a_malformed_packet_is_an_error_not_a_panic() {
     let (stream, _outgoing) = duplex(stream_with(&[join]));
     let (sender, _receiver) = crossbeam_channel::unbounded();
     let error = Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect_err("a cut short Join Game must be reported");
     assert!(matches!(error, SessionError::Packet(_)), "error: {error:?}");
 }
@@ -696,7 +814,7 @@ fn a_server_disconnect_reports_its_reason() {
     let (stream, _outgoing) = duplex(stream_with(&[join_game_frame(), disconnect]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("a disconnect ends the session cleanly");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -720,14 +838,19 @@ fn packets_m1_does_not_use_are_skipped_not_fatal() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("packets M1 has no use for do not end the session");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    match events.last() {
-        Some(ClientEvent::KeepAlive { id: 11 }) => {}
-        other => panic!("expected the keepalive to be answered, got {other:?}"),
-    }
+    let keepalive = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event, ClientEvent::KeepAlive { .. }))
+        .expect("the keepalive is answered");
+    assert!(
+        matches!(keepalive, ClientEvent::KeepAlive { id: 11 }),
+        "expected keepalive 11, got {keepalive:?}"
+    );
     // Nothing was sent for the skipped packets: the keepalive echo is the
     // fifth packet, right after the settings and the brand.
     let written = outgoing.lock().unwrap().clone();
@@ -756,14 +879,19 @@ fn player_list_updates_do_not_end_the_session() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("player list traffic does not end the session");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
-    match events.last() {
-        Some(ClientEvent::KeepAlive { id: 12 }) => {}
-        other => panic!("expected the keepalive to be answered, got {other:?}"),
-    }
+    let keepalive = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event, ClientEvent::KeepAlive { .. }))
+        .expect("the keepalive is answered");
+    assert!(
+        matches!(keepalive, ClientEvent::KeepAlive { id: 12 }),
+        "expected keepalive 12, got {keepalive:?}"
+    );
     let written = outgoing.lock().unwrap().clone();
     let mut cursor = &written[..];
     client_frame(&mut cursor, Compression::Disabled); // handshake
@@ -802,7 +930,7 @@ fn a_keepalive_behind_a_column_burst_is_answered() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -883,8 +1011,9 @@ fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
     let (stream, outgoing) = duplex(script);
     let (sender, receiver) = crossbeam_channel::unbounded();
     let started = Instant::now();
-    let session =
-        std::thread::spawn(move || Session::new(Conn::new(stream), config()).run_over(&sender));
+    let session = std::thread::spawn(move || {
+        Session::new(Conn::new(stream), config()).run_over(&sender, silent_inputs())
+    });
 
     let deadline = started + ECHO_DEADLINE;
     let mut meshed = 0usize;
@@ -926,11 +1055,13 @@ fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
 }
 
 /// A duplex with a quiet stretch: after `head` is consumed, the stream reports
-/// nothing readable for `stalls` waits, then serves `tail`.
+/// nothing readable for `stalls` waits, then serves `tail`; once `tail` is
+/// consumed too, a second stretch of `tail_stalls` waits precedes the end.
 struct GappedDuplex {
     head: std::io::Cursor<Vec<u8>>,
     tail: std::io::Cursor<Vec<u8>>,
     stalls: usize,
+    tail_stalls: usize,
     outgoing: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -965,6 +1096,12 @@ impl DeadlineStream for GappedDuplex {
             // window the tick gives it.
             std::thread::sleep(timeout);
             Ok(false)
+        } else if self.tail.position() < self.tail.get_ref().len() as u64 {
+            Ok(true)
+        } else if self.tail_stalls > 0 {
+            self.tail_stalls -= 1;
+            std::thread::sleep(timeout);
+            Ok(false)
         } else {
             Ok(true)
         }
@@ -997,11 +1134,12 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
         // before the tail arrives: twenty deadlines is a few hundred
         // milliseconds of quiet.
         stalls: 20,
+        tail_stalls: 0,
         outgoing: Arc::clone(&outgoing),
     };
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -1016,6 +1154,331 @@ fn a_quiet_stretch_is_used_to_rebuild_the_pending_meshes() {
     assert!(
         last_mesh < second,
         "the meshes are built in the quiet stretch, before the next keepalive: {events:?}"
+    );
+}
+
+/// A script holding one keepalive.
+fn keepalive_script(id: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    frame(&mut out, &keep_alive_frame(id), SERVER_FRAMING);
+    out
+}
+
+/// Runs a quiet session — a join, one running Time Update, then `stalls` idle waits before
+/// `tail` is served — with `inputs` queued, and returns every event it reported with the
+/// wall-clock span the run took.
+fn run_quiet_session(
+    stalls: usize,
+    tail: Vec<u8>,
+    inputs: Vec<InputEvent>,
+) -> (Vec<ClientEvent>, Duration) {
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    // A positive wire time: the day-night cycle runs, so every tick advances the clock.
+    frame(&mut head, &time_update_frame(48_000, 6000), SERVER_FRAMING);
+
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(tail),
+        stalls,
+        tail_stalls: 0,
+        outgoing,
+    };
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    for input in inputs {
+        input_tx.send(input).expect("the input channel is open");
+    }
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let started = Instant::now();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, input_rx)
+        .expect("the session runs to the end of the stream");
+    let elapsed = started.elapsed();
+    (receiver.try_iter().collect(), elapsed)
+}
+
+#[test]
+fn the_tick_advances_through_a_quiet_stretch_and_every_clock_tick_reports_the_sky() {
+    // The loop's idle waits are where the ticks run: the connection goes quiet after the
+    // join and one Time Update, and the session's own clock keeps the player stepping with
+    // no frame in sight — the source's arrangement, where the game tick is driven by the
+    // frame clock but needs no frame per tick. A held key reaches the tick's report, every
+    // tick that advances the running clock reports the sky it moved, and the keepalive
+    // behind the quiet stretch is read after those tick batches, not before them.
+    let (events, elapsed) = run_quiet_session(
+        16,
+        keepalive_script(71),
+        vec![InputEvent::Key {
+            key: Key::ShiftLeft,
+            pressed: true,
+        }],
+    );
+
+    let ticks: Vec<(u64, bool)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick { tick, sneaking, .. } => Some((*tick, *sneaking)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ticks.len() >= 3,
+        "the quiet stretch owes whole steps: {ticks:?}"
+    );
+    assert_eq!(
+        ticks.first().map(|(tick, _)| *tick),
+        Some(1),
+        "the first tick is tick 1: the player starts at zero"
+    );
+    for pair in ticks.windows(2) {
+        assert_eq!(
+            pair[1].0,
+            pair[0].0 + 1,
+            "the tick count is gap-free: {ticks:?}"
+        );
+    }
+    // A tick batch is capped and no debt is carried, so the whole run cannot report more
+    // steps than the elapsed time owed.
+    let budget = (elapsed.as_millis() / 50) as usize + TICK_CATCHUP_CAP as usize;
+    assert!(
+        ticks.len() <= budget,
+        "{} ticks in {elapsed:?} exceed the elapsed steps plus one capped batch",
+        ticks.len()
+    );
+    assert!(
+        ticks.iter().all(|(_, sneaking)| *sneaking),
+        "the held key is on every tick's report: {ticks:?}"
+    );
+    // The Time Update's own sky, plus exactly one for every tick that advanced the clock.
+    let skies = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::Sky { .. }))
+        .count();
+    assert_eq!(
+        skies,
+        ticks.len() + 1,
+        "one sky per clock-advancing tick plus the Time Update's: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::KeepAlive { id: 71 })),
+        "the quiet stretch does not starve the read loop: {events:?}"
+    );
+}
+
+#[test]
+fn a_focus_loss_releases_the_held_keys_before_the_next_tick() {
+    // The same quiet session with the sneak key held reports it on every tick; the same
+    // script with a FocusLost behind the key — and a mouse button edge riding along, which
+    // must not disturb the intent — reports the neutral intent instead, because a window
+    // that stopped receiving holds nothing. The two runs differ by those events alone.
+    let (held, _) = run_quiet_session(
+        12,
+        Vec::new(),
+        vec![InputEvent::Key {
+            key: Key::ShiftLeft,
+            pressed: true,
+        }],
+    );
+    let (released, _) = run_quiet_session(
+        12,
+        Vec::new(),
+        vec![
+            InputEvent::Key {
+                key: Key::ShiftLeft,
+                pressed: true,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+            InputEvent::FocusLost,
+        ],
+    );
+
+    let sneaking = |events: &[ClientEvent]| -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::PlayerTick { sneaking, .. } => Some(*sneaking),
+                _ => None,
+            })
+            .collect()
+    };
+    let held_ticks = sneaking(&held);
+    let released_ticks = sneaking(&released);
+    assert!(!held_ticks.is_empty(), "the quiet stretch ticks: {held:?}");
+    assert!(
+        held_ticks.iter().all(|sneaking| *sneaking),
+        "the held key is on every tick: {held:?}"
+    );
+    assert!(
+        !released_ticks.is_empty(),
+        "the quiet stretch ticks: {released:?}"
+    );
+    assert!(
+        released_ticks.iter().all(|sneaking| !*sneaking),
+        "the focus loss released the held key: {released:?}"
+    );
+}
+
+#[test]
+fn a_correction_between_two_ticks_moves_the_player_and_reports_one_snapped_tick() {
+    // A join and a first teleport settle the player; the connection then goes quiet long
+    // enough for whole ticks to run, a second correction arrives, and the connection goes
+    // quiet again. The correction is reported at once — the window must not interpolate
+    // across it — and its snapped tick carries the tick count it landed on: the same count
+    // the last regular tick reported, and one before the next.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &position_frame(100.0, 70.0, -50.0, 30.0, 10.0, 0),
+        SERVER_FRAMING,
+    );
+
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(tail),
+        // Ten idle waits on each side: several whole steps fall inside each stretch.
+        stalls: 10,
+        tail_stalls: 10,
+        outgoing,
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let snapped = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::PlayerTick { snapped: true, .. }))
+        .expect("the correction is reported");
+    let (x, y, z, tick) = match &events[snapped] {
+        ClientEvent::PlayerTick { x, y, z, tick, .. } => (*x, *y, *z, *tick),
+        other => panic!("expected the snapped tick, got {other:?}"),
+    };
+    assert_eq!(
+        (x, y, z),
+        (100.0, 70.0, -50.0),
+        "the correction moved the player to the values it carried"
+    );
+    let before = events[..snapped]
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ClientEvent::PlayerTick {
+                tick,
+                snapped: false,
+                ..
+            } => Some(*tick),
+            _ => None,
+        })
+        .expect("a regular tick ran before the correction");
+    let after = events[snapped + 1..]
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::PlayerTick {
+                tick,
+                snapped: false,
+                ..
+            } => Some(*tick),
+            _ => None,
+        })
+        .expect("a regular tick ran after the correction");
+    assert_eq!(
+        before, tick,
+        "the snapped tick carries the count of the tick it landed on"
+    );
+    assert_eq!(after, tick + 1, "the next regular tick is the one after it");
+}
+
+#[test]
+fn a_frame_flood_does_not_starve_the_ticks_and_a_quiet_tail_owes_no_debt() {
+    // The burst a live server sends on join arrives back to back with a keepalive behind it,
+    // and then the stream goes quiet. Each pass reads one frame and then runs the ticks that
+    // have come due, so the flood does not starve them, and the quiet stretch cannot pay off
+    // debt the ticker never accumulated: the total stays within the elapsed time's steps
+    // plus one capped batch. The burst's columns are still meshed and both keepalives are
+    // answered.
+    const BURST: i32 = 96;
+    let mut script = Vec::new();
+    login_sequence(&mut script);
+    frame(&mut script, &join_game_frame(), SERVER_FRAMING);
+    for index in 0..BURST {
+        frame(&mut script, &chunk_data_frame(index % 4, 0), SERVER_FRAMING);
+    }
+    frame(&mut script, &keep_alive_frame(81), SERVER_FRAMING);
+
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(script),
+        tail: std::io::Cursor::new(keepalive_script(82)),
+        stalls: 10,
+        tail_stalls: 0,
+        outgoing,
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let started = Instant::now();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let elapsed = started.elapsed();
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    for id in [81, 82] {
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ClientEvent::KeepAlive { id: answered } if *answered == id)
+            ),
+            "keepalive {id} is answered: {events:?}"
+        );
+    }
+    let ticks: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                tick,
+                snapped: false,
+                ..
+            } => Some(*tick),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ticks.len() >= 2,
+        "the flood and the quiet stretch owe whole steps: {ticks:?}"
+    );
+    assert_eq!(ticks.first().copied(), Some(1), "the first tick is tick 1");
+    for pair in ticks.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "the tick count is gap-free: {ticks:?}"
+        );
+    }
+    let budget = (elapsed.as_millis() / 50) as usize + TICK_CATCHUP_CAP as usize;
+    assert!(
+        ticks.len() <= budget,
+        "{} ticks in {elapsed:?} exceed the elapsed steps plus one capped batch",
+        ticks.len()
+    );
+    assert_eq!(
+        updated_columns(&events),
+        BTreeSet::from([(0, 0), (1, 0), (2, 0), (3, 0)]),
+        "the flood's columns are still meshed: {events:?}"
     );
 }
 
@@ -1034,10 +1497,13 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
-    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let events: Vec<ClientEvent> = receiver
+        .try_iter()
+        .filter(|event| !matches!(event, ClientEvent::PlayerTick { snapped: false, .. }))
+        .collect();
     assert!(matches!(events[0], ClientEvent::LoggedIn { .. }));
     assert!(matches!(
         events[1],
@@ -1133,7 +1599,7 @@ fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -1194,7 +1660,7 @@ fn an_applied_column_refreshes_its_loaded_neighbours() {
     ]));
     let (sender, receiver) = crossbeam_channel::unbounded();
     Session::new(Conn::new(stream), config())
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -1237,7 +1703,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
     let (sender, receiver) = crossbeam_channel::unbounded();
     let session = Session::new(Conn::new(stream), config());
     session
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -1257,30 +1723,10 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
         "every Time Update is reported, the frozen frame's time negated by the receive rule"
     );
 
-    // The sky's shape carries the view-block colour and the other world-derived values.
-    let skies: Vec<SkyReport> = events
-        .iter()
-        .filter_map(|event| match event {
-            ClientEvent::Sky {
-                celestial_angle,
-                colour,
-                sun_brightness,
-                star_brightness,
-                cloud_colour,
-                moon_phase,
-                light_level,
-            } => Some(SkyReport {
-                celestial_angle: *celestial_angle,
-                colour: *colour,
-                sun_brightness: *sun_brightness,
-                star_brightness: *star_brightness,
-                cloud_colour: *cloud_colour,
-                moon_phase: *moon_phase,
-                light_level: *light_level,
-            }),
-            _ => None,
-        })
-        .collect();
+    // The sky's shape carries the view-block colour and the other world-derived values. The
+    // frames' own reports are identified by their markers — a running clock's ticks add their
+    // own between them, because the sun travels at the tick rate.
+    let skies = frame_skies(&events);
     // The plains noon the loaded column's biome gives, reported by the plain frame and — the
     // frozen frame's negative wire time negated back to `+6000` by the receive rule — by the
     // frozen frame too, for the teleport that followed it as well.
@@ -1318,8 +1764,8 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
     );
     let last_position = events
         .iter()
-        .rposition(|event| matches!(event, ClientEvent::PlayerPosition { .. }))
-        .expect("the teleports are reported");
+        .rposition(|event| matches!(event, ClientEvent::PlayerTick { snapped: true, .. }))
+        .expect("the corrections are reported");
     let last_sky = events
         .iter()
         .rposition(|event| matches!(event, ClientEvent::Sky { .. }))
@@ -1350,7 +1796,7 @@ fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
     let (sender, receiver) = crossbeam_channel::unbounded();
     let session = Session::new(Conn::new(stream), config());
     session
-        .run_over(&sender)
+        .run_over(&sender, silent_inputs())
         .expect("the session runs to the end of the stream");
 
     let events: Vec<ClientEvent> = receiver.try_iter().collect();
@@ -1375,29 +1821,7 @@ fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
         "each frozen frame reports the clock its negation produces, not its wire sign"
     );
 
-    let skies: Vec<SkyReport> = events
-        .iter()
-        .filter_map(|event| match event {
-            ClientEvent::Sky {
-                celestial_angle,
-                colour,
-                sun_brightness,
-                star_brightness,
-                cloud_colour,
-                moon_phase,
-                light_level,
-            } => Some(SkyReport {
-                celestial_angle: *celestial_angle,
-                colour: *colour,
-                sun_brightness: *sun_brightness,
-                star_brightness: *star_brightness,
-                cloud_colour: *cloud_colour,
-                moon_phase: *moon_phase,
-                light_level: *light_level,
-            }),
-            _ => None,
-        })
-        .collect();
+    let skies = frame_skies(&events);
     assert_eq!(skies.len(), 4, "one sky per clock update: {events:?}");
     assert_eq!(
         skies[0].celestial_angle, 0.0,
