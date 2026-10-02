@@ -7,6 +7,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Milestone M2: textured terrain
+
+Delivered and tagged `m2` on 2026-10-02. The client draws the world from the real 1.8.9 jar — the
+atlas, block models, biome tints, the light engine, the sky, fog and clouds — with the parity metric
+and the acceptance baseline recorded; the acceptance's documented residue and every caveat are in
+`docs/STATE.md`.
+
+### Added
+
+- PNG texture loader, `.mcmeta` parser and `TextureSet`; the blockstate and model loader with the
+  1.8 baker.
+- The texture atlas: the client's mip chain and blend kernel, the sprite index, animation frames
+  and the fallback sprite.
+- The block behaviour table (73 covered ids) and the biome table with the tint path (the Perlin and
+  `java.util.Random` ports, the colour-map lookup, the nine-sample average, and the swamp, mesa and
+  roofed-forest overrides).
+- The light engine — vanilla's sky and block light rules with the two-way recomputation and the
+  mesher's query.
+- The model-driven mesh core: the column snapshot, the model join with the world-position variant
+  choice, atlas UVs, cullface, per-vertex light and the full ambient-occlusion path; the liquids,
+  the Fast leaves rule and the three terrain layers.
+- The atlas-textured terrain pipelines, the lightmap and brightness pipeline, the linear fog, and
+  the non-sRGB colour-space policy (`docs/DIVERGENCES.md` entry 4 retired).
+- The world clock, the sky pass (band, sun, moon phase, stars, celestial rotation) and the flat
+  cloud layer.
+- The rayon mesh pool with the generation-tracked mesh queue and the bounded end drain; the asset
+  bootstrap, the jar font and the overlay's geometry cache.
+- The parity metric (`scripts/parity-diff.py`), the acceptance baseline (`docs/perf.md`) and the
+  sample-wall cells.
+
+New dependencies: `png` 0.18.1 and `rayon` 1.12.0; `docs/DIVERGENCES.md` entry 4 is retired; the
+milestone's corrected documents ride its commits.
+
 ### Milestone M1: bytes to world
 
 Delivered and tagged `m1` on 2026-09-26. The client connects to the 1.8.9 rig server, speaks the

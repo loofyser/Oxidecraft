@@ -119,3 +119,8 @@ choices: no warm-up or median (M9's); the vanilla frame rate deferred to M9; fra
 the debug build, which is the build the rig's launch script runs and the one every acceptance
 capture of this task used; the ours route re-run in place (the first run measured the pre-fix
 build, see "Redo").
+
+## Milestone summary
+
+M2 (textured terrain) closed and tagged `m2` on 2026-10-02; the milestone's state entry and
+acceptance record are in `docs/STATE.md` ("M2 evidence").
