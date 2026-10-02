@@ -20,8 +20,11 @@
 //! faces culled (`GlStateManager.enableCull()`, `:1458`) and depth writes off
 //! (`GlStateManager.depthMask(false)`, `:1463`, restored at `:1469`). It draws last.
 //!
-//! Depth: the camera's projection maps the near plane to 0 and the far plane to 1, which is
-//! the convention [`DEPTH_FORMAT`] with [`wgpu::CompareFunction::Less`] expects. Opaque and
+//! Depth: the camera's projection maps the near plane to 0 and the far plane to 1, and the
+//! test over that range is the client's own depth function, `GlStateManager.depthFunc(515)` —
+//! GL_LEQUAL — set once at startup (`Minecraft.java:540`) and in force at the block layers'
+//! draws: a nearer fragment wins and so does an equal one, so the grass model's overlay draws
+//! over the base cube's coincident faces. Opaque and
 //! cutout test and write depth, so the nearest surface wins whatever order their meshes draw
 //! in. Translucent tests depth and, like the client, writes none: a translucent fragment never
 //! rejects a later one, so the per-section back-to-front order below decides which surface
@@ -202,7 +205,8 @@ const CUTOUT_ALPHA: f32 = 0.1;
 ///
 /// The renderer builds its depth texture with this format, and the depth state of every
 /// layer's pipeline declares it; the projection maps the near plane to depth 0 and the far
-/// plane to depth 1, as [`wgpu::CompareFunction::Less`] over a 0..1 range expects.
+/// plane to depth 1, and the test is [`wgpu::CompareFunction::LessEqual`] over that 0..1
+/// range — the client's `GlStateManager.depthFunc(515)` (`Minecraft.java:540`).
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// The size of the camera uniform in bytes: one `mat4x4<f32>` and the eye's `vec4<f32>`.
@@ -781,14 +785,17 @@ fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
 /// The depth state every layer shares, with the write on or off.
 ///
 /// The format and the comparison are the same for all three layers — the projection maps the
-/// near plane to 0 and the far plane to 1, as [`wgpu::CompareFunction::Less`] expects, and a
-/// nearer fragment wins — and `write` is the client's depth mask: on for its solid layers,
-/// off for the translucent one (`GlStateManager.depthMask(false)`, `EntityRenderer.java:1463`).
+/// near plane to 0 and the far plane to 1, and the comparison is the client's own,
+/// `GlStateManager.depthFunc(515)` — GL_LEQUAL — set once at startup (`Minecraft.java:540`) and
+/// in force at the block layers' draws: a nearer fragment wins and so does an equal one, which
+/// is what draws the grass model's overlay over the base cube's coincident faces. `write` is
+/// the client's depth mask: on for its solid layers, off for the translucent one
+/// (`GlStateManager.depthMask(false)`, `EntityRenderer.java:1463`).
 fn depth_state(write: bool) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: write,
-        depth_compare: wgpu::CompareFunction::Less,
+        depth_compare: wgpu::CompareFunction::LessEqual,
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     }
@@ -973,7 +980,14 @@ mod tests {
         let solid = depth_state(layer_plan(Layer::Opaque).depth_write);
         assert_eq!(solid.format, DEPTH_FORMAT);
         assert!(solid.depth_write_enabled, "the terrain writes depth");
-        assert_eq!(solid.depth_compare, CompareFunction::Less, "nearer wins");
+        // The client's own function, `GlStateManager.depthFunc(515)` — GL_LEQUAL — set once at
+        // startup (`Minecraft.java:540`) and in force at the block layers' draws; equal wins, so
+        // the grass model's overlay, coincident with the base cube's own faces, draws over them.
+        assert_eq!(
+            solid.depth_compare,
+            CompareFunction::LessEqual,
+            "equal wins, the source's LEQUAL"
+        );
         let cutout = depth_state(layer_plan(Layer::Cutout).depth_write);
         assert_eq!(cutout.format, solid.format);
         assert!(
@@ -985,7 +999,7 @@ mod tests {
         // mask off.
         let translucent = depth_state(layer_plan(Layer::Translucent).depth_write);
         assert_eq!(translucent.format, DEPTH_FORMAT);
-        assert_eq!(translucent.depth_compare, CompareFunction::Less);
+        assert_eq!(translucent.depth_compare, CompareFunction::LessEqual);
         assert!(
             !translucent.depth_write_enabled,
             "the translucent layer writes no depth"
