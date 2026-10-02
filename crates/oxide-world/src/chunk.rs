@@ -312,6 +312,27 @@ impl Chunk {
         }
     }
 
+    /// Sets the packed block at world-local coordinates; y 0..256.
+    ///
+    /// A section the column does not hold is materialised first as its air
+    /// defaults — block light 0, sky light 15 in a dimension with sky — and
+    /// the write then lands in it. That is the store's own rule for an absent
+    /// section (the column pass's write-back materialises the same way), so a
+    /// sparse column stops being distinguishable from a fully sent one only
+    /// for the section that was written.
+    ///
+    /// Answers the previous value, or `None` for a y outside the build range,
+    /// where no section slot exists and nothing is written.
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, value: u16) -> Option<u16> {
+        let has_sky = self.has_sky;
+        let slot = self.sections.get_mut(y / SECTION_SIZE)?;
+        let section = slot.get_or_insert_with(|| Section::air(has_sky));
+        let (x, y, z) = (x % SECTION_SIZE, y % SECTION_SIZE, z % SECTION_SIZE);
+        let previous = section.block(x, y, z);
+        section.set_block(x, y, z, value);
+        Some(previous)
+    }
+
     /// Whether the column holds no blocks at all.
     pub fn is_empty(&self) -> bool {
         self.sections

@@ -654,15 +654,26 @@ fn cells_outside_the_region_keep_their_light() {
 #[test]
 fn a_column_pass_reads_a_loaded_neighbours_sky_at_the_border() {
     // Two loaded columns side by side. The west one is flat stone through
-    // y 62, so its y 63 layer sits under open sky at 15. The east one is stone
-    // through y 63 with a one-cell pocket at its west edge, local (0, 63, 0),
-    // covered by stone at (0, 64, 0) and walled by stone on every other side:
-    // the west column's edge cell (15, 63, 0) is the pocket's only source, and
-    // the one-cell border read `recompute_column` makes is what carries it
-    // across, at 15 - max(1, 0) = 14. With the border read off the pocket
-    // stays 0.
+    // y 62, so its y 63 layer sits under open sky at 15, and its edge cell
+    // (15, 63, 0) carries a torch: the source of both kinds across the
+    // border. The east one is stone through y 63 with a one-cell pocket at
+    // its west edge, local (0, 63, 0), covered by stone at (0, 64, 0) and
+    // walled by stone on every other side: the west column's edge cell is the
+    // pocket's only source, and the one-cell border read `recompute_column`
+    // makes is what carries it across — sky at 15 - max(1, 0) = 14 and block
+    // light at 14 - 1 = 13. With the border read off the pocket stays 0 in
+    // both kinds; with the block kind's half off it stays 0 there while the
+    // sky half still carries 14.
     let mut world = world_of(1, |_, _| {
-        column_of(0, 0, |_, y, _| if y <= 62 { STONE } else { AIR })
+        column_of(0, 0, |x, y, z| {
+            if x == 15 && y == 63 && z == 0 {
+                TORCH
+            } else if y <= 62 {
+                STONE
+            } else {
+                AIR
+            }
+        })
     });
     let mut east = ColumnData::empty();
     for sy in 0..SECTION_COUNT {
@@ -683,7 +694,9 @@ fn a_column_pass_reads_a_loaded_neighbours_sky_at_the_border() {
     // The west column's own pass gives it its light; the pocket starts dark.
     recompute_column(&mut world, 0, 0);
     assert_eq!(sky(&world, 15, 63, 0), 15, "the west column's open edge");
+    assert_eq!(block(&world, 15, 63, 0), 14, "and the torch it carries");
     assert_eq!(sky(&world, 16, 63, 0), 0, "the pocket before the pass");
+    assert_eq!(block(&world, 16, 63, 0), 0, "in both kinds");
     assert_eq!(sky(&world, 16, 64, 0), 0, "and its cover takes nothing");
 
     recompute_column(&mut world, 1, 0);
@@ -691,6 +704,11 @@ fn a_column_pass_reads_a_loaded_neighbours_sky_at_the_border() {
         sky(&world, 16, 63, 0),
         14,
         "the pocket takes 15 - 1 across the border"
+    );
+    assert_eq!(
+        block(&world, 16, 63, 0),
+        13,
+        "the pocket takes 14 - 1 across the border"
     );
 
     // A second pass over a now-correct column changes nothing.
@@ -711,8 +729,12 @@ fn a_column_pass_materialises_the_sections_the_column_does_not_hold() {
     // pins. In the store's own sense — a section the column does not hold — the
     // pass changes the value: it materialises the absent sections as air
     // carrying the computed light, so their reads become the computed ones.
-    // That is the defined behaviour for M2; sparse-column semantics are
-    // deferred to M3.
+    // That is the landed sparse-column rule M2 deferred (M3 Task 6): a write
+    // into an absent section materialises that section as its air defaults —
+    // sky light 15 in a dimension with sky, block light 0 — and then applies
+    // the change, so the pass's write-back and `World::set_block` agree on one
+    // rule. `a_write_into_an_absent_section_materialises_it_as_its_air_defaults`
+    // pins the write's half.
     //
     // The world is one column holding only a stone-filled section 5 (y 80..95):
     // nothing lights the cells below the stone, and the cell above it is
@@ -750,6 +772,120 @@ fn a_column_pass_materialises_the_sections_the_column_does_not_hold() {
     for y in 0..96 {
         assert_eq!(sky(&world, 0, y, 0), 0, "nothing below the stone lights");
     }
+}
+
+#[test]
+fn a_write_into_an_absent_section_materialises_it_as_its_air_defaults() {
+    // One column holding only its stone section 5 (y 80..95): every other
+    // section is absent, so its cells read air with sky light 15 and block
+    // light 0. A write into the absent section 2 (y 32..47) materialises that
+    // section as exactly those defaults and then applies the change: the
+    // written cell holds the block, every other cell of the section reads
+    // what it read before, and the column holds the section afterwards. This
+    // is the landed sparse-column rule; the column pass's write-back
+    // (`a_column_pass_materialises_the_sections_the_column_does_not_hold`)
+    // materialises the same way.
+    let mut world = World::new(true);
+    let mut sparse = ColumnData::empty();
+    sparse.sections[5] = Some(section_of(true, 0, 0, |_, _, _| STONE));
+    sparse.mask = 1u16 << 5;
+    world.apply_column(0, 0, &sparse, true);
+
+    assert_eq!(held_sections(&world, 0, 0), 1, "only section 5 is held");
+    let neighbour_before = (
+        world.block(1, 40, 0),
+        sky(&world, 1, 40, 0),
+        block(&world, 1, 40, 0),
+    );
+    assert_eq!(
+        neighbour_before,
+        (AIR, 15, 0),
+        "the absent section's air-with-light defaults"
+    );
+
+    assert_eq!(
+        world.set_block(0, 40, 0, GLOWSTONE),
+        Some(AIR),
+        "the write lands on the absent section's air"
+    );
+
+    assert_eq!(world.block(0, 40, 0), GLOWSTONE, "the change");
+    assert_eq!(
+        (
+            world.block(1, 40, 0),
+            sky(&world, 1, 40, 0),
+            block(&world, 1, 40, 0)
+        ),
+        neighbour_before,
+        "the section's other cells read as the air-with-light defaults did"
+    );
+    assert_eq!(
+        sky(&world, 0, 40, 0),
+        15,
+        "and the written cell keeps the air sky until a relight runs"
+    );
+    assert_eq!(
+        held_sections(&world, 0, 0),
+        2,
+        "the write materialised section 2"
+    );
+    for y in 80..96 {
+        assert_eq!(world.block(0, y, 0), STONE, "the stone at y {y} survives");
+    }
+}
+
+#[test]
+fn a_placed_glowstone_brightens_its_neighbourhood_and_removing_it_relights() {
+    // A flat stone world (stone through y 63, open sky above) with the light
+    // recomputed: the surface cell (5, 64, 5) sits in the block kind's dark.
+    // Writing a glowstone there and recomputing brightens the cell and its
+    // neighbourhood — 15 at the cell, one off per step of spread — and
+    // writing air back and recomputing relights them. The two writes and the
+    // two recomputes are the pipeline `apply_block_change` runs.
+    let mut world = flat_world(3);
+    recompute(&mut world, 5, 64, 5);
+    assert_eq!(
+        block(&world, 5, 64, 5),
+        0,
+        "the surface cell before the write"
+    );
+    assert_eq!(block(&world, 6, 64, 5), 0, "and its neighbour");
+
+    assert_eq!(
+        world.set_block(5, 64, 5, GLOWSTONE),
+        Some(AIR),
+        "the write lands on the air cell"
+    );
+    recompute(&mut world, 5, 64, 5);
+    assert_eq!(
+        block(&world, 5, 64, 5),
+        15,
+        "the glowstone holds its emission"
+    );
+    assert_eq!(
+        block(&world, 6, 64, 5),
+        14,
+        "and its neighbourhood brightens: 15 - 1"
+    );
+    assert_eq!(block(&world, 5, 65, 5), 14, "up as much as sideways");
+    assert_eq!(block(&world, 5, 64, 6), 14, "and the other way");
+    assert_eq!(block(&world, 7, 64, 5), 13, "15 - manhattan 2");
+    assert_eq!(
+        sky(&world, 5, 64, 5),
+        14,
+        "the glowstone takes 15 - 1 of sky"
+    );
+
+    assert_eq!(
+        world.set_block(5, 64, 5, AIR),
+        Some(GLOWSTONE),
+        "the removal lands"
+    );
+    recompute(&mut world, 5, 64, 5);
+    assert_eq!(block(&world, 5, 64, 5), 0, "removing it relights the cell");
+    assert_eq!(block(&world, 6, 64, 5), 0, "and the neighbourhood");
+    assert_eq!(block(&world, 5, 65, 5), 0);
+    assert_eq!(sky(&world, 5, 64, 5), 15, "and the sky returns");
 }
 
 #[test]

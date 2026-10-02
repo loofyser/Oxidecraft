@@ -351,6 +351,54 @@ fn plugin_message_frame(channel: &str, data: &[u8]) -> Vec<u8> {
     payload
 }
 
+/// Stone, id 1, meta 0: the packed value `1 << 4 | 0`.
+const STONE: u16 = 0x0010;
+
+/// One Block Change frame (0x23): the Location Position and the block value.
+///
+/// The literal-level pinning of the packing lives in the decoder's own
+/// fixtures (`oxide-proto-v47`'s `clientbound` tests); here the frame only
+/// has to drive the session.
+fn block_change_frame(x: i32, y: i32, z: i32, value: u16) -> Vec<u8> {
+    let mut payload = vec![0x23];
+    let packed =
+        ((x as i64 & 0x3FFFFFF) << 38) | ((y as i64 & 0xFFF) << 26) | (z as i64 & 0x3FFFFFF);
+    payload.extend_from_slice(&packed.to_be_bytes());
+    push_varint(&mut payload, value as i32);
+    payload
+}
+
+/// One Multi Block Change frame (0x22): the chunk, then each record's crammed
+/// position short and block value.
+fn multi_block_change_frame(chunk_x: i32, chunk_z: i32, records: &[(u16, u16)]) -> Vec<u8> {
+    let mut payload = vec![0x22];
+    payload.extend_from_slice(&chunk_x.to_be_bytes());
+    payload.extend_from_slice(&chunk_z.to_be_bytes());
+    push_varint(&mut payload, records.len() as i32);
+    for (crammed, value) in records {
+        payload.extend_from_slice(&crammed.to_be_bytes());
+        push_varint(&mut payload, *value as i32);
+    }
+    payload
+}
+
+/// The light every vertex of a relit mesh must carry: block light 0 — the
+/// wire's sentinel 15 was recomputed away, since nothing emits — and sky
+/// light at least 14 — the wire's sentinel 0 was replaced by the computed
+/// values of the open column.
+fn assert_relit(mesh: &ChunkMesh) {
+    for vertex in mesh.layers.iter().flat_map(|layer| layer.vertices.iter()) {
+        assert_eq!(
+            vertex.light[0], 8,
+            "the block kind was recomputed to 0: {vertex:?}"
+        );
+        assert!(
+            vertex.light[1] >= 14 * 16 + 8,
+            "and the sky kind to at least 14: {vertex:?}"
+        );
+    }
+}
+
 /// Reads one frame out of the client's own traffic, under the framing that was
 /// in force when the client wrote it.
 fn client_frame(cursor: &mut &[u8], compression: Compression) -> Vec<u8> {
@@ -793,6 +841,72 @@ fn a_section_update_carries_its_light_and_keeps_unlisted_sections() {
         [3 * 16 + 8, 7 * 16 + 8],
         "section 2 outside the mask keeps its stored light"
     );
+}
+
+#[test]
+fn a_block_change_lands_with_its_light_and_a_chunk_update() {
+    // A ground-up column whose wire light is a sentinel: block light 15 and
+    // sky light 0 everywhere, with one stone block at local (1, 1, 1). The
+    // 0x23 then places a second stone at world (4, 1, 1). The packet carries
+    // no light, so the local pipeline recomputes it: the block kind drops to
+    // 0 everywhere (nothing emits) and the sky kind becomes the computed one
+    // — `assert_relit` proves both — while the mesh's two blocks prove the
+    // write landed and the `ChunkUpdated` proves the invalidation ran.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        lit_column_frame(0, 0, &[0], 15, 0, true),
+        block_change_frame(4, 1, 1, STONE),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert_eq!(
+        updated_columns(&events),
+        BTreeSet::from([(0, 0)]),
+        "the changed column is the only one the change marked: {events:?}"
+    );
+    let slots = last_updated_slots(&events, 0, 0);
+    let mesh = slots[0].1.as_ref().expect("section 0 draws its blocks");
+    assert_eq!(
+        mesh.vertex_count(),
+        48,
+        "the column's stone and the changed one, six faces each"
+    );
+    assert_relit(mesh);
+}
+
+#[test]
+fn a_multi_block_change_applies_every_record_in_a_negative_chunk() {
+    // One column at chunk (-1, -1) with the same sentinel light (block 15,
+    // sky 0) and one stone at local (1, 1, 1). The 0x22 carries two records
+    // in that chunk, crammed as the literals 0x4101 — local (4, 1, 1) — and
+    // 0x6203 — local (6, 3, 2). Both records must land: the mesh draws three
+    // blocks. The world coordinates compose as chunk * 16 + local, so the
+    // negative chunk is the column that rebuilds, with the same local relight
+    // as the single-block path.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        lit_column_frame(-1, -1, &[0], 15, 0, true),
+        multi_block_change_frame(-1, -1, &[(0x4101, STONE), (0x6203, STONE)]),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert_eq!(
+        updated_columns(&events),
+        BTreeSet::from([(-1, -1)]),
+        "the negative chunk is the only column touched: {events:?}"
+    );
+    let slots = last_updated_slots(&events, -1, -1);
+    let mesh = slots[0].1.as_ref().expect("section 0 draws its blocks");
+    assert_eq!(mesh.vertex_count(), 72, "three blocks, six faces each");
+    assert_relit(mesh);
 }
 
 #[test]

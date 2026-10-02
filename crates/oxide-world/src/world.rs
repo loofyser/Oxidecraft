@@ -94,6 +94,30 @@ impl World {
         }
     }
 
+    /// Sets the packed block at world coordinates, answering the previous
+    /// value.
+    ///
+    /// The write lands in the column's section store; a section the column
+    /// does not hold is materialised first as its air defaults (block light 0,
+    /// sky light 15 when the dimension has sky light — the store's own
+    /// materialisation rule, the one the column pass writes back with).
+    ///
+    /// `None` when the column is not loaded or y is outside 0..256: there is
+    /// no slot to write and nothing changes. The previous value is what the
+    /// cell read before the write — air (0) for a cell of a materialised
+    /// section.
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, value: u16) -> Option<u16> {
+        if !(0..(SECTION_COUNT * SECTION_SIZE) as i32).contains(&y) {
+            return None;
+        }
+        let cx = x.div_euclid(SECTION_SIZE as i32);
+        let cz = z.div_euclid(SECTION_SIZE as i32);
+        let local_x = x.rem_euclid(SECTION_SIZE as i32) as usize;
+        let local_z = z.rem_euclid(SECTION_SIZE as i32) as usize;
+        let chunk = self.chunks.get_mut(&(cx, cz))?;
+        chunk.set_block(local_x, y as usize, local_z, value)
+    }
+
     /// The block-light nibble at world coordinates; 0 when the column is not
     /// loaded or y is outside 0..256.
     ///
@@ -145,5 +169,150 @@ impl World {
         let mut coords: Vec<(i32, i32)> = self.chunks.keys().copied().collect();
         coords.sort_unstable();
         coords
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The store's block write: the round trip, the sparse materialisation
+    //! rule, the chunk border and the build-height guard.
+
+    use oxide_proto_v47::column::ColumnData;
+
+    use super::World;
+
+    /// Stone, id 1, no metadata.
+    const STONE: u16 = 1 << 4;
+    /// Glowstone, id 89, no metadata.
+    const GLOWSTONE: u16 = 89 << 4;
+
+    /// A world with one loaded but section-less column at (0, 0): the sparse
+    /// shape a partial send leaves, where every read answers the absent
+    /// section's own default.
+    fn sparse_world(has_sky: bool) -> World {
+        let mut world = World::new(has_sky);
+        world.apply_column(0, 0, &ColumnData::empty(), false);
+        world
+    }
+
+    #[test]
+    fn a_write_round_trips_and_answers_the_previous_value() {
+        let mut world = sparse_world(true);
+        assert_eq!(
+            world.set_block(0, 70, 0, STONE),
+            Some(0),
+            "the previous value is air"
+        );
+        assert_eq!(world.block(0, 70, 0), STONE, "the write reads back");
+        assert_eq!(
+            world.set_block(0, 70, 0, GLOWSTONE),
+            Some(STONE),
+            "the next write answers the value it replaced"
+        );
+        assert_eq!(world.block(0, 70, 0), GLOWSTONE, "and lands");
+    }
+
+    #[test]
+    fn a_write_crosses_a_chunk_border() {
+        let mut world = sparse_world(true);
+        world.apply_column(1, 0, &ColumnData::empty(), false);
+        world.apply_column(-1, 0, &ColumnData::empty(), false);
+
+        assert_eq!(
+            world.set_block(15, 70, 0, STONE),
+            Some(0),
+            "the chunk's last local x"
+        );
+        assert_eq!(
+            world.set_block(16, 70, 0, GLOWSTONE),
+            Some(0),
+            "the next chunk's first local x"
+        );
+        assert_eq!(
+            world.set_block(-1, 70, 0, GLOWSTONE),
+            Some(0),
+            "and the negative side's last local x"
+        );
+        assert_eq!(world.block(15, 70, 0), STONE);
+        assert_eq!(world.block(16, 70, 0), GLOWSTONE);
+        assert_eq!(world.block(-1, 70, 0), GLOWSTONE);
+    }
+
+    #[test]
+    fn a_write_materialises_the_absent_section_as_its_air_defaults() {
+        let mut world = sparse_world(true);
+        assert_eq!(
+            world.sky_light(0, 40, 0),
+            15,
+            "an absent section reads its sky default"
+        );
+        assert_eq!(world.block_light(0, 40, 0), 0, "and its block light");
+        assert_eq!(world.block(0, 40, 0), 0, "and air");
+        let neighbour_before = (
+            world.block(1, 40, 0),
+            world.sky_light(1, 40, 0),
+            world.block_light(1, 40, 0),
+        );
+
+        assert_eq!(
+            world.set_block(0, 40, 0, STONE),
+            Some(0),
+            "the write lands on the absent section's air"
+        );
+
+        assert_eq!(world.block(0, 40, 0), STONE, "the change");
+        assert_eq!(
+            (
+                world.block(1, 40, 0),
+                world.sky_light(1, 40, 0),
+                world.block_light(1, 40, 0)
+            ),
+            neighbour_before,
+            "its neighbour reads exactly as the air-with-light defaults did"
+        );
+        assert_eq!(
+            world.sky_light(1, 40, 0),
+            15,
+            "which is sky 15 in a dimension with sky"
+        );
+        assert_eq!(world.block_light(1, 40, 0), 0, "and block light 0");
+        assert_eq!(world.block(1, 40, 0), 0, "and air");
+    }
+
+    #[test]
+    fn a_write_outside_the_build_range_is_rejected() {
+        let mut world = sparse_world(true);
+        assert_eq!(world.set_block(0, 256, 0, STONE), None, "above the world");
+        assert_eq!(world.set_block(0, -1, 0, STONE), None, "below the world");
+        assert_eq!(world.block(0, 255, 0), 0, "nothing was written");
+        assert_eq!(world.block(0, 0, 0), 0, "and nothing below");
+    }
+
+    #[test]
+    fn a_write_into_an_unloaded_column_is_rejected() {
+        let mut world = sparse_world(true);
+        assert_eq!(
+            world.set_block(64, 70, 0, STONE),
+            None,
+            "there is no column to write into"
+        );
+        assert_eq!(world.block(64, 70, 0), 0, "and nothing changed");
+    }
+
+    #[test]
+    fn a_write_into_a_dimension_without_sky_keeps_the_sky_dark() {
+        let mut world = sparse_world(false);
+        assert_eq!(
+            world.set_block(0, 40, 0, GLOWSTONE),
+            Some(0),
+            "the write lands"
+        );
+        assert_eq!(world.block(0, 40, 0), GLOWSTONE);
+        assert_eq!(
+            world.sky_light(1, 40, 0),
+            0,
+            "the materialised section carries no sky store"
+        );
+        assert_eq!(world.block_light(1, 40, 0), 0, "and no block light");
     }
 }

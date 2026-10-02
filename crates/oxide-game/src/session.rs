@@ -45,9 +45,9 @@ use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk, PlayDisconnect,
-    PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage, TimeUpdate,
-    read_packet_id,
+    self, BlockChange, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange,
+    PlayDisconnect, PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage,
+    TimeUpdate, read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -58,7 +58,8 @@ use oxide_proto_v47::serverbound::{
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
 use oxide_world::biome::{ColorMap, TintMaps};
-use oxide_world::light::view_light_level;
+use oxide_world::chunk::SECTION_SIZE;
+use oxide_world::light::{self, view_light_level};
 use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
 };
@@ -654,6 +655,42 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 }
                             }
                             None => warn!("a bulk column arrived before Join Game built the world"),
+                        },
+                        BlockChange::ID => match world.as_mut() {
+                            Some(store) => {
+                                let change = decoded(id, BlockChange::decode(body))?;
+                                apply_block_change(
+                                    store,
+                                    &mut queue,
+                                    change.x,
+                                    change.y,
+                                    change.z,
+                                    change.value,
+                                );
+                            }
+                            None => {
+                                warn!("a block change arrived before Join Game built the world")
+                            }
+                        },
+                        MultiBlockChange::ID => match world.as_mut() {
+                            Some(store) => {
+                                let change = decoded(id, MultiBlockChange::decode(body))?;
+                                for update in &change.updates {
+                                    apply_block_change(
+                                        store,
+                                        &mut queue,
+                                        change.chunk_x * SECTION_SIZE as i32 + update.x,
+                                        update.y,
+                                        change.chunk_z * SECTION_SIZE as i32 + update.z,
+                                        update.value,
+                                    );
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    "a multi block change arrived before Join Game built the world"
+                                )
+                            }
                         },
                         PlayerListItem::ID => {
                             // The decoder takes the add action only, while a live
@@ -1333,6 +1370,47 @@ fn mark_column_changed(store: &World, queue: &mut MeshQueue, cx: i32, cz: i32) {
     for (nx, nz) in [(cx + 1, cz), (cx - 1, cz), (cx, cz + 1), (cx, cz - 1)] {
         if store.chunk(nx, nz).is_some() {
             queue.mark_dirty(nx, nz);
+        }
+    }
+}
+
+/// Applies one block change locally: the world write, the light it needs and
+/// the mesh invalidation of every column the recompute rewrote.
+///
+/// This is the pipeline clientbound 0x23 and every record of 0x22 land
+/// through, and the one Tasks 8 and 9's prediction paths reuse verbatim: the
+/// write (which materialises a section the column does not hold as its air
+/// defaults), the light recompute over the changed column and its eight
+/// neighbours ([`light::recompute`], the region the source's `checkLightFor`
+/// neighbourhood derives), and the invalidation of every loaded column of
+/// that region — the light of all nine can change, and the changed column's
+/// four orthogonal neighbours' meshes also read its blocks through their
+/// collar, which [`mark_column_changed`] covers.
+///
+/// A write that does not land — an unloaded column, a y outside the build
+/// range — changes nothing, so there is no light to recompute and no mesh to
+/// invalidate, and the change is dropped.
+fn apply_block_change(
+    store: &mut World,
+    queue: &mut MeshQueue,
+    x: i32,
+    y: i32,
+    z: i32,
+    value: u16,
+) {
+    if store.set_block(x, y, z, value).is_none() {
+        return;
+    }
+    light::recompute(store, x, y, z);
+    let cx = x.div_euclid(SECTION_SIZE as i32);
+    let cz = z.div_euclid(SECTION_SIZE as i32);
+    mark_column_changed(store, queue, cx, cz);
+    // The light recompute also rewrites the four diagonal columns of its
+    // region, so their own light can change even though no collar reads the
+    // changed column: they are marked too.
+    for (dx, dz) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
+        if store.chunk(cx + dx, cz + dz).is_some() {
+            queue.mark_dirty(cx + dx, cz + dz);
         }
     }
 }

@@ -626,3 +626,275 @@ impl MapChunkBulk {
         Ok(Self { sky_light, columns })
     }
 }
+
+/// Reads a Location Position: x, y and z packed into one big-endian `i64`.
+///
+/// The packing is
+/// `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)` — x and
+/// z are 26 signed bits, y is 12 — and the read mirrors `BlockPos.fromLong`
+/// (`util/BlockPos.java:208-214`, bit counts at `:11-18`): each field is
+/// shifted into the sign position and back, which sign-extends it. This is
+/// 1.8.9's own packing; later versions reordered it, so it must not be
+/// "updated" from modern documentation.
+fn read_position(cursor: &mut Cursor<&[u8]>) -> Result<(i32, i32, i32), PacketError> {
+    let raw = codec::read_i64(cursor)?;
+    let x = (raw >> 38) as i32;
+    let y = (raw << 26 >> 52) as i32;
+    let z = (raw << 38 >> 38) as i32;
+    Ok((x, y, z))
+}
+
+/// Reads a block-change BlockID: the VarInt carrying `id << 4 | meta`.
+///
+/// The value is validated into the store's own 16-bit field — `oxide-world`'s
+/// packed `(id << 4) | meta` — before it is used: a value outside it cannot
+/// name a block, so it is refused rather than truncated.
+fn read_block_value(cursor: &mut Cursor<&[u8]>) -> Result<u16, PacketError> {
+    let raw = read_varint(cursor)?;
+    u16::try_from(raw).map_err(|_| {
+        PacketError::Codec(codec::CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("block value {raw} does not fit the 16-bit id/meta field"),
+        )))
+    })
+}
+
+/// Clientbound Block Change (play id 0x23).
+///
+/// One block's new value at a world position: the Location Position and the
+/// BlockID VarInt (`S23PacketBlockChange.readPacketData`). The packet carries
+/// no light data, so the client recomputes the light locally
+/// (`docs/research/protocol-47-reference.md` §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockChange {
+    /// The world x.
+    pub x: i32,
+    /// The world y.
+    pub y: i32,
+    /// The world z.
+    pub z: i32,
+    /// The new block value, `id << 4 | meta`.
+    pub value: u16,
+}
+
+impl BlockChange {
+    /// The packet id.
+    pub const ID: i32 = 0x23;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let (x, y, z) = read_position(&mut cursor)?;
+        let value = read_block_value(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { x, y, z, value })
+    }
+}
+
+/// One Multi Block Change record: a changed cell inside the packet's chunk.
+///
+/// The record's two position bytes are read as one big-endian short `v`
+/// (`S22PacketMultiBlockChange.BlockUpdateData.getPos`) and split with three
+/// logical shifts: `x = (v >> 12) & 15`, `y = v & 255`, `z = (v >> 8) & 15`.
+/// The shifts are logical by construction — `v` is unsigned here — while the
+/// source's `>>` sign-propagates on its signed short; the masks are what keep
+/// the fields apart, and a fixture whose high bit is set cannot by itself tell
+/// the two apart, so the rule is stated rather than inferred. The world
+/// position composes as `chunk * 16 + local`, which the session does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockUpdate {
+    /// The local x in the chunk, 0..16: bits 12..15 of the record.
+    pub x: i32,
+    /// The local y, 0..256: the record's low byte.
+    pub y: i32,
+    /// The local z in the chunk, 0..16: bits 8..11 of the record.
+    pub z: i32,
+    /// The new block value, `id << 4 | meta`.
+    pub value: u16,
+}
+
+/// Clientbound Multi Block Change (play id 0x22).
+///
+/// A batch of changed cells inside one chunk: the chunk coordinates, a record
+/// count and the records (`S22PacketMultiBlockChange.readPacketData`). The
+/// packet carries no light data, so the client recomputes the light locally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiBlockChange {
+    /// The chunk x the records are local to.
+    pub chunk_x: i32,
+    /// The chunk z the records are local to.
+    pub chunk_z: i32,
+    /// The records, in the packet's order.
+    pub updates: Vec<BlockUpdate>,
+}
+
+impl MultiBlockChange {
+    /// The packet id.
+    pub const ID: i32 = 0x22;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let chunk_x = codec::read_i32(&mut cursor)?;
+        let chunk_z = codec::read_i32(&mut cursor)?;
+        let count = read_varint(&mut cursor)?;
+        if count < 0 {
+            return Err(PacketError::Codec(codec::CodecError::NegativeLength(count)));
+        }
+        let count = count as usize;
+        // The count is hostile until checked: each record occupies at least
+        // three bytes — the two-byte position and a one-byte value VarInt — so
+        // the reservation is bounded by the bytes still available rather than
+        // trusting the declared count.
+        let remaining = body.len().saturating_sub(cursor.position() as usize);
+        let mut updates = Vec::with_capacity(count.min(remaining / 3));
+        for _ in 0..count {
+            let v = codec::read_u16(&mut cursor)?;
+            let value = read_block_value(&mut cursor)?;
+            updates.push(BlockUpdate {
+                x: ((v >> 12) & 15) as i32,
+                y: (v & 255) as i32,
+                z: ((v >> 8) & 15) as i32,
+                value,
+            });
+        }
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            chunk_x,
+            chunk_z,
+            updates,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Fixed-literal fixtures for the block-change packets: every byte is
+    //! hand-packed from the layout the protocol reference records
+    //! (`docs/research/protocol-47-reference.md` §2) and from the source's own
+    //! packing (`BlockPos.toLong`), never rebuilt with the decoder's
+    //! arithmetic, so a wrong shift cannot be confirmed by its own twin.
+
+    use super::{BlockChange, MultiBlockChange};
+    use crate::PacketError;
+
+    #[test]
+    fn block_change_decodes_the_position_and_the_packed_value() {
+        // 0x23: Location Position then BlockID VarInt
+        // (`S23PacketBlockChange.readPacketData`). The position's literal
+        // bytes are (-5, 70, -33) under the packing
+        // `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)`
+        // (`BlockPos.toLong`, `util/BlockPos.java:200-203`); the negative x
+        // and z are the sign-extension case. 0x97 0x0B is the VarInt 1431,
+        // the packed value 89 << 4 | 7.
+        let body: &[u8] = &[
+            0xff, 0xff, 0xfe, 0xc1, 0x1b, 0xff, 0xff, 0xdf, // the position
+            0x97, 0x0b, // the block value
+        ];
+        let change = BlockChange::decode(body).expect("the fixture decodes");
+        assert_eq!(change.x, -5, "the packed x, sign-extended");
+        assert_eq!(change.y, 70, "the packed y");
+        assert_eq!(change.z, -33, "the packed z");
+        assert_eq!(change.value, 1431, "the block value, `id << 4 | meta`");
+        assert_eq!(change.value >> 4, 89, "the id nibbles");
+        assert_eq!(change.value & 0x0F, 7, "the meta nibble");
+        assert_eq!(BlockChange::ID, 0x23, "the packet id");
+    }
+
+    #[test]
+    fn multi_block_change_decodes_every_record_of_a_negative_chunk() {
+        // 0x22: ChunkX Int, ChunkZ Int, RecordCount VarInt, then per record the
+        // big-endian short `v` and the BlockID VarInt
+        // (`S22PacketMultiBlockChange.readPacketData`). The chunk is (-3, -7).
+        // The first record's `v` is 0x4A25: x = (v >> 12) & 15 = 4,
+        // y = v & 255 = 37, z = (v >> 8) & 15 = 10; its value 151 is 9 << 4 | 7.
+        // The second record's `v` is 0xF8A5, the high bit set: x = 15,
+        // y = 165, z = 8; its value 1424 is 89 << 4 | 0.
+        let body: &[u8] = &[
+            0xff, 0xff, 0xff, 0xfd, // chunk x: -3
+            0xff, 0xff, 0xff, 0xf9, // chunk z: -7
+            0x02, // two records
+            0x4a, 0x25, 0x97, 0x01, // the first: (4, 37, 10), water meta 7
+            0xf8, 0xa5, 0x90, 0x0b, // the second: (15, 165, 8), glowstone
+        ];
+        let change = MultiBlockChange::decode(body).expect("the fixture decodes");
+        assert_eq!(change.chunk_x, -3, "the chunk x, negative");
+        assert_eq!(change.chunk_z, -7, "the chunk z, negative");
+        assert_eq!(change.updates.len(), 2, "both records");
+        let first = &change.updates[0];
+        assert_eq!(
+            (first.x, first.y, first.z),
+            (4, 37, 10),
+            "the first record's nibbles from 0x4A25"
+        );
+        assert_eq!(first.value, 151, "the first value, `id << 4 | meta`");
+        assert_eq!(
+            (first.value >> 4, first.value & 0x0F),
+            (9, 7),
+            "id 9, meta 7"
+        );
+        let second = &change.updates[1];
+        assert_eq!(
+            (second.x, second.y, second.z),
+            (15, 165, 8),
+            "the second record's nibbles from 0xF8A5"
+        );
+        assert_eq!(second.value, 1424, "the second value");
+        assert_eq!(
+            (second.value >> 4, second.value & 0x0F),
+            (89, 0),
+            "glowstone, no meta"
+        );
+        assert_eq!(MultiBlockChange::ID, 0x22, "the packet id");
+    }
+
+    #[test]
+    fn a_block_change_with_trailing_bytes_is_refused() {
+        let body: &[u8] = &[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // (0, 64, 0)
+            0x10, // stone
+            0x00, // one byte too many
+        ];
+        assert!(
+            matches!(BlockChange::decode(body), Err(PacketError::Trailing(1))),
+            "the trailing byte is refused"
+        );
+    }
+
+    #[test]
+    fn a_multi_block_change_with_a_cut_record_is_refused() {
+        // Two records declared; the payload ends inside the second one.
+        let body: &[u8] = &[
+            0xff, 0xff, 0xff, 0xfd, 0xff, 0xff, 0xff, 0xf9, 0x02, 0x4a, 0x25, 0x97, 0x01, 0xf8,
+        ];
+        assert!(
+            MultiBlockChange::decode(body).is_err(),
+            "a cut record is an error, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_negative_record_count_is_refused() {
+        // A VarInt -1: five bytes, the two's-complement encoding.
+        let body: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f,
+        ];
+        assert!(
+            MultiBlockChange::decode(body).is_err(),
+            "a negative count is refused"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_block_value_is_refused() {
+        // The VarInt 65536 does not fit the 16-bit `id << 4 | meta` field.
+        let body: &[u8] = &[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // (0, 64, 0)
+            0x80, 0x80, 0x04, // 65536
+        ];
+        assert!(
+            BlockChange::decode(body).is_err(),
+            "a value outside the 16-bit field is refused"
+        );
+    }
+}
