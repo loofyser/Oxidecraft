@@ -12,9 +12,10 @@ its section 13 run M0 to M9.
 
 ## Where things stand (2026-10-02)
 
-- **Milestone M2 (textured terrain) is complete and tagged `m2`.** Close-out commit `e90a30d` (the
-  commit the tag marks), follow-up `14b182f`; `origin/main` = `14b182f`; worktree clean; CI green
-  on both (runs `36999029133` and `36999837908`, all seven jobs).
+- **Milestone M2 (textured terrain) is complete and tagged `m2`.** The annotated tag marks the
+  close-out commit `e90a30d`; `14b182f` recorded its CI run, and the same day's tidy pass and close
+  decisions sit above it on `main`. Worktree clean; CI green on every pushed head (the close-out's
+  run: `36999837908`, all seven jobs; check the current head with `gh run list --limit 1`).
 - The final whole-branch review over the milestone returned PASS: no Critical or Important
   findings, and all 37 deferred items triaged safe to carry. The acceptance residue stands as
   documented — all three scene pairs fail the masked bar as written, every class recorded in
