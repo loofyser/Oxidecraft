@@ -28,8 +28,8 @@
 //! pure, block-local boxes with no world storage — and the behaviour table's
 //! `collision` column names which one a block id resolves through. Decoding a
 //! metadata nibble into the property a function reads has its own small
-//! helpers here ([`slab_half`], [`stair_facing`], [`front_facing`],
-//! [`door_facing`]).
+//! helpers here ([`slab_half`], [`stair_half`], [`stair_facing`],
+//! [`front_facing`], [`door_facing`]).
 //!
 //! Two classes read their neighbours: a stair's step and corner boxes are
 //! shaped by the stairs around it ([`stairs_boxes`] takes the neighbour
@@ -160,6 +160,20 @@ pub struct StairState {
 /// (`BlockStoneSlab.java:94-108`, the bit at `:104`), and double slabs carry no half.
 pub const fn slab_half(meta: u8) -> SlabHalf {
     if meta & 8 != 0 {
+        SlabHalf::Top
+    } else {
+        SlabHalf::Bottom
+    }
+}
+
+/// The half a stair's metadata names: bit 2, high when set.
+///
+/// `BlockStairs.getStateFromMeta` reads
+/// `(meta & 4) > 0 ? TOP : BOTTOM` (`BlockStairs.java:728`), and
+/// `getMetaFromState` writes `i |= 4` for the top half (`:736-742`) — not the
+/// slab's bit 3.
+pub const fn stair_half(meta: u8) -> SlabHalf {
+    if meta & 4 != 0 {
         SlabHalf::Top
     } else {
         SlabHalf::Bottom
@@ -362,6 +376,7 @@ pub fn stairs_boxes(
                 if let Some(other) = neighbour(Facing::North) {
                     if other.half == half {
                         z0 = 0.0;
+                        z1 = 0.5;
                         if other.facing == Facing::West && !is_same_stair(Facing::West) {
                             corners = true;
                         } else if other.facing == Facing::East && !is_same_stair(Facing::East) {
@@ -398,7 +413,9 @@ pub fn stairs_boxes(
 ///
 /// `BlockSnow.getCollisionBoundingBox` (`BlockSnow.java:43-48`): the `LAYERS`
 /// property runs 1..=8 and the top stands `0.125` per layer short of the
-/// block's own top, a one-layer drift having no collision box at all.
+/// block's own top, a one-layer drift having no collision box at all. The
+/// count is clamped to that range, so an out-of-range value still answers the
+/// base or the full layer.
 pub fn snow_layer_box(layers: u8) -> CollisionBox {
     let layers = layers.clamp(1, 8);
     let height = f64::from(u32::from(layers - 1)) * 0.125;
@@ -603,8 +620,9 @@ mod tests {
     //! The pinned shapes the behaviour table and the movement model consume.
 
     use super::{
-        CollisionBox, Connections, Facing, SlabHalf::Bottom, SlabHalf::Top, door_box, fence_boxes,
-        ladder_box, pane_boxes, slab_boxes, snow_layer_box, soul_sand_box, stairs_boxes,
+        CollisionBox, Connections, Facing, SlabHalf::Bottom, SlabHalf::Top, StairState, chest_box,
+        door_box, fence_boxes, front_facing, ladder_box, pane_boxes, slab_boxes, snow_layer_box,
+        soul_sand_box, stair_half, stairs_boxes, wall_box,
     };
 
     #[test]
@@ -687,9 +705,223 @@ mod tests {
         );
     }
 
+    /// A neighbour lookup answering `state` at `dir`, `None` everywhere else:
+    /// the stair-state probe's shape without a world.
+    fn turned(dir: Facing, state: StairState) -> impl Fn(Facing) -> Option<StairState> {
+        move |query| if query == dir { Some(state) } else { None }
+    }
+
+    /// The bottom stair's base box, common to the turning-run cases.
+    const BASE: CollisionBox = CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.5, 1.0]);
+
+    #[test]
+    fn the_stair_half_decoder_reads_the_stair_bit() {
+        // Stair metadata bit 2 (`BlockStairs.java:728`, written back at
+        // `:736-742`) — not the slab's bit 3.
+        assert_eq!(stair_half(0), Bottom);
+        assert_eq!(stair_half(3), Bottom);
+        assert_eq!(stair_half(4), Top);
+        assert_eq!(stair_half(7), Top);
+    }
+
+    #[test]
+    fn the_front_facing_decoder_folds_the_vertical_faces_to_north() {
+        // `EnumFacing.getFront` wraps the index modulo six
+        // (`BlockLadder.java:140-150`): north at 2, south at 3 and 9, west at
+        // 4 and 10, east at 5.
+        assert_eq!(front_facing(2), Facing::North);
+        assert_eq!(front_facing(3), Facing::South);
+        assert_eq!(front_facing(9), Facing::South);
+        assert_eq!(front_facing(4), Facing::West);
+        assert_eq!(front_facing(10), Facing::West);
+        assert_eq!(front_facing(5), Facing::East);
+    }
+
+    #[test]
+    fn the_step_box_shrinks_against_a_turning_run_on_every_facing() {
+        // `func_176306_h` (`BlockStairs.java:292-406`): where the stair ahead
+        // turns and the continuation behind it is not the same stair, the step
+        // box is cut back and the returned flag keeps the corner box closed.
+        // Bottom half throughout — the half only moves the y span.
+        let cases = [
+            (
+                Facing::East,
+                Facing::North,
+                CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 0.5]),
+            ),
+            (
+                Facing::East,
+                Facing::South,
+                CollisionBox::of([0.5, 0.5, 0.5], [1.0, 1.0, 1.0]),
+            ),
+            (
+                Facing::West,
+                Facing::North,
+                CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 0.5]),
+            ),
+            (
+                Facing::West,
+                Facing::South,
+                CollisionBox::of([0.0, 0.5, 0.5], [0.5, 1.0, 1.0]),
+            ),
+            (
+                Facing::South,
+                Facing::West,
+                CollisionBox::of([0.0, 0.5, 0.5], [0.5, 1.0, 1.0]),
+            ),
+            (
+                Facing::South,
+                Facing::East,
+                CollisionBox::of([0.5, 0.5, 0.5], [1.0, 1.0, 1.0]),
+            ),
+            (
+                Facing::North,
+                Facing::West,
+                CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 0.5]),
+            ),
+            (
+                Facing::North,
+                Facing::East,
+                CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 0.5]),
+            ),
+        ];
+        for (facing, turn, step) in cases {
+            let state = StairState {
+                facing: turn,
+                half: Bottom,
+            };
+            assert_eq!(
+                stairs_boxes(facing, Bottom, turned(facing, state)),
+                vec![BASE, step],
+                "a {facing:?} stair meeting a {turn:?} turn"
+            );
+        }
+
+        // The gates: a neighbour continuing the run, one of another half and a
+        // run whose far side is the queried stair itself all keep the step
+        // full.
+        let full_step = CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 1.0]);
+        let continuing = StairState {
+            facing: Facing::East,
+            half: Bottom,
+        };
+        assert_eq!(
+            stairs_boxes(Facing::East, Bottom, turned(Facing::East, continuing)),
+            vec![BASE, full_step],
+            "a straight run"
+        );
+        let other_half = StairState {
+            facing: Facing::North,
+            half: Top,
+        };
+        assert_eq!(
+            stairs_boxes(Facing::East, Bottom, turned(Facing::East, other_half)),
+            vec![BASE, full_step],
+            "a neighbour of the other half"
+        );
+        let state = continuing;
+        assert_eq!(
+            stairs_boxes(Facing::East, Bottom, |dir| match dir {
+                Facing::East => Some(StairState {
+                    facing: Facing::North,
+                    half: Bottom,
+                }),
+                Facing::South => Some(state),
+                _ => None,
+            }),
+            vec![BASE, full_step],
+            "the queried stair continues past the turn"
+        );
+    }
+
+    #[test]
+    fn a_south_stair_turning_through_its_north_neighbour_gains_the_corner_box() {
+        // `func_176304_i`'s south arm sets both z bounds of the corner box
+        // and adjusts only x per the neighbour's facing
+        // (`BlockStairs.java:482-497`).
+        let west = StairState {
+            facing: Facing::West,
+            half: Bottom,
+        };
+        assert_eq!(
+            stairs_boxes(Facing::South, Bottom, turned(Facing::North, west)),
+            vec![
+                BASE,
+                CollisionBox::of([0.0, 0.5, 0.5], [1.0, 1.0, 1.0]),
+                CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 0.5]),
+            ]
+        );
+        let east = StairState {
+            facing: Facing::East,
+            half: Bottom,
+        };
+        assert_eq!(
+            stairs_boxes(Facing::South, Bottom, turned(Facing::North, east)),
+            vec![
+                BASE,
+                CollisionBox::of([0.0, 0.5, 0.5], [1.0, 1.0, 1.0]),
+                CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 0.5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_west_or_north_stair_gains_its_turning_corner_box() {
+        // The corner function's west arm (`BlockStairs.java:450-476`) and
+        // north arm (`:500-528`), both sub-cases each.
+        let north = StairState {
+            facing: Facing::North,
+            half: Bottom,
+        };
+        let south = StairState {
+            facing: Facing::South,
+            half: Bottom,
+        };
+        assert_eq!(
+            stairs_boxes(Facing::West, Bottom, turned(Facing::East, north)),
+            vec![
+                BASE,
+                CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 1.0]),
+                CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 0.5]),
+            ]
+        );
+        assert_eq!(
+            stairs_boxes(Facing::West, Bottom, turned(Facing::East, south)),
+            vec![
+                BASE,
+                CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 1.0]),
+                CollisionBox::of([0.5, 0.5, 0.5], [1.0, 1.0, 1.0]),
+            ]
+        );
+        let west = StairState {
+            facing: Facing::West,
+            half: Bottom,
+        };
+        let east = StairState {
+            facing: Facing::East,
+            half: Bottom,
+        };
+        assert_eq!(
+            stairs_boxes(Facing::North, Bottom, turned(Facing::South, west)),
+            vec![
+                BASE,
+                CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 0.5]),
+                CollisionBox::of([0.0, 0.5, 0.5], [0.5, 1.0, 1.0]),
+            ]
+        );
+        assert_eq!(
+            stairs_boxes(Facing::North, Bottom, turned(Facing::South, east)),
+            vec![
+                BASE,
+                CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 0.5]),
+                CollisionBox::of([0.5, 0.5, 0.5], [1.0, 1.0, 1.0]),
+            ]
+        );
+    }
+
     #[test]
     fn a_fence_post_grows_arms_toward_its_connections() {
-        // A lone fence: the west–east axis' post alone (`BlockFence.java:96-106`).
+        // A lone fence: the west–east axis' post alone (`BlockFence.java:90-94`).
         assert_eq!(
             fence_boxes(Connections::default()),
             vec![CollisionBox::of([0.375, 0.0, 0.375], [0.625, 1.5, 0.625])]
@@ -709,6 +941,40 @@ mod tests {
                 CollisionBox::of([0.375, 0.0, 0.375], [1.0, 1.5, 0.625]),
             ]
         );
+        // One connection: the arm reaches its side and the post's other end
+        // falls back to the 0.375..0.625 span (`BlockFence.java:56-94`).
+        for (connections, box_) in [
+            (
+                Connections {
+                    north: true,
+                    ..Connections::default()
+                },
+                CollisionBox::of([0.375, 0.0, 0.0], [0.625, 1.5, 0.625]),
+            ),
+            (
+                Connections {
+                    south: true,
+                    ..Connections::default()
+                },
+                CollisionBox::of([0.375, 0.0, 0.375], [0.625, 1.5, 1.0]),
+            ),
+            (
+                Connections {
+                    west: true,
+                    ..Connections::default()
+                },
+                CollisionBox::of([0.0, 0.0, 0.375], [0.625, 1.5, 0.625]),
+            ),
+            (
+                Connections {
+                    east: true,
+                    ..Connections::default()
+                },
+                CollisionBox::of([0.375, 0.0, 0.375], [1.0, 1.5, 0.625]),
+            ),
+        ] {
+            assert_eq!(fence_boxes(connections), vec![box_], "{connections:?}");
+        }
     }
 
     #[test]
@@ -739,6 +1005,85 @@ mod tests {
         assert_eq!(
             pane_boxes(north_south),
             vec![CollisionBox::of([0.4375, 0.0, 0.0], [0.5625, 1.0, 1.0])]
+        );
+        // A single north or south connection emits that side's half plate
+        // alone (`:101-118`).
+        let north = Connections {
+            north: true,
+            ..Connections::default()
+        };
+        assert_eq!(
+            pane_boxes(north),
+            vec![CollisionBox::of([0.4375, 0.0, 0.0], [0.5625, 1.0, 0.5])]
+        );
+        let south = Connections {
+            south: true,
+            ..Connections::default()
+        };
+        assert_eq!(
+            pane_boxes(south),
+            vec![CollisionBox::of([0.4375, 0.0, 0.5], [0.5625, 1.0, 1.0])]
+        );
+    }
+
+    #[test]
+    fn a_chest_merges_toward_each_of_its_four_sides() {
+        // `BlockChest.setBlockBoundsBasedOnState` (`BlockChest.java:66-88`):
+        // the 14/16 box reaches the cell's edge on the side its twin sits at.
+        assert_eq!(
+            chest_box(false, false, false, false),
+            CollisionBox::of([0.0625, 0.0, 0.0625], [0.9375, 0.875, 0.9375])
+        );
+        assert_eq!(
+            chest_box(true, false, false, false),
+            CollisionBox::of([0.0625, 0.0, 0.0], [0.9375, 0.875, 0.9375])
+        );
+        assert_eq!(
+            chest_box(false, true, false, false),
+            CollisionBox::of([0.0625, 0.0, 0.0625], [0.9375, 0.875, 1.0])
+        );
+        assert_eq!(
+            chest_box(false, false, true, false),
+            CollisionBox::of([0.0, 0.0, 0.0625], [0.9375, 0.875, 0.9375])
+        );
+        assert_eq!(
+            chest_box(false, false, false, true),
+            CollisionBox::of([0.0625, 0.0, 0.0625], [1.0, 0.875, 0.9375])
+        );
+    }
+
+    #[test]
+    fn a_wall_narrows_across_a_single_axis_run() {
+        // `BlockWall.setBlockBoundsBasedOnState` (`BlockWall.java:67-113`)
+        // builds the 0.25..0.75 post, the arms and the 0.3125..0.6875
+        // narrowing when only one axis connects.
+        assert_eq!(
+            wall_box(Connections::default()),
+            CollisionBox::of([0.25, 0.0, 0.25], [0.75, 1.5, 0.75])
+        );
+        assert_eq!(
+            wall_box(Connections {
+                north: true,
+                south: true,
+                ..Connections::default()
+            }),
+            CollisionBox::of([0.3125, 0.0, 0.0], [0.6875, 1.5, 1.0])
+        );
+        assert_eq!(
+            wall_box(Connections {
+                west: true,
+                east: true,
+                ..Connections::default()
+            }),
+            CollisionBox::of([0.0, 0.0, 0.3125], [1.0, 1.5, 0.6875])
+        );
+        // A single connected side reaches the cell's edge without narrowing.
+        assert_eq!(
+            wall_box(Connections {
+                north: true,
+                ..Connections::default()
+            }),
+            CollisionBox::of([0.25, 0.0, 0.0], [0.75, 1.5, 0.75])
         );
     }
 
@@ -781,6 +1126,32 @@ mod tests {
             door_box(Facing::East, true, true),
             CollisionBox::of([0.0, 0.0, 0.8125], [1.0, 1.0, 1.0])
         );
+        // Closed south and west (`BlockDoor.java:138-153`).
+        assert_eq!(
+            door_box(Facing::South, false, false),
+            CollisionBox::of([0.0, 0.0, 0.0], [1.0, 1.0, 0.1875])
+        );
+        assert_eq!(
+            door_box(Facing::West, false, false),
+            CollisionBox::of([0.8125, 0.0, 0.0], [1.0, 1.0, 1.0])
+        );
+        // Open south and west swing to the hinge's side (`BlockDoor.java:91-136`).
+        assert_eq!(
+            door_box(Facing::South, true, false),
+            CollisionBox::of([0.8125, 0.0, 0.0], [1.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            door_box(Facing::South, true, true),
+            CollisionBox::of([0.0, 0.0, 0.0], [0.1875, 1.0, 1.0])
+        );
+        assert_eq!(
+            door_box(Facing::West, true, false),
+            CollisionBox::of([0.0, 0.0, 0.8125], [1.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            door_box(Facing::West, true, true),
+            CollisionBox::of([0.0, 0.0, 0.0], [1.0, 1.0, 0.1875])
+        );
     }
 
     #[test]
@@ -803,6 +1174,16 @@ mod tests {
         );
         assert_eq!(
             snow_layer_box(8),
+            CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.875, 1.0])
+        );
+        // The count clamps to the property's 1..=8 range: below it the base
+        // layer, above it the full top.
+        assert_eq!(
+            snow_layer_box(0),
+            CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.0, 1.0])
+        );
+        assert_eq!(
+            snow_layer_box(9),
             CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.875, 1.0])
         );
     }

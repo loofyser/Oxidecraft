@@ -99,11 +99,13 @@ fn tick_displacement(player: &mut Player, intent: &Intent, view: &WorldView<'_>)
 ///
 /// The brief's scene reaches for a half slab (id 44); that id is outside the
 /// covered set, so its equal-height covered shape — the bottom stair's base
-/// box, `[0, 0]..[1, 0.5]` (`BlockStairs.java:475-490`) — carries the check.
+/// box, `[0, 0]..[1, 0.5]` (`BlockStairs.setBaseCollisionBounds`,
+/// `BlockStairs.java:80-90`) — carries the check.
 #[test]
 fn a_walk_steps_up_the_lower_box_of_a_stair() {
     // The stair at (4, 64, 4) faces east: its base is the whole cell at half
-    // height, its step the cell's east half at the top (`BlockStairs.java:429-450`).
+    // height, its step the cell's east half at the top
+    // (`BlockStairs.java:292-406`, the east arm at `:313-340`).
     let world = world_of(floor(|x, y, z| {
         if (x, y, z) == (4, 64, 4) {
             STAIR_EAST

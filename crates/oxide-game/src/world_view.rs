@@ -7,7 +7,7 @@
 //! them here, through predicates derived from the source's own connection
 //! rules:
 //!
-//! * a fence reads `BlockFence.canConnectTo` (`BlockFence.java:161-196`),
+//! * a fence reads `BlockFence.canConnectTo` (`BlockFence.java:161-165`),
 //! * a cobblestone wall `BlockWall.canConnectTo` (`BlockWall.java:122-126`),
 //! * a pane `BlockPane.canPaneConnectToBlock` (`BlockPane.java:177-180`),
 //! * a stair `BlockStairs.isSameStair` (`BlockStairs.java:103-108`),
@@ -23,7 +23,7 @@ use oxide_world::behaviour::{BlockBehaviour, CollisionShape, LiquidKind, Materia
 use oxide_world::collision::{
     CollisionBox, Connections, Facing, StairState, cactus_box, chest_box, door_box, door_facing,
     fence_boxes, front_facing, ladder_box, pane_boxes, slab_boxes, slab_half, snow_layer_box,
-    soul_sand_box, stair_facing, stairs_boxes, wall_box,
+    soul_sand_box, stair_facing, stair_half, stairs_boxes, wall_box,
 };
 use oxide_world::world::World;
 
@@ -60,7 +60,7 @@ impl CollisionView for WorldView<'_> {
                 out.push(slab_boxes(double, slab_half(meta))[0].offset(ox, oy, oz));
             }
             CollisionShape::Stairs => {
-                let boxes = stairs_boxes(stair_facing(meta), slab_half(meta), |dir| {
+                let boxes = stairs_boxes(stair_facing(meta), stair_half(meta), |dir| {
                     self.stair_state(x, y, z, dir)
                 });
                 for box_ in boxes {
@@ -153,7 +153,7 @@ impl WorldView<'_> {
         let meta = meta_of(self.0, x + dx, y, z + dz);
         Some(StairState {
             facing: stair_facing(meta),
-            half: slab_half(meta),
+            half: stair_half(meta),
         })
     }
 
@@ -183,7 +183,7 @@ impl WorldView<'_> {
         (door_facing(combined), combined & 4 != 0, combined & 16 != 0)
     }
 
-    /// `BlockFence.canConnectTo` (`BlockFence.java:161-196`) for the fence at
+    /// `BlockFence.canConnectTo` (`BlockFence.java:161-165`) for the fence at
     /// a neighbour cell: a fence of the same material, or an opaque full-cube
     /// block other than the gourd. The source's barrier and fence-gate clauses
     /// (`:163-164`) cover ids outside the covered set, which answer `false`.
@@ -264,10 +264,16 @@ mod tests {
     const ICE: u16 = 79 << 4;
     /// A ladder, id 65, facing north (metadata 2).
     const LADDER_NORTH: u16 = 65 << 4 | 2;
+    /// A ladder facing south (metadata 3): the plate on the cell's north edge.
+    const LADDER_SOUTH: u16 = 65 << 4 | 3;
     /// An oak stair, id 53, facing east, bottom half (metadata 0).
     const STAIR_EAST: u16 = 53 << 4;
     /// An oak stair facing north, bottom half (metadata 3).
     const STAIR_NORTH: u16 = 53 << 4 | 3;
+    /// An oak stair facing east, top half (metadata 4).
+    const STAIR_TOP_EAST: u16 = 53 << 4 | 4;
+    /// An oak stair facing north, top half (metadata 4 | 3).
+    const STAIR_TOP_NORTH: u16 = 53 << 4 | 7;
     /// A chest, id 54.
     const CHEST: u16 = 54 << 4;
     /// A wooden door, id 64, lower half: facing east, closed (metadata 0),
@@ -464,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn a_south_ladder_is_a_plate_on_its_attached_face() {
+        // Metadata 3 is the south facing (`BlockLadder.java:140-150`):
+        // `EnumFacing.getFront(3)` is south, so the plate lies on the cell's
+        // north edge (`BlockLadder.java:40-66`).
+        let world = world_of(|x, y, z| {
+            if (x, y, z) == (8, 64, 8) {
+                LADDER_SOUTH
+            } else {
+                AIR
+            }
+        });
+        assert_eq!(
+            boxes_at(&world, 8, 64, 8),
+            vec![CollisionBox::of([8.0, 64.0, 8.0], [9.0, 65.0, 8.125])]
+        );
+    }
+
+    #[test]
     fn a_stair_reads_its_neighbours_step_and_corner() {
         // The queried bottom stair faces east; its west neighbour is a bottom
         // stair facing north, which opens the outer corner box
@@ -484,6 +508,52 @@ mod tests {
                 CollisionBox::of([8.0, 64.0, 8.0], [9.0, 64.5, 9.0]),
                 CollisionBox::of([8.5, 64.5, 8.0], [9.0, 65.0, 9.0]),
                 CollisionBox::of([8.0, 64.5, 8.0], [8.5, 65.0, 8.5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_top_stair_is_its_top_half_and_its_low_step() {
+        // Metadata 4 is the top half (`BlockStairs.java:728`): the base box
+        // is the upper half and the step the lower one, facing east.
+        let world = world_of(|x, y, z| {
+            if (x, y, z) == (8, 64, 8) {
+                STAIR_TOP_EAST
+            } else {
+                AIR
+            }
+        });
+        assert_eq!(
+            boxes_at(&world, 8, 64, 8),
+            vec![
+                CollisionBox::of([8.0, 64.5, 8.0], [9.0, 65.0, 9.0]),
+                CollisionBox::of([8.5, 64.0, 8.0], [9.0, 64.5, 9.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_top_stair_reads_a_top_neighbours_turn() {
+        // The queried top stair faces east; its west neighbour is a top stair
+        // facing north — same half, turning — so the outer corner box opens
+        // with the top half's own y span (`func_176304_i`'s east arm,
+        // `BlockStairs.java:429-450`).
+        let world = world_of(|x, y, z| {
+            if y != 64 {
+                return AIR;
+            }
+            match (x, z) {
+                (8, 8) => STAIR_TOP_EAST,
+                (7, 8) => STAIR_TOP_NORTH,
+                _ => AIR,
+            }
+        });
+        assert_eq!(
+            boxes_at(&world, 8, 64, 8),
+            vec![
+                CollisionBox::of([8.0, 64.5, 8.0], [9.0, 65.0, 9.0]),
+                CollisionBox::of([8.5, 64.0, 8.0], [9.0, 64.5, 9.0]),
+                CollisionBox::of([8.0, 64.0, 8.0], [8.5, 64.5, 8.5]),
             ]
         );
     }
@@ -567,7 +637,7 @@ mod tests {
         let view = WorldView(&world);
         let fence = oxide_world::behaviour::behaviour(85).expect("fence");
         // Fence: a same-material fence and an opaque full cube connect; the
-        // gourd, the pane and air do not (`BlockFence.java:165-196`).
+        // gourd, the pane and air do not (`BlockFence.java:161-165`).
         assert!(view.neighbour_connects_fence(fence, 8, 64, 8));
         assert!(view.neighbour_connects_fence(fence, 9, 64, 8));
         assert!(!view.neighbour_connects_fence(fence, 10, 64, 8));

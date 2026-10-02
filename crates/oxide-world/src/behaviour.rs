@@ -2861,29 +2861,32 @@ mod tests {
         // (`BlockStairs.java:80-90`, `:292-406`).
         let base_bottom = CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.5, 1.0]);
         let base_top = CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 1.0]);
-        for (facing, step) in [
+        for (facing, step, top_step) in [
             (
                 Facing::North,
                 CollisionBox::of([0.0, 0.5, 0.0], [1.0, 1.0, 0.5]),
+                CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.5, 0.5]),
             ),
             (
                 Facing::South,
                 CollisionBox::of([0.0, 0.5, 0.5], [1.0, 1.0, 1.0]),
+                CollisionBox::of([0.0, 0.0, 0.5], [1.0, 0.5, 1.0]),
             ),
             (
                 Facing::West,
                 CollisionBox::of([0.0, 0.5, 0.0], [0.5, 1.0, 1.0]),
+                CollisionBox::of([0.0, 0.0, 0.0], [0.5, 0.5, 1.0]),
             ),
             (
                 Facing::East,
                 CollisionBox::of([0.5, 0.5, 0.0], [1.0, 1.0, 1.0]),
+                CollisionBox::of([0.5, 0.0, 0.0], [1.0, 0.5, 1.0]),
             ),
         ] {
             let lower = stairs_boxes(facing, SlabHalf::Bottom, |_| None);
             assert_eq!(lower, vec![base_bottom, step], "a bottom stair, {facing:?}");
             let top = stairs_boxes(facing, SlabHalf::Top, |_| None);
-            assert_eq!(top[0], base_top, "a top stair's base, {facing:?}");
-            assert_eq!(top[1].min[1], 0.0, "a top stair's step is low, {facing:?}");
+            assert_eq!(top, vec![base_top, top_step], "a top stair, {facing:?}");
         }
 
         // The fence's post and arms (`BlockFence.java:50-107`).
@@ -3007,6 +3010,63 @@ mod tests {
         assert_eq!(block(161).hardness, 0.2); // leaves2, BlockLeaves.java:32
         assert_eq!(block(162).hardness, 2.0); // log2, BlockLog.java:21
         assert_eq!(block(175).hardness, 0.0); // double plant, BlockDoublePlant.java:36
+
+        // The rest of the covered column, each value from its registration
+        // line in `block/Block.java`.
+        assert_eq!(block(2).hardness, 0.6); // grass, :1253
+        assert_eq!(block(4).hardness, 2.0); // cobblestone, :1255
+        assert_eq!(block(5).hardness, 2.0); // planks, :1257
+        assert_eq!(block(8).hardness, 100.0); // flowing_water, :1261
+        assert_eq!(block(10).hardness, 100.0); // flowing_lava, :1263
+        assert_eq!(block(11).hardness, 100.0); // lava, :1264
+        assert_eq!(block(12).hardness, 0.5); // sand, :1265
+        assert_eq!(block(13).hardness, 0.6); // gravel, :1266
+        assert_eq!(block(14).hardness, 3.0); // gold_ore, :1267
+        assert_eq!(block(15).hardness, 3.0); // iron_ore, :1268
+        assert_eq!(block(16).hardness, 3.0); // coal_ore, :1269
+        assert_eq!(block(21).hardness, 3.0); // lapis_ore, :1274
+        assert_eq!(block(24).hardness, 0.8); // sandstone, :1277
+        assert_eq!(block(31).hardness, 0.0); // tallgrass, :1285
+        assert_eq!(block(32).hardness, 0.0); // deadbush, :1286
+        assert_eq!(block(37).hardness, 0.0); // yellow_flower, :1291
+        assert_eq!(block(38).hardness, 0.0); // red_flower, :1292
+        assert_eq!(block(39).hardness, 0.0); // brown_mushroom, :1293
+        assert_eq!(block(40).hardness, 0.0); // red_mushroom, :1295
+        assert_eq!(block(41).hardness, 3.0); // gold_block, :1297
+        assert_eq!(block(42).hardness, 5.0); // iron_block, :1298
+        assert_eq!(block(43).hardness, 2.0); // double_stone_slab, :1299
+        assert_eq!(block(45).hardness, 2.0); // brick_block, :1301
+        assert_eq!(block(46).hardness, 0.0); // tnt, :1303
+        assert_eq!(block(47).hardness, 1.5); // bookshelf, :1304
+        assert_eq!(block(48).hardness, 2.0); // mossy_cobblestone, :1305
+        assert_eq!(block(50).hardness, 0.0); // torch, :1307
+        assert_eq!(block(52).hardness, 5.0); // mob_spawner, :1309
+        assert_eq!(block(54).hardness, 2.5); // chest, :1311
+        assert_eq!(block(56).hardness, 3.0); // diamond_ore, :1313
+        assert_eq!(block(57).hardness, 5.0); // diamond_block, :1314
+        assert_eq!(block(58).hardness, 2.5); // crafting_table, :1315
+        assert_eq!(block(60).hardness, 0.6); // farmland, :1317
+        assert_eq!(block(61).hardness, 3.5); // furnace, :1319
+        assert_eq!(block(62).hardness, 3.5); // lit_furnace, :1320
+        assert_eq!(block(64).hardness, 3.0); // wooden_door, :1322
+        assert_eq!(block(65).hardness, 0.4); // ladder, :1323
+        assert_eq!(block(72).hardness, 0.5); // wooden_pressure_plate, :1330
+        assert_eq!(block(73).hardness, 3.0); // redstone_ore, :1331
+        assert_eq!(block(79).hardness, 0.5); // ice, :1337
+        assert_eq!(block(80).hardness, 0.2); // snow, :1338
+        assert_eq!(block(81).hardness, 0.4); // cactus, :1339
+        assert_eq!(block(82).hardness, 0.6); // clay, :1340
+        assert_eq!(block(83).hardness, 0.0); // reeds, :1341
+        assert_eq!(block(85).hardness, 2.0); // fence, :1343
+        assert_eq!(block(86).hardness, 1.0); // pumpkin, :1344
+        assert_eq!(block(87).hardness, 0.4); // netherrack, :1346
+        assert_eq!(block(89).hardness, 0.3); // glowstone, :1348
+        assert_eq!(block(98).hardness, 1.5); // stonebrick, :1357
+        assert_eq!(block(99).hardness, 0.2); // brown_mushroom_block, :1359
+        assert_eq!(block(100).hardness, 0.2); // red_mushroom_block, :1360
+        assert_eq!(block(110).hardness, 0.6); // mycelium, :1371
+        assert_eq!(block(129).hardness, 3.0); // emerald_ore, :1391
+        assert_eq!(block(155).hardness, 0.8); // quartz_block, :1417
     }
 
     #[test]
