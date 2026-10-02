@@ -351,7 +351,7 @@ persistent vertex buffers, and optional multithreaded chunk upload.
 
 ### 11.1 Movement, interaction, input
 
-- Physics: vanilla constants and order of operations. Working values: walk 4.317, sprint 5.612, jump apex 1.2522 blocks (derived by simulating the recurrence; provenance recorded in section 12), plus the sneak and terminal-velocity values listed in the parity report, gravity, drag, liquid movement, ladders, and sneaking edge protection.
+- Physics: vanilla constants and order of operations. Working values: walk 4.317, sprint 5.612, jump apex 1.24919 blocks (derived by simulating the recurrence; provenance recorded in section 12; corrected after execution — the 1.8.9 `|motionY| < 0.005` clamp, `EntityLivingBase.java:1979-1982`, drops the final step), plus the sneak and terminal-velocity values listed in the parity report, gravity, drag, liquid movement, ladders, and sneaking edge protection.
 - Prediction: the client applies local movement immediately, then reconciles when the server sends a position update, exactly as vanilla does.
 - Interaction: block reach is gamemode-dependent — 5.0 in creative, 4.5 otherwise; the value is re-verified against decompiled 1.8.9 during M3 and recorded in the behaviour table's notes. Break progress and tool timing follow block hardness, and placement obeys the collision rules.
 - Input: vanilla default keybinds, mouse capture, the sensitivity formula, F2 screenshots, and F3 with its sub-modes (F3+B, G, H, P, A, T, and the lagometer).
@@ -375,7 +375,7 @@ win and credits screen, and an extended render distance beyond the vanilla 16 ch
 | --- | --- |
 | Codecs | Unit tests with golden byte fixtures generated from the archived `minecraft-data` 1.8 definitions, plus round-trip encode and decode. Includes the chunk-size fixture for mask 0x0001 (12,544 bytes) and the three hexdigest golden vectors |
 | World | Unit tests for chunk parse, light propagation against small hand-built worlds, respawn and dimension-change state clearing, and inventory semantics |
-| Physics | Test vectors against recorded vanilla values: walk 4.317, sprint 5.612, jump apex 1.2522 (provenance: derived by simulating the recurrence in the parity report, not read from source), plus sneak, terminal velocity, step-up, and collision cases |
+| Physics | Test vectors against recorded vanilla values: walk 4.317, sprint 5.612, jump apex 1.24919 (provenance: derived by simulating the recurrence plus the source's clamp in the parity report; corrected after execution), plus sneak, terminal velocity, step-up, and collision cases |
 | End-to-end | Replay harness: record a raw server byte stream once, replay it offline in tests, and assert world, entity, and HUD state with no panics |
 | Live | Connect to the local 1.8.9 test server; compare packet sequence and behaviour against a vanilla client on the same server, per appendix C's capture procedure |
 | Visual | The parity checklist, classified in appendix C into screenshot-diffable, behavioural, and audio items, each with its verification method |

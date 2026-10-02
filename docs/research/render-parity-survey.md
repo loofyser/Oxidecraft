@@ -472,7 +472,7 @@ hand swing (ItemRenderer.renderItemInFirstPerson / transformFirstPersonItem:296-
 | Input decay | `moveStrafing *= 0.98; moveForward *= 0.98` each tick | `EntityLivingBase.java:2031-2032` |
 | Sneaking | input × **0.3** | `MovementInputFromOptions.java:42-45` |
 | Jump | `motionY = 0.42` (+0.1 per Jump Boost level), then per tick `motionY = (motionY − 0.08) * 0.98` | `EntityLivingBase.java:1561-1573, 1677-1680` |
-| Jump height | **1.2522 blocks** (matches the wiki's post-15w45a value; my simulation of the recurrence gives 1.25220) | `Movement.wiki:746` + simulation |
+| Jump height | **1.24919 blocks** in 1.8.9 (**1.2522** is the wiki's post-15w45a value — the threshold became 0.003 there; the 1.8.9 `|motionY| < 0.005` clamp, `EntityLivingBase.java:1979-1982`, drops the final 0.003016 step, and simulation without the clamp gives 1.25220) | `Movement.wiki:746` + simulation; corrected after execution (M3 Task 2) |
 | Terminal fall | `3.92` blocks/tick (78.4 m/s) | recurrence + `Movement.wiki:659` |
 | Air drag | ×0.98 vertical, ×0.91 horizontal | `Entity.java` |
 | Ladder climb | `motionY = 0.2` while climbing (`0.2` when not sneaking), horizontal speed cap 0.15 | `Entity.moveEntity` |
@@ -560,7 +560,7 @@ Sources: <https://minecraft.wiki/w/Sound>, <https://minecraft.wiki/w/Sounds.json
 47. All 40 `EnumParticleTypes` (§4.6) exist with the vanilla sprite cells and behaviours, including `iconcrack_`/`blockcrack_` atlas lookups and the `ParticleSetting` reduction.
 48. FOV matches: 70 default, sprint 1.15×, flying 1.1×, bow-draw down to 0.85×, underwater 60/70, death zoom, and the 0.5-per-tick smoothing with [0.1,1.5] clamp.
 49. Mouse look matches `((sens*0.6+0.2)³*8)` degrees per mouse pixel, with the same pitch clamp and cinematic-camera low-pass.
-50. Movement feel matches the constants in §5.4: jump apex 1.2522, walk 4.317 m/s, sprint 5.612 m/s, sneak 1.3 m/s, ladder 0.2/tick, water/lava drag, terminal 3.92/tick.
+50. Movement feel matches the constants in §5.4: jump apex 1.24919 *(corrected after execution)*, walk 4.317 m/s, sprint 5.612 m/s, sneak 1.3 m/s, ladder 0.2/tick, water/lava drag, terminal 3.92/tick.
 51. `F5` shows third-person back/front with the same camera distance/occlusion pull-in; `F1` hides HUD + hand + overlays.
 52. Sounds play with the 9 vanilla categories, pitch clamp [0.5,2.0], per-call pitch randomisation, correct streaming for music/records, and the vanilla 16-block attenuation.
 53. GUI scale Auto/Small/Normal/Large produce the same scaled resolution as vanilla at 1920×1080, 2560×1440 and 1280×720.
