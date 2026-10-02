@@ -81,7 +81,7 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
-    use super::{TICK_CATCHUP_CAP, Ticker};
+    use super::Ticker;
 
     /// One step: twenty ticks per second (`new Timer(20.0F)`,
     /// `Minecraft.java:223`; `Minecraft.run` runs its ticks from it).
@@ -131,13 +131,16 @@ mod tests {
     }
 
     #[test]
-    fn a_long_pause_reports_the_cap_and_leaves_no_debt() {
+    fn a_long_pause_reports_ten_steps_and_leaves_no_debt() {
         let (mut ticker, start) = ticker();
         let paused = start + STEP * 50;
+        // The cap's literal value: a frame's tick run is clamped to ten
+        // (`if (this.elapsedTicks > 10) { this.elapsedTicks = 10; }`,
+        // `Timer.java:103-106`).
         assert_eq!(
             ticker.due(paused),
-            TICK_CATCHUP_CAP,
-            "a fifty-step pause reports the cap, not fifty"
+            10,
+            "a fifty-step pause reports ten steps, not fifty"
         );
         assert_eq!(
             ticker.due(paused),

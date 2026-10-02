@@ -9,7 +9,7 @@
 //! view block produce is computed here and reported with it, because the
 //! window's own crate may not reach the world store.
 //!
-//! The session thread is also the tick thread (plan Decision 1): a fixed
+//! The session thread is also the tick thread: a fixed
 //! 20 Hz step scheduled inside the play loop drives the player state — the
 //! window's input, the clock's and the cloud counter's advance, and the
 //! per-tick report — while the read loop's discipline holds: ticks are
@@ -94,10 +94,10 @@ const TICK_PERIOD: Duration = Duration::from_millis(50);
 
 /// How many of the window's input events one pass drains.
 ///
-/// This bound is the plan's own — the source has no counterpart, because its
-/// input arrives from the window it already owns. The backlog drains across
-/// passes and nothing is dropped; the bound only keeps one pass' work finite
-/// when the window outruns the session.
+/// The bound has no source counterpart: the source's input arrives from the
+/// window it already owns. The backlog drains across passes and nothing is
+/// dropped; the bound only keeps one pass' work finite when the window
+/// outruns the session.
 const INPUTS_PER_PASS: usize = 32;
 
 /// The mouse sensitivity the look mapping runs with.
@@ -818,8 +818,8 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) {
             player.yaw += d_yaw;
             player.pitch = (player.pitch + d_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         }
-        // The buttons belong to interaction, which M3's later tasks add; the
-        // held intent has no use for them.
+        // The buttons belong to interaction, not movement; the held intent
+        // has no use for them.
         InputEvent::MouseButton { .. } => {}
         InputEvent::FocusLost => intent.release_all(),
     }
@@ -1193,5 +1193,113 @@ fn finish_meshes(
             return;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The tick period and the frozen clock gate, against synthetic state.
+
+    use std::time::{Duration, Instant};
+
+    use oxide_world::world::World;
+
+    use super::{ClientEvent, Clock, TICK_PERIOD, step_tick};
+    use crate::input::Intent;
+    use crate::player::Player;
+    use crate::ticker::Ticker;
+
+    #[test]
+    fn the_tick_period_is_fifty_milliseconds() {
+        // `new Timer(20.0F)` (`Minecraft.java:223`): twenty steps per second.
+        assert_eq!(
+            TICK_PERIOD,
+            Duration::from_millis(50),
+            "one tick every 50 ms is the source's 20 Hz"
+        );
+        // The value drives the scheduler: a synthetic instant inside a period
+        // reports nothing, and a hair past it reports the one whole step.
+        let start = Instant::now();
+        let mut ticker = Ticker::new(TICK_PERIOD);
+        assert_eq!(ticker.due(start + Duration::from_millis(49)), 0);
+        assert_eq!(
+            ticker.due(start + TICK_PERIOD + Duration::from_millis(5)),
+            1
+        );
+    }
+
+    #[test]
+    fn a_frozen_tick_advances_the_world_age_and_holds_the_time_of_day() {
+        // `WorldClient.tick` advances the world age every tick and the time of
+        // day only while the cycle runs (`WorldClient.java:66-74`); the frozen
+        // flag is the sign the receive rule read (`:468-483`). One frozen
+        // step: the age and the player's tick move, the time of day holds, and
+        // no sky is reported — a step reports a sky exactly when it moved the
+        // time of day.
+        let world = World::new(true);
+        let intent = Intent::neutral();
+        let (sender, receiver) = crossbeam_channel::unbounded::<ClientEvent>();
+
+        let mut player = Player::new();
+        let mut frozen = Clock {
+            world_age: 48_000,
+            time_of_day: 6000,
+            frozen: true,
+        };
+        step_tick(
+            &mut player,
+            &intent,
+            Some(&mut frozen),
+            Some(&world),
+            &sender,
+        );
+        assert_eq!(frozen.world_age, 48_001, "the age advances every tick");
+        assert_eq!(frozen.time_of_day, 6000, "the frozen time of day holds");
+        assert_eq!(player.tick, 1, "the step ran");
+        let frozen_events: Vec<ClientEvent> = receiver.try_iter().collect();
+        assert!(
+            frozen_events.iter().any(|event| matches!(
+                event,
+                ClientEvent::PlayerTick {
+                    tick: 1,
+                    snapped: false,
+                    ..
+                }
+            )),
+            "the frozen step reports its tick: {frozen_events:?}"
+        );
+        assert!(
+            !frozen_events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Sky { .. })),
+            "a frozen step reports no sky: {frozen_events:?}"
+        );
+
+        // The running contrast: the same step with the cycle running reports
+        // the sky it moved.
+        let mut player = Player::new();
+        let mut running = Clock {
+            world_age: 48_000,
+            time_of_day: 6000,
+            frozen: false,
+        };
+        step_tick(
+            &mut player,
+            &intent,
+            Some(&mut running),
+            Some(&world),
+            &sender,
+        );
+        assert_eq!(running.world_age, 48_001);
+        assert_eq!(running.time_of_day, 6001, "a running time of day advances");
+        let running_events: Vec<ClientEvent> = receiver.try_iter().collect();
+        assert_eq!(
+            running_events
+                .iter()
+                .filter(|event| matches!(event, ClientEvent::Sky { .. }))
+                .count(),
+            1,
+            "the running step reports the sky it moved: {running_events:?}"
+        );
     }
 }

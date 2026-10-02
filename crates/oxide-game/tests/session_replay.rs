@@ -1836,3 +1836,145 @@ fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
         "the same for the frozen -6001 frame against the plain 6001 frame"
     );
 }
+
+#[test]
+fn the_frozen_clock_holds_the_time_of_day_while_the_ticks_advance() {
+    // A stopped day-night cycle puts a negative time on the wire
+    // (`S03PacketTimeUpdate.java:17-31`); the receive rule reads its sign into
+    // the clock's frozen flag (`WorldClient.setWorldTime`, `WorldClient.java:468-483`)
+    // and the tick's advance of the time of day is gated on it (`WorldClient.tick`,
+    // `:71-74`). The connection then goes quiet for whole ticks: the player steps and the
+    // world age moves with every tick, the time of day holds at the frozen value, and no
+    // tick reports a sky — a step reports a sky exactly when it moved the time of day.
+    // The quiet stretch's keepalive is still answered.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(&mut head, &chunk_data_frame(0, 0), SERVER_FRAMING);
+    // `-6000` on the wire: the cycle is stopped and the hour is noon.
+    frame(&mut head, &time_update_frame(48_000, -6000), SERVER_FRAMING);
+
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(keepalive_script(91)),
+        // Sixteen idle waits: a few hundred milliseconds of quiet, whole steps of it.
+        stalls: 16,
+        tail_stalls: 0,
+        outgoing,
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let ticks: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                tick,
+                snapped: false,
+                ..
+            } => Some(*tick),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ticks.len() >= 3,
+        "the quiet stretch owes whole steps even with the cycle stopped: {ticks:?}"
+    );
+    assert_eq!(ticks.first().copied(), Some(1), "the first tick is tick 1");
+    for pair in ticks.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "the tick count is gap-free: {ticks:?}"
+        );
+    }
+    // One clock update — the frozen frame's, its wire sign negated — and no other.
+    let clocks: Vec<(i64, i64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Time {
+                world_age,
+                time_of_day,
+            } => Some((*world_age, *time_of_day)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        clocks,
+        vec![(48_000, 6000)],
+        "the frozen frame is the only clock: {events:?}"
+    );
+    // No tick advanced the time of day, so no tick reports a sky: the only sky is the
+    // frozen frame's own, and it is the noon the negated time renders.
+    let skies: Vec<SkyReport> = events.iter().filter_map(sky_report).collect();
+    assert_eq!(
+        skies.len(),
+        1,
+        "a tick reports a sky only when it moved the time of day: {events:?}"
+    );
+    assert_eq!(
+        skies[0].celestial_angle, 0.0,
+        "the frozen noon: `-6000` is 6000"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::KeepAlive { id: 91 })),
+        "the quiet stretch does not starve the read loop: {events:?}"
+    );
+}
+
+#[test]
+fn the_pitch_look_clamps_at_ninety_degrees_each_way() {
+    // `Entity.setAngles` clamps the pitch to ±90 (`Entity.java:395`). The look applies its
+    // delta where the source applies it — when the mouse is polled, not on the tick — so a
+    // delta far past the limit leaves the pitch at the limit exactly, in either direction.
+    // The clamped value rides the snapped tick the correction reports: the pitch arrives
+    // with the relative flag and a zero delta, so the report adds nothing of its own.
+    let pitch_after_delta = |dy: f64| -> f32 {
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        input_tx
+            .send(InputEvent::MouseDelta { dx: 0.0, dy })
+            .expect("the input channel is open");
+        let (stream, _outgoing) = duplex(stream_with(&[
+            join_game_frame(),
+            position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0x10),
+        ]));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        Session::new(Conn::new(stream), config())
+            .run_over(&sender, input_rx)
+            .expect("the session runs to the end of the stream");
+        let events: Vec<ClientEvent> = receiver.try_iter().collect();
+        events
+            .iter()
+            .find_map(|event| match event {
+                ClientEvent::PlayerTick {
+                    pitch,
+                    snapped: true,
+                    ..
+                } => Some(*pitch),
+                _ => None,
+            })
+            .expect("the correction reports a snapped tick")
+    };
+    // Ten thousand pixels down: 1,500° at the fixed 0.5 sensitivity, far past the limit.
+    assert_eq!(
+        pitch_after_delta(10_000.0),
+        90.0,
+        "a delta far down clamps the pitch at +90"
+    );
+    assert_eq!(
+        pitch_after_delta(-10_000.0),
+        -90.0,
+        "a delta far up clamps the pitch at -90"
+    );
+}

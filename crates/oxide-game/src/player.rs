@@ -12,11 +12,10 @@ const EYE_HEIGHT: f64 = 1.62;
 
 /// The player: the state one tick steps and the window draws.
 ///
-/// The fields are the surface the later M3 tasks extend — each extension is
-/// declared in its own task. `position`, `last_tick_position`, `tick`, the
-/// look and the flags are what the per-tick `PlayerTick` event reports;
-/// `motion` and `on_ground` are the physics core's input (Task 2);
-/// `flying` and `in_water` gate the movement rules (Tasks 2, 3).
+/// The fields are the surface the movement and physics rules extend.
+/// `position`, `last_tick_position`, `tick`, the look and the flags are what
+/// the per-tick `PlayerTick` event reports; `motion` and `on_ground` are the
+/// physics core's input; `flying` and `in_water` gate the movement rules.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Player {
     /// The feet position in the world.
@@ -66,8 +65,8 @@ impl Player {
 
     /// The eye's height above the feet, in blocks.
     ///
-    /// The one place the constant is defined; the interaction raycast
-    /// (Task 7) and the camera (Task 11) both consume it.
+    /// The one place the constant is defined; the interaction raycast and the
+    /// camera read the value from here.
     pub fn eye_height(&self) -> f64 {
         EYE_HEIGHT
     }

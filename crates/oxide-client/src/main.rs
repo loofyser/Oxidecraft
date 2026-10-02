@@ -469,9 +469,9 @@ struct SessionLink {
     /// The window's end of the input channel; the session thread drains the other
     /// end.
     ///
-    /// Nothing sends here until the window's events are translated — that wiring
-    /// is the task after this one — but the link owns the sender so the channel
-    /// lives as long as the session does.
+    /// Nothing sends here yet — the window's events are not translated into
+    /// `InputEvent`s — but the link owns the sender so the channel lives as
+    /// long as the session does.
     #[allow(dead_code)]
     input_tx: Sender<InputEvent>,
 }

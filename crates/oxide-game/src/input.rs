@@ -205,9 +205,9 @@ impl SprintTap {
     ///
     /// `sprinting` is the state the previous tick left; the return value is
     /// the state this tick leaves. The rule is `EntityPlayerSP.onLivingUpdate`'s
-    /// own (`:801-820`), with the terms M3 cannot carry yet left out and
-    /// recorded here: the food gate `flag3`, the item use and blindness gates
-    /// and the horizontal-collision release all need state later tasks add.
+    /// own (`:801-820`); the food gate `flag3`, the item use and blindness
+    /// gates and the horizontal-collision release all need player state this
+    /// client does not carry yet, so they are left out and recorded here.
     pub fn update(&mut self, input: &Intent, sprinting: bool, on_ground: bool) -> bool {
         // The source reads the previous tick's input bits before this tick's
         // input updates (`:782-785`), and runs the window down first (`:727-729`).
@@ -392,6 +392,37 @@ mod tests {
     }
 
     #[test]
+    fn the_sprint_window_is_exactly_seven_ticks_wide() {
+        // The border of the source's window (`sprintToggleTimer = 7`,
+        // `EntityPlayerSP.java:805`; read at `:803`). The timer runs down
+        // once per tick at the top of the rule (`:727-729`), so a press that
+        // lands five intervening ticks after the arming press — six ticks on —
+        // still finds the window open and sprints, while one intervening tick
+        // later — seven ticks on — finds it expired and re-arms instead. The
+        // two sides fix the width at seven.
+        let sprint_after_intervening_ticks = |intervening: usize| -> bool {
+            let mut tap = SprintTap::default();
+            let mut intent = Intent::neutral();
+            intent.apply_key(Key::W, true);
+            tick(&mut tap, &intent, false); // the arming press opens the window
+            intent.apply_key(Key::W, false);
+            for _ in 0..intervening {
+                tick(&mut tap, &intent, false);
+            }
+            intent.apply_key(Key::W, true);
+            tick(&mut tap, &intent, false)
+        };
+        assert!(
+            sprint_after_intervening_ticks(5),
+            "a press six ticks on from the arming press is inside the window"
+        );
+        assert!(
+            !sprint_after_intervening_ticks(6),
+            "a press seven ticks on finds the window expired and re-arms"
+        );
+    }
+
+    #[test]
     fn the_sprint_key_sprints_while_forward_is_held() {
         // `... && keyBindSprint.isKeyDown()) { this.setSprinting(true); }`
         // (`EntityPlayerSP.java:813-816`) needs no double tap.
@@ -423,6 +454,33 @@ mod tests {
             !tick(&mut tap, &intent, sprinting),
             "sneak drops the forward input and releases sprint"
         );
+    }
+
+    #[test]
+    fn the_sprint_threshold_is_the_sources_eight_tenths() {
+        // The forward input a sprint needs is `float f = 0.8F`
+        // (`EntityPlayerSP.java:784`, compared at `:785` and `:801`). The
+        // bindings can hold full forward (1.0), its sneak-scaled 0.3, or
+        // nothing — no value near the threshold — so it is fixed against
+        // synthetic inputs the window cannot produce: 0.85 and 0.81 clear it,
+        // 0.79 and 0.75 fall short.
+        let sprinting_with = |forward: f32| -> bool {
+            let mut tap = SprintTap::default();
+            let mut intent = Intent::neutral();
+            intent.forward = forward;
+            intent.sprint = true;
+            tick(&mut tap, &intent, false)
+        };
+        assert!(
+            sprinting_with(0.85),
+            "0.85 clears the eight-tenths threshold"
+        );
+        assert!(
+            !sprinting_with(0.75),
+            "0.75 falls short of the eight-tenths threshold"
+        );
+        assert!(sprinting_with(0.81), "0.81 clears it");
+        assert!(!sprinting_with(0.79), "0.79 falls short of it");
     }
 
     #[test]
