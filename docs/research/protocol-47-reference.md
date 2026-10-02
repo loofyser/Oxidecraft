@@ -279,7 +279,7 @@ them.
 | 0x05 | Player Look | Yaw Float; Pitch Float; OnGround Bool | core |
 | 0x06 | Player Position And Look | X Double; FeetY Double; Z Double; Yaw Float; Pitch Float; OnGround Bool (**reply to clientbound 0x08**) | core |
 | 0x07 | Player Digging | Status Byte (0 start, 1 cancel, 2 finish, 3 drop stack, 4 drop item, 5 shoot/finish eating); Location Position; Face Byte (0 −Y, 1 +Y, 2 −Z, 3 +Z, 4 −X, 5 +X) | core |
-| 0x08 | Player Block Placement | Location Position; Face Byte; HeldItem Slot; CursorX/Y/Z Byte (0–15) | need |
+| 0x08 | Player Block Placement | Location Position; Face Byte; Held Item Stack (short −1 when empty, else id/count/damage/NBT via `PacketBuffer.writeItemStackToBuffer`); CursorX/Y/Z Byte (0–16; a face-exact hit writes 16) | need |
 | 0x09 | Held Item Change | Slot Short (0–8) | need |
 | 0x0A | Animation (sb) | *(no fields)* — swing arm | need |
 | 0x0B | Entity Action | EID VarInt; ActionID VarInt (0 crouch, 1 uncrouch, 2 leave bed, 3 start sprinting, 4 stop sprinting, 5 jump horse, 6 open inventory); JumpBoost VarInt (horse 0–100) | need |
