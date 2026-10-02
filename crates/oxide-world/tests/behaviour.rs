@@ -386,3 +386,99 @@ fn the_opacity_predicate_is_not_the_full_cube_column() {
         "the leaves occlude under Fast graphics"
     );
 }
+
+/// The extra sample-wall cells: the multi-variant ids the acceptance scenes
+/// exercise, as explicit (id, meta) pairs.
+///
+/// The canonical wall cell of every covered id carries meta 0; these add the
+/// states the canonical cell does not show. The list is Task 15 Step 3's:
+/// wool's and planks' colours, the logs' variants and axes, stone's, stone
+/// brick's and sandstone's named variants, the slab's two seamless states,
+/// and the grass block's snowy pair. The last one is a metadata pair only:
+/// `BlockGrass.getMetaFromState` returns 0 (`BlockGrass.java:165-168`) and the
+/// class does not override `getStateFromMeta`, so meta 1 places the same state
+/// as meta 0 — the snowy=true state is the world-contextual `getActualState`
+/// value the M2 plan's Decision 8 leaves to M6/M9.
+const EXTRA_CELLS: &[(u16, u8)] = &[
+    // Wool's colours, metas 1..=15 (meta 0 is the canonical cell).
+    (35, 1),
+    (35, 2),
+    (35, 3),
+    (35, 4),
+    (35, 5),
+    (35, 6),
+    (35, 7),
+    (35, 8),
+    (35, 9),
+    (35, 10),
+    (35, 11),
+    (35, 12),
+    (35, 13),
+    (35, 14),
+    (35, 15),
+    // Planks' colours, metas 1..=5.
+    (5, 1),
+    (5, 2),
+    (5, 3),
+    (5, 4),
+    (5, 5),
+    // The old log's four variants on the y, x and z axes.
+    (17, 1),
+    (17, 2),
+    (17, 3),
+    (17, 4),
+    (17, 5),
+    (17, 6),
+    (17, 7),
+    (17, 8),
+    (17, 9),
+    (17, 10),
+    (17, 11),
+    // The new log's two variants on the y, x and z axes.
+    (162, 1),
+    (162, 4),
+    (162, 5),
+    (162, 8),
+    (162, 9),
+    // Stone's named variants, metas 1..=6.
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (1, 5),
+    (1, 6),
+    // Stone brick's named variants, metas 1..=3.
+    (98, 1),
+    (98, 2),
+    (98, 3),
+    // Sandstone's named variants, metas 1..=2.
+    (24, 1),
+    (24, 2),
+    // The double stone slab's two seamless states.
+    (43, 8),
+    // The grass block's snowy pair (meta 0 is the canonical cell).
+    (2, 1),
+];
+
+/// Prints the sample-wall input: every covered id at its canonical meta, then
+/// the extra variant cells.
+///
+/// This is the rig's wall list. Run it explicitly and capture the output:
+///
+/// ```text
+/// cargo test -p oxide-world --test behaviour -- --ignored --nocapture \
+///   print_the_sample_wall_input
+/// ```
+#[test]
+#[ignore = "prints the sample-wall input for the rig; run it explicitly"]
+fn print_the_sample_wall_input() {
+    println!("# covered canonical cells: id\tname\tmeta");
+    for &id in covered_ids() {
+        println!("{id}\t{}\t0", block(id).name);
+    }
+    println!("# extra variant cells: id\tname\tmeta\tvariant_key");
+    for &(id, meta) in EXTRA_CELLS {
+        let entry = block(id);
+        println!("{id}\t{}\t{meta}\t{}", entry.name, variant_key(entry, meta));
+    }
+}
