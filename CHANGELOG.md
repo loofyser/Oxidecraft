@@ -7,6 +7,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Milestone M3: the player
+
+Delivered and tagged `m3` on 2026-10-04. The client is a participant in the world: the 20 Hz tick
+loop and input path, the movement model with its environment rules, the collision view of the
+world, gamemode-dependent reach, digging and placing with prediction, the crack overlay and block
+outline, movement packets, death and respawn, and the full FOV camera with view bobbing and the
+hurt roll — carried through a live acceptance run whose every headline number was re-derived from
+the recorded artifacts; the defect the run surfaced (a mid-session game-mode change going
+untracked) was fixed in the milestone's scoped fix round. The documented classes and the
+operator's by-eye list are in `docs/STATE.md`.
+
+### Added
+
+- The tick loop, the keybind map and the scripted-input capture path (`--input-script`).
+- The player movement model with the recorded test vectors — walk/sprint/jump, water and lava
+  drag, ladders, sneaking edge protection and creative flight — and the collision view of the
+  world.
+- The movement packets and self-state (0x03–0x06, abilities), the block-change packets
+  (0x22/0x23) with their light hooks, and block placement (0x08) with optimistic prediction and
+  reconcile.
+- Death, respawn and the interim death view; the dig machine with break progress and prediction;
+  the aim raycast with gamemode-dependent reach.
+- The camera's full FOV formula, view bobbing and the hurt roll; the crack overlay and the block
+  outline.
+- The live acceptance run (movement vectors, the creative leg, death/respawn, the serverbound
+  spot-check, the latency proxy) with its recorded numbers and the vanilla-visible placement
+  captures.
+
+No new dependencies added; the milestone's corrected documents ride its commits.
+
 ### Milestone M2: textured terrain
 
 Delivered and tagged `m2` on 2026-10-02. The client draws the world from the real 1.8.9 jar — the

@@ -14,10 +14,11 @@ faster, more stable, lighter, and open source.
 
 ## Development status
 
-Pre-alpha, and past the groundwork: milestone M0 (foundations) is complete — the workspace, the
-verified asset pipeline, jar extraction and the wgpu window all work, and CI is green. Milestone M1
-(bytes to world) is next. See `docs/STATE.md` for where the project stands, what is verified, and
-the evidence.
+Pre-alpha and playable on the rig: M0 (foundations), M1 (bytes to world) and M2 (textured terrain)
+are complete, and M3 (the player) closed on 2026-10-04 — the client ticks, moves with the recorded
+physics, digs and places blocks in agreement with a live 1.8.9 server, and dies and respawns.
+Milestone M4 (entities and chat) is next. See `docs/STATE.md` for where the project stands, what is
+verified, and the evidence.
 
 ## Building
 

@@ -122,5 +122,9 @@ build, see "Redo").
 
 ## Milestone summary
 
-M2 (textured terrain) closed and tagged `m2` on 2026-10-02; the milestone's state entry and
-acceptance record are in `docs/STATE.md` ("M2 evidence").
+M3 (the player) closed and tagged `m3` on 2026-10-04; its state entry and acceptance record are
+in `docs/STATE.md` ("M3 evidence"). M3 added no image-metric classes; its one frame-cost finding
+is build-side: under the identical movement segment the release build holds a flat ≈144 fps
+while the debug build collapses late (median 80.8, tail ≤ 50) — recorded in the milestone's
+completion report. The M2 baseline (textured terrain, tagged `m2` 2026-10-02) above stands as the
+comparison point for M9's full protocol.
