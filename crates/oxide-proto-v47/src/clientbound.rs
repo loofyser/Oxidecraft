@@ -891,6 +891,43 @@ impl Respawn {
     }
 }
 
+/// Clientbound Change Game State (play id 0x2B).
+///
+/// One reason byte and one float whose meaning depends on the reason
+/// (`S2BPacketChangeGameState.readPacketData:29-30`): reason 3 carries the new
+/// game mode's id as a float, and every other reason decodes to fields this
+/// client leaves alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChangeGameState {
+    /// The reason code; [`Self::REASON_CHANGE_GAME_MODE`] is the game-mode
+    /// change.
+    pub reason: u8,
+    /// The reason's float payload: the game mode id for reason 3.
+    pub value: f32,
+}
+
+impl ChangeGameState {
+    /// The packet id.
+    ///
+    /// The play list's 44th clientbound registration — 43 entries precede it
+    /// (`EnumConnectionState.java:168`) — the reference's own row for 0x2B
+    /// (`docs/research/protocol-47-reference.md` §2).
+    pub const ID: i32 = 0x2B;
+
+    /// Reason 3: the game mode changed; [`Self::value`] carries the mode id
+    /// (`NetHandlerPlayClient.handleChangeGameState:1383`).
+    pub const REASON_CHANGE_GAME_MODE: u8 = 3;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let reason = codec::read_u8(&mut cursor)?;
+        let value = codec::read_f32(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { reason, value })
+    }
+}
+
 /// Clientbound Entity Status (play id 0x1A).
 ///
 /// An entity id and one status byte (`S19PacketEntityStatus.readPacketData:28-31`),
@@ -931,7 +968,8 @@ mod tests {
     //! arithmetic, so a wrong shift cannot be confirmed by its own twin.
 
     use super::{
-        BlockBreakAnimation, BlockChange, EntityStatus, MultiBlockChange, Respawn, UpdateHealth,
+        BlockBreakAnimation, BlockChange, ChangeGameState, EntityStatus, MultiBlockChange, Respawn,
+        UpdateHealth,
     };
     use crate::PacketError;
 
@@ -1211,5 +1249,48 @@ mod tests {
             BlockBreakAnimation::decode(&body[..4]).is_err(),
             "a cut payload is an error"
         );
+    }
+
+    #[test]
+    fn change_game_state_decodes_the_reason_and_the_value() {
+        // 0x2B: Reason UByte, Value Float
+        // (`S2BPacketChangeGameState.readPacketData:27-31`). The id is the
+        // play list's 44th clientbound registration — 43 entries precede it
+        // (`EnumConnectionState.java:168`) — and the reference's own row
+        // (`docs/research/protocol-47-reference.md` §2, 0x2B). The first
+        // fixture is reason 3, the game-mode change, value 1.0f32
+        // (0x3F800000, creative's id); the second is reason 7 with value 0.0.
+        let mode: &[u8] = &[0x03, 0x3f, 0x80, 0x00, 0x00];
+        let change = ChangeGameState::decode(mode).expect("the fixture decodes");
+        assert_eq!(
+            change.reason,
+            ChangeGameState::REASON_CHANGE_GAME_MODE,
+            "the reason byte"
+        );
+        assert_eq!(
+            ChangeGameState::REASON_CHANGE_GAME_MODE,
+            3,
+            "reason 3 is the game-mode change"
+        );
+        assert_eq!(change.value, 1.0, "value 1.0 is creative's id");
+        assert_eq!(
+            ChangeGameState::ID,
+            0x2b,
+            "the play id: the 44th clientbound registration"
+        );
+
+        let fade: &[u8] = &[0x07, 0x00, 0x00, 0x00, 0x00];
+        let change = ChangeGameState::decode(fade).expect("the fixture decodes");
+        assert_eq!(change.reason, 7, "an inert reason decodes like any other");
+        assert_eq!(change.value, 0.0, "the reason's float");
+
+        // A cut payload is an error, never a panic; a trailing byte is
+        // refused.
+        assert!(ChangeGameState::decode(&mode[..4]).is_err());
+        let trailing: &[u8] = &[0x03, 0x3f, 0x80, 0x00, 0x00, 0x01];
+        assert!(matches!(
+            ChangeGameState::decode(trailing),
+            Err(PacketError::Trailing(1))
+        ));
     }
 }

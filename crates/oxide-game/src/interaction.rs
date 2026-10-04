@@ -101,6 +101,28 @@ pub fn creative(gamemode: u8) -> bool {
     gamemode & !HARDCORE_BIT == CREATIVE_ID
 }
 
+/// The gamemode byte a Change Game State value names.
+///
+/// `NetHandlerPlayClient.handleChangeGameState` reads the wire float, floors
+/// it to an id — `MathHelper.floor_float(f + 0.5F)` (`:1364`) — and asks
+/// `WorldSettings.GameType.getByID` for the type (`:1383`). That lookup
+/// exact-matches the enum's ids — `NOT_SET(-1)`, `SURVIVAL(0)`, `CREATIVE(1)`,
+/// `ADVENTURE(2)`, `SPECTATOR(3)` (`world/WorldSettings.java:137-141`) — and
+/// answers survival for every other id (`:203-213`). The reach asks the type
+/// one question — is it creative (`client/multiplayer/PlayerControllerMP.java:344-346`)
+/// — so every id but 1 reads non-creative, and the byte returned is the id
+/// itself for `0..=3`, survival for the rest. NOT_SET is stored as survival:
+/// its reach is survival's, and the byte this session carries cannot hold -1.
+///
+/// Hostile values land survival without a panic: Java's narrowing of the
+/// floored float reads a NaN as zero and an infinity as the integer's bound
+/// (`MathHelper.floor_float`), and Rust's `as` cast produces the same values,
+/// so neither can reach the creative id.
+pub fn mode_from_value(value: f32) -> u8 {
+    let id = (value + 0.5).floor() as i32;
+    if (0..=3).contains(&id) { id as u8 } else { 0 }
+}
+
 /// The face of a block the interaction ray met.
 ///
 /// The variants and their order are the source's `EnumFacing`
@@ -1173,8 +1195,8 @@ mod tests {
 
     use super::{
         Aim, BreakStages, CREATIVE_REACH, DigAction, DigAim, DigState, Face, Placement,
-        SURVIVAL_REACH, hand_rate, look_vector, placement, placement_cursor, raycast, reach,
-        replaceable, tool_not_required,
+        SURVIVAL_REACH, creative, hand_rate, look_vector, mode_from_value, placement,
+        placement_cursor, raycast, reach, replaceable, tool_not_required,
     };
     use crate::player::Player;
     use crate::world_view::WorldView;
@@ -2505,5 +2527,45 @@ mod tests {
         assert!(stages.set(0, 64, 0, 7), "the second changed the stage");
         assert_eq!(stages.len(), 1, "one entry for the position");
         assert_eq!(stages.stage(0, 64, 0), Some(7), "the latest stage");
+    }
+
+    #[test]
+    fn the_mode_from_a_change_game_state_value_follows_the_source() {
+        // `NetHandlerPlayClient.handleChangeGameState` floors the wire float —
+        // `MathHelper.floor_float(f + 0.5F)` (`:1362`) — and asks
+        // `WorldSettings.GameType.getByID` (`:1383`), whose exact matches are
+        // the enum's ids and whose fallback is SURVIVAL
+        // (`WorldSettings.java:203-214`). The reach asks the answer one
+        // question — is it creative (`PlayerControllerMP.java:344-346`) — so
+        // every id but 1 reads non-creative.
+        let cases = [
+            (1.0, 1, "creative"),
+            (0.0, 0, "survival"),
+            (-1.0, 0, "NOT_SET reads non-creative; stored as survival"),
+            (2.0, 2, "adventure"),
+            (3.0, 3, "spectator"),
+            (4.0, 0, "no such id: getByID answers survival"),
+            (0.4, 0, "floor(0.9): a ceiling would flip this one"),
+            (0.5, 1, "floor(1.0) is creative's id exactly"),
+            (1.4, 1, "floor(1.9)"),
+            (1.5, 2, "floor(2.0) is the next id, not creative"),
+            (f32::NAN, 0, "NaN narrows to zero, survival's id"),
+            (
+                f32::INFINITY,
+                0,
+                "an infinity saturates to a bound, not an id",
+            ),
+            (f32::NEG_INFINITY, 0, "either bound answers survival"),
+            (3.4e38, 0, "a huge value"),
+            (-3.4e38, 0, "a huge negative value"),
+        ];
+        for (value, expected, why) in cases {
+            assert_eq!(mode_from_value(value), expected, "{value} -> {why}");
+            assert_eq!(
+                creative(mode_from_value(value)),
+                expected == 1,
+                "{value} reads creative only for id 1"
+            );
+        }
     }
 }

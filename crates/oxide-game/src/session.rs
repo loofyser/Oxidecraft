@@ -47,10 +47,10 @@ use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChunkData, EntityStatus, JoinGame,
-    KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect, PlayerAbilities,
-    PlayerListItem, PlayerPositionAndLook, PluginMessage, Respawn, TimeUpdate, UpdateHealth,
-    read_packet_id,
+    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChangeGameState, ChunkData, EntityStatus,
+    JoinGame, KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect,
+    PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage, Respawn, TimeUpdate,
+    UpdateHealth, read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -75,8 +75,8 @@ use tracing::{debug, info, warn};
 
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
-    Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector, placement,
-    raycast, reach, tool_not_required,
+    Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
+    mode_from_value, placement, raycast, reach, tool_not_required,
 };
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
@@ -914,6 +914,26 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // The view block moved: the sky's colour is sampled at the player's own
                             // block, so a correction can change it without a new clock.
                             report_sky(world.as_ref(), player.position, clock.as_ref(), events);
+                        }
+                        ChangeGameState::ID => {
+                            let change = decoded(id, ChangeGameState::decode(body))?;
+                            if change.reason == ChangeGameState::REASON_CHANGE_GAME_MODE {
+                                // The mode the reach and the dig machine's creative
+                                // branch read. Both read it live — the aim recomputes
+                                // against this byte each tick, and the dig step takes
+                                // it per step — so the next recompute already uses the
+                                // new reach (`PlayerControllerMP.java:344-346`). The
+                                // value maps as the source's handler maps it: floored
+                                // and matched against the enum, everything unknown
+                                // answering survival (`NetHandlerPlayClient.java:1364`,
+                                // `:1383`).
+                                gamemode = mode_from_value(change.value);
+                                debug!(
+                                    gamemode,
+                                    value = change.value,
+                                    "the server changed the game mode"
+                                );
+                            }
                         }
                         TimeUpdate::ID => {
                             let update = decoded(id, TimeUpdate::decode(body))?;

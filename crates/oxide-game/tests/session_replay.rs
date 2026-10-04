@@ -4684,3 +4684,113 @@ fn an_entity_status_for_the_player_fills_the_hurt_flash_and_the_ticks_count_it_d
         "the flash reaches zero: {flashes:?}"
     );
 }
+
+/// One Change Game State payload (0x2B): the reason byte and the value float,
+/// hand-packed as the source reads them
+/// (`S2BPacketChangeGameState.readPacketData:27-31`: an unsigned byte then a
+/// big-endian float), never through a writer's own arithmetic.
+fn change_game_state_frame(reason: u8, value: f32) -> Vec<u8> {
+    let mut payload = vec![0x2B, reason];
+    payload.extend_from_slice(&value.to_be_bytes());
+    payload
+}
+
+/// A join under `gamemode` carrying the stone floor, a teleport onto its
+/// surface at (0.5, 64.0, 0.389) facing south, and a stone at (0, 65, 5)
+/// whose north face sits 4.611 from the pose eye: inside creative's 5.0 reach
+/// and outside survival's 4.5 — the step-3 scene's own edge distance.
+fn reach_edge_head(gamemode: u8) -> Vec<u8> {
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame_as(gamemode), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 64.0, 0.389, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 5, STONE),
+        SERVER_FRAMING,
+    );
+    head
+}
+
+#[test]
+fn a_mid_session_game_mode_change_arms_the_reach_for_a_placement() {
+    // The join carries survival, so the 4.611 stone is out of reach while the
+    // session ticks. The server's 0x2B reason 3 value 1.0 then restates the
+    // mode (`NetHandlerPlayClient.handleChangeGameState:1360-1383`), and the
+    // next aim recompute reads creative's 5.0
+    // (`PlayerControllerMP.java:344-346`): the stone is aimed and the right
+    // press sends exactly one placement naming it.
+    let mut tail = Vec::new();
+    frame(&mut tail, &change_game_state_frame(3, 1.0), SERVER_FRAMING);
+    let (events, frames) = flip_session(reach_edge_head(0), tail, 6, 48, vec![(8, right_press())]);
+
+    let placements: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x08).collect();
+    assert_eq!(
+        placements,
+        vec![&placement_frame(0, 65, 5, 2, [8, 9, 0])],
+        "one placement frame, its bytes the aim's own: {frames:?}"
+    );
+
+    // The reach is visible in the aim: the first aim the session reports is
+    // the stone only creative's reach can touch.
+    let first = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("the mode change armed the aim");
+    match &events[first] {
+        ClientEvent::Aim { aim: Some(aim) } => assert_eq!(
+            (aim.x, aim.y, aim.z, aim.face),
+            (0, 65, 5, Face::North),
+            "the stone 4.611 away, met through its north face"
+        ),
+        other => panic!("expected the stone the mode change armed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_zero_game_mode_value_leaves_the_reach_at_survival() {
+    // The same scene and press with value 0.0: `getByID(0)` is survival, the
+    // mode byte stays 0, the 4.611 stone is never aimed, and the press sends
+    // no placement.
+    let mut tail = Vec::new();
+    frame(&mut tail, &change_game_state_frame(3, 0.0), SERVER_FRAMING);
+    let (events, frames) = flip_session(reach_edge_head(0), tail, 6, 48, vec![(8, right_press())]);
+
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x08),
+        "no placement leaves for a target out of reach: {frames:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_), .. })),
+        "the survival reach never arms the 4.611 stone: {events:?}"
+    );
+}
+
+#[test]
+fn an_inert_change_game_state_reason_leaves_the_game_mode_alone() {
+    // Reason 7 (the fade value) with value 1.0 — the weather-side reasons the
+    // acceptance's own log carried per tick — decodes but changes nothing:
+    // only reason 3 touches the mode, so the reach stays survival and no
+    // placement leaves.
+    let mut tail = Vec::new();
+    frame(&mut tail, &change_game_state_frame(7, 1.0), SERVER_FRAMING);
+    let (events, frames) = flip_session(reach_edge_head(0), tail, 6, 48, vec![(8, right_press())]);
+
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x08),
+        "an inert reason arms nothing: {frames:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_), .. })),
+        "the mode is unchanged, so the 4.611 stone stays out of reach: {events:?}"
+    );
+}
