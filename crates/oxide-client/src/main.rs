@@ -42,9 +42,14 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::Aim;
+use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
 use oxide_proto_v47::serverbound::ClientSettings;
-use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
+use oxide_render::camera::{
+    Camera, CameraPose, CameraSensor, DEFAULT_FOV, FovInputs, FovSmoother, NEAR_PLANE,
+    WalkDistance, bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll,
+    interpolate_pose, render_eye,
+};
 use oxide_render::fog::{FogParams, fog_colour, linear_params};
 use oxide_render::fps::FpsCounter;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
@@ -389,6 +394,10 @@ struct ClientApp {
     /// the two, so nothing interpolates across the jump. The tick is the session's own
     /// 20 Hz clock, and it is what the cloud offset advances from.
     player: PlayerState,
+    /// The camera's own per-tick state: the smoother the FOV base blends through, the walk
+    /// distance and the two damped sensors the view bob reads, the hurt flash, and the
+    /// death and arrival clocks the frame's terms and fraction use.
+    camera: CameraState,
     /// Whether F3 has the overlay showing.
     overlay_visible: bool,
     /// Whether the session last reported the player dead.
@@ -485,6 +494,145 @@ impl PlayerState {
             self.previous = self.current;
         }
         self.tick = tick;
+    }
+}
+
+/// The camera's per-tick state: the FOV smoother, the walk distance and the damped camera
+/// sensors the view bob reads, the hurt flash, and the death and arrival clocks.
+///
+/// The smoother steps once per tick toward `AbstractClientPlayer.getFovModifier`'s value —
+/// what `EntityRenderer.updateFovModifierHand` blends (`EntityRenderer.java:527-530`), which
+/// carries the flying factor and the sprint attribute but not the water or death terms. The
+/// walk distance and the two sensors mirror `Entity.moveEntity`'s distance increment
+/// (`Entity.java:872`), `Entity.onEntityUpdate`'s previous-tick copies (`:420`) and
+/// `EntityPlayer.onLivingUpdate`'s damping (`EntityPlayer.java:653-654`). The tick's
+/// displacement between the two reported positions stands in for the source's motion
+/// vector, which the tick events do not carry.
+#[derive(Debug, Default)]
+struct CameraState {
+    /// The FOV smoother the frame's base blends through.
+    smoother: FovSmoother,
+    /// The walk-distance accumulator and its previous tick's copy.
+    walk: WalkDistance,
+    /// The damped yaw sensor.
+    camera_yaw: CameraSensor,
+    /// The damped pitch sensor.
+    camera_pitch: CameraSensor,
+    /// The latest tick's hurt flash (`hurtTime`).
+    hurt_time: u32,
+    /// The yaw the last hurt came from (`attackedAtYaw`); zero until M4 tracks attackers.
+    attacked_at_yaw: f32,
+    /// Whether the latest tick reported the player in water, for the FOV's water term.
+    in_water: bool,
+    /// Ticks the death state has run (`deathTime`).
+    death_time: u32,
+    /// The feet position the latest tick reported, for the next tick's displacement.
+    last_position: Option<[f64; 3]>,
+    /// When the latest tick arrived, for the frame fraction.
+    last_tick_arrival: Option<Instant>,
+}
+
+/// One `PlayerTick`'s camera-relevant state: the position the displacement is measured from,
+/// the flags the smoother and the accumulators read, the hurt flash and the death state.
+#[derive(Debug, Clone, Copy)]
+struct CameraTick {
+    /// The feet position the tick reported.
+    position: [f64; 3],
+    /// Whether the player stands on something.
+    on_ground: bool,
+    /// Whether the player is sprinting.
+    sprinting: bool,
+    /// Whether the player is sneaking.
+    sneaking: bool,
+    /// Whether the player is flying.
+    flying: bool,
+    /// Whether the player is in water.
+    in_water: bool,
+    /// Ticks left of the hurt flash.
+    hurt_time: u32,
+    /// The yaw the last hurt came from.
+    attacked_at_yaw: f32,
+    /// Whether a server correction produced this tick.
+    snapped: bool,
+    /// Whether the player is dead.
+    dead: bool,
+}
+
+impl CameraState {
+    /// Folds one `PlayerTick` into the state.
+    ///
+    /// The previous tick's copies slide in first, the smoother steps toward the tick's own
+    /// modifier, and the walk distance and the two sensors advance. A snapped tick carries
+    /// a server correction, so its displacement is neither walking nor motion.
+    fn observe(&mut self, tick: CameraTick) {
+        self.walk.previous = self.walk.distance;
+        self.camera_yaw.previous = self.camera_yaw.value;
+        self.camera_pitch.previous = self.camera_pitch.value;
+        self.smoother.step(fov_modifier(&FovInputs {
+            sprinting: tick.sprinting,
+            flying: tick.flying,
+            // The bow's counter arrives with M5; the term is the identity at zero.
+            item_use_ticks: 0,
+        }));
+        self.hurt_time = tick.hurt_time;
+        self.attacked_at_yaw = tick.attacked_at_yaw;
+        self.in_water = tick.in_water;
+        if tick.dead {
+            self.death_time += 1;
+        } else {
+            self.death_time = 0;
+        }
+        let delta = if tick.snapped {
+            [0.0, 0.0, 0.0]
+        } else {
+            match self.last_position {
+                Some(previous) => [
+                    tick.position[0] - previous[0],
+                    tick.position[1] - previous[1],
+                    tick.position[2] - previous[2],
+                ],
+                None => [0.0, 0.0, 0.0],
+            }
+        };
+        self.last_position = Some(tick.position);
+        // The walk-distance increment (`Entity.java:872`): the horizontal displacement
+        // times 0.6, skipped while flying (`EntityPlayer.canTriggerWalking`,
+        // `:2205-2208`), on the sneak glide on the ground (`Entity.java:626`) and on a
+        // correction.
+        if !tick.snapped && !tick.flying && !(tick.on_ground && tick.sneaking) {
+            self.walk.distance += ((delta[0] * delta[0] + delta[2] * delta[2]).sqrt() * 0.6) as f32;
+        }
+        // The damped camera sensors (`EntityPlayer.java:635-654`): the yaw follows the
+        // horizontal speed clamped to 0.1 and zeroed off the ground or dead, the pitch
+        // follows the vertical motion's lean and is zeroed on the ground or dead.
+        let mut speed = ((delta[0] * delta[0] + delta[2] * delta[2]).sqrt()).min(0.1) as f32;
+        if !tick.on_ground || tick.dead {
+            speed = 0.0;
+        }
+        let mut lean = ((-delta[1] * f64::from(0.2_f32)).atan() * 15.0) as f32;
+        if tick.on_ground || tick.dead {
+            lean = 0.0;
+        }
+        self.camera_yaw.value += (speed - self.camera_yaw.value) * 0.4;
+        self.camera_pitch.value += (lean - self.camera_pitch.value) * 0.8;
+    }
+
+    /// The frame fraction: the time since the latest `PlayerTick` arrived over the 50 ms
+    /// tick, clamped to `0..=1`; a frame before the first tick is at zero.
+    fn partial(&self, now: Instant) -> f32 {
+        match self.last_tick_arrival {
+            Some(arrival) => (now.duration_since(arrival).as_secs_f32() / 0.05).clamp(0.0, 1.0),
+            None => 0.0,
+        }
+    }
+}
+
+/// The camera pose of one reported tick pose.
+fn camera_pose(pose: Pose) -> CameraPose {
+    CameraPose {
+        position: pose.position,
+        yaw: pose.yaw,
+        pitch: pose.pitch,
     }
 }
 
@@ -612,6 +760,7 @@ impl ClientApp {
             },
             sky: SkyState::default(),
             player: PlayerState::default(),
+            camera: CameraState::default(),
             aim: None,
             overlay_visible,
             dead: false,
@@ -648,6 +797,13 @@ impl ClientApp {
                 yaw,
                 pitch,
                 on_ground,
+                sprinting,
+                sneaking,
+                flying,
+                in_water,
+                snapped,
+                hurt_time,
+                attacked_at_yaw,
                 ..
             } = &event
             {
@@ -662,6 +818,19 @@ impl ClientApp {
                         return;
                     }
                 }
+                self.camera.observe(CameraTick {
+                    position: [*x, *y, *z],
+                    on_ground: *on_ground,
+                    sprinting: *sprinting,
+                    sneaking: *sneaking,
+                    flying: *flying,
+                    in_water: *in_water,
+                    hurt_time: *hurt_time,
+                    attacked_at_yaw: *attacked_at_yaw,
+                    snapped: *snapped,
+                    dead: self.dead,
+                });
+                self.camera.last_tick_arrival = Some(Instant::now());
             }
             session_ended |= apply_session_event(
                 renderer,
@@ -682,15 +851,55 @@ impl ClientApp {
         // without a session stays as M0 left it: no camera, so the frame is the
         // sky clear.
         if self.session.is_some() {
+            let partial = self.camera.partial(Instant::now());
+            let pose = interpolate_pose(
+                camera_pose(self.player.previous),
+                camera_pose(self.player.current),
+                partial,
+            );
+            let walk = self.camera.walk;
+            let yaw_sensor = self.camera.camera_yaw;
+            let pitch_sensor = self.camera.camera_pitch;
+            // The frame's FOV chain and view effect: the smoothed setting with the water and
+            // death terms, and the hurt roll over the view bob (`EntityRenderer.java:551-629`,
+            // `:585-609`, `:615-629`), all at this frame's fraction.
+            let frame_fov = fov(
+                DEFAULT_FOV,
+                &self.camera.smoother,
+                partial,
+                self.camera.in_water,
+                self.dead,
+                self.camera.death_time,
+            );
+            let bob_offset = bob_translate(walk, yaw_sensor, partial);
+            let bob_turns = bob_rotations(walk, yaw_sensor, pitch_sensor, partial);
+            let hurt_turns = hurt_roll(
+                self.camera.hurt_time,
+                MAX_HURT_TIME,
+                partial,
+                self.camera.attacked_at_yaw,
+                self.dead,
+                self.camera.death_time,
+            );
+            // The frame's camera record: one line per frame, the values a rig run
+            // reconciles the live behaviour against (the smoke runs keep this level on).
+            tracing::debug!(
+                ?bob_offset,
+                ?bob_turns,
+                ?hurt_turns,
+                eye = ?render_eye(&pose),
+                yaw = pose.yaw,
+                pitch = pose.pitch,
+                fov = frame_fov,
+                partial,
+                "the frame camera"
+            );
             renderer.set_camera(Camera {
-                pose: CameraPose {
-                    position: self.player.current.position,
-                    yaw: self.player.current.yaw,
-                    pitch: self.player.current.pitch,
-                },
-                fov_degrees: DEFAULT_FOV,
+                pose,
+                fov_degrees: frame_fov,
                 near: NEAR_PLANE,
                 far_chunks: self.render_distance as f32,
+                view_effect: camera_effect(bob_offset, &bob_turns, &hurt_turns),
             });
             if let (Some(time_of_day), Some(values)) = (self.sky.time_of_day, self.sky.sky) {
                 let (fog, sky) = frame_params(
@@ -1396,16 +1605,17 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Aim, Capture, CaptureStep, Cli, ClientApp, DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE,
-        Directive, Key, MouseButton, PlayerState, ScriptDriver, SkyValues, bound_mouse_button,
-        frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
-        parse_server_address, store_aim, void_y_factor,
+        Aim, CameraState, CameraTick, Capture, CaptureStep, Cli, ClientApp, DEATH_DIM,
+        DEATH_RESPAWN, DEATH_TITLE, Directive, Key, MouseButton, PlayerState, ScriptDriver,
+        SkyValues, bound_mouse_button, frame_params, gameplay_key, is_escape_press, is_f3_press,
+        parse_script, parse_server_address, store_aim, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
     use winit::event::{ElementState, MouseButton as WinitMouseButton};
     use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
 
@@ -1997,5 +2207,168 @@ mod tests {
         // `deathScreen.respawn` strings.
         assert_eq!(DEATH_TITLE, "You died!");
         assert_eq!(DEATH_RESPAWN, "Respawn");
+    }
+
+    /// One tick's camera state at a position, with everything else quiet.
+    fn quiet_tick(position: [f64; 3]) -> CameraTick {
+        CameraTick {
+            position,
+            on_ground: true,
+            sprinting: false,
+            sneaking: false,
+            flying: false,
+            in_water: false,
+            hurt_time: 0,
+            attacked_at_yaw: 0.0,
+            snapped: false,
+            dead: false,
+        }
+    }
+
+    #[test]
+    fn the_camera_state_steps_the_smoother_toward_the_ticks_flags() {
+        // The smoother's target is the flag-borne modifier only (`EntityRenderer.java:527-530`
+        // reads `AbstractClientPlayer.getFovModifier`): a walk tick holds the hand at the
+        // identity, a sprinting tick blends it toward the sprint attribute's 1.15 — 1.075
+        // after the first tick, 1.1125 after the second (`:532-534`).
+        let mut camera = CameraState::default();
+        camera.observe(quiet_tick([0.0, 64.0, 0.0]));
+        assert_eq!(camera.smoother.hand, 1.0, "a walk tick holds the identity");
+        let mut sprinting = quiet_tick([0.0, 64.0, 0.0]);
+        sprinting.sprinting = true;
+        camera.observe(sprinting);
+        assert!(
+            (camera.smoother.hand - 1.075).abs() < 1e-6,
+            "got {}",
+            camera.smoother.hand
+        );
+        camera.observe(sprinting);
+        assert!((camera.smoother.hand - 1.1125).abs() < 1e-6);
+        assert!((camera.smoother.prev - 1.075).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_walk_accumulator_adds_the_sources_increment_and_skips_corrections() {
+        // `Entity.moveEntity` (`Entity.java:872`) adds the tick's horizontal displacement
+        // times 0.6, with the previous tick's copy sliding in first (`Entity.onEntityUpdate`,
+        // `:420`); the increment is skipped while flying (`canTriggerWalking`,
+        // `EntityPlayer.java:2205-2208`), on the ground while sneaking (`Entity.java:626`)
+        // and on a server correction.
+        let mut camera = CameraState::default();
+        camera.observe(quiet_tick([0.0, 64.0, 0.0]));
+        assert_eq!(
+            camera.walk.distance, 0.0,
+            "the first tick measures across nothing"
+        );
+        camera.observe(quiet_tick([3.0, 64.0, 4.0]));
+        assert!(
+            (camera.walk.distance - 3.0).abs() < 1e-6,
+            "sqrt(3² + 4²) × 0.6, got {}",
+            camera.walk.distance
+        );
+        assert_eq!(camera.walk.previous, 0.0, "the previous tick's copy");
+        let mut snapped = quiet_tick([100.0, 64.0, 0.0]);
+        snapped.snapped = true;
+        camera.observe(snapped);
+        assert!(
+            (camera.walk.distance - 3.0).abs() < 1e-6,
+            "a correction is not walking"
+        );
+        assert!((camera.walk.previous - 3.0).abs() < 1e-6);
+        let mut sneaking = quiet_tick([100.0, 64.0, 0.5]);
+        sneaking.sneaking = true;
+        camera.observe(sneaking);
+        assert!(
+            (camera.walk.distance - 3.0).abs() < 1e-6,
+            "the sneak glide adds nothing"
+        );
+        let mut flying = quiet_tick([100.0, 64.0, 1.0]);
+        flying.flying = true;
+        camera.observe(flying);
+        assert!(
+            (camera.walk.distance - 3.0).abs() < 1e-6,
+            "flight adds nothing"
+        );
+        camera.observe(quiet_tick([100.0, 64.0, 2.0]));
+        assert!(
+            (camera.walk.distance - 3.6).abs() < 1e-6,
+            "one more block × 0.6"
+        );
+    }
+
+    #[test]
+    fn the_camera_sensors_damp_toward_the_ticks_displacement() {
+        // `EntityPlayer.onLivingUpdate` (`EntityPlayer.java:635-654`): the yaw sensor follows
+        // the horizontal speed clamped to 0.1 and zeroed off the ground, the pitch sensor
+        // follows `atan(−motionY × 0.2) × 15` and is zeroed on the ground. The tick's
+        // displacement stands in for the motion vector. A ground tick five blocks on clamps
+        // to 0.1: `cameraYaw += (0.1 − 0) × 0.4 = 0.04`. Airborne, the yaw target is zero
+        // and a 0.42-block rise leans the pitch by `atan(−0.42 × 0.2) × 15 ≈ −1.257°`,
+        // damped by 0.8 to −1.0056.
+        let mut camera = CameraState::default();
+        camera.observe(quiet_tick([0.0, 64.0, 0.0]));
+        camera.observe(quiet_tick([3.0, 64.0, 4.0]));
+        assert!(
+            (camera.camera_yaw.value - 0.04).abs() < 1e-6,
+            "got {}",
+            camera.camera_yaw.value
+        );
+        assert_eq!(camera.camera_yaw.previous, 0.0);
+        assert_eq!(
+            camera.camera_pitch.value, 0.0,
+            "on the ground the pitch target is zero"
+        );
+        let mut airborne = quiet_tick([3.0, 64.42, 4.0]);
+        airborne.on_ground = false;
+        camera.observe(airborne);
+        assert!(
+            (camera.camera_yaw.value - 0.024).abs() < 1e-6,
+            "0.04 damped toward zero by 0.4, got {}",
+            camera.camera_yaw.value
+        );
+        assert!(
+            (camera.camera_pitch.value - -1.0056392).abs() < 1e-4,
+            "got {}",
+            camera.camera_pitch.value
+        );
+    }
+
+    #[test]
+    fn the_frame_fraction_is_the_elapsed_fraction_of_the_fifty_millisecond_tick() {
+        let start = Instant::now();
+        let mut camera = CameraState::default();
+        assert_eq!(
+            camera.partial(start),
+            0.0,
+            "before the first tick the fraction is zero"
+        );
+        camera.last_tick_arrival = Some(start);
+        assert!(
+            (camera.partial(start + Duration::from_millis(12)) - 0.24).abs() < 1e-4,
+            "12 ms into the tick"
+        );
+        assert!((camera.partial(start + Duration::from_millis(25)) - 0.5).abs() < 1e-4);
+        assert!((camera.partial(start + Duration::from_millis(50)) - 1.0).abs() < 1e-4);
+        assert!(
+            (camera.partial(start + Duration::from_millis(500)) - 1.0).abs() < 1e-4,
+            "a late frame clamps to the tick's end"
+        );
+    }
+
+    #[test]
+    fn the_death_clock_counts_dead_ticks_and_clears_when_alive() {
+        // `EntityLivingBase.onDeathUpdate`'s `++deathTime` (`EntityLivingBase.java:400`,
+        // reached from `:349`) advances once per dead tick; the client clears it once a
+        // living tick arrives (the source resets it on the respawn,
+        // `EntityPlayer.preparePlayerToSpawn:578-583`).
+        let mut camera = CameraState::default();
+        let mut dead = quiet_tick([0.0, 64.0, 0.0]);
+        dead.dead = true;
+        camera.observe(dead);
+        assert_eq!(camera.death_time, 1);
+        camera.observe(dead);
+        assert_eq!(camera.death_time, 2);
+        camera.observe(quiet_tick([0.0, 64.0, 0.0]));
+        assert_eq!(camera.death_time, 0, "a living tick clears the clock");
     }
 }

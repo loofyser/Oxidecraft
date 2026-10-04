@@ -629,7 +629,7 @@ mod tests {
         SKY_COLOR, SceneDraw, SurfaceAction, block_on, classify_surface_error, clear_colour,
         scene_draws,
     };
-    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE};
+    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
     use crate::fog::{FogParams, fog_colour};
 
     /// A camera at `feet_y` with no facing, for the scene order's own tests.
@@ -643,6 +643,7 @@ mod tests {
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
+            view_effect: NO_VIEW_EFFECT,
         }
     }
 

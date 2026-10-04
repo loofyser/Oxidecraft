@@ -57,7 +57,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
 use oxide_assets::texture::Texture;
 use oxide_render::camera::{
-    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE,
+    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
 };
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
@@ -1136,6 +1136,7 @@ fn sky_camera(feet_y: f64, yaw: f32, pitch: f32, fov: f32) -> Camera {
         fov_degrees: fov,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     }
 }
 
@@ -1416,6 +1417,7 @@ fn frame_camera() -> Camera {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 1.0,
+        view_effect: NO_VIEW_EFFECT,
     }
 }
 
@@ -1683,6 +1685,7 @@ fn camera() -> Camera {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     }
 }
 

@@ -1767,7 +1767,7 @@ mod tests {
         cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv, sky_depth_state,
         sky_vertex_layout, star_field, sun_quad_vertices, void_box_low,
     };
-    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE};
+    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
 
     #[test]
     fn the_sky_vertex_layout_matches_the_byte_stream() {
@@ -1891,6 +1891,7 @@ mod tests {
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
+            view_effect: NO_VIEW_EFFECT,
         };
         assert!(cloud_under_layer(&under));
         assert_eq!(under.eye().y, 127.62);
@@ -1912,6 +1913,7 @@ mod tests {
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
+            view_effect: NO_VIEW_EFFECT,
         };
         // The wall pose's feet 57.0: eye 58.62, under the layer.
         let wall = at(57.0, 0.0);

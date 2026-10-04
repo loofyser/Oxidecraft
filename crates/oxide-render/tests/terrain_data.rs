@@ -1,7 +1,7 @@
 //! Tests for the vertex layout and the camera maths. No GPU is involved.
 
 use oxide_render::camera::{
-    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE,
+    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
 };
 use oxide_render::terrain::{VERTEX_BYTES, Vertex, vertex_bytes};
 
@@ -75,6 +75,7 @@ fn yaw_zero_faces_south_and_ninety_faces_west() {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     };
     let forward = camera.forward();
     assert!(
@@ -101,6 +102,7 @@ fn positive_pitch_looks_down() {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     };
     assert!(camera.forward().y < -0.99, "pitch 90 looks down");
 }
@@ -112,6 +114,7 @@ fn the_eye_sits_one_and_a_six_above_the_feet() {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     };
     assert!((camera.eye().y - (64.0 + EYE_HEIGHT)).abs() < 1e-5);
 }
@@ -123,6 +126,7 @@ fn a_point_ahead_projects_to_the_centre_and_near_maps_to_zero_depth() {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     };
     let view_projection = camera.view_projection(16.0 / 9.0);
     // The camera sits FIRST_PERSON_OFFSET blocks behind the eye on the view axis
@@ -179,6 +183,7 @@ fn a_point_behind_the_camera_has_negative_w() {
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,
         far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
     };
     let behind = camera.view_projection(1.0) * glam::Vec4::new(0.0, camera.eye().y, -5.0, 1.0);
     assert!(behind.w < 0.0, "behind the camera clips: {behind:?}");
