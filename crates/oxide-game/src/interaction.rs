@@ -6,19 +6,32 @@
 //! (`EntityRenderer.getMouseOver`, `client/renderer/EntityRenderer.java:409-420`;
 //! `Entity.rayTrace`, `entity/Entity.java:1500-1506`:
 //! `this.worldObj.rayTraceBlocks(vec3, vec32, false, false, true)`).
-//! [`raycast`] walks that trace: the segment's cells in order, stopping at the
-//! first collision box that meets it, and answers the block, the face the ray
-//! entered through and the point on that face ([`Aim`]).
+//! [`raycast`] walks that trace: the segment's cells in order, testing each
+//! cell whose block passes the source's own check, and answers the block the
+//! ray stops at, the face it entered through and the point on that face
+//! ([`Aim`]).
 //!
-//! The predicate over blocks is the collision shapes the behaviour table
-//! carries: a cell stops the ray when one of its collision boxes meets it.
-//! Liquids and the cross plants answer no box (`block/BlockLiquid.java:121-124`,
-//! `block/BlockBush.java:76-79`) and do not stop the ray; a solid block does.
-//! The source's own walk stops on any block whose `canCollideCheck` is true and
-//! traces its *selection* bounds (`block/Block.java:512-515`, `:681-794`), which
-//! the cross plants carry too (`BlockBush.java:31`) — this client's
-//! interaction ray is defined over the collision shapes, the surface the aim,
-//! the outline and the break and place paths consume.
+//! The predicate over blocks is the source's own: an entered cell is tested
+//! when its block passes `canCollideCheck(state, stopOnLiquid)`
+//! (`world/World.java:904`, `:1037`), and with the frame path's flags the
+//! collision-box clause is skipped and `stopOnLiquid` is false, so the test is
+//! `canCollideCheck(state, false)` — `Block.isCollidable()`
+//! (`block/Block.java:512-515`, `:520-523`), true for every covered block but
+//! the four liquids (`block/BlockLiquid.java:82-85`). Cells outside the
+//! covered set — air and fire included, non-collidable at their classes
+//! (`BlockAir.java:37-40`, `BlockFire.java:353-356`) — carry no row and never
+//! stop the ray.
+//!
+//! A tested cell is traced against the bounds its block reports to
+//! `Block.collisionRayTrace` (`block/Block.java:681-794`): the collision boxes
+//! the behaviour table carries, and — for the non-cube blocks that answer no
+//! collision box — the selection bounds their own classes set, the cross
+//! plants, the torch, the pressure plate, the reeds, the crops and the double
+//! plant (`block/BlockBush.java:30-31`, `block/BlockTallGrass.java:32-33`,
+//! `block/BlockDeadBush.java:22-23`, `block/BlockMushroom.java:15-16`,
+//! `block/BlockCrops.java:25-26`, `block/BlockReed.java:26-28`,
+//! `block/BlockTorch.java:185-208`, `block/BlockBasePressurePlate.java:34-46`,
+//! `block/BlockDoublePlant.java:41-43`).
 //!
 //! The reach is the controller's own: `5.0F` in creative, `4.5F` otherwise
 //! (`client/multiplayer/PlayerControllerMP.java:344-346`), read from the
@@ -42,7 +55,7 @@
 
 use std::collections::HashMap;
 
-use oxide_world::behaviour::Material;
+use oxide_world::behaviour::{CollisionShape, Material, behaviour};
 use oxide_world::collision::CollisionBox;
 
 use crate::physics::CollisionView;
@@ -181,12 +194,13 @@ pub fn look_vector(yaw: f32, pitch: f32) -> [f64; 3] {
 /// (`world/World.java:888-1066`): the cell the eye stands in is tested first,
 /// then the ray steps from cell boundary to boundary — x first, then y, then z
 /// when two boundaries are crossed at the same distance — testing each cell it
-/// enters, up to the source's two-hundred step cap. A cell stops the ray when
-/// one of its collision boxes meets the segment; the answer is the box's
-/// nearest entry, with the face the ray crosses there and the point on it
-/// (`Block.collisionRayTrace`'s own faces, `block/Block.java:763-791`). A
-/// non-finite eye or end answers `None`, where the source refuses a NaN one
-/// (`:890-893`).
+/// enters, up to the source's two-hundred step cap. A cell is tested when its
+/// block passes the source's own check ([`ray_bounds`], `world/World.java:904`'s
+/// predicate) and stops the ray when one of the bounds that block reports meets
+/// the segment; the answer is the nearest entry, with the face the ray crosses
+/// there and the point on it (`Block.collisionRayTrace`'s own faces,
+/// `block/Block.java:763-791`). A non-finite eye or end answers `None`, where
+/// the source refuses a NaN one (`:890-893`).
 pub fn raycast(view: &WorldView<'_>, eye: [f64; 3], dir: [f64; 3], reach: f64) -> Option<Aim> {
     let end = [
         eye[0] + dir[0] * reach,
@@ -286,8 +300,8 @@ fn cell_of(point: [f64; 3]) -> [i32; 3] {
     ]
 }
 
-/// The aim one cell answers for the segment `from..to`, when one of its
-/// collision boxes meets it: the box's nearest entry, on the cell's own block.
+/// The aim one cell answers for the segment `from..to`, when one of the bounds
+/// its block reports meets it: the nearest entry, on the cell's own block.
 fn cell_aim(
     view: &WorldView<'_>,
     boxes: &mut Vec<CollisionBox>,
@@ -296,7 +310,7 @@ fn cell_aim(
     cell: [i32; 3],
 ) -> Option<Aim> {
     boxes.clear();
-    view.collision_boxes(cell[0], cell[1], cell[2], boxes);
+    ray_bounds(view, cell, boxes);
     let mut nearest: Option<(f64, Face)> = None;
     for box_ in boxes.iter() {
         let Some((t, face)) = box_entry(box_, from, to) else {
@@ -318,6 +332,92 @@ fn cell_aim(
             from[2] + (to[2] - from[2]) * t,
         ],
     })
+}
+
+/// The bounds the reference's per-cell trace reads, pushed into `out`.
+///
+/// The cell's stop check is the source's own: `World.rayTraceBlocks` tests
+/// `canCollideCheck(state, stopOnLiquid)` on every entered cell
+/// (`world/World.java:904`, `:1037`), and the frame path's flags leave the
+/// collision-box clause out and pass `stopOnLiquid = false`
+/// (`entity/Entity.java:1505`), so the check is `canCollideCheck(state, false)`
+/// — `Block.isCollidable()` (`block/Block.java:512-515`, `:520-523`), false
+/// only for the liquids here (`block/BlockLiquid.java:82-85`). A cell outside
+/// the covered set (air, fire and the rest) or a liquid pushes nothing and
+/// cannot stop the ray. A stopping cell's trace is `Block.collisionRayTrace`
+/// (`:681-794`): the collision boxes the behaviour table carries, or, for a
+/// non-cube block that answers no collision box, the selection bounds its own
+/// class sets ([`selection_bounds`]).
+fn ray_bounds(view: &WorldView<'_>, cell: [i32; 3], out: &mut Vec<CollisionBox>) {
+    let value = view.0.block(cell[0], cell[1], cell[2]);
+    let Some(row) = behaviour(value >> 4) else {
+        return;
+    };
+    if row.liquid.is_some() {
+        return;
+    }
+    if matches!(row.collision, CollisionShape::None) {
+        selection_bounds(value >> 4, (value & 0xF) as u8, cell, out);
+    } else {
+        view.collision_boxes(cell[0], cell[1], cell[2], out);
+    }
+}
+
+/// The selection bounds the source's classes set for the collision-less
+/// non-cube blocks, pushed into `out` in world coordinates.
+///
+/// `Block.collisionRayTrace` traces the bounds `setBlockBoundsBasedOnState`
+/// leaves behind (`block/Block.java:683`), and these blocks answer no
+/// collision box (`BlockBush.getCollisionBoundingBox`, `block/BlockBush.java:76-79`,
+/// bypassed by the frame path's false `ignoreBlockWithoutBoundingBox`), so the
+/// trace runs on the bounds their own classes set:
+///
+/// * the bush default, `[0.3, 0, 0.3]..[0.7, 0.6, 0.7]` (`block/BlockBush.java:30-31`,
+///   inherited by the two flowers, which do not override it);
+/// * the tall grass and the dead bush, `[0.1, 0, 0.1]..[0.9, 0.8, 0.9]`
+///   (`block/BlockTallGrass.java:32-33`, `block/BlockDeadBush.java:22-23`);
+/// * the mushrooms, `[0.3, 0, 0.3]..[0.7, 0.4, 0.7]` (`block/BlockMushroom.java:15-16`);
+/// * the crops and their carrot and potato subclasses,
+///   `[0, 0, 0]..[1, 0.25, 1]` (`block/BlockCrops.java:25-26`, with
+///   `BlockCarrot.java:6` and `BlockPotato.java:10` extending it);
+/// * the reeds, `[0.125, 0, 0.125]..[0.875, 1, 0.875]` (`block/BlockReed.java:26-28`);
+/// * the double plant, the full cube (`block/BlockDoublePlant.java:41-43`);
+/// * the torch, per facing (`BlockTorch.collisionRayTrace`, `block/BlockTorch.java:185-208`,
+///   over the metadata of `getStateFromMeta`, `:244-269`: 1 east, 2 west,
+///   3 south, 4 north, anything else standing);
+/// * the pressure plate, `[1/16, 0, 1/16]..[15/16, h, 15/16]` with `h` 1/32
+///   powered and 1/16 otherwise (`block/BlockBasePressurePlate.java:34-46`,
+///   over `BlockPressurePlate.getStateFromMeta`, `:73-76`: metadata 1 is
+///   powered).
+fn selection_bounds(id: u16, meta: u8, cell: [i32; 3], out: &mut Vec<CollisionBox>) {
+    let (min, max): ([f64; 3], [f64; 3]) = match id {
+        31 | 32 => ([0.1, 0.0, 0.1], [0.9, 0.8, 0.9]),
+        37 | 38 => ([0.3, 0.0, 0.3], [0.7, 0.6, 0.7]),
+        39 | 40 => ([0.3, 0.0, 0.3], [0.7, 0.4, 0.7]),
+        59 | 141 | 142 => ([0.0, 0.0, 0.0], [1.0, 0.25, 1.0]),
+        83 => ([0.125, 0.0, 0.125], [0.875, 1.0, 0.875]),
+        175 => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+        50 => match meta {
+            1 => ([0.0, 0.2, 0.35], [0.3, 0.8, 0.65]),
+            2 => ([0.7, 0.2, 0.35], [1.0, 0.8, 0.65]),
+            3 => ([0.35, 0.2, 0.0], [0.65, 0.8, 0.3]),
+            4 => ([0.35, 0.2, 0.7], [0.65, 0.8, 1.0]),
+            _ => ([0.4, 0.0, 0.4], [0.6, 0.6, 0.6]),
+        },
+        72 => {
+            if meta == 1 {
+                ([0.0625, 0.0, 0.0625], [0.9375, 0.03125, 0.9375])
+            } else {
+                ([0.0625, 0.0, 0.0625], [0.9375, 0.0625, 0.9375])
+            }
+        }
+        _ => return,
+    };
+    out.push(CollisionBox::of(min, max).offset(
+        f64::from(cell[0]),
+        f64::from(cell[1]),
+        f64::from(cell[2]),
+    ));
 }
 
 /// The segment's entry into a box: the smallest `t` in `0..=1` at which the
@@ -944,6 +1044,9 @@ mod tests {
     const WATER: u16 = 9 << 4;
     /// Lava, id 11.
     const LAVA: u16 = 11 << 4;
+    /// Fire, id 51: outside the covered set, as `BlockFire.isCollidable`
+    /// answers false (`block/BlockFire.java:353-356`).
+    const FIRE: u16 = 51 << 4;
     /// The double stone slab, id 43 — the one covered slab id, whose collision
     /// box is the full cell (`CollisionShape::Slab { double: true }`).
     const SLAB: u16 = 43 << 4;
@@ -1160,43 +1263,319 @@ mod tests {
     }
 
     #[test]
-    fn plants_and_liquids_do_not_stop_the_ray_and_solids_do() {
-        // Tall grass, water and lava in the ray's path, with stone behind
-        // them: the ray passes through the three and meets the stone.
-        let layered = world_of(|x, y, z| match (x, y, z) {
+    fn plants_stop_the_ray_while_liquids_air_and_fire_pass() {
+        // The frame path's flags (`entity/Entity.java:1505`) leave the
+        // collision-box clause of the cell test out and pass
+        // `stopOnLiquid = false` (`world/World.java:904`, `:1037`), so the
+        // stop check is `canCollideCheck(state, false)` — `Block.isCollidable()`
+        // (`block/Block.java:512-515`). A plant passes that check, so it stops
+        // the ray on its own selection bounds (`block/BlockBush.java:31`), not
+        // the cell's.
+        let behind = world_of(|x, y, z| match (x, y, z) {
             (0, 65, 2) => TALL_GRASS,
-            (0, 65, 3) => WATER,
-            (0, 65, 4) => LAVA,
             (0, 65, 5) => STONE,
             _ => AIR,
         });
-        let aim = aim_in(&layered, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH)
-            .expect("the stone behind them is hit");
+        let aim = aim_in(&behind, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH)
+            .expect("the grass stops the ray");
         assert_eq!(
             (aim.x, aim.y, aim.z, aim.face),
-            (0, 65, 5, Face::North),
-            "the ray reached the stone"
+            (0, 65, 2, Face::North),
+            "the tall grass stops the ray before the stone behind it"
         );
+        assert_hit(aim.hit, [0.5, 65.62, 2.1]);
 
-        // With no solid behind them the ray meets nothing at all.
+        // Liquids do not: `BlockLiquid.canCollideCheck` answers false at the
+        // frame path's `stopOnLiquid = false` (`block/BlockLiquid.java:82-85`).
+        // With only water and lava in the path the ray meets nothing; with
+        // stone behind them it meets the stone.
         let soft = world_of(|x, y, z| match (x, y, z) {
-            (0, 65, 2) => TALL_GRASS,
-            (0, 65, 3) => WATER,
-            (0, 65, 4) => LAVA,
+            (0, 65, 2) => WATER,
+            (0, 65, 3) => LAVA,
             _ => AIR,
         });
         assert_eq!(
             aim_in(&soft, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH),
             None,
-            "the grass, the water and the lava do not stop the ray"
+            "water and lava do not stop the ray"
+        );
+        let soggy = world_of(|x, y, z| match (x, y, z) {
+            (0, 65, 2) => WATER,
+            (0, 65, 3) => LAVA,
+            (0, 65, 5) => STONE,
+            _ => AIR,
+        });
+        let aim = aim_in(&soggy, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH)
+            .expect("the stone behind the liquids is hit");
+        assert_eq!(
+            (aim.x, aim.y, aim.z, aim.face),
+            (0, 65, 5, Face::North),
+            "the ray reaches the stone behind the liquids"
         );
 
-        // A single solid block does stop it: the same cell as the grass, as
-        // stone.
-        let solid = world_of(|x, y, z| if (x, y, z) == (0, 65, 2) { STONE } else { AIR });
-        let aim = aim_in(&solid, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH)
-            .expect("the stone stops the ray");
-        assert_eq!((aim.x, aim.y, aim.z, aim.face), (0, 65, 2, Face::North));
+        // Fire answers false too (`block/BlockFire.java:353-356`) and is
+        // outside the covered set: the ray passes it as it passes air.
+        let burning = world_of(|x, y, z| match (x, y, z) {
+            (0, 65, 2) => FIRE,
+            (0, 65, 5) => STONE,
+            _ => AIR,
+        });
+        let aim = aim_in(&burning, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH)
+            .expect("the stone behind the fire is hit");
+        assert_eq!(
+            (aim.x, aim.y, aim.z, aim.face),
+            (0, 65, 5, Face::North),
+            "the fire does not stop the ray"
+        );
+    }
+
+    /// Asserts the ray from `feet`, at `yaw` and `pitch`, stops at the single
+    /// block in `world`'s cell (0, 65, 2) with `face` and the hit point `hit`.
+    fn assert_stops_at(
+        block: u16,
+        feet: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+        face: Face,
+        hit: [f64; 3],
+        message: &str,
+    ) {
+        let world = world_of(|x, y, z| if (x, y, z) == (0, 65, 2) { block } else { AIR });
+        let aim = aim_in(&world, feet, yaw, pitch, SURVIVAL_REACH);
+        assert_eq!(
+            aim.map(|aim| (aim.x, aim.y, aim.z, aim.face)),
+            Some((0, 65, 2, face)),
+            "{message}"
+        );
+        assert_hit(aim.expect("the block stops the ray").hit, hit);
+    }
+
+    #[test]
+    fn the_collidable_non_cube_blocks_stop_the_ray_on_their_selection_bounds() {
+        // The covered ids that answer no collision box but pass the source's
+        // stop check — the cross plants, the torch, the pressure plate, the
+        // reeds, the crops and the double plant — stop the ray on the
+        // selection bounds their own classes set (see `selection_bounds`).
+        // Each world holds one block at (0, 65, 2), in the eye's own row.
+        let row_eye = [0.5, 64.0, 0.5]; // eye y 65.62, inside the 0.8-high boxes
+        let low_eye = [0.5, 63.5, 0.5]; // eye y 65.12, inside the 0.25-high crops
+        let bush_eye = [0.5, 63.9, 0.5]; // eye y 65.52, inside the 0.6-high bush
+        let torch_eye = [0.5, 63.78, 2.5]; // eye y 65.4, inside a wall torch's band
+
+        // The tall grass (`block/BlockTallGrass.java:32-33`) and the dead bush
+        // (`block/BlockDeadBush.java:22-23`): x/z 0.1..0.9, y 0..0.8.
+        assert_stops_at(
+            31 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.1],
+            "the tall grass stops the ray",
+        );
+        assert_stops_at(
+            32 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.1],
+            "the dead bush stops the ray",
+        );
+        // The flowers carry the bush default (`block/BlockBush.java:30-31`).
+        assert_stops_at(
+            37 << 4,
+            bush_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.52, 2.3],
+            "the yellow flower stops the ray",
+        );
+        assert_stops_at(
+            38 << 4,
+            bush_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.52, 2.3],
+            "the red flower stops the ray",
+        );
+        // The mushrooms (`block/BlockMushroom.java:15-16`): y 0..0.4.
+        assert_stops_at(
+            39 << 4,
+            low_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.12, 2.3],
+            "the brown mushroom stops the ray",
+        );
+        assert_stops_at(
+            40 << 4,
+            low_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.12, 2.3],
+            "the red mushroom stops the ray",
+        );
+        // The crops and their carrot and potato subclasses
+        // (`block/BlockCrops.java:25-26`, `BlockCarrot.java:6`,
+        // `BlockPotato.java:10`): the full footprint, y 0..0.25.
+        assert_stops_at(
+            59 << 4,
+            low_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.12, 2.0],
+            "the wheat stops the ray",
+        );
+        assert_stops_at(
+            141 << 4,
+            low_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.12, 2.0],
+            "the carrots stop the ray",
+        );
+        assert_stops_at(
+            142 << 4,
+            low_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.12, 2.0],
+            "the potatoes stop the ray",
+        );
+        // The reeds (`block/BlockReed.java:26-28`).
+        assert_stops_at(
+            83 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.125],
+            "the reeds stop the ray",
+        );
+        // The double plant: the full cube (`block/BlockDoublePlant.java:41-43`).
+        assert_stops_at(
+            175 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.0],
+            "the double plant stops the ray",
+        );
+        // The torch (`BlockTorch.collisionRayTrace`, `:185-208`): standing
+        // (metadata 0 and the wire's own 5, `:244-269`) and the four wall
+        // facings, each met on its own box.
+        assert_stops_at(
+            50 << 4,
+            bush_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.52, 2.4],
+            "the standing torch stops the ray",
+        );
+        assert_stops_at(
+            50 << 4 | 5,
+            bush_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.52, 2.4],
+            "the wire's standing torch stops the ray",
+        );
+        assert_stops_at(
+            50 << 4 | 1,
+            torch_eye,
+            90.0,
+            0.0,
+            Face::East,
+            [0.3, 65.4, 2.5],
+            "the east-facing torch stops the ray on its west edge",
+        );
+        assert_stops_at(
+            50 << 4 | 2,
+            torch_eye,
+            -90.0,
+            0.0,
+            Face::West,
+            [0.7, 65.4, 2.5],
+            "the west-facing torch stops the ray on its east edge",
+        );
+        assert_stops_at(
+            50 << 4 | 3,
+            [0.5, 63.78, 0.5],
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.4, 2.0],
+            "the south-facing torch stops the ray",
+        );
+        assert_stops_at(
+            50 << 4 | 4,
+            [0.5, 63.78, 0.5],
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.4, 2.7],
+            "the north-facing torch stops the ray",
+        );
+        // The pressure plate, met from above (`block/BlockBasePressurePlate.java:34-46`):
+        // the unpowered 1/16 and the powered 1/32 top (metadata 1 is powered,
+        // `BlockPressurePlate.getStateFromMeta`, `:73-76`).
+        assert_stops_at(
+            72 << 4,
+            [0.5, 65.38, 2.5],
+            0.0,
+            90.0,
+            Face::Up,
+            [0.5, 65.0625, 2.5],
+            "the unpowered pressure plate stops the ray",
+        );
+        assert_stops_at(
+            72 << 4 | 1,
+            [0.5, 65.38, 2.5],
+            0.0,
+            90.0,
+            Face::Up,
+            [0.5, 65.03125, 2.5],
+            "the powered pressure plate stops the ray",
+        );
+
+        // The trace runs on those bounds, not the whole cell: rays beside the
+        // tall grass box (x 0.05 < 0.1) and beside the standing torch box
+        // (x 0.2 < 0.4) pass them and find nothing.
+        let grass = world_of(|x, y, z| {
+            if (x, y, z) == (0, 65, 2) {
+                TALL_GRASS
+            } else {
+                AIR
+            }
+        });
+        assert_eq!(
+            aim_in(&grass, [0.05, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH),
+            None,
+            "beside the grass bounds the ray passes"
+        );
+        let torch = world_of(|x, y, z| {
+            if (x, y, z) == (0, 65, 2) {
+                50 << 4
+            } else {
+                AIR
+            }
+        });
+        assert_eq!(
+            aim_in(&torch, [0.2, 63.9, 0.5], 0.0, 0.0, SURVIVAL_REACH),
+            None,
+            "beside the torch bounds the ray passes"
+        );
     }
 
     #[test]
