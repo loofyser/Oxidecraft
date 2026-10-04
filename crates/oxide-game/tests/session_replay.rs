@@ -4128,9 +4128,12 @@ fn a_zero_health_death_cancels_the_dig_and_gates_the_window_input() {
         SERVER_FRAMING,
     );
     let flips = vec![
-        // Early enough for the dig to run, late enough that the first ticks
-        // have found the block.
-        (8, left_press()),
+        // Four waits in: the death follows eight waits later, so the
+        // press-to-death window is at least 160 ms — three fifty-millisecond
+        // tick boundaries at any phase, where two carry the dig's start and
+        // its stage ladder — and late enough that the first ticks have found
+        // the block.
+        (4, left_press()),
         // All of these land after the death, during the tail's quiet stretch.
         (
             16,

@@ -332,18 +332,19 @@ impl Player {
     /// The player-local half of a respawn reset (clientbound 0x07).
     ///
     /// The source answers a respawn by building a fresh `EntityPlayerSP` and
-    /// spawning it in (`Minecraft.setDimensionAndSpawnPlayer:990-1018`): the
-    /// entity id, the position and the client brand carry over, every other
-    /// transient field starts over, and `preparePlayerToSpawn` zeroes the
-    /// motion and the pitch (`Entity.preparePlayerToSpawn:315-333`), resets the
-    /// health to its maximum and the death clock to zero
-    /// (`EntityPlayer.preparePlayerToSpawn:578-583`). This port keeps the
-    /// session's own object and clears the same transients in place: the
-    /// motion, the pitch, the movement flags and their server mirrors, the
-    /// ground, water, jump and flight-toggle state, the hurt flash and the
-    /// death state. The position — which the source only nudges upward out of
-    /// a collision — is left to the 0x08 that follows, which carries it
-    /// absolutely.
+    /// spawning it in (`Minecraft.setDimensionAndSpawnPlayer:2430-2464`): the
+    /// entity id and the client brand carry over, while every other transient
+    /// field starts over — the fresh player begins at the origin
+    /// (`Entity.java:278`) — and `preparePlayerToSpawn` zeroes the motion and
+    /// the pitch (`Entity.preparePlayerToSpawn:315-333`), resets the health to
+    /// its maximum and the death clock to zero
+    /// (`EntityPlayer.preparePlayerToSpawn:578-583`); the controller then
+    /// flips the yaw to -180 (`PlayerControllerMP.flipPlayer:110-113`). This
+    /// port keeps the session's own object and clears the same transients in
+    /// place: the motion, the pitch, the movement flags and their server
+    /// mirrors, the ground, water, jump and flight-toggle state, the hurt
+    /// flash and the death state. The position and the yaw are left to the
+    /// 0x08 that follows, which carries them absolutely.
     pub fn reset_for_respawn(&mut self) {
         self.motion = [0.0; 3];
         self.pitch = 0.0;
@@ -440,7 +441,7 @@ mod tests {
 
     #[test]
     fn the_respawn_reset_clears_the_transients_and_keeps_the_abilities() {
-        // `Minecraft.setDimensionAndSpawnPlayer:990-1018` with
+        // `Minecraft.setDimensionAndSpawnPlayer:2430-2464` with
         // `EntityPlayer.preparePlayerToSpawn:578-583`: motion, pitch, the hurt
         // flash, the death state and every movement transient start over; the
         // health returns to its maximum; the abilities the server last stated
@@ -471,7 +472,7 @@ mod tests {
         player.reset_for_respawn();
         assert_eq!(player.motion, [0.0; 3]);
         assert_eq!(player.pitch, 0.0, "`preparePlayerToSpawn` zeroes the pitch");
-        assert_eq!(player.yaw, 90.0, "the yaw the source does not touch");
+        assert_eq!(player.yaw, 90.0, "the yaw is left to the 0x08 that follows");
         assert_eq!(player.health, 20.0, "the health returns to its maximum");
         assert!(!player.dead);
         assert_eq!(player.death_time, 0);
