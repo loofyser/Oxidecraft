@@ -29,6 +29,7 @@
 mod assets;
 mod keymap;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,7 @@ use oxide_render::fog::{FogParams, fog_colour, linear_params};
 use oxide_render::fps::FpsCounter;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use oxide_render::sky::SkyParams;
+use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
@@ -406,17 +408,32 @@ struct ClientApp {
     /// and the two lines — instead of the debug overlay, and the session
     /// answers clicks and Space with respawn requests.
     dead: bool,
-    /// The latest aim the session reported, or `None` when the interaction ray
-    /// meets no block.
+    /// The overlay pass's own inputs: the latest aim the session reported and
+    /// the live destroy stages.
     ///
-    /// The window keeps it for the outline and crack passes to draw from and
-    /// the click paths to act on; a report that clears the aim stops the
-    /// outline.
-    aim: Option<Aim>,
+    /// The window keeps them so a frame can hand the outline the aim's cell
+    /// and the crack every stage within the render distance, and the click
+    /// paths can act on the aim.
+    world_overlay: WorldOverlayState,
     /// The pointer-capture rules.
     capture: Capture,
     /// The `--input-script` replay, when the flag was given.
     script: Option<ScriptDriver>,
+}
+
+/// The world-overlay state the session's events keep for the frame.
+#[derive(Debug, Default)]
+struct WorldOverlayState {
+    /// The latest aim the session reported, or `None` when the interaction ray
+    /// meets no block: the outline draws its cell, `None` stops it.
+    aim: Option<Aim>,
+    /// The live destroy stages the crack draws: one entry per breaking block,
+    /// keyed by the block's cell, holding the sprite stage `0..=9`.
+    ///
+    /// The session reports each landing and clearing as `BreakStage` and
+    /// `BreakCleared`; the window keeps the map so a frame can hand the pass
+    /// every stage within the render distance.
+    break_stages: BTreeMap<[i32; 3], u8>,
 }
 
 /// The clock and the sky the session last reported: what each frame's sky parameters and fog
@@ -761,7 +778,7 @@ impl ClientApp {
             sky: SkyState::default(),
             player: PlayerState::default(),
             camera: CameraState::default(),
-            aim: None,
+            world_overlay: WorldOverlayState::default(),
             overlay_visible,
             dead: false,
             capture: Capture::default(),
@@ -837,7 +854,7 @@ impl ClientApp {
                 &mut self.hud,
                 &mut self.sky,
                 &mut self.player,
-                &mut self.aim,
+                &mut self.world_overlay,
                 &mut self.dead,
                 event,
             );
@@ -901,6 +918,14 @@ impl ClientApp {
                 far_chunks: self.render_distance as f32,
                 view_effect: camera_effect(bob_offset, &bob_turns, &hurt_turns),
             });
+            // The world overlay's own inputs: the aim's block for the outline, and every
+            // destroy stage the render distance can show for the crack.
+            renderer.set_outline(self.world_overlay.aim.map(aim_outline));
+            renderer.set_cracks(cracks_in_view(
+                &self.world_overlay.break_stages,
+                self.player.current.position,
+                self.render_distance,
+            ));
             if let (Some(time_of_day), Some(values)) = (self.sky.time_of_day, self.sky.sky) {
                 let (fog, sky) = frame_params(
                     time_of_day,
@@ -1158,6 +1183,66 @@ fn store_aim(aim: &mut Option<Aim>, report: Option<Aim>) -> bool {
     moved
 }
 
+/// The outline the aim draws: the aimed block's cell and its box.
+///
+/// The session publishes no block state with the aim, so the box is [`FULL_CUBE`] — the box
+/// every full-block class's selection bounds report (`RenderGlobal.java:1895`). A block whose
+/// behaviour-table shape is partial (stairs, slabs, fences, panes, walls, doors) is a recorded
+/// class for the milestone that carries block state into the frame.
+fn aim_outline(aim: Aim) -> Outline {
+    Outline {
+        block: [aim.x, aim.y, aim.z],
+        shape: FULL_CUBE,
+    }
+}
+
+/// The crack entries a frame draws: the stage map's entries within `render_distance` chunks of
+/// `eye`, in cell order.
+///
+/// The overlay itself drops entries beyond the source's 32-block reach
+/// (`RenderGlobal.java:1843-1848`); the window's own filter keeps a stage left behind by a
+/// walked-away block out of the pass at all.
+fn cracks_in_view(
+    stages: &BTreeMap<[i32; 3], u8>,
+    eye: [f64; 3],
+    render_distance: u8,
+) -> Vec<Crack> {
+    let limit = f64::from(render_distance) * 16.0;
+    stages
+        .iter()
+        .filter(|(block, _)| {
+            let dx = f64::from(block[0]) + 0.5 - eye[0];
+            let dy = f64::from(block[1]) + 0.5 - eye[1];
+            let dz = f64::from(block[2]) + 0.5 - eye[2];
+            dx * dx + dy * dy + dz * dz <= limit * limit
+        })
+        .map(|(&block, &stage)| Crack { block, stage })
+        .collect()
+}
+
+/// Stores a destroy stage the session reported, and answers whether the map moved.
+///
+/// The reports land in the source's `destroyBlockIcons` map, keyed by block position
+/// (`RenderGlobal.java:1789-1794`); a repeat of the stage already stored is no move, so the
+/// caller's log line fires once per change.
+fn store_break_stage(
+    stages: &mut BTreeMap<[i32; 3], u8>,
+    x: i32,
+    y: i32,
+    z: i32,
+    stage: u8,
+) -> bool {
+    stages.insert([x, y, z], stage) != Some(stage)
+}
+
+/// Removes a block's destroy stage, and answers whether the map moved.
+///
+/// The session reports the removal when a dig stops or completes; the answer tells the caller
+/// whether the log line is worth writing.
+fn clear_break_stage(stages: &mut BTreeMap<[i32; 3], u8>, x: i32, y: i32, z: i32) -> bool {
+    stages.remove(&[x, y, z]).is_some()
+}
+
 /// Applies one event the session reported: meshes go to the renderer, the pose
 /// to the view state and the overlay, the join parameters to the overlay state,
 /// the clock and the sky to the frame's parameters, and the aim to the
@@ -1171,7 +1256,7 @@ fn apply_session_event(
     hud: &mut HudState,
     sky: &mut SkyState,
     player: &mut PlayerState,
-    aim: &mut Option<Aim>,
+    world_overlay: &mut WorldOverlayState,
     dead: &mut bool,
     event: ClientEvent,
 ) -> bool {
@@ -1219,19 +1304,23 @@ fn apply_session_event(
             false
         }
         ClientEvent::Aim { aim: report } => {
-            if store_aim(aim, report) {
+            if store_aim(&mut world_overlay.aim, report) {
                 tracing::debug!(?report, "the aim moved");
             }
             false
         }
         ClientEvent::BreakStage { x, y, z, stage } => {
-            // The crack overlay's own input (Task 12); the dev client only
-            // records it for the log.
-            tracing::debug!(x, y, z, stage, "a destroy stage landed");
+            // The crack overlay's own input: the stage lands in the map a frame
+            // hands the pass, and the log line fires once per change.
+            if store_break_stage(&mut world_overlay.break_stages, x, y, z, stage) {
+                tracing::debug!(x, y, z, stage, "a destroy stage landed");
+            }
             false
         }
         ClientEvent::BreakCleared { x, y, z } => {
-            tracing::debug!(x, y, z, "a destroy stage left");
+            if clear_break_stage(&mut world_overlay.break_stages, x, y, z) {
+                tracing::debug!(x, y, z, "a destroy stage left");
+            }
             false
         }
         ClientEvent::Time {
@@ -1607,13 +1696,16 @@ mod tests {
     use super::{
         Aim, CameraState, CameraTick, Capture, CaptureStep, Cli, ClientApp, DEATH_DIM,
         DEATH_RESPAWN, DEATH_TITLE, Directive, Key, MouseButton, PlayerState, ScriptDriver,
-        SkyValues, bound_mouse_button, frame_params, gameplay_key, is_escape_press, is_f3_press,
-        parse_script, parse_server_address, store_aim, void_y_factor,
+        SkyValues, aim_outline, bound_mouse_button, clear_break_stage, cracks_in_view,
+        frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
+        parse_server_address, store_aim, store_break_stage, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
+    use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use winit::event::{ElementState, MouseButton as WinitMouseButton};
@@ -2191,6 +2283,104 @@ mod tests {
         assert!(store_aim(&mut aim, None), "the clearing report moves it");
         assert_eq!(aim, None, "the aim is cleared");
         assert!(!store_aim(&mut aim, None), "there is nothing left to clear");
+    }
+
+    #[test]
+    fn the_aim_outline_wraps_the_aims_cell_in_the_full_cube() {
+        // The outline draws the ray's block — the session's `Aim` — with the full cube's box,
+        // the shape every full-block class's selection bounds report
+        // (`RenderGlobal.java:1895`).
+        let aim = Aim {
+            x: -3,
+            y: 64,
+            z: 12,
+            face: Face::Up,
+            hit: [-2.5, 65.0, 12.5],
+        };
+        assert_eq!(
+            aim_outline(aim),
+            Outline {
+                block: [-3, 64, 12],
+                shape: FULL_CUBE,
+            }
+        );
+    }
+
+    #[test]
+    fn the_crack_set_is_the_stage_maps_entries_within_the_render_distance() {
+        // The window feeds one crack entry per live destroy stage, in cell order, and keeps
+        // only what the render distance can show; the pass drops the rest itself at the
+        // source's 32-block reach (`RenderGlobal.java:1843-1848`).
+        let mut stages = BTreeMap::new();
+        assert!(store_break_stage(&mut stages, 0, 64, 0, 3));
+        assert!(store_break_stage(&mut stages, 7, 64, 0, 5));
+        assert!(store_break_stage(&mut stages, 140, 64, 0, 9), "far out");
+        let eye = [0.5, 64.5, 0.5];
+        assert_eq!(
+            cracks_in_view(&stages, eye, 8),
+            vec![
+                Crack {
+                    block: [0, 64, 0],
+                    stage: 3,
+                },
+                Crack {
+                    block: [7, 64, 0],
+                    stage: 5,
+                },
+            ]
+        );
+        // The boundary cell is inside: its centre sits 128 blocks out, the plane itself.
+        assert!(store_break_stage(&mut stages, 128, 64, 0, 1));
+        assert_eq!(
+            cracks_in_view(&stages, eye, 8),
+            vec![
+                Crack {
+                    block: [0, 64, 0],
+                    stage: 3,
+                },
+                Crack {
+                    block: [7, 64, 0],
+                    stage: 5,
+                },
+                Crack {
+                    block: [128, 64, 0],
+                    stage: 1,
+                },
+            ]
+        );
+        // A wider render distance takes the far one back.
+        assert_eq!(cracks_in_view(&stages, eye, 12).len(), 4);
+    }
+
+    #[test]
+    fn the_break_stage_store_reports_its_moves() {
+        // The session's stage reports land in a map keyed by the block's cell, and each
+        // report answers whether the entry it wrote changed — the same stage twice is one
+        // landing.
+        let mut stages = BTreeMap::new();
+        assert!(
+            store_break_stage(&mut stages, 1, 2, 3, 4),
+            "a first stage lands"
+        );
+        assert_eq!(stages.get(&[1, 2, 3]), Some(&4));
+        assert!(
+            !store_break_stage(&mut stages, 1, 2, 3, 4),
+            "the same stage is no move"
+        );
+        assert!(
+            store_break_stage(&mut stages, 1, 2, 3, 7),
+            "a later stage moves"
+        );
+        assert_eq!(stages.get(&[1, 2, 3]), Some(&7));
+        assert!(
+            clear_break_stage(&mut stages, 1, 2, 3),
+            "the clear removes it"
+        );
+        assert!(
+            !clear_break_stage(&mut stages, 1, 2, 3),
+            "nothing is left to clear"
+        );
+        assert!(stages.is_empty());
     }
 
     #[test]

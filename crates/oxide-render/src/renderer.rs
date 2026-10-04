@@ -19,6 +19,7 @@ use crate::sky::{
 };
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
+use crate::world_overlay::{Crack, Outline, WorldOverlay};
 
 /// One draw of the scene pass, in the order the source issues it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,10 @@ enum SceneDraw {
     /// The terrain's layers, the translucent one last (`EntityRenderer.java:1385-1396`,
     /// `:1460`).
     Terrain,
+    /// The world overlay: the aimed block's outline and the destroy-stage crack, the source's
+    /// `"outline"` and `"destroyProgress"` sections after the terrain and before the clouds'
+    /// at-or-above arm (`EntityRenderer.java:1412-1416`, `:1431-1437`).
+    WorldOverlay,
     /// The cloud layer through the source's at-or-above arm, after the translucent layer
     /// (`EntityRenderer.java:1474-1478`).
     CloudsAtOrAbove,
@@ -39,16 +44,19 @@ enum SceneDraw {
 /// The scene pass's draws for a camera, in the order the source issues them.
 ///
 /// The sky draws first (`EntityRenderer.java:1351-1354`), then the terrain's layers
-/// (`:1385-1396`). The cloud layer draws exactly once; the entity eye's height picks the arm
-/// and with it the cloud's place in the order — the under-arm before the terrain while the eye
-/// is under the layer (`:1364-1367`), the at-or-above arm after the translucent layer once it
-/// is at or above it (`:1474-1478`).
+/// (`:1385-1396`), then the world overlay — the outline and the damage texture, the source's
+/// `"outline"` and `"destroyProgress"` sections (`:1412-1416`, `:1431-1437`). The cloud layer
+/// draws exactly once; the entity eye's height picks the arm and with it the cloud's place in
+/// the order — the under-arm before the terrain while the eye is under the layer
+/// (`:1364-1367`), the at-or-above arm after the overlay once it is at or above it
+/// (`:1474-1478`).
 fn scene_draws(camera: &Camera) -> Vec<SceneDraw> {
     let mut draws = vec![SceneDraw::Sky];
     if cloud_under_layer(camera) {
         draws.push(SceneDraw::CloudsUnder);
     }
     draws.push(SceneDraw::Terrain);
+    draws.push(SceneDraw::WorldOverlay);
     if cloud_at_or_above_layer(camera) {
         draws.push(SceneDraw::CloudsAtOrAbove);
     }
@@ -119,7 +127,8 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 /// [`Renderer::render`] clears the window to the frame's fog colour — the sky the terrain fades
 /// towards, so the two agree where the terrain ends — and the depth buffer to the far plane,
 /// draws the sky through the sky pass, the cloud layer, the section meshes through the terrain
-/// pass and the debug overlay over them, then presents the frame. The cloud layer draws exactly
+/// pass, the world overlay — the aim's outline and the destroy-stage crack — and the debug
+/// overlay over them, then presents the frame. The cloud layer draws exactly
 /// once, and the entity eye's height places it: the source's under-arm before the terrain while
 /// the eye is under the layer (`EntityRenderer.java:1364-1367`) and its at-or-above arm after
 /// the translucent layer once the eye is at or above it (`:1474-1478`); [`scene_draws`] is the
@@ -144,6 +153,9 @@ pub struct Renderer {
     depth: DepthTarget,
     /// The terrain pipeline, and the section meshes it draws.
     terrain: TerrainPass,
+    /// The world overlay: the aimed block's outline and the destroy-stage crack, drawn in the
+    /// scene pass after the terrain (`EntityRenderer.java:1412-1416`, `:1431-1437`).
+    world_overlay: WorldOverlay,
     /// The sky pass, drawing the band, the void, the sun, the moon and the stars.
     sky: SkyPass,
     /// The cloud pass, drawing the flat layer under the camera.
@@ -257,6 +269,7 @@ impl Renderer {
         );
 
         let terrain = TerrainPass::new(&device, &queue, format);
+        let world_overlay = WorldOverlay::new(&device, format);
         let sky = SkyPass::new(&device, &queue, format);
         let cloud = CloudPass::new(&device, &queue, format);
         let mut overlay = OverlayPass::new(&device, format);
@@ -272,6 +285,7 @@ impl Renderer {
             adapter_info,
             depth,
             terrain,
+            world_overlay,
             sky,
             cloud,
             overlay,
@@ -334,12 +348,17 @@ impl Renderer {
     /// Uploads the block atlas the terrain draws with.
     ///
     /// The atlas is uploaded once and bound for every frame that follows; calling this again
-    /// replaces it, dropping the old texture and its bind group. Until an atlas is set the
-    /// terrain pass issues no draw calls, so a session that has no asset store yet — the
-    /// shipping client sets one from its bootstrap — still renders its clear colour rather
-    /// than sampling an unbound texture. M6 re-uploads here when an animated sprite advances.
+    /// replaces it, dropping the old texture and its bind group. The world overlay binds the
+    /// same atlas through its own level-0 pair, and resolves its ten destroy-stage sprites
+    /// from it, so one call serves both passes. Until an atlas is set the terrain pass issues
+    /// no draw calls and the overlay draws no crack, so a session that has no asset store yet
+    /// — the shipping client sets one from its bootstrap — still renders its clear colour
+    /// rather than sampling an unbound texture. M6 re-uploads here when an animated sprite
+    /// advances.
     pub fn set_atlas(&mut self, atlas: &Atlas) {
         self.terrain.set_atlas(&self.device, &self.queue, atlas);
+        self.world_overlay
+            .set_atlas(&self.device, &self.queue, atlas);
     }
 
     /// Uploads the ascii font sheet the debug overlay draws with.
@@ -368,6 +387,26 @@ impl Renderer {
     /// a stale projection behind.
     pub fn set_camera(&mut self, camera: Camera) {
         self.camera = Some(camera);
+    }
+
+    /// Sets the aimed block's outline the following frames draw, or clears it.
+    ///
+    /// The outline is the source's `"outline"` section (`EntityRenderer.java:1412-1416`),
+    /// drawn in the scene pass after the terrain; the caller wraps the aim's block cell and
+    /// its shape box. `None` — the state of a frame whose ray meets no block — draws no
+    /// outline.
+    pub fn set_outline(&mut self, outline: Option<Outline>) {
+        self.world_overlay.set_outline(outline);
+    }
+
+    /// Sets the breaking blocks the crack draws, replacing any earlier set.
+    ///
+    /// The crack is the source's `"destroyProgress"` section (`EntityRenderer.java:1431-1437`),
+    /// drawn in the scene pass after the terrain; one entry per tracked destroy stage. An
+    /// empty set draws no crack, and the overlay itself drops entries beyond the source's
+    /// 32-block reach.
+    pub fn set_cracks(&mut self, cracks: Vec<Crack>) {
+        self.world_overlay.set_cracks(cracks);
     }
 
     /// Uploads the three environment textures the sky and the clouds sample, replacing any
@@ -461,6 +500,15 @@ impl Renderer {
             self.terrain.set_camera(&self.queue, camera, aspect);
             self.sky.set_camera(&self.queue, camera, aspect);
             self.cloud.set_camera(&self.queue, camera, aspect);
+            // The overlay's frame: the outline's pixel width and the crack's projection both
+            // follow the surface size, so the frame is built from the same configuration the
+            // render pass is.
+            self.world_overlay.set_frame(
+                &self.device,
+                &self.queue,
+                &camera,
+                [self.config.width as f32, self.config.height as f32],
+            );
         }
 
         let mut encoder = self
@@ -501,6 +549,7 @@ impl Renderer {
                             self.cloud.draw(&mut pass);
                         }
                         SceneDraw::Terrain => self.terrain.draw(&mut pass),
+                        SceneDraw::WorldOverlay => self.world_overlay.draw(&mut pass),
                     }
                 }
             }
@@ -657,13 +706,19 @@ mod tests {
         // second arm; the wall pose's feet 57.0 leaves the eye under the layer.
         assert_eq!(
             scene_draws(&scene_camera(57.0)),
-            [SceneDraw::Sky, SceneDraw::CloudsUnder, SceneDraw::Terrain]
+            [
+                SceneDraw::Sky,
+                SceneDraw::CloudsUnder,
+                SceneDraw::Terrain,
+                SceneDraw::WorldOverlay
+            ]
         );
         assert_eq!(
             scene_draws(&scene_camera(150.0)),
             [
                 SceneDraw::Sky,
                 SceneDraw::Terrain,
+                SceneDraw::WorldOverlay,
                 SceneDraw::CloudsAtOrAbove
             ]
         );

@@ -966,6 +966,64 @@ fn the_real_extraction_tree_stitches() {
     assert_eq!(prismarine.times, [300; 22]);
 }
 
+/// The destroy stages the crack draws, straight out of the real tree: the ten
+/// `blocks/destroy_stage_{0..9}` sprites are stitched because the model bakery's builtin
+/// texture list carries them (`BUILTIN_TEXTURE_LOCATIONS`,
+/// `crates/oxide-assets/src/model.rs:80-89`, folded into the requested set at `:665-668`),
+/// and the reference registers the same ten icons (`RenderGlobal.java:210-212`) for
+/// `TextureMap.loadTextureAtlas` to stitch (`TextureMap.java:81`). Each is a full 16x16
+/// cell, and `Atlas::drawn` — the lookup the crack's stage table resolves through —
+/// answers the stage's own sprite rather than the fallback.
+/// Ignored by default like [`the_real_extraction_tree_stitches`], and for the same reason:
+/// it needs the user's own store, named by `OXIDECRAFT_STORE`, and fails naming the
+/// variable when it is unset.
+#[test]
+#[ignore = "reads the real extraction tree; run it with OXIDECRAFT_STORE set and --ignored"]
+fn the_real_extraction_tree_stitches_the_destroy_stages() {
+    let store = std::env::var("OXIDECRAFT_STORE").expect(
+        "OXIDECRAFT_STORE must name the store root that holds extracted/ (for example \
+         ~/.local/share/oxidecraft); this test does not pass without a store",
+    );
+    let root = Path::new(&store).join("extracted").join("1.8.9");
+    let set = TextureSet::load(&root).expect("the real tree loads");
+    let source = ModelSource::open(&root).expect("the real tree opens");
+    let requested = source.texture_paths();
+    let atlas = build_atlas(&set, &requested, 4).expect("the real tree stitches");
+
+    for stage in 0..10 {
+        let path = format!("blocks/destroy_stage_{stage}");
+        assert!(
+            requested.contains(&path),
+            "{path} is not in the model tree's requested paths"
+        );
+        assert!(atlas.sprites.contains_key(&path), "{path} is not stitched");
+        let sprite = atlas.drawn(&path);
+        // A 16x16 sprite keeps a 16x16 padded cell, so the content and the region agree.
+        assert_eq!(sprite.content.w, 16, "{path}'s width");
+        assert_eq!(sprite.content.h, 16, "{path}'s height");
+        assert_eq!(sprite.region.w, 16, "{path}'s cell width");
+        assert_eq!(sprite.region.h, 16, "{path}'s cell height");
+        assert!(
+            sprite.content.x + sprite.content.w <= atlas.width
+                && sprite.content.y + sprite.content.h <= atlas.height,
+            "{path}'s rect is inside the atlas"
+        );
+        // `drawn` resolves the stage's own sprite, not the fallback: the uv rect the crack
+        // draws the stage with is the stitched sprite's own.
+        let stitched = &atlas.sprites[&path];
+        assert_eq!(
+            atlas.uv(sprite),
+            atlas.uv(stitched),
+            "{path}'s resolved rect"
+        );
+        assert_ne!(
+            atlas.uv(stitched),
+            atlas.uv(&atlas.missing),
+            "{path} resolved to the fallback sprite"
+        );
+    }
+}
+
 /// Writes the shared synthetic tree the stitching tests build from.
 ///
 /// Two 16x16 sprites with distinct flat colours, one 32x32, an identity strip

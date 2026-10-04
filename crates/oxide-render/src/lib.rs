@@ -1,4 +1,4 @@
-//! wgpu device and passes: sky, terrain, entities, particles, GUI, text; camera; frustum culling.
+//! wgpu device and passes: sky, terrain, world overlay, entities, particles, GUI, text; camera; frustum culling.
 
 pub mod atlas_texture;
 pub mod camera;
@@ -13,3 +13,4 @@ pub mod renderer;
 pub mod sky;
 pub mod terrain;
 pub mod terrain_pass;
+pub mod world_overlay;

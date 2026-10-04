@@ -69,6 +69,7 @@ use oxide_render::sky::{
 };
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
+use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline, WorldOverlay};
 
 use glam::Vec3;
 
@@ -589,23 +590,26 @@ fn the_multi_level_atlas_reads_back_every_level_it_writes() {
     );
 }
 
-/// The lightmap the pass builds its texture with: the client's own starting image — the
-/// Overworld's brightness table, `getSunBrightness` at the noon angle and the default gamma
-/// (`World.java:1418-1427`, `GameSettings.java:171`).
+/// One cell of [`lightmap_image`] as RGBA, addressed through the module's own convention: the
+/// block level across, the sky level down.
 ///
-/// The read-backs below are computed from it rather than from the texels alone, because the
-/// fragment stage multiplies the atlas texel by it. Its brightest cell is 252 and not 255: the
-/// source's closing `* 0.96 + 0.03` chain leaves the full-day cell at 0.99, so even a fully lit
-/// surface reads back a little darker than its texture. Its floor is the darkest dark, 14.
-fn lightmap() -> [u8; 16 * 16 * 4] {
-    lightmap_image(&BrightnessTable::overworld(), 1.0, 0.0)
+/// The noon cell is the client's own starting image — the Overworld's brightness table,
+/// `getSunBrightness` at the noon angle and the default gamma (`World.java:1418-1427`,
+/// `GameSettings.java:171`). The read-backs below are computed from it rather than from the
+/// texels alone, because the fragment stage multiplies the atlas texel by it. Its brightest
+/// cell is 252 and not 255: the source's closing `* 0.96 + 0.03` chain leaves the full-day cell
+/// at 0.99, so even a fully lit surface reads back a little darker than its texture. Its floor
+/// is the darkest dark, 14.
+fn light_cell(block: u8, sky: u8) -> [u8; 4] {
+    light_cell_with(1.0, block, sky)
 }
 
-/// One cell of [`lightmap`] as RGBA, addressed through the module's own convention: the block
-/// level across, the sky level down.
-fn light_cell(block: u8, sky: u8) -> [u8; 4] {
+/// One cell of the lightmap a sky brightness builds, as the fragment would read it: the image
+/// `set_lightmap` rewrites the texture with, `lightmap_image` of the same table at
+/// `sun_brightness` and the default gamma.
+fn light_cell_with(sun_brightness: f32, block: u8, sky: u8) -> [u8; 4] {
     let (u, v) = sample_index(sky, block);
-    let image = lightmap();
+    let image = lightmap_image(&BrightnessTable::overworld(), sun_brightness, 0.0);
     let index = ((v * 16 + u) * 4) as usize;
     [
         image[index],
@@ -1775,6 +1779,229 @@ fn expect_pixel(pixels: &[u8], x: u32, y: u32, want: [u8; 3], what: &str) {
 fn expect_texel(pixels: &[u8], x: u32, y: u32, want: [u8; 4], what: &str) {
     let got = pixel_rgba(pixels, x, y);
     assert_eq!(got, want, "{what} at ({x}, {y})");
+}
+
+/// Renders one frame through the terrain-sized pass: the colour cleared to the sky, the depth
+/// cleared to the far plane, the caller's draws in the given order, then the target read back.
+fn render_scene(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    depth: &wgpu::TextureView,
+    draw: impl FnOnce(&mut wgpu::RenderPass<'_>),
+) -> Vec<u8> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide pipeline headless encoder"),
+    });
+    with_terrain_pass(&mut encoder, &target.view, depth, draw);
+    queue.submit(Some(encoder.finish()));
+    read_pixels(device, queue, target)
+}
+
+/// The world overlay's outline drawn over the terrain, pixel evidence for the source's state:
+/// the aimed block's twelve edges as two-pixel screen-space quads in black at 0.4 alpha with
+/// the depth writes off and no culling (`RenderGlobal.java:1875-1901`). The frame is rendered
+/// twice — the terrain alone, then the terrain and the overlay — at a fixed camera.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_world_overlay_draws_the_aimed_blocks_outline() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, camera(), 1.0);
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let mut overlay = WorldOverlay::new(&device, format);
+    overlay.set_outline(Some(Outline {
+        block: [0, 0, 0],
+        shape: FULL_CUBE,
+    }));
+    overlay.set_frame(&device, &queue, &camera(), [SIZE as f32, SIZE as f32]);
+
+    let without = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    let with = render_scene(&device, &queue, &target, &depth, |pass| {
+        terrain.draw(pass);
+        overlay.draw(pass);
+    });
+
+    // The outline inked pixels the frame did not have, and every pixel it touched came out
+    // darker — black at 0.4 alpha over what was there (the blend's 770/771), never brighter.
+    let mut changed = 0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let before = pixel(&without, x, y);
+            let after = pixel(&with, x, y);
+            if before != after {
+                changed += 1;
+                assert!(
+                    after
+                        .iter()
+                        .zip(before)
+                        .all(|(&after, before)| after <= before),
+                    "the outline brightened ({x}, {y}): {before:?} -> {after:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        changed > 20,
+        "the outline left only {changed} pixels changed: its edges did not reach the frame"
+    );
+
+    // The outline's quads sit on the box's edges, not across its faces: the aimed block's top
+    // face is untouched and the corners above it keep the sky.
+    expect_pixel(
+        &with,
+        SIZE / 2,
+        SIZE / 2,
+        STONE,
+        "the aimed block's top face",
+    );
+    expect_pixel(&with, 0, 0, SKY, "the corner above the block");
+}
+
+/// The crack over a breaking block: the stage sprite drawn over the block's own cube with the
+/// source's ×2 multiply (`tryBlendFuncSeparate(774, 768, 1, 0)`, `RenderGlobal.java:1799`), so
+/// the surface darkens towards the sprite and never brightens. The frame is rendered twice —
+/// the terrain alone, then the terrain and the overlay — at a fixed camera.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_crack_darkens_the_block_with_the_sources_multiply() {
+    // A mid-grey sprite: 2 * 64/255 * dst is darker than either source, so a wrong blend —
+    // src-over would lighten the sprite's grey into the frame, a single src×dst would darken
+    // twice as far — fails the prediction below.
+    const SPRITE: u8 = 64;
+    let grey = [SPRITE, SPRITE, SPRITE, 255];
+
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, grey));
+    terrain.set_camera(&queue, camera(), 1.0);
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let mut overlay = WorldOverlay::new(&device, format);
+    overlay.set_atlas(&device, &queue, &solid_atlas(16, grey));
+    overlay.set_cracks(vec![Crack {
+        block: [0, 0, 0],
+        stage: 5,
+    }]);
+    overlay.set_frame(&device, &queue, &camera(), [SIZE as f32, SIZE as f32]);
+
+    let without = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    let with = render_scene(&device, &queue, &target, &depth, |pass| {
+        terrain.draw(pass);
+        overlay.draw(pass);
+    });
+
+    // Every pixel the crack touched darkened — the multiply's factor on this sprite is below
+    // one — and pixels it did not reach are untouched.
+    let mut darkened = 0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let before = pixel(&without, x, y);
+            let after = pixel(&with, x, y);
+            assert!(
+                after
+                    .iter()
+                    .zip(before)
+                    .all(|(&after, before)| after <= before + 1),
+                "the crack brightened ({x}, {y}): {before:?} -> {after:?}"
+            );
+            if after != before {
+                darkened += 1;
+            }
+        }
+    }
+    assert!(
+        darkened > 20,
+        "the crack left only {darkened} pixels changed: it did not cover the block"
+    );
+
+    // The centre pixel is the multiply's own prediction: 2 * sprite/255 * dst, which the unorm
+    // target rounds. It is below both sources — the frame's own pixel and the sprite's grey.
+    let before = pixel(&without, SIZE / 2, SIZE / 2);
+    let after = pixel(&with, SIZE / 2, SIZE / 2);
+    assert_eq!(before, [32, 32, 32], "the lit grey block's top face");
+    let predicted = (2.0 * f64::from(SPRITE) / 255.0 * f64::from(before[0])).round() as u8;
+    for channel in 0..3 {
+        assert!(
+            (i16::from(after[channel]) - i16::from(predicted)).abs() <= 1,
+            "channel {channel} at the centre: got {}, want {predicted} (2 * {SPRITE}/255 * {})",
+            after[channel],
+            before[channel]
+        );
+        assert!(
+            after[channel] <= before[channel] && after[channel] <= SPRITE,
+            "channel {channel} is not below both sources: {} vs dst {} and src {SPRITE}",
+            after[channel],
+            before[channel]
+        );
+    }
+}
+
+/// The lightmap's runtime rewrite, folded in from the M2 final review's deferred item 34: a
+/// change between two draws through the same pass must take the buffer-rewrite path and reach
+/// the frame, not read a stale image. The fixture is a quad lit by the (block 0, sky 15) cell —
+/// the cell the sun's brightness scales — so a stale texture reads the noon value twice.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn a_lightmap_change_mid_frame_rewrites_the_lightmap() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, frame_camera(), 1.0);
+    let mut mesh = ChunkMesh::default();
+    // `[8, 248]`: block light 0, sky light 15.
+    push_quad_with_light(
+        &mut mesh,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
+        WHITE,
+        [8, 248],
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &mesh);
+
+    let noon = light_cell_with(1.0, 0, 15);
+    let dusk = light_cell_with(0.2, 0, 15);
+    assert_ne!(
+        noon, dusk,
+        "the cell this test reads must move with the sun"
+    );
+
+    let first = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(
+        &first,
+        SIZE / 2,
+        SIZE / 2,
+        noon,
+        "the lightmap the pass was built with",
+    );
+
+    terrain.set_lightmap(&queue, 0.2);
+    let second = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(&second, SIZE / 2, SIZE / 2, dusk, "the rewritten lightmap");
+
+    terrain.set_lightmap(&queue, 1.0);
+    let third = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(
+        &third,
+        SIZE / 2,
+        SIZE / 2,
+        noon,
+        "the lightmap rewritten back to noon",
+    );
 }
 
 /// Blocks the calling thread until `future` resolves; the test has no async runtime.
