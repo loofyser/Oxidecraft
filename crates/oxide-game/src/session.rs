@@ -692,6 +692,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         ChunkData::ID => match world.as_mut() {
                             Some(store) => {
                                 let column = decoded(id, ChunkData::decode(body, store.has_sky()))?;
+                                check_column_coordinate(column.chunk_x, column.chunk_z)?;
                                 if store.apply_chunk_data(&column) {
                                     mark_column_changed(
                                         store,
@@ -715,6 +716,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         MapChunkBulk::ID => match world.as_mut() {
                             Some(store) => {
                                 let bulk = decoded(id, MapChunkBulk::decode(body))?;
+                                for column in &bulk.columns {
+                                    check_column_coordinate(column.chunk_x, column.chunk_z)?;
+                                }
                                 store.apply_bulk(&bulk);
                                 for column in &bulk.columns {
                                     if store.chunk(column.chunk_x, column.chunk_z).is_some() {
@@ -1796,6 +1800,33 @@ fn coordinate_refusal(chunk_x: i32, chunk_z: i32) -> SessionError {
     SessionError::Packet(PacketError::Codec(CodecError::Io(io::Error::new(
         io::ErrorKind::InvalidData,
         format!("chunk coordinate ({chunk_x}, {chunk_z}) cannot compose a block position"),
+    ))))
+}
+
+/// Refuses a column whose chunk coordinate is outside the range the world
+/// carries ([`World::accepts_chunk_coordinate`]) before anything of it
+/// applies.
+///
+/// The coordinate is a raw `i32` off the wire, and the store and its light
+/// engine only compose positions within that range: a loaded column outside
+/// it would drive the engine's region arithmetic past `i32` on its next
+/// block change, which a checked build panics on. The refusal is the
+/// decoders' own malformed-field shape, and it precedes every write the
+/// column feeds, so a refused packet applies nothing.
+fn check_column_coordinate(cx: i32, cz: i32) -> Result<(), SessionError> {
+    if World::accepts_chunk_coordinate(cx, cz) {
+        return Ok(());
+    }
+    warn!(
+        cx = cx,
+        cz = cz,
+        "a chunk coordinate is outside the range the world's light region carries"
+    );
+    Err(SessionError::Packet(PacketError::Codec(CodecError::Io(
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("chunk coordinate ({cx}, {cz}) is outside the supported range"),
+        ),
     ))))
 }
 

@@ -933,6 +933,133 @@ fn a_multi_block_change_with_an_extreme_chunk_coordinate_is_refused() {
     }
 }
 
+/// The largest chunk coordinate magnitude the world carries: the range the
+/// light engine's region arithmetic composes without overflow (see
+/// `oxide_world::world`).
+const CHUNK_RANGE_EDGE: i32 = 134_217_726;
+
+#[test]
+fn a_column_below_the_supported_chunk_range_is_refused() {
+    // The load is the only way a coordinate reaches the light engine: a
+    // change lands in a loaded column, and its recomputation composes the
+    // region around that column, one chunk past its edges. A column loaded
+    // at -2^27 puts the region's far base one chunk below -2^27, where the
+    // region math multiplies past i32::MIN and a checked build panics. The
+    // load must refuse the coordinate instead of loading the column whose
+    // next change panics — an error, never a panic.
+    let cx = -(1 << 27);
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        chunk_data_frame(cx, 0),
+        multi_block_change_frame(cx, 0, &[(0x4101, STONE)]),
+    ]));
+    let (sender, _receiver) = crossbeam_channel::unbounded();
+    let error = Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect_err("a column below the supported range must be refused");
+    assert!(matches!(error, SessionError::Packet(_)), "error: {error:?}");
+}
+
+#[test]
+fn a_column_above_the_supported_chunk_range_is_refused() {
+    // 2^27 - 1 is the other side of the same edge: the region's rightmost
+    // cells sit at i32::MAX, and the spread's one-cell probe past one of
+    // them adds one more, which a checked build panics on. The load must
+    // refuse the coordinate; the change behind it proves the panic the
+    // refused load forecloses.
+    let cx = (1 << 27) - 1;
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        chunk_data_frame(cx, 0),
+        multi_block_change_frame(cx, 0, &[(0x4101, STONE)]),
+    ]));
+    let (sender, _receiver) = crossbeam_channel::unbounded();
+    let error = Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect_err("a column above the supported range must be refused");
+    assert!(matches!(error, SessionError::Packet(_)), "error: {error:?}");
+}
+
+#[test]
+fn a_column_at_the_supported_chunk_range_edge_loads_and_relights() {
+    // The edge is the largest magnitude the region math composes: the edge
+    // times 16, plus the spread's one-cell probe, is 2147483632, fifteen
+    // below i32::MAX. A column at the edge must load, run a change and
+    // rebuild its mesh with no overflow, in both signs and on both axes.
+    for (cx, cz) in [
+        (CHUNK_RANGE_EDGE, 0),
+        (-CHUNK_RANGE_EDGE, 0),
+        (0, CHUNK_RANGE_EDGE),
+        (0, -CHUNK_RANGE_EDGE),
+    ] {
+        let (stream, _outgoing) = duplex(stream_with(&[
+            join_game_frame(),
+            lit_column_frame(cx, cz, &[0], 15, 0, true),
+            multi_block_change_frame(cx, cz, &[(0x4101, STONE)]),
+        ]));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        Session::new(Conn::new(stream), config())
+            .run_over(&sender, silent_inputs())
+            .expect("a column at the range's edge runs");
+        let events: Vec<ClientEvent> = receiver.try_iter().collect();
+        assert_eq!(
+            updated_columns(&events),
+            BTreeSet::from([(cx, cz)]),
+            "({cx}, {cz}) is the only column the change marks: {events:?}"
+        );
+        let slots = last_updated_slots(&events, cx, cz);
+        let mesh = slots[0].1.as_ref().expect("section 0 draws its blocks");
+        assert_eq!(
+            mesh.vertex_count(),
+            48,
+            "({cx}, {cz}): the column's stone and the changed one, six faces each"
+        );
+        assert_relit(mesh);
+    }
+}
+
+#[test]
+fn a_column_one_step_outside_the_supported_chunk_range_is_refused() {
+    // One step past the edge is the first magnitude that fails to compose:
+    // the probe past 2^27 - 1 overflows. The store refuses it, on every sign
+    // and axis, and each run carries the change that would panic if the load
+    // were accepted.
+    let outside = CHUNK_RANGE_EDGE + 1;
+    for (cx, cz) in [(outside, 0), (-outside, 0), (0, outside), (0, -outside)] {
+        let (stream, _outgoing) = duplex(stream_with(&[
+            join_game_frame(),
+            chunk_data_frame(cx, cz),
+            multi_block_change_frame(cx, cz, &[(0x4101, STONE)]),
+        ]));
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let error = Session::new(Conn::new(stream), config())
+            .run_over(&sender, silent_inputs())
+            .expect_err("a column one step outside the range must be refused");
+        assert!(
+            matches!(error, SessionError::Packet(_)),
+            "({cx}, {cz}): error: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bulk_column_outside_the_supported_chunk_range_is_refused() {
+    // Map Chunk Bulk is the other load route and takes the same check: a
+    // bulk carrying one column below the range is refused whole, before any
+    // of its columns applies, so even the legal column is not loaded.
+    let cx = -(1 << 27);
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        bulk_frame_of(&[(0, 0), (cx, 0)]),
+        multi_block_change_frame(cx, 0, &[(0x4101, STONE)]),
+    ]));
+    let (sender, _receiver) = crossbeam_channel::unbounded();
+    let error = Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect_err("a bulk with a column outside the range must be refused");
+    assert!(matches!(error, SessionError::Packet(_)), "error: {error:?}");
+}
+
 #[test]
 fn a_multi_block_change_runs_one_light_pass_for_the_whole_packet() {
     // The packet's records all compose into its own chunk, so their recompute

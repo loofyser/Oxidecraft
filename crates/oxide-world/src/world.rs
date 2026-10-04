@@ -8,6 +8,23 @@ use oxide_proto_v47::column::ColumnData;
 
 use crate::chunk::{Chunk, SECTION_COUNT, SECTION_SIZE};
 
+/// The largest magnitude a chunk coordinate the store carries may have.
+///
+/// The bound is the range the light engine's region arithmetic composes
+/// without overflow. The engine's `recompute` owns the changed column and
+/// its eight neighbours; for a column at `c` that region math composes world
+/// positions from the far region base `(c - 1) * 16`, each cell's own
+/// `c * 16 + local`, and the one-cell probe the spread makes past an extreme
+/// cell, `c * 16 + 16`. The tightest of those in `i32` is the probe:
+/// `2^27 - 2` times 16 is 2147483616, one probe past it is 2147483632, and
+/// the next magnitude up, `2^27 - 1`, probes to 2147483648 — one past
+/// `i32::MAX`, which a checked build panics on. The negative side's far base
+/// admits one chunk more, so the store takes the symmetric bound: a
+/// coordinate outside `-CHUNK_COORDINATE_BOUND..=CHUNK_COORDINATE_BOUND` is
+/// never loaded, and the recomputation is only ever reached through a
+/// loaded column.
+pub const CHUNK_COORDINATE_BOUND: i32 = (1 << 27) - 2;
+
 /// The client's chunk store.
 #[derive(Debug)]
 pub struct World {
@@ -31,6 +48,18 @@ impl World {
         self.has_sky
     }
 
+    /// Whether both coordinates of a chunk lie within the range the store
+    /// carries, as [`CHUNK_COORDINATE_BOUND`] derives it.
+    ///
+    /// [`World::apply_column`] refuses a coordinate this answers `false`
+    /// for, so no column that would drive the light engine's region
+    /// arithmetic past `i32` is ever loaded; a caller reading a coordinate
+    /// off the wire asks this before the store sees it.
+    pub fn accepts_chunk_coordinate(cx: i32, cz: i32) -> bool {
+        (-CHUNK_COORDINATE_BOUND..=CHUNK_COORDINATE_BOUND).contains(&cx)
+            && (-CHUNK_COORDINATE_BOUND..=CHUNK_COORDINATE_BOUND).contains(&cz)
+    }
+
     /// Applies a decoded column to its chunk, creating the chunk when it is new.
     ///
     /// The unload shape — a ground-up column that selects no sections — removes
@@ -38,7 +67,17 @@ impl World {
     /// the column carries decide: a ground-up column that still carries
     /// sections is applied, whatever its mask says. This is the entry point the
     /// packet-facing calls below share.
+    ///
+    /// A coordinate outside the range the store carries
+    /// ([`World::accepts_chunk_coordinate`]) is refused: nothing is loaded or
+    /// unloaded, and `false` is reported. The load paths refuse the packet
+    /// before this, so on the wire a refused coordinate ends the session on a
+    /// malformed-packet error; this guard keeps the refusal structural, so no
+    /// route can put a column outside the range into the store.
     pub fn apply_column(&mut self, cx: i32, cz: i32, data: &ColumnData, ground_up: bool) -> bool {
+        if !Self::accepts_chunk_coordinate(cx, cz) {
+            return false;
+        }
         if ground_up && data.mask == 0 && data.sections.iter().all(Option::is_none) {
             self.unload(cx, cz);
             return false;
