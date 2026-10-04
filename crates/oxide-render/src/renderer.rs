@@ -11,6 +11,7 @@ use oxide_assets::font::FontError;
 use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
+use crate::dim_pass::DimPass;
 use crate::fog::FogParams;
 use crate::overlay::OverlayPass;
 use crate::sky::{
@@ -149,6 +150,8 @@ pub struct Renderer {
     cloud: CloudPass,
     /// The overlay pipeline, and the debug lines it draws.
     overlay: OverlayPass,
+    /// The dim quad, drawn over the scene before the overlay text.
+    dim: DimPass,
     /// The camera the next frame is drawn with, until a new one is set.
     camera: Option<Camera>,
     /// The fog the next frames are drawn and cleared with, until a new one is set.
@@ -258,6 +261,7 @@ impl Renderer {
         let cloud = CloudPass::new(&device, &queue, format);
         let mut overlay = OverlayPass::new(&device, format);
         overlay.set_size(&queue, config.width as f32, config.height as f32);
+        let dim = DimPass::new(&device, format);
         let depth = DepthTarget::new(&device, config.width, config.height);
 
         Ok(Self {
@@ -271,6 +275,7 @@ impl Renderer {
             sky,
             cloud,
             overlay,
+            dim,
             camera: None,
             fog: None,
         })
@@ -416,6 +421,24 @@ impl Renderer {
         self.overlay.upload_text(&self.device, &self.queue, &lines);
     }
 
+    /// Sets the full-frame tint the next frames draw over the scene, or clears it.
+    ///
+    /// The interim death view's backdrop: a colour here dims the whole frame
+    /// — blended so the scene shows through — under the overlay text. `None`,
+    /// the state every frame of a live player draws in, issues nothing.
+    pub fn set_dim(&mut self, colour: Option<[f32; 4]>) {
+        self.dim.set_colour(&self.queue, colour);
+    }
+
+    /// Forgets every section mesh the terrain holds, freeing their buffers.
+    ///
+    /// The world those meshes were built from is gone — a respawn across
+    /// dimensions replaces it whole — so the next frame draws none of them
+    /// until the session reports fresh columns.
+    pub fn clear_section_meshes(&mut self) {
+        self.terrain.clear_meshes();
+    }
+
     /// Draws the frame and presents it.
     ///
     /// The colour and depth attachments are cleared in the frame's single scene pass: the colour
@@ -498,6 +521,7 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            self.dim.draw(&mut overlay_pass);
             self.overlay.draw(&mut overlay_pass);
         }
         self.queue.submit(Some(encoder.finish()));

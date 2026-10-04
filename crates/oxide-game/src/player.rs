@@ -24,6 +24,23 @@ const WALK_SPEED: f32 = 0.1;
 /// `this.flyToggleTimer = 7` (`EntityPlayerSP.java:837`).
 const FLY_TOGGLE_WINDOW: i32 = 7;
 
+/// The player's maximum health, which a fresh `EntityLivingBase` starts at:
+/// `setHealth(getMaxHealth())` (`EntityLivingBase.java:201`) over
+/// `maxHealth`'s base value 20.0 (`SharedMonsterAttributes.java:18`).
+const MAX_HEALTH: f32 = 20.0;
+
+/// `FoodStats`' starting food level: `private int foodLevel = 20`
+/// (`FoodStats.java:12`).
+const START_FOOD: i32 = 20;
+
+/// `FoodStats`' starting saturation: `private float foodSaturationLevel = 5.0F`
+/// (`FoodStats.java:15`).
+const START_SATURATION: f32 = 5.0;
+
+/// The hurt flash's length in ticks: the status-2 handler sets
+/// `hurtTime = maxHurtTime = 10` (`EntityLivingBase.handleStatusUpdate:1362`).
+pub const MAX_HURT_TIME: u32 = 10;
+
 /// The player's abilities, the state the ability packets carry.
 ///
 /// The fields are `PlayerCapabilities`' own (`PlayerCapabilities.java:7-24`):
@@ -94,7 +111,9 @@ impl Abilities {
 /// sets. `last_reported_*`, `position_update_ticks`, `server_sprint_state`
 /// and `server_sneak_state` are the walking report's state, the source's
 /// `lastReported*`/`positionUpdateTicks` and `serverSprintState`/
-/// `serverSneakState` (`EntityPlayerSP.java:64-100`, `:189-274`).
+/// `serverSneakState` (`EntityPlayerSP.java:64-100`, `:189-274`). `health`,
+/// `food` and `saturation` mirror the last 0x06, `dead`/`death_time` carry
+/// the death state and `hurt_time`/`attacked_at_yaw` the hurt state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Player {
     /// The feet position in the world.
@@ -156,6 +175,47 @@ pub struct Player {
     /// fresh press when it was up then and is down now (`:834`); this is that
     /// previous bit.
     pub prev_jump: bool,
+    /// The player's health, from clientbound 0x06.
+    ///
+    /// A fresh `EntityLivingBase` starts at its maximum
+    /// (`EntityLivingBase.java:201` calls `setHealth(getMaxHealth())`), which
+    /// for a player is 20.0 (`SharedMonsterAttributes.java:18`); the server's
+    /// 0x06 replaces it, and a value at or below zero is the death.
+    pub health: f32,
+    /// The food level, from clientbound 0x06; `FoodStats`' own start is 20
+    /// (`FoodStats.java:12`).
+    pub food: i32,
+    /// The food saturation, from clientbound 0x06; `FoodStats`' own start is
+    /// 5.0 (`FoodStats.java:15`).
+    pub saturation: f32,
+    /// Whether the player is dead: health at or below zero, from the 0x06
+    /// that landed it, until clientbound 0x07 respawns the player.
+    ///
+    /// The source reads the death straight off the health each tick
+    /// (`EntityLivingBase.onEntityUpdate:344-349`); this client keeps the flag
+    /// its own 0x06 set, because the health mirror is not re-synced until the
+    /// server sends the next 0x06.
+    pub dead: bool,
+    /// Ticks since the death state began (`deathTime`).
+    ///
+    /// The source advances it once per tick while the entity is dead
+    /// (`EntityLivingBase.onDeathUpdate:398-400`, reached from
+    /// `onEntityUpdate:349`), and the camera's death tilt reads it (Task 11).
+    pub death_time: u32,
+    /// Ticks left of the hurt flash (`hurtTime`).
+    ///
+    /// The hurt status sets it to its maximum, ten
+    /// (`EntityLivingBase.handleStatusUpdate:1362`), and it counts down once
+    /// per tick (`onEntityUpdate:337-340`). Task 11's hurt roll reads it.
+    pub hurt_time: u32,
+    /// The yaw the last hurt came from (`attackedAtYaw`), for the hurt roll.
+    ///
+    /// The client's own status-2 handler zeroes it
+    /// (`EntityLivingBase.handleStatusUpdate:1363`); the attacker-derived value
+    /// is computed server-side in `attackEntityFrom` (`:961`) from the
+    /// attacker's position and is never carried by the status packet, so this
+    /// stays zero until M4 tracks attackers.
+    pub attacked_at_yaw: f32,
 }
 
 impl Player {
@@ -185,6 +245,13 @@ impl Player {
             server_sneak_state: false,
             fly_toggle_timer: 0,
             prev_jump: false,
+            health: MAX_HEALTH,
+            food: START_FOOD,
+            saturation: START_SATURATION,
+            dead: false,
+            death_time: 0,
+            hurt_time: 0,
+            attacked_at_yaw: 0.0,
         }
     }
 
@@ -247,6 +314,58 @@ impl Player {
         }
         toggled
     }
+
+    /// Applies the hurt status (clientbound 0x1A with status
+    /// [`EntityStatus::HURT`](oxide_proto_v47::clientbound::EntityStatus::HURT)).
+    ///
+    /// The source's status-2 branch sets `hurtTime = maxHurtTime = 10` and
+    /// zeroes `attackedAtYaw` (`EntityLivingBase.handleStatusUpdate:1362-1363`).
+    /// The attacker-derived yaw — `attackEntityFrom` computes it from the
+    /// attacker's position (`:961`) — is server-side state that the status
+    /// packet does not carry, so the field stays zero until M4 tracks
+    /// attackers; that split is recorded on [`Player::attacked_at_yaw`].
+    pub fn apply_hurt_status(&mut self) {
+        self.hurt_time = MAX_HURT_TIME;
+        self.attacked_at_yaw = 0.0;
+    }
+
+    /// The player-local half of a respawn reset (clientbound 0x07).
+    ///
+    /// The source answers a respawn by building a fresh `EntityPlayerSP` and
+    /// spawning it in (`Minecraft.setDimensionAndSpawnPlayer:990-1018`): the
+    /// entity id, the position and the client brand carry over, every other
+    /// transient field starts over, and `preparePlayerToSpawn` zeroes the
+    /// motion and the pitch (`Entity.preparePlayerToSpawn:315-333`), resets the
+    /// health to its maximum and the death clock to zero
+    /// (`EntityPlayer.preparePlayerToSpawn:578-583`). This port keeps the
+    /// session's own object and clears the same transients in place: the
+    /// motion, the pitch, the movement flags and their server mirrors, the
+    /// ground, water, jump and flight-toggle state, the hurt flash and the
+    /// death state. The position — which the source only nudges upward out of
+    /// a collision — is left to the 0x08 that follows, which carries it
+    /// absolutely.
+    pub fn reset_for_respawn(&mut self) {
+        self.motion = [0.0; 3];
+        self.pitch = 0.0;
+        self.health = MAX_HEALTH;
+        self.dead = false;
+        self.death_time = 0;
+        self.hurt_time = 0;
+        self.attacked_at_yaw = 0.0;
+        self.sprinting = false;
+        self.sneaking = false;
+        self.server_sprint_state = false;
+        self.server_sneak_state = false;
+        // The flags follow the abilities the server last stated, so the two
+        // copies cannot disagree (`Player::set_flying`).
+        self.set_flying(self.abilities.flying);
+        self.on_ground = false;
+        self.in_water = false;
+        self.jump_ticks = 0;
+        self.fly_toggle_timer = 0;
+        self.prev_jump = false;
+        self.sprint_tap = SprintTap::default();
+    }
 }
 
 impl Default for Player {
@@ -259,7 +378,7 @@ impl Default for Player {
 mod tests {
     //! The pinned literals of the player state.
 
-    use super::{Abilities, Player};
+    use super::{Abilities, MAX_HURT_TIME, Player};
 
     #[test]
     fn a_new_player_is_at_the_origin_and_the_eye_is_the_sources_own_height() {
@@ -293,6 +412,95 @@ mod tests {
         assert!(!player.server_sneak_state);
         assert_eq!(player.fly_toggle_timer, 0);
         assert!(!player.prev_jump);
+        // A fresh entity starts at its maximum health
+        // (`EntityLivingBase.java:201`, `SharedMonsterAttributes.java:18`),
+        // with `FoodStats`' own starting level and saturation
+        // (`FoodStats.java:12`, `:15`), and neither dead nor hurt.
+        assert_eq!(player.health, 20.0);
+        assert_eq!(player.food, 20);
+        assert_eq!(player.saturation, 5.0);
+        assert!(!player.dead);
+        assert_eq!(player.death_time, 0);
+        assert_eq!(player.hurt_time, 0);
+        assert_eq!(player.attacked_at_yaw, 0.0);
+    }
+
+    #[test]
+    fn the_hurt_status_sets_the_maximum_hurt_time_and_zeroes_the_attacker_yaw() {
+        // `EntityLivingBase.handleStatusUpdate:1362-1363`: status 2 sets
+        // `hurtTime = maxHurtTime = 10` and `attackedAtYaw = 0.0F`.
+        assert_eq!(MAX_HURT_TIME, 10, "the source's own ten ticks");
+        let mut player = Player::new();
+        player.hurt_time = 3;
+        player.attacked_at_yaw = 42.0;
+        player.apply_hurt_status();
+        assert_eq!(player.hurt_time, MAX_HURT_TIME);
+        assert_eq!(player.attacked_at_yaw, 0.0);
+    }
+
+    #[test]
+    fn the_respawn_reset_clears_the_transients_and_keeps_the_abilities() {
+        // `Minecraft.setDimensionAndSpawnPlayer:990-1018` with
+        // `EntityPlayer.preparePlayerToSpawn:578-583`: motion, pitch, the hurt
+        // flash, the death state and every movement transient start over; the
+        // health returns to its maximum; the abilities the server last stated
+        // are the one thing the flags still follow.
+        let mut player = Player::new();
+        player.motion = [1.0, 2.0, 3.0];
+        player.pitch = -30.0;
+        player.yaw = 90.0;
+        player.health = 0.0;
+        player.dead = true;
+        player.death_time = 17;
+        player.hurt_time = 4;
+        player.attacked_at_yaw = 12.0;
+        player.sprinting = true;
+        player.sneaking = true;
+        player.server_sprint_state = true;
+        player.server_sneak_state = true;
+        player.on_ground = true;
+        player.in_water = true;
+        player.jump_ticks = 6;
+        player.fly_toggle_timer = 5;
+        player.prev_jump = true;
+        player.abilities.allow_flying = true;
+        // A flight left over from before the death: the abilities say the
+        // player is not flying, so the reset must follow them, not the stale
+        // flag.
+        player.flying = true;
+        player.reset_for_respawn();
+        assert_eq!(player.motion, [0.0; 3]);
+        assert_eq!(player.pitch, 0.0, "`preparePlayerToSpawn` zeroes the pitch");
+        assert_eq!(player.yaw, 90.0, "the yaw the source does not touch");
+        assert_eq!(player.health, 20.0, "the health returns to its maximum");
+        assert!(!player.dead);
+        assert_eq!(player.death_time, 0);
+        assert_eq!(player.hurt_time, 0);
+        assert_eq!(player.attacked_at_yaw, 0.0);
+        assert!(!player.sprinting);
+        assert!(!player.sneaking);
+        assert!(!player.server_sprint_state);
+        assert!(!player.server_sneak_state);
+        assert!(!player.flying, "the abilities' own flying value is false");
+        assert!(!player.abilities.flying, "both copies agree");
+        assert!(!player.on_ground);
+        assert!(!player.in_water);
+        assert_eq!(player.jump_ticks, 0);
+        assert_eq!(player.fly_toggle_timer, 0);
+        assert!(!player.prev_jump);
+        assert!(player.abilities.allow_flying, "the abilities are kept");
+
+        // With flying stated by the abilities, the reset follows them.
+        let mut player = Player::new();
+        let flying_abilities = Abilities {
+            flying: true,
+            allow_flying: true,
+            ..Abilities::default()
+        };
+        player.apply_abilities(flying_abilities);
+        player.set_flying(true);
+        player.reset_for_respawn();
+        assert!(player.flying && player.abilities.flying);
     }
 
     #[test]

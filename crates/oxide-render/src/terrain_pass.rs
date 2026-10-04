@@ -711,6 +711,16 @@ impl TerrainPass {
         self.meshes.remove(&key);
     }
 
+    /// Forgets every section's mesh, freeing their buffers.
+    ///
+    /// The world they were built from is gone — a respawn across dimensions
+    /// replaces it whole, and the source's own dimension change builds a fresh
+    /// `RenderGlobal` for the new one — so the next draw has none of them
+    /// until the session reports fresh columns.
+    pub fn clear_meshes(&mut self) {
+        self.meshes.clear();
+    }
+
     /// Draws every mesh the frame keeps, layer by layer, in the layers' own order.
     ///
     /// The opaque and cutout layers draw in the table's order — the table is a hash map, and

@@ -201,3 +201,80 @@ fn every_change_bumps_the_column_generation() {
     let next = take(&mut queue);
     assert_eq!(next.generation, 3);
 }
+
+#[test]
+fn a_clear_empties_the_queue_and_keeps_the_generation_counter() {
+    // The state backlog's item 2: a world reset empties the queue in place,
+    // and the generations the old world's jobs carried must never come round
+    // again, or a build still out across the reset could answer as the new
+    // world's own.
+    let mut queue = MeshQueue::new();
+    queue.mark_dirty(0, 0);
+    queue.mark_dirty(1, 1);
+    let stale = take(&mut queue);
+    assert_eq!(stale.generation, 1, "the counter starts at one");
+    queue.clear_in_place();
+    assert_eq!(queue.pending(), 0, "the clear empties the queue");
+    assert_eq!(queue.next_job(), None, "nothing is left to build");
+    assert!(queue.generations().is_empty(), "no column is outstanding");
+
+    queue.mark_dirty(5, 5);
+    let fresh = take(&mut queue);
+    assert_eq!(
+        fresh.generation, 3,
+        "the counter survives the clear and keeps counting: one per mark, nothing reset"
+    );
+    assert!(
+        fresh.generation > stale.generation,
+        "no generation is ever handed out twice: {} against {}",
+        fresh.generation,
+        stale.generation
+    );
+}
+
+#[test]
+fn a_build_out_across_the_clear_is_discarded_and_new_work_is_kept() {
+    // The ordering guarantee `clear_in_place` exists for: a mesh result
+    // handed out before the clear and returned after it is rejected as stale;
+    // work enqueued after the clear is accepted.
+    let mut queue = MeshQueue::new();
+    queue.mark_dirty(2, 2);
+    let stale = take(&mut queue);
+    queue.clear_in_place();
+    queue.mark_dirty(2, 2);
+    let fresh = take(&mut queue);
+    assert!(
+        fresh.generation > stale.generation,
+        "the rebuild carries a generation the old job cannot match"
+    );
+    assert!(
+        !queue.complete(stale),
+        "the pre-clear build is discarded, not reported as the new world's"
+    );
+    assert!(
+        queue.complete(fresh),
+        "the post-clear build is the column's current one"
+    );
+    assert_eq!(queue.pending(), 0, "a fresh completion drains the queue");
+}
+
+#[test]
+fn a_stale_build_landing_before_the_rebuild_leaves_the_column_queued_once() {
+    // The other return order: the pre-clear build comes back after the clear
+    // re-queued the column but before the rebuild was handed out. It is
+    // discarded and the column keeps its one place in the queue.
+    let mut queue = MeshQueue::new();
+    queue.mark_dirty(3, 3);
+    let stale = take(&mut queue);
+    queue.clear_in_place();
+    queue.mark_dirty(3, 3);
+    assert!(!queue.complete(stale), "the pre-clear build is discarded");
+    assert_eq!(
+        queue.pending(),
+        1,
+        "the column is queued once, not once per mark"
+    );
+    let fresh = take(&mut queue);
+    assert!(queue.complete(fresh));
+    assert_eq!(queue.pending(), 0);
+}

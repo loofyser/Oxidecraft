@@ -64,6 +64,25 @@ const MAX_FRAMES_VAR: &str = "OXIDECRAFT_MAX_FRAMES";
 /// How many sections one column has.
 const SECTIONS_PER_COLUMN: u8 = 16;
 
+/// The interim death view's frame dim.
+///
+/// The first stop of the source's death-screen gradient:
+/// `GuiGameOver.drawScreen` fills `drawGradientRect(0, 0, width, height,
+/// 1615855616, -1602211792)`, and `1615855616` is `0x60500000` — alpha 96,
+/// red 80, green and blue zero. The one flat quad is this milestone's
+/// stand-in for the two-stop gradient; the bytes are written as the client's
+/// own no-transfer-function floats.
+const DEATH_DIM: [f32; 4] = [80.0 / 255.0, 0.0, 0.0, 96.0 / 255.0];
+
+/// The interim death view's title, the source's `deathScreen.title` string.
+const DEATH_TITLE: &str = "You died!";
+
+/// The interim death view's prompt, the source's `deathScreen.respawn` string.
+///
+/// A click or Space is answered with one client-status respawn request, and
+/// the server's clientbound 0x07 clears the view.
+const DEATH_RESPAWN: &str = "Respawn";
+
 /// The command line.
 #[derive(Parser)]
 #[command(name = "oxide-client", version, about = "Oxidecraft client")]
@@ -372,6 +391,12 @@ struct ClientApp {
     player: PlayerState,
     /// Whether F3 has the overlay showing.
     overlay_visible: bool,
+    /// Whether the session last reported the player dead.
+    ///
+    /// While it holds, the frame draws the interim death view — the dim quad
+    /// and the two lines — instead of the debug overlay, and the session
+    /// answers clicks and Space with respawn requests.
+    dead: bool,
     /// The latest aim the session reported, or `None` when the interaction ray
     /// meets no block.
     ///
@@ -589,6 +614,7 @@ impl ClientApp {
             player: PlayerState::default(),
             aim: None,
             overlay_visible,
+            dead: false,
             capture: Capture::default(),
             script,
         })
@@ -643,6 +669,7 @@ impl ClientApp {
                 &mut self.sky,
                 &mut self.player,
                 &mut self.aim,
+                &mut self.dead,
                 event,
             );
         }
@@ -679,11 +706,20 @@ impl ClientApp {
                 renderer.set_sky(sky);
             }
         }
-        renderer.set_overlay_lines(if self.overlay_visible {
-            debug_lines(&self.hud)
+        // The death view replaces the debug overlay while the player is dead:
+        // the dim quad over the scene and the two lines where the overlay's
+        // text goes. Both are cleared when the respawn arrives.
+        if self.dead {
+            renderer.set_dim(Some(DEATH_DIM));
+            renderer.set_overlay_lines(vec![DEATH_TITLE.to_string(), DEATH_RESPAWN.to_string()]);
         } else {
-            Vec::new()
-        });
+            renderer.set_dim(None);
+            renderer.set_overlay_lines(if self.overlay_visible {
+                debug_lines(&self.hud)
+            } else {
+                Vec::new()
+            });
+        }
         match present_frame(renderer) {
             Ok(PresentOutcome::Presented) => {}
             Ok(PresentOutcome::Skipped) => return,
@@ -927,6 +963,7 @@ fn apply_session_event(
     sky: &mut SkyState,
     player: &mut PlayerState,
     aim: &mut Option<Aim>,
+    dead: &mut bool,
     event: ClientEvent,
 ) -> bool {
     match event {
@@ -1028,6 +1065,38 @@ fn apply_session_event(
             for section in 0..SECTIONS_PER_COLUMN {
                 renderer.set_section_mesh((cx, cz, section), None);
             }
+            false
+        }
+        ClientEvent::Health {
+            health,
+            food,
+            saturation,
+        } => {
+            tracing::debug!(health, food, saturation, "the health was set");
+            false
+        }
+        ClientEvent::Died => {
+            // The death view goes up: the dim quad and the two lines, drawn
+            // from the next frame until the respawn clears them. The session
+            // has already gated the input and cancelled the dig.
+            tracing::info!("the player died; the death view is up");
+            *dead = true;
+            false
+        }
+        ClientEvent::Respawned {
+            dimension,
+            gamemode,
+        } => {
+            tracing::info!(dimension, gamemode, "the player respawned");
+            *dead = false;
+            hud.dimension = dimension;
+            false
+        }
+        ClientEvent::WorldCleared => {
+            // The world those meshes were built from is gone; the session's
+            // fresh columns replace them as they arrive.
+            tracing::info!("the world was rebuilt; the section meshes are dropped");
+            renderer.clear_section_meshes();
             false
         }
         ClientEvent::KeepAlive { id } => {
@@ -1327,9 +1396,10 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Aim, Capture, CaptureStep, Cli, ClientApp, Directive, Key, MouseButton, PlayerState,
-        ScriptDriver, SkyValues, bound_mouse_button, frame_params, gameplay_key, is_escape_press,
-        is_f3_press, parse_script, parse_server_address, store_aim, void_y_factor,
+        Aim, Capture, CaptureStep, Cli, ClientApp, DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE,
+        Directive, Key, MouseButton, PlayerState, ScriptDriver, SkyValues, bound_mouse_button,
+        frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
+        parse_server_address, store_aim, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -1911,5 +1981,21 @@ mod tests {
         assert!(store_aim(&mut aim, None), "the clearing report moves it");
         assert_eq!(aim, None, "the aim is cleared");
         assert!(!store_aim(&mut aim, None), "there is nothing left to clear");
+    }
+
+    #[test]
+    fn the_death_view_constants_are_the_sources() {
+        // The dim is the first stop of `GuiGameOver`'s gradient
+        // (`drawGradientRect(0, 0, width, height, 1615855616, -1602211792)`):
+        // `0x60500000` is alpha 96 over red 80, and the client's floats are
+        // the byte values over 255, its no-transfer-function convention.
+        assert_eq!(DEATH_DIM[0], 80.0 / 255.0, "red 80");
+        assert_eq!(DEATH_DIM[1], 0.0, "green 0");
+        assert_eq!(DEATH_DIM[2], 0.0, "blue 0");
+        assert_eq!(DEATH_DIM[3], 96.0 / 255.0, "alpha 96");
+        // The two lines are the source's `deathScreen.title` and
+        // `deathScreen.respawn` strings.
+        assert_eq!(DEATH_TITLE, "You died!");
+        assert_eq!(DEATH_RESPAWN, "Respawn");
     }
 }

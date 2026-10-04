@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::{Aim, Face};
+use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError, recompute_passes};
 use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
@@ -217,6 +218,19 @@ fn chunk_data_frame_at(cx: i32, cz: i32, x: usize, z: usize) -> Vec<u8> {
 /// The unload shape: a ground-up Chunk Data with an empty mask and no data.
 fn chunk_unload_frame(cx: i32, cz: i32) -> Vec<u8> {
     column_frame(cx, cz, true, 0x0000, &[])
+}
+
+/// One ground-up Chunk Data column for a dimension without sky light: one
+/// stone block at its origin, dark block light and plains biomes — the sky
+/// light array the Overworld's columns carry is absent, because the reader
+/// takes it only when the dimension has a sky
+/// (`NetHandlerPlayClient.handleChunkData:1187-1196`).
+fn sky_less_column_frame(cx: i32, cz: i32) -> Vec<u8> {
+    let mut column = vec![0u8; 8192];
+    column[..2].copy_from_slice(&0x0010u16.to_le_bytes());
+    column.extend_from_slice(&[0u8; 2048]); // block light
+    column.extend_from_slice(&[1u8; 256]); // biomes
+    column_frame(cx, cz, true, 0x0001, &column)
 }
 
 /// One Map Chunk Bulk frame (0x26) carrying a simple ground-up column at each
@@ -4027,5 +4041,643 @@ fn a_right_press_during_a_dig_places_nothing() {
             .iter()
             .any(|event| matches!(event, ClientEvent::BreakStage { .. })),
         "the dig did run: {events:?}"
+    );
+}
+
+/// The player's own entity id, as `join_game_frame` names it.
+const OWN_ENTITY_ID: i32 = 20;
+
+/// The source's hurt status byte: `EntityLivingBase.handleStatusUpdate`'s
+/// status 2.
+const HURT_STATUS: u8 = 2;
+
+/// One Update Health payload (0x06): the health f32, the food VarInt and the
+/// saturation f32 (`S06PacketUpdateHealth.readPacketData:28-32`).
+fn update_health_frame(health: f32, food: i32, saturation: f32) -> Vec<u8> {
+    let mut payload = vec![0x06];
+    payload.extend_from_slice(&health.to_be_bytes());
+    push_varint(&mut payload, food);
+    payload.extend_from_slice(&saturation.to_be_bytes());
+    payload
+}
+
+/// One Respawn payload (0x07): the dimension i32, the difficulty and gamemode
+/// bytes and the level type string (`S07PacketRespawn`).
+fn respawn_frame(dimension: i32, difficulty: u8, gamemode: u8, level_type: &str) -> Vec<u8> {
+    let mut payload = vec![0x07];
+    payload.extend_from_slice(&dimension.to_be_bytes());
+    payload.push(difficulty);
+    payload.push(gamemode);
+    push_string(&mut payload, level_type);
+    payload
+}
+
+/// One Entity Status payload (0x1A): the entity id i32 and the status byte
+/// (`S19PacketEntityStatus`).
+fn entity_status_frame(entity_id: i32, status: u8) -> Vec<u8> {
+    let mut payload = vec![0x1a];
+    payload.extend_from_slice(&entity_id.to_be_bytes());
+    payload.push(status);
+    payload
+}
+
+/// The Client Status payload that asks the server to respawn the player:
+/// action 0 (`C16PacketClientStatus.EnumState.PERFORM_RESPAWN`).
+fn respawn_request_frame() -> Vec<u8> {
+    vec![0x16, 0x00]
+}
+
+/// One fresh Space press and its release, for the death view's second key.
+fn space_event(pressed: bool) -> InputEvent {
+    InputEvent::Key {
+        key: Key::Space,
+        pressed,
+    }
+}
+
+/// One fresh Shift press and its release, the sneak key.
+fn shift_event(pressed: bool) -> InputEvent {
+    InputEvent::Key {
+        key: Key::ShiftLeft,
+        pressed,
+    }
+}
+
+/// The walking reports (0x03–0x06) in a frame list, in order.
+fn walking_frames(frames: &[Vec<u8>]) -> Vec<&Vec<u8>> {
+    frames
+        .iter()
+        .filter(|frame| matches!(frame[0], 0x03..=0x06))
+        .collect()
+}
+
+#[test]
+fn a_zero_health_death_cancels_the_dig_and_gates_the_window_input() {
+    // Health at or below zero enters the death
+    // (`EntityLivingBase.onEntityUpdate:344-349` reads the health off the
+    // field every tick): the running dig is cancelled the way the death
+    // screen cancels it (`Minecraft.java:1515-1518` runs
+    // `sendClickBlockToController` with no left click), the state is reported
+    // once, and from then on the window's input is the death view's: a click
+    // or Space asks for the respawn, and a movement key or a look moves
+    // nothing.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &update_health_frame(0.0, 20, 5.0),
+        SERVER_FRAMING,
+    );
+    let flips = vec![
+        // Early enough for the dig to run, late enough that the first ticks
+        // have found the block.
+        (8, left_press()),
+        // All of these land after the death, during the tail's quiet stretch.
+        (
+            16,
+            InputEvent::Key {
+                key: Key::W,
+                pressed: true,
+            },
+        ),
+        (20, InputEvent::MouseDelta { dx: 40.0, dy: 0.0 }),
+        (24, left_press()),
+    ];
+    let (events, frames) = flip_session(dig_head(DIRT), tail, 12, 60, flips);
+
+    // The dig: the press's start, then the death's abort with the DOWN face
+    // (`PlayerControllerMP.resetBlockRemoving:274-283`) and nothing else.
+    let digs: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x07).collect();
+    assert_eq!(
+        digs,
+        vec![
+            &digging_frame(0x00, 0, 65, 2, 2),
+            &digging_frame(0x01, 0, 65, 2, 0),
+        ],
+        "the start and the death's abort, and the click sends nothing: {frames:?}"
+    );
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x0a).count(),
+        1,
+        "the press swung once; the click while dead does not swing: {frames:?}"
+    );
+    let requests: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x16).collect();
+    assert_eq!(
+        requests,
+        vec![&respawn_request_frame()],
+        "the click asks for the respawn once: {frames:?}"
+    );
+
+    // Movement and look are gated: the walk key and the mouse produce no new
+    // pose — the walking reports the source keeps sending repeat the
+    // teleport's own position whenever the twenty-tick stale rule fires
+    // (`EntityPlayerSP.onUpdateWalkingPlayer:225-247`), so every report is
+    // checked to carry exactly the teleported pose.
+    let echo = &frames[nth_frame(&frames, 0x06, 0)];
+    for frame in frames
+        .iter()
+        .filter(|frame| matches!(frame[0], 0x04..=0x06))
+    {
+        match frame[0] {
+            0x04 => assert_eq!(
+                &frame[1..25],
+                &echo[1..25],
+                "a position report repeats the teleport's position: {frame:?}"
+            ),
+            0x05 => assert_eq!(
+                &frame[1..9],
+                &echo[25..33],
+                "a rotation report repeats the teleport's rotation: {frame:?}"
+            ),
+            _ => {
+                assert_eq!(
+                    &frame[1..25],
+                    &echo[1..25],
+                    "the combined report's position: {frame:?}"
+                );
+                assert_eq!(
+                    &frame[25..33],
+                    &echo[25..33],
+                    "the combined report's rotation: {frame:?}"
+                );
+            }
+        }
+    }
+    let died = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Died))
+        .expect("the death was reported");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::Died))
+            .count(),
+        1,
+        "the death is entered once: {events:?}"
+    );
+    assert!(
+        events[..died].iter().any(|event| matches!(
+            event,
+            ClientEvent::Health {
+                health: 0.0,
+                food: 20,
+                ..
+            }
+        )),
+        "the health landed before the death: {events:?}"
+    );
+    let after: Vec<&ClientEvent> = events[died + 1..]
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .collect();
+    assert!(after.len() >= 3, "the tick kept running: {events:?}");
+    for event in after {
+        if let ClientEvent::PlayerTick {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+            ..
+        } = event
+        {
+            assert_eq!(
+                (*x, *y, *z, *yaw, *pitch),
+                (0.5, 64.0, 0.5, 0.0, 0.0),
+                "the walk key and the look moved nothing: {event:?}"
+            );
+        }
+    }
+
+    // The dig's stage ladder ended in its clear (`sendBlockBreakProgress`
+    // with a negative progress drops the entry, `:281`).
+    let stages = reported_stages(&events);
+    let dug: Vec<Option<u8>> = stages
+        .iter()
+        .filter(|(position, _)| *position == (0, 65, 2))
+        .map(|(_, stage)| *stage)
+        .collect();
+    assert!(dug.len() >= 2, "the dig stepped: {events:?}");
+    assert_eq!(dug.last(), Some(&None), "the death cleared the stage");
+}
+
+#[test]
+fn a_click_or_space_while_dead_asks_for_one_respawn_per_press() {
+    // The death view's own input: one client-status request per press
+    // (`GuiGameOver.actionPerformed:57-77` sends one from the button's click),
+    // and a held button does not repeat — the request is the press, not the
+    // held state. A later health above zero does not leave the death: only the
+    // server's respawn does.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &update_health_frame(0.0, 20, 5.0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &update_health_frame(0.0, 20, 5.0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &update_health_frame(20.0, 20, 5.0),
+        SERVER_FRAMING,
+    );
+    let flips = vec![
+        (6, left_press()),
+        (
+            8,
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+            },
+        ),
+        (10, left_press()),
+        (12, space_event(true)),
+        (14, space_event(false)),
+        (16, space_event(true)),
+        (
+            18,
+            InputEvent::Key {
+                key: Key::W,
+                pressed: true,
+            },
+        ),
+    ];
+    let (events, frames) = flip_session(floor_head(), tail, 4, 60, flips);
+
+    let requests = frames
+        .iter()
+        .filter(|frame| frame.as_slice() == respawn_request_frame())
+        .count();
+    assert_eq!(
+        requests, 4,
+        "two clicks and two Space presses ask four times, and nothing repeats: {frames:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::Died))
+            .count(),
+        1,
+        "the repeated death frame does not re-enter the state: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::Health { .. }))
+            .count(),
+        3,
+        "every Update Health is reported: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            ClientEvent::Respawned { .. } | ClientEvent::WorldCleared
+        )),
+        "nothing but the server's respawn leaves the death: {events:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame[0] != 0x0a && frame[0] != 0x07),
+        "the clicks while dead swing and dig nothing: {frames:?}"
+    );
+}
+
+#[test]
+fn a_tick_between_the_respawn_and_its_placement_sends_no_movement_packet() {
+    // The respawn leaves the fresh player unplaced: the movement reports wait
+    // for the 0x08 that carries the placement, so the ticks between the two
+    // send nothing — while the session's own tick keeps running. The keepalive
+    // the server follows the respawn with marks the wire, and every frame
+    // after its echo is checked.
+    let mut head = floor_head();
+    frame(&mut head, &keep_alive_frame(7), SERVER_FRAMING);
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &respawn_frame(0, 1, 0, "default"),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(9), SERVER_FRAMING);
+    let flips = vec![(
+        6,
+        InputEvent::Key {
+            key: Key::W,
+            pressed: true,
+        },
+    )];
+    let (events, frames) = flip_session(head, tail, 4, 60, flips);
+
+    let echo9 = nth_frame(&frames, 0x00, 1);
+    assert_eq!(
+        frames[echo9],
+        vec![0x00, 0x09],
+        "the second keepalive's echo marks the respawn's wire: {frames:?}"
+    );
+    assert!(
+        walking_frames(&frames[echo9 + 1..]).is_empty(),
+        "no movement packet follows the respawn before its placement: {frames:?}"
+    );
+    let respawned = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Respawned { dimension: 0, .. }))
+        .expect("the respawn was reported");
+    let ticks_after = events[respawned + 1..]
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    assert!(
+        ticks_after >= 3,
+        "the ticks kept running through the hold: {ticks_after}"
+    );
+}
+
+#[test]
+fn the_placements_echo_re_arms_the_reporters() {
+    // The 0x08 ends the hold: its echo is the position report that reconciles
+    // the placement, and the ticks after it report again — the frames between
+    // the respawn and the echo carry nothing, and the frames after it carry
+    // the walking reports.
+    let mut head = floor_head();
+    frame(&mut head, &keep_alive_frame(7), SERVER_FRAMING);
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &respawn_frame(0, 1, 0, "default"),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(9), SERVER_FRAMING);
+    frame(
+        &mut tail,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(11), SERVER_FRAMING);
+    let (events, frames) = flip_session(head, tail, 4, 60, Vec::new());
+
+    let echo9 = nth_frame(&frames, 0x00, 1);
+    let echo11 = nth_frame(&frames, 0x00, 2);
+    let placement_echo = nth_frame(&frames, 0x06, 1);
+    assert!(
+        echo9 < placement_echo && placement_echo < echo11,
+        "the placement's echo sits between the two keepalives: {frames:?}"
+    );
+    assert!(
+        frames[echo9 + 1..placement_echo].is_empty(),
+        "the hold sends nothing between the respawn and the placement: {frames:?}"
+    );
+    assert!(
+        !walking_frames(&frames[echo11 + 1..]).is_empty(),
+        "the reporters re-arm after the placement's echo: {frames:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Respawned { dimension: 0, .. })),
+        "the respawn was reported: {events:?}"
+    );
+}
+
+#[test]
+fn a_same_dimension_respawn_keeps_the_world_and_restarts_the_player() {
+    // The dimension matches the one the world was built for, so the world is
+    // kept: the source's handler rebuilds only on a change
+    // (`NetHandlerPlayClient.handleRespawn:1056-1073`), no chunk is dropped,
+    // and the fresh player starts over inside it — the flags per the
+    // abilities, the motion and the pitch zeroed
+    // (`Entity.preparePlayerToSpawn:315-333`), the dig and the aim gone. A
+    // held key re-asserts itself once the placement's echo re-arms the
+    // reporters, because the respawn replaced the server's own player too.
+    let mut head = dig_head(DIRT);
+    // The server's abilities with the flying bit: the respawn's reset must
+    // follow them, not clear flight blindly.
+    frame(&mut head, &abilities_frame(0x0E, 0.05, 0.1), SERVER_FRAMING);
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &respawn_frame(0, 1, 0, "default"),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(9), SERVER_FRAMING);
+    frame(
+        &mut tail,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(11), SERVER_FRAMING);
+    let flips = vec![(4, shift_event(true)), (18, left_press())];
+    let (events, frames) = flip_session(head, tail, 30, 60, flips);
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Respawned { dimension: 0, .. })),
+        "the respawn was reported: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            ClientEvent::WorldCleared | ClientEvent::ChunkUnloaded { .. }
+        )),
+        "the world was kept: {events:?}"
+    );
+    // The dig is gone: the respawn aborted it with the DOWN face
+    // (`PlayerControllerMP.resetBlockRemoving:274-283`), and the held button
+    // starts a fresh dig on the block the recomputed aim found — the source's
+    // `sendClickBlockToController` runs on the held button whether or not a
+    // dig was underway, and the reset left none underway.
+    let digs: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x07).collect();
+    assert_eq!(
+        digs,
+        vec![
+            &digging_frame(0x00, 0, 65, 2, 2),
+            &digging_frame(0x01, 0, 65, 2, 0),
+            &digging_frame(0x00, 0, 65, 2, 2),
+            &digging_frame(0x02, 0, 65, 2, 2),
+        ],
+        "the respawn aborted the running dig, and the held button started over: {frames:?}"
+    );
+    let stages = reported_stages(&events);
+    let dug: Vec<Option<u8>> = stages
+        .iter()
+        .filter(|(position, _)| *position == (0, 65, 2))
+        .map(|(_, stage)| *stage)
+        .collect();
+    assert_eq!(dug.last(), Some(&None), "the stage map dropped the dig");
+    // The aim was cleared at the respawn and recomputed against the kept
+    // world: the clear goes out before the respawn reports itself (the window
+    // learns the state changed, then that it is a new player), and the first
+    // recompute after it names the same dirt block the kept world holds.
+    let respawned = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Respawned { .. }))
+        .expect("the respawn was reported");
+    assert!(
+        matches!(
+            events[..respawned]
+                .iter()
+                .rev()
+                .find(|event| matches!(event, ClientEvent::Aim { .. })),
+            Some(ClientEvent::Aim { aim: None })
+        ),
+        "the respawn cleared the aim: {respawning:?}",
+        respawning = &events[respawned.saturating_sub(3)..=respawned]
+    );
+    let recomputed = events[respawned..]
+        .iter()
+        .find(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("the aim was recomputed against the kept world");
+    assert!(
+        matches!(
+            recomputed,
+            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+        ),
+        "the aim was recomputed against the kept world: {recomputed:?}"
+    );
+    // The held sneak re-asserts itself once the reporters re-arm: one Start
+    // Sneaking before the respawn, one after the placement's echo.
+    let starts = frames
+        .iter()
+        .filter(|frame| frame.as_slice() == [0x0B, 0x14, 0x00, 0x00])
+        .count();
+    assert_eq!(
+        starts, 2,
+        "the held key re-asserts after the respawn: {frames:?}"
+    );
+    let echo11 = nth_frame(&frames, 0x00, 1);
+    let restarts: Vec<&Vec<u8>> = frames[echo11..]
+        .iter()
+        .filter(|frame| frame.as_slice() == [0x0B, 0x14, 0x00, 0x00])
+        .collect();
+    assert_eq!(
+        restarts.len(),
+        1,
+        "the re-assertion is the only action after the respawn: {frames:?}"
+    );
+}
+
+#[test]
+fn a_respawn_into_another_dimension_rebuilds_the_world_and_clears_the_queue() {
+    // The dimension changed: the source rebuilds the world
+    // (`NetHandlerPlayClient.handleRespawn:1056-1073`), this client builds a
+    // new one and empties the mesh queue in place — the column set belongs to
+    // a world that is gone — and the window is told its chunk store is stale
+    // before the respawn is reported. The fresh columns then replace the old
+    // world's meshes, and the new world reads them without sky light because
+    // the dimension has no sky.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &respawn_frame(-1, 1, 2, "default"),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(9), SERVER_FRAMING);
+    frame(&mut tail, &sky_less_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut tail,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(11), SERVER_FRAMING);
+    let (events, frames) = flip_session(floor_head(), tail, 4, 60, Vec::new());
+
+    let cleared = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::WorldCleared))
+        .expect("the world clear was reported");
+    let respawned = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Respawned { dimension: -1, .. }))
+        .expect("the respawn was reported");
+    assert!(
+        cleared < respawned,
+        "the world clear precedes the respawn: {events:?}"
+    );
+    assert!(
+        events[respawned..].iter().any(|event| matches!(
+            event,
+            ClientEvent::Respawned {
+                gamemode: 2,
+                dimension: -1
+            }
+        )),
+        "the respawn carries the packet's dimension and gamemode: {events:?}"
+    );
+    assert!(
+        events[cleared..]
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ChunkUpdated { cx: 0, cz: 0, .. })),
+        "the fresh world's column replaced the old meshes: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ChunkUnloaded { .. })),
+        "the rebuild does not unload columns; the clear is the window's cue: {events:?}"
+    );
+    let echo11 = nth_frame(&frames, 0x00, 1);
+    assert!(
+        !walking_frames(&frames[echo11 + 1..]).is_empty(),
+        "the reporters re-arm in the new world: {frames:?}"
+    );
+}
+
+#[test]
+fn an_entity_status_for_the_player_fills_the_hurt_flash_and_the_ticks_count_it_down() {
+    // Status 2 fills the hurt flash to its maximum
+    // (`EntityLivingBase.handleStatusUpdate:1362-1363`, `hurtTime = maxHurtTime
+    // = 10`), and the ticks count it down one per tick
+    // (`onEntityUpdate:337-340`). A status for another entity is not the
+    // player's and fills nothing: a second fill would make the flash jump back
+    // up, and the sequence never does.
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &entity_status_frame(21, HURT_STATUS),
+        SERVER_FRAMING,
+    );
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &entity_status_frame(OWN_ENTITY_ID, HURT_STATUS),
+        SERVER_FRAMING,
+    );
+    let (events, _frames) = flip_session(head, tail, 8, 60, Vec::new());
+    let flashes: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                hurt_time,
+                snapped: false,
+                ..
+            } => Some(*hurt_time),
+            _ => None,
+        })
+        .collect();
+    let filled = flashes
+        .iter()
+        .position(|flash| *flash > 0)
+        .expect("the status filled the flash");
+    // The step counts the flash down before it reports, so the first value the
+    // events carry is one below the maximum the status set.
+    assert_eq!(
+        flashes[filled],
+        MAX_HURT_TIME - 1,
+        "the flash starts at `maxHurtTime` (`EntityLivingBase:336-340`): {flashes:?}"
+    );
+    assert!(
+        flashes[..filled].iter().all(|flash| *flash == 0),
+        "nothing before the status filled it: {flashes:?}"
+    );
+    assert!(
+        flashes[filled..].windows(2).all(|pair| pair[1] <= pair[0]),
+        "the flash only counts down: {flashes:?}"
+    );
+    assert_eq!(
+        flashes.last(),
+        Some(&0),
+        "the flash reaches zero: {flashes:?}"
     );
 }

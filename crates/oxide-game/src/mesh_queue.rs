@@ -18,7 +18,10 @@
 //!   job until its completion has been seen;
 //! - [`MeshQueue::mark_column_unloaded`] forgets the column and queues its
 //!   four neighbours: a column that leaves the store changes the collar their
-//!   meshes read.
+//!   meshes read;
+//! - [`MeshQueue::clear_in_place`] empties the queue for a world that is gone
+//!   without resetting the generation counter, so a build that was out across
+//!   the clear can never answer as the new world's own.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -203,6 +206,26 @@ impl MeshQueue {
             .iter()
             .map(|(&(cx, cz), state)| ((cx, cz), state.generation()))
             .collect()
+    }
+
+    /// Empties the queue in place, keeping the generation counter.
+    ///
+    /// Every outstanding column is forgotten — the dirty set and the states
+    /// with it — and the counter is left where it is, so the next generation
+    /// handed out is still ahead of every generation any earlier job carried.
+    /// That is the ordering guarantee the clear exists for: a build handed to
+    /// a worker before the clear and returned after it can never match a
+    /// column's current generation, so its result is discarded as stale (and
+    /// the column is queued once more, whose build reads whatever world now
+    /// stands), while work marked after the clear carries fresh generations
+    /// and its completions are accepted.
+    ///
+    /// The reset a re-sent Join Game and a dimension rebuild take: the columns
+    /// in the queue belong to a world that is gone. Only a genuinely fresh
+    /// session may start the counter over ([`MeshQueue::new`]).
+    pub fn clear_in_place(&mut self) {
+        self.dirty.clear();
+        self.states.clear();
     }
 
     /// Forgets a column entirely: its state and its place in the dirty set.

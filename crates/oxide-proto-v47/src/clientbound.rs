@@ -815,6 +815,113 @@ impl BlockBreakAnimation {
     }
 }
 
+/// Clientbound Update Health (play id 0x06).
+///
+/// The player's health, food level and food saturation, in the source's own
+/// order (`S06PacketUpdateHealth.readPacketData:28-32`): the health an `f32`,
+/// the food level a VarInt and the saturation an `f32`. A health at or below
+/// zero is the server saying the player died; the fields are carried raw,
+/// because nothing here can validate a hostile server's numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UpdateHealth {
+    /// The player's health; a survival player's maximum is 20.
+    pub health: f32,
+    /// The food level, 0..=20.
+    pub food: i32,
+    /// The food saturation.
+    pub saturation: f32,
+}
+
+impl UpdateHealth {
+    /// The packet id.
+    pub const ID: i32 = 0x06;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let health = codec::read_f32(&mut cursor)?;
+        let food = read_varint(&mut cursor)?;
+        let saturation = codec::read_f32(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            health,
+            food,
+            saturation,
+        })
+    }
+}
+
+/// Clientbound Respawn (play id 0x07).
+///
+/// The dimension to respawn into, the difficulty, the game type and the
+/// level-type name (`S07PacketRespawn.readPacketData:41-46`): an `i32`, two
+/// bytes and a string of at most sixteen bytes. The dimension is the raw wire
+/// value — any `i32` can arrive — and the world's own width for it is checked
+/// where the world is rebuilt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Respawn {
+    /// The dimension: -1 nether, 0 overworld, 1 end.
+    pub dimension: i32,
+    /// The difficulty, 0..=3 (`EnumDifficulty`, read as one byte).
+    pub difficulty: u8,
+    /// Gamemode; the 0x08 bit means hardcore.
+    pub gamemode: u8,
+    /// Level type, for example `default`.
+    pub level_type: String,
+}
+
+impl Respawn {
+    /// The packet id.
+    pub const ID: i32 = 0x07;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let dimension = codec::read_i32(&mut cursor)?;
+        let difficulty = codec::read_u8(&mut cursor)?;
+        let gamemode = codec::read_u8(&mut cursor)?;
+        let level_type = codec::read_string(&mut cursor, 16)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            dimension,
+            difficulty,
+            gamemode,
+            level_type,
+        })
+    }
+}
+
+/// Clientbound Entity Status (play id 0x1A).
+///
+/// An entity id and one status byte (`S19PacketEntityStatus.readPacketData:28-31`),
+/// both read big-endian `i32` and signed `byte`. The byte is the entity's status
+/// opcode; [`Self::HURT`] is the one this client acts on, for its own player only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityStatus {
+    /// The entity the status belongs to.
+    pub entity_id: i32,
+    /// The status byte, signed as the wire carries it.
+    pub status: i8,
+}
+
+impl EntityStatus {
+    /// The packet id.
+    pub const ID: i32 = 0x1A;
+
+    /// The hurt status: the hurt flash and sound
+    /// (`EntityLivingBase.handleStatusUpdate:1356-1365`).
+    pub const HURT: i8 = 2;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let entity_id = codec::read_i32(&mut cursor)?;
+        let status = codec::read_u8(&mut cursor)? as i8;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self { entity_id, status })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Fixed-literal fixtures for the block-change packets: every byte is
@@ -823,8 +930,111 @@ mod tests {
     //! packing (`BlockPos.toLong`), never rebuilt with the decoder's
     //! arithmetic, so a wrong shift cannot be confirmed by its own twin.
 
-    use super::{BlockBreakAnimation, BlockChange, MultiBlockChange};
+    use super::{
+        BlockBreakAnimation, BlockChange, EntityStatus, MultiBlockChange, Respawn, UpdateHealth,
+    };
     use crate::PacketError;
+
+    #[test]
+    fn update_health_decodes_zero_health_and_an_integer_valued_health() {
+        // 0x06: Health Float, FoodLevel VarInt, Saturation Float
+        // (`S06PacketUpdateHealth.readPacketData:28-32`). The first fixture is
+        // the death message: health 0.0f32 (0x00000000), food 0 (0x00) and
+        // saturation 0.0f32. The second is a whole survival bar: 20.0f32
+        // (0x41A00000), food 20 (0x14) and saturation 5.0f32 (0x40A00000).
+        let dead: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let health = UpdateHealth::decode(dead).expect("the fixture decodes");
+        assert_eq!(health.health, 0.0, "the death message's health");
+        assert_eq!(health.food, 0, "the food level");
+        assert_eq!(health.saturation, 0.0, "the saturation");
+        assert_eq!(UpdateHealth::ID, 0x06, "the packet id");
+
+        let full: &[u8] = &[
+            0x41, 0xa0, 0x00, 0x00, // health 20.0
+            0x14, // food 20
+            0x40, 0xa0, 0x00, 0x00, // saturation 5.0
+        ];
+        let health = UpdateHealth::decode(full).expect("the fixture decodes");
+        assert_eq!(
+            health.health, 20.0,
+            "an integer-valued float keeps its exact value"
+        );
+        assert_eq!(health.food, 20, "a full food bar");
+        assert_eq!(health.saturation, 5.0, "FoodStats' own starting saturation");
+
+        // A trailing byte is refused, and a cut payload is an error, never a
+        // panic.
+        let trailing: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert!(matches!(
+            UpdateHealth::decode(trailing),
+            Err(PacketError::Trailing(1))
+        ));
+        assert!(UpdateHealth::decode(&dead[..6]).is_err());
+    }
+
+    #[test]
+    fn respawn_decodes_a_negative_dimension_and_a_longer_level_type() {
+        // 0x07: Dimension Int, Difficulty Byte, Gamemode Byte, LevelType
+        // String(16) (`S07PacketRespawn.readPacketData:41-46`). The dimension
+        // is the nether's -1 as a big-endian i32; the level type is the
+        // eleven-byte `largeBiomes` — longer than `default` and still inside
+        // the sixteen-byte field.
+        let body: &[u8] = &[
+            0xff, 0xff, 0xff, 0xff, // dimension -1
+            0x02, // difficulty 2: normal
+            0x01, // gamemode 1: creative
+            0x0b, b'l', b'a', b'r', b'g', b'e', b'B', b'i', b'o', b'm', b'e', b's',
+        ];
+        let respawn = Respawn::decode(body).expect("the fixture decodes");
+        assert_eq!(respawn.dimension, -1, "the nether, sign-extended");
+        assert_eq!(respawn.difficulty, 2, "the difficulty byte");
+        assert_eq!(respawn.gamemode, 1, "the creative bit");
+        assert_eq!(respawn.level_type, "largeBiomes", "the level type");
+        assert_eq!(Respawn::ID, 0x07, "the packet id");
+
+        // The field's own cap: seventeen bytes of level type are refused
+        // before the string is built (`readStringFromBuffer(16)`).
+        let mut long = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11];
+        long.extend_from_slice(b"seventeen-bytes!!");
+        assert!(
+            Respawn::decode(&long).is_err(),
+            "a level type beyond the field's cap is refused"
+        );
+
+        // A cut payload is an error, never a panic; a trailing byte is refused.
+        assert!(Respawn::decode(&body[..5]).is_err());
+        let mut trailing = body.to_vec();
+        trailing.push(0x00);
+        assert!(matches!(
+            Respawn::decode(&trailing),
+            Err(PacketError::Trailing(1))
+        ));
+    }
+
+    #[test]
+    fn entity_status_decodes_the_id_and_the_signed_status_byte() {
+        // 0x1A: EntityID Int, EntityStatus Byte
+        // (`S19PacketEntityStatus.readPacketData:28-31`). The id is the join
+        // fixture's own entity 20; the status is 2, the hurt opcode. The
+        // status byte is read signed, so 0xFF is -1 and not 255.
+        let body: &[u8] = &[0x00, 0x00, 0x00, 0x14, 0x02];
+        let status = EntityStatus::decode(body).expect("the fixture decodes");
+        assert_eq!(status.entity_id, 20, "the entity the status names");
+        assert_eq!(status.status, EntityStatus::HURT, "the hurt opcode");
+        assert_eq!(EntityStatus::HURT, 2, "status 2 is the hurt flash");
+        assert_eq!(EntityStatus::ID, 0x1a, "the packet id");
+
+        let removal: &[u8] = &[0x00, 0x00, 0x00, 0x14, 0xff];
+        let status = EntityStatus::decode(removal).expect("the fixture decodes");
+        assert_eq!(status.status, -1, "the byte is signed");
+
+        // A trailing byte is refused, and a cut payload is an error.
+        assert!(matches!(
+            EntityStatus::decode(&[0x00, 0x00, 0x00, 0x14, 0x02, 0x00]),
+            Err(PacketError::Trailing(1))
+        ));
+        assert!(EntityStatus::decode(&body[..4]).is_err());
+    }
 
     #[test]
     fn block_change_decodes_the_position_and_the_packed_value() {

@@ -47,16 +47,18 @@ use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChunkData, JoinGame, KeepAlive,
-    LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect, PlayerAbilities, PlayerListItem,
-    PlayerPositionAndLook, PluginMessage, TimeUpdate, read_packet_id,
+    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChunkData, EntityStatus, JoinGame,
+    KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect, PlayerAbilities,
+    PlayerListItem, PlayerPositionAndLook, PluginMessage, Respawn, TimeUpdate, UpdateHealth,
+    read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
-    ClientSettings, DiggingStatus, EntityAction, write_animation, write_client_settings,
-    write_entity_action, write_keep_alive, write_login_start, write_player, write_player_abilities,
-    write_player_block_placement, write_player_digging, write_player_look, write_player_position,
-    write_player_position_and_look, write_plugin_message,
+    ClientSettings, ClientStatusAction, DiggingStatus, EntityAction, write_animation,
+    write_client_settings, write_client_status, write_entity_action, write_keep_alive,
+    write_login_start, write_player, write_player_abilities, write_player_block_placement,
+    write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
+    write_plugin_message,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
@@ -71,7 +73,7 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
-use crate::input::{InputEvent, Intent, MouseButton, look_delta};
+use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector, placement,
     raycast, reach, tool_not_required,
@@ -303,6 +305,41 @@ pub enum ClientEvent {
         tick: u64,
         /// Whether a server correction produced this tick.
         snapped: bool,
+        /// Ticks left of the hurt flash (`hurtTime`), for the camera's roll.
+        hurt_time: u32,
+        /// The yaw the last hurt came from (`attackedAtYaw`); zero until M4
+        /// tracks attackers.
+        attacked_at_yaw: f32,
+    },
+    /// The player's health, food and saturation, from clientbound 0x06.
+    ///
+    /// Reported for every 0x06. Health at or below zero is the death the
+    /// `Died` that follows reports.
+    Health {
+        /// The health the packet carried.
+        health: f32,
+        /// The food level the packet carried.
+        food: i32,
+        /// The food saturation the packet carried.
+        saturation: f32,
+    },
+    /// The player died: a 0x06 left the health at or below zero.
+    ///
+    /// Reported once per death, when the state is entered. The window shows
+    /// the interim death view on it; a click or Space then asks the session
+    /// for the respawn, which the server answers with clientbound 0x07.
+    Died,
+    /// The server respawned the player (clientbound 0x07).
+    ///
+    /// The world was kept when the packet's dimension matched the one the
+    /// session held and rebuilt otherwise, in which case a `WorldCleared`
+    /// precedes this event. The window clears the death view on it and reads
+    /// the dimension for its fog.
+    Respawned {
+        /// The dimension respawned into: -1 nether, 0 overworld, 1 end.
+        dimension: i8,
+        /// The gamemode, as Join Game carries it.
+        gamemode: u8,
     },
     /// The aimed block changed.
     ///
@@ -384,6 +421,13 @@ pub enum ClientEvent {
         /// (`oxide-world`'s `light::view_light_level`).
         light_level: u8,
     },
+    /// The world was rebuilt: every column the window holds is stale.
+    ///
+    /// Emitted when a respawn crossed dimensions and the session built a new
+    /// world for it, before the `Respawned` that follows. The window drops
+    /// its whole chunk store on it; a same-dimension respawn keeps the world
+    /// and emits nothing of this kind.
+    WorldCleared,
     /// A column's meshes were (re)built; `None` means the section now draws
     /// nothing.
     ChunkUpdated {
@@ -537,6 +581,21 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut left_presses: u32 = 0;
         let mut right_presses: u32 = 0;
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
+        // The dimension the world was built for, from the last Join Game: a
+        // respawn compares its own dimension against it to decide whether the
+        // world survives (`NetHandlerPlayClient.handleRespawn:1056-1073`).
+        let mut dimension: i8 = 0;
+        // Whether the session waits for the 0x08 that places it after a
+        // respawn. While it is set the tick sends no movement report: the
+        // fresh player the respawn left must not race the correction that is
+        // about to move it, and the source's own report waits for a world it
+        // belongs to (`EntityPlayerSP.onUpdate:170`).
+        let mut awaiting_respawn_position = false;
+        // The respawn requests the window's clicks and Space asked for since
+        // the last drain: each is answered with exactly one client-status
+        // packet, and there is no held-repeat path
+        // (`GuiGameOver.actionPerformed:57-77` sends one on the button's click).
+        let mut respawn_requests: u32 = 0;
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -547,20 +606,49 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             let mut looked = false;
             for _ in 0..INPUTS_PER_PASS {
                 match inputs.try_recv() {
-                    Ok(event) => match event {
-                        InputEvent::MouseButton { button, pressed } => {
-                            apply_button(
-                                button,
-                                pressed,
-                                &mut left_held,
-                                &mut left_presses,
-                                &mut right_presses,
-                            );
+                    Ok(event) => {
+                        if player.dead {
+                            // While dead the window's input is the death
+                            // view's: a click or Space asks for the respawn —
+                            // one request per press — and nothing else
+                            // reaches the movement, the look or the
+                            // interaction. A focus loss still releases the
+                            // held intent, so a window that stops receiving
+                            // leaves nothing held.
+                            match event {
+                                InputEvent::MouseButton { pressed: true, .. }
+                                | InputEvent::Key {
+                                    key: Key::Space,
+                                    pressed: true,
+                                } => respawn_requests += 1,
+                                InputEvent::FocusLost => intent.release_all(),
+                                _ => {}
+                            }
+                        } else {
+                            match event {
+                                InputEvent::MouseButton { button, pressed } => {
+                                    apply_button(
+                                        button,
+                                        pressed,
+                                        &mut left_held,
+                                        &mut left_presses,
+                                        &mut right_presses,
+                                    );
+                                }
+                                other => looked |= apply_input(other, &mut intent, &mut player),
+                            }
                         }
-                        other => looked |= apply_input(other, &mut intent, &mut player),
-                    },
+                    }
                     Err(_) => break,
                 }
+            }
+            // Each queued respawn request goes out now, one packet per press:
+            // the requirement is the source's own button, and the server
+            // answers with clientbound 0x07.
+            for _ in 0..std::mem::take(&mut respawn_requests) {
+                let request =
+                    payload_of(|out| write_client_status(out, ClientStatusAction::Respawn))?;
+                send_reply(&mut conn, &request)?;
             }
             // A look moves the aim at once — the mouse is polled between
             // ticks (`EntityRenderer.updateMouse:1094-1123`) — and only a
@@ -591,10 +679,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             let join = decoded(id, JoinGame::decode(body))?;
                             // The dimension decides whether columns carry sky light. A
                             // re-sent Join Game starts the column set over: the queue's
-                            // columns belong to the old world, and any job still out
-                            // completes stale and builds against the new one.
+                            // columns belong to the old world, so it is emptied in
+                            // place — the generation counter survives, and any job still
+                            // out completes stale and builds against the new one.
                             world = Some(World::new(join.dimension == 0));
-                            queue = MeshQueue::new();
+                            queue.clear_in_place();
+                            dimension = join.dimension;
                             // The player's own entity id is named here. It gates this
                             // client's tick sends: the source's tick is gated on the
                             // player standing in a loaded world
@@ -624,6 +714,155 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 },
                             );
                         }
+                        UpdateHealth::ID => {
+                            let update = decoded(id, UpdateHealth::decode(body))?;
+                            player.health = update.health;
+                            player.food = update.food;
+                            player.saturation = update.saturation;
+                            report(
+                                events,
+                                ClientEvent::Health {
+                                    health: update.health,
+                                    food: update.food,
+                                    saturation: update.saturation,
+                                },
+                            );
+                            // Health at or below zero is the death
+                            // (`EntityLivingBase.onEntityUpdate:344-349` reads
+                            // it off the health every tick); the state is
+                            // entered once, and later 0x06 packets keep
+                            // updating the health without re-reporting it.
+                            if player.health <= 0.0 && !player.dead {
+                                report(events, ClientEvent::Died);
+                                player.dead = true;
+                                player.death_time = 0;
+                                // The death screen unpresses every key
+                                // (`Minecraft.setIngameNotInFocus:1469-1478`
+                                // through `KeyBinding.unPressAllKeys`), and
+                                // nothing of the movement survives the
+                                // death: the flags and their server mirrors
+                                // clear with it, so no stale sprint or sneak
+                                // edge can follow the respawn. The mirrors
+                                // alone owe the server nothing — a respawn
+                                // replaces its own player too.
+                                intent.release_all();
+                                left_held = false;
+                                left_presses = 0;
+                                right_presses = 0;
+                                player.sprinting = false;
+                                player.server_sprint_state = false;
+                                player.sneaking = false;
+                                player.server_sneak_state = false;
+                                // The dig is cancelled the way the death
+                                // screen cancels it: `sendClickBlockToController`
+                                // runs with no left click while the screen is
+                                // up (`Minecraft.java:1515-1518`), which is
+                                // the abort and its stage's removal.
+                                for action in dig.reset_block_removing() {
+                                    apply_dig_action(
+                                        &action,
+                                        world.as_mut(),
+                                        &mut queue,
+                                        &mut stages,
+                                        &mut conn,
+                                        events,
+                                    )?;
+                                }
+                            }
+                        }
+                        EntityStatus::ID => {
+                            let status = decoded(id, EntityStatus::decode(body))?;
+                            // The status is only this client's business when
+                            // it names its own player: the source's handler
+                            // resolves whatever entity the id names
+                            // (`NetHandlerPlayClient.handleEntityStatus`),
+                            // and until M4 tracks entities the only one that
+                            // exists here is the player.
+                            if Some(status.entity_id) == player.entity_id {
+                                if status.status == EntityStatus::HURT {
+                                    // The hurt flash: `hurtTime` back to its
+                                    // maximum, the attack yaw zeroed
+                                    // (`EntityLivingBase.handleStatusUpdate:1362-1363`).
+                                    player.apply_hurt_status();
+                                } else {
+                                    debug!(
+                                        status = status.status,
+                                        "a status this client has no use for"
+                                    );
+                                }
+                            } else {
+                                debug!(
+                                    entity_id = status.entity_id,
+                                    status = status.status,
+                                    "a status for an entity this client does not track"
+                                );
+                            }
+                        }
+                        Respawn::ID => {
+                            let respawn = decoded(id, Respawn::decode(body))?;
+                            // The dimension arrives as a raw `i32`; the world
+                            // model's own width for it is the byte Join Game
+                            // names it in, and a value outside that range
+                            // cannot build a world this client can carry — it
+                            // would silently pick a different sky flag — so it
+                            // is refused rather than truncated.
+                            let respawned = respawn_dimension(respawn.dimension)?;
+                            // The source keeps the world when the dimension
+                            // matches and rebuilds it otherwise
+                            // (`NetHandlerPlayClient.handleRespawn:1056-1073`).
+                            if world.is_some() && respawned != dimension {
+                                world = Some(World::new(respawned == 0));
+                                // The queue's columns belong to the world that
+                                // is gone. The clear keeps the generation
+                                // counter, so a build still out can never
+                                // answer as the new world's own (backlog item
+                                // 2); whatever it returns is discarded, and
+                                // the column is queued once more against the
+                                // new world.
+                                queue.clear_in_place();
+                                report(events, ClientEvent::WorldCleared);
+                            }
+                            dimension = respawned;
+                            // The gamemode the reach reads, restated by the
+                            // respawn: the source's handler sets the
+                            // controller's game type from the packet
+                            // (`:1072`, `PlayerControllerMP.setGameType:...`).
+                            gamemode = respawn.gamemode;
+                            // The player starts over where the source's fresh
+                            // player would (see `Player::reset_for_respawn`).
+                            player.reset_for_respawn();
+                            // Nothing of the dig or the aim survives either:
+                            // the dig's cancel goes out now (an idle machine
+                            // produces nothing), and a live aim is cleared and
+                            // reported so the window drops its outline; the
+                            // tick after the position arrives recomputes it
+                            // against whatever world now stands.
+                            for action in dig.reset_block_removing() {
+                                apply_dig_action(
+                                    &action,
+                                    world.as_mut(),
+                                    &mut queue,
+                                    &mut stages,
+                                    &mut conn,
+                                    events,
+                                )?;
+                            }
+                            if aim.take().is_some() {
+                                report(events, ClientEvent::Aim { aim: None });
+                            }
+                            // The movement reports wait for the 0x08 the server
+                            // follows every respawn with; it is the packet that
+                            // places the fresh player, and the echo it answers
+                            // with re-arms the reporters.
+                            awaiting_respawn_position = true;
+                            report(
+                                events,
+                                ClientEvent::Respawned {
+                                    dimension: respawned,
+                                    gamemode: respawn.gamemode,
+                                },
+                            );
+                        }
                         PlayerAbilities::ID => {
                             let packet = decoded(id, PlayerAbilities::decode(body))?;
                             debug!(
@@ -645,6 +884,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         }
                         PlayerPositionAndLook::ID => {
                             let teleport = decoded(id, PlayerPositionAndLook::decode(body))?;
+                            // The correction is the placement a respawn was
+                            // waiting for: the movement reports resume with
+                            // this echo, and the gate clears before the
+                            // reporters are re-armed below.
+                            awaiting_respawn_position = false;
                             apply_correction(&mut player, &teleport);
                             // The echo below is the position report that reconciles the
                             // correction, so the walking reporters start from the corrected
@@ -903,45 +1147,62 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             // tick's packets go out in the order the source sends them, each
             // as soon as the tick produced it.
             for _ in 0..ticker.due(Instant::now()) {
-                for payload in
-                    step_tick(&mut player, &intent, clock.as_mut(), world.as_ref(), events)
-                {
+                // While dead the tick steps a neutral intent — the death
+                // screen's own input state: the keys are unheld and the look
+                // is not polled, so nothing the window does moves the player.
+                // The movement model itself still runs, which is what lets the
+                // body settle and the death clock advance.
+                let dead = player.dead;
+                let tick_intent = if dead { Intent::neutral() } else { intent };
+                for payload in step_tick(
+                    &mut player,
+                    &tick_intent,
+                    clock.as_mut(),
+                    world.as_ref(),
+                    events,
+                    !awaiting_respawn_position,
+                ) {
                     send_reply(&mut conn, &payload)?;
                 }
                 // The aim follows the tick's own state: a step that moved the
                 // player, and any world change behind it, is read here.
                 update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
-                // The placement presses run against that same aim, before the
-                // dig's step: the source's tick orders the use button's presses
-                // before `sendClickBlockToController` (`Minecraft.java:2153-2166`).
-                step_place(
-                    world.as_mut(),
-                    &mut queue,
-                    aim,
-                    &mut right_presses,
-                    dig.hitting(),
-                    &mut conn,
-                )?;
-                // The dig runs against that same aim, and its actions run in
-                // the order the machine produced them: the completion's finish
-                // goes out before the removal it predicts, and the local path
-                // waits on nothing (`PlayerControllerMP.java:324-325`).
-                for action in step_dig(
-                    world.as_ref(),
-                    gamemode,
-                    &mut dig,
-                    aim,
-                    &mut left_presses,
-                    left_held,
-                ) {
-                    apply_dig_action(
-                        &action,
+                // Nothing the window presses reaches the interaction while the
+                // death view is up: a click is the respawn request then, and
+                // the presses and the dig step run only while alive.
+                if !dead {
+                    // The placement presses run against that same aim, before the
+                    // dig's step: the source's tick orders the use button's presses
+                    // before `sendClickBlockToController` (`Minecraft.java:2153-2166`).
+                    step_place(
                         world.as_mut(),
                         &mut queue,
-                        &mut stages,
+                        aim,
+                        &mut right_presses,
+                        dig.hitting(),
                         &mut conn,
-                        events,
                     )?;
+                    // The dig runs against that same aim, and its actions run in
+                    // the order the machine produced them: the completion's finish
+                    // goes out before the removal it predicts, and the local path
+                    // waits on nothing (`PlayerControllerMP.java:324-325`).
+                    for action in step_dig(
+                        world.as_ref(),
+                        gamemode,
+                        &mut dig,
+                        aim,
+                        &mut left_presses,
+                        left_held,
+                    ) {
+                        apply_dig_action(
+                            &action,
+                            world.as_mut(),
+                            &mut queue,
+                            &mut stages,
+                            &mut conn,
+                            events,
+                        )?;
+                    }
                 }
                 // The stages' own clock: the counter advances once per tick
                 // and the sweep runs every twentieth, reporting the entries it
@@ -1212,7 +1473,29 @@ fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
         in_water: player.in_water,
         tick: player.tick,
         snapped,
+        hurt_time: player.hurt_time,
+        attacked_at_yaw: player.attacked_at_yaw,
     }
+}
+
+/// The respawn's dimension, checked against the width the session's world
+/// carries.
+///
+/// The packet carries the dimension as an `i32` (`S07PacketRespawn:17-19`) and
+/// Join Game names it as a byte, and the session's world model is the byte:
+/// only `-1`, `0` and `1` are dimensions this client can build. The source
+/// cannot carry any other value either — `WorldProvider.getProviderForDimension`
+/// answers null for it and `WorldClient` dereferences that
+/// (`WorldClient.java:52-56`) — so it is refused rather than narrowed, and the
+/// refusal is the packet error the decoders raise for a value no model can
+/// hold.
+fn respawn_dimension(dimension: i32) -> Result<i8, SessionError> {
+    i8::try_from(dimension).map_err(|_| {
+        SessionError::Packet(PacketError::Codec(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("respawn dimension {dimension} does not fit the world model's byte"),
+        ))))
+    })
 }
 
 /// One 20 Hz step of the session's state.
@@ -1240,15 +1523,34 @@ fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
 /// 0x13 (`:904-908`), then the sprint and sneak edges
 /// (`onUpdateWalkingPlayer:189-221`) and the walking report (`:215-274`).
 /// They return to the caller, which writes each one as the tick produced it.
+/// `movement_reports` gates the edges and the report — a respawn holds them
+/// until the 0x08 that places the fresh player arrives (the play loop's
+/// `awaiting_respawn_position`); the movement model, the clock and the
+/// per-tick event run either way.
+///
+/// The hurt countdown and the death clock advance at the top of the step,
+/// where the source's own entity tick runs them before the movement
+/// (`EntityLivingBase.onEntityUpdate:337-349`): the hurt flash falls by one
+/// each tick and the death clock rises by one while the death state holds.
 fn step_tick(
     player: &mut Player,
     input: &Intent,
     mut clock: Option<&mut Clock>,
     world: Option<&World>,
     events: &Sender<ClientEvent>,
+    movement_reports: bool,
 ) -> Vec<Vec<u8>> {
     player.last_tick_position = player.position;
     player.tick += 1;
+    // The hurt flash's countdown (`EntityLivingBase.onEntityUpdate:337-340`)
+    // and the death clock's advance while dead (`:344-349` reaching
+    // `onDeathUpdate`, whose `++this.deathTime` is `:400`).
+    if player.hurt_time > 0 {
+        player.hurt_time -= 1;
+    }
+    if player.dead {
+        player.death_time += 1;
+    }
     // The sneak flag is the held key, and the sprint rule runs once per tick.
     player.sneaking = input.sneak;
     let sprinting = player.sprinting;
@@ -1281,61 +1583,70 @@ fn step_tick(
     // The walking report and the action edges are the tick's own, and they
     // begin where this client enters a world — at Join Game, which also names
     // the entity id they carry. The source's tick is gated the same way, on
-    // the block under the player being loaded (`EntityPlayerSP.onUpdate:170`).
+    // the block under the player being loaded (`EntityPlayerSP.onUpdate:170`),
+    // and `movement_reports` is the respawn's own version of that gate: the
+    // fresh player waits for the 0x08 that places it.
     if let Some(entity_id) = player.entity_id {
-        // One packet per change (`EntityPlayerSP.onUpdateWalkingPlayer:189-221`):
-        // a stable state sends nothing, so the server hears exactly the edges.
-        if player.sprinting != player.server_sprint_state {
-            let action = if player.sprinting {
-                EntityAction::StartSprinting
-            } else {
-                EntityAction::StopSprinting
-            };
-            sends.push(tick_payload(|out| {
-                write_entity_action(out, entity_id, action, 0)
-            }));
-            player.server_sprint_state = player.sprinting;
+        // The respawn gate: the fresh player waits for the 0x08 that places
+        // it before it reports anything of itself, exactly as the source's
+        // tick waits for the world under the player to load
+        // (`EntityPlayerSP.onUpdate:170`). The edges and the report are what
+        // the gate holds; the movement model above ran either way.
+        if movement_reports {
+            // One packet per change (`EntityPlayerSP.onUpdateWalkingPlayer:189-221`):
+            // a stable state sends nothing, so the server hears exactly the edges.
+            if player.sprinting != player.server_sprint_state {
+                let action = if player.sprinting {
+                    EntityAction::StartSprinting
+                } else {
+                    EntityAction::StopSprinting
+                };
+                sends.push(tick_payload(|out| {
+                    write_entity_action(out, entity_id, action, 0)
+                }));
+                player.server_sprint_state = player.sprinting;
+            }
+            if player.sneaking != player.server_sneak_state {
+                let action = if player.sneaking {
+                    EntityAction::StartSneaking
+                } else {
+                    EntityAction::StopSneaking
+                };
+                sends.push(tick_payload(|out| {
+                    write_entity_action(out, entity_id, action, 0)
+                }));
+                player.server_sneak_state = player.sneaking;
+            }
+            // The walking report, built after the edges so a tick's packets keep
+            // the source's order.
+            let report_kind = walking_report(player);
+            sends.push(match report_kind {
+                WalkingReport::Player => tick_payload(|out| write_player(out, player.on_ground)),
+                WalkingReport::Position => tick_payload(|out| {
+                    write_player_position(
+                        out,
+                        player.position[0],
+                        player.position[1],
+                        player.position[2],
+                        player.on_ground,
+                    )
+                }),
+                WalkingReport::Look => tick_payload(|out| {
+                    write_player_look(out, player.yaw, player.pitch, player.on_ground)
+                }),
+                WalkingReport::PositionAndLook => tick_payload(|out| {
+                    write_player_position_and_look(
+                        out,
+                        player.position[0],
+                        player.position[1],
+                        player.position[2],
+                        player.yaw,
+                        player.pitch,
+                        player.on_ground,
+                    )
+                }),
+            });
         }
-        if player.sneaking != player.server_sneak_state {
-            let action = if player.sneaking {
-                EntityAction::StartSneaking
-            } else {
-                EntityAction::StopSneaking
-            };
-            sends.push(tick_payload(|out| {
-                write_entity_action(out, entity_id, action, 0)
-            }));
-            player.server_sneak_state = player.sneaking;
-        }
-        // The walking report, built after the edges so a tick's packets keep
-        // the source's order.
-        let report_kind = walking_report(player);
-        sends.push(match report_kind {
-            WalkingReport::Player => tick_payload(|out| write_player(out, player.on_ground)),
-            WalkingReport::Position => tick_payload(|out| {
-                write_player_position(
-                    out,
-                    player.position[0],
-                    player.position[1],
-                    player.position[2],
-                    player.on_ground,
-                )
-            }),
-            WalkingReport::Look => tick_payload(|out| {
-                write_player_look(out, player.yaw, player.pitch, player.on_ground)
-            }),
-            WalkingReport::PositionAndLook => tick_payload(|out| {
-                write_player_position_and_look(
-                    out,
-                    player.position[0],
-                    player.position[1],
-                    player.position[2],
-                    player.yaw,
-                    player.pitch,
-                    player.on_ground,
-                )
-            }),
-        });
     }
 
     let mut advanced = false;
@@ -2096,7 +2407,7 @@ mod tests {
 
     use super::{ASSUMED_HELD_BLOCK, ClientEvent, Clock, TICK_PERIOD, step_tick};
     use crate::input::Intent;
-    use crate::player::Player;
+    use crate::player::{MAX_HURT_TIME, Player};
     use crate::ticker::Ticker;
 
     #[test]
@@ -2152,6 +2463,7 @@ mod tests {
             Some(&mut frozen),
             Some(&world),
             &sender,
+            true,
         );
         assert_eq!(frozen.world_age, 48_001, "the age advances every tick");
         assert_eq!(frozen.time_of_day, 6000, "the frozen time of day holds");
@@ -2189,6 +2501,7 @@ mod tests {
             Some(&mut running),
             Some(&world),
             &sender,
+            true,
         );
         assert_eq!(running.world_age, 48_001);
         assert_eq!(running.time_of_day, 6001, "a running time of day advances");
@@ -2201,5 +2514,72 @@ mod tests {
             1,
             "the running step reports the sky it moved: {running_events:?}"
         );
+    }
+
+    #[test]
+    fn a_hurt_flash_counts_down_and_the_death_clock_advances_per_tick() {
+        // `EntityLivingBase.onEntityUpdate:337-340` drops the hurt flash by
+        // one every tick and never below zero; while the entity is dead its
+        // clock rises by one per tick (`:344-349` reaching `onDeathUpdate`,
+        // whose `++this.deathTime` is `:400`).
+        let intent = Intent::neutral();
+        let (sender, _receiver) = crossbeam_channel::unbounded::<ClientEvent>();
+        let mut player = Player::new();
+        player.apply_hurt_status();
+        assert_eq!(
+            player.hurt_time, MAX_HURT_TIME,
+            "the status filled the flash"
+        );
+        player.dead = true;
+        for expected in 1u32..=3 {
+            step_tick(&mut player, &intent, None, None, &sender, true);
+            assert_eq!(
+                player.death_time, expected,
+                "the death clock counts the step's ticks"
+            );
+        }
+        assert_eq!(
+            player.hurt_time,
+            MAX_HURT_TIME - 3,
+            "the flash falls by one each step"
+        );
+        for _ in 0..MAX_HURT_TIME {
+            step_tick(&mut player, &intent, None, None, &sender, true);
+        }
+        assert_eq!(player.hurt_time, 0, "the flash stops at zero");
+        assert_eq!(
+            player.death_time,
+            3 + MAX_HURT_TIME,
+            "the clock keeps going"
+        );
+    }
+
+    #[test]
+    fn a_gated_step_holds_its_reports_but_still_steps() {
+        // The respawn hold: between the 0x07 and the 0x08 that places the
+        // fresh player, the step runs its model and its own event while the
+        // action edges and the walking report stay unsent — the source's own
+        // gate waits for the world under the player to load
+        // (`EntityPlayerSP.onUpdate:170`).
+        let intent = Intent::neutral();
+        let (sender, receiver) = crossbeam_channel::unbounded::<ClientEvent>();
+        let mut player = Player::new();
+        player.entity_id = Some(7);
+        player.yaw = 30.0;
+
+        let held = step_tick(&mut player, &intent, None, None, &sender, false);
+        assert!(held.is_empty(), "a held step sends nothing: {held:?}");
+        assert_eq!(player.tick, 1, "the step still ran");
+        assert!(
+            receiver
+                .try_iter()
+                .any(|event| matches!(event, ClientEvent::PlayerTick { tick: 1, .. })),
+            "the step's own event still goes out"
+        );
+
+        // The contrast: the same state with the reporters armed sends its one
+        // walking report.
+        let sent = step_tick(&mut player, &intent, None, None, &sender, true);
+        assert_eq!(sent.len(), 1, "one walking report per step: {sent:?}");
     }
 }
