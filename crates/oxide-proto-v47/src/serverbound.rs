@@ -158,6 +158,67 @@ pub fn write_player_position_and_look(
     out.write_all(&[u8::from(on_ground)])
 }
 
+/// The actions Player Digging carries (`C07PacketPlayerDigging.Action`,
+/// `network/play/client/C07PacketPlayerDigging.java:63-71`).
+///
+/// The variants' declaration order is the status id on the wire. The source's
+/// fourth action, `DROP_ITEM`, belongs to the drop key and is not written by
+/// this client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiggingStatus {
+    /// Start destroying a block (status 0).
+    Start = 0,
+    /// Abort destroying a block (status 1).
+    Abort = 1,
+    /// Finish destroying a block (status 2).
+    Finish = 2,
+}
+
+/// Serverbound Player Digging (play id 0x07).
+pub const PLAYER_DIGGING_ID: i32 = 0x07;
+
+/// Writes Player Digging: the status VarInt, the Location Position and the
+/// face byte (`C07PacketPlayerDigging.writePacketData`, `:39-45`).
+///
+/// The position is packed as `BlockPos.toLong` packs it — x and z are 26
+/// signed bits, y is 12 (`util/BlockPos.java:200-203`) — and the face byte is
+/// `EnumFacing.getIndex()`'s ordinal (`util/EnumFacing.java:53-58`), which
+/// `Face::wire` answers.
+pub fn write_player_digging(
+    mut out: impl Write,
+    status: DiggingStatus,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: u8,
+) -> io::Result<()> {
+    write_id_and_varint(&mut out, PLAYER_DIGGING_ID, status as i32)?;
+    out.write_all(&pack_position(x, y, z).to_be_bytes())?;
+    out.write_all(&[face])
+}
+
+/// Packs a block position the way `BlockPos.toLong` packs it
+/// (`util/BlockPos.java:200-203`):
+/// `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)`.
+///
+/// The masks keep every field's bits clear of its neighbours, and the shifts
+/// run on the widened `i64`; a negative x or z sign-extends through its 26
+/// bits when the reader takes them back (`BlockPos.fromLong`, `:208-214`).
+/// This is 1.8.9's own packing; later versions reordered it, so it must not be
+/// "updated" from modern documentation.
+fn pack_position(x: i32, y: i32, z: i32) -> i64 {
+    (i64::from(x & 0x03FF_FFFF) << 38) | (i64::from(y & 0xFFF) << 26) | i64::from(z & 0x03FF_FFFF)
+}
+
+/// Serverbound Animation (play id 0x0A).
+pub const ANIMATION_ID: i32 = 0x0A;
+
+/// Writes Animation: the packet id alone — the packet carries no fields
+/// (`C0APacketAnimation.writePacketData`, `network/play/client/C0APacketAnimation.java:21-23`).
+pub fn write_animation(mut out: impl Write) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, ANIMATION_ID)
+}
+
 /// The actions Entity Action carries (`C0BPacketEntityAction.Action`,
 /// `C0BPacketEntityAction.java:63-71`).
 ///
@@ -299,4 +360,79 @@ pub fn player_position_and_look_payload(
     write_player_position_and_look(&mut out, x, y, z, yaw, pitch, on_ground)
         .expect("writing to a Vec cannot fail");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Fixed-literal fixtures for the digging and animation packets: every
+    //! byte is hand-packed from the layout the protocol reference records
+    //! (`docs/research/protocol-47-reference.md` §2.2, the S 0x07 and S 0x0A
+    //! rows) and from the source's own packing (`BlockPos.toLong`), never
+    //! rebuilt with the writer's arithmetic, so a wrong shift cannot be
+    //! confirmed by its own twin.
+
+    use super::{DiggingStatus, write_animation, write_player_digging};
+
+    /// The bytes `write_player_digging` writes, for byte-exact assertions.
+    fn digging_bytes(status: DiggingStatus, x: i32, y: i32, z: i32, face: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_player_digging(&mut out, status, x, y, z, face)
+            .expect("writing to a Vec cannot fail");
+        out
+    }
+
+    #[test]
+    fn player_digging_writes_the_finish_status_and_a_negative_position() {
+        // 0x07: Status VarInt, Location Position (one big-endian i64), Face
+        // Byte (`C07PacketPlayerDigging.writePacketData`, `:39-45`; the
+        // reference's §2.2 row). The position (-5, 70, -33) packs as
+        // `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)`
+        // (`BlockPos.toLong`, `util/BlockPos.java:200-203`) — the same
+        // hand-derived literal the block-change fixture carries — and the
+        // face is 5, EAST's ordinal (`EnumFacing.getIndex`, `:53-58`).
+        assert_eq!(
+            digging_bytes(DiggingStatus::Finish, -5, 70, -33, 5),
+            vec![
+                0x07, // the packet id
+                0x02, // status 2: finish
+                0xff, 0xff, 0xfe, 0xc1, 0x1b, 0xff, 0xff, 0xdf, // (-5, 70, -33)
+                0x05, // the face byte
+            ],
+            "the finish at a negative position"
+        );
+    }
+
+    #[test]
+    fn player_digging_writes_the_start_and_abort_statuses() {
+        // Status 0 (start) at (0, 65, 2) with face 2 (NORTH) — the block the
+        // aim tests meet — and status 1 (abort) at (16, 70, -1) with face 0
+        // (DOWN, the face `resetBlockRemoving` sends, `PlayerControllerMP.java:278`).
+        assert_eq!(
+            digging_bytes(DiggingStatus::Start, 0, 65, 2, 2),
+            vec![
+                0x07, 0x00, // the id and status 0
+                0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x02, // (0, 65, 2)
+                0x02, // the face byte
+            ],
+            "the start"
+        );
+        assert_eq!(
+            digging_bytes(DiggingStatus::Abort, 16, 70, -1, 0),
+            vec![
+                0x07, 0x01, // the id and status 1
+                0x00, 0x00, 0x04, 0x01, 0x1b, 0xff, 0xff, 0xff, // (16, 70, -1)
+                0x00, // the face byte
+            ],
+            "the abort at a negative z"
+        );
+    }
+
+    #[test]
+    fn animation_writes_the_id_alone() {
+        // 0x0A carries no fields (`C0APacketAnimation.writePacketData`,
+        // `network/play/client/C0APacketAnimation.java:21-23`).
+        let mut out = Vec::new();
+        write_animation(&mut out).expect("writing to a Vec cannot fail");
+        assert_eq!(out, vec![0x0a], "the id alone");
+    }
 }

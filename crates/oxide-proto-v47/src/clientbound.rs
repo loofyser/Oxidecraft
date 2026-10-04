@@ -767,6 +767,54 @@ impl MultiBlockChange {
     }
 }
 
+/// Clientbound Block Break Animation (play id 0x25).
+///
+/// A destroy stage landed on a block: the breaking player's entity id, the
+/// Location Position and the destroy stage byte
+/// (`S25PacketBlockBreakAnim.readPacketData`, `:30-35`). The protocol
+/// reference's §2.2 row carries the reader's rule — stages 0–9 set, anything
+/// else removes — which the source's own receive path applies when it hands
+/// the value to `RenderGlobal.sendBlockBreakProgress` (`:2364-2380`).
+///
+/// The entity id is the breaker's; the source keys its stage map by it
+/// (`RenderGlobal.java:126-127`). This client's map is keyed by position until
+/// M4's entity work, so the id is decoded and carried but not filtered on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockBreakAnimation {
+    /// The breaking player's entity id.
+    pub entity_id: i32,
+    /// The world x.
+    pub x: i32,
+    /// The world y.
+    pub y: i32,
+    /// The world z.
+    pub z: i32,
+    /// The destroy stage byte, read unsigned: 0..=9 set, anything else
+    /// removes.
+    pub stage: u8,
+}
+
+impl BlockBreakAnimation {
+    /// The packet id.
+    pub const ID: i32 = 0x25;
+
+    /// Decodes the fields after the packet id.
+    pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
+        let mut cursor = Cursor::new(body);
+        let entity_id = read_varint(&mut cursor)?;
+        let (x, y, z) = read_position(&mut cursor)?;
+        let stage = codec::read_u8(&mut cursor)?;
+        check_no_trailing(&cursor, body.len())?;
+        Ok(Self {
+            entity_id,
+            x,
+            y,
+            z,
+            stage,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Fixed-literal fixtures for the block-change packets: every byte is
@@ -775,7 +823,7 @@ mod tests {
     //! packing (`BlockPos.toLong`), never rebuilt with the decoder's
     //! arithmetic, so a wrong shift cannot be confirmed by its own twin.
 
-    use super::{BlockChange, MultiBlockChange};
+    use super::{BlockBreakAnimation, BlockChange, MultiBlockChange};
     use crate::PacketError;
 
     #[test]
@@ -895,6 +943,63 @@ mod tests {
         assert!(
             BlockChange::decode(body).is_err(),
             "a value outside the 16-bit field is refused"
+        );
+    }
+
+    #[test]
+    fn block_break_animation_decodes_the_breaker_the_position_and_the_stage() {
+        // 0x25: EID VarInt, Location Position, DestroyStage Byte
+        // (`S25PacketBlockBreakAnim.readPacketData`, `:30-35`; the
+        // reference's §2.2 row: stages 0–9 set, anything else removes). The
+        // EID 300 is the VarInt AC 02; the position (-5, 70, -33) is the same
+        // hand-derived literal the block-change fixture carries; the stage is
+        // 9, the last of the set range.
+        let body: &[u8] = &[
+            0xac, 0x02, // the breaker's entity id, 300
+            0xff, 0xff, 0xfe, 0xc1, 0x1b, 0xff, 0xff, 0xdf, // (-5, 70, -33)
+            0x09, // the destroy stage
+        ];
+        let animation = BlockBreakAnimation::decode(body).expect("the fixture decodes");
+        assert_eq!(animation.entity_id, 300, "the breaker's entity id");
+        assert_eq!(
+            (animation.x, animation.y, animation.z),
+            (-5, 70, -33),
+            "the position, sign-extended"
+        );
+        assert_eq!(animation.stage, 9, "the destroy stage");
+        assert_eq!(BlockBreakAnimation::ID, 0x25, "the packet id");
+    }
+
+    #[test]
+    fn block_break_animation_reads_a_removal_stage_byte() {
+        // The removal the reference names: a stage outside 0–9. The byte is
+        // read unsigned — 0xFF is 255, not -1 — so the "else remove" the
+        // caller runs is a value test, not a sign one.
+        let body: &[u8] = &[
+            0x01, // breaker id 1
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // (0, 64, 0)
+            0xff, // 255: removal
+        ];
+        let animation = BlockBreakAnimation::decode(body).expect("the fixture decodes");
+        assert_eq!(animation.stage, 255, "the unsigned stage byte");
+        assert_eq!(
+            (animation.x, animation.y, animation.z),
+            (0, 64, 0),
+            "the position"
+        );
+
+        // A trailing byte is refused, and a cut payload is an error, never a
+        // panic.
+        let trailing: &[u8] = &[
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00,
+        ];
+        assert!(matches!(
+            BlockBreakAnimation::decode(trailing),
+            Err(PacketError::Trailing(1))
+        ));
+        assert!(
+            BlockBreakAnimation::decode(&body[..4]).is_err(),
+            "a cut payload is an error"
         );
     }
 }

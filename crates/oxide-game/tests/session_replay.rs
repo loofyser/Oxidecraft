@@ -3048,3 +3048,520 @@ fn the_aim_uses_the_gamemodes_reach() {
         "4.55 is beyond the survival reach: {survival:?}"
     );
 }
+
+/// Dirt, id 3, meta 0: the packed value `3 << 4 | 0`.
+const DIRT: u16 = 0x0030;
+
+/// Bedrock, id 7, meta 0: `setBlockUnbreakable`'s hardness -1.0
+/// (`Block.java:1260`), the row the behaviour table carries.
+const BEDROCK: u16 = 0x0070;
+
+/// A join carrying the stone floor, a teleport onto its surface at
+/// (0.5, 64, 0.5) facing south, and `value` placed two cells south at
+/// (0, 65, 2) — the block a dig aims.
+fn dig_head(value: u16) -> Vec<u8> {
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 2, value),
+        SERVER_FRAMING,
+    );
+    head
+}
+
+/// One Player Digging payload (0x07): the status, the Location Position and
+/// the face byte.
+fn digging_frame(status: u8, x: i32, y: i32, z: i32, face: u8) -> Vec<u8> {
+    let mut payload = vec![0x07, status];
+    let packed =
+        ((x as i64 & 0x3FFFFFF) << 38) | ((y as i64 & 0xFFF) << 26) | (z as i64 & 0x3FFFFFF);
+    payload.extend_from_slice(&packed.to_be_bytes());
+    payload.push(face);
+    payload
+}
+
+/// One Block Break Animation payload (0x25): the breaker's entity id, the
+/// Location Position and the stage byte.
+fn block_break_animation_frame(entity_id: i32, x: i32, y: i32, z: i32, stage: u8) -> Vec<u8> {
+    let mut payload = vec![0x25];
+    push_varint(&mut payload, entity_id);
+    let packed =
+        ((x as i64 & 0x3FFFFFF) << 38) | ((y as i64 & 0xFFF) << 26) | (z as i64 & 0x3FFFFFF);
+    payload.extend_from_slice(&packed.to_be_bytes());
+    payload.push(stage);
+    payload
+}
+
+/// The destroy stages a session reported, in order: each position with the
+/// stage a set landed, or `None` for a cleared entry.
+fn reported_stages(events: &[ClientEvent]) -> Vec<((i32, i32, i32), Option<u8>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::BreakStage { x, y, z, stage } => Some(((*x, *y, *z), Some(*stage))),
+            ClientEvent::BreakCleared { x, y, z } => Some(((*x, *y, *z), None)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A left press as the scripted window sends it.
+fn left_press() -> InputEvent {
+    InputEvent::MouseButton {
+        button: MouseButton::Left,
+        pressed: true,
+    }
+}
+
+/// The walking reports (0x03–0x06) between two frames, exclusive.
+fn reports_between(frames: &[Vec<u8>], from: usize, to: usize) -> usize {
+    frames[from + 1..to]
+        .iter()
+        .filter(|frame| matches!(frame[0], 0x03..=0x06))
+        .count()
+}
+
+#[test]
+fn a_held_press_digs_dirt_at_the_hands_rate_and_removes_it_locally() {
+    // The press starts the dig and the held ticks step the hand's dirt rate
+    // (1/0.5/30 per tick, `Block.java:590-594`): fifteen damage ticks complete
+    // it, so exactly fourteen walking reports — one per damage tick between —
+    // separate the start from the finish. The completion sends the finish,
+    // removes the block locally, and clears the stage; the server sent
+    // nothing after the press, so the local path waited on no round trip.
+    let (events, frames) = flip_session(dig_head(DIRT), Vec::new(), 4, 60, vec![(2, left_press())]);
+
+    let digs: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x07).collect();
+    assert_eq!(
+        digs,
+        vec![
+            &digging_frame(0x00, 0, 65, 2, 2),
+            &digging_frame(0x02, 0, 65, 2, 2),
+        ],
+        "one start and one finish, nothing else: {frames:?}"
+    );
+    let swings: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| frame[0] == 0x0a)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        swings.len(),
+        2,
+        "one swing per press and one at the completion: {frames:?}"
+    );
+    let start = nth_frame(&frames, 0x07, 0);
+    let finish = nth_frame(&frames, 0x07, 1);
+    assert!(
+        swings[0] < start,
+        "the press swings before it starts: {frames:?}"
+    );
+    assert!(
+        finish < swings[1],
+        "the completion's finish precedes its swing: {frames:?}"
+    );
+    assert_eq!(
+        reports_between(&frames, start, finish),
+        14,
+        "fifteen damage ticks complete dirt: {frames:?}"
+    );
+    assert!(
+        frames[swings[1] + 1..]
+            .iter()
+            .all(|frame| matches!(frame[0], 0x03..=0x06)),
+        "nothing follows the completion's swing but walking reports: {frames:?}"
+    );
+
+    // The stage map stepped 0..8 once each — repeats are not re-reported —
+    // and the completion's reset index cleared it.
+    let expected: Vec<((i32, i32, i32), Option<u8>)> = (0..9)
+        .map(|stage| ((0, 65, 2), Some(stage)))
+        .chain([((0, 65, 2), None)])
+        .collect();
+    assert_eq!(
+        reported_stages(&events),
+        expected,
+        "the stages step 0..8 and then clear: {events:?}"
+    );
+    // The removal was local and immediate: the clear lands before the next
+    // tick, and the next recomputed aim passes through the hole.
+    let cleared = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::BreakCleared { .. }))
+        .expect("the dig cleared");
+    let next_tick = events[cleared + 1..]
+        .iter()
+        .position(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .map(|offset| cleared + 1 + offset)
+        .expect("ticks continue after the dig");
+    assert!(
+        events[cleared + 1..next_tick]
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::Aim { .. })),
+        "the clear lands in the completion's own pass: {events:?}"
+    );
+    let last_aim = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("an aim");
+    assert!(
+        matches!(&events[last_aim], ClientEvent::Aim { aim: None }),
+        "the block is air: {:?}",
+        events[last_aim]
+    );
+    assert!(
+        events[cleared..]
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ChunkUpdated { cx: 0, cz: 0, .. })),
+        "the removal invalidated the column's meshes: {events:?}"
+    );
+}
+
+#[test]
+fn a_held_press_on_stone_digs_at_the_slow_rate() {
+    // The same press on stone: the material refuses the hand, so the rate is
+    // 1/1.5/100 (`Block.java:590-594`) — a fifteenth of dirt's — and no
+    // completion lands in this window. The stage map steps its own pace:
+    // stage k first lands at damage tick 15(k+1), so four steps prove the
+    // slow rate, where dirt's would have finished at tick fifteen.
+    let (events, frames) =
+        flip_session(dig_head(STONE), Vec::new(), 4, 190, vec![(2, left_press())]);
+
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x07).count(),
+        1,
+        "the start alone, no finish: {frames:?}"
+    );
+    assert_eq!(
+        frames[nth_frame(&frames, 0x07, 0)],
+        digging_frame(0x00, 0, 65, 2, 2),
+        "the start"
+    );
+    let stages = reported_stages(&events);
+    assert!(
+        stages.len() >= 4,
+        "the slow rate stepped at least 0..3: {events:?}"
+    );
+    assert_eq!(
+        stages,
+        (0..stages.len() as u8)
+            .map(|stage| ((0, 65, 2), Some(stage)))
+            .collect::<Vec<_>>(),
+        "the stages ascend once each: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::BreakCleared { .. })),
+        "nothing clears: {events:?}"
+    );
+}
+
+#[test]
+fn bedrock_never_completes_and_never_reports_a_stage() {
+    // A negative hardness is the unbreakable zero (`Block.java:590-594`), so a
+    // held press on bedrock sends the start and then nothing: no progress, no
+    // stage to land (every tick's index is the -1 that clears an entry that
+    // was never set), and no finish however long the button is held.
+    let (events, frames) = flip_session(
+        dig_head(BEDROCK),
+        Vec::new(),
+        4,
+        40,
+        vec![(2, left_press())],
+    );
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x07).count(),
+        1,
+        "the start alone: {frames:?}"
+    );
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x0a).count(),
+        1,
+        "the press's swing alone: {frames:?}"
+    );
+    assert!(
+        reported_stages(&events).is_empty(),
+        "no stage lands or clears: {events:?}"
+    );
+    let last_aim = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("an aim");
+    assert!(
+        matches!(
+            &events[last_aim],
+            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+        ),
+        "the bedrock is still aimed: {:?}",
+        events[last_aim]
+    );
+}
+
+#[test]
+fn a_creative_press_destroys_the_block_in_one_click() {
+    // clickBlock's creative branch (`PlayerControllerMP.java:230-235`): the
+    // start and the instant destroy, no running dig, no stage — and the block
+    // is gone locally, so the next recomputed aim passes through it.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame_as(1), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 2, STONE),
+        SERVER_FRAMING,
+    );
+    let (events, frames) = flip_session(head, Vec::new(), 4, 30, vec![(2, left_press())]);
+
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x07).count(),
+        1,
+        "the start alone, no finish: {frames:?}"
+    );
+    assert_eq!(
+        frames[nth_frame(&frames, 0x07, 0)],
+        digging_frame(0x00, 0, 65, 2, 2),
+        "the start"
+    );
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x0a).count(),
+        1,
+        "the press's swing alone: {frames:?}"
+    );
+    assert!(
+        reported_stages(&events).is_empty(),
+        "no stage in creative: {events:?}"
+    );
+    let last_aim = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("an aim");
+    assert!(
+        matches!(&events[last_aim], ClientEvent::Aim { aim: None }),
+        "the block is air: {:?}",
+        events[last_aim]
+    );
+}
+
+#[test]
+fn a_block_break_animation_sets_steps_and_clears_by_position() {
+    // The decoded 0x25 lands on the stage map: 0..=9 sets, reporting only a
+    // change, and anything else clears. The breaker's id is carried but not
+    // filtered on — the map is keyed by position until M4's entity work — so
+    // two breakers on one block share the one entry, and a repeat stage and a
+    // repeat removal report nothing.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &block_break_animation_frame(1, 0, 65, 2, 2),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &block_break_animation_frame(2, 0, 65, 2, 5),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &block_break_animation_frame(2, 0, 65, 2, 5),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &block_break_animation_frame(2, 0, 65, 2, 255),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &block_break_animation_frame(2, 0, 65, 2, 255),
+        SERVER_FRAMING,
+    );
+    let (events, _frames) = flip_session(dig_head(STONE), tail, 6, 6, Vec::new());
+
+    assert_eq!(
+        reported_stages(&events),
+        vec![
+            ((0, 65, 2), Some(2)),
+            ((0, 65, 2), Some(5)),
+            ((0, 65, 2), None),
+        ],
+        "two setters, a repeat, a clear and a no-op: {events:?}"
+    );
+}
+
+#[test]
+fn the_servers_echo_of_a_predicted_removal_is_idempotent() {
+    // The completion removes the block locally; the server's own 0x23 with
+    // air for the same block follows on the tail, then a keepalive. The echo
+    // writes air over air: no error, no stage, and the aim keeps passing
+    // through — the prediction is already the server's answer.
+    let mut tail = Vec::new();
+    frame(&mut tail, &block_change_frame(0, 65, 2, 0), SERVER_FRAMING);
+    frame(&mut tail, &keep_alive_frame(77), SERVER_FRAMING);
+    let (events, frames) = flip_session(dig_head(DIRT), tail, 60, 8, vec![(2, left_press())]);
+
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x07).count(),
+        2,
+        "a start and a finish: {frames:?}"
+    );
+    let cleared = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::BreakCleared { .. }))
+        .expect("the dig cleared");
+    let echo = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 77 }))
+        .expect("the tail was read");
+    assert!(
+        cleared < echo,
+        "the local removal preceded the echo: {events:?}"
+    );
+    let expected: Vec<((i32, i32, i32), Option<u8>)> = (0..9)
+        .map(|stage| ((0, 65, 2), Some(stage)))
+        .chain([((0, 65, 2), None)])
+        .collect();
+    assert_eq!(
+        reported_stages(&events),
+        expected,
+        "the echo added no stage and cleared nothing twice: {events:?}"
+    );
+    assert!(
+        events[echo..].iter().all(|event| !matches!(
+            event,
+            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+        )),
+        "the block never reappears: {events:?}"
+    );
+}
+
+#[test]
+fn an_aim_change_aborts_the_running_block_and_clears_its_stage() {
+    // A held press digs the block the player faces; a quarter turn east moves
+    // the aim to a second block. The switch is the source's own
+    // (`PlayerControllerMP.clickBlock:238-243`): the abort for the running
+    // block goes out carrying the incoming face, the new dig starts, and the
+    // breaker's damage entry — the old block's crack — is dropped as the new
+    // dig starts (`sendBlockBreakProgress` with a negative progress, `:263`).
+    // The release then aborts the new dig with the DOWN face (`:278`) and
+    // drops its entry the same way (`:281`).
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 2, DIRT),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &block_change_frame(2, 65, 0, DIRT),
+        SERVER_FRAMING,
+    );
+    let flips = vec![
+        (2, left_press()),
+        (
+            12,
+            InputEvent::MouseDelta {
+                dx: -600.0,
+                dy: 0.0,
+            },
+        ),
+        (
+            16,
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+            },
+        ),
+    ];
+    let (events, frames) = flip_session(head, Vec::new(), 4, 48, flips);
+
+    let digs: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x07).collect();
+    assert_eq!(
+        digs,
+        vec![
+            &digging_frame(0x00, 0, 65, 2, 2), // the press starts the south block
+            &digging_frame(0x01, 0, 65, 2, 4), // the turn aborts it, with the incoming face
+            &digging_frame(0x00, 2, 65, 0, 4), // and starts the east block
+            &digging_frame(0x01, 2, 65, 0, 0), // the release aborts that one, with DOWN
+        ],
+        "the start, the switch's abort and start, and the release's abort: {frames:?}"
+    );
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x0a).count(),
+        1,
+        "one swing, the press's own: {frames:?}"
+    );
+
+    // The first block's stage ladder ends in its clear: the abort dropped the
+    // entry, and nothing lands on the block again.
+    let stages = reported_stages(&events);
+    let first: Vec<Option<u8>> = stages
+        .iter()
+        .filter(|(position, _)| *position == (0, 65, 2))
+        .map(|(_, stage)| *stage)
+        .collect();
+    assert!(
+        first.len() >= 2,
+        "the dig stepped before the turn: {events:?}"
+    );
+    assert_eq!(
+        first.last(),
+        Some(&None),
+        "the abort cleared the stage: {events:?}"
+    );
+    let stepped: Vec<u8> = first[..first.len() - 1]
+        .iter()
+        .map(|stage| stage.expect("a set"))
+        .collect();
+    assert_eq!(
+        stepped,
+        (0..stepped.len() as u8).collect::<Vec<_>>(),
+        "the stages ascend once each before the clear: {events:?}"
+    );
+}
+
+#[test]
+fn a_block_break_animation_stage_expires_after_four_hundred_ticks() {
+    // A decoded 0x25 lands stage 4 on a block and nothing refreshes it: the
+    // sweep every twentieth tick removes an entry more than 400 ticks old
+    // (`RenderGlobal.cleanupDamagedBlocks:1131`), so the clear lands 401 to
+    // 420 ticks after the set — here the first sweep past 400, tick 420 —
+    // and exactly once.
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &block_break_animation_frame(1, 0, 65, 2, 4),
+        SERVER_FRAMING,
+    );
+    let (events, _frames) = flip_session(head, Vec::new(), 4, 1120, Vec::new());
+
+    let stages = reported_stages(&events);
+    assert_eq!(
+        stages,
+        vec![((0, 65, 2), Some(4)), ((0, 65, 2), None)],
+        "one set, then the expiry's one clear: {events:?}"
+    );
+    let set = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::BreakStage { .. }))
+        .expect("the set landed");
+    let clear = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::BreakCleared { .. }))
+        .expect("the expiry cleared it");
+    let ticks = events[set + 1..=clear]
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    assert!(
+        (400..=420).contains(&ticks) && ticks > 400,
+        "the expiry lands 401 to 420 ticks after the set, not {ticks}: {events:?}"
+    );
+}

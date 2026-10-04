@@ -47,18 +47,20 @@ use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::{VarIntError, read_varint};
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, BlockChange, BlockUpdate, ChunkData, JoinGame, KeepAlive, LoginPacket, MapChunkBulk,
-    MultiBlockChange, PlayDisconnect, PlayerAbilities, PlayerListItem, PlayerPositionAndLook,
-    PluginMessage, TimeUpdate, read_packet_id,
+    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChunkData, JoinGame, KeepAlive,
+    LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect, PlayerAbilities, PlayerListItem,
+    PlayerPositionAndLook, PluginMessage, TimeUpdate, read_packet_id,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
-    ClientSettings, EntityAction, write_client_settings, write_entity_action, write_keep_alive,
-    write_login_start, write_player, write_player_abilities, write_player_look,
-    write_player_position, write_player_position_and_look, write_plugin_message,
+    ClientSettings, DiggingStatus, EntityAction, write_animation, write_client_settings,
+    write_entity_action, write_keep_alive, write_login_start, write_player, write_player_abilities,
+    write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
+    write_plugin_message,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
+use oxide_world::behaviour::behaviour;
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::SECTION_SIZE;
 use oxide_world::light::{self, view_light_level};
@@ -69,8 +71,11 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
-use crate::input::{InputEvent, Intent, look_delta};
-use crate::interaction::{Aim, look_vector, raycast, reach};
+use crate::input::{InputEvent, Intent, MouseButton, look_delta};
+use crate::interaction::{
+    Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector, raycast,
+    reach, tool_not_required,
+};
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
@@ -310,6 +315,38 @@ pub enum ClientEvent {
         /// The block the interaction ray meets, or `None` when it meets none.
         aim: Option<Aim>,
     },
+    /// A destroy stage landed on a block.
+    ///
+    /// Reported when the stage map's entry for the position changes — the
+    /// session's own digging writes it, and decoded clientbound 0x25 writes
+    /// it — with the stage the map holds, `0..=9` (the values a set can carry:
+    /// `RenderGlobal.sendBlockBreakProgress`'s `progress >= 0 && progress < 10`,
+    /// `client/renderer/RenderGlobal.java:2364`). The window's crack overlay
+    /// draws from it.
+    BreakStage {
+        /// The block's x.
+        x: i32,
+        /// The block's y.
+        y: i32,
+        /// The block's z.
+        z: i32,
+        /// The stage the map now holds, 0..=9.
+        stage: u8,
+    },
+    /// A destroy stage left a block.
+    ///
+    /// Reported when the stage map removes an entry: a dig stopped or
+    /// completed, a 0x25 carried a stage outside `0..=9`
+    /// (`RenderGlobal.sendBlockBreakProgress:2377-2380`), or the entry
+    /// expired in the sweep (`cleanupDamagedBlocks:1131`).
+    BreakCleared {
+        /// The block's x.
+        x: i32,
+        /// The block's y.
+        y: i32,
+        /// The block's z.
+        z: i32,
+    },
     /// Time Update arrived: the world's clock.
     ///
     /// The time of day is the value the celestial angle and the moon phase are read from, after
@@ -492,16 +529,29 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut gamemode: u8 = 0;
         // The aim the last recompute left; only a change is reported.
         let mut aim: Option<Aim> = None;
+        // The dig machine and the destroy stages, and the left button they
+        // read: the held flag and the presses queued since the last tick.
+        let mut dig = DigState::new();
+        let mut stages = BreakStages::new();
+        let mut left_held = false;
+        let mut left_presses: u32 = 0;
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
             // the backlog drains across passes — and the bound keeps one pass'
-            // work finite however far the window runs ahead.
+            // work finite however far the window runs ahead. The mouse buttons
+            // are the dig input, so they go to it rather than to the movement
+            // intent.
             let mut looked = false;
             for _ in 0..INPUTS_PER_PASS {
                 match inputs.try_recv() {
-                    Ok(event) => looked |= apply_input(event, &mut intent, &mut player),
+                    Ok(event) => match event {
+                        InputEvent::MouseButton { button, pressed } => {
+                            apply_button(button, pressed, &mut left_held, &mut left_presses);
+                        }
+                        other => looked |= apply_input(other, &mut intent, &mut player),
+                    },
                     Err(_) => break,
                 }
             }
@@ -721,6 +771,42 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 )
                             }
                         },
+                        BlockBreakAnimation::ID => {
+                            let animation = decoded(id, BlockBreakAnimation::decode(body))?;
+                            // The stage map's own rule, from the packet's
+                            // reader through `RenderGlobal.sendBlockBreakProgress`
+                            // (`:2364-2380`): 0..=9 sets, anything else removes.
+                            // The breaker's id is carried but not filtered on:
+                            // this client's map is keyed by position until M4's
+                            // entity work.
+                            if animation.stage < 10 {
+                                if stages.set(
+                                    animation.x,
+                                    animation.y,
+                                    animation.z,
+                                    animation.stage,
+                                ) {
+                                    report(
+                                        events,
+                                        ClientEvent::BreakStage {
+                                            x: animation.x,
+                                            y: animation.y,
+                                            z: animation.z,
+                                            stage: animation.stage,
+                                        },
+                                    );
+                                }
+                            } else if stages.clear(animation.x, animation.y, animation.z) {
+                                report(
+                                    events,
+                                    ClientEvent::BreakCleared {
+                                        x: animation.x,
+                                        y: animation.y,
+                                        z: animation.z,
+                                    },
+                                );
+                            }
+                        }
                         PlayerListItem::ID => {
                             // The decoder takes the add action only, while a live
                             // server sends latency, gamemode and display-name updates
@@ -814,6 +900,33 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // The aim follows the tick's own state: a step that moved the
                 // player, and any world change behind it, is read here.
                 update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
+                // The dig runs against that same aim, and its actions run in
+                // the order the machine produced them: the completion's finish
+                // goes out before the removal it predicts, and the local path
+                // waits on nothing (`PlayerControllerMP.java:324-325`).
+                for action in step_dig(
+                    world.as_ref(),
+                    gamemode,
+                    &mut dig,
+                    aim,
+                    &mut left_presses,
+                    left_held,
+                ) {
+                    apply_dig_action(
+                        &action,
+                        world.as_mut(),
+                        &mut queue,
+                        &mut stages,
+                        &mut conn,
+                        events,
+                    )?;
+                }
+                // The stages' own clock: the counter advances once per tick
+                // and the sweep runs every twentieth, reporting the entries it
+                // expired (`RenderGlobal.updateClouds`, `RenderGlobal.java:1138-1146`).
+                for (x, y, z) in stages.tick() {
+                    report(events, ClientEvent::BreakCleared { x, y, z });
+                }
             }
         }
         finish_meshes(
@@ -978,13 +1091,30 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
             true
         }
         // The buttons belong to interaction, not movement; the held intent
-        // has no use for them.
+        // has no use for them. The left button is drained by the play loop
+        // into the dig input ([`apply_button`]) before this sees it.
         InputEvent::MouseButton { .. } => false,
         InputEvent::FocusLost => {
             intent.release_all();
             false
         }
     }
+}
+
+/// Applies one mouse button edge to the digging input.
+///
+/// The left button is the source's attack key: a press is one `clickMouse`
+/// call (`Minecraft.java:1454-1458`) and the held flag is
+/// `sendClickBlockToController`'s `leftClick` (`:1496-1505`). The right
+/// button's path arrives with placement (Task 9), so it is dropped here.
+fn apply_button(button: MouseButton, pressed: bool, left_held: &mut bool, left_presses: &mut u32) {
+    if button != MouseButton::Left {
+        return;
+    }
+    if pressed {
+        *left_presses += 1;
+    }
+    *left_held = pressed;
 }
 
 /// Applies a clientbound 0x08 teleport to the player.
@@ -1485,6 +1615,136 @@ pub fn recompute_passes() -> u64 {
 fn recompute_light(store: &mut World, x: i32, y: i32, z: i32) {
     RECOMPUTE_PASSES.with(|passes| passes.set(passes.get() + 1));
     light::recompute(store, x, y, z);
+}
+
+/// Air's block value: id 0 at metadata 0 — the packed `id << 4 | meta` zero
+/// (`Section`'s default for a cell no section holds).
+const AIR: u16 = 0;
+
+/// The block facts one dig step reads at the aim: the aimed block, the face
+/// and the hand's rate from the behaviour table.
+///
+/// The rate is [`hand_rate`] over the row's hardness and the material's own
+/// harvest rule. An id outside the covered set has no row and is treated as
+/// unbreakable — rate 0 — rather than guessed at.
+fn dig_aim(world: &World, aim: Aim) -> DigAim {
+    let id = world.block(aim.x, aim.y, aim.z) >> 4;
+    let rate = match behaviour(id) {
+        Some(row) => hand_rate(row.hardness, tool_not_required(row.material)),
+        None => 0.0,
+    };
+    DigAim {
+        x: aim.x,
+        y: aim.y,
+        z: aim.z,
+        face: aim.face,
+        rate,
+    }
+}
+
+/// One tick of the digging input: the presses and the held state against the
+/// current aim, in the source's order.
+///
+/// The source's tick runs `clickMouse` once per queued press and then
+/// `sendClickBlockToController` (`Minecraft.java:1454-1460`); each step's
+/// actions are the packets and local effects the machine produced, in their
+/// own order. The presses are taken, so a press is delivered once. A held
+/// button with no aim is the reset the source's else branch takes
+/// (`:1515-1518`).
+fn step_dig(
+    world: Option<&World>,
+    gamemode: u8,
+    dig: &mut DigState,
+    aim: Option<Aim>,
+    presses: &mut u32,
+    held: bool,
+) -> Vec<DigAction> {
+    let aimed = world.and_then(|world| aim.map(|aim| dig_aim(world, aim)));
+    let creative = creative(gamemode);
+    let mut actions = Vec::new();
+    for _ in 0..std::mem::take(presses) {
+        actions.extend(dig.click(aimed, creative));
+    }
+    if held {
+        actions.extend(dig.on_player_damage_block(aimed, creative));
+    } else {
+        actions.extend(dig.reset_block_removing());
+    }
+    actions
+}
+
+/// Performs one dig action: its packet goes out, or its local effect lands,
+/// in the order the machine produced them.
+///
+/// The completion's order is the source's own (`PlayerControllerMP.java:324-325`):
+/// the finish is written before [`apply_block_change`] removes the block
+/// locally, so the local path waits on no server round trip; the stage that
+/// follows carries the reset progress's removal. An abort also clears the
+/// aborted block's entry: the source drops the breaker's damage entry as the
+/// abort goes out (`sendBlockBreakProgress` with a negative progress,
+/// `PlayerControllerMP.java:263`, `:281`), and under this map's position
+/// keying that entry is the aborted block's. A stage with a negative index
+/// clears the position's entry; a set reports only when the stored value
+/// changed.
+fn apply_dig_action<S: Read + Write>(
+    action: &DigAction,
+    world: Option<&mut World>,
+    queue: &mut MeshQueue,
+    stages: &mut BreakStages,
+    conn: &mut Conn<S>,
+    events: &Sender<ClientEvent>,
+) -> Result<(), SessionError> {
+    match *action {
+        DigAction::Start { x, y, z, face } => send_reply(
+            conn,
+            &tick_payload(|out| {
+                write_player_digging(out, DiggingStatus::Start, x, y, z, face.wire())
+            }),
+        ),
+        DigAction::Abort { x, y, z, face } => {
+            send_reply(
+                conn,
+                &tick_payload(|out| {
+                    write_player_digging(out, DiggingStatus::Abort, x, y, z, face.wire())
+                }),
+            )?;
+            if stages.clear(x, y, z) {
+                report(events, ClientEvent::BreakCleared { x, y, z });
+            }
+            Ok(())
+        }
+        DigAction::Finish { x, y, z, face } => send_reply(
+            conn,
+            &tick_payload(|out| {
+                write_player_digging(out, DiggingStatus::Finish, x, y, z, face.wire())
+            }),
+        ),
+        DigAction::Swing => send_reply(conn, &tick_payload(|out| write_animation(out))),
+        DigAction::Destroy { x, y, z } => {
+            if let Some(store) = world {
+                apply_block_change(store, queue, x, y, z, AIR);
+            }
+            Ok(())
+        }
+        DigAction::Stage { x, y, z, index } => {
+            if index >= 0 {
+                if stages.set(x, y, z, index as u8) {
+                    report(
+                        events,
+                        ClientEvent::BreakStage {
+                            x,
+                            y,
+                            z,
+                            stage: index as u8,
+                        },
+                    );
+                }
+            } else if stages.clear(x, y, z) {
+                report(events, ClientEvent::BreakCleared { x, y, z });
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Applies one block change locally: the world write, the light it needs and

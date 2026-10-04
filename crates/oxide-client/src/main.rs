@@ -978,6 +978,16 @@ fn apply_session_event(
             }
             false
         }
+        ClientEvent::BreakStage { x, y, z, stage } => {
+            // The crack overlay's own input (Task 12); the dev client only
+            // records it for the log.
+            tracing::debug!(x, y, z, stage, "a destroy stage landed");
+            false
+        }
+        ClientEvent::BreakCleared { x, y, z } => {
+            tracing::debug!(x, y, z, "a destroy stage left");
+            false
+        }
         ClientEvent::Time {
             world_age,
             time_of_day,
