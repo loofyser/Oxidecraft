@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use oxide_game::input::{InputEvent, Key, MouseButton};
-use oxide_game::interaction::Face;
+use oxide_game::interaction::{Aim, Face};
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError, recompute_passes};
 use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
@@ -3690,5 +3690,342 @@ fn a_block_break_animation_stage_expires_after_four_hundred_ticks() {
     assert!(
         (400..=420).contains(&ticks) && ticks > 400,
         "the expiry lands 401 to 420 ticks after the set, not {ticks}: {events:?}"
+    );
+}
+
+/// A fence, id 85, meta 0: its post is 0.375..0.625 across and 1.5 tall
+/// (`BlockFence.java:50-107`), and its material is not replaceable — the
+/// block a placement cannot land in.
+const FENCE: u16 = 85 << 4;
+
+/// One Player Block Placement payload (0x08): the Location Position, the
+/// face byte, the empty held item stack (the short -1, two `FF` bytes) and
+/// the cursor's three bytes. Hand-packed, never through the writer's own
+/// arithmetic.
+fn placement_frame(x: i32, y: i32, z: i32, face: u8, cursor: [u8; 3]) -> Vec<u8> {
+    let mut payload = vec![0x08];
+    let packed =
+        ((x as i64 & 0x3FFFFFF) << 38) | ((y as i64 & 0xFFF) << 26) | (z as i64 & 0x3FFFFFF);
+    payload.extend_from_slice(&packed.to_be_bytes());
+    payload.push(face);
+    payload.extend_from_slice(&[0xFF, 0xFF]);
+    payload.extend_from_slice(&cursor);
+    payload
+}
+
+/// A right press as the scripted window sends it.
+fn right_press() -> InputEvent {
+    InputEvent::MouseButton {
+        button: MouseButton::Right,
+        pressed: true,
+    }
+}
+
+#[test]
+fn a_right_press_places_the_block_and_predicts_it_locally() {
+    // The press runs `rightClickMouse`'s path (`Minecraft.java:1570-1603`):
+    // the checks pass on the stone the ray meets, so 0x08 goes out
+    // (`PlayerControllerMP.java:424`) and the block lands locally at once
+    // (`:436`, `:443`). Exactly one placement frame follows — no dig, no
+    // swing — and the next recomputed aim reads the placed block the
+    // prediction left in front of the original stone.
+    let (events, frames) = flip_session(aim_head(), Vec::new(), 4, 60, vec![(2, right_press())]);
+
+    let placements: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x08).collect();
+    assert_eq!(
+        placements,
+        vec![&placement_frame(0, 65, 2, 2, [8, 9, 0])],
+        "one placement frame, its bytes the aim's own: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame[0] != 0x07 && frame[0] != 0x0a),
+        "no dig and no swing follow a placement: {frames:?}"
+    );
+
+    // The prediction is readable: the aim moved to the cell the block landed
+    // in — one north of the stone, met through the new block's north face —
+    // and it stays there.
+    let aims: Vec<Aim> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Aim { aim: Some(aim) } => Some(*aim),
+            _ => None,
+        })
+        .collect();
+    let placed_aim = aims
+        .iter()
+        .find(|aim| (aim.x, aim.y, aim.z) == (0, 65, 1))
+        .expect("the placed block is aimed");
+    assert_eq!(placed_aim.face, Face::North, "the new block's north face");
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("an aim");
+    assert!(
+        matches!(
+            &events[last],
+            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 1)
+        ),
+        "the placed block stays the aim: {:?}",
+        events[last]
+    );
+    // The local write invalidated the column's meshes like any block change.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ChunkUpdated { cx: 0, cz: 0, .. })),
+        "the prediction invalidated the column: {events:?}"
+    );
+}
+
+#[test]
+fn the_servers_echo_of_the_predicted_placement_is_idempotent() {
+    // The prediction wrote stone at (0, 65, 1); the server's 0x23 with the
+    // same stone follows on the tail, then a keepalive. The echo writes the
+    // value over itself (`NetHandlerPlayClient.handleBlockChange`, `:776-780`,
+    // applies whatever arrives): the aim never leaves the placed block, and
+    // the session keeps reading — the keepalive is answered after it.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &block_change_frame(0, 65, 1, STONE),
+        SERVER_FRAMING,
+    );
+    frame(&mut tail, &keep_alive_frame(78), SERVER_FRAMING);
+    let (events, frames) = flip_session(aim_head(), tail, 60, 10, vec![(2, right_press())]);
+
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x08).count(),
+        1,
+        "one placement frame: {frames:?}"
+    );
+    let placed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 1)
+            )
+        })
+        .expect("the prediction is readable");
+    let echo = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::KeepAlive { id: 78 }))
+        .expect("the tail was read");
+    assert!(placed < echo, "the placement preceded the echo: {events:?}");
+    assert!(
+        events[echo..].iter().all(|event| match event {
+            ClientEvent::Aim { aim: Some(aim) } => (aim.x, aim.y, aim.z) == (0, 65, 1),
+            ClientEvent::Aim { aim: None } => false,
+            _ => true,
+        }),
+        "the echo changed nothing: {events:?}"
+    );
+}
+
+#[test]
+fn the_servers_correction_of_the_predicted_placement_replaces_it() {
+    // The prediction wrote stone at (0, 65, 1); the server's own answer is
+    // air — it refused the placement — so its 0x23 replaces the prediction
+    // (`handleBlockChange` applies the server's value over whatever the
+    // client holds, `:776-780`): the next recomputed aim passes through the
+    // gap and reads the stone behind it again.
+    let mut tail = Vec::new();
+    frame(&mut tail, &block_change_frame(0, 65, 1, 0), SERVER_FRAMING);
+    frame(&mut tail, &keep_alive_frame(79), SERVER_FRAMING);
+    let (events, frames) = flip_session(aim_head(), tail, 60, 12, vec![(2, right_press())]);
+
+    assert_eq!(
+        frames.iter().filter(|frame| frame[0] == 0x08).count(),
+        1,
+        "one placement frame: {frames:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .position(|event| matches!(event, ClientEvent::KeepAlive { id: 79 }))
+            .is_some(),
+        "the tail was read: {events:?}"
+    );
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("an aim");
+    assert!(
+        matches!(
+            &events[last],
+            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+        ),
+        "the prediction was replaced and the stone behind shows: {:?}",
+        events[last]
+    );
+}
+
+#[test]
+fn a_stack_of_two_placements_lands_both() {
+    // Two presses: the first at the stone the player faces — the block lands
+    // at (0, 65, 1) — then a quarter turn east and a press at a second stone,
+    // landing at (1, 65, 0). Both predictions are readable as they land, in
+    // order, and each frame carries its own aim's bytes.
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 2, STONE),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &block_change_frame(2, 65, 0, STONE),
+        SERVER_FRAMING,
+    );
+    let flips = vec![
+        (4, right_press()),
+        (
+            16,
+            InputEvent::MouseDelta {
+                dx: -600.0,
+                dy: 0.0,
+            },
+        ),
+        (28, right_press()),
+    ];
+    let (events, frames) = flip_session(head, Vec::new(), 32, 40, flips);
+
+    let placements: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x08).collect();
+    assert_eq!(
+        placements,
+        vec![
+            &placement_frame(0, 65, 2, 2, [8, 9, 0]),
+            &placement_frame(2, 65, 0, 4, [0, 9, 8]),
+        ],
+        "both placements, each with its own aim's bytes: {frames:?}"
+    );
+    let aims: Vec<(i32, i32, i32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Aim { aim: Some(aim) } => Some((aim.x, aim.y, aim.z)),
+            _ => None,
+        })
+        .collect();
+    let first = aims
+        .iter()
+        .position(|at| *at == (0, 65, 1))
+        .expect("the first placed block is aimed");
+    let second = aims
+        .iter()
+        .position(|at| *at == (1, 65, 0))
+        .expect("the second placed block is aimed");
+    assert!(first < second, "the placed blocks read in order: {aims:?}");
+    assert_eq!(
+        aims.last(),
+        Some(&(1, 65, 0)),
+        "the second block stays the aim: {aims:?}"
+    );
+}
+
+#[test]
+fn a_right_press_without_an_aim_places_nothing() {
+    // The source's null-mouse-over branch (`Minecraft.java:1577-1581`): a
+    // press with nothing aimed logs and does nothing. The floor alone leaves
+    // the level ray aiming nothing, and no placement frame follows the press.
+    let (events, frames) = flip_session(floor_head(), Vec::new(), 4, 20, vec![(2, right_press())]);
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x08),
+        "no placement frame: {frames:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_) })),
+        "nothing is aimed: {events:?}"
+    );
+}
+
+#[test]
+fn a_right_press_at_an_occupied_target_places_nothing() {
+    // A fence stands on the stone's north neighbour: the aim finds the stone
+    // through the gap beside the fence post, but the landing cell holds the
+    // fence, whose material is not replaceable — the check refuses before the
+    // packet (`PlayerControllerMP.java:417-421`) and nothing changes.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.1, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 1, FENCE),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &block_change_frame(0, 65, 2, STONE),
+        SERVER_FRAMING,
+    );
+    let (events, frames) = flip_session(head, Vec::new(), 6, 24, vec![(2, right_press())]);
+
+    let aimed = events
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::Aim { aim: Some(aim) } => Some(*aim),
+            _ => None,
+        })
+        .expect("the stone through the gap is aimed");
+    assert_eq!(
+        (aimed.x, aimed.y, aimed.z, aimed.face),
+        (0, 65, 2, Face::North),
+        "the aim reaches past the fence post"
+    );
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x08),
+        "the refusal keeps the packet: {frames:?}"
+    );
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
+        .expect("an aim");
+    assert!(
+        matches!(
+            &events[last],
+            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+        ),
+        "the world is untouched: {:?}",
+        events[last]
+    );
+}
+
+#[test]
+fn a_right_press_during_a_dig_places_nothing() {
+    // `rightClickMouse`'s own guard refuses while the controller is hitting a
+    // block (`Minecraft.java:1572`'s `getIsHittingBlock`): a right press that
+    // lands mid-dig is dropped — the dig's own frames continue and no
+    // placement follows.
+    let (events, frames) = flip_session(
+        dig_head(DIRT),
+        Vec::new(),
+        30,
+        6,
+        vec![(2, left_press()), (12, right_press())],
+    );
+    let digs: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x07).collect();
+    assert!(
+        !digs.is_empty() && digs.iter().all(|frame| frame[1] == 0x00),
+        "the dig started and nothing finished inside the window: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|frame| frame[0] != 0x08),
+        "the guarded press sends no placement: {frames:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::BreakStage { .. })),
+        "the dig did run: {events:?}"
     );
 }

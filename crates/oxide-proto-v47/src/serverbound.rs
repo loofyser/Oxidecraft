@@ -210,6 +210,40 @@ fn pack_position(x: i32, y: i32, z: i32) -> i64 {
     (i64::from(x & 0x03FF_FFFF) << 38) | (i64::from(y & 0xFFF) << 26) | i64::from(z & 0x03FF_FFFF)
 }
 
+/// Serverbound Player Block Placement (play id 0x08).
+pub const PLAYER_BLOCK_PLACEMENT_ID: i32 = 0x08;
+
+/// Writes Player Block Placement: the Location Position, the face byte, the
+/// held item stack and the cursor's three bytes
+/// (`C08PacketPlayerBlockPlacement.writePacketData`, `:55-63`).
+///
+/// The position is packed as `BlockPos.toLong` packs it
+/// (`util/BlockPos.java:200-203`) — the same packing the digging packet
+/// carries — and the face byte is `EnumFacing.getIndex()`'s ordinal
+/// (`util/EnumFacing.java:53-58`), which `Face::wire` answers. The cursor
+/// bytes are the source's `(int)(facing * 16.0F)` per axis (`:60-62`),
+/// already scaled by the caller.
+///
+/// The held stack is empty: this client's inventory is M5's, and an empty
+/// stack is the short `-1` (`PacketBuffer.writeItemStackToBuffer`,
+/// `network/PacketBuffer.java:232-237`) — two `FF` bytes on the wire. The
+/// server reads the placed item from the inventory it holds for the account
+/// (`NetHandlerPlayServer.processPlayerBlockPlacement`,
+/// `:578-601`'s `this.playerEntity.inventory.getCurrentItem()`, `:582`), not
+/// from the packet's stack, so an empty stack still places the server's item.
+pub fn write_player_block_placement(
+    mut out: impl Write,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: u8,
+    cursor: [u8; 3],
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, PLAYER_BLOCK_PLACEMENT_ID)?;
+    out.write_all(&pack_position(x, y, z).to_be_bytes())?;
+    out.write_all(&[face, 0xff, 0xff, cursor[0], cursor[1], cursor[2]])
+}
+
 /// Serverbound Animation (play id 0x0A).
 pub const ANIMATION_ID: i32 = 0x0A;
 
@@ -371,7 +405,18 @@ mod tests {
     //! rebuilt with the writer's arithmetic, so a wrong shift cannot be
     //! confirmed by its own twin.
 
-    use super::{DiggingStatus, write_animation, write_player_digging};
+    use super::{
+        DiggingStatus, write_animation, write_player_block_placement, write_player_digging,
+    };
+
+    /// The bytes `write_player_block_placement` writes, for byte-exact
+    /// assertions.
+    fn placement_bytes(x: i32, y: i32, z: i32, face: u8, cursor: [u8; 3]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_player_block_placement(&mut out, x, y, z, face, cursor)
+            .expect("writing to a Vec cannot fail");
+        out
+    }
 
     /// The bytes `write_player_digging` writes, for byte-exact assertions.
     fn digging_bytes(status: DiggingStatus, x: i32, y: i32, z: i32, face: u8) -> Vec<u8> {
@@ -434,5 +479,53 @@ mod tests {
         let mut out = Vec::new();
         write_animation(&mut out).expect("writing to a Vec cannot fail");
         assert_eq!(out, vec![0x0a], "the id alone");
+    }
+
+    #[test]
+    fn player_block_placement_writes_the_empty_stack_and_the_cursor() {
+        // 0x08: Location Position, Face Byte, the held item stack, then the
+        // CursorX/Y/Z bytes (`C08PacketPlayerBlockPlacement.writePacketData`,
+        // `:55-63`; the reference's §2.2 row). The stack is empty — this
+        // client carries no inventory until M5 — and an empty stack is the
+        // short `-1` (`PacketBuffer.writeItemStackToBuffer`, `:232-237`): two
+        // `FF` bytes. Each cursor byte is `(int)(facing * 16.0F)` for the
+        // hit's fraction, 0 through 16, a face-exact hit writing 16 (`:60-62`).
+        // The position (-5, 70, -33) packs as `BlockPos.toLong` packs it
+        // (`util/BlockPos.java:200-203`), hand-derived here as in the digging
+        // fixture, and the face is 5, EAST's ordinal (`EnumFacing.getIndex`,
+        // `:53-58`).
+        let bytes = placement_bytes(-5, 70, -33, 5, [8, 16, 1]);
+        assert_eq!(
+            bytes,
+            vec![
+                0x08, // the packet id
+                0xff, 0xff, 0xfe, 0xc1, 0x1b, 0xff, 0xff, 0xdf, // (-5, 70, -33)
+                0x05, // the face byte
+                0xff, 0xff, // the empty held item stack: the short -1
+                0x08, 0x10, 0x01, // the cursor's x, y and z bytes
+            ],
+            "the placement at a negative position"
+        );
+        // The item-stack bytes and the cursor bytes, named so a wrong middle
+        // shift cannot hide inside a whole-vector match.
+        assert_eq!(&bytes[10..12], &[0xff, 0xff], "the empty held item stack");
+        assert_eq!(&bytes[12..15], &[8, 16, 1], "the cursor's three bytes");
+
+        // The shape the session's first placement sends: the aimed block
+        // (0, 65, 2) through its north face (ordinal 2) with the fractions
+        // (0.5, 0.62, 0.0) scaled to (8, 9, 0).
+        let bytes = placement_bytes(0, 65, 2, 2, [8, 9, 0]);
+        assert_eq!(
+            bytes,
+            vec![
+                0x08, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x02, // (0, 65, 2)
+                0x02, // the face byte
+                0xff, 0xff, // the empty held item stack
+                0x08, 0x09, 0x00, // the cursor's three bytes
+            ],
+            "the placement at the aim's own position"
+        );
+        assert_eq!(&bytes[10..12], &[0xff, 0xff], "the empty held item stack");
+        assert_eq!(&bytes[12..15], &[8, 9, 0], "the cursor's three bytes");
     }
 }

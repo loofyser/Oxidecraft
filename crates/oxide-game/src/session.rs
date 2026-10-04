@@ -55,8 +55,8 @@ use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
     ClientSettings, DiggingStatus, EntityAction, write_animation, write_client_settings,
     write_entity_action, write_keep_alive, write_login_start, write_player, write_player_abilities,
-    write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
-    write_plugin_message,
+    write_player_block_placement, write_player_digging, write_player_look, write_player_position,
+    write_player_position_and_look, write_plugin_message,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
@@ -73,8 +73,8 @@ use tracing::{debug, info, warn};
 
 use crate::input::{InputEvent, Intent, MouseButton, look_delta};
 use crate::interaction::{
-    Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector, raycast,
-    reach, tool_not_required,
+    Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector, placement,
+    raycast, reach, tool_not_required,
 };
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
@@ -535,6 +535,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut stages = BreakStages::new();
         let mut left_held = false;
         let mut left_presses: u32 = 0;
+        let mut right_presses: u32 = 0;
         let mut players: HashMap<[u8; 16], String> = HashMap::new();
 
         loop {
@@ -548,7 +549,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 match inputs.try_recv() {
                     Ok(event) => match event {
                         InputEvent::MouseButton { button, pressed } => {
-                            apply_button(button, pressed, &mut left_held, &mut left_presses);
+                            apply_button(
+                                button,
+                                pressed,
+                                &mut left_held,
+                                &mut left_presses,
+                                &mut right_presses,
+                            );
                         }
                         other => looked |= apply_input(other, &mut intent, &mut player),
                     },
@@ -904,6 +911,17 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // The aim follows the tick's own state: a step that moved the
                 // player, and any world change behind it, is read here.
                 update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
+                // The placement presses run against that same aim, before the
+                // dig's step: the source's tick orders the use button's presses
+                // before `sendClickBlockToController` (`Minecraft.java:2153-2166`).
+                step_place(
+                    world.as_mut(),
+                    &mut queue,
+                    aim,
+                    &mut right_presses,
+                    dig.hitting(),
+                    &mut conn,
+                )?;
                 // The dig runs against that same aim, and its actions run in
                 // the order the machine produced them: the completion's finish
                 // goes out before the removal it predicts, and the local path
@@ -1105,20 +1123,33 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
     }
 }
 
-/// Applies one mouse button edge to the digging input.
+/// Applies one mouse button edge to the interaction input.
 ///
 /// The left button is the source's attack key: a press is one `clickMouse`
 /// call (`Minecraft.java:1454-1458`) and the held flag is
 /// `sendClickBlockToController`'s `leftClick` (`:1496-1505`). The right
-/// button's path arrives with placement (Task 9), so it is dropped here.
-fn apply_button(button: MouseButton, pressed: bool, left_held: &mut bool, left_presses: &mut u32) {
-    if button != MouseButton::Left {
-        return;
+/// button is the use key: a press is one `rightClickMouse` call
+/// (`:2153-2156`), consumed by the placement step.
+fn apply_button(
+    button: MouseButton,
+    pressed: bool,
+    left_held: &mut bool,
+    left_presses: &mut u32,
+    right_presses: &mut u32,
+) {
+    match button {
+        MouseButton::Left => {
+            if pressed {
+                *left_presses += 1;
+            }
+            *left_held = pressed;
+        }
+        MouseButton::Right => {
+            if pressed {
+                *right_presses += 1;
+            }
+        }
     }
-    if pressed {
-        *left_presses += 1;
-    }
-    *left_held = pressed;
 }
 
 /// Applies a clientbound 0x08 teleport to the player.
@@ -1625,6 +1656,16 @@ fn recompute_light(store: &mut World, x: i32, y: i32, z: i32) {
 /// (`Section`'s default for a cell no section holds).
 const AIR: u16 = 0;
 
+/// The block value a placement predicts with until M5's inventory.
+///
+/// The packet carries an empty held item stack, and the server places from
+/// the stack it holds for the account (`NetHandlerPlayServer
+/// .processPlayerBlockPlacement`, `:582`), which this client cannot see — the
+/// acceptance rig arranges a full cube with `/give`, so placements predict
+/// the plain stone the rig gives, id 1 at metadata 0. A different held block
+/// shows as the server's own 0x23 replacing the prediction.
+pub const ASSUMED_HELD_BLOCK: u16 = 1 << 4;
+
 /// The block facts one dig step reads at the aim: the aimed block, the face
 /// and the hand's rate from the behaviour table.
 ///
@@ -1749,6 +1790,65 @@ fn apply_dig_action<S: Read + Write>(
             Ok(())
         }
     }
+}
+
+/// One tick of the placement input: each queued press, when an aim exists,
+/// runs the source's checks, sends 0x08 and predicts the block locally.
+///
+/// The source's path is `rightClickMouse` (`Minecraft.java:1570-1603`): it
+/// refuses while a dig runs (`:1572`'s `getIsHittingBlock`), drops a press
+/// with nothing aimed (`:1577-1581`), and hands the frame's hit result to
+/// `PlayerControllerMP.onPlayerRightClick` (`:395-396`'s `hitPos` and
+/// `side`). That method refuses a target that cannot take the block before
+/// the packet (`:417-421`), queues 0x08 (`:424`) and then lets
+/// `onItemUse` write the block locally (`:436`, `:443`) — so the packet goes
+/// out before the prediction lands, the order the two calls run here.
+///
+/// The prediction's value is [`ASSUMED_HELD_BLOCK`]: the packet's held stack
+/// is empty, and the server places from its own copy of the held item
+/// (`NetHandlerPlayServer.processPlayerBlockPlacement`, `:582`).
+fn step_place<S: Read + Write>(
+    mut world: Option<&mut World>,
+    queue: &mut MeshQueue,
+    aim: Option<Aim>,
+    presses: &mut u32,
+    hitting: bool,
+    conn: &mut Conn<S>,
+) -> Result<(), SessionError> {
+    let presses = std::mem::take(presses);
+    if hitting {
+        return Ok(());
+    }
+    for _ in 0..presses {
+        let (Some(store), Some(aim)) = (world.as_deref_mut(), aim) else {
+            break;
+        };
+        let Some(placed) = placement(&WorldView(store), &aim) else {
+            continue;
+        };
+        send_reply(
+            conn,
+            &tick_payload(|out| {
+                write_player_block_placement(
+                    out,
+                    placed.x,
+                    placed.y,
+                    placed.z,
+                    placed.face.wire(),
+                    placed.cursor,
+                )
+            }),
+        )?;
+        apply_block_change(
+            store,
+            queue,
+            placed.target[0],
+            placed.target[1],
+            placed.target[2],
+            ASSUMED_HELD_BLOCK,
+        );
+    }
+    Ok(())
 }
 
 /// Applies one block change locally: the world write, the light it needs and
@@ -1994,7 +2094,7 @@ mod tests {
 
     use oxide_world::world::World;
 
-    use super::{ClientEvent, Clock, TICK_PERIOD, step_tick};
+    use super::{ASSUMED_HELD_BLOCK, ClientEvent, Clock, TICK_PERIOD, step_tick};
     use crate::input::Intent;
     use crate::player::Player;
     use crate::ticker::Ticker;
@@ -2016,6 +2116,16 @@ mod tests {
             ticker.due(start + TICK_PERIOD + Duration::from_millis(5)),
             1
         );
+    }
+
+    #[test]
+    fn the_assumed_held_block_is_stone() {
+        // The prediction's own value until M5's inventory: the packet's held
+        // stack is empty and the server places from the stack it holds for
+        // the account (`NetHandlerPlayServer.processPlayerBlockPlacement`,
+        // `:582`), which the acceptance rig arranges as plain stone — id 1,
+        // metadata 0 (`Blocks.stone`'s one variant).
+        assert_eq!(ASSUMED_HELD_BLOCK, 1 << 4, "stone: id 1 at metadata 0");
     }
 
     #[test]

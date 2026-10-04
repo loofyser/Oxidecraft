@@ -56,6 +56,7 @@
 use std::collections::HashMap;
 
 use oxide_world::behaviour::{CollisionShape, Material, behaviour};
+use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
 use oxide_world::collision::CollisionBox;
 
 use crate::physics::CollisionView;
@@ -135,6 +136,25 @@ impl Face {
             Face::South => 3,
             Face::West => 4,
             Face::East => 5,
+        }
+    }
+
+    /// The cell offset along this face's normal: DOWN `(0, -1, 0)`, UP
+    /// `(0, 1, 0)`, NORTH `(0, 0, -1)`, SOUTH `(0, 0, 1)`, WEST `(-1, 0, 0)`,
+    /// EAST `(1, 0, 0)`.
+    ///
+    /// `EnumFacing`'s front offsets (`util/EnumFacing.java:222-240`), the
+    /// vector `BlockPos.offset(facing)` adds (`util/BlockPos.java:176-181`)
+    /// — the step `ItemBlock.onItemUse` spends on a block that is not
+    /// replaceable (`item/ItemBlock.java:43-45`).
+    pub const fn offset(self) -> (i32, i32, i32) {
+        match self {
+            Face::Down => (0, -1, 0),
+            Face::Up => (0, 1, 0),
+            Face::North => (0, 0, -1),
+            Face::South => (0, 0, 1),
+            Face::West => (-1, 0, 0),
+            Face::East => (1, 0, 0),
         }
     }
 }
@@ -480,6 +500,131 @@ fn box_entry(box_: &CollisionBox, from: [f64; 3], to: [f64; 3]) -> Option<(f64, 
     // A box with no extent on any axis the segment moves along: the segment's
     // start lies on it, as the source's first candidate does.
     Some((0.0, entry_face))
+}
+
+/// Whether a block value is replaceable by a placement — the source's own
+/// overwrite rule, read at both checks a right click makes.
+///
+/// `ItemBlock.onItemUse` keeps the aimed cell when its block answers
+/// `Block.isReplaceable` and steps one cell along the face otherwise
+/// (`item/ItemBlock.java:43-45`), and the landing cell must pass
+/// `World.canBlockBePlaced`, whose material clause is
+/// `blockMaterial.isReplaceable()` (`world/World.java:3153-3157`). The
+/// material rule is set at the material singletons: `MaterialTransparent` —
+/// air and fire (`Material.java:5,19`; `MaterialTransparent.java:8`) —
+/// `MaterialLiquid` — water and lava (`Material.java:9-10`;
+/// `MaterialLiquid.java:8`) — and `Material.vine` (`Material.java:16`),
+/// which the covered plants carry: the tall grass (`BlockTallGrass.java:30`),
+/// the dead bush (`BlockDeadBush.java:21`) and the double plant
+/// (`BlockDoublePlant.java:34`). `Material.isReplaceable()` answers the flag
+/// (`Material.java:162-165`).
+///
+/// Over that material set the source's block-level overrides narrow exactly
+/// one covered block: `Block.isReplaceable` defaults to false
+/// (`block/Block.java:387-390`) and `BlockDoublePlant` overrides it to its
+/// grass and fern variants alone (`:69-81`), so the double plant is gated on
+/// its meta here.
+///
+/// The four liquids can never be aimed — the interaction ray passes them —
+/// but they are replaceable as landing cells. Values outside the covered set
+/// (the snow layer's, the vine block's, fire) carry no table row, and this
+/// client does not replace what it cannot vouch for.
+pub fn replaceable(value: u16) -> bool {
+    match value >> 4 {
+        0 | 8 | 9 | 10 | 11 | 31 | 32 => true,
+        175 => matches!(value & 0xF, 2 | 3),
+        _ => false,
+    }
+}
+
+/// The placement a right press at an [`Aim`] would make: the packet's own
+/// facts and the cell the block lands in.
+///
+/// The source builds its packet from exactly these — the aimed position and
+/// the face (`PlayerControllerMP.onPlayerRightClick` spends the frame's
+/// `ObjectMouseOver` at `:395-396` and sends at `:424`), and the three hit
+/// fractions (`:395-397`'s `f`, `f1`, `f2`, scaled at
+/// `C08PacketPlayerBlockPlacement.writePacketData:60-62`) — and predicts the
+/// block at the cell its `onItemUse` call writes (`:436`, `:443`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// The aimed block's x — the packet's Location Position.
+    pub x: i32,
+    /// The aimed block's y.
+    pub y: i32,
+    /// The aimed block's z.
+    pub z: i32,
+    /// The face the ray entered through — the packet's face byte.
+    pub face: Face,
+    /// The cursor's three bytes, 0 through 16.
+    pub cursor: [u8; 3],
+    /// The cell the block lands in.
+    pub target: [i32; 3],
+}
+
+/// The cursor's three bytes for a hit in `aim`'s cell: the source's
+/// `(int)(facing * 16.0F)` per axis
+/// (`C08PacketPlayerBlockPlacement.writePacketData`, `:60-62`), where each
+/// fraction is the hit point minus the cell's own coordinate on that axis
+/// (`PlayerControllerMP.onPlayerRightClick`, `:395-397`).
+///
+/// The cast truncates toward zero and is not clamped: a hit on the cell's
+/// far plane carries a fraction of exactly 1 and writes 16.
+pub fn placement_cursor(aim: &Aim) -> [u8; 3] {
+    let mut cursor = [0u8; 3];
+    for (axis, byte) in cursor.iter_mut().enumerate() {
+        let cell = match axis {
+            0 => aim.x,
+            1 => aim.y,
+            _ => aim.z,
+        };
+        let fraction = (aim.hit[axis] - f64::from(cell)) as f32;
+        *byte = (fraction * 16.0) as u8;
+    }
+    cursor
+}
+
+/// The placement a right press with `aim` makes, or `None` when the
+/// source's own client-side checks refuse the press.
+///
+/// The target is the aimed cell when its block is [`replaceable`] and the
+/// next cell along the face's normal otherwise — `ItemBlock.onItemUse`'s
+/// rule, applied before it spends the stack (`item/ItemBlock.java:43-45`).
+/// The target must then accept the block: the block there must itself be
+/// [`replaceable`], `World.canBlockBePlaced`'s material clause
+/// (`world/World.java:3153-3157`; with the null entity `ItemBlock` passes at
+/// `:56` its bounding-box clause never refuses), and the target must lie
+/// inside the world's build range, 0 through 255 — the range the world's own
+/// write path takes (`World::block` answers air outside it, `World::set_block`
+/// refuses it).
+///
+/// The source checks the world border on the aimed position instead
+/// (`PlayerControllerMP.java:398-401`: outside `getWorldBorder().contains`
+/// it refuses, and the border's default span cannot be met within a reach of
+/// five), and leaves collision and support validation to the server; until
+/// M5's inventory this client assumes a full cube is held, whose support rule
+/// is the material check above.
+pub fn placement(view: &WorldView<'_>, aim: &Aim) -> Option<Placement> {
+    let aimed = view.0.block(aim.x, aim.y, aim.z);
+    let target = if replaceable(aimed) {
+        [aim.x, aim.y, aim.z]
+    } else {
+        let (dx, dy, dz) = aim.face.offset();
+        [aim.x + dx, aim.y + dy, aim.z + dz]
+    };
+    let in_bounds = (0..(SECTION_COUNT * SECTION_SIZE) as i32).contains(&target[1]);
+    let accepts = replaceable(view.0.block(target[0], target[1], target[2]));
+    if !in_bounds || !accepts {
+        return None;
+    }
+    Some(Placement {
+        x: aim.x,
+        y: aim.y,
+        z: aim.z,
+        face: aim.face,
+        cursor: placement_cursor(aim),
+        target,
+    })
 }
 
 /// The hand's progress per tick on a block with no tool held: the source's
@@ -1027,8 +1172,9 @@ mod tests {
     use oxide_world::world::World;
 
     use super::{
-        Aim, BreakStages, CREATIVE_REACH, DigAction, DigAim, DigState, Face, SURVIVAL_REACH,
-        hand_rate, look_vector, raycast, reach, tool_not_required,
+        Aim, BreakStages, CREATIVE_REACH, DigAction, DigAim, DigState, Face, Placement,
+        SURVIVAL_REACH, hand_rate, look_vector, placement, placement_cursor, raycast, reach,
+        replaceable, tool_not_required,
     };
     use crate::player::Player;
     use crate::world_view::WorldView;
@@ -1053,6 +1199,22 @@ mod tests {
     /// A lone fence, id 85: its post is 0.375..0.625 across and 1.5 tall
     /// (`BlockFence.java:50-107`).
     const FENCE: u16 = 85 << 4;
+    /// The dead bush, id 32, a `Material.vine` plant like the tall grass.
+    const DEAD_BUSH: u16 = 32 << 4;
+    /// The poppy, id 38: a plant of `Material.plants`, which does not carry
+    /// the replaceable flag (`Material.java:15`).
+    const FLOWER: u16 = 38 << 4;
+    /// The double plant, id 175, its grass variant (meta 2) — the replaceable
+    /// half of the block's own override (`BlockDoublePlant.java:69-81`).
+    const DOUBLE_PLANT_GRASS: u16 = (175 << 4) | 2;
+    /// The double plant's fern variant (meta 3), replaceable like the grass.
+    const DOUBLE_PLANT_FERN: u16 = (175 << 4) | 3;
+    /// The double plant's rose variant (meta 4): the override refuses it, so
+    /// a placement steps beside it.
+    const DOUBLE_PLANT_ROSE: u16 = (175 << 4) | 4;
+    /// The snow layer, id 78: outside the covered set, as the ray tests note
+    /// the covered non-cube blocks.
+    const SNOW_LAYER: u16 = 78 << 4;
 
     /// One section: every cell's value from `block_at(local x, local y, local
     /// z)`, all light zero.
@@ -1113,6 +1275,273 @@ mod tests {
                 "the hit point {hit:?} is not {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_placement_target_is_the_aimed_cell_or_its_face_neighbour() {
+        // `ItemBlock.onItemUse` keeps the aimed pos when its block answers
+        // `Block.isReplaceable` and steps one cell along the face otherwise
+        // (`item/ItemBlock.java:38-45`: `pos = pos.offset(side)`), and
+        // `BlockPos.offset` adds `EnumFacing`'s front offsets
+        // (`util/BlockPos.java:176-181`, `util/EnumFacing.java:222-240`).
+        // A stone aim takes every one of the six neighbours.
+        let world = world_of(|x, y, z| {
+            if x == 0 && y == 65 && z == 2 {
+                STONE
+            } else {
+                AIR
+            }
+        });
+        for (face, target) in [
+            (Face::Down, [0, 64, 2]),
+            (Face::Up, [0, 66, 2]),
+            (Face::North, [0, 65, 1]),
+            (Face::South, [0, 65, 3]),
+            (Face::West, [-1, 65, 2]),
+            (Face::East, [1, 65, 2]),
+        ] {
+            let aim = Aim {
+                x: 0,
+                y: 65,
+                z: 2,
+                face,
+                hit: [0.5, 65.5, 2.0],
+            };
+            assert_eq!(
+                placement(&WorldView(&world), &aim).map(|placed| placed.target),
+                Some(target),
+                "the {face:?} neighbour"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaceable_aimed_block_is_replaced_in_place() {
+        // The other half of the same rule (`item/ItemBlock.java:43-45`): tall
+        // grass answers `isReplaceable` true (`BlockTallGrass.java:49-52`,
+        // material `Material.vine`, `Material.java:16`) and water carries
+        // `MaterialLiquid`'s replaceable flag (`MaterialLiquid.java:8`), so
+        // the block lands in the aimed cell itself — which the landing check
+        // also passes, its material being replaceable.
+        let aim = Aim {
+            x: 0,
+            y: 65,
+            z: 2,
+            face: Face::North,
+            hit: [0.5, 65.5, 2.0],
+        };
+        for value in [TALL_GRASS, WATER] {
+            let world = world_of(|x, y, z| {
+                if x == 0 && y == 65 && z == 2 {
+                    value
+                } else {
+                    AIR
+                }
+            });
+            assert_eq!(
+                placement(&WorldView(&world), &aim).map(|placed| placed.target),
+                Some([0, 65, 2]),
+                "the aimed cell itself for {value:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_replaceable_set_is_the_materials_own() {
+        // The landing check `World.canBlockBePlaced` runs is the material's
+        // `isReplaceable` (`world/World.java:3153-3157`; the field is set by
+        // `Material.setReplaceable`, `Material.java:153-157`): true for
+        // `MaterialTransparent` — air and fire (`Material.java:5,19`;
+        // `MaterialTransparent.java:8`) — for `MaterialLiquid` — water and
+        // lava (`Material.java:9-10`; `MaterialLiquid.java:8`) — for
+        // `Material.vine` (`Material.java:16`), which the covered plants
+        // carry (`BlockTallGrass.java:30`, `BlockDeadBush.java:21`,
+        // `BlockDoublePlant.java:34`), and for the four liquid ids the ray
+        // passes but a placement can overwrite.
+        for value in [
+            AIR,
+            8 << 4,
+            WATER,
+            10 << 4,
+            LAVA,
+            TALL_GRASS,
+            DEAD_BUSH,
+            DOUBLE_PLANT_GRASS,
+            DOUBLE_PLANT_FERN,
+        ] {
+            assert!(replaceable(value), "{value:#06x} is replaceable");
+        }
+        // False for `Material.plants` — the flower and crop family, which
+        // does not set the flag (`Material.java:15`) — for the rock and wood
+        // families, and for the double plant's rose half, which
+        // `BlockDoublePlant` overrides away (`:69-81`).
+        for value in [
+            STONE,
+            3 << 4,
+            FLOWER,
+            39 << 4,
+            59 << 4,
+            83 << 4,
+            SLAB,
+            FENCE,
+            50 << 4,
+            DOUBLE_PLANT_ROSE,
+        ] {
+            assert!(!replaceable(value), "{value:#06x} is not replaceable");
+        }
+        // The values outside the covered set carry no table row, so this
+        // client refuses to replace them: the snow layer's material and the
+        // vine block's are replaceable in the source, fire's too, but nothing
+        // the table cannot vouch for is overwritten blind.
+        for value in [SNOW_LAYER, 106 << 4, FIRE] {
+            assert!(
+                !replaceable(value),
+                "{value:#06x} is outside the covered set"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_bytes_scale_each_hit_fraction_through_sixteen() {
+        // `C08PacketPlayerBlockPlacement.writePacketData` writes
+        // `(int)(facing * 16.0F)` per axis, each fraction taken from the hit
+        // point minus the aimed cell's coordinate (`PlayerControllerMP.java`
+        // `:395-397`'s `f`, `f1`, `f2`; `:60-62`'s casts, truncating toward
+        // zero).
+        let north = Aim {
+            x: 0,
+            y: 65,
+            z: 2,
+            face: Face::North,
+            hit: [0.5, 65.62, 2.0],
+        };
+        assert_eq!(
+            placement_cursor(&north),
+            [8, 9, 0],
+            "the fractions (0.5, 0.62, 0.0)"
+        );
+        // A hit on the cell's far plane carries a fraction of exactly 1 on
+        // that axis and writes 16: unclamped, and the source's own value.
+        let far_plane = Aim {
+            x: 0,
+            y: 65,
+            z: 2,
+            face: Face::East,
+            hit: [1.0, 65.62, 2.5],
+        };
+        assert_eq!(placement_cursor(&far_plane), [16, 9, 8], "a face-exact hit");
+        // The floor hit a downward aim meets: the top face's hit at y 64.0
+        // over the cell at y 63 has the fraction 1.0 on y.
+        let floor = Aim {
+            x: 0,
+            y: 63,
+            z: 2,
+            face: Face::Up,
+            hit: [0.5, 64.0, 2.1200000000000045],
+        };
+        assert_eq!(placement_cursor(&floor), [8, 16, 1], "the floor's top face");
+    }
+
+    #[test]
+    fn a_target_that_cannot_accept_the_block_refuses_the_placement() {
+        // The aimed stone's north neighbour is stone too: the landing check
+        // (`World.canBlockBePlaced`'s material clause, `:3153-3157`) refuses,
+        // and the client keeps the packet (`PlayerControllerMP.java:417-421`
+        // returns false before it).
+        let blocked = world_of(|x, y, z| {
+            if x == 0 && y == 65 && (z == 1 || z == 2) {
+                STONE
+            } else {
+                AIR
+            }
+        });
+        let aim = Aim {
+            x: 0,
+            y: 65,
+            z: 2,
+            face: Face::North,
+            hit: [0.5, 65.5, 2.0],
+        };
+        assert_eq!(
+            placement(&WorldView(&blocked), &aim),
+            None,
+            "the occupied neighbour"
+        );
+        // The target must lie inside the world's build range, 0 through 255:
+        // the highest cell's up neighbour is y 256 and the lowest cell's down
+        // neighbour is -1.
+        let top = world_of(|x, y, z| {
+            if x == 0 && y == 255 && z == 2 {
+                STONE
+            } else {
+                AIR
+            }
+        });
+        let up = Aim {
+            x: 0,
+            y: 255,
+            z: 2,
+            face: Face::Up,
+            hit: [0.5, 255.5, 2.0],
+        };
+        assert_eq!(
+            placement(&WorldView(&top), &up),
+            None,
+            "y 256 leaves the range"
+        );
+        let bottom = world_of(|x, y, z| {
+            if x == 0 && y == 0 && z == 2 {
+                STONE
+            } else {
+                AIR
+            }
+        });
+        let down = Aim {
+            x: 0,
+            y: 0,
+            z: 2,
+            face: Face::Down,
+            hit: [0.5, 0.5, 2.0],
+        };
+        assert_eq!(
+            placement(&WorldView(&bottom), &down),
+            None,
+            "y -1 leaves the range"
+        );
+    }
+
+    #[test]
+    fn a_placement_carries_the_packets_own_facts() {
+        // The source builds the packet from the frame's hit result — the
+        // aimed position and the side (`PlayerControllerMP.java:424`'s
+        // `hitPos` and `side.getIndex()`) and the three fractions
+        // (`:395-397`) — and predicts the block at the cell `onItemUse`
+        // writes.
+        let world = world_of(|x, y, z| {
+            if x == 0 && y == 65 && z == 2 {
+                STONE
+            } else {
+                AIR
+            }
+        });
+        let aim = Aim {
+            x: 0,
+            y: 65,
+            z: 2,
+            face: Face::North,
+            hit: [0.5, 65.62, 2.0],
+        };
+        assert_eq!(
+            placement(&WorldView(&world), &aim),
+            Some(Placement {
+                x: 0,
+                y: 65,
+                z: 2,
+                face: Face::North,
+                cursor: [8, 9, 0],
+                target: [0, 65, 1],
+            })
+        );
     }
 
     #[test]
