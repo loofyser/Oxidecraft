@@ -410,9 +410,11 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M3 is complete and tagged; milestone M4 (spec section 13: entities and chat) is the live
-milestone. The M4 plan is not yet written — the next step is authoring it from the spec's M4 row
-plus the ordered backlog below, reviewed and approved by the owner, then executing it task by task
-in the established loop. The M3 close handoff is `docs/handoff/2026-10-04-m3-close.md`.
+milestone. The M4 plan is written and approved: `docs/plans/2026-10-04-m4-entities-and-chat.md`
+(twenty-three tasks; independently reviewed, all review findings folded and re-verified; owner
+approved 2026-10-04 with all three open questions answered as recommended). Execution starts on the
+owner's explicit go, task by task in the established loop. The M3 close handoff is
+`docs/handoff/2026-10-04-m3-close.md`.
 
 The ordered M4 backlog (from the M3 final review's triage and carry-forward; the full list is
 `refs/m3-final-review/deferred-list.md`, each item triaged safe-to-leave in
