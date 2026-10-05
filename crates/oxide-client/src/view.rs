@@ -17,7 +17,9 @@ use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
 use oxide_game::session::ClientEvent;
 use oxide_render::entity_models::player::CapeMotion;
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
-use oxide_render::entity_pass::{DrawExtra, EntityDraw, FrameContent, ModelRef, TextureRef};
+use oxide_render::entity_pass::{
+    DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, TextureRef,
+};
 use oxide_world::entity::EntityKind;
 
 use crate::items;
@@ -421,6 +423,9 @@ fn draw_for(
         hurt,
         death,
         health: frame.health,
+        // The frame carries the composed text the session resolved; a frame without a name
+        // leaves the field empty and the pass writes nothing.
+        nametag: frame.nametag.clone().map(|text| NametagDraw { text }),
         extra: draw_extra,
     })
 }
@@ -853,11 +858,12 @@ mod tests {
     use std::time::Duration;
 
     use oxide_assets::skins::DefaultModel;
+
     use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
     use oxide_proto_v47::entity::MetadataItem;
     use oxide_render::entity_models::PoseExtra;
     use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
-    use oxide_render::entity_pass::{FrameContent, ModelRef, TextureRef};
+    use oxide_render::entity_pass::{FrameContent, ModelRef, NametagDraw, TextureRef};
     use oxide_world::entity::EntityKind;
 
     /// The uuid whose default model the rule calls wide (its last bit is zero).
@@ -965,6 +971,25 @@ mod tests {
                 slim: true
             }
         );
+    }
+
+    #[test]
+    fn a_frames_nametag_maps_onto_the_draw_and_an_absent_one_stays_none() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        let mut named = player_frame(8, UUID_SLIM);
+        named.nametag = Some(Arc::from("Notch"));
+        view.observe(vec![named], t0);
+        assert_eq!(
+            draws_at(&view, t0, TICK / 2)[0].nametag,
+            Some(NametagDraw {
+                text: Arc::from("Notch")
+            })
+        );
+        // A frame without a name leaves the draw's field empty.
+        let plain = player_frame(8, UUID_SLIM);
+        view.observe(vec![plain], t0);
+        assert_eq!(draws_at(&view, t0, TICK / 2)[0].nametag, None);
     }
 
     #[test]

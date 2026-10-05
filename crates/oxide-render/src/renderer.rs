@@ -382,12 +382,16 @@ impl Renderer {
             .set_atlas(&self.device, &self.queue, atlas);
     }
 
-    /// Uploads the ascii font sheet the debug overlay draws with.
+    /// Uploads the ascii font sheet the debug overlay and the entity pass's nametags draw
+    /// with.
     ///
     /// The overlay measures the sheet as it uploads it, so the layout's widths and the
-    /// sampled texels cannot disagree; until this is called the overlay draws nothing. A
-    /// sheet that is not a 16x16 grid is [`FontError`] and the previous font stays.
+    /// sampled texels cannot disagree; until this is called the overlay draws nothing and a
+    /// nametag has no glyphs to measure. A sheet that is not a 16x16 grid is [`FontError`]
+    /// and the previous font stays on both passes.
     pub fn set_font(&mut self, sheet: &Texture) -> Result<(), FontError> {
+        self.entity_pass
+            .set_font(&self.device, &self.queue, sheet)?;
         self.overlay.set_font(&self.device, &self.queue, sheet)
     }
 

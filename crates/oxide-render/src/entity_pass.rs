@@ -36,12 +36,14 @@ use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Vec3};
 use oxide_assets::atlas::missing_pixels;
+use oxide_assets::font::{Font, FontError};
 use oxide_assets::texture::Texture;
 
 use crate::camera::{Camera, render_eye};
 use crate::entity_models::{self, PoseExtra, build_vertices, player};
 use crate::fog::FogParams;
 use crate::terrain_pass::{color_target, depth_state, primitive_state};
+use crate::text::{self, TextBuilder};
 
 /// The model a draw uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,8 +517,24 @@ pub struct EntityDraw {
     pub death: f32,
     /// The health pair for the kinds whose maximum is known, in hearts.
     pub health: Option<(f32, f32)>,
+    /// The composed nametag the draw may show, when the session resolved one.
+    pub nametag: Option<NametagDraw>,
     /// The kind's own extras.
     pub extra: DrawExtra,
+}
+
+/// The composed nametag a draw may show: the session's display text, its `§` runs included.
+///
+/// The session resolves the "name may show" terms it can see — the invisibility flag, the
+/// ridden reverse lookup, the player list and teams (`oxide-game`'s `entity_view`); the
+/// draw-side residue the source's `renderName` still holds is the distance rule
+/// ([`nametag_visible`]) here, while the GUI-enabled flag, the camera-entity self-exclusion
+/// and the pointed-entity term are not modelled by the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NametagDraw {
+    /// The composed display text, legacy `§` codes included
+    /// (`Entity.getDisplayName().getFormattedText()`, `RendererLivingEntity.java`:503).
+    pub text: Arc<str>,
 }
 
 /// A registered entity texture: the GPU texture and the bind group the pass samples through.
@@ -861,6 +879,111 @@ fn upload_texture(
     }
 }
 
+/// The tag's anchor above a draw's feet: the interpolated feet position raised by the kind's
+/// height plus a half block, less a child's own half height — the source's
+/// `translate(x, y + height + 0.5, z)` (`Render.renderLivingLabel`, `Render.java`:342),
+/// where the standing path has already subtracted the child's half height at the call site
+/// (`RendererLivingEntity.java`:541); the sneaking branch's own translate carries the term
+/// inline (`RendererLivingEntity.java`:511).
+///
+/// The kind's own height is the model registry's ([`entity_models::height`]).
+fn nametag_anchor(draw: &EntityDraw) -> Vec3 {
+    let height = entity_models::height(draw.model);
+    let child = if draw.pose.child { height / 2.0 } else { 0.0 };
+    Vec3::new(
+        draw.position[0] as f32,
+        draw.position[1] as f32 + height + 0.5 - child,
+        draw.position[2] as f32,
+    )
+}
+
+/// The billboard chain a tag draws through: the anchor's translation, the negation of the
+/// source's `playerViewY` about y, its `playerViewX` about x and the `-f1, -f1, f1` flip
+/// (`Render.renderLivingLabel`, `Render.java`:344-346; `RendererLivingEntity.renderName`,
+/// `RendererLivingEntity.java`:513-515), with the sneaking branch's own lift appended inside
+/// the scaled frame (`RendererLivingEntity.java`:516).
+///
+/// `view_y` is the camera's yaw plus 180 and `view_x` its pitch — the source's
+/// `playerViewY`/`playerViewX` (`RenderManager.java`:260-266), the same pair
+/// [`entity_models::objects::billboard_angles`] takes.
+fn nametag_chain(anchor: Vec3, view_y: f32, view_x: f32, sneaking: bool) -> Mat4 {
+    let mut chain = Mat4::from_translation(anchor)
+        * Mat4::from_rotation_y((-view_y).to_radians())
+        * Mat4::from_rotation_x(view_x.to_radians())
+        * Mat4::from_scale(Vec3::new(-NAMETAG_SCALE, -NAMETAG_SCALE, NAMETAG_SCALE));
+    if sneaking {
+        chain *= Mat4::from_translation(Vec3::new(0.0, NAMETAG_SNEAK_LIFT, 0.0));
+    }
+    chain
+}
+
+/// Whether the distance rule lets a draw's tag show: `d0 < f * f` with the range 64 standing
+/// or 32 while sneaking, both squared in f32 and the test strict
+/// (`RendererLivingEntity.renderName`, `RendererLivingEntity.java`:498-501). The squared
+/// distance is the raw squares of the feet offsets in double (`Entity.getDistanceSqToEntity`,
+/// `Entity.java`:1360-1366).
+fn nametag_visible(draw: &EntityDraw, view: [f64; 3]) -> bool {
+    let range = if draw.pose.sneak {
+        NAMETAG_SNEAKING_RANGE
+    } else {
+        NAMETAG_STANDING_RANGE
+    };
+    let dx = draw.position[0] - view[0];
+    let dy = draw.position[1] - view[1];
+    let dz = draw.position[2] - view[2];
+    let squared = dx * dx + dy * dy + dz * dz;
+    squared < f64::from(range * range)
+}
+
+/// The label pipelines' depth state: the world pass's own compare, with `always` replacing it
+/// for the passes the source runs with the depth test off.
+fn depth_state_with(compare: wgpu::CompareFunction, write: bool) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_compare: compare,
+        ..depth_state(write)
+    }
+}
+
+/// The four label pipelines, built once with the pass.
+struct NametagPipelines {
+    /// The text, depth-tested with writes on: the standing path's solid copy and the
+    /// sneaking path's faint copy.
+    text: wgpu::RenderPipeline,
+    /// The text with the depth test off: the standing path's faint copy.
+    text_through: wgpu::RenderPipeline,
+    /// The box, depth-tested with writes masked: the sneaking path's box.
+    background: wgpu::RenderPipeline,
+    /// The box with the depth test off: the standing path's box.
+    background_through: wgpu::RenderPipeline,
+}
+
+/// The nametag font: the sheet's measured metrics and its uploaded binding.
+struct NametagFont {
+    /// The measured glyph metrics.
+    font: Font,
+    /// The sheet's size in texels, for the glyph uvs.
+    sheet_size: (u32, u32),
+    /// The uploaded sheet and the bind group the label pipelines sample.
+    sheet: RegisteredTexture,
+}
+
+/// One nametag range and the kind of pipeline it draws through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagPass {
+    /// The background box: the bare colour, untextured.
+    Background {
+        /// Whether the depth test is off — the standing path's box runs with it off, the
+        /// sneaking path's with it on (`Render.java`:349 / `RendererLivingEntity.java`:518).
+        through: bool,
+    },
+    /// A text pass: the glyph sheet.
+    Text {
+        /// Whether the depth test is off — the standing path's faint copy is the one the
+        /// source draws between `disableDepth` and `enableDepth` (`Render.java`:349-371).
+        through: bool,
+    },
+}
+
 /// The entity pass: its three pipelines, the frame uniforms they read, and the vertex buffer
 /// the frame's geometry is uploaded into.
 pub struct EntityPass {
@@ -898,6 +1021,19 @@ pub struct EntityPass {
     view_yaw: f32,
     /// The camera's pitch in degrees, the source's `playerViewX`.
     view_pitch: f32,
+    /// The camera's feet position, the render-view entity's origin for the nametag's
+    /// distance rule.
+    view_position: [f64; 3],
+    /// The nametag font: its measured metrics and uploaded sheet, once [`EntityPass::set_font`]
+    /// gave one.
+    nametag_font: Option<NametagFont>,
+    /// The label pipelines: the text and the background, each in a depth-tested and a
+    /// depth-through variant.
+    nametag_pipelines: NametagPipelines,
+    /// The texture group's layout, kept to build the nametag font's bind group.
+    texture_layout: wgpu::BindGroupLayout,
+    /// The sampler the nametag font's bind group binds.
+    sampler: wgpu::Sampler,
 }
 
 impl EntityPass {
@@ -972,7 +1108,7 @@ impl EntityPass {
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
                     }),
                     primitive: primitive_state(cull),
-                    depth_stencil: Some(depth_state(plan.depth_write)),
+                    depth_stencil: Some(depth_state_with(plan.compare, plan.depth_write)),
                     multisample: wgpu::MultisampleState::default(),
                     multiview: None,
                     cache: None,
@@ -984,6 +1120,7 @@ impl EntityPass {
             PipelinePlan {
                 blend: None,
                 depth_write: true,
+                compare: wgpu::CompareFunction::LessEqual,
             },
             None,
         );
@@ -993,6 +1130,7 @@ impl EntityPass {
             PipelinePlan {
                 blend: None,
                 depth_write: true,
+                compare: wgpu::CompareFunction::LessEqual,
             },
             None,
         );
@@ -1002,6 +1140,7 @@ impl EntityPass {
             PipelinePlan {
                 blend: Some(shadow_blend()),
                 depth_write: false,
+                compare: wgpu::CompareFunction::LessEqual,
             },
             Some(wgpu::Face::Back),
         );
@@ -1011,6 +1150,7 @@ impl EntityPass {
             PipelinePlan {
                 blend: Some(additive_blend()),
                 depth_write: true,
+                compare: wgpu::CompareFunction::LessEqual,
             },
             None,
         );
@@ -1020,9 +1160,60 @@ impl EntityPass {
             PipelinePlan {
                 blend: Some(alpha_blend()),
                 depth_write: true,
+                compare: wgpu::CompareFunction::LessEqual,
             },
             None,
         );
+        // The label's four pipelines: `Render.renderLivingLabel` disables the depth test
+        // and masks the writes for the box and the faint pass (`Render.java`:348-349) and
+        // re-enables both before the solid pass (`Render.java`:371-372); the sneaking
+        // branch keeps the test on, masking the writes alone
+        // (`RendererLivingEntity.java`:518, `:532`). The blend is one
+        // `tryBlendFuncSeparate(770, 771, 1, 0)` for every part (`Render.java`:351,
+        // `RendererLivingEntity.java`:521), the same pair the shadow uses.
+        let nametag_pipelines = NametagPipelines {
+            text: pipeline(
+                "oxide nametag text pipeline",
+                FRAGMENT_TAG_TEXT,
+                PipelinePlan {
+                    blend: Some(shadow_blend()),
+                    depth_write: true,
+                    compare: wgpu::CompareFunction::LessEqual,
+                },
+                None,
+            ),
+            text_through: pipeline(
+                "oxide nametag text through pipeline",
+                FRAGMENT_TAG_TEXT,
+                PipelinePlan {
+                    blend: Some(shadow_blend()),
+                    depth_write: false,
+                    compare: wgpu::CompareFunction::Always,
+                },
+                None,
+            ),
+            background: pipeline(
+                "oxide nametag background pipeline",
+                FRAGMENT_TAG_BACKGROUND,
+                PipelinePlan {
+                    blend: Some(shadow_blend()),
+                    depth_write: false,
+                    compare: wgpu::CompareFunction::LessEqual,
+                },
+                None,
+            ),
+            background_through: pipeline(
+                "oxide nametag background through pipeline",
+                FRAGMENT_TAG_BACKGROUND,
+                PipelinePlan {
+                    blend: Some(shadow_blend()),
+                    depth_write: false,
+                    compare: wgpu::CompareFunction::Always,
+                },
+                None,
+            ),
+        };
+        let sampler = device.create_sampler(&texture_sampler_descriptor());
         let vertex_capacity = INITIAL_VERTEX_BYTES;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxide entity vertices"),
@@ -1047,6 +1238,11 @@ impl EntityPass {
             block_cache: BlockItemCache::new(),
             view_yaw: 0.0,
             view_pitch: 0.0,
+            view_position: [0.0; 3],
+            nametag_font: None,
+            nametag_pipelines,
+            texture_layout: texture_layout.clone(),
+            sampler,
         }
     }
 
@@ -1069,12 +1265,41 @@ impl EntityPass {
         self.camera_set = true;
         self.view_yaw = camera.pose.yaw;
         self.view_pitch = camera.pose.pitch;
+        self.view_position = camera.pose.position;
     }
 
     /// Gives the pass the item meshes its object draws read: the client's own atlas and
     /// model tables, reached through [`ItemMeshSource`] so this crate names neither.
     pub fn set_item_source(&mut self, source: Arc<dyn ItemMeshSource>) {
         self.item_source = Some(source);
+    }
+
+    /// Gives the pass the font its nametags measure and sample: the same sheet the text
+    /// overlay takes.
+    ///
+    /// A sheet that is not a 16x16 grid of 8x8 cells is [`FontError`] and the previous font,
+    /// if any, stays put.
+    pub fn set_font(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sheet: &Texture,
+    ) -> Result<(), FontError> {
+        let font = Font::load(sheet, None)?;
+        let registered = upload_texture(
+            device,
+            queue,
+            "oxide nametag font",
+            sheet,
+            &self.texture_layout,
+            &self.sampler,
+        );
+        self.nametag_font = Some(NametagFont {
+            font,
+            sheet_size: (sheet.width, sheet.height),
+            sheet: registered,
+        });
+        Ok(())
     }
 
     /// Writes the frame's fog for the frames that follow.
@@ -1150,6 +1375,30 @@ impl EntityPass {
                     }
                 }
             }
+            // The nametag draws after the layers and before the shadow: the living renderer
+            // reaches `renderName` at its own tail (`RendererLivingEntity.java`:195-198
+            // through `Render.doRender`:54-57), and the shadow follows after the whole
+            // entity in `RenderManager.doRenderEntity`:386-389. The ranges are built in the
+            // source's order — the box, then the faint pass, then the solid one.
+            if let Some(font) = &self.nametag_font {
+                for (range, kind) in &geometry.nametag {
+                    let pipeline = match kind {
+                        TagPass::Background { through: true } => {
+                            &self.nametag_pipelines.background_through
+                        }
+                        TagPass::Background { through: false } => {
+                            &self.nametag_pipelines.background
+                        }
+                        TagPass::Text { through: true } => &self.nametag_pipelines.text_through,
+                        TagPass::Text { through: false } => &self.nametag_pipelines.text,
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                    pass.set_bind_group(1, &font.sheet.bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    pass.draw(range.clone(), 0..1);
+                }
+            }
             // The shadow draws last: `RenderManager.renderEntity` draws it after the entity
             // (`RenderManager.java:388`), through the shared shadow sprite.
             if let Some(range) = &geometry.shadow {
@@ -1178,6 +1427,7 @@ impl EntityPass {
             body: 0..0,
             layers: Vec::new(),
             cape: None,
+            nametag: Vec::new(),
             hurt: draw.hurt > 0.0 || draw.death > 0.0,
         };
 
@@ -1268,7 +1518,112 @@ impl EntityPass {
                 }
             }
         }
+
+        // The nametag: the source draws it after the model and its layers, before the
+        // shadow (`RendererLivingEntity.java`:195-198, `RenderManager.java`:386-389).
+        self.build_nametag(draw, vertices, &mut built);
+
         built
+    }
+
+    /// Builds one draw's nametag into `vertices`: the background box, then the text passes,
+    /// all through the source's billboard chain — when the draw carries one, the pass has a
+    /// font and the distance rule lets it draw.
+    fn build_nametag(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+    ) {
+        let Some(nametag) = &draw.nametag else {
+            return;
+        };
+        let Some(font) = &self.nametag_font else {
+            return;
+        };
+        if !nametag_visible(draw, self.view_position) {
+            return;
+        }
+        let width = text::string_width(&font.font, &nametag.text);
+        let half = width / 2;
+        let chain = nametag_chain(
+            nametag_anchor(draw),
+            self.view_yaw + 180.0,
+            self.view_pitch,
+            draw.pose.sneak,
+        );
+        // The deadmau5 term: the standing path lifts that exact name ten font pixels
+        // (`Render.java`:356-359); the sneaking branch draws at zero.
+        let lift = if !draw.pose.sneak && nametag.text.as_ref() == "deadmau5" {
+            NAMETAG_DEADMAU5_LIFT
+        } else {
+            0.0
+        };
+        // The background box: `[-half - 1, half + 1]` across and `[-1, 8]` tall in font
+        // pixels, black at 0.25, on the source's own quad order (`Render.java`:364-367;
+        // sneak `RendererLivingEntity.java`:526-529). The centring is Java's integer
+        // division of the width, computed at both sites (`Render.java`:361, `:370`).
+        let text_x = ((-width) / 2) as f32;
+        let corners = [
+            [-(half as f32) - 1.0, -1.0 + lift],
+            [-(half as f32) - 1.0, 8.0 + lift],
+            [half as f32 + 1.0, 8.0 + lift],
+            [half as f32 + 1.0, -1.0 + lift],
+        ];
+        let start = vertices.len() as u32;
+        for corner in [0, 1, 2, 0, 2, 3] {
+            let position =
+                chain.transform_point3(Vec3::new(corners[corner][0], corners[corner][1], 0.0));
+            vertices.push(EntityVertex {
+                position: position.into(),
+                uv: [0.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                colour: NAMETAG_BACKGROUND,
+            });
+        }
+        built.nametag.push((
+            start..vertices.len() as u32,
+            TagPass::Background {
+                through: !draw.pose.sneak,
+            },
+        ));
+        // The text passes: the standing path's faint copy then its solid one
+        // (`Render.java`:370-373), the sneaking path's single faint copy
+        // (`RendererLivingEntity.java`:533). The composed text goes through the shared
+        // builder at full brightness — the label path disables lighting — with the `§`
+        // runs decoded.
+        let passes: &[([f32; 4], bool)] = if draw.pose.sneak {
+            &[([1.0, 1.0, 1.0, NAMETAG_FAINT_ALPHA], false)]
+        } else {
+            &[
+                ([1.0, 1.0, 1.0, NAMETAG_FAINT_ALPHA], true),
+                (NAMETAG_SOLID, false),
+            ]
+        };
+        for (colour, through) in passes {
+            let mut builder = TextBuilder::new();
+            builder.push(&nametag.text, [text_x, lift, 0.0], 1.0, *colour, false);
+            let (glyphs, indices) = builder.geometry(&font.font, font.sheet_size);
+            let start = vertices.len() as u32;
+            for index in indices {
+                let glyph = glyphs[index as usize];
+                let position = chain.transform_point3(Vec3::new(
+                    glyph.position[0],
+                    glyph.position[1],
+                    glyph.position[2],
+                ));
+                vertices.push(EntityVertex {
+                    position: position.into(),
+                    uv: glyph.uv,
+                    normal: [0.0, 1.0, 0.0],
+                    colour: glyph.colour,
+                });
+            }
+            built.nametag.push((
+                start..vertices.len() as u32,
+                TagPass::Text { through: *through },
+            ));
+        }
     }
 }
 
@@ -1771,6 +2126,9 @@ struct BuiltDraw {
     layers: Vec<(Range<u32>, &'static str, entity_models::layers::Blend)>,
     /// The cape's range, when both the bit and a texture are present.
     cape: Option<Range<u32>>,
+    /// The nametag's ranges in the source's draw order — the box, then the text passes —
+    /// each with the pipeline kind it draws through.
+    nametag: Vec<(Range<u32>, TagPass)>,
     /// Whether the hurt combine draws over the body.
     hurt: bool,
 }
@@ -1984,6 +2342,9 @@ struct PipelinePlan {
     blend: Option<wgpu::BlendState>,
     /// Whether the pipeline writes the depth buffer.
     depth_write: bool,
+    /// The depth compare: the world pass's `LessEqual`, or `Always` for the passes the
+    /// source runs with the depth test off.
+    compare: wgpu::CompareFunction,
 }
 
 /// The shadow's blend: source alpha over one-minus-source alpha, the alpha channel kept
@@ -2055,6 +2416,12 @@ const FRAGMENT_HURT: &str = "fs_hurt";
 /// The shadow fragment.
 const FRAGMENT_SHADOW: &str = "fs_shadow";
 
+/// The nametag text fragment: the lit-less glyph sheet.
+const FRAGMENT_TAG_TEXT: &str = "fs_tag_text";
+
+/// The nametag background fragment: the bare colour.
+const FRAGMENT_TAG_BACKGROUND: &str = "fs_tag_background";
+
 /// The alpha below which the model and hurt fragments discard: the client's own tenth.
 const CUTOUT_ALPHA: f32 = 0.1;
 
@@ -2078,6 +2445,37 @@ const SHADOW_FADE_DISTANCE: f32 = 256.0;
 /// How far above the feet the shadow quad lies, in blocks (`Render.renderShadowBlock`:
 /// `pos.getY() + blockBounds + dy + 0.015625`).
 const SHADOW_LIFT: f32 = 0.015625;
+
+/// The nametag's scale, in blocks per font pixel: `0.016666668F * 1.6F` (`Render.java`:339-340)
+/// is the f32 0.0266666691750288 (bits `0x3CDA740F`), which the sneaking branch's own literal
+/// `0.02666667F` parses to exactly (`RendererLivingEntity.java`:515).
+const NAMETAG_SCALE: f32 = 0.016666668 * 1.6;
+
+/// The nametag's standing range in blocks (`RendererLivingEntity.java`:499); the rule squares
+/// it in f32 and tests strict (`:501`).
+const NAMETAG_STANDING_RANGE: f32 = 64.0;
+
+/// The nametag's sneaking range in blocks (`RendererLivingEntity.java`:499).
+const NAMETAG_SNEAKING_RANGE: f32 = 32.0;
+
+/// The background box's colour: black at alpha 0.25 (`Render.java`:364-367; sneak
+/// `RendererLivingEntity.java`:526-529).
+const NAMETAG_BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 0.25];
+
+/// The faint text pass's alpha: the source's colour `553648127` = `0x20FFFFFF`, 32/255
+/// (`Render.java`:370; sneak `RendererLivingEntity.java`:533).
+const NAMETAG_FAINT_ALPHA: f32 = 32.0 / 255.0;
+
+/// The solid text pass's colour: `-1` = `0xFFFFFFFF` (`Render.java`:373).
+const NAMETAG_SOLID: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// The sneaking tag's own lift, in font pixels (`RendererLivingEntity.java`:516): the f32
+/// `9.374999 * -NAMETAG_SCALE` is exactly -0.25 — a quarter block down the tag's own axis.
+const NAMETAG_SNEAK_LIFT: f32 = 9.374999;
+
+/// The deadmau5 term: the standing tag shifts ten font pixels up for that exact name
+/// (`Render.java`:356-359); the sneaking branch has no such term.
+const NAMETAG_DEADMAU5_LIFT: f32 = -10.0;
 
 /// The first vertex buffer's capacity in bytes.
 const INITIAL_VERTEX_BYTES: usize = 1024 * 48;
@@ -2177,6 +2575,26 @@ fn fs_shadow(input: VertexOutput) -> @location(0) vec4<f32> {{
     let colour = vec4<f32>(texel.rgb * input.colour.rgb, texel.a * input.colour.a);
     return fogged(colour, input.distance);
 }}
+
+// The label's background: the bare vertex colour, untextured — the source disables the
+// texture for the box and restores it after (`Render.java`:362-369) — with the fog.
+@fragment
+fn fs_tag_background(input: VertexOutput) -> @location(0) vec4<f32> {{
+    return fogged(input.colour, input.distance);
+}}
+
+// The label's text: the sheet's texel times the run's colour, unlit — the label path
+// disables lighting (`Render.java`:347) — with the client's alpha test and the fog. The
+// test's tenth is set for both label branches (`RendererLivingEntity.java`:505).
+@fragment
+fn fs_tag_text(input: VertexOutput) -> @location(0) vec4<f32> {{
+    let texel = textureSample(entity, entity_sampler, input.uv);
+    let colour = vec4<f32>(texel.rgb * input.colour.rgb, texel.a * input.colour.a);
+    if (colour.a < CUTOUT_ALPHA) {{
+        discard;
+    }}
+    return fogged(colour, input.distance);
+}}
 "#
     )
 }
@@ -2220,6 +2638,7 @@ mod tests {
             hurt: 0.0,
             death: 0.0,
             health: None,
+            nametag: None,
             extra: DrawExtra::None,
         }
     }
@@ -2645,6 +3064,7 @@ mod tests {
     #[test]
     fn the_dropped_stack_composes_the_sources_scale_and_arrangement() {
         let block_draw = EntityDraw {
+            nametag: None,
             model: ModelRef::BlockItem { block: 1 },
             position: [0.0, 0.0, 0.0],
             body_yaw: 0.0,
@@ -2705,5 +3125,117 @@ mod tests {
                 < 1.0e-6,
             "the flat copies keep the z-step: {flat_step:?}"
         );
+    }
+
+    #[test]
+    fn the_nametag_scale_is_the_sources_f32_product() {
+        // `0.016666668F * 1.6F` in f32: the bits 0x3cda740f, which the sneaking branch's
+        // own literal `0.02666667F` parses to exactly (`RendererLivingEntity.java`:515
+        // against `Render.java`:339-340).
+        assert_eq!(NAMETAG_SCALE.to_bits(), 0x3cda_740f);
+        assert_eq!(NAMETAG_SCALE, 0.02666667_f32);
+        assert_eq!(9.0 * NAMETAG_SCALE, 0.24000002);
+        assert_eq!(8.0 * NAMETAG_SCALE, 0.21333335);
+        // The lift the sneaking branch chose is a quarter block in the scaled frame.
+        assert_eq!(NAMETAG_SNEAK_LIFT * -NAMETAG_SCALE, -0.25);
+    }
+
+    #[test]
+    fn the_nametag_chain_maps_the_font_frame_at_known_camera_angles() {
+        // The font frame: +u is the text's right and +v its down, in font pixels; the
+        // chain scales both by NAMETAG_SCALE and flips them into the world. `view_y` is
+        // the source's playerViewY -- the camera's yaw plus 180 (`RenderManager.java`:260-266).
+        let anchor = Vec3::new(1.0, 2.3, -4.0);
+        let point = |chain: Mat4, u: f32, v: f32| chain.transform_point3(Vec3::new(u, v, 0.0));
+        let scale = NAMETAG_SCALE;
+        // playerViewY 0 (a camera at yaw 180): local +u maps to -x and local +v to -y --
+        // the text reads left to right and hangs below the anchor.
+        let chain = nametag_chain(anchor, 0.0, 0.0, false);
+        assert!(close(point(chain, 0.0, 0.0).into(), [1.0, 2.3, -4.0]));
+        assert!(close(
+            point(chain, 10.0, 0.0).into(),
+            [1.0 - 10.0 * scale, 2.3, -4.0]
+        ));
+        assert!(close(
+            point(chain, 0.0, 8.0).into(),
+            [1.0, 2.3 - 8.0 * scale, -4.0]
+        ));
+        // The yaw turns the text with the camera: at playerViewY 90 it runs along -z, at
+        // 180 back along +x.
+        let chain = nametag_chain(anchor, 90.0, 0.0, false);
+        assert!(close(
+            point(chain, 10.0, 0.0).into(),
+            [1.0, 2.3, -4.0 - 10.0 * scale]
+        ));
+        let chain = nametag_chain(anchor, 180.0, 0.0, false);
+        assert!(close(
+            point(chain, 10.0, 0.0).into(),
+            [1.0 + 10.0 * scale, 2.3, -4.0]
+        ));
+        // The pitch tips it: at playerViewX 90 local +v goes down -z.
+        let chain = nametag_chain(anchor, 0.0, 90.0, false);
+        assert!(close(
+            point(chain, 0.0, 8.0).into(),
+            [1.0, 2.3, -4.0 - 8.0 * scale]
+        ));
+        // The sneaking lift is a quarter block along the tag's own +v, so the local origin
+        // sits a quarter block down the flipped axis and the text rides with it.
+        let chain = nametag_chain(anchor, 0.0, 0.0, true);
+        assert!(close(
+            point(chain, 0.0, 0.0).into(),
+            [1.0, 2.3 - 0.25, -4.0]
+        ));
+        assert!(close(
+            point(chain, 0.0, 8.0).into(),
+            [1.0, 2.3 - 0.25 - 8.0 * scale, -4.0]
+        ));
+    }
+
+    #[test]
+    fn the_nametag_gate_is_strict_at_sixty_four_and_thirty_two() {
+        let mut draw = player_draw();
+        let view = |distance: f64| [distance, 0.0, 0.0];
+        assert!(nametag_visible(&draw, view(63.999)), "just inside");
+        assert!(!nametag_visible(&draw, view(64.0)), "the test is strict");
+        assert!(nametag_visible(&draw, view(-63.999)));
+        draw.pose.sneak = true;
+        assert!(
+            nametag_visible(&draw, view(31.999)),
+            "just inside, sneaking"
+        );
+        assert!(!nametag_visible(&draw, view(32.0)));
+        // The rule is the squares of the feet offsets alone: a vertical offset can push it
+        // out at the same range.
+        draw.pose.sneak = false;
+        assert!(nametag_visible(&draw, [0.0, 63.9, 0.0]));
+        assert!(!nametag_visible(&draw, [0.0, 64.0, 0.0]));
+    }
+
+    #[test]
+    fn the_nametag_anchor_is_the_height_plus_a_half_and_a_child_drops_its_half() {
+        let mut draw = player_draw();
+        assert!(close(nametag_anchor(&draw).into(), [0.0, 2.3, 0.0]));
+        draw.model = ModelRef::Giant;
+        assert!(close(nametag_anchor(&draw).into(), [0.0, 11.3, 0.0]));
+        let mut child = player_draw();
+        child.model = ModelRef::Villager {
+            profession: 0,
+            child: true,
+        };
+        child.pose.child = true;
+        // The child's own half height comes off again: 0.9 + 0.5 - 0.45.
+        assert!(close(nametag_anchor(&child).into(), [0.0, 0.95, 0.0]));
+    }
+
+    #[test]
+    fn the_nametag_colours_are_the_sources_walk() {
+        // The box: black at a quarter alpha (`Render.java`:364-367).
+        assert_eq!(NAMETAG_BACKGROUND, [0.0, 0.0, 0.0, 0.25]);
+        // The faint pass: 553648127 = 0x20FFFFFF, 32/255 (`Render.java`:370).
+        assert_eq!(NAMETAG_FAINT_ALPHA, 32.0 / 255.0);
+        // The solid pass: -1 = 0xFFFFFFFF (`Render.java`:373).
+        assert_eq!(NAMETAG_SOLID, [1.0, 1.0, 1.0, 1.0]);
+        // The deadmau5 term: ten font pixels up (`Render.java`:356-359).
+        assert_eq!(NAMETAG_DEADMAU5_LIFT, -10.0);
     }
 }

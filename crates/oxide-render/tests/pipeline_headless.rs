@@ -61,7 +61,7 @@ use oxide_render::camera::{
 };
 use oxide_render::entity_models::{Pose, PoseExtra};
 use oxide_render::entity_pass::{
-    DrawExtra, EntityDraw, EntityPass, ModelRef, TextureRef, TextureRegistry,
+    DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw, TextureRef, TextureRegistry,
 };
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
@@ -2077,6 +2077,7 @@ fn player_at_origin(texture: TextureRef) -> EntityDraw {
         hurt: 0.0,
         death: 0.0,
         health: Some((20.0, 20.0)),
+        nametag: None,
         extra: DrawExtra::None,
     }
 }
@@ -2317,6 +2318,243 @@ fn the_death_tilt_lays_the_model_down() {
     );
 }
 
+/// A 128x128 synthetic ascii sheet: the `A` cell inks its left five columns over every
+/// row, so the font's scan measures six font pixels and the glyph covers most of its cell.
+fn nametag_sheet() -> Texture {
+    let mut rgba = vec![0u8; (128 * 128 * 4) as usize];
+    let code = 'A' as u32;
+    let (cell_x, cell_y) = ((code % 16) * 8, (code / 16) * 8);
+    for row in 0..8 {
+        for column in 0..=4 {
+            let offset = (((cell_y + row) * 128 + cell_x + column) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: 128,
+        height: 128,
+        rgba,
+    }
+}
+
+/// The player at the origin carrying the given nametag text.
+fn tagged(text: &str) -> EntityDraw {
+    EntityDraw {
+        nametag: Some(NametagDraw { text: text.into() }),
+        ..player_at_origin(TextureRef::Named("entity/test.png"))
+    }
+}
+
+/// The height the range cases aim at: the player's tag band, a touch under the anchor's
+/// `height + 0.5` = 2.3.
+const TAG_AIM_HEIGHT: f64 = 2.2;
+
+/// The range cases' camera: the entity camera's facing pulled back to `distance` blocks
+/// from the origin's feet and zoomed in to a two-degree field of view, so a tag at that
+/// range still covers whole fragments. The pose aims the view up at the tag's band
+/// (positive pitch looks down, [`CameraPose::forward`]).
+fn tag_camera(distance: f64) -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: [0.0, 1.06 - f64::from(EYE_HEIGHT), distance],
+            yaw: 180.0,
+            pitch: -((TAG_AIM_HEIGHT - 1.06) / distance).atan().to_degrees() as f32,
+        },
+        fov_degrees: 2.0,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
+}
+
+/// The nametag draws its box and its glyph above the model's head: the silhouette grows
+/// upwards, the solid pass lands near-white texels there, and the untagged frame at the
+/// same pose holds none of it.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_nametag_draws_its_text_above_the_entity() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = entity_registry(&device, &queue, [200, 90, 40, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    entities
+        .set_font(&device, &queue, &nametag_sheet())
+        .expect("the synthetic sheet loads");
+
+    let untagged = render_scene(&device, &queue, &target, &depth, |pass| {
+        let draw = player_at_origin(TextureRef::Named("entity/test.png"));
+        entities.draw(&device, pass, &[draw], &registry);
+    });
+    let with_tag = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, std::slice::from_ref(&tagged("A")), &registry);
+    });
+
+    let (_, body_top, _, _) = silhouette(&untagged);
+    let (_, tag_top, _, _) = silhouette(&with_tag);
+    assert!(
+        tag_top + 3 <= body_top,
+        "the tagged silhouette reaches above the body: body top {body_top}, tag top {tag_top}"
+    );
+    // The solid pass: at least one near-white pixel in the band above the body — the box
+    // alone washes black at a quarter alpha, which is darker than the sky, never white.
+    let bright = (0..body_top)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(&with_tag, x, y).iter().all(|channel| *channel >= 250))
+        .count();
+    assert!(
+        bright >= 1,
+        "the solid text pass lands near-white pixels above the body, got {bright}"
+    );
+    let changed = changed_pixels(&untagged, &with_tag);
+    eprintln!(
+        "near tag: {changed} changed pixels, body top {body_top}, tag top {tag_top}, \
+         {bright} near-white"
+    );
+    // Measured 16 changed pixels at the pinning run: the box's wash and the glyph.
+    assert!(
+        changed >= 8,
+        "the tag's box and glyph cover whole pixels, got {changed} changed"
+    );
+}
+
+/// The range rule: an in-range tag adds pixels over the untagged frame at the same pose,
+/// and one past the range adds none — 64 blocks standing, 32 sneaking, both the source's
+/// own constants (`RendererLivingEntity.java`:499).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_nametag_keeps_and_drops_at_its_ranges() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = entity_registry(&device, &queue, [200, 90, 40, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities
+        .set_font(&device, &queue, &nametag_sheet())
+        .expect("the synthetic sheet loads");
+
+    // The controls carry the same pose as the tagged draws, so the only difference
+    // between the pair is the tag itself — the sneak pose alone would crouch the body.
+    let plain = player_at_origin(TextureRef::Named("entity/test.png"));
+    let mut plain_sneak = plain.clone();
+    plain_sneak.pose.sneak = true;
+    let named = tagged("A");
+    let mut sneaking = named.clone();
+    sneaking.pose.sneak = true;
+
+    let contribution = |entities: &mut EntityPass,
+                        distance: f64,
+                        control: &EntityDraw,
+                        draw: &EntityDraw|
+     -> usize {
+        entities.set_camera(tag_camera(distance), 1.0);
+        let untagged = render_scene(&device, &queue, &target, &depth, |pass| {
+            entities.draw(&device, pass, std::slice::from_ref(control), &registry);
+        });
+        let tagged_frame = render_scene(&device, &queue, &target, &depth, |pass| {
+            entities.draw(&device, pass, std::slice::from_ref(draw), &registry);
+        });
+        changed_pixels(&untagged, &tagged_frame)
+    };
+
+    let inside = contribution(&mut entities, 63.9, &plain, &named);
+    let outside = contribution(&mut entities, 65.0, &plain, &named);
+    eprintln!("standing: 63.9 -> {inside} px, 65.0 -> {outside} px");
+    // Measured 42 pixels at the pinning run.
+    assert!(
+        inside >= 20,
+        "the standing tag draws just inside 64 blocks, got {inside} changed pixels"
+    );
+    assert_eq!(
+        outside, 0,
+        "past 64 blocks the standing tag draws nothing, got {outside} changed pixels"
+    );
+
+    let inside = contribution(&mut entities, 31.5, &plain_sneak, &sneaking);
+    let outside = contribution(&mut entities, 33.0, &plain_sneak, &sneaking);
+    eprintln!("sneaking: 31.5 -> {inside} px, 33.0 -> {outside} px");
+    // Measured 168 pixels at the pinning run.
+    assert!(
+        inside >= 80,
+        "the sneaking tag draws just inside 32 blocks, got {inside} changed pixels"
+    );
+    assert_eq!(
+        outside, 0,
+        "past 32 blocks the sneaking tag draws nothing, got {outside} changed pixels"
+    );
+}
+
+/// The see-through rule as the source holds it: the standing path draws its box and its
+/// faint pass with the depth test off and re-enables it only for the solid pass
+/// (`Render.java`:348-349, `:371-372`), so a standing tag in front of a wall still washes
+/// through; the sneaking branch keeps the test on for both its passes
+/// (`RendererLivingEntity.java`:518, `:532`), so a sneaking tag behind the same wall
+/// leaves the frame untouched.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_nametag_sees_through_walls_standing_but_not_sneaking() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = entity_registry(&device, &queue, [200, 90, 40, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    entities
+        .set_font(&device, &queue, &nametag_sheet())
+        .expect("the synthetic sheet loads");
+
+    // The wall: a giant's body a block and a half in front of the tagged player, filling
+    // the frame's middle.
+    let wall = EntityDraw {
+        position: [0.0, 0.0, 1.0],
+        ..mob_at_origin(ModelRef::Giant, "entity/test.png", DrawExtra::None)
+    };
+    let plain = player_at_origin(TextureRef::Named("entity/test.png"));
+    let mut sneaking = tagged("A");
+    sneaking.pose.sneak = true;
+
+    let frame = |entities: &mut EntityPass, draw: &EntityDraw| -> Vec<u8> {
+        let draws = [wall.clone(), draw.clone()];
+        render_scene(&device, &queue, &target, &depth, |pass| {
+            entities.draw(&device, pass, &draws, &registry);
+        })
+    };
+
+    let bare = frame(&mut entities, &plain);
+    let standing = frame(&mut entities, &tagged("A"));
+    let sneaking_frame = frame(&mut entities, &sneaking);
+    let standing_diff = changed_pixels(&bare, &standing);
+    let sneaking_diff = changed_pixels(&bare, &sneaking_frame);
+    eprintln!("through a wall: standing {standing_diff} px, sneaking {sneaking_diff} px");
+    // Measured 16 pixels at the pinning run; the sneaking pair's exact zero is the
+    // discriminating read.
+    assert!(
+        standing_diff >= 8,
+        "the standing tag's box and faint pass wash through the wall, got {standing_diff} \
+         changed pixels"
+    );
+    assert_eq!(
+        sneaking_diff, 0,
+        "the sneaking tag's passes are depth-tested, got {sneaking_diff} changed pixels"
+    );
+}
+
 /// The entities sit between the terrain's solid and translucent layers: a translucent quad
 /// in front of an entity lets the entity show through the blend when the entity draws first
 /// (the source's order) and hides it when the order is inverted — the canary that proves the
@@ -2429,6 +2667,7 @@ fn mob_at_origin(model: ModelRef, sheet: &'static str, extra: DrawExtra) -> Enti
         hurt: 0.0,
         death: 0.0,
         health: None,
+        nametag: None,
         extra,
     }
 }
@@ -4291,6 +4530,7 @@ fn object_draw(model: ModelRef, extra: DrawExtra) -> EntityDraw {
         hurt: 0.0,
         death: 0.0,
         health: None,
+        nametag: None,
         extra,
     }
 }
