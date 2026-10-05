@@ -52,10 +52,38 @@ const CLOUDS: &str = "environment/clouds";
 /// The entity textures the window uploads once at startup: the entity pass's static
 /// set, keyed by its own names.
 ///
-/// This milestone's set is the shadow sprite and the two default skins; the mob
-/// textures arrive with the models that draw them, each added here with the case that
-/// needs it.
-pub const ENTITY_TEXTURES: [&str; 3] = ["misc/shadow.png", "entity/steve.png", "entity/alex.png"];
+/// The set is the shadow sprite, the two default skins and the mob sheets the kinds of
+/// this milestone draw — the biped family and the core quadrupeds, each key the class
+/// renderer's own resource location and the layers' sheets beside theirs.
+///
+/// The keys are the renderers' own, which are not always the obvious names: the giant
+/// binds `textures/entity/zombie/zombie.png`, the zombie's own sheet
+/// (`RenderGiantZombie.java`:13), the golem binds `textures/entity/iron_golem.png`, no
+/// subdirectory (`RenderIronGolem.java`:11), and the wool layer binds
+/// `textures/entity/sheep/sheep_fur.png` (`LayerSheepWool.java`:12).
+pub const ENTITY_TEXTURES: [&str; 21] = [
+    "misc/shadow.png",
+    "entity/steve.png",
+    "entity/alex.png",
+    "entity/zombie/zombie.png",
+    "entity/zombie/zombie_villager.png",
+    "entity/skeleton/skeleton.png",
+    "entity/villager/villager.png",
+    "entity/villager/farmer.png",
+    "entity/villager/librarian.png",
+    "entity/villager/priest.png",
+    "entity/villager/smith.png",
+    "entity/villager/butcher.png",
+    "entity/witch.png",
+    "entity/snowman.png",
+    "entity/iron_golem.png",
+    "entity/pig/pig.png",
+    "entity/pig/pig_saddle.png",
+    "entity/cow/cow.png",
+    "entity/cow/mooshroom.png",
+    "entity/sheep/sheep.png",
+    "entity/sheep/sheep_fur.png",
+];
 
 /// The wide default skin's key, an entry of [`ENTITY_TEXTURES`].
 pub const DEFAULT_SKIN_WIDE: &str = "entity/steve.png";
@@ -211,9 +239,22 @@ pub fn default_store_root() -> Result<PathBuf, AssetError> {
     Ok(base.join("oxidecraft"))
 }
 
-/// The texture a resource path names, or the missing-texture error.
+/// The extraction tree's key for a sheet the pass names by its file name.
+///
+/// The pass registers its sheets under the file names the models name them by
+/// (`entity/steve.png`), while [`TextureSet`] keys the tree by the path below
+/// `textures/` without the extension (`entity/steve`). The suffix is stripped here,
+/// at the store's edge.
+fn store_key(sheet: &str) -> &str {
+    sheet.strip_suffix(".png").unwrap_or(sheet)
+}
+
+/// The texture a sheet's name reads, refused (by name) rather than defaulted.
 fn texture<'a>(textures: &'a TextureSet, key: &'static str) -> Result<&'a Texture, AssetError> {
-    textures.get(key).ok_or(AssetError::MissingTexture { key })
+    let tree_key = store_key(key);
+    textures
+        .get(tree_key)
+        .ok_or(AssetError::MissingTexture { key: tree_key })
 }
 
 /// The colour map a resource path names, decoded from its texture's RGBA bytes.
@@ -231,17 +272,83 @@ mod tests {
     //! tree behind `-- --ignored`.
 
     use super::*;
+    use oxide_render::entity_pass::ModelRef;
 
     #[test]
-    fn the_entity_set_names_the_shadow_and_the_two_default_skins() {
+    fn the_entity_set_names_the_shadow_the_skins_and_the_mob_sheets() {
         // The pass's static set: the shadow sprite first, then the two defaults, under
-        // the keys the resolver falls back to.
+        // the keys the resolver falls back to, then the mob sheets of this milestone's
+        // kinds.
         assert_eq!(
             ENTITY_TEXTURES,
-            ["misc/shadow.png", "entity/steve.png", "entity/alex.png"]
+            [
+                "misc/shadow.png",
+                "entity/steve.png",
+                "entity/alex.png",
+                "entity/zombie/zombie.png",
+                "entity/zombie/zombie_villager.png",
+                "entity/skeleton/skeleton.png",
+                "entity/villager/villager.png",
+                "entity/villager/farmer.png",
+                "entity/villager/librarian.png",
+                "entity/villager/priest.png",
+                "entity/villager/smith.png",
+                "entity/villager/butcher.png",
+                "entity/witch.png",
+                "entity/snowman.png",
+                "entity/iron_golem.png",
+                "entity/pig/pig.png",
+                "entity/pig/pig_saddle.png",
+                "entity/cow/cow.png",
+                "entity/cow/mooshroom.png",
+                "entity/sheep/sheep.png",
+                "entity/sheep/sheep_fur.png",
+            ]
         );
         assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_WIDE));
         assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_SLIM));
+    }
+
+    #[test]
+    fn every_kinds_sheets_are_in_the_static_entity_set() {
+        // Every kind this milestone draws resolves through the pass's named keys: each of
+        // the model's own sheets, layers included, must be in the window's static set.
+        let kinds = [
+            ModelRef::Zombie,
+            ModelRef::ZombieVillager,
+            ModelRef::Skeleton,
+            ModelRef::Witch,
+            ModelRef::Giant,
+            ModelRef::SnowGolem,
+            ModelRef::IronGolem,
+            ModelRef::Cow,
+            ModelRef::Mooshroom,
+            ModelRef::Pig { saddle: true },
+            ModelRef::Sheep {
+                wool: 14,
+                sheared: false,
+            },
+        ];
+        for reference in kinds {
+            for key in oxide_render::entity_models::textures(reference) {
+                assert!(
+                    ENTITY_TEXTURES.contains(key),
+                    "{reference:?} draws {key}, which the static entity set is missing"
+                );
+            }
+        }
+        // The villager's five profession sheets too.
+        for profession in 0..5 {
+            for key in oxide_render::entity_models::textures(ModelRef::Villager {
+                profession,
+                child: false,
+            }) {
+                assert!(
+                    ENTITY_TEXTURES.contains(key),
+                    "the villager's profession {profession} draws {key}"
+                );
+            }
+        }
     }
 
     /// Every key the static entity set names exists in the store's extraction tree.
@@ -259,7 +366,7 @@ mod tests {
         let textures = TextureSet::load(&tree).expect("the texture tree loads");
         for key in ENTITY_TEXTURES {
             assert!(
-                textures.get(key).is_some(),
+                textures.get(store_key(key)).is_some(),
                 "the entity texture {key} is in the store"
             );
         }

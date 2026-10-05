@@ -1,0 +1,355 @@
+//! The layer framework: the extra geometry a model draws over itself.
+//!
+//! A layer is a model of its own — its boxes, its sheet and its pose — that a renderer draws
+//! inside the same entity transform, after the base model, when the layer's condition holds
+//! (`RenderLiving.renderModel` draws the model first and walks its layer list after it). The
+//! framework's conditions are the renderer's own: a layer that draws only when a flag is set,
+//! and a colour the layer's texels are multiplied by — either one colour for the whole sheet
+//! or the draw's own colour byte indexing a 16-entry palette table.
+//!
+//! The palettes are the source's own. [`WOOL_COLOURS`] is `EntitySheep`'s static dye table
+//! (`EntitySheep.java`:370-388), the table the wool layer (`LayerSheepWool.java`:35-42) and
+//! the collar layer (`LayerWolfCollar.java`:26-27) both tint through. [`DYE_COLOURS`] is
+//! `ItemDye.dyeColors` (`ItemDye.java`:21), the packed 0xRRGGBB palette the dye items carry;
+//! no layer of this milestone reads it, and it is pinned here beside the wool table because
+//! both are 16-entry colour tables indexed by `EnumDyeColor`'s metadata
+//! (`EnumDyeColor.java`:9-24).
+//!
+//! The layers this milestone draws are the identity set the plan's decision lists: the
+//! sheep's wool and the pig's saddle. Three more identity layers are in the set but draw a
+//! block through the block renderer — the snow golem's jack-o-lantern
+//! (`LayerSnowmanHead.java`:25-30 draws `Blocks.pumpkin` through the item renderer), the
+//! iron golem's rose (`LayerIronGolemFlower.java`:24-43 draws `Blocks.red_flower`), and the
+//! mooshroom's mushrooms (`LayerMooshroomMushroom.java`:25-51 draws `Blocks.red_mushroom`)
+//! — and the baked block models they re-use arrive with the object pass's block-item path,
+//! so those three layers defer with it and are recorded here and in Task 9's report.
+
+use super::{Model, Pose, Rot};
+use crate::entity_pass::{DrawExtra, ModelRef};
+
+/// The wool table: `EntitySheep`'s dye colours as floats, indexed by `EnumDyeColor`'s
+/// metadata — white, orange, magenta, light blue, yellow, lime, pink, gray, silver, cyan,
+/// purple, blue, brown, green, red, black (`EntitySheep.java`:372-387).
+pub static WOOL_COLOURS: [[f32; 3]; 16] = [
+    [1.0, 1.0, 1.0],
+    [0.85, 0.5, 0.2],
+    [0.7, 0.3, 0.85],
+    [0.4, 0.6, 0.85],
+    [0.9, 0.9, 0.2],
+    [0.5, 0.8, 0.1],
+    [0.95, 0.5, 0.65],
+    [0.3, 0.3, 0.3],
+    [0.6, 0.6, 0.6],
+    [0.3, 0.5, 0.6],
+    [0.5, 0.25, 0.7],
+    [0.2, 0.3, 0.7],
+    [0.4, 0.3, 0.2],
+    [0.4, 0.5, 0.2],
+    [0.6, 0.2, 0.2],
+    [0.1, 0.1, 0.1],
+];
+
+/// The dye items' packed 0xRRGGBB palette, in `EnumDyeColor`'s metadata order
+/// (`ItemDye.java`:21).
+pub static DYE_COLOURS: [u32; 16] = [
+    1973019, 11743532, 3887386, 5320730, 2437522, 8073150, 2651799, 11250603, 4408131, 14188952,
+    4312372, 14602026, 6719955, 12801229, 15435844, 15790320,
+];
+
+/// The colour a layer multiplies its sheet's texels by.
+#[derive(Debug, Clone, Copy)]
+pub enum Tint {
+    /// The sheet's own colours, untouched.
+    Sheet,
+    /// One colour over the whole layer, the way `GlStateManager.color` sets a flat colour
+    /// before a layer draws (`LayerWolfCollar.java`:27).
+    Flat([f32; 3]),
+    /// A colour read from a 16-entry table by a byte the draw's own extras carry — the wool
+    /// layer's fleece colour (`LayerSheepWool.java`:41-42).
+    Palette {
+        /// The table, indexed by the palette byte's low nibble.
+        table: &'static [[f32; 3]; 16],
+        /// The byte the draw carries, read from its extras.
+        index: fn(&DrawExtra) -> u8,
+    },
+}
+
+impl Tint {
+    /// The colour this tint resolves to for a draw.
+    pub fn rgb(&self, extra: &DrawExtra) -> [f32; 3] {
+        match self {
+            Tint::Sheet => [1.0, 1.0, 1.0],
+            Tint::Flat(colour) => *colour,
+            Tint::Palette { table, index } => table[usize::from(index(extra) & 0x0f)],
+        }
+    }
+}
+
+/// One layer of a model class: the geometry it draws, the sheet it samples and its rules.
+#[derive(Debug, Clone, Copy)]
+pub struct Layer {
+    /// The layer's geometry, its own model.
+    pub model: &'static Model,
+    /// The sheet the layer's texels come from, by the pass's registry key.
+    pub texture: &'static str,
+    /// The sheet's size in texels, which the layer's uvs divide through.
+    pub texture_size: [f32; 2],
+    /// Whether the layer draws for a draw's extras.
+    pub active: fn(&DrawExtra) -> bool,
+    /// The colour the layer's texels are multiplied by.
+    pub tint: Tint,
+    /// The pose the layer's geometry takes — the frames of its own model, in that model's
+    /// part order.
+    pub pose: fn(&Pose, &mut [Rot]),
+}
+
+/// One layer's resolved draw: its geometry with the frame's transforms, its sheet and the
+/// colour its texels are multiplied by.
+#[derive(Debug, Clone)]
+pub struct LayerDraw {
+    /// The layer's geometry.
+    pub model: &'static Model,
+    /// The transforms, one per part of `model`, in its own part order.
+    pub transforms: Vec<Rot>,
+    /// The sheet's registry key.
+    pub texture: &'static str,
+    /// The sheet's size in texels.
+    pub texture_size: [f32; 2],
+    /// The colour the texels are multiplied by.
+    pub tint: [f32; 3],
+}
+
+/// The wool byte a sheep draw carries.
+pub fn wool_index(extra: &DrawExtra) -> u8 {
+    match extra {
+        DrawExtra::Sheep { wool, .. } => *wool,
+        _ => 0,
+    }
+}
+
+/// The sheep's wool layer (`LayerSheepWool.java`:21-42): `ModelSheep1` on the fur sheet,
+/// tinted by the draw's fleece colour.
+///
+/// The source's gate is `!getSheared() && !isInvisible()`. An invisible draw never reaches
+/// the pass — the client skips invisible entities before the draw list is built — so the
+/// layer's condition is the shears alone. The layer draws its own sheet when the entity is
+/// hurt (`shouldCombineTextures` true), and the wool's part in the hurt overlay is not
+/// re-drawn: the overlay pass re-draws the base model only.
+static WOOL_LAYER: Layer = Layer {
+    model: &super::quadrupeds::MODEL_SHEEP_WOOL,
+    texture: "entity/sheep/sheep_fur.png",
+    texture_size: [64.0, 32.0],
+    active: |extra| matches!(extra, DrawExtra::Sheep { sheared: false, .. }),
+    tint: Tint::Palette {
+        table: &WOOL_COLOURS,
+        index: wool_index,
+    },
+    pose: super::quadrupeds::pose_sheep,
+};
+
+/// The sheep's layer table.
+static SHEEP_LAYERS: [Layer; 1] = [WOOL_LAYER];
+
+/// The pig's saddle layer (`LayerSaddle.java`:11-22): `ModelPig(0.5F)` on the saddle sheet,
+/// untinted.
+static SADDLE_LAYER: Layer = Layer {
+    model: &super::quadrupeds::MODEL_PIG_SADDLE,
+    texture: "entity/pig/pig_saddle.png",
+    texture_size: [64.0, 32.0],
+    active: |extra| matches!(extra, DrawExtra::Pig { saddle: true }),
+    tint: Tint::Sheet,
+    pose: super::quadrupeds::pose_pig,
+};
+
+/// The pig's layer table.
+static PIG_LAYERS: [Layer; 1] = [SADDLE_LAYER];
+
+/// The layers a model draws, in the source's order after its base model.
+pub fn layers_for(model: ModelRef) -> &'static [Layer] {
+    match model {
+        ModelRef::Sheep { .. } => &SHEEP_LAYERS,
+        ModelRef::Pig { .. } => &PIG_LAYERS,
+        _ => &[],
+    }
+}
+
+/// Resolves the layers a draw's model draws this frame: every active layer of the model, in
+/// order, with its transforms built over the layer's own rest table.
+pub fn draw_layers(model: ModelRef, extra: &DrawExtra, pose: &Pose) -> Vec<LayerDraw> {
+    resolve(layers_for(model), extra, pose)
+}
+
+/// Resolves one layer table for a draw: the active layers' geometry in the table's order.
+fn resolve(layers: &[Layer], extra: &DrawExtra, pose: &Pose) -> Vec<LayerDraw> {
+    layers
+        .iter()
+        .filter(|layer| (layer.active)(extra))
+        .map(|layer| {
+            let mut transforms = layer.model.rest();
+            (layer.pose)(pose, &mut transforms);
+            LayerDraw {
+                model: layer.model,
+                transforms,
+                texture: layer.texture,
+                texture_size: layer.texture_size,
+                tint: layer.tint.rgb(extra),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity_models::{Box, Part};
+    use crate::entity_pass::DrawExtra;
+    use std::f32::consts::PI;
+
+    /// A one-box model, for the ordering case's synthetic layers.
+    static DOT_BOXES: [Box; 1] = [Box {
+        origin: [0.0, 0.0, 0.0],
+        size: [2.0, 2.0, 2.0],
+        uv: [0.0, 0.0],
+        inflate: 0.0,
+        mirror: false,
+    }];
+    static DOT_PARTS: [Part; 1] = [Part {
+        point: [0.0, 0.0, 0.0],
+        rest: [0.0, 0.0, 0.0],
+        boxes: &DOT_BOXES,
+        children: &[],
+    }];
+    static DOT: Model = Model { parts: &DOT_PARTS };
+
+    /// A pose function that writes nothing: the ordering case reads the transforms it seeds.
+    fn still(_pose: &Pose, _out: &mut [Rot]) {}
+
+    /// A pose function that turns the part a quarter about x.
+    fn quarter(pose: &Pose, out: &mut [Rot]) {
+        for rot in out.iter_mut() {
+            rot.angles = [pose.head_pitch.to_radians(), 0.0, PI / 2.0];
+        }
+    }
+
+    /// The two synthetic layers the ordering case drives: the first always active, the second
+    /// only when the draw carries a saddle. The source's own ordering is the table's.
+    static FIRST: Layer = Layer {
+        model: &DOT,
+        texture: "entity/first.png",
+        texture_size: [16.0, 16.0],
+        active: |_| true,
+        tint: Tint::Sheet,
+        pose: still,
+    };
+    static SECOND: Layer = Layer {
+        model: &DOT,
+        texture: "entity/second.png",
+        texture_size: [32.0, 32.0],
+        active: |extra| matches!(extra, DrawExtra::Pig { saddle: true }),
+        tint: Tint::Flat([0.25, 0.5, 0.75]),
+        pose: quarter,
+    };
+    static PAIR: [Layer; 2] = [FIRST, SECOND];
+
+    /// The wool byte a draw carries.
+    fn wool_index(extra: &DrawExtra) -> u8 {
+        match extra {
+            DrawExtra::Sheep { wool, .. } => *wool,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn the_wool_palette_is_the_sources_dye_table() {
+        // `EntitySheep`'s static block, in `EnumDyeColor`'s metadata order.
+        let wool = [
+            (0, [1.0, 1.0, 1.0]),
+            (1, [0.85, 0.5, 0.2]),
+            (2, [0.7, 0.3, 0.85]),
+            (3, [0.4, 0.6, 0.85]),
+            (4, [0.9, 0.9, 0.2]),
+            (5, [0.5, 0.8, 0.1]),
+            (6, [0.95, 0.5, 0.65]),
+            (7, [0.3, 0.3, 0.3]),
+            (8, [0.6, 0.6, 0.6]),
+            (9, [0.3, 0.5, 0.6]),
+            (10, [0.5, 0.25, 0.7]),
+            (11, [0.2, 0.3, 0.7]),
+            (12, [0.4, 0.3, 0.2]),
+            (13, [0.4, 0.5, 0.2]),
+            (14, [0.6, 0.2, 0.2]),
+            (15, [0.1, 0.1, 0.1]),
+        ];
+        for (index, colour) in wool {
+            assert_eq!(
+                WOOL_COLOURS[index], colour,
+                "the wool palette at metadata {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dye_palette_is_the_sources_packed_table() {
+        // `ItemDye.dyeColors`, the packed 0xRRGGBB values in metadata order.
+        let dye: [u32; 16] = [
+            1973019, 11743532, 3887386, 5320730, 2437522, 8073150, 2651799, 11250603, 4408131,
+            14188952, 4312372, 14602026, 6719955, 12801229, 15435844, 15790320,
+        ];
+        assert_eq!(DYE_COLOURS, dye);
+    }
+
+    #[test]
+    fn the_palette_tint_reads_the_draws_byte_masked_to_its_nibble() {
+        let palette = Tint::Palette {
+            table: &WOOL_COLOURS,
+            index: wool_index,
+        };
+        let red = DrawExtra::Sheep {
+            wool: 14,
+            sheared: false,
+        };
+        let white = DrawExtra::Sheep {
+            wool: 0,
+            sheared: false,
+        };
+        // The draw's own byte indexes the table: red is `[0.6, 0.2, 0.2]`, white `[1, 1, 1]`.
+        assert_eq!(palette.rgb(&red), [0.6, 0.2, 0.2]);
+        assert_eq!(palette.rgb(&white), [1.0, 1.0, 1.0]);
+        // A byte off the wire keeps its low nibble — the source's own fold, `getFleeceColor`'s
+        // `& 15` into `EnumDyeColor.byMetadata` (`EntitySheep.java`:262): 200 reads silver.
+        let hostile = DrawExtra::Sheep {
+            wool: 200,
+            sheared: false,
+        };
+        assert_eq!(
+            palette.rgb(&hostile),
+            WOOL_COLOURS[8],
+            "a hostile byte keeps its low nibble"
+        );
+        // The other two tint rules: the sheet untouched, and a flat colour.
+        assert_eq!(Tint::Sheet.rgb(&white), [1.0, 1.0, 1.0]);
+        assert_eq!(Tint::Flat([0.25, 0.5, 0.75]).rgb(&white), [0.25, 0.5, 0.75]);
+    }
+
+    #[test]
+    fn the_layers_resolve_in_the_tables_order_and_skip_the_inactive_ones() {
+        let pose = Pose::default();
+        // Without the saddle only the first layer draws: its own sheet and leave of tint.
+        let bare = DrawExtra::None;
+        let draws = resolve(&PAIR, &bare, &pose);
+        assert_eq!(draws.len(), 1, "the inactive layer is skipped");
+        assert_eq!(draws[0].texture, "entity/first.png");
+        assert_eq!(draws[0].tint, [1.0, 1.0, 1.0]);
+        assert_eq!(draws[0].transforms.len(), 1);
+
+        // With it, both draw, in the table's order, the second's transforms its own pose's.
+        let saddled = DrawExtra::Pig { saddle: true };
+        let draws = resolve(&PAIR, &saddled, &pose);
+        assert_eq!(draws.len(), 2, "both layers draw");
+        assert_eq!(draws[0].texture, "entity/first.png");
+        assert_eq!(draws[1].texture, "entity/second.png");
+        assert_eq!(draws[1].texture_size, [32.0, 32.0]);
+        assert_eq!(draws[1].tint, [0.25, 0.5, 0.75]);
+        assert_eq!(draws[1].transforms[0].angles[2], PI / 2.0);
+    }
+}

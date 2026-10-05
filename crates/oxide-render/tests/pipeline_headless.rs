@@ -2394,6 +2394,518 @@ fn the_entities_draw_between_the_terrain_layers() {
     );
 }
 
+/// One mob draw at the origin with the given model, sheet and extras.
+fn mob_at_origin(model: ModelRef, sheet: &'static str, extra: DrawExtra) -> EntityDraw {
+    EntityDraw {
+        model,
+        position: [0.0; 3],
+        body_yaw: 0.0,
+        head_yaw: 0.0,
+        head_pitch: 0.0,
+        pose: Pose::default(),
+        texture: TextureRef::Named(sheet),
+        light: 1.0,
+        hurt: 0.0,
+        death: 0.0,
+        health: None,
+        extra,
+    }
+}
+
+/// The entity registry with each key's own flat sheet and the shadow sprite.
+fn mob_registry(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    sheets: &[(&'static str, [u8; 4])],
+) -> TextureRegistry {
+    let mut registry = TextureRegistry::new(device, queue);
+    for (key, colour) in sheets {
+        registry.set_named(device, queue, key, &flat_sheet(*colour));
+    }
+    registry.set_named(
+        device,
+        queue,
+        "misc/shadow.png",
+        &flat_sheet([255, 255, 255, 128]),
+    );
+    registry
+}
+
+/// Renders one draw on the entity camera and returns the frame.
+fn render_mob(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    depth: &wgpu::TextureView,
+    entities: &mut EntityPass,
+    registry: &TextureRegistry,
+    draw: EntityDraw,
+) -> Vec<u8> {
+    render_scene(device, queue, target, depth, |pass| {
+        entities.draw(device, pass, &[draw], registry);
+    })
+}
+
+/// The count of pixels that are not the sky.
+fn model_pixels(pixels: &[u8]) -> usize {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(pixels, x, y) != SKY)
+        .count()
+}
+
+/// The count of pixels carrying the test sheet's hue: its red is well above its green, its
+/// green above its blue, so any shaded texel of it keeps that ordering while the sky and
+/// the grey shadow do not.
+fn hued_pixels(pixels: &[u8]) -> usize {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b] = pixel(pixels, x, y);
+            r as i32 > g as i32 + 30 && g as i32 > b as i32 + 10
+        })
+        .count()
+}
+
+/// The count of pixels whose green is well above both other channels: the saddle sheet's
+/// hue, which neither the sky (its green sits under its red) nor a white sheet carries.
+fn green_pixels(pixels: &[u8]) -> usize {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b] = pixel(pixels, x, y);
+            g as i32 > r as i32 + 40 && g as i32 > b as i32 + 40
+        })
+        .count()
+}
+
+/// Every biped draws its own model: each silhouette stands in the frame, carries its own
+/// class sheet's hue, and the classes that differ from the wide biped read differently —
+/// the skeleton's thin limbs cover fewer pixels than the zombie's, the giant's sixfold
+/// scale fills the frame, and the snow golem stands wider than tall.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_biped_family_draws_its_own_silhouettes() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/zombie/zombie.png", SKIN),
+            ("entity/zombie/zombie_villager.png", SKIN),
+            ("entity/skeleton/skeleton.png", SKIN),
+            ("entity/villager/farmer.png", SKIN),
+            ("entity/witch.png", SKIN),
+            ("entity/snowman.png", SKIN),
+            ("entity/iron_golem.png", SKIN),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let frames = [
+        (
+            "the zombie",
+            mob_at_origin(
+                ModelRef::Zombie,
+                "entity/zombie/zombie.png",
+                DrawExtra::None,
+            ),
+        ),
+        (
+            "the zombie villager",
+            mob_at_origin(
+                ModelRef::ZombieVillager,
+                "entity/zombie/zombie_villager.png",
+                DrawExtra::ZombieVillager,
+            ),
+        ),
+        (
+            "the skeleton",
+            mob_at_origin(
+                ModelRef::Skeleton,
+                "entity/skeleton/skeleton.png",
+                DrawExtra::None,
+            ),
+        ),
+        (
+            "the villager",
+            mob_at_origin(
+                ModelRef::Villager {
+                    profession: 0,
+                    child: false,
+                },
+                "entity/villager/farmer.png",
+                DrawExtra::Villager {
+                    profession: 0,
+                    child: false,
+                },
+            ),
+        ),
+        (
+            "the witch",
+            mob_at_origin(ModelRef::Witch, "entity/witch.png", DrawExtra::None),
+        ),
+        (
+            "the giant",
+            mob_at_origin(ModelRef::Giant, "entity/zombie/zombie.png", DrawExtra::None),
+        ),
+        (
+            "the snow golem",
+            mob_at_origin(ModelRef::SnowGolem, "entity/snowman.png", DrawExtra::None),
+        ),
+        (
+            "the iron golem",
+            mob_at_origin(
+                ModelRef::IronGolem,
+                "entity/iron_golem.png",
+                DrawExtra::None,
+            ),
+        ),
+    ];
+
+    let mut rendered = Vec::new();
+    for (name, draw) in frames {
+        rendered.push((
+            name,
+            render_mob(
+                &device,
+                &queue,
+                &target,
+                &depth,
+                &mut entities,
+                &registry,
+                draw,
+            ),
+        ));
+    }
+
+    for (name, frame) in &rendered {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 4 && max_y - min_y >= 16,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            hued_pixels(frame) >= 30,
+            "{name} draws its own sheet's hue, {} pixels",
+            hued_pixels(frame)
+        );
+    }
+
+    // The skeleton's two-wide limbs read fewer pixels than the zombie's four-wide ones at
+    // the same camera (`ModelSkeleton.java`:31-43).
+    assert!(
+        model_pixels(&rendered[2].1) < model_pixels(&rendered[0].1),
+        "the skeleton's thin limbs cover fewer pixels: {} against {}",
+        model_pixels(&rendered[2].1),
+        model_pixels(&rendered[0].1)
+    );
+    // The giant's pre-render callback scales the whole model sixfold
+    // (`RenderGiantZombie.preRenderCallback`:44): the frame is all but covered.
+    let giant = silhouette(&rendered[5].1);
+    assert!(
+        giant.3 - giant.1 >= 55 && giant.2 - giant.0 >= 40,
+        "the giant fills the frame, got ({}, {})..({}, {})",
+        giant.0,
+        giant.1,
+        giant.2,
+        giant.3
+    );
+    assert!(
+        model_pixels(&rendered[5].1) > model_pixels(&rendered[0].1),
+        "the giant covers more than the zombie"
+    );
+    // The snow golem's base is twelve units wide where the zombie is eight, and its head
+    // seven (`ModelSnowMan.java`:18-20): the silhouette stands and spreads.
+    let snow = silhouette(&rendered[6].1);
+    assert!(
+        snow.2 - snow.0 >= 14 && snow.3 - snow.1 >= 25,
+        "the snow golem stands, got ({}, {})..({}, {})",
+        snow.0,
+        snow.1,
+        snow.2,
+        snow.3
+    );
+}
+
+/// Every quadruped draws its own model: each stands in the frame wider than tall, carries
+/// its class sheet's hue, and the mooshroom draws the cow's model off its own sheet.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_quadruped_family_draws_its_own_silhouettes() {
+    const COW_SKIN: [u8; 4] = [200, 90, 40, 255];
+    const PIG_SKIN: [u8; 4] = [90, 200, 40, 255];
+    const SHEEP_SKIN: [u8; 4] = [40, 90, 200, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/cow/cow.png", COW_SKIN),
+            ("entity/cow/mooshroom.png", COW_SKIN),
+            ("entity/pig/pig.png", PIG_SKIN),
+            ("entity/sheep/sheep.png", SHEEP_SKIN),
+            ("entity/sheep/sheep_fur.png", [255, 255, 255, 255]),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let frames = [
+        (
+            "the cow",
+            mob_at_origin(ModelRef::Cow, "entity/cow/cow.png", DrawExtra::None),
+        ),
+        (
+            "the mooshroom",
+            mob_at_origin(
+                ModelRef::Mooshroom,
+                "entity/cow/mooshroom.png",
+                DrawExtra::None,
+            ),
+        ),
+        (
+            "the pig",
+            mob_at_origin(
+                ModelRef::Pig { saddle: false },
+                "entity/pig/pig.png",
+                DrawExtra::Pig { saddle: false },
+            ),
+        ),
+        (
+            "the sheep",
+            mob_at_origin(
+                ModelRef::Sheep {
+                    wool: 0,
+                    sheared: true,
+                },
+                "entity/sheep/sheep.png",
+                DrawExtra::Sheep {
+                    wool: 0,
+                    sheared: true,
+                },
+            ),
+        ),
+    ];
+
+    let mut rendered = Vec::new();
+    for (name, draw) in frames {
+        rendered.push((
+            name,
+            render_mob(
+                &device,
+                &queue,
+                &target,
+                &depth,
+                &mut entities,
+                &registry,
+                draw,
+            ),
+        ));
+    }
+
+    for (name, frame) in &rendered {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 8 && max_y - min_y >= 6,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            max_y - min_y >= 18,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(frame) >= 150,
+            "{name} covers pixels, {}",
+            model_pixels(frame)
+        );
+    }
+    // Six-high legs and a sixteen-long body sit smaller than the cow's twelve-high legs
+    // and eighteen-long body (`ModelPig.java`:12, `ModelCow.java`:13-17).
+    assert!(
+        model_pixels(&rendered[2].1) < model_pixels(&rendered[0].1),
+        "the pig covers fewer pixels than the cow: {} against {}",
+        model_pixels(&rendered[2].1),
+        model_pixels(&rendered[0].1)
+    );
+    assert!(
+        model_pixels(&rendered[3].1) < model_pixels(&rendered[0].1),
+        "the sheep covers fewer pixels than the cow: {} against {}",
+        model_pixels(&rendered[3].1),
+        model_pixels(&rendered[0].1)
+    );
+    // The cow and the mooshroom share the model; the sheep's own sheet still binds.
+    assert_eq!(
+        silhouette(&rendered[0].1),
+        silhouette(&rendered[1].1),
+        "the mooshroom draws the cow's model"
+    );
+}
+
+/// The layers draw over their models: the sheep's wool re-draws the grown fleece in the
+/// fleece colour's tint unless the sheep is sheared (`LayerSheepWool.java`:27-28), and the
+/// pig's saddle only when the pig carries one (`LayerSaddle.java`:25-29).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_wool_and_saddle_layers_draw_over_their_models() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    // The sheep's own sheet and the pig's are white flats; the fur sheet and the saddle
+    // sheet carry their own colours, so a layer's pixels are unmistakable.
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/sheep/sheep.png", [255, 255, 255, 255]),
+            ("entity/sheep/sheep_fur.png", [255, 255, 255, 255]),
+            ("entity/pig/pig.png", [255, 255, 255, 255]),
+            ("entity/pig/pig_saddle.png", [30, 220, 60, 255]),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    // A white-woolled sheep: the wool layer draws, but its tint is white too, so a sheared
+    // and an unsheared sheep differ — the sheared one has no fleece geometry at all.
+    let unsheared = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Sheep {
+                wool: 14,
+                sheared: false,
+            },
+            "entity/sheep/sheep.png",
+            DrawExtra::Sheep {
+                wool: 14,
+                sheared: false,
+            },
+        ),
+    );
+    // The wool colour 14 is the red [0.6, 0.2, 0.2] (`EntitySheep.java`:372-387): its
+    // pixels are the sheet's white multiplied by that tint, red well above green.
+    let red = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, _] = pixel(&unsheared, x, y);
+            r as i32 > g as i32 + 30
+        })
+        .count();
+    assert!(
+        red >= 50,
+        "the unsheared sheep's wool is tinted in its fleece colour, {red} pixels"
+    );
+    let sheared = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Sheep {
+                wool: 14,
+                sheared: true,
+            },
+            "entity/sheep/sheep.png",
+            DrawExtra::Sheep {
+                wool: 14,
+                sheared: true,
+            },
+        ),
+    );
+    let sheared_red = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, _] = pixel(&sheared, x, y);
+            r as i32 > g as i32 + 30
+        })
+        .count();
+    assert_eq!(
+        sheared_red, 0,
+        "a sheared sheep draws no fleece, {sheared_red} tinted pixels"
+    );
+    assert!(
+        model_pixels(&sheared) < model_pixels(&unsheared),
+        "the fleece covers pixels the sheared sheep does not: {} against {}",
+        model_pixels(&sheared),
+        model_pixels(&unsheared)
+    );
+
+    // The pig's saddle: the layer draws only while the pig carries one, in the saddle
+    // sheet's colour.
+    let saddled = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Pig { saddle: true },
+            "entity/pig/pig.png",
+            DrawExtra::Pig { saddle: true },
+        ),
+    );
+    assert!(
+        green_pixels(&saddled) >= 6,
+        "the saddled pig carries the saddle sheet's colour, {} pixels",
+        green_pixels(&saddled)
+    );
+    let bare = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Pig { saddle: false },
+            "entity/pig/pig.png",
+            DrawExtra::Pig { saddle: false },
+        ),
+    );
+    assert_eq!(
+        green_pixels(&bare),
+        0,
+        "an unsaddled pig carries no saddle pixels"
+    );
+    assert!(
+        changed_pixels(&saddled, &bare) >= 6,
+        "the saddle layer changes the frame: {} pixels",
+        changed_pixels(&saddled, &bare)
+    );
+}
+
 /// Blocks the calling thread until `future` resolves; the test has no async runtime.
 ///
 /// The test target cannot reach the private `block_on` in `renderer.rs`, so this is a copy of

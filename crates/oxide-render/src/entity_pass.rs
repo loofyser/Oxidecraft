@@ -52,6 +52,47 @@ pub enum ModelRef {
         /// The model-parts byte: which of the skin's overlay parts the draw wears.
         parts: u8,
     },
+    /// A zombie: `ModelZombie`'s raised arms over the biped table (`ModelZombie.java`:20).
+    Zombie,
+    /// A zombie villager: `ModelZombieVillager`'s own head over the biped limbs
+    /// (`ModelZombieVillager.java`:25-28).
+    ZombieVillager,
+    /// A skeleton: the two-wide limbs of `ModelSkeleton` (`ModelSkeleton.java`:20-33).
+    Skeleton,
+    /// A villager: `ModelVillager`'s table, under the profession's own sheet
+    /// (`RenderVillager.getEntityTexture`:32-51).
+    Villager {
+        /// The profession, `0..5` — the renderer's texture switch.
+        profession: u8,
+        /// Whether the draw is a child: the renderer's pre-render scale, halved
+        /// (`RenderVillager.preRenderCallback`:64-67).
+        child: bool,
+    },
+    /// A witch: the villager's table with the hat and nose (`ModelWitch.java`:9-39).
+    Witch,
+    /// A giant: the zombie's model drawn at `RenderGiantZombie`'s sixfold scale
+    /// (`RenderManager.java`:162).
+    Giant,
+    /// A snow golem: `ModelSnowMan`'s three boxes and hands (`ModelSnowMan.java`:18-32).
+    SnowGolem,
+    /// An iron golem: `ModelIronGolem`'s table (`ModelIronGolem.java`:41-61).
+    IronGolem,
+    /// A pig: `ModelPig`'s quadruped (`ModelPig.java`), saddle or bare.
+    Pig {
+        /// Whether the draw is saddled, which its saddle layer reads.
+        saddle: bool,
+    },
+    /// A cow: `ModelCow`'s quadruped (`ModelCow.java`:8-25).
+    Cow,
+    /// A sheep: `ModelSheep2`'s quadruped, fleece or sheared.
+    Sheep {
+        /// The wool colour, `0..16`.
+        wool: u8,
+        /// Whether the draw is sheared, which its wool layer reads.
+        sheared: bool,
+    },
+    /// A mooshroom: `ModelCow` under the mooshroom's own sheet (`RenderMooshroom`:9).
+    Mooshroom,
 }
 
 /// The texture a draw samples.
@@ -68,13 +109,36 @@ pub enum TextureRef {
     },
 }
 
-/// The extras a draw carries beyond its model — the per-kind state the kind's own path reads;
-/// empty at this milestone.
+/// The extras a draw carries beyond its model and pose — the per-kind state the kind's own
+/// path reads. One variant per kind whose renderer or layers read state the model and pose
+/// do not; the rest draw as [`DrawExtra::None`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum DrawExtra {
     /// A draw whose model and poses carry everything.
     #[default]
     None,
+    /// A zombie villager — the flag `RenderZombie` reads to swap the head's model
+    /// (`RenderZombie.func_82427_a`).
+    ZombieVillager,
+    /// A villager: the profession picks the sheet, the child the renderer's scale.
+    Villager {
+        /// The profession, `0..5`.
+        profession: u8,
+        /// Whether the draw is a child.
+        child: bool,
+    },
+    /// A sheep: the wool layer's gate and its palette byte.
+    Sheep {
+        /// The wool colour, `0..16`.
+        wool: u8,
+        /// Whether the draw is sheared.
+        sheared: bool,
+    },
+    /// A pig: the saddle layer's gate.
+    Pig {
+        /// Whether the draw is saddled.
+        saddle: bool,
+    },
 }
 
 /// One entity's draw for a frame, as the window assembles it.
@@ -673,6 +737,14 @@ impl EntityPass {
                 pass.set_pipeline(&self.hurt_pipeline);
                 pass.draw(geometry.body.clone(), 0..1);
             }
+            // The layers draw after the body, each through its own sheet
+            // (`RenderLiving.renderModel`'s layer walk).
+            for (range, key) in &geometry.layers {
+                let texture = textures.texture_for(&TextureRef::Named(key));
+                pass.set_pipeline(&self.model_pipeline);
+                pass.set_bind_group(1, &texture.bind_group, &[]);
+                pass.draw(range.clone(), 0..1);
+            }
             if let Some(range) = &geometry.cape {
                 if let TextureRef::Skin { uuid, .. } = &draw.texture {
                     if let Some(cape_texture) = textures.cape(uuid) {
@@ -702,13 +774,13 @@ impl EntityPass {
         textures: &TextureRegistry,
         vertices: &mut Vec<EntityVertex>,
     ) -> BuiltDraw {
-        let ModelRef::Player { parts, .. } = draw.model;
         let model = entity_models::model_for(draw.model);
         let colour = [draw.light, draw.light, draw.light, 1.0];
 
         let mut built = BuiltDraw {
             shadow: None,
             body: 0..0,
+            layers: Vec::new(),
             cape: None,
             hurt: draw.hurt > 0.0 || draw.death > 0.0,
         };
@@ -737,34 +809,55 @@ impl EntityPass {
             built.shadow = Some(start..vertices.len() as u32);
         }
 
-        // The body: the model's parts with the cape's bit cleared — the cape is its own build
+        // The body: the model's parts posed by the model's own pose. The player's model
+        // takes the parts byte with the cape's bit cleared — the cape is its own build
         // through its own sheet.
         let mut rots = model.rest();
-        player::pose(&draw.pose, parts & !player::PART_CAPE, &mut rots);
-        let body = build_vertices(model, &rots, player::PLAYER_TEXTURE_SIZE);
+        entity_models::pose(draw.model, &draw.pose, &mut rots);
+        let body = build_vertices(model, &rots, entity_models::texture_size(draw.model));
         let chain = body_chain(draw);
         let start = vertices.len() as u32;
         push_vertices(vertices, &body, chain, colour);
         built.body = start..vertices.len() as u32;
 
+        // The layers draw after the model, in the source's list order
+        // (`RenderLiving.renderModel` walks its layer renderers after the main model), each
+        // through its own sheet with its tint multiplied into the vertex colour.
+        for layer in entity_models::layers::draw_layers(draw.model, &draw.extra, &draw.pose) {
+            let layer_vertices = build_vertices(layer.model, &layer.transforms, layer.texture_size);
+            let tint = [
+                draw.light * layer.tint[0],
+                draw.light * layer.tint[1],
+                draw.light * layer.tint[2],
+                1.0,
+            ];
+            let start = vertices.len() as u32;
+            push_vertices(vertices, &layer_vertices, chain, tint);
+            built
+                .layers
+                .push((start..vertices.len() as u32, layer.texture));
+        }
+
         // The cape: the layer's own box, wave and chain.
-        if parts & player::PART_CAPE != 0 {
-            if let TextureRef::Skin { uuid, .. } = &draw.texture {
-                if textures.cape(uuid).is_some() {
-                    let rot = player::cape_rot(&draw.pose, parts);
-                    let cape = build_vertices(
-                        &player::MODEL_PLAYER_CAPE,
-                        std::slice::from_ref(&rot),
-                        player::CAPE_TEXTURE_SIZE,
-                    );
-                    let motion = match draw.pose.extra {
-                        PoseExtra::Player(cape) => cape.motion,
-                        PoseExtra::None => [0.0; 3],
-                    };
-                    let angles = player::cape_rotation(&draw.pose, motion);
-                    let start = vertices.len() as u32;
-                    push_vertices(vertices, &cape, cape_chain(draw, angles), colour);
-                    built.cape = Some(start..vertices.len() as u32);
+        if let ModelRef::Player { parts, .. } = draw.model {
+            if parts & player::PART_CAPE != 0 {
+                if let TextureRef::Skin { uuid, .. } = &draw.texture {
+                    if textures.cape(uuid).is_some() {
+                        let rot = player::cape_rot(&draw.pose, parts);
+                        let cape = build_vertices(
+                            &player::MODEL_PLAYER_CAPE,
+                            std::slice::from_ref(&rot),
+                            player::CAPE_TEXTURE_SIZE,
+                        );
+                        let motion = match draw.pose.extra {
+                            PoseExtra::Player(cape) => cape.motion,
+                            _ => [0.0; 3],
+                        };
+                        let angles = player::cape_rotation(&draw.pose, motion);
+                        let start = vertices.len() as u32;
+                        push_vertices(vertices, &cape, cape_chain(draw, angles), colour);
+                        built.cape = Some(start..vertices.len() as u32);
+                    }
                 }
             }
         }
@@ -773,27 +866,24 @@ impl EntityPass {
 }
 
 /// The body chain for a draw: the source's `renderLivingAt` composition — the interpolated
-/// position, the `180 - body_yaw` turn, the death tilt, the `(-1, -1, 1)` flip, the player
-/// renderer's `0.9375` pre-render scale, the `-1.5078125` model drop and the sneak lift,
-/// then the model's own 1/16 units (`Render.doRender`, `RenderPlayer`'s pre-render callback,
-/// `RendererLivingEntity.doRender`).
+/// position, the `180 - body_yaw` turn, the death tilt with the class's own extra roll, the
+/// `(-1, -1, 1)` flip, the class's pre-render scale, the `-1.5078125` model drop and the
+/// model's own sneak lift, then the model's 1/16 units (`Render.doRender`, the renderer's
+/// pre-render callback, `RendererLivingEntity.doRender`).
 fn body_chain(draw: &EntityDraw) -> Mat4 {
+    let [_, lift] = entity_models::sneak_terms(draw.model);
     let position = Vec3::new(
         draw.position[0] as f32,
-        draw.position[1] as f32 - sneak_drop(&draw.pose),
+        draw.position[1] as f32 - sneak_drop(draw),
         draw.position[2] as f32,
     );
-    let death = (draw.death * DEATH_MAX_ROTATION).to_radians();
-    let lift = if draw.pose.sneak {
-        SNEAK_MODEL_LIFT
-    } else {
-        0.0
-    };
+    let tilt = draw.death * DEATH_MAX_ROTATION + entity_models::corpse_roll(draw.model, &draw.pose);
+    let lift = if draw.pose.sneak { lift } else { 0.0 };
     Mat4::from_translation(position)
         * Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians())
-        * Mat4::from_rotation_z(death)
+        * Mat4::from_rotation_z(tilt.to_radians())
         * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
-        * Mat4::from_scale(Vec3::splat(RENDER_SCALE))
+        * Mat4::from_scale(Vec3::splat(entity_models::render_scale(draw.model)))
         * Mat4::from_translation(Vec3::new(0.0, MODEL_DROP, 0.0))
         * Mat4::from_translation(Vec3::new(0.0, lift, 0.0))
         * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
@@ -804,7 +894,7 @@ fn body_chain(draw: &EntityDraw) -> Mat4 {
 fn cape_chain(draw: &EntityDraw, angles: [f32; 3]) -> Mat4 {
     let position = Vec3::new(
         draw.position[0] as f32,
-        draw.position[1] as f32 - sneak_drop(&draw.pose),
+        draw.position[1] as f32 - sneak_drop(draw),
         draw.position[2] as f32,
     );
     let death = (draw.death * DEATH_MAX_ROTATION).to_radians();
@@ -812,7 +902,7 @@ fn cape_chain(draw: &EntityDraw, angles: [f32; 3]) -> Mat4 {
         * Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians())
         * Mat4::from_rotation_z(death)
         * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
-        * Mat4::from_scale(Vec3::splat(RENDER_SCALE))
+        * Mat4::from_scale(Vec3::splat(entity_models::render_scale(draw.model)))
         * Mat4::from_translation(Vec3::new(0.0, MODEL_DROP, 0.0))
         * Mat4::from_translation(Vec3::new(0.0, 0.0, CAPE_OFFSET))
         * Mat4::from_rotation_x(angles[0].to_radians())
@@ -846,6 +936,8 @@ struct BuiltDraw {
     shadow: Option<Range<u32>>,
     /// The model's range.
     body: Range<u32>,
+    /// The layers' ranges with their sheets' registry keys, in the model's layer order.
+    layers: Vec<(Range<u32>, &'static str)>,
     /// The cape's range, when both the bit and a texture are present.
     cape: Option<Range<u32>>,
     /// Whether the hurt combine draws over the body.
@@ -897,9 +989,14 @@ fn entity_lights(rotation: Mat3) -> [[f32; 3]; 2] {
     [l0.normalize().into(), l1.normalize().into()]
 }
 
-/// The sneaking player's own drop, in blocks (`RenderPlayer.doRender`).
-fn sneak_drop(pose: &entity_models::Pose) -> f32 {
-    if pose.sneak { SNEAK_POSITION_DROP } else { 0.0 }
+/// The position drop a sneaking draw takes, in blocks: the player's own renderer drops it a
+/// sneak's eighth (`RenderPlayer.doRender`); the mob renderers do not.
+fn sneak_drop(draw: &EntityDraw) -> f32 {
+    if draw.pose.sneak {
+        entity_models::sneak_terms(draw.model)[0]
+    } else {
+        0.0
+    }
 }
 
 /// Pushes a built vertex set through `chain` with the draw's colour.
@@ -1094,19 +1191,9 @@ const FRAGMENT_SHADOW: &str = "fs_shadow";
 /// The alpha below which the model and hurt fragments discard: the client's own tenth.
 const CUTOUT_ALPHA: f32 = 0.1;
 
-/// The player's render shrink (`RenderPlayer.preRenderCallback`).
-const RENDER_SCALE: f32 = 0.9375;
-
 /// The drop the living renderer puts under every model, in blocks
 /// (`RendererLivingEntity.doRender`: `translate(0, -1.5078125, 0)`).
 const MODEL_DROP: f32 = -1.5078125;
-
-/// The sneaking player's own position drop, in blocks (`RenderPlayer.doRender`).
-const SNEAK_POSITION_DROP: f32 = 0.125;
-
-/// The model's own sneak lift, in blocks (`ModelBiped.render`'s `translate(0, 0.2, 0)`); the
-/// model frame's y runs downwards after the flip, so the lift lowers the model.
-const SNEAK_MODEL_LIFT: f32 = 0.2;
 
 /// The cape layer's own forward offset, in blocks (`LayerCape.doRenderLayer`).
 const CAPE_OFFSET: f32 = 0.125;
@@ -1408,5 +1495,99 @@ mod tests {
         let feet = body_chain(&draw).transform_point3(Vec3::new(0.0, 24.0, 0.0));
         let plain = body_chain(&player_draw()).transform_point3(Vec3::new(0.0, 24.0, 0.0));
         assert!((feet[1] - (plain[1] - 0.125 - 0.1875)).abs() < 1.0e-4);
+    }
+
+    /// A mob draw: the player template's inputs with the kind's model.
+    fn mob_draw(model: ModelRef) -> EntityDraw {
+        EntityDraw {
+            model,
+            ..player_draw()
+        }
+    }
+
+    #[test]
+    fn the_giant_scales_sixfold_where_the_zombie_stands_unscaled() {
+        // The chain's pre-render scale is the class's own (`RenderGiantZombie.preRenderCallback`:44);
+        // the same model point lands at six times the zombie's height.
+        let zombie = body_chain(&mob_draw(ModelRef::Zombie));
+        let giant = body_chain(&mob_draw(ModelRef::Giant));
+        let sample = Vec3::new(0.0, -8.0, 0.0);
+        let zombie_y = zombie.transform_point3(sample).y;
+        let giant_y = giant.transform_point3(sample).y;
+        assert!(
+            (giant_y - 6.0 * zombie_y).abs() < 1.0e-4,
+            "the giant stands sixfold: {giant_y} against the zombie's {zombie_y}"
+        );
+        // The villager's pre-render scale shrinks it a sixteenth short of the block
+        // (`RenderVillager.preRenderCallback`:62-74), and its child's half of that.
+        let villager = body_chain(&mob_draw(ModelRef::Villager {
+            profession: 0,
+            child: false,
+        }));
+        let child = body_chain(&mob_draw(ModelRef::Villager {
+            profession: 0,
+            child: true,
+        }));
+        let villager_y = villager.transform_point3(sample).y;
+        let child_y = child.transform_point3(sample).y;
+        assert!(
+            (villager_y - 0.9375 * zombie_y).abs() < 1.0e-4,
+            "the villager scales 0.9375: {villager_y} against the zombie's {zombie_y}"
+        );
+        assert!(
+            (child_y - 0.5 * villager_y).abs() < 1.0e-4,
+            "the child villager halves its size: {child_y} against {villager_y}"
+        );
+    }
+
+    #[test]
+    fn the_mobs_take_the_models_sneak_lift_without_the_players_drop() {
+        // A mob's position takes no drop — the player's own renderer takes that eighth
+        // (`RenderPlayer.doRender`) and drops nothing else — while the biped models' own
+        // render still lifts the model a fifth (`ModelBiped.render`); the models off
+        // `ModelBase` take neither.
+        let mut sneak_zombie = mob_draw(ModelRef::Zombie);
+        sneak_zombie.pose.sneak = true;
+        let walk_zombie = body_chain(&mob_draw(ModelRef::Zombie));
+        let sneak = body_chain(&sneak_zombie);
+        let sample = Vec3::new(0.0, -8.0, 0.0);
+        let sneak_y = sneak.transform_point3(sample).y;
+        let walk_y = walk_zombie.transform_point3(sample).y;
+        assert!(
+            (sneak_y - (walk_y - 0.2)).abs() < 1.0e-4,
+            "the zombie's model lifts a fifth on a sneak: {sneak_y} against {walk_y}"
+        );
+        // The chain's whole shift is the model's own lift for the mob (-0.2) and the lift
+        // plus the player's eighth for the player (-0.3125).
+        let mob_shift = sneak.w_axis.y - walk_zombie.w_axis.y;
+        assert!(
+            (mob_shift - (-0.2)).abs() < 1.0e-4,
+            "the mob's chain shifts by the lift alone: {mob_shift}"
+        );
+        // The pig's model carries no sneak term at all.
+        let mut sneak_pig = mob_draw(ModelRef::Pig { saddle: false });
+        sneak_pig.pose.sneak = true;
+        let walk_pig = body_chain(&mob_draw(ModelRef::Pig { saddle: false }));
+        let pig_y = body_chain(&sneak_pig).transform_point3(sample).y;
+        let pig_walk_y = walk_pig.transform_point3(sample).y;
+        assert!(
+            (pig_y - pig_walk_y).abs() < 1.0e-6,
+            "the quadruped's model takes no sneak term: {pig_y} against {pig_walk_y}"
+        );
+        // And the player's own drop still lands on its chain, an eighth below the mob's
+        // own shift.
+        let mut sneak_player = player_draw();
+        sneak_player.pose.sneak = true;
+        let sneak_chain = body_chain(&sneak_player);
+        let walk_chain = body_chain(&player_draw());
+        let player_shift = sneak_chain.w_axis.y - walk_chain.w_axis.y;
+        assert!(
+            (player_shift - (-0.3125)).abs() < 1.0e-4,
+            "the player's chain shifts by the lift and the drop: {player_shift}"
+        );
+        assert!(
+            (player_shift - -(0.2 * 0.9375 + 0.125)).abs() < 1.0e-4,
+            "the player's shift is its scaled lift plus the eighth: {player_shift}"
+        );
     }
 }

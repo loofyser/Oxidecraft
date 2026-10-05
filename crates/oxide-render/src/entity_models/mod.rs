@@ -25,7 +25,11 @@ use glam::{Mat4, Vec3};
 
 use crate::entity_pass::ModelRef;
 
+pub mod layers;
 pub mod player;
+pub mod quadrupeds;
+
+pub mod bipeds;
 
 /// A box of a part: the cuboid `ModelBox` expands into six quads.
 ///
@@ -55,7 +59,7 @@ pub struct Box {
 /// The rest rotation seeds the part's [`Rot`] slot; a part with no rest rotation leaves the
 /// slot at zero. Children are drawn inside the part's transform, in order, after the part's
 /// own boxes (`ModelRenderer.render`).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Part {
     /// The pivot the part turns around, in 1/16 model units (`ModelRenderer.rotationPoint*`).
     pub point: [f32; 3],
@@ -76,14 +80,20 @@ pub struct Model {
 
 /// One part's pose state: where it hangs, how it is turned and whether it draws.
 ///
-/// The three fields are the three mutable pieces of a `ModelRenderer` a pose function writes:
-/// `rotationPointX/Y/Z`, `rotateAngleX/Y/Z` and `showModel`.
+/// The fields are the mutable pieces of a `ModelRenderer` a pose function writes:
+/// `rotationPointX/Y/Z`, `rotateAngleX/Y/Z`, `offsetX/Y/Z` and `showModel`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rot {
     /// The pivot, in 1/16 model units.
     pub point: [f32; 3],
     /// The rotation in radians, `(x, y, z)`.
     pub angles: [f32; 3],
+    /// The part's own offset, `ModelRenderer.render`'s `offsetX/Y/Z`, in the source's own
+    /// value: it translates by the offset unscaled where its pivot is weighted a sixteenth
+    /// of a block, so the offset is in blocks — the local step weights it sixteenfold into
+    /// the model's units. It slides the part, its boxes and its children before the pivot
+    /// turn and leaves the offset behind after them (`ModelRenderer.render`:137,`:202`).
+    pub offset: [f32; 3],
     /// Whether the part (and so its children) draws this frame.
     pub visible: bool,
 }
@@ -97,6 +107,20 @@ pub enum PoseExtra {
     None,
     /// The player model's own: the cape layer's motion term.
     Player(player::CapeMotion),
+    /// The skeleton's own: whether the class is the wither type, whose living-animation rule
+    /// turns on the aim pose (`ModelSkeleton.setLivingAnimations`:43).
+    Skeleton {
+        /// Whether the skeleton type is the wither one (`getSkeletonType() == 1`).
+        aimed_bow: bool,
+    },
+    /// The witch's own: the held-item gate for the nose's hold state and the entity's id,
+    /// which the nose's idle sway reads (`ModelWitch.setRotationAngles`:51-60).
+    Witch {
+        /// Whether the witch holds an item (`getHeldItem() != null`).
+        holding: bool,
+        /// The entity's own id, the sway's seed (`getEntityId() % 10`).
+        entity_id: i32,
+    },
 }
 
 /// The frame's shared pose input.
@@ -170,6 +194,7 @@ fn rest_of(part: &Part, out: &mut Vec<Rot>) {
     out.push(Rot {
         point: part.point,
         angles: part.rest,
+        offset: [0.0; 3],
         visible: true,
     });
     for child in part.children {
@@ -218,9 +243,11 @@ fn walk(
     if !rot.visible {
         return;
     }
-    // `ModelRenderer.render`'s own composition: the pivot first, then z, y and x — each turn
-    // about its axis, in that order.
-    let local = Mat4::from_translation(Vec3::from(rot.point))
+    // `ModelRenderer.render`'s own composition: the part's offset first — the source's
+    // value in blocks, weighted sixteenfold into the model's units — then the pivot and
+    // the turns z, y and x, each turn about its axis, in that order.
+    let local = Mat4::from_translation(Vec3::from(rot.offset) * 16.0)
+        * Mat4::from_translation(Vec3::from(rot.point))
         * Mat4::from_rotation_z(rot.angles[2])
         * Mat4::from_rotation_y(rot.angles[1])
         * Mat4::from_rotation_x(rot.angles[0]);
@@ -313,6 +340,21 @@ fn push_box(b: &Box, world: Mat4, texture: [f32; 2], out: &mut Vertices) {
     }
 }
 
+/// The player renderer's own pre-render scale (`RenderPlayer.preRenderCallback`), shared by
+/// the villager's and the witch's (`RenderVillager.preRenderCallback`:62-74,
+/// `RenderWitch.preRenderCallback`:47-48): the source's `0.9375F`, the default every
+/// pre-render callback starts from.
+pub const RENDER_SCALE: f32 = 0.9375;
+
+/// The drop a sneaking player's position takes, in blocks (`RenderPlayer.doRender`'s
+/// `-0.125`): the player's renderer alone drops the position; a mob renderer does not.
+pub const SNEAK_POSITION_DROP: f32 = 0.125;
+
+/// The model's own lift while it sneaks, in the model's pre-scale blocks
+/// (`ModelBiped.render`:107-110's `translate(0, 0.2, 0)`, inherited by every biped subclass;
+/// `ModelVillager`, `ModelIronGolem`, `ModelSnowMan` and the quadrupeds add none).
+pub const SNEAK_MODEL_LIFT: f32 = 0.2;
+
 /// The model a draw's reference names.
 pub fn model_for(reference: ModelRef) -> &'static Model {
     match reference {
@@ -323,23 +365,191 @@ pub fn model_for(reference: ModelRef) -> &'static Model {
                 &player::MODEL_PLAYER_WIDE
             }
         }
+        ModelRef::Zombie | ModelRef::Giant => &bipeds::MODEL_ZOMBIE,
+        ModelRef::ZombieVillager => &bipeds::MODEL_ZOMBIE_VILLAGER,
+        ModelRef::Skeleton => &bipeds::MODEL_SKELETON,
+        ModelRef::Villager { .. } => &bipeds::MODEL_VILLAGER,
+        ModelRef::Witch => &bipeds::MODEL_WITCH,
+        ModelRef::SnowGolem => &bipeds::MODEL_SNOW_GOLEM,
+        ModelRef::IronGolem => &bipeds::MODEL_IRON_GOLEM,
+        ModelRef::Pig { .. } => &quadrupeds::MODEL_PIG,
+        ModelRef::Cow | ModelRef::Mooshroom => &quadrupeds::MODEL_COW,
+        ModelRef::Sheep { .. } => &quadrupeds::MODEL_SHEEP,
     }
 }
 
-/// The drawn entity class's own height in blocks: the size constant its class sets
-/// (`EntityPlayer` sets `0.6` by `1.8`), which the nametag offset stands on.
+/// The sheet size the model's uvs divide through: the `setTextureSize` call of the model
+/// class the reference names (`ModelBase`'s own `64` by `32` default for the classes that
+/// never set one).
+pub fn texture_size(reference: ModelRef) -> [f32; 2] {
+    match reference {
+        ModelRef::Player { .. } => player::PLAYER_TEXTURE_SIZE,
+        ModelRef::Zombie | ModelRef::ZombieVillager | ModelRef::Giant => [64.0, 64.0],
+        ModelRef::Skeleton => [64.0, 32.0],
+        ModelRef::Villager { .. } => [64.0, 64.0],
+        ModelRef::Witch => [64.0, 128.0],
+        ModelRef::SnowGolem => [64.0, 64.0],
+        ModelRef::IronGolem => [128.0, 128.0],
+        ModelRef::Pig { .. } | ModelRef::Cow | ModelRef::Sheep { .. } | ModelRef::Mooshroom => {
+            [64.0, 32.0]
+        }
+    }
+}
+
+/// The sheets the model draws with, in draw order: its own sheet and then its layers', by the
+/// pass's registry keys.
+///
+/// The player is absent: a player's sheet resolves through the skin registry by profile, not
+/// by a key.
+pub fn textures(reference: ModelRef) -> &'static [&'static str] {
+    match reference {
+        ModelRef::Player { .. } => &[],
+        ModelRef::Zombie | ModelRef::Giant => &["entity/zombie/zombie.png"],
+        ModelRef::ZombieVillager => &["entity/zombie/zombie_villager.png"],
+        ModelRef::Skeleton => &["entity/skeleton/skeleton.png"],
+        ModelRef::Villager { profession, .. } => match profession {
+            0 => &["entity/villager/farmer.png"],
+            1 => &["entity/villager/librarian.png"],
+            2 => &["entity/villager/priest.png"],
+            3 => &["entity/villager/smith.png"],
+            4 => &["entity/villager/butcher.png"],
+            _ => &["entity/villager/villager.png"],
+        },
+        ModelRef::Witch => &["entity/witch.png"],
+        ModelRef::SnowGolem => &["entity/snowman.png"],
+        ModelRef::IronGolem => &["entity/iron_golem.png"],
+        ModelRef::Pig { .. } => &["entity/pig/pig.png", "entity/pig/pig_saddle.png"],
+        ModelRef::Cow => &["entity/cow/cow.png"],
+        ModelRef::Sheep { .. } => &["entity/sheep/sheep.png", "entity/sheep/sheep_fur.png"],
+        ModelRef::Mooshroom => &["entity/cow/mooshroom.png"],
+    }
+}
+
+/// The model's pose for a draw, dispatched to the model class the reference names.
+pub fn pose(reference: ModelRef, pose: &Pose, out: &mut [Rot]) {
+    match reference {
+        ModelRef::Player { parts, .. } => player::pose(pose, parts & !player::PART_CAPE, out),
+        ModelRef::Zombie | ModelRef::Giant | ModelRef::ZombieVillager => {
+            bipeds::pose_zombie(pose, out);
+        }
+        ModelRef::Skeleton => bipeds::pose_skeleton(pose, out),
+        ModelRef::Villager { .. } => bipeds::pose_villager(pose, out),
+        ModelRef::Witch => bipeds::pose_witch(pose, out),
+        ModelRef::SnowGolem => bipeds::pose_snow_golem(pose, out),
+        ModelRef::IronGolem => bipeds::pose_iron_golem(pose, out),
+        ModelRef::Pig { .. } => quadrupeds::pose_pig(pose, out),
+        ModelRef::Cow | ModelRef::Mooshroom => quadrupeds::pose_quadruped(pose, out),
+        ModelRef::Sheep { .. } => quadrupeds::pose_sheep(pose, out),
+    }
+}
+
+/// The drawn entity class's own height in blocks: the size constant its class sets — the
+/// zombie's `0.6` by `1.95` (`EntityZombie.java`:79), the skeleton's (`EntitySkeleton.java`:388),
+/// the witch's (`EntityWitch.java`:47), the villager's `1.8` (`EntityVillager.java`:108), the
+/// giant's sixfold `1.8` (`EntityGiantZombie.java`:12 over `Entity`'s own size), the snow
+/// golem's `1.9` (`EntitySnowman.java`:29), the iron golem's `2.9` (`EntityIronGolem.java`:48)
+/// and the quadrupeds' `0.9`/`1.3` (`EntityPig.java`:35, `EntityCow.java`:27) — which the
+/// nametag offset stands on.
 pub fn height(reference: ModelRef) -> f32 {
     match reference {
         ModelRef::Player { .. } => 1.8,
+        ModelRef::Zombie | ModelRef::ZombieVillager | ModelRef::Witch => 1.95,
+        ModelRef::Skeleton => 1.95,
+        ModelRef::Villager { child, .. } => {
+            // The child's own scale half (`EntityAgeable.java`:229-231): 1.8 becomes 0.9.
+            if child { 0.9 } else { 1.8 }
+        }
+        ModelRef::Giant => 10.8,
+        ModelRef::SnowGolem => 1.9,
+        ModelRef::IronGolem => 2.9,
+        ModelRef::Pig { .. } => 0.9,
+        ModelRef::Cow | ModelRef::Sheep { .. } | ModelRef::Mooshroom => 1.3,
     }
 }
 
 /// The shadow quad's size in blocks and its opacity factor, per the class's renderer: the
-/// player's renderer is built with `0.5F`, and the base renderer's opacity default is one.
+/// size each renderer is registered with (`RenderManager.java`:142-166 — `0.7F` for the
+/// quadrupeds, `0.5F` for the bipeds; the giant's is its `0.5F` grown by its sixfold scale,
+/// `RenderGiantZombie`'s constructor) and the child villager's own `0.25F`
+/// (`RenderVillager.preRenderCallback`:67); the base renderer's opacity default is one.
 pub fn shadow(reference: ModelRef) -> [f32; 2] {
     match reference {
-        ModelRef::Player { .. } => [0.5, 1.0],
+        ModelRef::Player { .. }
+        | ModelRef::Zombie
+        | ModelRef::ZombieVillager
+        | ModelRef::Skeleton
+        | ModelRef::Witch
+        | ModelRef::SnowGolem
+        | ModelRef::IronGolem => [0.5, 1.0],
+        ModelRef::Villager { child, .. } => {
+            if child {
+                [0.25, 1.0]
+            } else {
+                [0.5, 1.0]
+            }
+        }
+        ModelRef::Giant => [3.0, 1.0],
+        ModelRef::Pig { .. } | ModelRef::Cow | ModelRef::Sheep { .. } | ModelRef::Mooshroom => {
+            [0.7, 1.0]
+        }
     }
+}
+
+/// The pre-render scale the class scales its model by: [`RENDER_SCALE`] for the player, the
+/// villager and the witch (`RenderPlayer`'s, `RenderVillager`'s and `RenderWitch`'s own
+/// callbacks; the mob renderers off `RenderLiving` never scale), the villager child's own
+/// half of it (`RenderVillager.preRenderCallback`:66), and the giant's sixfold one
+/// (`RenderGiantZombie.preRenderCallback`:44, registered with `6.0F` at
+/// `RenderManager.java`:162).
+pub fn render_scale(reference: ModelRef) -> f32 {
+    match reference {
+        ModelRef::Player { .. } | ModelRef::Witch => RENDER_SCALE,
+        ModelRef::Villager { child, .. } => {
+            if child {
+                RENDER_SCALE * 0.5
+            } else {
+                RENDER_SCALE
+            }
+        }
+        ModelRef::Giant => 6.0,
+        _ => 1.0,
+    }
+}
+
+/// The sneak terms a model's render path carries, in blocks: the position drop the renderer
+/// takes and the lift the model itself adds.
+///
+/// The player's renderer drops the position an eighth (`RenderPlayer.doRender`) and the model
+/// lifts [`SNEAK_MODEL_LIFT`] (`ModelBiped.render`); the mob bipeds that inherit
+/// `ModelBiped.render` lift but do not drop, and the classes off `ModelBiped` do neither.
+pub fn sneak_terms(reference: ModelRef) -> [f32; 2] {
+    match reference {
+        ModelRef::Player { .. } => [SNEAK_POSITION_DROP, SNEAK_MODEL_LIFT],
+        ModelRef::Zombie | ModelRef::ZombieVillager | ModelRef::Skeleton | ModelRef::Giant => {
+            [0.0, SNEAK_MODEL_LIFT]
+        }
+        _ => [0.0, 0.0],
+    }
+}
+
+/// The extra roll the class's renderer turns into `rotateCorpse`, in degrees, after the death
+/// tilt: the iron golem's walking lean (`RenderIronGolem.rotateCorpse`:31-37 — the folded
+/// thirteen-tick wave of its limb pair, `6.5` degrees at its full swing, only while the walk
+/// is running). Every other class adds none.
+pub fn corpse_roll(reference: ModelRef, pose: &Pose) -> f32 {
+    match reference {
+        ModelRef::IronGolem if pose.limb_swing_amount >= 0.01 => {
+            6.5 * folded_wave(pose.limb_swing + 6.0, 13.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// The folded wave `ModelIronGolem.func_78172_a` folds a value by: a saw-tooth about a
+/// period, one at the fold's peaks and minus one at its trough —
+/// `(|value % period - period * 0.5| - period * 0.25) / (period * 0.25)`.
+pub fn folded_wave(value: f32, period: f32) -> f32 {
+    ((value % period - period * 0.5).abs() - period * 0.25) / (period * 0.25)
 }
 
 #[cfg(test)]
@@ -411,6 +621,7 @@ mod tests {
         vec![Rot {
             point: [0.0, 0.0, 0.0],
             angles: [0.0, 0.0, 0.0],
+            offset: [0.0; 3],
             visible: true,
         }]
     }
@@ -426,6 +637,7 @@ mod tests {
         let transforms = [Rot {
             point: [2.0, 12.0, 2.0],
             angles: [PI / 2.0, 0.0, 0.0],
+            offset: [0.0; 3],
             visible: true,
         }];
         let vertices = build_vertices(&PLAIN_MODEL, &transforms, [64.0, 64.0]);
@@ -465,11 +677,13 @@ mod tests {
             Rot {
                 point: [2.0, 12.0, 2.0],
                 angles: [0.0, PI / 2.0, 0.0],
+                offset: [0.0; 3],
                 visible: true,
             },
             Rot {
                 point: [0.0, 8.0, 0.0],
                 angles: [PI / 2.0, 0.0, 0.0],
+                offset: [0.0; 3],
                 visible: true,
             },
         ];
@@ -699,5 +913,210 @@ mod tests {
             &crate::entity_models::player::MODEL_PLAYER_SLIM
         ));
         assert_eq!(shadow(wide), [0.5, 1.0]);
+    }
+
+    #[test]
+    fn the_mob_registry_pairs_each_kind_with_its_model_height_and_sheet() {
+        // The heights are each class's own `setSize` (`EntityZombie.java`:79, the skeleton
+        // type 0 at `EntitySkeleton.java`:388, `EntityWitch.java`:47, `EntityVillager.java`:108,
+        // `EntityIronGolem.java`:48, `EntitySnowman.java`:29, `EntityPig.java`:35,
+        // `EntityCow.java`:27, `EntitySheep.java`:66) and the giant's sixfold scale over the
+        // base class's default (`EntityGiantZombie.java`:12, `EntityMob`'s 0.6x1.8).
+        let cases = [
+            (ModelRef::Zombie, 1.95, [0.5, 1.0], [64.0, 64.0]),
+            (ModelRef::ZombieVillager, 1.95, [0.5, 1.0], [64.0, 64.0]),
+            (ModelRef::Skeleton, 1.95, [0.5, 1.0], [64.0, 32.0]),
+            (
+                ModelRef::Villager {
+                    profession: 0,
+                    child: false,
+                },
+                1.8,
+                [0.5, 1.0],
+                [64.0, 64.0],
+            ),
+            (
+                ModelRef::Villager {
+                    profession: 0,
+                    child: true,
+                },
+                0.9,
+                [0.25, 1.0],
+                [64.0, 64.0],
+            ),
+            (ModelRef::Witch, 1.95, [0.5, 1.0], [64.0, 128.0]),
+            (ModelRef::Giant, 10.8, [3.0, 1.0], [64.0, 64.0]),
+            (ModelRef::SnowGolem, 1.9, [0.5, 1.0], [64.0, 64.0]),
+            (ModelRef::IronGolem, 2.9, [0.5, 1.0], [128.0, 128.0]),
+            (
+                ModelRef::Pig { saddle: false },
+                0.9,
+                [0.7, 1.0],
+                [64.0, 32.0],
+            ),
+            (ModelRef::Cow, 1.3, [0.7, 1.0], [64.0, 32.0]),
+            (
+                ModelRef::Sheep {
+                    wool: 0,
+                    sheared: false,
+                },
+                1.3,
+                [0.7, 1.0],
+                [64.0, 32.0],
+            ),
+            (ModelRef::Mooshroom, 1.3, [0.7, 1.0], [64.0, 32.0]),
+        ];
+        for (reference, height_wanted, shadow_wanted, size_wanted) in cases {
+            assert_eq!(height(reference), height_wanted, "{reference:?}'s height");
+            assert_eq!(shadow(reference), shadow_wanted, "{reference:?}'s shadow");
+            assert_eq!(
+                texture_size(reference),
+                size_wanted,
+                "{reference:?}'s sheet size"
+            );
+        }
+        // The giant draws the zombie's own model six times over.
+        assert!(std::ptr::eq(
+            model_for(ModelRef::Giant),
+            &crate::entity_models::bipeds::MODEL_ZOMBIE
+        ));
+        // The mooshroom is the cow's model (`RenderMooshroom`'s `ModelCow`, line 9).
+        assert!(std::ptr::eq(
+            model_for(ModelRef::Mooshroom),
+            &crate::entity_models::quadrupeds::MODEL_COW
+        ));
+    }
+
+    #[test]
+    fn the_mob_textures_name_the_sources_sheets() {
+        // Each key is the class's own resource location, `textures/` dropped for the
+        // registry's namespace: `RenderZombie.java`:18-19, `RenderSkeleton.java`:12,
+        // `RenderVillager.java`:11-16, `RenderWitch.java`:11, `RenderGiantZombie.java`:13,
+        // `RenderSnowMan.java`:10, `RenderIronGolem.java`:11, `RenderPig.java`:10,
+        // `RenderCow.java`:9, `RenderSheep.java`:10, `RenderMooshroom.java`:10.
+        assert_eq!(textures(ModelRef::Zombie), ["entity/zombie/zombie.png"]);
+        assert_eq!(
+            textures(ModelRef::ZombieVillager),
+            ["entity/zombie/zombie_villager.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::Skeleton),
+            ["entity/skeleton/skeleton.png"]
+        );
+        assert_eq!(textures(ModelRef::Witch), ["entity/witch.png"]);
+        // The giant has no sheet of its own: it draws `RenderGiantZombie`'s zombie sheet
+        // (line 13), not the `entity/giant.png` a quick guess would name.
+        assert_eq!(textures(ModelRef::Giant), ["entity/zombie/zombie.png"]);
+        assert_eq!(textures(ModelRef::SnowGolem), ["entity/snowman.png"]);
+        assert_eq!(textures(ModelRef::IronGolem), ["entity/iron_golem.png"]);
+        assert_eq!(textures(ModelRef::Cow), ["entity/cow/cow.png"]);
+        assert_eq!(textures(ModelRef::Mooshroom), ["entity/cow/mooshroom.png"]);
+        // The layered kinds carry their layers' sheets beside the base one: the saddle and
+        // the fur come from `LayerSaddle.java`:10 and `LayerSheepWool.java`:12.
+        assert_eq!(
+            textures(ModelRef::Pig { saddle: true }),
+            ["entity/pig/pig.png", "entity/pig/pig_saddle.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::Sheep {
+                wool: 0,
+                sheared: false
+            }),
+            ["entity/sheep/sheep.png", "entity/sheep/sheep_fur.png"]
+        );
+        // The professions pick their sheets (`RenderVillager.getEntityTexture`:32-56); any
+        // value off the wire falls back to the plain villager sheet, the source's default.
+        let sheet = |profession| match textures(ModelRef::Villager {
+            profession,
+            child: false,
+        })[0]
+        {
+            "entity/villager/farmer.png" => 0,
+            "entity/villager/librarian.png" => 1,
+            "entity/villager/priest.png" => 2,
+            "entity/villager/smith.png" => 3,
+            "entity/villager/butcher.png" => 4,
+            "entity/villager/villager.png" => 5,
+            other => panic!("unexpected villager sheet {other}"),
+        };
+        assert_eq!(
+            [
+                sheet(0),
+                sheet(1),
+                sheet(2),
+                sheet(3),
+                sheet(4),
+                sheet(5),
+                sheet(255)
+            ],
+            [0, 1, 2, 3, 4, 5, 5]
+        );
+    }
+
+    #[test]
+    fn the_sneak_terms_and_corpse_rolls_are_the_kinds_own() {
+        // The player's renderer drops a sneak's eighth (`RenderPlayer.doRender`) and the
+        // biped models lift the model a fifth (`ModelBiped.render`); the mob models off
+        // `ModelBase` carry no sneak term at all — `ModelVillager` and `ModelWitch` never
+        // read `isSneak` — and the quadrupeds take neither.
+        let player = ModelRef::Player {
+            slim: false,
+            parts: 0x7F,
+        };
+        assert_eq!(sneak_terms(player), [0.125, 0.2]);
+        assert_eq!(sneak_terms(ModelRef::Zombie), [0.0, 0.2]);
+        assert_eq!(sneak_terms(ModelRef::ZombieVillager), [0.0, 0.2]);
+        assert_eq!(sneak_terms(ModelRef::Skeleton), [0.0, 0.2]);
+        assert_eq!(sneak_terms(ModelRef::Giant), [0.0, 0.2]);
+        assert_eq!(
+            sneak_terms(ModelRef::Villager {
+                profession: 0,
+                child: false
+            }),
+            [0.0, 0.0]
+        );
+        assert_eq!(sneak_terms(ModelRef::Witch), [0.0, 0.0]);
+        assert_eq!(sneak_terms(ModelRef::Pig { saddle: false }), [0.0, 0.0]);
+        assert_eq!(sneak_terms(ModelRef::IronGolem), [0.0, 0.0]);
+        // The iron golem leans into its walk (`RenderIronGolem.rotateCorpse`:28-34): on a
+        // whole stride (limb swing 6.5 of the fold) the lean is six and a half degrees over
+        // the wave's four-thirteenths.
+        let walking = Pose {
+            limb_swing: 6.5,
+            limb_swing_amount: 1.0,
+            ..Pose::default()
+        };
+        assert_eq!(corpse_roll(ModelRef::IronGolem, &walking), 5.5);
+        // Below a hundredth of a stride the source's own guard leaves the body upright.
+        let still = Pose {
+            limb_swing: 6.5,
+            limb_swing_amount: 0.005,
+            ..Pose::default()
+        };
+        assert_eq!(corpse_roll(ModelRef::IronGolem, &still), 0.0);
+        // Every other kind stands upright, the walking or not.
+        assert_eq!(corpse_roll(ModelRef::Pig { saddle: false }, &walking), 0.0);
+        assert_eq!(corpse_roll(player, &walking), 0.0);
+        // The villager's child half-scales the model (`RenderVillager.preRenderCallback`);
+        // the witch's and the adult villager's own scale is the player renderer's.
+        assert_eq!(render_scale(player), 0.9375);
+        assert_eq!(
+            render_scale(ModelRef::Villager {
+                profession: 0,
+                child: true
+            }),
+            0.46875
+        );
+        assert_eq!(
+            render_scale(ModelRef::Villager {
+                profession: 0,
+                child: false
+            }),
+            0.9375
+        );
+        assert_eq!(render_scale(ModelRef::Witch), 0.9375);
+        assert_eq!(render_scale(ModelRef::Giant), 6.0);
+        assert_eq!(render_scale(ModelRef::Zombie), 1.0);
+        assert_eq!(render_scale(ModelRef::Cow), 1.0);
     }
 }

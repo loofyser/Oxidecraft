@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use oxide_assets::skins::{DefaultModel, default_skin};
-use oxide_game::entity_view::EntityFrame;
+use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
 use oxide_game::session::ClientEvent;
 use oxide_render::entity_models::player::CapeMotion;
 use oxide_render::entity_models::{Pose, PoseExtra};
@@ -135,22 +135,6 @@ fn draw_for(
     if frame.invisible {
         return None;
     }
-    if frame.kind != EntityKind::Player {
-        tracing::debug!(kind = ?frame.kind, "the entity kind has no model yet");
-        return None;
-    }
-    let Some(uuid) = frame.uuid.clone() else {
-        tracing::debug!(
-            id = frame.id,
-            "a player without a profile cannot be looked up"
-        );
-        return None;
-    };
-    let slim = match skins.get(&uuid) {
-        Some(update) => update.model == DefaultModel::Slim,
-        None => default_skin(&uuid) == DefaultModel::Slim,
-    };
-
     let position = interpolate_position(frame.prev, frame.pos, partial);
     let body_yaw = interpolate_rotation(
         frame.prev_render_yaw_offset,
@@ -184,8 +168,67 @@ fn draw_for(
         0.0
     };
 
+    // The kind's own channel: a player's skin and cape terms, a mob's model, sheet and
+    // extras. The kinds with neither draw nothing.
+    let (model, texture, draw_extra, pose_extra, child) = match &frame.extra {
+        EntityExtra::Player => {
+            let Some(uuid) = frame.uuid.clone() else {
+                tracing::debug!(
+                    id = frame.id,
+                    "a player without a profile cannot be looked up"
+                );
+                return None;
+            };
+            let slim = match skins.get(&uuid) {
+                Some(update) => update.model == DefaultModel::Slim,
+                None => default_skin(&uuid) == DefaultModel::Slim,
+            };
+            // The cape layer's wave reads the frame pair's own displacement — the window's
+            // stand-in for the smoothed chaser and camera-yaw terms its state cannot
+            // produce (`CapeMotion`).
+            (
+                ModelRef::Player {
+                    slim,
+                    parts: ALL_PARTS,
+                },
+                TextureRef::Skin { uuid, slim },
+                DrawExtra::None,
+                PoseExtra::Player(CapeMotion {
+                    motion: [
+                        (frame.pos[0] - frame.prev[0]) as f32,
+                        (frame.pos[1] - frame.prev[1]) as f32,
+                        (frame.pos[2] - frame.prev[2]) as f32,
+                    ],
+                }),
+                false,
+            )
+        }
+        EntityExtra::Mob(mob) => match mob_draw(frame.kind, frame.id, mob) {
+            Some(terms) => terms,
+            None => {
+                tracing::debug!(kind = ?frame.kind, "the entity kind has no model yet");
+                return None;
+            }
+        },
+        other => {
+            tracing::debug!(
+                kind = ?frame.kind,
+                extra = ?other,
+                "the entity kind has no model yet"
+            );
+            return None;
+        }
+    };
+
+    // A child's limb swing runs three times as fast before the pose reads it
+    // (`RendererLivingEntity.doRender`:140-143).
+    let mut limb_swing = frame.limb_swing - frame.limb_swing_amount * (1.0 - partial);
+    if child {
+        limb_swing *= 3.0;
+    }
+
     let pose = Pose {
-        limb_swing: frame.limb_swing - frame.limb_swing_amount * (1.0 - partial),
+        limb_swing,
         limb_swing_amount: frame.prev_limb_swing_amount
             + (frame.limb_swing_amount - frame.prev_limb_swing_amount) * partial,
         age: frame.age as f32 + partial,
@@ -196,36 +239,160 @@ fn draw_for(
         swing_progress: swing,
         hurt,
         death,
-        child: false,
-        // The cape layer's wave reads the frame pair's own displacement — the window's
-        // stand-in for the smoothed chaser and camera-yaw terms its state cannot produce
-        // (`CapeMotion`).
-        extra: PoseExtra::Player(CapeMotion {
-            motion: [
-                (frame.pos[0] - frame.prev[0]) as f32,
-                (frame.pos[1] - frame.prev[1]) as f32,
-                (frame.pos[2] - frame.prev[2]) as f32,
-            ],
-        }),
+        child,
+        extra: pose_extra,
     };
 
     Some(EntityDraw {
-        model: ModelRef::Player {
-            slim,
-            parts: ALL_PARTS,
-        },
+        model,
         position,
         body_yaw,
         head_yaw,
         head_pitch,
         pose,
-        texture: TextureRef::Skin { uuid, slim },
+        texture,
         light: frame.brightness,
         hurt,
         death,
         health: frame.health,
-        extra: DrawExtra::None,
+        extra: draw_extra,
     })
+}
+
+/// The draw terms one mob frame's kind and metadata name: the model, the sheet, the
+/// renderer's extras and the pose's own, plus whether the frame is a child.
+///
+/// The mapping is each renderer's own: the zombie's villager flag swaps in the villager
+/// zombie's model and sheet (`RenderZombie.getEntityTexture`:101-104), the skeleton
+/// draws its thin-limbed model off the skeleton sheet (`RenderSkeleton`), the villager's
+/// profession picks the sheet out of the renderer's table with its own default
+/// (`RenderVillager.getEntityTexture`:105-126), the witch's nose gate reads the held
+/// stack (`RenderWitch`, not carried by the frames; [`PoseExtra::Witch`]), the giant
+/// draws the zombie model and sheet sixfold (`RenderGiantZombie`), and the quadrupeds
+/// draw their class sheets (`RenderPig`/`RenderCow`/`RenderSheep`/`RenderMooshroom`).
+/// `None` for a kind without a model.
+fn mob_draw(
+    kind: EntityKind,
+    entity_id: i32,
+    mob: &MobExtra,
+) -> Option<(ModelRef, TextureRef, DrawExtra, PoseExtra, bool)> {
+    let terms = match (kind, mob) {
+        (EntityKind::Zombie, MobExtra::Zombie { villager: true }) => (
+            ModelRef::ZombieVillager,
+            TextureRef::Named("entity/zombie/zombie_villager.png"),
+            DrawExtra::ZombieVillager,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Zombie, _) => (
+            ModelRef::Zombie,
+            TextureRef::Named("entity/zombie/zombie.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Skeleton, _) => (
+            ModelRef::Skeleton,
+            TextureRef::Named("entity/skeleton/skeleton.png"),
+            DrawExtra::None,
+            PoseExtra::Skeleton { aimed_bow: false },
+            false,
+        ),
+        (EntityKind::Villager, MobExtra::Villager { profession, child }) => (
+            ModelRef::Villager {
+                profession: *profession,
+                child: *child,
+            },
+            TextureRef::Named(villager_sheet(*profession)),
+            DrawExtra::Villager {
+                profession: *profession,
+                child: *child,
+            },
+            PoseExtra::None,
+            *child,
+        ),
+        (EntityKind::Witch, _) => (
+            ModelRef::Witch,
+            TextureRef::Named("entity/witch.png"),
+            DrawExtra::None,
+            PoseExtra::Witch {
+                holding: false,
+                entity_id,
+            },
+            false,
+        ),
+        (EntityKind::Giant, _) => (
+            ModelRef::Giant,
+            TextureRef::Named("entity/zombie/zombie.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::SnowMan, _) => (
+            ModelRef::SnowGolem,
+            TextureRef::Named("entity/snowman.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::VillagerGolem, _) => (
+            ModelRef::IronGolem,
+            TextureRef::Named("entity/iron_golem.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Pig, MobExtra::Pig { saddle }) => (
+            ModelRef::Pig { saddle: *saddle },
+            TextureRef::Named("entity/pig/pig.png"),
+            DrawExtra::Pig { saddle: *saddle },
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Cow, _) => (
+            ModelRef::Cow,
+            TextureRef::Named("entity/cow/cow.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Sheep, MobExtra::Sheep { wool, sheared }) => (
+            ModelRef::Sheep {
+                wool: *wool,
+                sheared: *sheared,
+            },
+            TextureRef::Named("entity/sheep/sheep.png"),
+            DrawExtra::Sheep {
+                wool: *wool,
+                sheared: *sheared,
+            },
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::MushroomCow, _) => (
+            ModelRef::Mooshroom,
+            TextureRef::Named("entity/cow/mooshroom.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        _ => return None,
+    };
+    Some(terms)
+}
+
+/// The villager's sheet for a profession: the renderer's table indexed by the profession
+/// with its own fallback (`RenderVillager.getEntityTexture`:105-126: farmer, librarian,
+/// priest, smith, butcher; anything else the plain villager sheet).
+fn villager_sheet(profession: u8) -> &'static str {
+    match profession {
+        0 => "entity/villager/farmer.png",
+        1 => "entity/villager/librarian.png",
+        2 => "entity/villager/priest.png",
+        3 => "entity/villager/smith.png",
+        4 => "entity/villager/butcher.png",
+        _ => "entity/villager/villager.png",
+    }
 }
 
 /// The position between the pair: the current one outright when the step is a teleport
@@ -263,7 +430,7 @@ mod tests {
     use std::time::Duration;
 
     use oxide_assets::skins::DefaultModel;
-    use oxide_game::entity_view::{EntityExtra, EntityFrame};
+    use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
     use oxide_render::entity_models::PoseExtra;
     use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
     use oxide_render::entity_pass::{ModelRef, TextureRef};
@@ -309,7 +476,7 @@ mod tests {
             brightness: 0.65,
             health: None,
             nametag: None,
-            extra: EntityExtra::None,
+            extra: EntityExtra::Player,
         }
     }
 
@@ -589,5 +756,197 @@ mod tests {
         frame.death_ticks = 40;
         view.observe(vec![frame], t0);
         assert_eq!(draws_at(&view, t0, Duration::ZERO)[0].death, 1.0);
+    }
+
+    /// A mob frame: the player template's pairs with the kind's own channel.
+    fn mob_frame(id: i32, kind: EntityKind, extra: EntityExtra) -> EntityFrame {
+        let mut frame = player_frame(id, UUID_WIDE);
+        frame.uuid = None;
+        frame.kind = kind;
+        frame.extra = extra;
+        frame
+    }
+
+    #[test]
+    fn every_new_kind_maps_to_its_model_sheet_and_extras() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![
+                mob_frame(
+                    1,
+                    EntityKind::Zombie,
+                    EntityExtra::Mob(MobExtra::Zombie { villager: false }),
+                ),
+                mob_frame(
+                    2,
+                    EntityKind::Zombie,
+                    EntityExtra::Mob(MobExtra::Zombie { villager: true }),
+                ),
+                mob_frame(3, EntityKind::Skeleton, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(
+                    4,
+                    EntityKind::Villager,
+                    EntityExtra::Mob(MobExtra::Villager {
+                        profession: 4,
+                        child: false,
+                    }),
+                ),
+                mob_frame(5, EntityKind::Witch, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(6, EntityKind::Giant, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(7, EntityKind::SnowMan, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(
+                    8,
+                    EntityKind::VillagerGolem,
+                    EntityExtra::Mob(MobExtra::Other),
+                ),
+                mob_frame(
+                    9,
+                    EntityKind::Pig,
+                    EntityExtra::Mob(MobExtra::Pig { saddle: true }),
+                ),
+                mob_frame(10, EntityKind::Cow, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(
+                    11,
+                    EntityKind::Sheep,
+                    EntityExtra::Mob(MobExtra::Sheep {
+                        wool: 9,
+                        sheared: false,
+                    }),
+                ),
+                mob_frame(
+                    12,
+                    EntityKind::MushroomCow,
+                    EntityExtra::Mob(MobExtra::Other),
+                ),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 12, "every mapped mob draws");
+        let expected = [
+            (ModelRef::Zombie, "entity/zombie/zombie.png"),
+            (
+                ModelRef::ZombieVillager,
+                "entity/zombie/zombie_villager.png",
+            ),
+            (ModelRef::Skeleton, "entity/skeleton/skeleton.png"),
+            (
+                ModelRef::Villager {
+                    profession: 4,
+                    child: false,
+                },
+                "entity/villager/butcher.png",
+            ),
+            (ModelRef::Witch, "entity/witch.png"),
+            (ModelRef::Giant, "entity/zombie/zombie.png"),
+            (ModelRef::SnowGolem, "entity/snowman.png"),
+            (ModelRef::IronGolem, "entity/iron_golem.png"),
+            (ModelRef::Pig { saddle: true }, "entity/pig/pig.png"),
+            (ModelRef::Cow, "entity/cow/cow.png"),
+            (
+                ModelRef::Sheep {
+                    wool: 9,
+                    sheared: false,
+                },
+                "entity/sheep/sheep.png",
+            ),
+            (ModelRef::Mooshroom, "entity/cow/mooshroom.png"),
+        ];
+        for (draw, (model, sheet)) in draws.iter().zip(expected) {
+            assert_eq!(draw.model, model);
+            assert_eq!(draw.texture, TextureRef::Named(sheet));
+        }
+        // The extras: the zombie villager's flag, the villager's profession pair, the
+        // pig's saddle and the sheep's wool; the pose carries the skeleton's aim state
+        // and the witch's hold gate seeded by the entity's own id
+        // (`ModelWitch.setRotationAngles`:51-60).
+        assert_eq!(draws[1].extra, DrawExtra::ZombieVillager);
+        assert_eq!(
+            draws[3].extra,
+            DrawExtra::Villager {
+                profession: 4,
+                child: false
+            }
+        );
+        assert_eq!(draws[8].extra, DrawExtra::Pig { saddle: true });
+        assert_eq!(
+            draws[10].extra,
+            DrawExtra::Sheep {
+                wool: 9,
+                sheared: false
+            }
+        );
+        assert_eq!(
+            draws[2].pose.extra,
+            PoseExtra::Skeleton { aimed_bow: false }
+        );
+        assert_eq!(
+            draws[4].pose.extra,
+            PoseExtra::Witch {
+                holding: false,
+                entity_id: 5
+            }
+        );
+        // Every draw names a zone the window and the pass share; the non-villager mobs
+        // carry no child term.
+        assert!(draws.iter().all(|draw| !draw.pose.child));
+    }
+
+    #[test]
+    fn a_child_villager_runs_its_limbs_threefold_and_carries_the_child_term() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![mob_frame(
+                4,
+                EntityKind::Villager,
+                EntityExtra::Mob(MobExtra::Villager {
+                    profession: 0,
+                    child: true,
+                }),
+            )],
+            t0,
+        );
+        let draw = &draws_at(&view, t0, TICK / 2)[0];
+        assert_eq!(
+            draw.model,
+            ModelRef::Villager {
+                profession: 0,
+                child: true
+            }
+        );
+        assert_eq!(
+            draw.texture,
+            TextureRef::Named("entity/villager/farmer.png")
+        );
+        assert!(draw.pose.child);
+        // `RendererLivingEntity.doRender`:140-143: a child's limb swing runs threefold
+        // before the pose reads it — (1 - 0.5 * (1 - 0.5)) * 3 = 2.25.
+        assert!(
+            (draw.pose.limb_swing - 2.25).abs() < 1.0e-4,
+            "the child's limb swing: {}",
+            draw.pose.limb_swing
+        );
+    }
+
+    #[test]
+    fn an_unmapped_kind_draws_nothing() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        // A kind beyond this milestone's kinds, and a mapped kind whose channel is not a
+        // mob's: both draw nothing.
+        view.observe(
+            vec![
+                mob_frame(
+                    1,
+                    EntityKind::Bat,
+                    EntityExtra::Mob(MobExtra::Bat { hanging: true }),
+                ),
+                mob_frame(2, EntityKind::Pig, EntityExtra::None),
+            ],
+            t0,
+        );
+        assert_eq!(draws_at(&view, t0, Duration::ZERO).len(), 0);
     }
 }

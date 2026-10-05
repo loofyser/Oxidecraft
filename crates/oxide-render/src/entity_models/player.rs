@@ -415,6 +415,7 @@ pub fn cape_rot(pose: &Pose, parts: u8) -> Rot {
     Rot {
         point: [0.0, if pose.sneak { 2.0 } else { 0.0 }, 0.0],
         angles: [0.0, 0.0, 0.0],
+        offset: [0.0; 3],
         visible: parts & PART_CAPE != 0,
     }
 }
