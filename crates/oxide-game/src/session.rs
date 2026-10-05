@@ -67,7 +67,7 @@ use oxide_proto_v47::serverbound::{
 };
 use oxide_proto_v47::ui::{
     ChatMessage, ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam,
-    TabHeaderFooter,
+    TabHeaderFooter, write_chat,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
@@ -671,6 +671,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // packet, and there is no held-repeat path
         // (`GuiGameOver.actionPerformed:57-77` sends one on the button's click).
         let mut respawn_requests: u32 = 0;
+        // The chat messages the window's field sent since the last drain:
+        // each is answered with exactly one Chat Message packet (play id
+        // 0x01), in send order (`GuiChat.keyTyped`:104-137 sends on the
+        // Enter press, one message per press).
+        let mut chat_messages: Vec<String> = Vec::new();
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -710,6 +715,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         &mut right_presses,
                                     );
                                 }
+                                InputEvent::SendChat { text } => chat_messages.push(text),
                                 other => looked |= apply_input(other, &mut intent, &mut player),
                             }
                         }
@@ -723,6 +729,23 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             for _ in 0..std::mem::take(&mut respawn_requests) {
                 let request =
                     payload_of(|out| write_client_status(out, ClientStatusAction::Respawn))?;
+                send_reply(&mut conn, &request)?;
+            }
+            // Each queued chat message goes out now, one packet per send, in
+            // the order the field sent them: `write_chat` is the protocol's
+            // own Chat Message (play id 0x01), the message as a
+            // length-prefixed UTF-8 string. The field's 100-character cap is
+            // the field's — nothing is cut here — so a message that slipped
+            // past it still goes out whole, with the guard's log as the only
+            // record that the field's rule was broken.
+            for text in std::mem::take(&mut chat_messages) {
+                if chat_over_cap(&text) {
+                    debug!(
+                        chars = text.chars().count(),
+                        "the chat message is past the field's 100-character cap"
+                    );
+                }
+                let request = write_chat(&text);
                 send_reply(&mut conn, &request)?;
             }
             // A look moves the aim at once — the mouse is polled between
@@ -1822,6 +1845,22 @@ fn update_aim(
     }
 }
 
+/// The chat field's character cap: `GuiChat.initGui`'s own
+/// `setMaxStringLength(100)` (`GuiChat.java`:59).
+///
+/// The field enforces it; the session keeps the same number for its guard
+/// over a message that slipped past the field.
+const CHAT_FIELD_CAP: usize = 100;
+
+/// Whether a chat message is past the field's cap, counted in characters.
+///
+/// The field counts characters (`GuiTextField.setMaxStringLength` over
+/// `String.length`, `GuiChat.java`:59) and so does this — a message of a
+/// hundred multibyte characters is within the cap.
+fn chat_over_cap(text: &str) -> bool {
+    text.chars().count() > CHAT_FIELD_CAP
+}
+
 /// Applies one window event to the held input and the player's look, and
 /// answers whether the look moved.
 ///
@@ -1831,6 +1870,10 @@ fn update_aim(
 /// (`Entity.java:395`). A focus loss releases every held key, so a window that
 /// stops receiving leaves nothing held. A moved look asks for the aim to be
 /// recomputed before the next tick.
+///
+/// The chat send has no arm here to reach: every [`InputEvent::SendChat`] is
+/// collected by the play loop's drain — and written there — before this sees
+/// it, and its arm below is match completeness only.
 fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> bool {
     match event {
         InputEvent::Key { key, pressed } => {
@@ -1851,6 +1894,9 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
             intent.release_all();
             false
         }
+        // The chat send was already collected and written by the drain; it
+        // carries no held key and no look, so nothing here applies.
+        InputEvent::SendChat { .. } => false,
     }
 }
 
@@ -3028,8 +3074,8 @@ mod tests {
     use oxide_world::world::World;
 
     use super::{
-        ASSUMED_HELD_BLOCK, ClientEvent, Clock, END_OF_SESSION_WAIT, MeshAssets, MeshQueue,
-        TICK_PERIOD, finish_meshes, mesh_pool, step_tick,
+        ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT, MeshAssets,
+        MeshQueue, TICK_PERIOD, chat_over_cap, finish_meshes, mesh_pool, step_tick,
     };
     use crate::entity_view::PlayerList;
     use crate::input::Intent;
@@ -3300,5 +3346,19 @@ mod tests {
             reported.try_iter().next().is_none(),
             "nothing was reported of a build that never finished"
         );
+    }
+
+    #[test]
+    fn the_chat_guard_reads_the_fields_hundred_character_cap() {
+        // `GuiChat.initGui` sets the field's cap to 100 (`GuiChat.java`:59
+        // over `GuiTextField.setMaxStringLength`:639-647); the session's
+        // guard is the backstop for a message that slipped past the field,
+        // so its boundary is 100 clear and 101 flagged, counted in
+        // characters rather than bytes.
+        assert_eq!(CHAT_FIELD_CAP, 100);
+        assert!(!chat_over_cap(&"x".repeat(100)));
+        assert!(chat_over_cap(&"x".repeat(101)));
+        assert!(!chat_over_cap(&"é".repeat(100)), "characters, not bytes");
+        assert!(chat_over_cap(&"é".repeat(101)));
     }
 }

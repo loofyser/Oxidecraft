@@ -21,7 +21,11 @@
 /// One physical key the client binds.
 ///
 /// The source binds many more; these are the movement keys and the sprint key
-/// M3's input surface names (`GameSettings.java:127-133`).
+/// M3's input surface names (`GameSettings.java:127-133`) plus the chat keys
+/// M4 adds: the two openers (`keyBindChat`, `keyBindCommand` — `:139`, `:141`)
+/// and the editing keys the open chat field reads (`GuiChat.keyTyped`:87-138).
+/// Escape is not here: the capture and chat rules route it before the key
+/// table, so it needs no slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     /// Forward: `keyBindForward`, key code 17.
@@ -38,6 +42,25 @@ pub enum Key {
     ShiftLeft,
     /// Sprint: `keyBindSprint`, key code 29.
     ControlLeft,
+    /// The chat key: `keyBindChat`, key code 20; T opens the field.
+    T,
+    /// The command key: `keyBindCommand`, key code 53; `/` opens the field
+    /// with its slash.
+    Slash,
+    /// Tab: the field's completion key, consumed and deferred (`GuiChat.keyTyped`:91-94).
+    Tab,
+    /// Enter: the field's send key (`:104-137`).
+    Enter,
+    /// Backspace: the field's delete key (`GuiTextField.textboxKeyTyped`:378-391).
+    Backspace,
+    /// The left arrow: the field's cursor moves back (`GuiTextField.textboxKeyTyped`:405-426).
+    ArrowLeft,
+    /// The right arrow: the field's cursor moves on (`GuiTextField.textboxKeyTyped`:428-449).
+    ArrowRight,
+    /// The up arrow: the field recalls its last sent message (`GuiChat.getSentHistory`:275-292).
+    ArrowUp,
+    /// The down arrow: the recall walks forward again (`GuiChat.getSentHistory`:275-292).
+    ArrowDown,
 }
 
 /// One mouse button the client binds.
@@ -50,7 +73,12 @@ pub enum MouseButton {
 }
 
 /// One input event, as the window reports it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// The derive drops the `Copy` this enum carried through M3: [`InputEvent::SendChat`]
+/// carries owned text, so an event that travels — a queued script flip, a
+/// drain that keeps its events — moves or clones rather than being copied
+/// implicitly.
+#[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
     /// A physical key was pressed or released.
     Key {
@@ -78,10 +106,26 @@ pub enum InputEvent {
     },
     /// The window lost focus: every held key is released.
     FocusLost,
+    /// The chat field sent a message: the text, exactly as the field's trim
+    /// left it.
+    ///
+    /// The field's non-empty gate and its trim have already run (`GuiChat.keyTyped`:104-137
+    /// hands `sendChatMessage` the trimmed text); the session
+    /// writes the message as one Chat Message (play id 0x01) and nothing
+    /// else. The field's 100-character cap is the field's; the session only
+    /// logs a message that slipped past it.
+    SendChat {
+        /// The message text, exactly as the field sent it.
+        text: String,
+    },
 }
 
 /// How many physical keys the intent tracks.
-const KEY_COUNT: usize = 7;
+///
+/// The movement and sprint keys and the chat keys the field rides; the count
+/// is the [`Key`] variant count so [`Key::index`] stays total, but only the
+/// gameplay keys drive any intent.
+const KEY_COUNT: usize = 16;
 
 /// The sneak input scale: `MovementInputFromOptions.java:42-46` multiplies
 /// both movement axes by 0.3 while sneak is held.
@@ -135,7 +179,29 @@ impl Key {
             Key::Space => 4,
             Key::ShiftLeft => 5,
             Key::ControlLeft => 6,
+            Key::T => 7,
+            Key::Slash => 8,
+            Key::Tab => 9,
+            Key::Enter => 10,
+            Key::Backspace => 11,
+            Key::ArrowLeft => 12,
+            Key::ArrowRight => 13,
+            Key::ArrowUp => 14,
+            Key::ArrowDown => 15,
         }
+    }
+
+    /// Whether the gameplay intent tracks this key.
+    ///
+    /// The movement update reads the movement slots only — the chat keys
+    /// carry slots so the index space stays total but drive no movement — and
+    /// the window's gameplay translation filters on this, so a chat key's
+    /// edge never travels to the session as gameplay input.
+    pub fn is_gameplay(self) -> bool {
+        matches!(
+            self,
+            Key::W | Key::A | Key::S | Key::D | Key::Space | Key::ShiftLeft | Key::ControlLeft
+        )
     }
 }
 
@@ -539,5 +605,74 @@ mod tests {
         assert!(left.0 < 0.0, "a leftward delta turns left: {left:?}");
         let up = look_delta(0.0, -10.0, 0.5);
         assert!(up.1 < 0.0, "an upward delta looks up: {up:?}");
+    }
+
+    #[test]
+    fn the_chat_keys_hold_slots_but_leave_the_intent_neutral() {
+        // The keys the chat rides carry held slots so the index space stays
+        // total (the enum orders the intent's `held` array); they drive no
+        // movement, so any of them alone leaves the intent neutral.
+        for key in [
+            Key::T,
+            Key::Slash,
+            Key::Tab,
+            Key::Enter,
+            Key::Backspace,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::ArrowUp,
+            Key::ArrowDown,
+        ] {
+            let mut intent = Intent::neutral();
+            intent.apply_key(key, true);
+            let motion = (
+                intent.forward,
+                intent.strafe,
+                intent.jump,
+                intent.sneak,
+                intent.sprint,
+            );
+            assert_eq!(
+                motion,
+                (0.0, 0.0, false, false, false),
+                "{key:?} drives no movement"
+            );
+            intent.apply_key(key, false);
+            assert_eq!(
+                (
+                    intent.forward,
+                    intent.strafe,
+                    intent.jump,
+                    intent.sneak,
+                    intent.sprint
+                ),
+                (0.0, 0.0, false, false, false)
+            );
+        }
+        // The gameplay set is exactly the movement keys and the sprint key.
+        for key in [
+            Key::W,
+            Key::A,
+            Key::S,
+            Key::D,
+            Key::Space,
+            Key::ShiftLeft,
+            Key::ControlLeft,
+        ] {
+            assert!(key.is_gameplay(), "{key:?} is gameplay input");
+        }
+        for key in [
+            Key::T,
+            Key::Slash,
+            Key::Tab,
+            Key::Enter,
+            Key::Backspace,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::ArrowUp,
+            Key::ArrowDown,
+        ] {
+            assert!(!key.is_gameplay(), "{key:?} is not gameplay input");
+        }
     }
 }

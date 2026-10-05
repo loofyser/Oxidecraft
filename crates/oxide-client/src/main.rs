@@ -19,6 +19,12 @@
 //! through the same channel and writes one CSV line per session tick to `<path>.log`; the
 //! directive grammar and the log's shape are [`ScriptDriver`]'s.
 //!
+//! The chat rides the same stream: T (or `/`) opens the field while the pointer is grabbed,
+//! its characters arrive as text and its editing keys through [`keymap`], and Enter sends
+//! one [`InputEvent::SendChat`]. While it is open the pointer frees, the look stills and the
+//! wheel scrolls the log; Escape closes it and touches nothing else. The field and its
+//! routing are [`ChatInput`]'s and [`ClientApp::on_key`]'s.
+//!
 //! With `--server` the client also loads the asset store's extraction tree before the window
 //! opens ([`assets::ClientAssets`]) and hands the atlas, the font and the sky textures to the
 //! renderer once it exists. Without a server nothing is loaded and the M0 smoke path stands;
@@ -66,7 +72,8 @@ use skin_worker::{SkinRequest, SkinUpdate};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
-    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton as WinitMouseButton, WindowEvent,
+    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton as WinitMouseButton,
+    MouseScrollDelta, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop};
 use winit::keyboard::{Key as WinitKey, NamedKey, PhysicalKey};
@@ -151,13 +158,25 @@ fn parse_server_address(address: &str) -> anyhow::Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
-/// One input-script directive: one event, due at one session tick.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One input-script directive: one action, due at one session tick.
+#[derive(Debug, Clone, PartialEq)]
 struct Directive {
     /// The tick the directive is applied at, once the session's count reaches it.
     tick: u64,
-    /// The event injected then.
-    event: InputEvent,
+    /// What the directive does then.
+    action: DirectiveAction,
+}
+
+/// What one script directive does.
+#[derive(Debug, Clone, PartialEq)]
+enum DirectiveAction {
+    /// One input event, injected into the session's channel exactly as the
+    /// window's own events are.
+    Input(InputEvent),
+    /// The `chat` macro's message: the field opens, the text goes through
+    /// the character path and the send leaves on the line's own tick — the
+    /// same field machine the window's T and typing drive, not a shortcut.
+    Chat(String),
 }
 
 /// The `--input-script` replay: the parsed directives and the tick log.
@@ -217,6 +236,15 @@ impl ScriptDriver {
     /// once: the session's count starts at zero, but the window sees it only
     /// from the tick it first receives.
     ///
+    /// A `chat` directive drives the window's own field: it opens, the text
+    /// goes through the character path and Enter's send leaves for the
+    /// session on this tick; a line that arrives while the field is already
+    /// open is refused and logged. A `look` directive's delta is not
+    /// forwarded while the field is open — the mouse then moves the window's
+    /// cursor, the source's screen rule, not the camera. The field's owner
+    /// runs the window's own follow-ups (the pointer rules are the window's;
+    /// a rig run has no pointer to free).
+    ///
     /// A log write failure is returned to the caller. A send failure is not
     /// fatal: a closed channel means the session ended.
     #[allow(clippy::too_many_arguments)]
@@ -229,14 +257,45 @@ impl ScriptDriver {
         yaw: f32,
         pitch: f32,
         on_ground: bool,
+        chat: &mut ChatInput,
     ) -> std::io::Result<()> {
         writeln!(self.log, "{tick},{x},{y},{z},{yaw},{pitch},{on_ground}")?;
         while let Some(directive) = self.directives.get(self.applied) {
             if directive.tick > tick {
                 break;
             }
-            if self.input_tx.send(directive.event).is_err() {
-                tracing::warn!("the session's input channel is closed; the script stopped");
+            match &directive.action {
+                DirectiveAction::Input(event) => {
+                    if chat.open && matches!(event, InputEvent::MouseDelta { .. }) {
+                        tracing::debug!(
+                            "a look while the chat is open moves the window's cursor, not the camera"
+                        );
+                    } else if self.input_tx.send(event.clone()).is_err() {
+                        tracing::warn!("the session's input channel is closed; the script stopped");
+                    }
+                }
+                DirectiveAction::Chat(text) => {
+                    if chat.open {
+                        tracing::warn!(
+                            text = %text,
+                            "the chat is already open; the chat directive was refused"
+                        );
+                    } else {
+                        // The same field machine the window's T, typing and
+                        // Enter drive — the filter and the cap run as they
+                        // would for a player — and the send leaves on this
+                        // line's own tick.
+                        chat.open("");
+                        chat.type_text(text);
+                        if let ChatKey::Send(send) = chat.key(Key::Enter) {
+                            if self.input_tx.send(send).is_err() {
+                                tracing::warn!(
+                                    "the session's input channel is closed; the script stopped"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             self.applied += 1;
         }
@@ -248,9 +307,16 @@ impl ScriptDriver {
 ///
 /// The format is one directive per line — a decimal tick, then the directive
 /// and its arguments: `12 key W down`, `15 mouse Left up`, `18 look 40 -5`.
-/// Fields are whitespace-separated; a `#` starts a comment that runs to the
-/// end of the line, and blank lines are ignored. A line the grammar does not
-/// cover is refused, and the refusal names its line number.
+/// A `chat` line is the one whose argument is free text: `<tick> chat <text>`
+/// opens the chat field, types `text` through the character path and sends it
+/// on the tick — the same field machine the window's T, typing and Enter
+/// drive — and a `chat` line while the chat is already open is refused. While
+/// the chat is open a `look` directive moves the window's cursor rather than
+/// the camera, the same rule the window's own mouse follows, so its delta is
+/// not forwarded while the field is open. Fields are whitespace-separated; a
+/// `#` starts a comment that runs to the end of the line, and blank lines are
+/// ignored. A line the grammar does not cover is refused, and the refusal
+/// names its line number.
 fn parse_script(text: &str) -> anyhow::Result<Vec<Directive>> {
     let mut directives = Vec::new();
     for (index, raw) in text.lines().enumerate() {
@@ -263,15 +329,18 @@ fn parse_script(text: &str) -> anyhow::Result<Vec<Directive>> {
             continue;
         }
         let fields: Vec<&str> = code.split_whitespace().collect();
-        let directive =
-            parse_directive(&fields).with_context(|| format!("input script line {}", index + 1))?;
+        let directive = parse_directive(code, &fields)
+            .with_context(|| format!("input script line {}", index + 1))?;
         directives.push(directive);
     }
     Ok(directives)
 }
 
 /// Parses one line's fields: the tick, then one directive with its arguments.
-fn parse_directive(fields: &[&str]) -> anyhow::Result<Directive> {
+///
+/// `code` is the line's own text, comment stripped and trimmed: the `chat`
+/// directive's message is the rest of it after the name, spaces and all.
+fn parse_directive(code: &str, fields: &[&str]) -> anyhow::Result<Directive> {
     let Some((&tick, rest)) = fields.split_first() else {
         anyhow::bail!("the line has no tick");
     };
@@ -281,13 +350,33 @@ fn parse_directive(fields: &[&str]) -> anyhow::Result<Directive> {
     let Some((&name, arguments)) = rest.split_first() else {
         anyhow::bail!("the tick is not followed by a directive");
     };
-    let event = match name {
-        "key" => parse_key(arguments)?,
-        "mouse" => parse_mouse(arguments)?,
-        "look" => parse_look(arguments)?,
-        other => anyhow::bail!("{other:?} is not one of key, mouse or look"),
+    let action = match name {
+        "key" => DirectiveAction::Input(parse_key(arguments)?),
+        "mouse" => DirectiveAction::Input(parse_mouse(arguments)?),
+        "look" => DirectiveAction::Input(parse_look(arguments)?),
+        "chat" => DirectiveAction::Chat(chat_text(code)?),
+        other => anyhow::bail!("{other:?} is not one of key, mouse, look or chat"),
     };
-    Ok(Directive { tick, event })
+    Ok(Directive { tick, action })
+}
+
+/// The message of a `chat` directive: everything after the name on the line,
+/// leading whitespace stripped.
+///
+/// The message is kept as written — spaces inside it and all — because it is
+/// the field that filters and trims it as the message goes out, exactly as a
+/// typed one. A line with nothing after the name is refused here.
+fn chat_text(code: &str) -> anyhow::Result<String> {
+    let after_tick = code
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or_default();
+    let text = after_tick
+        .strip_prefix("chat")
+        .unwrap_or_default()
+        .trim_start();
+    anyhow::ensure!(!text.is_empty(), "the chat directive has no message");
+    Ok(text.to_string())
 }
 
 /// Parses a `key <name> down|up` directive.
@@ -430,6 +519,9 @@ struct ClientApp {
     view: view::View,
     /// The chat mirror: the session's chat messages and the frame's hud draws for them.
     chat: view::ChatView,
+    /// The chat field: the text, the cursor and the open state the window's
+    /// keys and the script's `chat` lines drive.
+    chat_input: ChatInput,
     /// The skin worker's request feed, when a session was opened.
     ///
     /// Dropping it — the client drops it with the app at exit — closes the
@@ -824,6 +916,7 @@ impl ClientApp {
                 }
                 None => view::ChatView::new(),
             },
+            chat_input: ChatInput::default(),
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
             overlay_visible,
@@ -899,8 +992,16 @@ impl ClientApp {
             } = &event
             {
                 if let Some(script) = self.script.as_mut() {
-                    if let Err(error) = script.observe(*tick, *x, *y, *z, *yaw, *pitch, *on_ground)
-                    {
+                    if let Err(error) = script.observe(
+                        *tick,
+                        *x,
+                        *y,
+                        *z,
+                        *yaw,
+                        *pitch,
+                        *on_ground,
+                        &mut self.chat_input,
+                    ) {
                         // The record of the run is broken; stop rather than
                         // pretend the measurement is whole.
                         tracing::error!(%error, "the tick log could not be written");
@@ -908,6 +1009,12 @@ impl ClientApp {
                         event_loop.exit();
                         return;
                     }
+                }
+                // The chat field's blink steps on the session's tick — the
+                // source runs its counter from `GuiChat.updateScreen`
+                // (`:78-81`).
+                if self.chat_input.open {
+                    self.chat_input.tick();
                 }
                 self.camera.observe(CameraTick {
                     position: [*x, *y, *z],
@@ -1090,15 +1197,24 @@ impl ClientApp {
         }
     }
 
-    /// Routes one keyboard event: the window's shortcuts, then the gameplay keys.
+    /// Routes one keyboard event: the window's shortcuts, the chat's own
+    /// routing, then the gameplay keys.
     ///
-    /// The shortcuts always work; gameplay keys are translated from the
-    /// physical key and flow only while the pointer is grabbed — while it is
-    /// free there is no game to steer, and the click that grabs arrives first.
+    /// Escape first: while the chat is open it closes the chat and nothing
+    /// else — the M3 capture rules apply only while the chat is closed.
+    /// While the chat is open every other key is the field's; while it is
+    /// closed the shortcuts work as before, T or `/` opens the field, and
+    /// gameplay keys flow only while the pointer is grabbed.
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         if is_escape_press(event.state, event.repeat, &event.logical_key) {
-            let step = self.capture.escape();
-            self.apply_capture(event_loop, step);
+            match escape_route(self.chat_input.open, &mut self.capture) {
+                EscapeRoute::CloseChat => self.close_chat(event_loop),
+                EscapeRoute::Capture(step) => self.apply_capture(event_loop, step),
+            }
+            return;
+        }
+        if self.chat_input.open {
+            self.on_chat_key(event_loop, event);
             return;
         }
         if is_f3_press(event.state, &event.logical_key) {
@@ -1109,9 +1225,77 @@ impl ClientApp {
             );
             return;
         }
+        if self.capture.grabbed() {
+            if let Some(default) = chat_opener(event.state, event.repeat, event.physical_key) {
+                self.open_chat(event_loop, default);
+                return;
+            }
+        }
         if let Some(input) = gameplay_key(self.capture.grabbed(), event.state, event.physical_key) {
             self.send_input(input);
         }
+    }
+
+    /// Routes one key event to the open chat field.
+    ///
+    /// The field's own keys are consumed by [`ChatInput::key`]; every other
+    /// key's character text (`KeyEvent.text`) goes through the field's
+    /// character path, which filters and caps it, exactly as a typed
+    /// character would. Enter's send leaves for the session and the field
+    /// closes — and the close is what recaptures the pointer.
+    fn on_chat_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let consumed = match event.physical_key {
+            PhysicalKey::Code(code) => match keymap::translate(code) {
+                Some(key) => match self.chat_input.key(key) {
+                    ChatKey::Send(send) => {
+                        self.send_input(send);
+                        true
+                    }
+                    ChatKey::Consumed => true,
+                    ChatKey::Character => false,
+                },
+                None => false,
+            },
+            PhysicalKey::Unidentified(_) => false,
+        };
+        if !consumed {
+            if let Some(text) = event.text.as_deref() {
+                self.chat_input.type_text(text);
+            }
+        }
+        if !self.chat_input.open {
+            self.close_chat(event_loop);
+        }
+    }
+
+    /// Opens the chat field and frees the pointer.
+    ///
+    /// This is the source's screen open: `displayGuiScreen` frees the cursor
+    /// and the held keys (`Minecraft.java`:1010-1012 through
+    /// `setIngameNotInFocus`:1470-1478), and the chat view goes open for the
+    /// frame's draws.
+    fn open_chat(&mut self, event_loop: &ActiveEventLoop, default: &str) {
+        self.chat_input.open(default);
+        self.chat.set_open(true);
+        let step = self.capture.chat_open();
+        self.apply_capture(event_loop, step);
+    }
+
+    /// Closes the chat field and recaptures the pointer.
+    ///
+    /// The source's screen close: `displayGuiScreen(null)` recaptures
+    /// (`Minecraft.java`:1019-1023 through `setIngameFocus`:1453-1465), the
+    /// scroll resets (`GuiChat.onGuiClosed`:69-73), the chat view goes shut
+    /// and the field drops its text.
+    fn close_chat(&mut self, event_loop: &ActiveEventLoop) {
+        self.chat_input.close();
+        self.chat.set_open(false);
+        self.chat.reset_scroll();
+        let step = self.capture.chat_close();
+        self.apply_capture(event_loop, step);
     }
 
     /// Routes one mouse button event: the click that grabs, or the gameplay
@@ -1119,13 +1303,18 @@ impl ClientApp {
     ///
     /// The grabbing click is consumed — the source's own first press goes to
     /// `setIngameFocus` (`Minecraft.java:1887-1891`), not to the game — and
-    /// with no session there is nothing to grab for.
+    /// with no session there is nothing to grab for. While the chat is open
+    /// the screen holds the click: it can neither grab nor steer, and the
+    /// screen's own hit-tests are a later round's.
     fn on_mouse_button(
         &mut self,
         event_loop: &ActiveEventLoop,
         state: ElementState,
         button: WinitMouseButton,
     ) {
+        if self.chat_input.open {
+            return;
+        }
         if !self.capture.grabbed() {
             if state == ElementState::Pressed && self.session.is_some() {
                 let step = self.capture.click();
@@ -1609,6 +1798,11 @@ fn present_frame(renderer: &mut Renderer) -> Result<PresentOutcome, RendererErro
 /// (`Minecraft.java:1469-1478`), which unpresses every held key and ungrabs
 /// the cursor — and exits while free. Losing focus drops capture the same
 /// way; nothing recaptures on focus gain: the next click does.
+///
+/// The open chat is the second thing that frees the pointer — the screen
+/// open itself, `Minecraft.displayGuiScreen`
+/// (`Minecraft.java:1010-1023`) — and its close recaptures; the rules live in
+/// [`Capture::chat_open`] and [`Capture::chat_close`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Capture {
     /// Whether the pointer is grabbed.
@@ -1671,6 +1865,29 @@ impl Capture {
         self.grabbed = false;
         CaptureStep::Release
     }
+
+    /// The chat's open: frees the pointer the way the source's screen open
+    /// does — `displayGuiScreen` calls `setIngameNotInFocus`
+    /// (`Minecraft.java`:1010-1012 through `:1470-1478`), which ungrabs the
+    /// cursor — and drops what the session holds with the release. A pointer
+    /// that is already free stays free, and the drop still runs.
+    fn chat_open(&mut self) -> CaptureStep {
+        if self.grabbed {
+            self.grabbed = false;
+            CaptureStep::Release
+        } else {
+            CaptureStep::Consumed
+        }
+    }
+
+    /// The chat's close: recaptures the pointer, the source's
+    /// `setIngameFocus` path (`Minecraft.java`:1019-1023 through
+    /// `:1453-1465`). The pointer was freed when the screen opened, so the
+    /// grab is asked for here — it is exactly a click's grab with no click.
+    fn chat_close(&mut self) -> CaptureStep {
+        self.grabbed = true;
+        CaptureStep::Grab
+    }
 }
 
 impl CaptureStep {
@@ -1690,7 +1907,9 @@ impl CaptureStep {
 ///
 /// Returns `None` while the pointer is free — gameplay input is suppressed
 /// until the click that grabs arrives — and for a key the client does not
-/// bind; a bound key's edge travels as [`InputEvent::Key`].
+/// bind or one that is not gameplay input at all ([`Key::is_gameplay`]: the
+/// chat keys carry slots but drive no movement); a bound gameplay key's edge
+/// travels as [`InputEvent::Key`].
 fn gameplay_key(
     grabbed: bool,
     state: ElementState,
@@ -1702,10 +1921,77 @@ fn gameplay_key(
     let PhysicalKey::Code(code) = physical_key else {
         return None;
     };
-    keymap::translate(code).map(|key| InputEvent::Key {
-        key,
-        pressed: state == ElementState::Pressed,
-    })
+    keymap::translate(code)
+        .filter(|key| key.is_gameplay())
+        .map(|key| InputEvent::Key {
+            key,
+            pressed: state == ElementState::Pressed,
+        })
+}
+
+/// The chat's opener keys while it is closed: a fresh press of T opens an
+/// empty field, `/` a slashed one — the source's two chat keys
+/// (`Minecraft.java`:2113-2121 over the `keyBindChat` and `keyBindCommand`
+/// bindings, `GameSettings.java`:139, `:141`). A repeat is not a fresh press
+/// and opens nothing; a release is no open at all.
+fn chat_opener(
+    state: ElementState,
+    repeat: bool,
+    physical_key: PhysicalKey,
+) -> Option<&'static str> {
+    if state != ElementState::Pressed || repeat {
+        return None;
+    }
+    let PhysicalKey::Code(code) = physical_key else {
+        return None;
+    };
+    match keymap::translate(code) {
+        Some(Key::T) => Some(""),
+        Some(Key::Slash) => Some("/"),
+        _ => None,
+    }
+}
+
+/// Where one Escape press goes: the open chat closes and nothing else; a
+/// closed chat leaves the M3 capture rules exactly as they were.
+fn escape_route(chat_open: bool, capture: &mut Capture) -> EscapeRoute {
+    if chat_open {
+        EscapeRoute::CloseChat
+    } else {
+        EscapeRoute::Capture(capture.escape())
+    }
+}
+
+/// The two destinations of an Escape press. The chat's own close is what
+/// makes an Escape while the chat is open close only — capture neither
+/// releases nor exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeRoute {
+    /// The open chat closes and nothing else moves.
+    CloseChat,
+    /// The capture rules run, exactly M3's.
+    Capture(CaptureStep),
+}
+
+/// The lines one wheel event scrolls the open chat: the event's delta clamps
+/// to one notch of sign — a pixel delta's magnitude is not a line count —
+/// and a notch is the source's seven lines (`GuiChat.handleMouseInput`:143-167
+/// computes `(int) dWheel`, clamps to ±1 and multiplies by seven at `:160-163`;
+/// its shift-flavoured second count needs a modifier state the window event
+/// does not carry, so the seven is the one rule).
+fn chat_wheel_lines(delta: MouseScrollDelta) -> i32 {
+    let notches = match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(position) => position.y as f32,
+    };
+    let notch = if notches > 0.0 {
+        1
+    } else if notches < 0.0 {
+        -1
+    } else {
+        0
+    };
+    notch * 7
 }
 
 /// The bound mouse button a window button maps to, or `None` when unbound.
@@ -1801,6 +2087,17 @@ impl ApplicationHandler for ClientApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_button(event_loop, state, button);
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // The wheel is the chat log's while the chat is open
+                // (`GuiChat.handleMouseInput`:143-167); a closed chat has no
+                // wheel surface yet — the hotbar's is a later task's.
+                if self.chat_input.open {
+                    let lines = chat_wheel_lines(delta);
+                    if lines != 0 {
+                        self.chat.scroll(lines);
+                    }
+                }
+            }
             WindowEvent::Focused(false) => {
                 tracing::info!("the window lost focus, dropping capture");
                 let step = self.capture.focus_lost();
@@ -1824,9 +2121,11 @@ impl ApplicationHandler for ClientApp {
     ) {
         // The look is raw device motion (`MouseHelper.mouseXYChange`,
         // `MouseHelper.java:33-37`) and flows only while the pointer is
-        // grabbed: a free cursor's motion never turns the player.
+        // grabbed: a free cursor's motion never turns the player. While the
+        // chat is open the motion belongs to the window's own cursor — the
+        // screen freed it — so the session is not told either.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.capture.grabbed() {
+            if self.capture.grabbed() && !self.chat_input.open {
                 self.send_input(InputEvent::MouseDelta { dx, dy });
             }
         }
@@ -1860,15 +2159,249 @@ fn is_f3_press(state: ElementState, key: &WinitKey) -> bool {
     state == ElementState::Pressed && *key == WinitKey::Named(NamedKey::F3)
 }
 
+/// The chat field's character cap: `GuiChat.initGui`'s own
+/// `setMaxStringLength(100)` (`GuiChat.java`:59).
+///
+/// The same hundred the session's guard reads (`oxide_game::session`'s
+/// `CHAT_FIELD_CAP`): the field enforces, the session's drain only logs a
+/// message that slipped past.
+const CHAT_TEXT_CAP: usize = 100;
+
+/// Whether the chat field accepts a character:
+/// `ChatAllowedCharacters.isAllowedCharacter` (`:10-13`) refuses the format
+/// code `§` (167), everything below the space, and DEL (127), and
+/// `GuiTextField.writeText` (`:132`) filters every append through it.
+fn chat_allowed(c: char) -> bool {
+    c != '\u{a7}' && c >= ' ' && c != '\u{7f}'
+}
+
+/// The chat field's state: the text, the cursor, whether it is open, and the
+/// blink counter — over the recall of the messages it sent.
+///
+/// The field is the source's `GuiChat` over its `GuiTextField`
+/// (`GuiChat.java`:47-66 initialises both): the text is edited in place — a
+/// character appends at the cursor, Backspace removes the one before it, the
+/// arrows walk it (`GuiTextField.textboxKeyTyped`:337-494) — under the
+/// 100-character cap the source sets (`GuiChat.initGui`:59). Enter sends the trimmed
+/// text as one [`InputEvent::SendChat`] and closes (`GuiChat.keyTyped`:104-137);
+/// Escape closes without sending (`:100-103`); the up and down arrows recall
+/// the messages already sent (`getSentHistory`:272-296 over `GuiNewChat`'s
+/// list, `GuiNewChat.java`:190-206), buffering the draft while they walk.
+/// While the field is closed it carries no text.
+#[derive(Debug, Default)]
+struct ChatInput {
+    /// The text, edited in place.
+    text: String,
+    /// The cursor's byte index into `text`, always on a character boundary
+    /// (the source's cursor is a character index — `GuiTextField`:222-234
+    /// clamps it to the text's length — and the byte index is the port's
+    /// form of the same position).
+    cursor: usize,
+    /// Whether the field is open. The closed field carries no text.
+    open: bool,
+    /// The blink counter: steps once per session tick while open, and the
+    /// cursor draws while `blink / 6 % 2 == 0` (`GuiTextField.java`:540
+    /// divides its counter by six the same way).
+    blink: u64,
+    /// The messages sent so far, oldest first: `GuiNewChat`'s own list
+    /// (`GuiNewChat.java`:190-206), which the recall walks.
+    sent: Vec<String>,
+    /// The recall's position, counted from the list's end —
+    /// `GuiChat.initGui` sets `sentHistoryCursor = getSentMessages().size()`
+    /// (`:57`) — so the end is the draft.
+    recall: usize,
+    /// The draft the recall started from, buffered when it leaves the end and
+    /// restored when it returns (`GuiChat.historyBuffer`, `:21-27`).
+    history_buffer: String,
+}
+
+/// What one field key did: the character path's next step, or the field's
+/// own.
+#[derive(Debug, Clone, PartialEq)]
+enum ChatKey {
+    /// The key is the character path's: append the event's text through
+    /// [`ChatInput::type_text`].
+    Character,
+    /// The key was the field's own and is done; nothing further to do.
+    Consumed,
+    /// Enter sent the field's text; the event goes to the session.
+    Send(InputEvent),
+}
+
+impl ChatInput {
+    /// Opens the field on a default text — `""` from T, `"/"` from the
+    /// command key (`Minecraft.java`:2113-2121) — the way
+    /// `GuiTextField.setFocused` (`:698-705`) takes focus: the cursor goes to
+    /// the text's end and the blink count starts over.
+    fn open(&mut self, default: &str) {
+        self.open = true;
+        self.recall = self.sent.len();
+        self.history_buffer.clear();
+        self.set_text(default);
+        self.blink = 0;
+    }
+
+    /// Closes the field and drops its text — the screen's own close; what
+    /// was typed and not sent goes with it (the source leaves it on the
+    /// field, and the next open clears the field, `:47-66`).
+    fn close(&mut self) {
+        self.open = false;
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Replaces the text with the cursor at its end (`GuiTextField.setText`:
+    /// `:86-101`).
+    fn set_text(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+        self.cursor = self.text.len();
+    }
+
+    /// One session tick of the blink counter (`GuiTextField.updateCursorCounter`,
+    /// `:78-81`).
+    fn tick(&mut self) {
+        self.blink = self.blink.wrapping_add(1);
+    }
+
+    /// Whether the cursor is in its lit phase (`GuiTextField.java`:540).
+    ///
+    /// The frame's draw consumes this in the rendering half; here it is the
+    /// field's own record of the blink.
+    #[allow(dead_code)]
+    fn cursor_visible(&self) -> bool {
+        (self.blink / 6) % 2 == 0
+    }
+
+    /// Appends text at the cursor — the character path `GuiTextField.writeText`
+    /// (`:129-169`) runs for any key that is not the field's own: every
+    /// character the filter refuses is dropped, and the append stops at the
+    /// field's cap.
+    fn type_text(&mut self, text: &str) {
+        let kept: Vec<char> = text.chars().filter(|&c| chat_allowed(c)).collect();
+        let room = CHAT_TEXT_CAP.saturating_sub(self.text.chars().count());
+        let insert: String = kept.into_iter().take(room).collect();
+        if insert.is_empty() {
+            return;
+        }
+        self.text.insert_str(self.cursor, &insert);
+        self.cursor += insert.len();
+    }
+
+    /// Backspace: removes the character before the cursor, if any
+    /// (`GuiTextField.textboxKeyTyped`:378-391's delete branch).
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.text[..self.cursor]
+            .chars()
+            .next_back()
+            .expect("a non-empty prefix has a last character");
+        self.text.drain(self.cursor - prev.len_utf8()..self.cursor);
+        self.cursor -= prev.len_utf8();
+    }
+
+    /// The left arrow: the cursor moves one character back (`:405-426`).
+    fn left(&mut self) {
+        if let Some(prev) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    /// The right arrow: the cursor moves one character on (`:428-449`).
+    fn right(&mut self) {
+        if let Some(next) = self.text[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    /// The recall (`GuiChat.getSentHistory`:272-296): `msg_pos` walks the
+    /// list — up is `-1`, down `+1`. Leaving the end buffers the draft and
+    /// shows the newest message; returning to the end restores the draft; a
+    /// step with nowhere to go holds.
+    fn recall(&mut self, msg_pos: i32) {
+        let next = (self.recall as i32 + msg_pos).clamp(0, self.sent.len() as i32) as usize;
+        if next == self.recall {
+            return;
+        }
+        if next == self.sent.len() {
+            self.recall = next;
+            let draft = self.history_buffer.clone();
+            self.set_text(&draft);
+        } else {
+            if self.recall == self.sent.len() {
+                self.history_buffer = self.text.clone();
+            }
+            self.recall = next;
+            let message = self.sent[next].clone();
+            self.set_text(&message);
+        }
+    }
+
+    /// Enter: sends the trimmed text when anything remains and closes either
+    /// way (`GuiChat.keyTyped`:104-137 — both branches reach
+    /// `displayGuiScreen(null)`); the sent message joins the recall list as
+    /// `sendChatMessage` adds it (`GuiScreen.java`:481-493 over
+    /// `GuiNewChat.addToSentMessages`, `:200-206`).
+    fn enter(&mut self) -> Option<InputEvent> {
+        let message = self.text.trim().to_string();
+        self.close();
+        if message.is_empty() {
+            return None;
+        }
+        if self.sent.last() != Some(&message) {
+            self.sent.push(message.clone());
+        }
+        Some(InputEvent::SendChat { text: message })
+    }
+
+    /// One editing key, as `GuiChat.keyTyped` (`:87-138`) reads it: the
+    /// field's own keys are consumed here — the source's Tab completion is
+    /// deferred, so Tab is consumed only — every other key is the character
+    /// path's, and Enter's send leaves as the event.
+    fn key(&mut self, key: Key) -> ChatKey {
+        match key {
+            Key::Backspace => {
+                self.backspace();
+                ChatKey::Consumed
+            }
+            Key::ArrowLeft => {
+                self.left();
+                ChatKey::Consumed
+            }
+            Key::ArrowRight => {
+                self.right();
+                ChatKey::Consumed
+            }
+            Key::ArrowUp => {
+                self.recall(-1);
+                ChatKey::Consumed
+            }
+            Key::ArrowDown => {
+                self.recall(1);
+                ChatKey::Consumed
+            }
+            Key::Tab => ChatKey::Consumed,
+            Key::Enter => match self.enter() {
+                Some(event) => ChatKey::Send(event),
+                None => ChatKey::Consumed,
+            },
+            _ => ChatKey::Character,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Aim, CameraState, CameraTick, Capture, CaptureStep, Cli, ClientApp, DEATH_DIM,
-        DEATH_RESPAWN, DEATH_TITLE, Directive, Key, MouseButton, PlayerState, ScriptDriver,
-        SkinRequest, SkinUpdate, SkyValues, aim_outline, bound_mouse_button, clear_break_stage,
-        cracks_in_view, frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
+        Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClientApp,
+        DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute, Key,
+        MouseButton, PlayerState, ScriptDriver, SkinRequest, SkinUpdate, SkyValues, aim_outline,
+        bound_mouse_button, chat_opener, chat_wheel_lines, clear_break_stage, cracks_in_view,
+        escape_route, frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
         parse_server_address, skin_requests, store_aim, store_break_stage, store_skins,
         void_y_factor,
     };
@@ -1884,7 +2417,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use winit::event::{ElementState, MouseButton as WinitMouseButton};
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta};
     use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
 
     #[test]
@@ -2184,6 +2718,54 @@ mod tests {
     }
 
     #[test]
+    fn escape_while_the_chat_is_open_closes_it_and_nothing_else() {
+        // The carve-out: the chat is a screen, so Escape closes it — it
+        // neither releases capture (the pointer already freed when the
+        // screen opened, `Minecraft.setIngameNotInFocus`:1470-1478, reached
+        // from `displayGuiScreen`:1010-1012) nor asks to exit; the close is
+        // what recaptures (`setIngameFocus`:1453-1465, `displayGuiScreen`:1019-1023).
+        let mut capture = Capture::default();
+        assert_eq!(
+            capture.chat_open(),
+            CaptureStep::Consumed,
+            "a free pointer stays free"
+        );
+        assert_eq!(capture.click(), CaptureStep::Grab);
+        assert_eq!(
+            capture.chat_open(),
+            CaptureStep::Release,
+            "the open frees the pointer"
+        );
+        assert!(!capture.grabbed());
+        assert_eq!(escape_route(true, &mut capture), EscapeRoute::CloseChat);
+        assert!(!capture.grabbed(), "the escape itself touches nothing");
+        assert_eq!(
+            capture.chat_close(),
+            CaptureStep::Grab,
+            "the close recaptures"
+        );
+        assert!(capture.grabbed());
+    }
+
+    #[test]
+    fn escape_while_the_chat_is_closed_keeps_the_m3_rules() {
+        // The same physical press, with no chat open, is exactly the M3
+        // rule above: while grabbed it releases, free it exits.
+        let mut capture = Capture::default();
+        capture.click();
+        assert_eq!(
+            escape_route(false, &mut capture),
+            EscapeRoute::Capture(CaptureStep::Release),
+            "escape while grabbed releases"
+        );
+        assert_eq!(
+            escape_route(false, &mut capture),
+            EscapeRoute::Capture(CaptureStep::Exit),
+            "the second escape exits"
+        );
+    }
+
+    #[test]
     fn a_release_carries_the_key_clearing_event() {
         // The source's focus loss unpresses every held key
         // (`Minecraft.java:1469-1478`): the release must carry the session's
@@ -2285,77 +2867,77 @@ mod tests {
             [
                 Directive {
                     tick: 10,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::W,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 11,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::A,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 12,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::S,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 13,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::D,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 14,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::Space,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 15,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::ShiftLeft,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 16,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::ControlLeft,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 17,
-                    event: InputEvent::MouseButton {
+                    action: DirectiveAction::Input(InputEvent::MouseButton {
                         button: MouseButton::Left,
                         pressed: true
-                    }
+                    })
                 },
                 Directive {
                     tick: 18,
-                    event: InputEvent::MouseButton {
+                    action: DirectiveAction::Input(InputEvent::MouseButton {
                         button: MouseButton::Right,
                         pressed: false
-                    }
+                    })
                 },
                 Directive {
                     tick: 20,
-                    event: InputEvent::MouseDelta { dx: 30.0, dy: -4.0 }
+                    action: DirectiveAction::Input(InputEvent::MouseDelta { dx: 30.0, dy: -4.0 })
                 },
                 Directive {
                     tick: 25,
-                    event: InputEvent::Key {
+                    action: DirectiveAction::Input(InputEvent::Key {
                         key: Key::W,
                         pressed: false
-                    }
+                    })
                 },
             ]
         );
@@ -2368,19 +2950,19 @@ mod tests {
         assert_eq!(directives.len(), 2, "only the two directives count");
         assert_eq!(directives[0].tick, 7);
         assert_eq!(
-            directives[0].event,
-            InputEvent::Key {
+            directives[0].action,
+            DirectiveAction::Input(InputEvent::Key {
                 key: Key::A,
                 pressed: true
-            }
+            })
         );
         assert_eq!(directives[1].tick, 8);
         assert_eq!(
-            directives[1].event,
-            InputEvent::Key {
+            directives[1].action,
+            DirectiveAction::Input(InputEvent::Key {
                 key: Key::A,
                 pressed: false
-            }
+            })
         );
     }
 
@@ -2389,8 +2971,11 @@ mod tests {
         let cases = [
             ("10 key W sideways", 1, "neither down nor up"),
             ("10 key Q down", 1, "not a bound key"),
-            ("10 jump", 1, "not one of key, mouse or look"),
+            ("10 jump", 1, "not one of key, mouse, look or chat"),
+            ("10 chat", 1, "no message"),
+            ("10 chat   ", 1, "no message"),
             ("x key W down", 1, "not a whole number"),
+            ("x chat hi", 1, "not a whole number"),
             ("10 look 3", 1, "look takes a dx and a dy"),
             ("10 look 1 two", 1, "the look dy"),
             ("10 mouse Middle down", 1, "not a bound mouse button"),
@@ -2426,10 +3011,11 @@ mod tests {
         .expect("the script is written");
         let (input_tx, input_rx) = unbounded();
         let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
         // The first tick the window sees may already be past a directive:
         // tick 6 is past the tick-4 press and short of the tick-7 pair.
         driver
-            .observe(6, 1.0, 2.0, 3.0, 0.0, 0.0, true)
+            .observe(6, 1.0, 2.0, 3.0, 0.0, 0.0, true, &mut chat)
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("the tick-4 press is due"),
@@ -2444,7 +3030,7 @@ mod tests {
         );
         // Tick 7 applies the two directives at tick 7, in file order.
         driver
-            .observe(7, 1.5, 2.0, 3.5, 10.0, -2.5, true)
+            .observe(7, 1.5, 2.0, 3.5, 10.0, -2.5, true, &mut chat)
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("D down"),
@@ -2463,11 +3049,11 @@ mod tests {
         assert!(input_rx.try_recv().is_err(), "the look is not due yet");
         // Tick 9 applies nothing new; tick 12 applies the look.
         driver
-            .observe(9, 2.0, 2.0, 4.0, 10.0, -2.5, true)
+            .observe(9, 2.0, 2.0, 4.0, 10.0, -2.5, true, &mut chat)
             .expect("the log line writes");
         assert!(input_rx.try_recv().is_err(), "nothing is due at tick 9");
         driver
-            .observe(12, 2.5, 2.0, 4.5, 40.0, -8.0, false)
+            .observe(12, 2.5, 2.0, 4.5, 40.0, -8.0, false, &mut chat)
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("the look"),
@@ -2791,5 +3377,457 @@ mod tests {
         assert_eq!(camera.death_time, 2);
         camera.observe(quiet_tick([0.0, 64.0, 0.0]));
         assert_eq!(camera.death_time, 0, "a living tick clears the clock");
+    }
+
+    /// A fresh field, opened the way T opens it.
+    fn open_field(default: &str) -> ChatInput {
+        let mut chat = ChatInput::default();
+        chat.open(default);
+        chat
+    }
+
+    #[test]
+    fn the_field_appends_at_the_cursor_and_the_arrows_walk_it() {
+        // `GuiTextField.writeText` (`:129-169`): the characters are inserted
+        // at the cursor, and the arrows move it one character at a time
+        // (`textboxKeyTyped` cases 203/205, `:405-449`).
+        let mut chat = open_field("");
+        chat.type_text("ac");
+        assert_eq!((chat.text.as_str(), chat.cursor), ("ac", 2));
+        assert_eq!(chat.key(Key::ArrowLeft), ChatKey::Consumed);
+        chat.type_text("b");
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor),
+            ("abc", 2),
+            "the character lands at the cursor"
+        );
+        chat.key(Key::ArrowRight);
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor),
+            ("abc", 3),
+            "the right arrow steps to the end"
+        );
+        chat.key(Key::ArrowLeft);
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor),
+            ("abc", 2),
+            "the left arrow steps back"
+        );
+        chat.key(Key::Backspace);
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor),
+            ("ac", 1),
+            "backspace removes the character before the cursor"
+        );
+    }
+
+    #[test]
+    fn the_cursor_walks_characters_and_never_lands_inside_one() {
+        // The source's cursor is a character index; this port keeps a byte
+        // index pinned to character boundaries, so one step across a
+        // multi-byte character moves by its whole UTF-8 length.
+        let mut chat = open_field("");
+        chat.type_text("éa");
+        assert_eq!((chat.text.as_str(), chat.cursor), ("éa", 3));
+        chat.key(Key::ArrowLeft);
+        assert_eq!(chat.cursor, 2, "one character left, not one byte");
+        chat.key(Key::ArrowLeft);
+        assert_eq!(chat.cursor, 0);
+        chat.key(Key::ArrowRight);
+        assert_eq!(chat.cursor, 2);
+        chat.key(Key::Backspace);
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor),
+            ("a", 0),
+            "backspace removes the two-byte character whole"
+        );
+    }
+
+    #[test]
+    fn the_cap_is_the_sources_hundred_characters() {
+        // `GuiChat.initGui` sets the field's cap to 100 (`GuiChat.java`:59
+        // over `GuiTextField.setMaxStringLength`:639-647), and
+        // `writeText` cuts an insertion to the room left under it
+        // (`GuiTextField.java`:135-152).
+        let mut chat = open_field("");
+        chat.type_text(&"a".repeat(100));
+        assert_eq!(chat.text.chars().count(), 100);
+        chat.type_text("bc");
+        assert_eq!(
+            chat.text,
+            "a".repeat(100),
+            "a full field refuses every further character"
+        );
+        assert_eq!(chat.cursor, 100, "and the cursor stays put");
+        let mut chat = open_field("");
+        chat.type_text(&"a".repeat(99));
+        chat.type_text("bc");
+        assert_eq!(
+            chat.text,
+            format!("{}b", "a".repeat(99)),
+            "an insertion fits only the room left under the cap"
+        );
+        assert_eq!(chat.cursor, 100);
+    }
+
+    #[test]
+    fn t_opens_the_field_empty_and_the_command_key_opens_it_slashed() {
+        // `Minecraft.java`:2113-2121: T opens a `GuiChat` with no text, `/`
+        // one prefilled with the command slash; the cursor sits after it
+        // (`GuiTextField.setText`, `:86-101`).
+        let chat = open_field("");
+        assert!(chat.open);
+        assert_eq!((chat.text.as_str(), chat.cursor), ("", 0));
+        let chat = open_field("/");
+        assert_eq!((chat.text.as_str(), chat.cursor), ("/", 1));
+        // A closed field carries no text: the next open starts fresh.
+        let mut chat = open_field("");
+        chat.type_text("draft");
+        chat.close();
+        assert!(!chat.open);
+        assert_eq!(chat.text, "");
+    }
+
+    #[test]
+    fn enter_sends_the_field_text_and_closes() {
+        // `GuiChat.keyTyped`:127-137: Enter takes the field's text, trims it
+        // (`:129`), sends it when anything remains and closes the screen.
+        let mut chat = open_field("");
+        chat.type_text("say hi");
+        assert_eq!(
+            chat.key(Key::Enter),
+            ChatKey::Send(InputEvent::SendChat {
+                text: "say hi".into()
+            }),
+            "the send carries exactly the field's text"
+        );
+        assert!(!chat.open, "Enter closes the field");
+        // The source trims the message before it goes (`GuiChat.java`:129).
+        let mut chat = open_field("");
+        chat.type_text("  spaced  ");
+        assert_eq!(
+            chat.key(Key::Enter),
+            ChatKey::Send(InputEvent::SendChat {
+                text: "spaced".into()
+            })
+        );
+        // A message that trims to nothing sends nothing and still closes
+        // (`:131-136`).
+        let mut chat = open_field("");
+        chat.type_text("   ");
+        assert_eq!(chat.key(Key::Enter), ChatKey::Consumed);
+        assert!(!chat.open);
+    }
+
+    #[test]
+    fn the_arrow_history_recalls_the_sent_messages_newest_first() {
+        // `GuiChat.getSentHistory` (`:272-296`) over the sent list
+        // (`GuiNewChat.sentMessages`, `:190-206`): the recall cursor starts
+        // at the list's end (`GuiChat.initGui`:57), Up walks toward the
+        // oldest, Down back to the newest, and a step past the end restores
+        // the draft the recall started from.
+        let mut chat = ChatInput::default();
+        for message in ["first", "second", "third"] {
+            chat.open("");
+            chat.type_text(message);
+            chat.key(Key::Enter);
+        }
+        chat.open("");
+        chat.key(Key::ArrowUp);
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor),
+            ("third", 5),
+            "the first Up is the newest message, cursor at its end"
+        );
+        chat.key(Key::ArrowUp);
+        assert_eq!(chat.text, "second");
+        chat.key(Key::ArrowUp);
+        assert_eq!(chat.text, "first");
+        chat.key(Key::ArrowUp);
+        assert_eq!(chat.text, "first", "the oldest is the recall's end");
+        chat.key(Key::ArrowDown);
+        assert_eq!(chat.text, "second");
+        chat.key(Key::ArrowDown);
+        assert_eq!(chat.text, "third");
+        chat.key(Key::ArrowDown);
+        assert_eq!(chat.text, "", "the draft comes back");
+    }
+
+    #[test]
+    fn the_recall_restores_the_draft_and_consecutive_sends_are_folded() {
+        // `addToSentMessages` skips a message equal to the previous one
+        // (`GuiNewChat.java`:200-206), and the draft typed before the recall
+        // is buffered and restored (`GuiChat.historyBuffer`, `:283-289`).
+        let mut chat = ChatInput::default();
+        for message in ["dup", "dup", "next"] {
+            chat.open("");
+            chat.type_text(message);
+            chat.key(Key::Enter);
+        }
+        chat.open("");
+        chat.type_text("draft");
+        chat.key(Key::ArrowUp);
+        assert_eq!(chat.text, "next");
+        chat.key(Key::ArrowUp);
+        assert_eq!(chat.text, "dup");
+        chat.key(Key::ArrowDown);
+        assert_eq!(chat.text, "next");
+        chat.key(Key::ArrowDown);
+        assert_eq!(chat.text, "draft", "the draft the recall started from");
+        chat.key(Key::ArrowDown);
+        assert_eq!(chat.text, "draft", "and the end of the list holds it");
+    }
+
+    #[test]
+    fn tab_while_open_is_swallowed_and_the_letter_keys_fall_through() {
+        // Completion is deferred (Known limits): Tab is consumed and does
+        // nothing (`GuiChat.keyTyped`:91-94 calls the autocomplete this
+        // milestone does not build). A letter key is not the field's to
+        // consume: its character text is what lands (`:122-125`).
+        let mut chat = open_field("");
+        chat.type_text("ab");
+        assert_eq!(chat.key(Key::Tab), ChatKey::Consumed);
+        assert_eq!(
+            (chat.text.as_str(), chat.cursor, chat.open),
+            ("ab", 2, true)
+        );
+        assert_eq!(chat.key(Key::W), ChatKey::Character);
+        assert_eq!(chat.key(Key::T), ChatKey::Character);
+        assert_eq!(chat.key(Key::Space), ChatKey::Character);
+    }
+
+    #[test]
+    fn the_character_path_filters_the_control_characters() {
+        // `ChatAllowedCharacters.isAllowedCharacter`:10-13: the format
+        // code § (167), everything below the space and DEL (127) are refused;
+        // `writeText` filters through it (`GuiTextField.java`:132).
+        let mut chat = open_field("");
+        chat.type_text("a\u{1}b\tc\u{7f}d\u{a7}e");
+        assert_eq!(chat.text, "abcde");
+        assert_eq!(chat.cursor, 5);
+    }
+
+    #[test]
+    fn the_cursor_blinks_on_the_sources_six_tick_phases() {
+        // `GuiTextField.java:540`: the cursor draws while
+        // `cursorCounter / 6 % 2 == 0`; the counter steps once per tick from
+        // the chat screen's `updateScreen` (`GuiChat.java`:78-81) and starts
+        // over when the field takes focus (`GuiTextField.setFocused`:698-705).
+        let mut chat = open_field("");
+        assert!(chat.cursor_visible(), "the field opens with the cursor up");
+        for _ in 0..5 {
+            chat.tick();
+        }
+        assert!(chat.cursor_visible(), "five ticks in it is still up");
+        chat.tick();
+        assert!(!chat.cursor_visible(), "the sixth tick puts it down");
+        for _ in 0..5 {
+            chat.tick();
+        }
+        assert!(!chat.cursor_visible(), "five more keep it down");
+        chat.tick();
+        assert!(chat.cursor_visible(), "the twelfth tick brings it back");
+        // Taking focus again restarts the count.
+        for _ in 0..6 {
+            chat.tick();
+        }
+        assert!(!chat.cursor_visible());
+        chat.open("/");
+        assert!(chat.cursor_visible(), "the reopen restarts the count");
+    }
+
+    #[test]
+    fn the_chat_openers_are_the_sources_own_keys() {
+        // T and `/`: `Minecraft.runTick` opens `new GuiChat()` / `new
+        // GuiChat("/")` on the `keyBindChat` / `keyBindCommand` presses
+        // (`Minecraft.runTick`:2113-2121), and the source's bindings are T (code 20) and
+        // slash (code 53) (`GameSettings.java`:139, `:141`). An opener is a
+        // fresh press of the physical key: a release or a repeat is no open.
+        let t = PhysicalKey::Code(KeyCode::KeyT);
+        let slash = PhysicalKey::Code(KeyCode::Slash);
+        assert_eq!(chat_opener(ElementState::Pressed, false, t), Some(""));
+        assert_eq!(chat_opener(ElementState::Pressed, false, slash), Some("/"));
+        assert_eq!(chat_opener(ElementState::Released, false, t), None);
+        assert_eq!(
+            chat_opener(ElementState::Pressed, true, t),
+            None,
+            "an auto-repeat is not a fresh press"
+        );
+        assert_eq!(
+            chat_opener(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::KeyW)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_chat_keys_stay_out_of_the_gameplay_path() {
+        // The keys the chat rides carry held slots in the intent so its
+        // index space stays total, but they drive no movement and never
+        // travel to the session as gameplay input.
+        for code in [
+            KeyCode::KeyT,
+            KeyCode::Slash,
+            KeyCode::Tab,
+            KeyCode::Enter,
+            KeyCode::NumpadEnter,
+            KeyCode::Backspace,
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+        ] {
+            assert_eq!(
+                gameplay_key(true, ElementState::Pressed, PhysicalKey::Code(code)),
+                None,
+                "{code:?} is not gameplay input"
+            );
+        }
+        assert_eq!(
+            gameplay_key(
+                true,
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::KeyW)
+            ),
+            Some(InputEvent::Key {
+                key: Key::W,
+                pressed: true
+            })
+        );
+    }
+
+    #[test]
+    fn the_wheel_clamps_every_event_to_one_notch_of_seven_lines() {
+        // `GuiChat.handleMouseInput`:143-167: the event's delta clamps to
+        // ±1 notch and a notch is seven lines unless shift is down
+        // (`GuiChat.handleMouseInput`:160-163); the log's own clamp (`GuiNewChat.scroll`:222-237)
+        // takes it from there.
+        assert_eq!(chat_wheel_lines(MouseScrollDelta::LineDelta(0.0, 1.0)), 7);
+        assert_eq!(
+            chat_wheel_lines(MouseScrollDelta::LineDelta(0.0, 5.0)),
+            7,
+            "a five-notch event still clamps to one notch"
+        );
+        assert_eq!(chat_wheel_lines(MouseScrollDelta::LineDelta(0.0, -1.0)), -7);
+        assert_eq!(chat_wheel_lines(MouseScrollDelta::LineDelta(0.0, 0.0)), 0);
+        assert_eq!(
+            chat_wheel_lines(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                0.0, -12.0
+            ))),
+            -7
+        );
+    }
+
+    #[test]
+    fn a_chat_line_carries_its_text_verbatim() {
+        // The macro's line is `<tick> chat <text>`: the text is the rest of
+        // the line after the name, inner spaces and all, as the field would
+        // receive it; a `#` still starts a comment, so a message cannot
+        // contain one.
+        let script = "5 chat say hello   world\n6 chat /gamemode 1 OxideDev\n";
+        let directives = parse_script(script).expect("the script parses");
+        assert_eq!(
+            directives,
+            [
+                Directive {
+                    tick: 5,
+                    action: DirectiveAction::Chat("say hello   world".into())
+                },
+                Directive {
+                    tick: 6,
+                    action: DirectiveAction::Chat("/gamemode 1 OxideDev".into())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chat_line_opens_types_and_sends_through_the_field() {
+        // The text path, not a shortcut: the macro drives the same field the
+        // window's T does — the characters filter and cap exactly as typed
+        // ones do — and the send leaves on the line's own tick.
+        let dir = std::env::temp_dir().join(format!("oxide-client-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("chat.script");
+        std::fs::write(&script_path, format!("4 chat \u{1}{}\n", "x".repeat(101)))
+            .expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        driver
+            .observe(4, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .expect("the log line writes");
+        assert_eq!(
+            input_rx.try_recv().expect("the send is due"),
+            InputEvent::SendChat {
+                text: "x".repeat(100),
+            },
+            "the control character was filtered and the cap cut at 100"
+        );
+        assert!(input_rx.try_recv().is_err(), "one send, exactly");
+        assert!(!chat.open, "the send closed the field");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chat_line_while_the_chat_is_already_open_is_refused() {
+        // The refusal: the macro cannot steal an open field — nothing is
+        // typed and nothing is sent, and the field is left as it was.
+        let dir = std::env::temp_dir().join(format!("oxide-client-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("chat.script");
+        std::fs::write(&script_path, "4 chat say hi\n").expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        chat.open("");
+        chat.type_text("mine");
+        driver
+            .observe(4, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .expect("the log line writes");
+        assert!(input_rx.try_recv().is_err(), "nothing left the field");
+        assert_eq!(
+            (chat.text.as_str(), chat.open),
+            ("mine", true),
+            "the open field is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_look_line_while_the_chat_is_open_does_not_reach_the_session() {
+        // The source's screen rule: while the chat is open the mouse moves
+        // the window's cursor, not the camera, so a scripted look must not
+        // travel as a session delta while the field is open — and must while
+        // it is closed.
+        let dir = std::env::temp_dir().join(format!("oxide-client-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("look.script");
+        std::fs::write(&script_path, "4 look 30 -4\n8 look 10 0\n").expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        driver
+            .observe(4, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .expect("the log line writes");
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("the closed chat lets the look through"),
+            InputEvent::MouseDelta { dx: 30.0, dy: -4.0 }
+        );
+        chat.open("");
+        driver
+            .observe(8, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .expect("the log line writes");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the open chat took the look: it moves the window's cursor"
+        );
+        assert!(chat.open, "the refused look left the field open");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

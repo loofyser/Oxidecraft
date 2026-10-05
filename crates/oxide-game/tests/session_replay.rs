@@ -3225,7 +3225,7 @@ impl DeadlineStream for FlipDuplex {
             self.waits += 1;
             for (after, event) in &self.flips {
                 if *after == self.waits {
-                    let _ = self.input_tx.send(*event);
+                    let _ = self.input_tx.send(event.clone());
                 }
             }
         }
@@ -4978,6 +4978,51 @@ fn walking_frames(frames: &[Vec<u8>]) -> Vec<&Vec<u8>> {
         .iter()
         .filter(|frame| matches!(frame[0], 0x03..=0x06))
         .collect()
+}
+
+#[test]
+fn a_send_chat_event_leaves_as_the_chat_packet_once() {
+    // The window's field sends one Chat Message per Enter — `GuiChat.keyTyped`
+    // hands `sendChatMessage` the trimmed text (`:104-137`) and
+    // `GuiScreen.sendChatMessage` is the call (`:481-493`); the session's
+    // drain writes it with the protocol crate's own writer (S 0x01,
+    // `ui.rs`'s `write_chat`): the packet id, then the message as a
+    // length-prefixed UTF-8 string whose length is bytes.
+    let flips = vec![
+        (2, InputEvent::SendChat { text: "hi".into() }),
+        (
+            6,
+            InputEvent::SendChat {
+                text: "éé".into()
+            },
+        ),
+    ];
+    let (_, frames) = flip_session(floor_head(), Vec::new(), 12, 0, flips);
+    let chats: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x01).collect();
+    assert_eq!(
+        chats,
+        vec![
+            &vec![0x01, 0x02, b'h', b'i'],
+            &vec![0x01, 0x04, 0xc3, 0xa9, 0xc3, 0xa9],
+        ],
+        "each send is one 0x01 carrying its text bytes: {frames:?}"
+    );
+}
+
+#[test]
+fn an_over_cap_chat_message_still_goes_out_whole() {
+    // The 100-character cap is the field's; the session's guard only logs a
+    // message that slipped past it (`chat_over_cap`) and the writer applies
+    // no cut of its own (`ui.rs`:376-396), so the message reaches the wire
+    // whole.
+    let text = "x".repeat(101);
+    let flips = vec![(2, InputEvent::SendChat { text: text.clone() })];
+    let (_, frames) = flip_session(floor_head(), Vec::new(), 8, 0, flips);
+    let chats: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x01).collect();
+    assert_eq!(chats.len(), 1, "the one send is on the wire: {frames:?}");
+    assert_eq!(chats[0][0], 0x01);
+    assert_eq!(chats[0][1], 101, "the length prefix counts the 101 bytes");
+    assert_eq!(&chats[0][2..], text.as_bytes());
 }
 
 #[test]
