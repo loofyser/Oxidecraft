@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use oxide_game::entity_view::{EntityExtra, EntityFrame};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::{Aim, Face};
 use oxide_game::player::MAX_HURT_TIME;
@@ -17,6 +18,7 @@ use oxide_proto_v47::clientbound::{MapChunkBulk, PlayerPositionAndLook};
 use oxide_proto_v47::column::block_index;
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::terrain::{ChunkMesh, Vertex};
+use oxide_world::entity::EntityKind;
 use oxide_world::world::World;
 
 /// The session config the scripts are written against.
@@ -358,6 +360,386 @@ fn player_list_ping_frame(uuid: [u8; 16], ping: i32) -> Vec<u8> {
     payload
 }
 
+/// One Spawn Player frame (0x0C): the id, the profile UUID, the fixed-point
+/// position, the two angle bytes, the current item and an empty metadata
+/// block.
+fn spawn_player_frame(
+    entity_id: i32,
+    uuid: [u8; 16],
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: u8,
+    pitch: u8,
+) -> Vec<u8> {
+    let mut payload = vec![0x0c];
+    push_varint(&mut payload, entity_id);
+    payload.extend_from_slice(&uuid);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&((value * 32.0) as i32).to_be_bytes());
+    }
+    payload.extend_from_slice(&[yaw, pitch]);
+    payload.extend_from_slice(&0i16.to_be_bytes()); // the current item
+    payload.push(0x7f); // the metadata terminator
+    payload
+}
+
+/// One Spawn Mob frame (0x0F): the id, the type byte, the fixed-point
+/// position, the three angle bytes, a zeroed velocity triple and an empty
+/// metadata block.
+#[allow(clippy::too_many_arguments)]
+fn spawn_mob_frame(
+    entity_id: i32,
+    type_id: u8,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: u8,
+    pitch: u8,
+    head_yaw: u8,
+) -> Vec<u8> {
+    let mut payload = vec![0x0f];
+    push_varint(&mut payload, entity_id);
+    payload.push(type_id);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&((value * 32.0) as i32).to_be_bytes());
+    }
+    payload.extend_from_slice(&[yaw, pitch, head_yaw]);
+    payload.extend_from_slice(&[0u8; 6]); // the velocity triple
+    payload.push(0x7f); // the metadata terminator
+    payload
+}
+
+/// One Spawn Object frame (0x0E); a positive `data` adds the velocity triple.
+fn spawn_object_frame(entity_id: i32, type_id: u8, x: f64, y: f64, z: f64, data: i32) -> Vec<u8> {
+    let mut payload = vec![0x0e];
+    push_varint(&mut payload, entity_id);
+    payload.push(type_id);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&((value * 32.0) as i32).to_be_bytes());
+    }
+    payload.extend_from_slice(&[0, 0]); // the pitch and yaw bytes
+    payload.extend_from_slice(&data.to_be_bytes());
+    if data > 0 {
+        payload.extend_from_slice(&[0u8; 6]); // the velocity triple
+    }
+    payload
+}
+
+/// One Spawn Experience Orb frame (0x11).
+fn spawn_xp_orb_frame(entity_id: i32, x: f64, y: f64, z: f64, count: i16) -> Vec<u8> {
+    let mut payload = vec![0x11];
+    push_varint(&mut payload, entity_id);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&((value * 32.0) as i32).to_be_bytes());
+    }
+    payload.extend_from_slice(&count.to_be_bytes());
+    payload
+}
+
+/// One Spawn Painting frame (0x10): the title, the packed block position and
+/// the facing byte.
+fn spawn_painting_frame(
+    entity_id: i32,
+    title: &str,
+    x: i32,
+    y: i32,
+    z: i32,
+    facing: u8,
+) -> Vec<u8> {
+    let mut payload = vec![0x10];
+    push_varint(&mut payload, entity_id);
+    push_string(&mut payload, title);
+    let packed =
+        ((x as i64 & 0x3ffffff) << 38) | ((y as i64 & 0xfff) << 26) | (z as i64 & 0x3ffffff);
+    payload.extend_from_slice(&packed.to_be_bytes());
+    payload.push(facing);
+    payload
+}
+
+/// One Spawn Global Entity frame (0x2C).
+fn spawn_global_frame(entity_id: i32, type_id: u8, x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut payload = vec![0x2c];
+    push_varint(&mut payload, entity_id);
+    payload.push(type_id);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&((value * 32.0) as i32).to_be_bytes());
+    }
+    payload
+}
+
+/// One Entity Relative Move frame (0x15): the deltas in 1/32 blocks and the
+/// trailing ground flag.
+fn relative_move_frame(entity_id: i32, dx: i8, dy: i8, dz: i8) -> Vec<u8> {
+    let mut payload = vec![0x15];
+    push_varint(&mut payload, entity_id);
+    payload.extend_from_slice(&[dx as u8, dy as u8, dz as u8, 1]);
+    payload
+}
+
+/// One Entity Look frame (0x16).
+fn entity_look_frame(entity_id: i32, yaw: u8, pitch: u8) -> Vec<u8> {
+    let mut payload = vec![0x16];
+    push_varint(&mut payload, entity_id);
+    payload.extend_from_slice(&[yaw, pitch, 1]);
+    payload
+}
+
+/// One Entity Look And Relative Move frame (0x17): the deltas in 1/32 blocks,
+/// the angle bytes and the trailing ground flag.
+fn entity_look_and_move_frame(
+    entity_id: i32,
+    dx: i8,
+    dy: i8,
+    dz: i8,
+    yaw: u8,
+    pitch: u8,
+) -> Vec<u8> {
+    let mut payload = vec![0x17];
+    push_varint(&mut payload, entity_id);
+    payload.extend_from_slice(&[dx as u8, dy as u8, dz as u8, yaw, pitch, 1]);
+    payload
+}
+
+/// One Entity Teleport frame (0x18).
+fn entity_teleport_frame(entity_id: i32, x: f64, y: f64, z: f64, yaw: u8, pitch: u8) -> Vec<u8> {
+    let mut payload = vec![0x18];
+    push_varint(&mut payload, entity_id);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&((value * 32.0) as i32).to_be_bytes());
+    }
+    payload.extend_from_slice(&[yaw, pitch, 1]);
+    payload
+}
+
+/// One Entity Head Look frame (0x19).
+fn entity_head_look_frame(entity_id: i32, head_yaw: u8) -> Vec<u8> {
+    let mut payload = vec![0x19];
+    push_varint(&mut payload, entity_id);
+    payload.push(head_yaw);
+    payload
+}
+
+/// One Entity Velocity frame (0x12): the shorts in 1/8000 blocks per tick.
+fn entity_velocity_frame(entity_id: i32, vx: i16, vy: i16, vz: i16) -> Vec<u8> {
+    let mut payload = vec![0x12];
+    push_varint(&mut payload, entity_id);
+    for value in [vx, vy, vz] {
+        payload.extend_from_slice(&value.to_be_bytes());
+    }
+    payload
+}
+
+/// One Attach Entity frame (0x1B): the attached id and the holder as the
+/// source's two ints (`S1BPacketEntityAttach.readPacketData:29-34`), then the
+/// leash byte.
+fn attach_frame(entity_id: i32, holder: i32, leash: bool) -> Vec<u8> {
+    let mut payload = vec![0x1b];
+    payload.extend_from_slice(&entity_id.to_be_bytes());
+    payload.extend_from_slice(&holder.to_be_bytes());
+    payload.push(leash as u8);
+    payload
+}
+
+/// One Collect Item frame (0x0D).
+fn collect_item_frame(collected: i32, collector: i32) -> Vec<u8> {
+    let mut payload = vec![0x0d];
+    push_varint(&mut payload, collected);
+    push_varint(&mut payload, collector);
+    payload
+}
+
+/// One Destroy Entities frame (0x13).
+fn destroy_entities_frame(entity_ids: &[i32]) -> Vec<u8> {
+    let mut payload = vec![0x13];
+    push_varint(&mut payload, entity_ids.len() as i32);
+    for id in entity_ids {
+        push_varint(&mut payload, *id);
+    }
+    payload
+}
+
+/// One Entity Equipment frame (0x04): one non-empty item with no NBT.
+fn entity_equipment_frame(entity_id: i32, slot: i16, item: (i16, u8, i16)) -> Vec<u8> {
+    let mut payload = vec![0x04];
+    push_varint(&mut payload, entity_id);
+    payload.extend_from_slice(&slot.to_be_bytes());
+    payload.extend_from_slice(&item.0.to_be_bytes());
+    payload.push(item.1);
+    payload.extend_from_slice(&item.2.to_be_bytes());
+    payload.push(0); // no NBT
+    payload
+}
+
+/// One Animation frame (0x0B).
+fn animation_frame(entity_id: i32, animation: u8) -> Vec<u8> {
+    let mut payload = vec![0x0b];
+    push_varint(&mut payload, entity_id);
+    payload.push(animation);
+    payload
+}
+
+/// One Entity frame (0x14) — the no-op.
+fn entity_frame(entity_id: i32) -> Vec<u8> {
+    let mut payload = vec![0x14];
+    push_varint(&mut payload, entity_id);
+    payload
+}
+
+/// One Entity Metadata frame (0x1C) from literal `(index, tag, payload)`
+/// entries.
+fn entity_metadata_frame(entity_id: i32, entries: &[(u8, u8, Vec<u8>)]) -> Vec<u8> {
+    let mut payload = vec![0x1c];
+    push_varint(&mut payload, entity_id);
+    for (index, tag, value) in entries {
+        payload.push((tag << 5) | index);
+        payload.extend_from_slice(value);
+    }
+    payload.push(0x7f); // the metadata terminator
+    payload
+}
+
+/// A byte metadata entry's payload.
+fn meta_byte(value: i8) -> Vec<u8> {
+    vec![value as u8]
+}
+
+/// A float metadata entry's payload.
+fn meta_float(value: f32) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// A string metadata entry's payload.
+fn meta_string(value: &str) -> Vec<u8> {
+    let mut bytes = vec![value.len() as u8];
+    bytes.extend_from_slice(value.as_bytes());
+    bytes
+}
+
+/// Player List Item, add action, one entry with a property and an optional
+/// display name.
+fn player_list_add_full_frame(uuid: [u8; 16], name: &str, display: Option<&str>) -> Vec<u8> {
+    let mut payload = vec![0x38];
+    push_varint(&mut payload, 0); // the add action
+    push_varint(&mut payload, 1); // one entry
+    payload.extend_from_slice(&uuid);
+    push_string(&mut payload, name);
+    push_varint(&mut payload, 1); // one property
+    push_string(&mut payload, "textures");
+    push_string(&mut payload, "eyJx");
+    payload.push(0); // unsigned
+    push_varint(&mut payload, 1); // gamemode: creative
+    push_varint(&mut payload, 42); // ping
+    match display {
+        Some(display) => {
+            payload.push(1);
+            push_string(&mut payload, display);
+        }
+        None => payload.push(0),
+    }
+    payload
+}
+
+/// Player List Item, update-game-mode action (1).
+fn player_list_gamemode_frame(uuid: [u8; 16], gamemode: i32) -> Vec<u8> {
+    let mut payload = vec![0x38];
+    push_varint(&mut payload, 1);
+    push_varint(&mut payload, 1);
+    payload.extend_from_slice(&uuid);
+    push_varint(&mut payload, gamemode);
+    payload
+}
+
+/// Player List Item, update-display-name action (3); a null clears the name.
+fn player_list_display_frame(uuid: [u8; 16], display: Option<&str>) -> Vec<u8> {
+    let mut payload = vec![0x38];
+    push_varint(&mut payload, 3);
+    push_varint(&mut payload, 1);
+    payload.extend_from_slice(&uuid);
+    match display {
+        Some(display) => {
+            payload.push(1);
+            push_string(&mut payload, display);
+        }
+        None => payload.push(0),
+    }
+    payload
+}
+
+/// Player List Item, remove action (4).
+fn player_list_remove_frame(uuid: [u8; 16]) -> Vec<u8> {
+    let mut payload = vec![0x38];
+    push_varint(&mut payload, 4);
+    push_varint(&mut payload, 1);
+    payload.extend_from_slice(&uuid);
+    payload
+}
+
+/// Runs one feed session: the caller's `head` bytes, `stalls` idle windows,
+/// the `tail` bytes, then `tail_stalls` more idle windows before the end.
+fn run_feed_session(
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    stalls: usize,
+    tail_stalls: usize,
+) -> (Vec<ClientEvent>, Arc<Mutex<Vec<u8>>>) {
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(tail),
+        stalls,
+        tail_stalls,
+        outgoing: Arc::clone(&outgoing),
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    (receiver.try_iter().collect(), outgoing)
+}
+
+/// The scripted prefix a feed session starts with: the login sequence, Join
+/// Game and one running Time Update, then `payloads` under the server's
+/// framing.
+fn feed_head(payloads: &[Vec<u8>]) -> Vec<u8> {
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &time_update_frame(48_000, 6000), SERVER_FRAMING);
+    for payload in payloads {
+        frame(&mut head, payload, SERVER_FRAMING);
+    }
+    head
+}
+
+/// The `payloads` under the server's framing.
+fn framed(payloads: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for payload in payloads {
+        frame(&mut out, payload, SERVER_FRAMING);
+    }
+    out
+}
+
+/// The entity frames of every feed in `events`, in tick order.
+fn feeds(events: &[ClientEvent]) -> Vec<Vec<EntityFrame>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::EntitiesTick { entities } => Some(entities.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One frame by entity id.
+fn frame_of(frames: &[EntityFrame], id: i32) -> &EntityFrame {
+    frames
+        .iter()
+        .find(|frame| frame.id == id)
+        .unwrap_or_else(|| panic!("id {id} is tracked: {frames:?}"))
+}
+
 /// Plugin Message on `channel` with `data` as its payload.
 fn plugin_message_frame(channel: &str, data: &[u8]) -> Vec<u8> {
     let mut payload = vec![0x3f];
@@ -463,22 +845,32 @@ fn sky_report(event: &ClientEvent) -> Option<SkyReport> {
     }
 }
 
-/// The skies the frames themselves report: each `Sky` directly preceded by the
-/// Time Update or the snapped tick that produced it. A tick that advances a
-/// running clock adds skies of its own between the frames — the sun travels at
-/// the tick rate — so the frame-driven reports are identified by their marker,
-/// not by position.
+/// The skies the frames themselves report: each `Sky` preceded by the Time
+/// Update or the snapped tick that produced it, with the snapped tick's own
+/// entity feed between them. A tick that advances a running clock adds skies
+/// of its own between the frames — the sun travels at the tick rate — so the
+/// frame-driven reports are identified by their marker, not by position.
 fn frame_skies(events: &[ClientEvent]) -> Vec<SkyReport> {
-    events
-        .windows(2)
-        .filter(|pair| {
-            matches!(
-                pair[0],
-                ClientEvent::Time { .. } | ClientEvent::PlayerTick { snapped: true, .. }
-            )
-        })
-        .filter_map(|pair| sky_report(&pair[1]))
-        .collect()
+    let mut skies = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let Some(report) = sky_report(event) else {
+            continue;
+        };
+        // The marker is the nearest event behind the sky, looking one step
+        // further back through a snapped tick's own feed.
+        let mut behind = events[..index].iter().rev();
+        let mut marker = behind.next();
+        if matches!(marker, Some(ClientEvent::EntitiesTick { .. })) {
+            marker = behind.next();
+        }
+        if matches!(
+            marker,
+            Some(ClientEvent::Time { .. } | ClientEvent::PlayerTick { snapped: true, .. })
+        ) {
+            skies.push(report);
+        }
+    }
+    skies
 }
 
 /// The section slots of the first `ChunkUpdated` for a column, panicking when
@@ -551,10 +943,16 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
         .expect("the session runs to the end of the stream");
 
     // The ticks the session's own clock adds are its own business here; the
-    // unsnapped ones are dropped so the frame-driven story reads as before.
+    // unsnapped ticks and the per-tick entity feeds are dropped so the
+    // frame-driven story reads as before.
     let events: Vec<ClientEvent> = receiver
         .try_iter()
-        .filter(|event| !matches!(event, ClientEvent::PlayerTick { snapped: false, .. }))
+        .filter(|event| {
+            !matches!(
+                event,
+                ClientEvent::PlayerTick { snapped: false, .. } | ClientEvent::EntitiesTick { .. }
+            )
+        })
         .collect();
     assert!(matches!(events[0], ClientEvent::LoggedIn { .. }));
     assert!(matches!(
@@ -1197,6 +1595,344 @@ fn player_list_updates_do_not_end_the_session() {
 }
 
 #[test]
+fn every_tick_feeds_the_tracked_entities_exactly_once() {
+    // One zombie spawns and a burst of relative moves lands between ticks;
+    // the quiet stretch then runs the session's own ticks. Every tick's
+    // PlayerTick is followed at once by exactly one entities feed — the
+    // burst adds no events of its own — and once the moves have settled,
+    // identical consecutive ticks are still fed: the cadence has no change
+    // detection.
+    let mut extra = vec![spawn_mob_frame(21, 54, 10.0, 64.0, -3.5, 64, 0, 64)];
+    for _ in 0..8 {
+        extra.push(relative_move_frame(21, 1, 0, 0));
+    }
+    let (events, outgoing) =
+        run_feed_session(feed_head(&extra), framed(&[keep_alive_frame(33)]), 8, 0);
+
+    let player_ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    let all_feeds = feeds(&events);
+    assert!(
+        player_ticks >= 3,
+        "the quiet stretch owes ticks: {events:?}"
+    );
+    assert_eq!(
+        all_feeds.len(),
+        player_ticks,
+        "one feed per player tick: {events:?}"
+    );
+    for (index, event) in events.iter().enumerate() {
+        if matches!(event, ClientEvent::EntitiesTick { .. }) {
+            assert!(
+                index > 0 && matches!(events.get(index - 1), Some(ClientEvent::PlayerTick { .. })),
+                "the feed at {index} does not sit behind a player tick: {events:?}"
+            );
+        }
+    }
+    // The burst's moves are all in the tick the first feed reports — the
+    // spawn's 10.0 plus eight 1/32 steps — and the pose pair has settled:
+    // every feed from the first on carries the same pair.
+    let first = &all_feeds[0];
+    let zombie = frame_of(first, 21);
+    assert!(
+        (zombie.pos[0] - 10.25).abs() < 1e-9,
+        "the burst landed in the first feed: {:?}",
+        zombie.pos
+    );
+    for axis in 0..3 {
+        assert!(
+            (zombie.pos[axis] - zombie.prev[axis]).abs() < 1e-9,
+            "the pair has settled: {:?} / {:?}",
+            zombie.prev,
+            zombie.pos
+        );
+    }
+    assert!(all_feeds.len() >= 2, "a pair of ticks to compare");
+    // The entity's own tick keeps moving its counters — the age rises and the
+    // limb swing pair eases — while everything the window reads has settled.
+    // Both ticks are still fed, frame for frame, once those counters are
+    // neutral: the cadence has no change detection.
+    let settled_view = |frames: &[EntityFrame]| -> Vec<EntityFrame> {
+        frames
+            .iter()
+            .map(|frame| {
+                let mut frame = frame.clone();
+                frame.age = 0;
+                frame.limb_swing = 0.0;
+                frame.limb_swing_amount = 0.0;
+                frame.prev_limb_swing_amount = 0.0;
+                frame
+            })
+            .collect()
+    };
+    assert_eq!(
+        settled_view(&all_feeds[all_feeds.len() - 2]),
+        settled_view(&all_feeds[all_feeds.len() - 1]),
+        "identical consecutive ticks are still fed"
+    );
+    // The session stayed healthy across all of it.
+    tail_with_echo(&outgoing, 33);
+}
+
+#[test]
+fn the_entity_arm_family_reaches_the_feed() {
+    // Every entity packet this milestone decodes, in one script: the spawns
+    // (player, mob, object — including one the world's tables cannot name —
+    // orb, painting, global), metadata, look, the look-and-relative-move,
+    // teleport, head look, relative move, velocity, status, equipment, the
+    // swing animation and the 0x14 no-op, then — behind a quiet stretch —
+    // attach, collect, destroy and a player list display-name update.
+    let uuid = [0x4a; 16];
+    let hyphenated = "4a4a4a4a-4a4a-4a4a-4a4a-4a4a4a4a4a4a";
+    let extra = vec![
+        player_list_add_full_frame(uuid, "OxideDev", None),
+        spawn_player_frame(30, uuid, 0.5, 64.0, -12.5, 64, 32),
+        spawn_mob_frame(31, 63, 10.0, 64.0, 0.0, 0, 0, 32),
+        entity_metadata_frame(
+            31,
+            &[(6, 3, meta_float(180.0)), (2, 4, meta_string("Boss"))],
+        ),
+        spawn_object_frame(32, 78, 2.0, 64.0, 2.0, 0),
+        entity_metadata_frame(32, &[(2, 4, meta_string("Stand"))]),
+        spawn_object_frame(33, 2, 3.0, 64.0, 3.0, 276),
+        spawn_xp_orb_frame(34, 4.0, 64.0, 4.0, 7),
+        spawn_painting_frame(35, "Kebab", 5, 64, 5, 2),
+        spawn_global_frame(36, 1, 6.0, 64.0, 6.0),
+        entity_velocity_frame(31, 800, -400, 0),
+        entity_teleport_frame(31, 5.0, 70.0, 2.0, 64, 0),
+        entity_look_and_move_frame(31, 8, 0, 0, 128, 8),
+        entity_look_frame(31, 32, 0),
+        entity_head_look_frame(31, 96),
+        relative_move_frame(31, 32, 0, 0),
+        entity_status_frame(31, 2),
+        entity_equipment_frame(31, 0, (276, 1, 0)),
+        animation_frame(31, 0),
+        entity_frame(999),
+    ];
+    let (events, outgoing) = run_feed_session(
+        feed_head(&extra),
+        framed(&[
+            attach_frame(32, 31, false),
+            collect_item_frame(33, 31),
+            destroy_entities_frame(&[34]),
+            player_list_display_frame(uuid, Some("§bOxideDev")),
+            keep_alive_frame(45),
+        ]),
+        6,
+        6,
+    );
+
+    let all_feeds = feeds(&events);
+    assert!(
+        all_feeds.len() >= 2,
+        "both quiet stretches tick: {events:?}"
+    );
+    let early = &all_feeds[0];
+    assert_eq!(
+        early.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+        vec![30, 31, 32, 33, 34, 35, 36],
+        "every spawned entity is tracked, ascending"
+    );
+    let player = frame_of(early, 30);
+    assert_eq!(player.kind, EntityKind::Player);
+    assert_eq!(player.uuid.as_deref(), Some(hyphenated));
+    assert_eq!(player.nametag.as_deref(), Some("OxideDev"));
+    assert!((player.pos[2] - -12.5).abs() < 1e-9, "{:?}", player.pos);
+    let dragon = frame_of(early, 31);
+    assert_eq!(dragon.kind, EntityKind::EnderDragon);
+    assert_eq!(
+        dragon.health,
+        Some((180.0, 200.0)),
+        "the health pair against the pinned class maximum"
+    );
+    assert_eq!(dragon.nametag.as_deref(), Some("Boss"));
+    assert_eq!(
+        dragon.pos,
+        [6.25, 70.0, 2.0],
+        "the teleport, the look-and-move and the relative move landed in order"
+    );
+    assert_eq!(dragon.yaw, 45.0, "the look's angle");
+    // The head look's raw angle (byte 96 -> 135) lands on the moving mob's
+    // chase: the body snaps to the body yaw (45) and the head bounds to 75
+    // of it (`EntityBodyHelper.updateRenderAngles:24-58`), so the head reads
+    // 120; the pre-bound angle stays as the pair's partner.
+    assert_eq!(dragon.head_yaw, 120.0, "the bounded head look's angle");
+    assert_eq!(
+        dragon.prev_head_yaw, 135.0,
+        "the pair's partner keeps the raw head look"
+    );
+    assert_eq!(
+        dragon.hurt_ticks, 9,
+        "status 2's ten-tick window, one tick in"
+    );
+    assert_eq!(dragon.brightness, 0.0, "no columns are loaded");
+    let stand = frame_of(early, 32);
+    assert_eq!(
+        stand.kind,
+        EntityKind::Unknown,
+        "an id the world's tables cannot name is tracked"
+    );
+    assert_eq!(stand.nametag.as_deref(), Some("Stand"));
+    assert_eq!(stand.extra, EntityExtra::None);
+    assert_eq!(
+        frame_of(early, 33).extra,
+        EntityExtra::Item {
+            id: 276,
+            count: 1,
+            damage: 0
+        }
+    );
+    assert_eq!(frame_of(early, 34).extra, EntityExtra::Orb);
+    assert_eq!(
+        frame_of(early, 35).extra,
+        EntityExtra::Painting {
+            title: "Kebab".into(),
+            facing: 2
+        }
+    );
+    assert_eq!(frame_of(early, 36).kind, EntityKind::Global);
+    assert_eq!(frame_of(early, 36).extra, EntityExtra::None);
+
+    let late = all_feeds.last().expect("a last feed");
+    assert!(
+        !late.iter().any(|frame| frame.id == 33),
+        "the collected item is gone: {late:?}"
+    );
+    assert!(
+        !late.iter().any(|frame| frame.id == 34),
+        "the destroyed orb is gone: {late:?}"
+    );
+    assert_eq!(
+        frame_of(late, 32).nametag,
+        None,
+        "a riding entity's name hides"
+    );
+    assert_eq!(
+        frame_of(late, 30).nametag.as_deref(),
+        Some("§bOxideDev"),
+        "the display-name update landed"
+    );
+    assert!(
+        frame_of(late, 31).hurt_ticks < 9,
+        "the hurt window counts down"
+    );
+    tail_with_echo(&outgoing, 45);
+}
+
+#[test]
+fn the_player_list_orders_names_and_updates_around_the_feed() {
+    // Three players: the second's list entry arrives before its spawn — the
+    // ordering obligation — and names it in the first feed; then, behind the
+    // quiet stretch, the first player's entry, a display-name update for the
+    // third, the second player's removal, and updates naming no entry all
+    // arrive at once.
+    let uuid = [0x11; 16];
+    let other = [0x22; 16];
+    let third = [0x33; 16];
+    let (events, outgoing) = run_feed_session(
+        feed_head(&[
+            player_list_add_full_frame(other, "Other", None),
+            spawn_player_frame(40, uuid, 0.0, 64.0, 0.0, 0, 0),
+            spawn_player_frame(41, other, 1.0, 64.0, 0.0, 0, 0),
+            spawn_player_frame(42, third, 2.0, 64.0, 0.0, 0, 0),
+        ]),
+        framed(&[
+            player_list_add_full_frame(uuid, "OxideDev", None),
+            player_list_add_full_frame(third, "Cee", None),
+            player_list_display_frame(third, Some("§cCee")),
+            player_list_remove_frame(other),
+            player_list_gamemode_frame([0x44; 16], 1),
+            keep_alive_frame(47),
+        ]),
+        6,
+        6,
+    );
+
+    let all_feeds = feeds(&events);
+    assert!(
+        all_feeds.len() >= 2,
+        "both quiet stretches tick: {events:?}"
+    );
+    let early = &all_feeds[0];
+    assert_eq!(
+        frame_of(early, 40).nametag,
+        None,
+        "a spawn before its entry has no name"
+    );
+    assert_eq!(
+        frame_of(early, 41).nametag.as_deref(),
+        Some("Other"),
+        "the entry that arrived first names its player"
+    );
+    assert_eq!(frame_of(early, 42).nametag, None);
+    let late = all_feeds.last().expect("a last feed");
+    assert_eq!(frame_of(late, 40).nametag.as_deref(), Some("OxideDev"));
+    assert_eq!(
+        frame_of(late, 41).nametag,
+        None,
+        "the removal dropped the name"
+    );
+    assert_eq!(
+        frame_of(late, 42).nametag.as_deref(),
+        Some("§cCee"),
+        "the display name is the composed text"
+    );
+    tail_with_echo(&outgoing, 47);
+}
+
+#[test]
+fn a_rebuilt_dimension_clears_the_tracked_world() {
+    // A zombie is tracked across a same-dimension respawn — the source's own
+    // rule — and the overworld-to-nether respawn that follows rebuilds the
+    // world: the feed clears with it and tracks what spawns after.
+    let (events, outgoing) = run_feed_session(
+        feed_head(&[
+            spawn_mob_frame(50, 54, 8.0, 64.0, 8.0, 0, 0, 0),
+            respawn_frame(0, 1, 0, "default"),
+        ]),
+        framed(&[
+            respawn_frame(-1, 1, 2, "default"),
+            spawn_mob_frame(51, 56, 9.0, 64.0, 9.0, 0, 0, 0),
+            keep_alive_frame(48),
+        ]),
+        6,
+        6,
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::WorldCleared))
+            .count(),
+        1,
+        "exactly the dimension change clears: {events:?}"
+    );
+    let all_feeds = feeds(&events);
+    assert!(
+        all_feeds.len() >= 2,
+        "both quiet stretches tick: {events:?}"
+    );
+    let early = &all_feeds[0];
+    assert!(
+        early.iter().any(|frame| frame.id == 50),
+        "the same-dimension respawn keeps the tracked world: {early:?}"
+    );
+    let late = all_feeds.last().expect("a last feed");
+    assert!(
+        !late.iter().any(|frame| frame.id == 50),
+        "the rebuild cleared it: {late:?}"
+    );
+    assert_eq!(
+        frame_of(late, 51).kind,
+        EntityKind::Ghast,
+        "and the store tracks again after the rebuild"
+    );
+    tail_with_echo(&outgoing, 48);
+}
+
+#[test]
 fn a_keepalive_behind_a_column_burst_is_answered() {
     // A live server sends its initial columns as a burst with the keepalives
     // behind it on the wire. The echo is a connection obligation, and the
@@ -1256,14 +1992,15 @@ fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
     // wait, so a stream that never idles is read without a single snapshot
     // copy on the way. Every frame here carries work for the mesh queue — the
     // frames re-send the few columns a busy server keeps updating, as its
-    // blocks change — so every frame finds the queue dirty, and each applied
-    // column's snapshot copy costs tens of milliseconds in a debug build: a
-    // loop that pumped between packets would need far longer than the deadline
-    // below for these 240 frames, and the diagnostic names how much of the
-    // burst was meshed while the echo went unanswered. The harness's stream has
-    // no idle wait, so the burst's meshes can only be reported after the
-    // stream ends: an echo answered here was answered while the burst was
-    // still unmeshed.
+    // blocks change — and the burst's tail is an entity flood, the spawn and
+    // movement frames a busy server interleaves with the columns, so the
+    // entity arms read at the same speed. Each applied column's snapshot copy
+    // costs tens of milliseconds in a debug build: a loop that pumped between
+    // packets would need far longer than the deadline below for these
+    // hundreds of frames, and the diagnostic names how much of the burst was
+    // meshed while the echo went unanswered. The harness's stream has no idle
+    // wait, so the burst's meshes can only be reported after the stream ends:
+    // an echo answered here was answered while the burst was still unmeshed.
     const BURST: i32 = 240;
     // The columns the burst re-sends. Few enough that the meshes left for the
     // end-of-session drain stay few — the drain pays their snapshot copies on
@@ -1284,6 +2021,27 @@ fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
             &chunk_data_frame(frame_index % COLUMNS, 0),
             SERVER_FRAMING,
         );
+    }
+    // The entity flood: one spawn then a movement frame per burst frame,
+    // with metadata updates dripped in — all of it ahead of the keepalive.
+    frame(
+        &mut script,
+        &spawn_mob_frame(90, 54, 0.0, 64.0, 0.0, 0, 0, 0),
+        SERVER_FRAMING,
+    );
+    for move_index in 0..BURST {
+        frame(
+            &mut script,
+            &relative_move_frame(90, 1, 0, 0),
+            SERVER_FRAMING,
+        );
+        if move_index % 8 == 0 {
+            frame(
+                &mut script,
+                &entity_metadata_frame(90, &[(13, 0, meta_byte(1))]),
+                SERVER_FRAMING,
+            );
+        }
     }
     frame(&mut script, &keep_alive_frame(97), SERVER_FRAMING);
 
@@ -3136,12 +3894,13 @@ fn a_tick_over_a_changed_world_re_emits_the_aim() {
         events[last]
     );
     assert!(
-        matches!(
-            events[last - 1],
-            ClientEvent::PlayerTick { snapped: false, .. }
-        ),
-        "the tick that stepped the changed world re-emitted the aim: {:?}",
-        events[last - 1]
+        matches!(events[last - 1], ClientEvent::EntitiesTick { .. })
+            && matches!(
+                events[last - 2],
+                ClientEvent::PlayerTick { snapped: false, .. }
+            ),
+        "the tick that stepped the changed world re-emitted the aim, its feed between: {:?}",
+        &events[last - 2..=last]
     );
 }
 

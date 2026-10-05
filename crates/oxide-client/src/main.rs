@@ -1303,6 +1303,11 @@ fn apply_session_event(
             player.observe(tick, [x, y, z], yaw, pitch, snapped);
             false
         }
+        ClientEvent::EntitiesTick { .. } => {
+            // The window's entity surfaces arrive with a later milestone; the
+            // feed is accepted here so the session's event stream stays total.
+            false
+        }
         ClientEvent::Aim { aim: report } => {
             if store_aim(&mut world_overlay.aim, report) {
                 tracing::debug!(?report, "the aim moved");

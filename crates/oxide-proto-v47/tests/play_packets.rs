@@ -176,6 +176,51 @@ fn a_player_list_add_entry_decodes_name_and_uuid() {
     assert_eq!(entries[0].name.as_deref(), Some("OxideDev"));
     assert_eq!(entries[0].gamemode, Some(0));
     assert_eq!(entries[0].ping, Some(0));
+    assert!(
+        entries[0].properties.is_empty(),
+        "a propertyless add keeps an empty list"
+    );
+}
+
+#[test]
+fn a_player_list_add_entry_keeps_its_profile_properties() {
+    // Two properties, one signed and one not: both name-value pairs survive
+    // in wire order, and the signed one's signature is consumed with its
+    // entry (a leftover byte would trip the trailing check below).
+    let mut body = vec![0x38];
+    oxide_proto::varint::write_varint(&mut body, 0).expect("action add");
+    oxide_proto::varint::write_varint(&mut body, 1).expect("one entry");
+    body.extend_from_slice(&[0xab; 16]);
+    body.push(8);
+    body.extend_from_slice(b"OxideDev");
+    oxide_proto::varint::write_varint(&mut body, 2).expect("two properties");
+    // The signed property: a name, a value, the signed flag, the signature.
+    body.push(8);
+    body.extend_from_slice(b"textures");
+    body.push(4);
+    body.extend_from_slice(b"eyJx");
+    body.push(1);
+    body.push(3);
+    body.extend_from_slice(b"sig");
+    // The unsigned property: a name, a value and its own false signed flag.
+    body.push(7);
+    body.extend_from_slice(b"texture");
+    body.push(3);
+    body.extend_from_slice(b"val");
+    body.push(0);
+    oxide_proto::varint::write_varint(&mut body, 0).expect("gamemode");
+    oxide_proto::varint::write_varint(&mut body, 0).expect("ping");
+    body.push(0); // no display name
+    let list = PlayerListItem::decode(&body[1..]).expect("decode");
+    let entries = list.entries;
+    assert_eq!(
+        entries[0].properties,
+        vec![
+            ("textures".to_string(), "eyJx".to_string()),
+            ("texture".to_string(), "val".to_string()),
+        ],
+        "both pairs, in wire order"
+    );
 }
 
 #[test]

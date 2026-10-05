@@ -33,7 +33,6 @@
 //! about thirty seconds.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -44,13 +43,19 @@ use oxide_assets::atlas::Atlas;
 use oxide_proto::codec::CodecError;
 use oxide_proto::conn::{Conn, DeadlineStream, RecvOutcome};
 use oxide_proto::frame::{Compression, FrameError};
-use oxide_proto::varint::{VarIntError, read_varint};
+use oxide_proto::varint::VarIntError;
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
     self, BlockBreakAnimation, BlockChange, BlockUpdate, ChangeGameState, ChunkData, EntityStatus,
     JoinGame, KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect,
     PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage, Respawn, TimeUpdate,
     UpdateHealth, read_packet_id,
+};
+use oxide_proto_v47::entity::{
+    self, Animation, AttachEntity, CollectItem, DestroyEntities, EntityEquipment, EntityHeadLook,
+    EntityLook, EntityLookAndRelativeMove, EntityMetadata, EntityRelativeMove, EntityTeleport,
+    EntityVelocity, MobType, ObjectType, SpawnGlobal, SpawnMob, SpawnObject, SpawnPainting,
+    SpawnPlayer, SpawnXpOrb,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -65,6 +70,7 @@ use oxide_render::terrain::ChunkMesh;
 use oxide_world::behaviour::behaviour;
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::SECTION_SIZE;
+use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
 use oxide_world::light::{self, view_light_level};
 use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
@@ -73,6 +79,7 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
+use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord};
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
@@ -310,6 +317,17 @@ pub enum ClientEvent {
         /// The yaw the last hurt came from (`attackedAtYaw`); zero until M4
         /// tracks attackers.
         attacked_at_yaw: f32,
+    },
+    /// The tracked entities, once per tick.
+    ///
+    /// Reported immediately behind the tick's `PlayerTick`; a tick that
+    /// changed nothing is still reported — the window's entity interpolation
+    /// needs the cadence, and change detection is `PlayerTick`'s own rule.
+    /// The frames come in ascending entity id, each carrying the pose pair
+    /// the interpolation slides between.
+    EntitiesTick {
+        /// One frame per tracked entity.
+        entities: Vec<EntityFrame>,
     },
     /// The player's health, food and saturation, from clientbound 0x06.
     ///
@@ -580,7 +598,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut left_held = false;
         let mut left_presses: u32 = 0;
         let mut right_presses: u32 = 0;
-        let mut players: HashMap<[u8; 16], String> = HashMap::new();
+        // The tracked entities and the player list: the connection's view of
+        // the world's population, applied from the packets below and cleared
+        // when a rebuild replaces the world.
+        let mut entities = Entities::new();
+        let mut player_list = PlayerList::new();
         // The dimension the world was built for, from the last Join Game: a
         // respawn compares its own dimension against it to decide whether the
         // world survives (`NetHandlerPlayClient.handleRespawn:1056-1073`).
@@ -684,6 +706,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // out completes stale and builds against the new one.
                             world = Some(World::new(join.dimension == 0));
                             queue.clear_in_place();
+                            // A rebuilt world carries no tracked entities and
+                            // no known players: the store and the list start
+                            // over with it.
+                            entities.clear();
+                            player_list.clear();
                             dimension = join.dimension;
                             // The player's own entity id is named here. It gates this
                             // client's tick sends: the source's tick is gated on the
@@ -772,12 +799,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         }
                         EntityStatus::ID => {
                             let status = decoded(id, EntityStatus::decode(body))?;
-                            // The status is only this client's business when
-                            // it names its own player: the source's handler
-                            // resolves whatever entity the id names
-                            // (`NetHandlerPlayClient.handleEntityStatus`),
-                            // and until M4 tracks entities the only one that
-                            // exists here is the player.
+                            // The status lands on whatever entity the id
+                            // names — the store tracks the hurt window for
+                            // every one of them — and the player's own hurt
+                            // flash is the same signal arriving at its own
+                            // state (`NetHandlerPlayClient.handleEntityStatus`).
+                            entities.apply_status(status.entity_id, status.status);
                             if Some(status.entity_id) == player.entity_id {
                                 if status.status == EntityStatus::HURT {
                                     // The hurt flash: `hurtTime` back to its
@@ -790,12 +817,6 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         "a status this client has no use for"
                                     );
                                 }
-                            } else {
-                                debug!(
-                                    entity_id = status.entity_id,
-                                    status = status.status,
-                                    "a status for an entity this client does not track"
-                                );
                             }
                         }
                         Respawn::ID => {
@@ -820,6 +841,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // the column is queued once more against the
                                 // new world.
                                 queue.clear_in_place();
+                                // The world that held them is gone: the
+                                // tracked entities and the list go with it
+                                // (`NetHandlerPlayClient.handleRespawn`).
+                                entities.clear();
+                                player_list.clear();
                                 report(events, ClientEvent::WorldCleared);
                             }
                             dimension = respawned;
@@ -911,6 +937,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // The correction settles at once: the window resets its interpolation
                             // on a snapped tick rather than sliding to the pose.
                             report(events, player_tick(&player, true));
+                            // Every `PlayerTick` is paired with its feed, the
+                            // correction's snapped report included: the window
+                            // reads its entities from the very next event.
+                            report(
+                                events,
+                                entities_tick(&entities, world.as_ref(), &player_list),
+                            );
                             // The view block moved: the sky's colour is sampled at the player's own
                             // block, so a correction can change it without a new clock.
                             report_sky(world.as_ref(), player.position, clock.as_ref(), events);
@@ -1082,31 +1115,250 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 );
                             }
                         }
+                        EntityEquipment::ID => {
+                            let equipment = decoded(id, entity::decode_entity_equipment(body))?;
+                            entities.set_equipment(
+                                equipment.entity_id,
+                                equipment.slot,
+                                equipment.item,
+                            );
+                        }
+                        Animation::ID => {
+                            let animation = decoded(id, entity::decode_animation(body))?;
+                            // Only the swing (byte 0) moves an arm the source's
+                            // handler answers (`NetHandlerPlayClient.handleAnimation`);
+                            // the other animations are dropped there and here.
+                            if animation.animation == 0 {
+                                // The id names a tracked entity or nothing:
+                                // the swing lands through the store's own
+                                // lookup.
+                                if let Some(entity) = entities.get_mut(animation.entity_id) {
+                                    entity.swing();
+                                }
+                            } else {
+                                debug!(
+                                    entity_id = animation.entity_id,
+                                    animation = animation.animation,
+                                    "an animation this client does not draw"
+                                );
+                            }
+                        }
+                        SpawnPlayer::ID => {
+                            let spawn = decoded(id, entity::decode_spawn_player(body))?;
+                            let mut entity = Entity::new(spawn.entity_id, EntityKind::Player);
+                            entity.uuid = Some(spawn.uuid);
+                            entity.position = [spawn.x, spawn.y, spawn.z];
+                            entity.last_tick_position = entity.position;
+                            entity.yaw = spawn.yaw;
+                            entity.last_tick_yaw = spawn.yaw;
+                            entity.pitch = spawn.pitch;
+                            entity.last_tick_pitch = spawn.pitch;
+                            // The head starts at the spawn's own yaw: the
+                            // handler's fresh player stands at the packet's
+                            // pose until a head-look packet names the head
+                            // (`NetHandlerPlayClient.handleSpawnPlayer:539-541`).
+                            entity.head_yaw = spawn.yaw;
+                            entity.last_tick_head_yaw = spawn.yaw;
+                            entities.insert(entity);
+                        }
+                        SpawnObject::ID => {
+                            let spawn = decoded(id, entity::decode_spawn_object(body))?;
+                            let mut entity =
+                                Entity::new(spawn.entity_id, kind_from_object(spawn.kind));
+                            entity.position = [spawn.x, spawn.y, spawn.z];
+                            entity.last_tick_position = entity.position;
+                            entity.pitch = spawn.pitch;
+                            entity.last_tick_pitch = spawn.pitch;
+                            entity.yaw = spawn.yaw;
+                            entity.last_tick_yaw = spawn.yaw;
+                            entity.velocity = spawn.velocity;
+                            entity.data = kind_data_of(spawn.kind, spawn.data);
+                            entities.insert(entity);
+                        }
+                        SpawnMob::ID => {
+                            let spawn = decoded(id, entity::decode_spawn_mob(body))?;
+                            let mut entity =
+                                Entity::new(spawn.entity_id, kind_from_mob(spawn.kind));
+                            entity.position = [spawn.x, spawn.y, spawn.z];
+                            entity.last_tick_position = entity.position;
+                            entity.yaw = spawn.yaw;
+                            entity.last_tick_yaw = spawn.yaw;
+                            entity.pitch = spawn.pitch;
+                            entity.last_tick_pitch = spawn.pitch;
+                            entity.head_yaw = spawn.head_yaw;
+                            entity.last_tick_head_yaw = spawn.head_yaw;
+                            // The body's render offset starts where the head
+                            // does (`NetHandlerPlayClient.handleSpawnMob:925`).
+                            entity.render_yaw_offset = spawn.head_yaw;
+                            entity.prev_render_yaw_offset = spawn.head_yaw;
+                            entity.velocity = spawn.velocity;
+                            entity.metadata = spawn.metadata;
+                            entities.insert(entity);
+                        }
+                        SpawnPainting::ID => {
+                            let spawn = decoded(id, entity::decode_spawn_painting(body))?;
+                            let mut entity = Entity::new(spawn.entity_id, EntityKind::Painting);
+                            entity.position =
+                                [f64::from(spawn.x), f64::from(spawn.y), f64::from(spawn.z)];
+                            entity.last_tick_position = entity.position;
+                            // The source masks the wire's direction byte with
+                            // `& 3` when it resolves the face
+                            // (`NetHandlerPlayClient.handleSpawnPainting:563-575`).
+                            entity.data = KindData::Painting {
+                                title: Arc::from(spawn.title.as_str()),
+                                facing: spawn.facing & 0x03,
+                            };
+                            entities.insert(entity);
+                        }
+                        SpawnXpOrb::ID => {
+                            let spawn = decoded(id, entity::decode_spawn_xp_orb(body))?;
+                            let mut entity = Entity::new(spawn.entity_id, EntityKind::XpOrb);
+                            entity.position = [spawn.x, spawn.y, spawn.z];
+                            entity.last_tick_position = entity.position;
+                            entity.data = KindData::XpOrb { count: spawn.count };
+                            entities.insert(entity);
+                        }
+                        SpawnGlobal::ID => {
+                            let spawn = decoded(id, entity::decode_spawn_global(body))?;
+                            let mut entity = Entity::new(spawn.entity_id, EntityKind::Global);
+                            entity.position = [spawn.x, spawn.y, spawn.z];
+                            entity.last_tick_position = entity.position;
+                            entities.insert(entity);
+                        }
+                        CollectItem::ID => {
+                            let collect = decoded(id, entity::decode_collect_item(body))?;
+                            // The collected drop leaves the world
+                            // (`NetHandlerPlayClient.handleCollectItem:840-852`).
+                            entities.remove(&[collect.collected]);
+                        }
+                        EntityVelocity::ID => {
+                            let velocity = decoded(id, entity::decode_entity_velocity(body))?;
+                            entities.apply_velocity(velocity.entity_id, velocity.velocity);
+                        }
+                        DestroyEntities::ID => {
+                            let destroy = decoded(id, entity::decode_destroy_entities(body))?;
+                            entities.remove(&destroy.entity_ids);
+                        }
+                        entity::Entity::ID => {
+                            // The packet names an entity and nothing else; the
+                            // source's handler reads it and drops it
+                            // (`NetHandlerPlayClient.handleEntity:476-478`).
+                            let packet = decoded(id, entity::decode_entity(body))?;
+                            debug!(entity_id = packet.entity_id, "ignoring the entity packet");
+                        }
+                        EntityRelativeMove::ID => {
+                            let movement = decoded(id, entity::decode_entity_relative_move(body))?;
+                            entities.apply_relative_move(movement.entity_id, movement.delta);
+                        }
+                        EntityLook::ID => {
+                            let look = decoded(id, entity::decode_entity_look(body))?;
+                            entities.apply_look(look.entity_id, look.yaw, look.pitch);
+                        }
+                        EntityLookAndRelativeMove::ID => {
+                            let both =
+                                decoded(id, entity::decode_entity_look_and_relative_move(body))?;
+                            entities.apply_relative_move(both.entity_id, both.delta);
+                            entities.apply_look(both.entity_id, both.yaw, both.pitch);
+                        }
+                        EntityTeleport::ID => {
+                            let teleport = decoded(id, entity::decode_entity_teleport(body))?;
+                            entities.apply_teleport(
+                                teleport.entity_id,
+                                [teleport.x, teleport.y, teleport.z],
+                                teleport.yaw,
+                                teleport.pitch,
+                                teleport.on_ground,
+                            );
+                        }
+                        EntityHeadLook::ID => {
+                            let head = decoded(id, entity::decode_entity_head_look(body))?;
+                            entities.apply_head_look(head.entity_id, head.head_yaw);
+                        }
+                        AttachEntity::ID => {
+                            let attach = decoded(id, entity::decode_attach_entity(body))?;
+                            entities.set_attachment(attach.attached, attach.holder, attach.leash);
+                        }
+                        EntityMetadata::ID => {
+                            let metadata = decoded(id, entity::decode_entity_metadata(body))?;
+                            entities.apply_metadata(metadata.entity_id, metadata.metadata);
+                        }
                         PlayerListItem::ID => {
-                            // The decoder takes the add action only, while a live
-                            // server sends latency, gamemode and display-name updates
-                            // as a matter of course. Reading the action first keeps
-                            // those out of the error path without guessing at the
-                            // decoder's fields.
-                            match read_varint(body) {
-                                Ok(PlayerListItem::ACTION_ADD) => {
-                                    let list = decoded(id, PlayerListItem::decode(body))?;
+                            // The decoder reads all five actions; each lands in
+                            // the list's own merge rules below — an add
+                            // replaces the record, the gamemode, latency and
+                            // display-name updates reach the record they name,
+                            // and a remove drops it. An update naming no
+                            // record is refused by the list and logged.
+                            let list = decoded(id, PlayerListItem::decode(body))?;
+                            match list.action {
+                                PlayerListItem::ACTION_ADD => {
                                     for entry in list.entries {
-                                        if let Some(name) = entry.name {
-                                            players.insert(entry.uuid, name);
+                                        let Some(name) = entry.name else {
+                                            continue;
+                                        };
+                                        player_list.insert(
+                                            entry.uuid,
+                                            PlayerListRecord {
+                                                name,
+                                                properties: entry.properties,
+                                                // The wire's gamemode runs through
+                                                // the same conversion the reach
+                                                // reads; an unknown number is
+                                                // survival there and here.
+                                                gamemode: mode_from_value(
+                                                    entry.gamemode.unwrap_or(0) as f32,
+                                                ),
+                                                latency: entry.ping.unwrap_or(0),
+                                                display_name: entry.display_name,
+                                            },
+                                        );
+                                    }
+                                }
+                                PlayerListItem::ACTION_UPDATE_GAME_MODE => {
+                                    for entry in list.entries {
+                                        if let Some(gamemode) = entry.gamemode {
+                                            if !player_list.set_gamemode(
+                                                entry.uuid,
+                                                mode_from_value(gamemode as f32),
+                                            ) {
+                                                debug!(
+                                                    uuid = ?entry.uuid,
+                                                    "a gamemode update for a player the list does not hold"
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                                Ok(action) => {
-                                    debug!(
-                                        action = action,
-                                        "skipping a Player List Item M1 has no use for"
-                                    );
+                                PlayerListItem::ACTION_UPDATE_LATENCY => {
+                                    for entry in list.entries {
+                                        if let Some(latency) = entry.ping {
+                                            if !player_list.set_latency(entry.uuid, latency) {
+                                                debug!(
+                                                    uuid = ?entry.uuid,
+                                                    "a latency update for a player the list does not hold"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
-                                Err(error) => {
-                                    warn!(packet_id = id, error = %error, "the player list action did not read");
-                                    return Err(SessionError::Packet(error.into()));
+                                PlayerListItem::ACTION_UPDATE_DISPLAY_NAME => {
+                                    for entry in list.entries {
+                                        if !player_list
+                                            .set_display_name(entry.uuid, entry.display_name)
+                                        {
+                                            debug!(
+                                                uuid = ?entry.uuid,
+                                                "a display-name update for a player the list does not hold"
+                                            );
+                                        }
+                                    }
                                 }
+                                PlayerListItem::ACTION_REMOVE => {
+                                    for entry in list.entries {
+                                        player_list.remove(entry.uuid);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         PluginMessage::ID => {
@@ -1179,6 +1431,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     &tick_intent,
                     clock.as_mut(),
                     world.as_ref(),
+                    &mut entities,
+                    &player_list,
                     events,
                     !awaiting_respawn_position,
                 ) {
@@ -1498,6 +1752,112 @@ fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
     }
 }
 
+/// The tracked entities as the window's per-tick event.
+///
+/// The frames are built here, against the same light data the mesher reads
+/// and the list the 0x38 arm maintains — the window holds no world snapshot
+/// of its own.
+fn entities_tick(
+    entities: &Entities,
+    world: Option<&World>,
+    player_list: &PlayerList,
+) -> ClientEvent {
+    ClientEvent::EntitiesTick {
+        entities: entity_view::snapshot(entities, world, player_list),
+    }
+}
+
+/// The store kind a spawn mob's wire type names.
+///
+/// The wire's mob table and the store's kinds are one-to-one: every variant
+/// the decoder accepts has a kind.
+fn kind_from_mob(mob: MobType) -> EntityKind {
+    match mob {
+        MobType::Creeper => EntityKind::Creeper,
+        MobType::Skeleton => EntityKind::Skeleton,
+        MobType::Spider => EntityKind::Spider,
+        MobType::Giant => EntityKind::Giant,
+        MobType::Zombie => EntityKind::Zombie,
+        MobType::Slime => EntityKind::Slime,
+        MobType::Ghast => EntityKind::Ghast,
+        MobType::PigZombie => EntityKind::PigZombie,
+        MobType::Enderman => EntityKind::Enderman,
+        MobType::CaveSpider => EntityKind::CaveSpider,
+        MobType::Silverfish => EntityKind::Silverfish,
+        MobType::Blaze => EntityKind::Blaze,
+        MobType::LavaSlime => EntityKind::LavaSlime,
+        MobType::EnderDragon => EntityKind::EnderDragon,
+        MobType::WitherBoss => EntityKind::WitherBoss,
+        MobType::Bat => EntityKind::Bat,
+        MobType::Witch => EntityKind::Witch,
+        MobType::Endermite => EntityKind::Endermite,
+        MobType::Guardian => EntityKind::Guardian,
+        MobType::Pig => EntityKind::Pig,
+        MobType::Sheep => EntityKind::Sheep,
+        MobType::Cow => EntityKind::Cow,
+        MobType::Chicken => EntityKind::Chicken,
+        MobType::Squid => EntityKind::Squid,
+        MobType::Wolf => EntityKind::Wolf,
+        MobType::MushroomCow => EntityKind::MushroomCow,
+        MobType::SnowMan => EntityKind::SnowMan,
+        MobType::Ozelot => EntityKind::Ozelot,
+        MobType::VillagerGolem => EntityKind::VillagerGolem,
+        MobType::EntityHorse => EntityKind::EntityHorse,
+        MobType::Rabbit => EntityKind::Rabbit,
+        MobType::Villager => EntityKind::Villager,
+    }
+}
+
+/// The store kind a spawn object's wire type names.
+///
+/// Objects the store's kinds cannot name — the primed TNT, the crystal, the
+/// falling blocks, the stands and hooks — arrive as [`EntityKind::Unknown`]:
+/// tracked, drawn not at all.
+fn kind_from_object(object: ObjectType) -> EntityKind {
+    match object {
+        ObjectType::Boat => EntityKind::Boat,
+        ObjectType::Item => EntityKind::Item,
+        ObjectType::Minecart | ObjectType::MinecartStorage | ObjectType::MinecartPowered => {
+            EntityKind::Minecart
+        }
+        ObjectType::Arrow => EntityKind::Arrow,
+        ObjectType::Snowball => EntityKind::Snowball,
+        ObjectType::ThrownEgg => EntityKind::Egg,
+        ObjectType::Fireball => EntityKind::Fireball,
+        ObjectType::SmallFireball => EntityKind::SmallFireball,
+        ObjectType::ThrownEnderpearl => EntityKind::EnderPearl,
+        ObjectType::WitherSkull => EntityKind::WitherSkull,
+        ObjectType::ItemFrame => EntityKind::ItemFrame,
+        ObjectType::EyeOfEnderSignal => EntityKind::EyeOfEnder,
+        ObjectType::ThrownPotion => EntityKind::Potion,
+        ObjectType::ThrownExpBottle => EntityKind::XpBottle,
+        ObjectType::FireworksRocketEntity => EntityKind::Firework,
+        _ => EntityKind::Unknown,
+    }
+}
+
+/// The spawn-given extras an object spawn carries.
+///
+/// Only the objects whose kinds hold extras take one; the rest keep
+/// [`KindData::None`]. An item's `data` is the item id — its stack's count
+/// and damage arrive with the entity's metadata (index 10) — and a negative
+/// id, which no item has, is kept as the wire's own zero like every other
+/// out-of-range item id.
+fn kind_data_of(object: ObjectType, data: i32) -> KindData {
+    match object {
+        ObjectType::Boat => KindData::Boat,
+        ObjectType::Item => KindData::Item {
+            id: i16::try_from(data).unwrap_or(0),
+            count: 1,
+            damage: 0,
+        },
+        ObjectType::Minecart | ObjectType::MinecartStorage | ObjectType::MinecartPowered => {
+            KindData::Minecart
+        }
+        _ => KindData::None,
+    }
+}
+
 /// The respawn's dimension, checked against the width the session's world
 /// carries.
 ///
@@ -1552,16 +1912,24 @@ fn respawn_dimension(dimension: i32) -> Result<i8, SessionError> {
 /// where the source's own entity tick runs them before the movement
 /// (`EntityLivingBase.onEntityUpdate:337-349`): the hurt flash falls by one
 /// each tick and the death clock rises by one while the death state holds.
+// One argument per owner of the tick's state; bundling them into a struct
+// would only move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 fn step_tick(
     player: &mut Player,
     input: &Intent,
     mut clock: Option<&mut Clock>,
     world: Option<&World>,
+    entities: &mut Entities,
+    player_list: &PlayerList,
     events: &Sender<ClientEvent>,
     movement_reports: bool,
 ) -> Vec<Vec<u8>> {
     player.last_tick_position = player.position;
     player.tick += 1;
+    // The entity store ticks with the player: its pose pairs are copied at
+    // the top and the per-kind rules advance (`Entities::tick`).
+    entities.tick();
     // The hurt flash's countdown (`EntityLivingBase.onEntityUpdate:337-340`)
     // and the death clock's advance while dead (`:344-349` reaching
     // `onDeathUpdate`, whose `++this.deathTime` is `:400`).
@@ -1681,6 +2049,9 @@ fn step_tick(
         report_sky(world, player.position, clock.as_deref(), events);
     }
     report(events, player_tick(player, false));
+    // The feed sits immediately behind the player's own event: one
+    // `EntitiesTick` per tick, carrying every tracked entity's frame.
+    report(events, entities_tick(entities, world, player_list));
     sends
 }
 
@@ -2423,9 +2794,11 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use oxide_world::entity::Entities;
     use oxide_world::world::World;
 
     use super::{ASSUMED_HELD_BLOCK, ClientEvent, Clock, TICK_PERIOD, step_tick};
+    use crate::entity_view::PlayerList;
     use crate::input::Intent;
     use crate::player::{MAX_HURT_TIME, Player};
     use crate::ticker::Ticker;
@@ -2482,6 +2855,8 @@ mod tests {
             &intent,
             Some(&mut frozen),
             Some(&world),
+            &mut Entities::new(),
+            &PlayerList::new(),
             &sender,
             true,
         );
@@ -2520,6 +2895,8 @@ mod tests {
             &intent,
             Some(&mut running),
             Some(&world),
+            &mut Entities::new(),
+            &PlayerList::new(),
             &sender,
             true,
         );
@@ -2552,7 +2929,16 @@ mod tests {
         );
         player.dead = true;
         for expected in 1u32..=3 {
-            step_tick(&mut player, &intent, None, None, &sender, true);
+            step_tick(
+                &mut player,
+                &intent,
+                None,
+                None,
+                &mut Entities::new(),
+                &PlayerList::new(),
+                &sender,
+                true,
+            );
             assert_eq!(
                 player.death_time, expected,
                 "the death clock counts the step's ticks"
@@ -2564,7 +2950,16 @@ mod tests {
             "the flash falls by one each step"
         );
         for _ in 0..MAX_HURT_TIME {
-            step_tick(&mut player, &intent, None, None, &sender, true);
+            step_tick(
+                &mut player,
+                &intent,
+                None,
+                None,
+                &mut Entities::new(),
+                &PlayerList::new(),
+                &sender,
+                true,
+            );
         }
         assert_eq!(player.hurt_time, 0, "the flash stops at zero");
         assert_eq!(
@@ -2587,7 +2982,16 @@ mod tests {
         player.entity_id = Some(7);
         player.yaw = 30.0;
 
-        let held = step_tick(&mut player, &intent, None, None, &sender, false);
+        let held = step_tick(
+            &mut player,
+            &intent,
+            None,
+            None,
+            &mut Entities::new(),
+            &PlayerList::new(),
+            &sender,
+            false,
+        );
         assert!(held.is_empty(), "a held step sends nothing: {held:?}");
         assert_eq!(player.tick, 1, "the step still ran");
         assert!(
@@ -2599,7 +3003,16 @@ mod tests {
 
         // The contrast: the same state with the reporters armed sends its one
         // walking report.
-        let sent = step_tick(&mut player, &intent, None, None, &sender, true);
+        let sent = step_tick(
+            &mut player,
+            &intent,
+            None,
+            None,
+            &mut Entities::new(),
+            &PlayerList::new(),
+            &sender,
+            true,
+        );
         assert_eq!(sent.len(), 1, "one walking report per step: {sent:?}");
     }
 }

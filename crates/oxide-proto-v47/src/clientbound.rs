@@ -427,6 +427,13 @@ pub struct PlayerListEntry {
     /// The display name, when the add or display-name action carries one; the
     /// display-name action's null stays [`None`].
     pub display_name: Option<String>,
+    /// The profile properties of the add action, name and value in wire
+    /// order; every other action carries none.
+    ///
+    /// A property's signature is read and dropped: it authenticates the
+    /// value at the server, and nothing this client renders consumes it, so
+    /// a signed property keeps its name-value pair.
+    pub properties: Vec<(String, String)>,
 }
 
 /// Clientbound Player List Item (play id 0x38).
@@ -487,6 +494,7 @@ impl PlayerListItem {
                 gamemode: None,
                 ping: None,
                 display_name: None,
+                properties: Vec::new(),
             };
             match action {
                 Self::ACTION_ADD => {
@@ -494,14 +502,19 @@ impl PlayerListItem {
                     let properties = read_varint(&mut cursor)?;
                     // The properties count is an Int-safe VarInt: a negative
                     // value cannot be a real list, so it is clamped to zero
-                    // rather than trusted.
+                    // rather than trusted. The reservation is bounded by what
+                    // the body can still hold, so a huge declared count cannot
+                    // size an allocation before the reads below run out of
+                    // payload.
+                    let mut kept = Vec::with_capacity((properties.max(0) as usize).min(remaining));
                     for _ in 0..properties.max(0) {
-                        let _name = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
-                        let _value = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                        let key = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                        let value = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
                         let is_signed = codec::read_bool(&mut cursor)?;
                         if is_signed {
                             let _signature = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
                         }
+                        kept.push((key, value));
                     }
                     let gamemode = read_varint(&mut cursor)?;
                     let ping = read_varint(&mut cursor)?;
@@ -515,6 +528,7 @@ impl PlayerListItem {
                     entry.gamemode = Some(gamemode);
                     entry.ping = Some(ping);
                     entry.display_name = display_name;
+                    entry.properties = kept;
                 }
                 Self::ACTION_UPDATE_GAME_MODE => {
                     entry.gamemode = Some(read_varint(&mut cursor)?);
