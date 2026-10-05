@@ -2,7 +2,6 @@
 
 use std::io::{Cursor, ErrorKind};
 
-use oxide_proto::codec::CodecError;
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
     self, JoinGame, KeepAlive, PlayDisconnect, PlayerAbilities, PlayerListItem,
@@ -169,7 +168,9 @@ fn a_player_list_add_entry_decodes_name_and_uuid() {
     oxide_proto::varint::write_varint(&mut body, 0).expect("gamemode");
     oxide_proto::varint::write_varint(&mut body, 0).expect("ping");
     body.push(0); // no display name
-    let PlayerListItem { entries } = PlayerListItem::decode(&body[1..]).expect("decode");
+    let list = PlayerListItem::decode(&body[1..]).expect("decode");
+    assert_eq!(list.action, PlayerListItem::ACTION_ADD, "the add action");
+    let entries = list.entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].uuid, [0xab; 16]);
     assert_eq!(entries[0].name.as_deref(), Some("OxideDev"));
@@ -250,18 +251,22 @@ fn plugin_message_data_is_written_verbatim() {
 }
 
 #[test]
-fn a_player_list_action_other_than_add_is_refused() {
-    // M1 handles the add action only; any other action has a different field
-    // list, and a silent partial read would desynchronise the stream.
+fn a_player_list_remove_action_decodes_its_uuids() {
+    // Every action decodes; the remove action carries the UUIDs alone
+    // (`S38PacketPlayerListItem.java:112-114`), so an entry's optional fields
+    // stay empty and the packet carries the action beside the entries.
     let mut body = vec![0x38];
     oxide_proto::varint::write_varint(&mut body, 4).expect("action remove");
-    match PlayerListItem::decode(&body[1..]) {
-        Err(PacketError::Codec(CodecError::Io(error))) => {
-            assert_eq!(error.kind(), ErrorKind::InvalidData);
-            assert_eq!(error.to_string(), "unsupported Player List Item action 4");
-        }
-        other => panic!("expected an unsupported-action refusal, got {other:?}"),
-    }
+    oxide_proto::varint::write_varint(&mut body, 1).expect("one entry");
+    body.extend_from_slice(&[0xcd; 16]);
+    let list = PlayerListItem::decode(&body[1..]).expect("the remove action decodes");
+    assert_eq!(list.action, PlayerListItem::ACTION_REMOVE);
+    assert_eq!(list.entries.len(), 1);
+    assert_eq!(list.entries[0].uuid, [0xcd; 16]);
+    assert_eq!(list.entries[0].name, None);
+    assert_eq!(list.entries[0].gamemode, None);
+    assert_eq!(list.entries[0].ping, None);
+    assert_eq!(list.entries[0].display_name, None);
 }
 
 #[test]

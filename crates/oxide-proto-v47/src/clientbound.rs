@@ -406,24 +406,39 @@ impl PlayDisconnect {
     }
 }
 
-/// One entry of a Player List Item add block.
+/// One entry of a Player List Item packet.
+///
+/// The UUID is present for every action; the other fields are filled only by
+/// the actions that carry them, so an entry's shape follows the packet's
+/// action: the add action fills every field, the gamemode and latency actions
+/// fill one each, the display-name action may carry a name or a null, and the
+/// remove action carries the UUID alone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerListEntry {
     /// The player's UUID.
     pub uuid: [u8; 16],
     /// The name, present for the add action.
     pub name: Option<String>,
-    /// The gamemode, present for the add action.
+    /// The gamemode, present for the add and gamemode actions.
     pub gamemode: Option<i32>,
-    /// The ping, present for the add action.
+    /// The ping, present for the add and latency actions; kept as sent,
+    /// negative values included.
     pub ping: Option<i32>,
-    /// The display name, when the entry carries one.
+    /// The display name, when the add or display-name action carries one; the
+    /// display-name action's null stays [`None`].
     pub display_name: Option<String>,
 }
 
-/// Clientbound Player List Item (play id 0x38), add action.
+/// Clientbound Player List Item (play id 0x38).
+///
+/// `S38PacketPlayerListItem.readPacketData:48-117`: the action, the entry
+/// count, then per entry the UUID and the action's own fields. Every action
+/// is decoded; one outside the five is refused, because it has a different
+/// field list and a silent partial read would desynchronise the stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerListItem {
+    /// The action the packet carries (the `ACTION_*` constants).
+    pub action: i32,
     /// The entries in this packet.
     pub entries: Vec<PlayerListEntry>,
 }
@@ -433,13 +448,20 @@ impl PlayerListItem {
     pub const ID: i32 = 0x38;
     /// The add action.
     pub const ACTION_ADD: i32 = 0;
+    /// The gamemode update action.
+    pub const ACTION_UPDATE_GAME_MODE: i32 = 1;
+    /// The latency update action.
+    pub const ACTION_UPDATE_LATENCY: i32 = 2;
+    /// The display name update action.
+    pub const ACTION_UPDATE_DISPLAY_NAME: i32 = 3;
+    /// The remove action.
+    pub const ACTION_REMOVE: i32 = 4;
 
-    /// Decodes an add-action packet. Any other action is refused: M1 has no use
-    /// for them, and a silent partial read would desynchronise the stream.
+    /// Decodes a Player List Item packet of any of the five actions.
     pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
         let mut cursor = Cursor::new(body);
         let action = read_varint(&mut cursor)?;
-        if action != Self::ACTION_ADD {
+        if !(Self::ACTION_ADD..=Self::ACTION_REMOVE).contains(&action) {
             return Err(PacketError::Codec(codec::CodecError::Io(
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -459,37 +481,63 @@ impl PlayerListItem {
         let mut entries = Vec::with_capacity((count as usize).min(remaining));
         for _ in 0..count {
             let uuid = codec::read_uuid(&mut cursor)?;
-            let name = codec::read_string(&mut cursor, 16)?;
-            let properties = read_varint(&mut cursor)?;
-            // The properties count is an Int-safe VarInt: a negative value
-            // cannot be a real list, so it is clamped to zero rather than
-            // trusted.
-            for _ in 0..properties.max(0) {
-                let _name = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
-                let _value = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
-                let is_signed = codec::read_bool(&mut cursor)?;
-                if is_signed {
-                    let _signature = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
-                }
-            }
-            let gamemode = read_varint(&mut cursor)?;
-            let ping = read_varint(&mut cursor)?;
-            let has_display_name = codec::read_bool(&mut cursor)?;
-            let display_name = if has_display_name {
-                Some(codec::read_string(&mut cursor, MAX_STRING_BYTES)?)
-            } else {
-                None
-            };
-            entries.push(PlayerListEntry {
+            let mut entry = PlayerListEntry {
                 uuid,
-                name: Some(name),
-                gamemode: Some(gamemode),
-                ping: Some(ping),
-                display_name,
-            });
+                name: None,
+                gamemode: None,
+                ping: None,
+                display_name: None,
+            };
+            match action {
+                Self::ACTION_ADD => {
+                    let name = codec::read_string(&mut cursor, 16)?;
+                    let properties = read_varint(&mut cursor)?;
+                    // The properties count is an Int-safe VarInt: a negative
+                    // value cannot be a real list, so it is clamped to zero
+                    // rather than trusted.
+                    for _ in 0..properties.max(0) {
+                        let _name = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                        let _value = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                        let is_signed = codec::read_bool(&mut cursor)?;
+                        if is_signed {
+                            let _signature = codec::read_string(&mut cursor, MAX_STRING_BYTES)?;
+                        }
+                    }
+                    let gamemode = read_varint(&mut cursor)?;
+                    let ping = read_varint(&mut cursor)?;
+                    let has_display_name = codec::read_bool(&mut cursor)?;
+                    let display_name = if has_display_name {
+                        Some(codec::read_string(&mut cursor, MAX_STRING_BYTES)?)
+                    } else {
+                        None
+                    };
+                    entry.name = Some(name);
+                    entry.gamemode = Some(gamemode);
+                    entry.ping = Some(ping);
+                    entry.display_name = display_name;
+                }
+                Self::ACTION_UPDATE_GAME_MODE => {
+                    entry.gamemode = Some(read_varint(&mut cursor)?);
+                }
+                Self::ACTION_UPDATE_LATENCY => {
+                    entry.ping = Some(read_varint(&mut cursor)?);
+                }
+                Self::ACTION_UPDATE_DISPLAY_NAME => {
+                    let has_display_name = codec::read_bool(&mut cursor)?;
+                    entry.display_name = if has_display_name {
+                        Some(codec::read_string(&mut cursor, MAX_STRING_BYTES)?)
+                    } else {
+                        None
+                    };
+                }
+                // The remove action carries the UUID alone; every other action
+                // value was refused above.
+                _ => {}
+            }
+            entries.push(entry);
         }
         check_no_trailing(&cursor, body.len())?;
-        Ok(Self { entries })
+        Ok(Self { action, entries })
     }
 }
 

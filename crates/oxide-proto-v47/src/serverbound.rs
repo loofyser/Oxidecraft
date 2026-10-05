@@ -16,6 +16,12 @@ pub fn write_login_start(mut out: impl Write, username: &str) -> io::Result<()> 
 /// Serverbound Keep Alive (play id 0x00).
 pub const KEEP_ALIVE_ID: i32 = 0x00;
 
+/// Serverbound Chat Message (play id 0x01).
+///
+/// The payload writer lives in [`crate::ui::write_chat`], beside the chat's
+/// decode side; the id sits here with the other write-side ids.
+pub const CHAT_MESSAGE_ID: i32 = 0x01;
+
 /// Serverbound Player (play id 0x03): the ground flag alone.
 pub const PLAYER_ID: i32 = 0x03;
 

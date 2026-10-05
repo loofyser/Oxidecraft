@@ -6,6 +6,7 @@ pub mod entity;
 pub mod handshake;
 pub mod serverbound;
 pub mod status;
+pub mod ui;
 
 use oxide_proto::codec::CodecError;
 
