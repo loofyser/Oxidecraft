@@ -1308,6 +1308,23 @@ fn apply_session_event(
             // feed is accepted here so the session's event stream stays total.
             false
         }
+        ClientEvent::PlayerList { .. } => {
+            // The window's tab-list surface arrives with a later milestone;
+            // the feed is accepted here so the session's event stream stays
+            // total.
+            false
+        }
+        ClientEvent::ScoreboardChanged { .. } => {
+            // The window's sidebar surface arrives with a later milestone; the
+            // feed is accepted here so the session's event stream stays total.
+            false
+        }
+        ClientEvent::TabText { .. } => {
+            // The window's tab-list surface arrives with a later milestone;
+            // the feed is accepted here so the session's event stream stays
+            // total.
+            false
+        }
         ClientEvent::Aim { aim: report } => {
             if store_aim(&mut world_overlay.aim, report) {
                 tracing::debug!(?report, "the aim moved");

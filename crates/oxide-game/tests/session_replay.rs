@@ -1,15 +1,16 @@
 //! Replay tests: a scripted 1.8.9 server stream drives the session, and the
 //! client's own traffic and events are asserted byte for byte.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use oxide_game::entity_view::{EntityExtra, EntityFrame};
+use oxide_game::entity_view::{EntityExtra, EntityFrame, PlayerListRecord, display_name};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::{Aim, Face};
 use oxide_game::player::MAX_HURT_TIME;
+use oxide_game::scoreboard::{Objective, Scoreboard, Team, entry_colour};
 use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError, recompute_passes};
 use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
@@ -672,6 +673,102 @@ fn player_list_remove_frame(uuid: [u8; 16]) -> Vec<u8> {
     push_varint(&mut payload, 4);
     push_varint(&mut payload, 1);
     payload.extend_from_slice(&uuid);
+    payload
+}
+
+/// Scoreboard Objective (0x3B): the name, the mode and — for the create and
+/// update modes — the display value and the render kind.
+fn scoreboard_objective_frame(name: &str, mode: u8, value: &str, kind: &str) -> Vec<u8> {
+    let mut payload = vec![0x3b];
+    push_string(&mut payload, name);
+    payload.push(mode);
+    if mode == 0 || mode == 2 {
+        push_string(&mut payload, value);
+        push_string(&mut payload, kind);
+    }
+    payload
+}
+
+/// Update Score (0x3C): the entry, the mode, the objective name and — for
+/// the set mode — the value.
+fn scoreboard_score_frame(entry: &str, mode: u8, objective: &str, value: i32) -> Vec<u8> {
+    let mut payload = vec![0x3c];
+    push_string(&mut payload, entry);
+    payload.push(mode);
+    push_string(&mut payload, objective);
+    if mode == 0 {
+        push_varint(&mut payload, value);
+    }
+    payload
+}
+
+/// Display Scoreboard (0x3D): the slot and the objective name.
+fn scoreboard_display_frame(slot: u8, objective: &str) -> Vec<u8> {
+    let mut payload = vec![0x3d];
+    payload.push(slot);
+    push_string(&mut payload, objective);
+    payload
+}
+
+/// Teams (0x3E) with its info block (create and update modes) and, for the
+/// create mode, the player list.
+#[allow(clippy::too_many_arguments)]
+fn scoreboard_team_info_frame(
+    name: &str,
+    mode: u8,
+    display_name: &str,
+    prefix: &str,
+    suffix: &str,
+    friendly_flags: u8,
+    name_tag_visibility: &str,
+    colour: u8,
+    players: &[&str],
+) -> Vec<u8> {
+    let mut payload = vec![0x3e];
+    push_string(&mut payload, name);
+    payload.push(mode);
+    if mode == 0 || mode == 2 {
+        push_string(&mut payload, display_name);
+        push_string(&mut payload, prefix);
+        push_string(&mut payload, suffix);
+        payload.push(friendly_flags);
+        push_string(&mut payload, name_tag_visibility);
+        payload.push(colour);
+    }
+    if mode == 0 {
+        push_varint(&mut payload, players.len() as i32);
+        for player in players {
+            push_string(&mut payload, player);
+        }
+    }
+    payload
+}
+
+/// Teams (0x3E) with a player list (add-players and remove-players modes).
+fn scoreboard_team_players_frame(name: &str, mode: u8, players: &[&str]) -> Vec<u8> {
+    let mut payload = vec![0x3e];
+    push_string(&mut payload, name);
+    payload.push(mode);
+    push_varint(&mut payload, players.len() as i32);
+    for player in players {
+        push_string(&mut payload, player);
+    }
+    payload
+}
+
+/// Teams (0x3E), the remove mode: the name alone.
+fn scoreboard_team_remove_frame(name: &str) -> Vec<u8> {
+    let mut payload = vec![0x3e];
+    push_string(&mut payload, name);
+    payload.push(1);
+    payload
+}
+
+/// Player List Header And Footer (0x47): the header and the footer.
+fn tab_header_footer_frame(header: &str, footer: &str) -> Vec<u8> {
+    let mut payload = vec![0x47];
+    push_string(&mut payload, header);
+    push_string(&mut payload, footer);
     payload
 }
 
@@ -5557,4 +5654,490 @@ fn an_inert_change_game_state_reason_leaves_the_game_mode_alone() {
             .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_), .. })),
         "the mode is unchanged, so the 4.611 stone stays out of reach: {events:?}"
     );
+}
+
+// -------------------------------------------------------------------------
+// The scoreboard, the team clauses and the tab text.
+// -------------------------------------------------------------------------
+
+/// The boards the Scoreboard Changed events carry, in order.
+fn boards(events: &[ClientEvent]) -> Vec<&Scoreboard> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::ScoreboardChanged { board } => Some(board),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The entry sets the Player List events carry, in order.
+fn player_lists(events: &[ClientEvent]) -> Vec<&Vec<PlayerListRecord>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerList { entries } => Some(entries),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One team row of the fixtures' own fields, for an expected board.
+fn team_row(
+    display_name: &str,
+    prefix: &str,
+    suffix: &str,
+    friendly_flags: u8,
+    name_tag_visibility: &str,
+    colour: Option<u8>,
+    players: &[&str],
+) -> Team {
+    Team {
+        display_name: display_name.to_owned(),
+        prefix: prefix.to_owned(),
+        suffix: suffix.to_owned(),
+        friendly_flags,
+        name_tag_visibility: name_tag_visibility.to_owned(),
+        colour,
+        players: players.iter().map(|player| (*player).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn the_scoreboard_reports_each_change_once() {
+    // A scripted 0x3B/0x3C/0x3D/0x3E sequence: every packet that changes the
+    // board reports the whole state, and a packet that writes what the board
+    // already holds reports nothing — the tests count events.
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            scoreboard_objective_frame("kills", 0, "Kills", "integer"),
+            // A second create with the same fields: the board does not move.
+            scoreboard_objective_frame("kills", 0, "Kills", "integer"),
+            scoreboard_display_frame(1, "kills"),
+            scoreboard_display_frame(1, "kills"),
+            scoreboard_score_frame("Alpha", 0, "kills", 5),
+            scoreboard_score_frame("Alpha", 0, "kills", 5),
+            scoreboard_team_info_frame(
+                "red",
+                0,
+                "Red",
+                "§c[Red] ",
+                "§r",
+                1,
+                "always",
+                0x0c,
+                &["Alpha"],
+            ),
+            // The add-players mode re-adds the member the create carried.
+            scoreboard_team_players_frame("red", 3, &["Alpha"]),
+            scoreboard_team_players_frame("red", 4, &["Alpha"]),
+            scoreboard_team_remove_frame("red"),
+            // The remove mode carries neither the value nor the kind.
+            scoreboard_objective_frame("kills", 1, "", ""),
+        ]),
+        framed(&[keep_alive_frame(21)]),
+        0,
+        0,
+    );
+
+    let reported = boards(&events);
+    assert_eq!(
+        reported.len(),
+        7,
+        "seven changes and four no-ops: {events:?}"
+    );
+    let mut expected = Scoreboard::new();
+    expected.objectives.insert(
+        "kills".to_owned(),
+        Objective {
+            name: "kills".to_owned(),
+            value: "Kills".to_owned(),
+            kind: "integer".to_owned(),
+        },
+    );
+    assert_eq!(*reported[0], expected, "the create's board");
+    expected.display[1] = Some("kills".to_owned());
+    assert_eq!(*reported[1], expected, "the display slot's board");
+    expected.scores.insert(
+        "Alpha".to_owned(),
+        BTreeMap::from([("kills".to_owned(), 5)]),
+    );
+    assert_eq!(*reported[2], expected, "the score's board");
+    expected.teams.insert(
+        "red".to_owned(),
+        team_row("Red", "§c[Red] ", "§r", 1, "always", Some(0x0c), &["Alpha"]),
+    );
+    expected
+        .member_of
+        .insert("Alpha".to_owned(), "red".to_owned());
+    assert_eq!(
+        *reported[3], expected,
+        "the create's board: the info block and the membership"
+    );
+    expected
+        .teams
+        .get_mut("red")
+        .expect("the team is held")
+        .players
+        .clear();
+    expected.member_of.clear();
+    assert_eq!(
+        *reported[4], expected,
+        "the remove-players board: the membership alone left"
+    );
+    expected.teams.clear();
+    assert_eq!(
+        *reported[5], expected,
+        "the team's removal: the rows fell, the rest held"
+    );
+    assert_eq!(
+        *reported[6],
+        Scoreboard::new(),
+        "the objective's remove dropped it, its slot and its scores"
+    );
+}
+
+#[test]
+fn the_tab_text_reports_each_change_once() {
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            tab_header_footer_frame("{\"text\":\"one\"}", "{\"text\":\"two\"}"),
+            // The same text again: no event.
+            tab_header_footer_frame("{\"text\":\"one\"}", "{\"text\":\"two\"}"),
+            tab_header_footer_frame("{\"text\":\"one\"}", "{\"text\":\"three\"}"),
+        ]),
+        framed(&[keep_alive_frame(22)]),
+        0,
+        0,
+    );
+    let texts: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::TabText { header, footer } => Some((header.as_str(), footer.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            ("{\"text\":\"one\"}", "{\"text\":\"two\"}"),
+            ("{\"text\":\"one\"}", "{\"text\":\"three\"}"),
+        ],
+        "the two changes, the raw JSON strings as sent: {events:?}"
+    );
+}
+
+#[test]
+fn the_player_list_reports_the_whole_set_once_per_change() {
+    let alpha = [0x11; 16];
+    let beta = [0x02; 16];
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            player_list_add_full_frame(alpha, "Alpha", Some("§bAlpha")),
+            // The add carried ping 42: the same ping again is no change.
+            player_list_ping_frame(alpha, 42),
+            player_list_ping_frame(alpha, 42),
+            player_list_ping_frame(alpha, 60),
+            player_list_add_full_frame(beta, "Beta", None),
+            player_list_gamemode_frame(beta, 2),
+            player_list_remove_frame(alpha),
+        ]),
+        framed(&[keep_alive_frame(23)]),
+        0,
+        0,
+    );
+
+    let sets = player_lists(&events);
+    assert_eq!(sets.len(), 5, "five changes and two no-ops: {events:?}");
+    assert_eq!(
+        sets[0][0],
+        PlayerListRecord {
+            name: "Alpha".to_owned(),
+            properties: vec![("textures".to_owned(), "eyJx".to_owned())],
+            gamemode: 1,
+            latency: 42,
+            display_name: Some("§bAlpha".to_owned()),
+        },
+        "the add's record as the wire carried it"
+    );
+    assert_eq!(
+        sets[1][0].latency, 60,
+        "the latency update reaches the record"
+    );
+    assert_eq!(
+        sets[2]
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Beta", "Alpha"],
+        "the full set, ascending uuid"
+    );
+    assert_eq!(sets[3][0].gamemode, 2, "the gamemode update");
+    assert_eq!(
+        sets[4]
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Beta"],
+        "the remove dropped Alpha"
+    );
+}
+
+#[test]
+fn a_player_on_a_team_carries_the_team_clauses_in_the_feed() {
+    // The composition is `prefix + text + suffix`
+    // (`ScorePlayerTeam.formatString:95-98`), reached from the feed's nametag
+    // (`EntityPlayer.getDisplayName:2316-2324`) and from the list entry
+    // (`GuiPlayerTabOverlay.getPlayerName:45-51`); the colour byte is not
+    // part of the text — the second team carries the colour with empty
+    // clauses and adds nothing.
+    let alpha = [0x03; 16];
+    let beta = [0x04; 16];
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            player_list_add_frame(alpha, "Alpha"),
+            player_list_add_frame(beta, "Beta"),
+            scoreboard_team_info_frame(
+                "red",
+                0,
+                "Red",
+                "§c[Red] ",
+                "§r",
+                1,
+                "always",
+                0x0c,
+                &["Alpha"],
+            ),
+            scoreboard_team_info_frame("plain", 0, "Plain", "", "", 0, "always", 0x0c, &["Beta"]),
+            spawn_player_frame(30, alpha, 0.5, 64.0, 0.5, 0, 0),
+            spawn_player_frame(31, beta, 1.5, 64.0, 0.5, 0, 0),
+        ]),
+        framed(&[keep_alive_frame(24)]),
+        6,
+        6,
+    );
+
+    let all_feeds = feeds(&events);
+    let feed = all_feeds.last().expect("the quiet stretch ticks");
+    assert_eq!(
+        frame_of(feed, 30).nametag.as_deref(),
+        Some("§c[Red] Alpha§r"),
+        "the team's clauses wrap the nametag"
+    );
+    assert_eq!(
+        frame_of(feed, 31).nametag.as_deref(),
+        Some("Beta"),
+        "a coloured team with empty clauses adds nothing: the colour is not the text"
+    );
+    // The same composition for the list entry, and the colour for the paths
+    // that colour from it.
+    let board = boards(&events)
+        .last()
+        .copied()
+        .expect("the team create reports the board");
+    let record = player_lists(&events)
+        .last()
+        .and_then(|set| set.iter().find(|record| record.name == "Alpha"))
+        .expect("Alpha's entry");
+    assert_eq!(
+        display_name(Some(record), board).as_deref(),
+        Some("§c[Red] Alpha§r"),
+        "the list entry composes with the same clauses"
+    );
+    assert_eq!(entry_colour(board, "Alpha"), Some(0x0c));
+    assert_eq!(entry_colour(board, "Beta"), Some(0x0c));
+    assert_eq!(entry_colour(board, "Nobody"), None);
+}
+
+#[test]
+fn a_re_sent_join_game_starts_the_scoreboard_and_the_list_over() {
+    // A re-sent Join Game builds a fresh world, and the world's scoreboard
+    // is fresh with it (`handleJoinGame:281` makes a new world; a dimension
+    // change is the case that carries the old board over,
+    // `handleRespawn:1065`).
+    let alpha = [0x05; 16];
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &player_list_add_frame(alpha, "Alpha"),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &scoreboard_objective_frame("kills", 0, "Kills", "integer"),
+        SERVER_FRAMING,
+    );
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let reported = boards(&events);
+    assert_eq!(
+        reported.len(),
+        2,
+        "the create and then the emptied board: {events:?}"
+    );
+    assert_eq!(
+        reported[0].objectives.len(),
+        1,
+        "the first board holds the objective"
+    );
+    assert_eq!(
+        *reported[1],
+        Scoreboard::new(),
+        "the rebuilt world starts the board over"
+    );
+    let sets = player_lists(&events);
+    assert_eq!(
+        sets.len(),
+        2,
+        "the add and then the emptied set: {events:?}"
+    );
+    assert_eq!(sets[0][0].name, "Alpha");
+    assert!(sets[1].is_empty(), "the rebuilt world names no players");
+}
+
+#[test]
+fn a_dimension_respawn_keeps_the_scoreboard_and_reports_the_list_cleared() {
+    // `handleRespawn:1058-1065` hands the old scoreboard to the new world, so
+    // a dimension change keeps it whole — objectives, scores and teams — and
+    // reports no board; the session's rebuilt world still starts its player
+    // list over.
+    let alpha = [0x06; 16];
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &player_list_add_frame(alpha, "Alpha"),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &scoreboard_objective_frame("kills", 0, "Kills", "integer"),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut head,
+        &respawn_frame(-1, 1, 2, "default"),
+        SERVER_FRAMING,
+    );
+    // One more objective after the respawn: the reported board still holds
+    // the first, so the respawn kept it.
+    frame(
+        &mut head,
+        &scoreboard_objective_frame("deaths", 0, "Deaths", "integer"),
+        SERVER_FRAMING,
+    );
+
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let reported = boards(&events);
+    assert_eq!(
+        reported.len(),
+        2,
+        "the two creates report; the respawn reports no board: {events:?}"
+    );
+    assert_eq!(reported[0].objectives.len(), 1, "the first board");
+    assert!(
+        reported[1].objectives.contains_key("kills"),
+        "the pre-respawn objective survived: {:?}",
+        reported[1].objectives
+    );
+    assert!(reported[1].objectives.contains_key("deaths"));
+    let sets = player_lists(&events);
+    assert_eq!(sets.len(), 2, "the add, then the cleared set: {events:?}");
+    assert_eq!(sets[0][0].name, "Alpha");
+    assert!(sets[1].is_empty());
+    // The cleared set sits with the world's rebuild: behind the clear and
+    // before the World Cleared report of the same block.
+    let set_positions: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, ClientEvent::PlayerList { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    let cleared = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::WorldCleared))
+        .expect("the respawn rebuilt the world");
+    assert!(
+        set_positions[1] < cleared,
+        "the clear precedes the world's own report: {events:?}"
+    );
+}
+
+#[test]
+fn a_time_update_of_the_smallest_value_freezes_the_clock_without_panicking() {
+    // The receive rule's negation is a two's-complement wrap on every `i64`
+    // (`S03PacketTimeUpdate.java:17-31`, `WorldClient.setWorldTime`,
+    // `WorldClient.java:468-483`): the smallest value negates to itself —
+    // still negative, so the frozen gate holds — and the sky the clock
+    // renders from it is computed without the read loop faulting.
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 65.0, 4.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    frame(&mut head, &chunk_data_frame(0, 0), SERVER_FRAMING);
+    // `i64::MIN` on the wire: the negation's fixed point.
+    frame(
+        &mut head,
+        &time_update_frame(48_000, i64::MIN),
+        SERVER_FRAMING,
+    );
+
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(keepalive_script(92)),
+        // Sixteen idle waits: a few hundred milliseconds of quiet, whole
+        // steps of it.
+        stalls: 16,
+        tail_stalls: 0,
+        outgoing,
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+
+    let clocks: Vec<(i64, i64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Time {
+                world_age,
+                time_of_day,
+            } => Some((*world_age, *time_of_day)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        clocks,
+        vec![(48_000, i64::MIN)],
+        "the smallest value negates to itself and is the clock's value: {events:?}"
+    );
+    // The receipt reports the sky the clock produces — the whole chain runs
+    // on the smallest value — and the frozen gate holds it: no tick reports
+    // another.
+    let skies: Vec<SkyReport> = events.iter().filter_map(sky_report).collect();
+    assert_eq!(
+        skies.len(),
+        1,
+        "one sky, the receipt's; the frozen ticks report none: {events:?}"
+    );
+    assert!(
+        skies[0].moon_phase < 8,
+        "the moon phase stays in the source's range: {}",
+        skies[0].moon_phase
+    );
+    let ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    assert!(ticks >= 3, "the quiet stretch owes whole steps: {ticks}");
 }

@@ -287,7 +287,9 @@ pub struct ScoreboardTeam {
     /// The name-tag visibility, carried by the create and update modes:
     /// `always`, `hideForOtherTeams`, `hideForOwnTeam` or `never`.
     pub name_tag_visibility: Option<String>,
-    /// The colour, carried by the create and update modes.
+    /// The colour, carried by the create and update modes: a colour-table
+    /// index, or the no-colour sentinel byte (`0xFF` read signed as `-1`),
+    /// which the consumer's own reading maps to no colour.
     pub colour: Option<u8>,
     /// The players, carried by the create, add-players and remove-players
     /// modes.
@@ -340,6 +342,9 @@ impl ScoreboardTeam {
             team.suffix = Some(codec::read_string(&mut cursor, 16)?);
             team.friendly_flags = Some(codec::read_u8(&mut cursor)?);
             team.name_tag_visibility = Some(codec::read_string(&mut cursor, 32)?);
+            // The raw byte: a colour-table index, or the `0xFF` sentinel
+            // (signed `-1`) for no colour (`S3EPacketTeams.java:92` reads it,
+            // `:121` writes the sentinel); its reader maps it.
             team.colour = Some(codec::read_u8(&mut cursor)?);
         }
         if mode == Self::MODE_CREATE

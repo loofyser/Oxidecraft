@@ -12,7 +12,8 @@
 //! The player-list model and the display-name composition live here too: the
 //! list is connection-scoped state the session mutates from clientbound 0x38,
 //! and [`display_name`] is the one composition point a player's frame text
-//! takes (Task 6 extends it with the team clauses).
+//! takes — the entry's own text wrapped in its team's clauses
+//! ([`format_entry`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -21,6 +22,8 @@ use oxide_proto_v47::entity::{MetadataItem, MetadataValue};
 use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
 use oxide_world::light;
 use oxide_world::world::World;
+
+use crate::scoreboard::{Scoreboard, format_entry};
 
 /// The metadata index of the base flag byte (`Entity.java:286`,
 /// `dataWatcher.addObject(0, Byte(0))`).
@@ -383,21 +386,18 @@ impl PlayerList {
     }
 }
 
-/// The composed display text for a player, from its list entry.
+/// The composed display text for a player, from its list entry and the board.
 ///
-/// The entry's display name when the server sent one, else the account name
-/// (`NetworkPlayerInfo.getDisplayName`'s preference); `None` when no entry is
+/// The entry's display name when the server sent one, else the account name,
+/// wrapped in the team's clauses ([`format_entry`], the source's
+/// `ScorePlayerTeam.formatString:95-98`) — the text a player's nametag and
+/// its tab-list row both read, composed once here. `None` when no entry is
 /// known — §8's ordering obligation has the list item arrive before the
-/// spawn, so a player frame without one is the not-yet-named case. This is
-/// the one composition point; Task 6 extends it with the team clauses.
-pub fn display_name(entry: Option<&PlayerListRecord>) -> Option<String> {
+/// spawn, so a player frame without one is the not-yet-named case.
+pub fn display_name(entry: Option<&PlayerListRecord>, board: &Scoreboard) -> Option<String> {
     let entry = entry?;
-    Some(
-        entry
-            .display_name
-            .clone()
-            .unwrap_or_else(|| entry.name.clone()),
-    )
+    let fallback = entry.display_name.as_deref().unwrap_or(entry.name.as_str());
+    Some(format_entry(board, &entry.name, fallback))
 }
 
 /// One frame per entity, in ascending id order.
@@ -414,6 +414,7 @@ pub fn snapshot(
     entities: &Entities,
     world: Option<&World>,
     player_list: &PlayerList,
+    board: &Scoreboard,
 ) -> Vec<EntityFrame> {
     // The ridden ids, one pass over the store: a mount attachment (`!leash`)
     // names its holder — the entity being ridden — and the living renderer
@@ -427,7 +428,7 @@ pub fn snapshot(
         .collect();
     entities
         .iter()
-        .map(|entity| frame_of(entity, world, player_list, &ridden))
+        .map(|entity| frame_of(entity, world, player_list, board, &ridden))
         .collect()
 }
 
@@ -436,6 +437,7 @@ fn frame_of(
     entity: &Entity,
     world: Option<&World>,
     player_list: &PlayerList,
+    board: &Scoreboard,
     ridden: &BTreeSet<i32>,
 ) -> EntityFrame {
     let flags = byte_at(entity, FLAGS_INDEX).unwrap_or(0);
@@ -466,7 +468,7 @@ fn frame_of(
         death_ticks: entity.death_ticks,
         brightness: brightness(world, entity.position),
         health: health(entity),
-        nametag: nametag(entity, player_list, ridden),
+        nametag: nametag(entity, player_list, board, ridden),
         extra: extra(entity),
     }
 }
@@ -484,7 +486,7 @@ fn frame_of(
 /// the mesher shades its cells with (`oxide_world::light::light_at`).
 ///
 /// The eye height arrives with the models, so this milestone pins the feet
-/// block (the plan's Task 5 interfaces), and the sample position is pinned
+/// block (the tracked-entity interfaces), and the sample position is pinned
 /// by a literal test against a scripted light state.
 fn brightness(world: Option<&World>, position: [f64; 3]) -> f32 {
     let Some(world) = world else {
@@ -548,14 +550,19 @@ fn health(entity: &Entity) -> Option<(f32, f32)> {
 /// `Entity.hasCustomName:2622-2625`; the always-show byte is index 3,
 /// `Entity.getAlwaysRenderNameTag:2632-2635`) is what a mob's text resolves
 /// to.
-fn nametag(entity: &Entity, player_list: &PlayerList, ridden: &BTreeSet<i32>) -> Option<Arc<str>> {
+fn nametag(
+    entity: &Entity,
+    player_list: &PlayerList,
+    board: &Scoreboard,
+    ridden: &BTreeSet<i32>,
+) -> Option<Arc<str>> {
     let flags = byte_at(entity, FLAGS_INDEX).unwrap_or(0);
     if flags & INVISIBLE_BIT != 0 || ridden.contains(&entity.id) {
         return None;
     }
     if entity.kind == EntityKind::Player {
         let uuid = entity.uuid.as_deref()?;
-        return display_name(player_list.get(uuid)).map(Arc::from);
+        return display_name(player_list.get(uuid), board).map(Arc::from);
     }
     let always = byte_at(entity, NAME_VISIBLE_INDEX).unwrap_or(0) == 1;
     let named = string_at(entity, CUSTOM_NAME_INDEX).filter(|name| !name.is_empty());
@@ -832,7 +839,7 @@ mod tests {
     fn frame_for(entity: &Entity) -> EntityFrame {
         let mut entities = Entities::new();
         entities.insert(entity.clone());
-        snapshot(&entities, None, &PlayerList::new())
+        snapshot(&entities, None, &PlayerList::new(), &Scoreboard::new())
             .into_iter()
             .next()
             .expect("one frame")
@@ -862,7 +869,7 @@ mod tests {
     fn frame_against(entity: &Entity, list: &PlayerList) -> EntityFrame {
         let mut entities = Entities::new();
         entities.insert(entity.clone());
-        snapshot(&entities, None, list)
+        snapshot(&entities, None, list, &Scoreboard::new())
             .into_iter()
             .next()
             .expect("one frame")
@@ -875,7 +882,7 @@ mod tests {
         for entity in entities {
             store.insert(entity.clone());
         }
-        snapshot(&store, None, &PlayerList::new())
+        snapshot(&store, None, &PlayerList::new(), &Scoreboard::new())
     }
 
     /// The frame with this id among the listed frames.
@@ -973,7 +980,7 @@ mod tests {
         entities.insert(Entity::new(9, EntityKind::Pig));
         entities.insert(Entity::new(3, EntityKind::Item));
         entities.insert(Entity::new(5, EntityKind::Cow));
-        let frames = snapshot(&entities, None, &PlayerList::new());
+        let frames = snapshot(&entities, None, &PlayerList::new(), &Scoreboard::new());
         let ids: Vec<i32> = frames.iter().map(|frame| frame.id).collect();
         assert_eq!(ids, vec![3, 5, 9]);
     }
@@ -1435,13 +1442,44 @@ mod tests {
             display_name: Some("§bOx".to_owned()),
             ..PlayerListRecord::default()
         };
-        assert_eq!(display_name(Some(&record)).as_deref(), Some("§bOx"));
+        assert_eq!(
+            display_name(Some(&record), &Scoreboard::new()).as_deref(),
+            Some("§bOx")
+        );
         let plain = PlayerListRecord {
             name: "OxideDev".to_owned(),
             ..PlayerListRecord::default()
         };
-        assert_eq!(display_name(Some(&plain)).as_deref(), Some("OxideDev"));
-        assert_eq!(display_name(None), None);
+        assert_eq!(
+            display_name(Some(&plain), &Scoreboard::new()).as_deref(),
+            Some("OxideDev")
+        );
+        assert_eq!(display_name(None, &Scoreboard::new()), None);
+    }
+
+    #[test]
+    fn the_display_name_carries_the_team_clauses() {
+        // `ScorePlayerTeam.formatString:95-98` around whichever text the entry
+        // resolves to: the name's own team wraps the display name here and
+        // adds nothing when the team holds the player under another key.
+        let record = PlayerListRecord {
+            name: "OxideDev".to_owned(),
+            display_name: Some("§bOx".to_owned()),
+            ..PlayerListRecord::default()
+        };
+        let mut board = Scoreboard::new();
+        assert_eq!(
+            display_name(Some(&record), &board).as_deref(),
+            Some("§bOx"),
+            "no team yet: the entry's own text"
+        );
+        board.set_team("red", "Red", "§c[Red] ", "§r", 1, "always", Some(0x0c));
+        board.add_team_players("red", &["OxideDev".to_owned()]);
+        assert_eq!(
+            display_name(Some(&record), &board).as_deref(),
+            Some("§c[Red] §bOx§r"),
+            "the team's clauses wrap the display name"
+        );
     }
 
     // -----------------------------------------------------------------

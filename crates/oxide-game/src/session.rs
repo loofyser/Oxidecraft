@@ -65,6 +65,9 @@ use oxide_proto_v47::serverbound::{
     write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
     write_plugin_message,
 };
+use oxide_proto_v47::ui::{
+    ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam, TabHeaderFooter,
+};
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
 use oxide_world::behaviour::behaviour;
@@ -91,6 +94,7 @@ use crate::mesher::{
 };
 use crate::physics;
 use crate::player::{Abilities, Player};
+use crate::scoreboard::{Scoreboard, colour_from_wire};
 use crate::ticker::Ticker;
 use crate::world_view::WorldView;
 
@@ -328,6 +332,35 @@ pub enum ClientEvent {
     EntitiesTick {
         /// One frame per tracked entity.
         entities: Vec<EntityFrame>,
+    },
+    /// The player list's whole entry set, from clientbound 0x38.
+    ///
+    /// Reported once per change — an add, an update of either kind or a
+    /// remove — and not at all for a packet that leaves the list as it was;
+    /// the records come in ascending uuid order, the list's own order.
+    PlayerList {
+        /// The records, ascending uuid.
+        entries: Vec<PlayerListRecord>,
+    },
+    /// The scoreboard's whole state, from clientbound 0x3B–0x3E.
+    ///
+    /// Reported once per change to any part of it — an objective, a score, a
+    /// display slot, a team or a membership — and not at all for a packet
+    /// that writes what the board already holds. The state is small, so the
+    /// whole of it travels and the window keeps no merge logic.
+    ScoreboardChanged {
+        /// The state as it stands.
+        board: Scoreboard,
+    },
+    /// The tab list's header and footer text, from clientbound 0x47.
+    ///
+    /// The two strings travel as sent — chat JSON — and the pair is reported
+    /// when it changed.
+    TabText {
+        /// The header as sent.
+        header: String,
+        /// The footer as sent.
+        footer: String,
     },
     /// The player's health, food and saturation, from clientbound 0x06.
     ///
@@ -603,6 +636,14 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // when a rebuild replaces the world.
         let mut entities = Entities::new();
         let mut player_list = PlayerList::new();
+        // The scoreboard and the tab text: further connection-scoped view
+        // state, fed by clientbound 0x3B–0x3E and 0x47 and reported on
+        // change. The board is cleared with a fresh world and carried across
+        // a dimension respawn — the source's own two rules
+        // (`handleJoinGame:281`, `handleRespawn:1058-1065`); the tab text is
+        // touched by nothing but its own packet.
+        let mut board = Scoreboard::new();
+        let mut tab_text: Option<(String, String)> = None;
         // The dimension the world was built for, from the last Join Game: a
         // respawn compares its own dimension against it to decide whether the
         // world survives (`NetHandlerPlayClient.handleRespawn:1056-1073`).
@@ -710,7 +751,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // no known players: the store and the list start
                             // over with it.
                             entities.clear();
-                            player_list.clear();
+                            let list_before = std::mem::take(&mut player_list);
+                            let board_before = std::mem::take(&mut board);
+                            // The rebuilt world reports the emptied list and
+                            // board at once; a first Join Game held neither
+                            // and reports nothing.
+                            report_list_change(&player_list, &list_before, events);
+                            report_board_change(&board, &board_before, events);
                             dimension = join.dimension;
                             // The player's own entity id is named here. It gates this
                             // client's tick sends: the source's tick is gated on the
@@ -845,7 +892,10 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // tracked entities and the list go with it
                                 // (`NetHandlerPlayClient.handleRespawn`).
                                 entities.clear();
-                                player_list.clear();
+                                let list_before = std::mem::take(&mut player_list);
+                                // The rebuilt world reports the emptied list
+                                // at once.
+                                report_list_change(&player_list, &list_before, events);
                                 report(events, ClientEvent::WorldCleared);
                             }
                             dimension = respawned;
@@ -942,7 +992,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // reads its entities from the very next event.
                             report(
                                 events,
-                                entities_tick(&entities, world.as_ref(), &player_list),
+                                entities_tick(&entities, world.as_ref(), &player_list, &board),
                             );
                             // The view block moved: the sky's colour is sampled at the player's own
                             // block, so a correction can change it without a new clock.
@@ -1294,6 +1344,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // and a remove drops it. An update naming no
                             // record is refused by the list and logged.
                             let list = decoded(id, PlayerListItem::decode(body))?;
+                            let before = player_list.clone();
                             match list.action {
                                 PlayerListItem::ACTION_ADD => {
                                     for entry in list.entries {
@@ -1364,6 +1415,123 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 }
                                 _ => {}
                             }
+                            report_list_change(&player_list, &before, events);
+                        }
+                        ScoreboardObjective::ID => {
+                            let objective = decoded(id, ScoreboardObjective::decode(body))?;
+                            let before = board.clone();
+                            if objective.mode == ScoreboardObjective::MODE_REMOVE {
+                                board.remove_objective(&objective.name);
+                            } else {
+                                // The create and update modes both carry the
+                                // whole info block and both write it over the
+                                // objective's name (`handleScoreboardObjective`,
+                                // `NetHandlerPlayClient.java:1874-1892`); the
+                                // decoder fills the two fields for exactly
+                                // those modes.
+                                board.set_objective(
+                                    &objective.name,
+                                    objective.value.as_deref().unwrap_or_default(),
+                                    objective.kind.as_deref().unwrap_or_default(),
+                                );
+                            }
+                            report_board_change(&board, &before, events);
+                        }
+                        ScoreboardScore::ID => {
+                            let score = decoded(id, ScoreboardScore::decode(body))?;
+                            let before = board.clone();
+                            match (score.mode, score.objective.as_deref()) {
+                                // The set mode carries the value (the decoder
+                                // fills it for that mode alone).
+                                (ScoreboardScore::MODE_SET, Some(objective)) => {
+                                    board.set_score(
+                                        &score.entry,
+                                        objective,
+                                        score.value.unwrap_or(0),
+                                    );
+                                }
+                                // The remove mode drops one objective's
+                                // score, or — the empty name — every
+                                // objective of the entry
+                                // (`handleUpdateScore`, `:1910-1919`).
+                                (ScoreboardScore::MODE_REMOVE, Some(objective)) => {
+                                    board.remove_score(&score.entry, objective);
+                                }
+                                (ScoreboardScore::MODE_REMOVE, None) => {
+                                    board.remove_scores(&score.entry);
+                                }
+                                // A set naming no objective writes nowhere.
+                                (_, None) => {}
+                                // The decoder admits only the two modes.
+                                _ => {}
+                            }
+                            report_board_change(&board, &before, events);
+                        }
+                        ScoreboardDisplay::ID => {
+                            let display = decoded(id, ScoreboardDisplay::decode(body))?;
+                            let before = board.clone();
+                            // The empty name clears the slot; anything else
+                            // names the objective it shows
+                            // (`handleDisplayScoreboard`, `:1932-1939`).
+                            board.set_display(display.slot as usize, display.objective.as_deref());
+                            report_board_change(&board, &before, events);
+                        }
+                        ScoreboardTeam::ID => {
+                            let team = decoded(id, ScoreboardTeam::decode(body))?;
+                            let before = board.clone();
+                            match team.mode {
+                                ScoreboardTeam::MODE_CREATE | ScoreboardTeam::MODE_UPDATE => {
+                                    // Both modes write the whole info block
+                                    // (`handleTeams:1962-1975`), and the
+                                    // colour byte runs through the sentinel's
+                                    // own reading. The create replaces the
+                                    // team registration; the update rewrites
+                                    // the one it names and keeps its players.
+                                    if team.mode == ScoreboardTeam::MODE_CREATE {
+                                        board.remove_team(&team.name);
+                                    }
+                                    board.set_team(
+                                        &team.name,
+                                        team.display_name.as_deref().unwrap_or_default(),
+                                        team.prefix.as_deref().unwrap_or_default(),
+                                        team.suffix.as_deref().unwrap_or_default(),
+                                        team.friendly_flags.unwrap_or(0),
+                                        team.name_tag_visibility.as_deref().unwrap_or_default(),
+                                        team.colour.and_then(colour_from_wire),
+                                    );
+                                    if let Some(players) = team.players.as_deref() {
+                                        board.add_team_players(&team.name, players);
+                                    }
+                                }
+                                ScoreboardTeam::MODE_ADD_PLAYERS => {
+                                    if let Some(players) = team.players.as_deref() {
+                                        board.add_team_players(&team.name, players);
+                                    }
+                                }
+                                ScoreboardTeam::MODE_REMOVE_PLAYERS => {
+                                    if let Some(players) = team.players.as_deref() {
+                                        board.remove_team_players(&team.name, players);
+                                    }
+                                }
+                                // The remove mode: the team and every
+                                // membership with it (`handleTeams:1993-1996`).
+                                _ => board.remove_team(&team.name),
+                            }
+                            report_board_change(&board, &before, events);
+                        }
+                        TabHeaderFooter::ID => {
+                            let text = decoded(id, TabHeaderFooter::decode(body))?;
+                            let next = (text.header, text.footer);
+                            if tab_text.as_ref() != Some(&next) {
+                                report(
+                                    events,
+                                    ClientEvent::TabText {
+                                        header: next.0.clone(),
+                                        footer: next.1.clone(),
+                                    },
+                                );
+                            }
+                            tab_text = Some(next);
                         }
                         PluginMessage::ID => {
                             let message = decoded(id, PluginMessage::decode(body))?;
@@ -1437,6 +1605,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     world.as_ref(),
                     &mut entities,
                     &player_list,
+                    &board,
                     events,
                     !awaiting_respawn_position,
                 ) {
@@ -1759,15 +1928,16 @@ fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
 /// The tracked entities as the window's per-tick event.
 ///
 /// The frames are built here, against the same light data the mesher reads
-/// and the list the 0x38 arm maintains — the window holds no world snapshot
-/// of its own.
+/// and the list and board the 0x38–0x3E arms maintain — the window holds no
+/// world snapshot of its own.
 fn entities_tick(
     entities: &Entities,
     world: Option<&World>,
     player_list: &PlayerList,
+    board: &Scoreboard,
 ) -> ClientEvent {
     ClientEvent::EntitiesTick {
-        entities: entity_view::snapshot(entities, world, player_list),
+        entities: entity_view::snapshot(entities, world, player_list, board),
     }
 }
 
@@ -1926,6 +2096,7 @@ fn step_tick(
     world: Option<&World>,
     entities: &mut Entities,
     player_list: &PlayerList,
+    board: &Scoreboard,
     events: &Sender<ClientEvent>,
     movement_reports: bool,
 ) -> Vec<Vec<u8>> {
@@ -2055,7 +2226,7 @@ fn step_tick(
     report(events, player_tick(player, false));
     // The feed sits immediately behind the player's own event: one
     // `EntitiesTick` per tick, carrying every tracked entity's frame.
-    report(events, entities_tick(entities, world, player_list));
+    report(events, entities_tick(entities, world, player_list, board));
     sends
 }
 
@@ -2233,6 +2404,38 @@ fn decoded<T>(id: i32, result: Result<T, PacketError>) -> Result<T, SessionError
 /// Reports one event; a window that stopped listening is not an error here.
 fn report(events: &Sender<ClientEvent>, event: ClientEvent) {
     let _ = events.send(event);
+}
+
+/// Reports the player list when it changed against the set it started from.
+///
+/// The 0x38 arm hands its five actions a snapshot of the list: a packet that
+/// leaves the list as it was reports nothing, however it spelled its entries.
+fn report_list_change(player_list: &PlayerList, before: &PlayerList, events: &Sender<ClientEvent>) {
+    if player_list == before {
+        return;
+    }
+    report(
+        events,
+        ClientEvent::PlayerList {
+            entries: player_list
+                .iter()
+                .map(|(_, record)| record.clone())
+                .collect(),
+        },
+    );
+}
+
+/// Reports the scoreboard when it changed against the state it started from.
+fn report_board_change(board: &Scoreboard, before: &Scoreboard, events: &Sender<ClientEvent>) {
+    if board == before {
+        return;
+    }
+    report(
+        events,
+        ClientEvent::ScoreboardChanged {
+            board: board.clone(),
+        },
+    );
 }
 
 /// The client's receive rule for a Time Update's time of day: `WorldClient.setWorldTime`
@@ -2801,11 +3004,16 @@ mod tests {
     use oxide_world::entity::Entities;
     use oxide_world::world::World;
 
-    use super::{ASSUMED_HELD_BLOCK, ClientEvent, Clock, TICK_PERIOD, step_tick};
+    use super::{
+        ASSUMED_HELD_BLOCK, ClientEvent, Clock, END_OF_SESSION_WAIT, MeshAssets, MeshQueue,
+        TICK_PERIOD, finish_meshes, mesh_pool, step_tick,
+    };
     use crate::entity_view::PlayerList;
     use crate::input::Intent;
     use crate::player::{MAX_HURT_TIME, Player};
+    use crate::scoreboard::Scoreboard;
     use crate::ticker::Ticker;
+    use std::sync::Arc;
 
     #[test]
     fn the_tick_period_is_fifty_milliseconds() {
@@ -2861,6 +3069,7 @@ mod tests {
             Some(&world),
             &mut Entities::new(),
             &PlayerList::new(),
+            &Scoreboard::new(),
             &sender,
             true,
         );
@@ -2901,6 +3110,7 @@ mod tests {
             Some(&world),
             &mut Entities::new(),
             &PlayerList::new(),
+            &Scoreboard::new(),
             &sender,
             true,
         );
@@ -2940,6 +3150,7 @@ mod tests {
                 None,
                 &mut Entities::new(),
                 &PlayerList::new(),
+                &Scoreboard::new(),
                 &sender,
                 true,
             );
@@ -2961,6 +3172,7 @@ mod tests {
                 None,
                 &mut Entities::new(),
                 &PlayerList::new(),
+                &Scoreboard::new(),
                 &sender,
                 true,
             );
@@ -2993,6 +3205,7 @@ mod tests {
             None,
             &mut Entities::new(),
             &PlayerList::new(),
+            &Scoreboard::new(),
             &sender,
             false,
         );
@@ -3014,9 +3227,55 @@ mod tests {
             None,
             &mut Entities::new(),
             &PlayerList::new(),
+            &Scoreboard::new(),
             &sender,
             true,
         );
         assert_eq!(sent.len(), 1, "one walking report per step: {sent:?}");
+    }
+
+    #[test]
+    fn the_end_of_session_drain_gives_up_at_its_bound() {
+        // The drain's expiry path (backlog item 31(8)): an outstanding build
+        // cannot hold the session's end forever — [`finish_meshes`] returns
+        // at [`END_OF_SESSION_WAIT`] with the build still outstanding and
+        // reports nothing of it. The queue's own rules make the case
+        // synthesisable: a job recorded as running but never completed stays
+        // outstanding, and nothing re-queues it, so the deadline is the
+        // drain's only exit.
+        let mut queue = MeshQueue::new();
+        queue.mark_dirty(4, -2);
+        let job = queue.next_job().expect("the column is waiting");
+        queue.mark_running(job);
+        let pool = mesh_pool().expect("the pool starts");
+        let (finished, results) = crossbeam_channel::unbounded();
+        let (events, reported) = crossbeam_channel::unbounded::<ClientEvent>();
+        let mesh = Arc::new(MeshAssets::fallback());
+        let world = World::new(true);
+
+        let start = Instant::now();
+        finish_meshes(
+            Some(&world),
+            &mut queue,
+            &pool,
+            &mesh,
+            &finished,
+            &results,
+            &events,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= END_OF_SESSION_WAIT,
+            "the drain waited its whole bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed < END_OF_SESSION_WAIT + Duration::from_secs(5),
+            "and no longer than the bound plus slack: {elapsed:?}"
+        );
+        assert_eq!(queue.pending(), 1, "the wedged build is still outstanding");
+        assert!(
+            reported.try_iter().next().is_none(),
+            "nothing was reported of a build that never finished"
+        );
     }
 }
