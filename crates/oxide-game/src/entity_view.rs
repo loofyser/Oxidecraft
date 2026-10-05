@@ -14,7 +14,7 @@
 //! and [`display_name`] is the one composition point a player's frame text
 //! takes (Task 6 extends it with the team clauses).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use oxide_proto_v47::entity::{MetadataItem, MetadataValue};
@@ -22,7 +22,7 @@ use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
 use oxide_world::light;
 use oxide_world::world::World;
 
-/// The metadata index of the base flag byte (`Entity.java:2141-2145`,
+/// The metadata index of the base flag byte (`Entity.java:286`,
 /// `dataWatcher.addObject(0, Byte(0))`).
 const FLAGS_INDEX: u8 = 0;
 
@@ -244,7 +244,7 @@ pub enum MobExtra {
     /// A horse's state: type byte index 19 (`EntityHorse.getHorseType:127`),
     /// variant int index 20 (`getHorseVariant:138`), the tamed and saddled
     /// bits of the flags int index 16 (`getHorseWatchableBoolean`,
-    /// `:177-180`, read through `:249` and `:345`), and the growing age at
+    /// `:175-178`, read through `:249` and `:345`), and the growing age at
     /// byte index 12.
     Horse {
         /// The horse type: `0` horse, `1` donkey, `2` mule, `3` zombie, `4`
@@ -415,14 +415,29 @@ pub fn snapshot(
     world: Option<&World>,
     player_list: &PlayerList,
 ) -> Vec<EntityFrame> {
+    // The ridden ids, one pass over the store: a mount attachment (`!leash`)
+    // names its holder — the entity being ridden — and the living renderer
+    // drops a ridden entity's name.
+    let ridden: BTreeSet<i32> = entities
+        .iter()
+        .filter_map(|entity| match &entity.attachment {
+            Some(attachment) if !attachment.leash => Some(attachment.holder),
+            _ => None,
+        })
+        .collect();
     entities
         .iter()
-        .map(|entity| frame_of(entity, world, player_list))
+        .map(|entity| frame_of(entity, world, player_list, &ridden))
         .collect()
 }
 
 /// The state one entity's frame carries, extracted from the store.
-fn frame_of(entity: &Entity, world: Option<&World>, player_list: &PlayerList) -> EntityFrame {
+fn frame_of(
+    entity: &Entity,
+    world: Option<&World>,
+    player_list: &PlayerList,
+    ridden: &BTreeSet<i32>,
+) -> EntityFrame {
     let flags = byte_at(entity, FLAGS_INDEX).unwrap_or(0);
     EntityFrame {
         id: entity.id,
@@ -451,24 +466,26 @@ fn frame_of(entity: &Entity, world: Option<&World>, player_list: &PlayerList) ->
         death_ticks: entity.death_ticks,
         brightness: brightness(world, entity.position),
         health: health(entity),
-        nametag: nametag(entity, player_list),
+        nametag: nametag(entity, player_list, ridden),
         extra: extra(entity),
     }
 }
 
 /// The brightness at an entity's feet, from the world's light.
 ///
-/// The chain is the source's own: the sample lands in the block the feet
-/// stand in; a position no loaded column holds answers nothing (zero), which
-/// is the source's unloaded answer; otherwise the level is the world's light
-/// there — the greater of the two kinds, exactly the number the mesher
-/// shades its cells with (`oxide_world::light::light_at`) — run through the
-/// provider's table (see [`brightness_of_level`]).
+/// The chain is the source's float `Entity.getBrightness`
+/// (`Entity.java:1256-1260`): the sample at `posY + getEyeHeight()` reads
+/// the world's light brightness at that block
+/// (`World.getLightBrightness:845-848`) and runs it through the provider's
+/// table (see [`brightness_of_level`]). Here the sample lands in the block
+/// the feet stand in; a position no loaded column holds answers nothing
+/// (zero), which is the source's unloaded answer; otherwise the level is the
+/// world's light there — the greater of the two kinds, exactly the number
+/// the mesher shades its cells with (`oxide_world::light::light_at`).
 ///
-/// The source samples at `posY + getEyeHeight()` (`Entity.java:1249`); the
-/// per-kind eye heights arrive with the models, so this milestone pins the
-/// feet block (the plan's Task 5 interfaces), and the sample position is
-/// pinned by a literal test against a scripted light state.
+/// The eye height arrives with the models, so this milestone pins the feet
+/// block (the plan's Task 5 interfaces), and the sample position is pinned
+/// by a literal test against a scripted light state.
 fn brightness(world: Option<&World>, position: [f64; 3]) -> f32 {
     let Some(world) = world else {
         return 0.0;
@@ -486,6 +503,9 @@ fn brightness(world: Option<&World>, position: [f64; 3]) -> f32 {
 /// (`WorldProvider.generateLightBrightnessTable:63-71`, the base provider's
 /// `f = 0`): `f1 = 1 - level / 15`, then `(1 - f1) / (f1 * 3 + 1)` — level
 /// `15` is `1.0`, level `12` is `0.5`, level `0` is `0.0`.
+///
+/// Overworld scope this milestone: the nether's `f = 0.1` floor term
+/// (`WorldProviderHell.generateLightBrightnessTable:34-43`) is not ported.
 fn brightness_of_level(level: u8) -> f32 {
     let f1 = 1.0 - f32::from(level) / 15.0;
     (1.0 - f1) / (f1 * 3.0 + 1.0)
@@ -513,24 +533,24 @@ fn health(entity: &Entity) -> Option<(f32, f32)> {
 /// The composed nametag text, when the name may show.
 ///
 /// The source's own resolution, as far as the session can evaluate it: the
-/// living renderer's last line (`RendererLivingEntity.canRenderName:547-583`)
-/// drops an invisible entity and one that rides; a player is offered without
-/// any flag — the class override answers `true`
-/// (`EntityPlayer.getAlwaysRenderNameTagForRender:2163-2166`), so the text is
-/// [`display_name`]'s composition of the list entry — while a mob takes the
-/// living renderer's two branches (`RenderLiving.canRenderName:21-24`,
-/// `flag || (hasCustomName && pointedEntity)`): the cursor term cannot be
-/// evaluated here, and the flag's own branch carries no text without a name,
-/// so a custom name (index 2, `Entity.hasCustomName:2622-2625`; the
-/// always-show byte is index 3, `Entity.getAlwaysRenderNameTag:2632-2635`) is
-/// what a mob's text resolves to.
-fn nametag(entity: &Entity, player_list: &PlayerList) -> Option<Arc<str>> {
+/// living renderer's last line (`RendererLivingEntity.canRenderName:547-581`)
+/// drops an invisible entity and one that is ridden — an entity its own
+/// `riddenByEntity` names (`Entity.java:63-64`; the term at `:580`). The
+/// store keeps the attachment on the passenger ("what it rides"), so the
+/// ridden set arrives as [`snapshot`]'s reverse lookup over the attachment
+/// holders; a player is offered without any flag — the class override
+/// answers `true` (`EntityPlayer.getAlwaysRenderNameTagForRender:2163-2166`),
+/// so the text is [`display_name`]'s composition of the list entry — while a
+/// mob takes the living renderer's two branches
+/// (`RenderLiving.canRenderName:21-24`, `flag || (hasCustomName && pointedEntity)`):
+/// the cursor term cannot be evaluated here, and the flag's own branch
+/// carries no text without a name, so a custom name (index 2,
+/// `Entity.hasCustomName:2622-2625`; the always-show byte is index 3,
+/// `Entity.getAlwaysRenderNameTag:2632-2635`) is what a mob's text resolves
+/// to.
+fn nametag(entity: &Entity, player_list: &PlayerList, ridden: &BTreeSet<i32>) -> Option<Arc<str>> {
     let flags = byte_at(entity, FLAGS_INDEX).unwrap_or(0);
-    let riding = entity
-        .attachment
-        .as_ref()
-        .is_some_and(|attachment| !attachment.leash);
-    if flags & INVISIBLE_BIT != 0 || riding {
+    if flags & INVISIBLE_BIT != 0 || ridden.contains(&entity.id) {
         return None;
     }
     if entity.kind == EntityKind::Player {
@@ -696,7 +716,7 @@ fn mob_extra(kind: EntityKind, entity: &Entity) -> MobExtra {
             saddle: byte_at(entity, 16).unwrap_or(0) & 0x01 != 0,
         },
         // A horse: int 16's bits 1 tamed and 2 saddled
-        // (`EntityHorse.getHorseWatchableBoolean` through `:249`/`:345`),
+        // (`EntityHorse.getHorseWatchableBoolean:175-178` through `:249`/`:345`),
         // byte 19 the type (`getHorseType:127`), int 20 the colour/variant
         // (`getHorseVariant:138`), byte 12 the growing age.
         EntityKind::EntityHorse => MobExtra::Horse {
@@ -846,6 +866,21 @@ mod tests {
             .into_iter()
             .next()
             .expect("one frame")
+    }
+
+    /// The frames the listed entities produce against no world and an empty
+    /// list.
+    fn frames_of(entities: &[Entity]) -> Vec<EntityFrame> {
+        let mut store = Entities::new();
+        for entity in entities {
+            store.insert(entity.clone());
+        }
+        snapshot(&store, None, &PlayerList::new())
+    }
+
+    /// The frame with this id among the listed frames.
+    fn frame_named(frames: &[EntityFrame], id: i32) -> &EntityFrame {
+        frames.iter().find(|frame| frame.id == id).expect("a frame")
     }
 
     // -----------------------------------------------------------------
@@ -1330,31 +1365,58 @@ mod tests {
     }
 
     #[test]
-    fn an_invisible_or_riding_entity_has_no_nametag() {
-        // The living renderer's last line drops these two before any name
-        // question is asked; a leash is not a ride.
-        let mut entity = Entity::new(1, EntityKind::Cow);
-        entity.metadata = metadata(&[(2, MetadataValue::String("Bessie".to_owned()))]);
-        entity.attachment = Some(Attachment {
-            holder: 4,
+    fn an_invisible_entity_and_a_ridden_one_have_no_nametag() {
+        // The living renderer's last line drops an invisible entity and a
+        // ridden one — an entity the source's `riddenByEntity` names; the
+        // store keeps the attachment on the passenger ("what it rides"), so
+        // the ridden entity is the attachment's holder. A leash is not a
+        // ride.
+        let mut cow = Entity::new(1, EntityKind::Cow);
+        cow.metadata = metadata(&[(2, MetadataValue::String("Bessie".to_owned()))]);
+        let mut pig = Entity::new(4, EntityKind::Pig);
+        pig.metadata = metadata(&[(2, MetadataValue::String("Porkchop".to_owned()))]);
+
+        // A leash is not a ride: the leash's anchor keeps its name.
+        pig.attachment = Some(Attachment {
+            holder: 1,
             leash: true,
         });
+        let frames = frames_of(&[cow.clone(), pig.clone()]);
         assert_eq!(
-            frame_for(&entity).nametag.as_deref(),
+            frame_named(&frames, 1).nametag.as_deref(),
             Some("Bessie"),
             "a leashed cow keeps its name"
         );
-        entity.attachment = Some(Attachment {
-            holder: 4,
+        assert_eq!(
+            frame_named(&frames, 4).nametag.as_deref(),
+            Some("Porkchop"),
+            "the leashed pig keeps its name"
+        );
+
+        // The pig rides the cow: the cow is the ridden one and drops its
+        // name; the pig keeps its own.
+        pig.attachment = Some(Attachment {
+            holder: 1,
             leash: false,
         });
-        assert_eq!(frame_for(&entity).nametag, None, "a riding cow does not");
-        entity.attachment = None;
-        entity.metadata = metadata(&[
+        let frames = frames_of(&[cow.clone(), pig]);
+        assert_eq!(
+            frame_named(&frames, 1).nametag,
+            None,
+            "the ridden cow's name hides"
+        );
+        assert_eq!(
+            frame_named(&frames, 4).nametag.as_deref(),
+            Some("Porkchop"),
+            "the riding pig keeps its name"
+        );
+
+        // An invisible entity loses its name with no attachment in play.
+        cow.metadata = metadata(&[
             (2, MetadataValue::String("Bessie".to_owned())),
             (0, MetadataValue::Byte(INVISIBLE_BIT)),
         ]);
-        assert_eq!(frame_for(&entity).nametag, None, "nor an invisible one");
+        assert_eq!(frame_for(&cow).nametag, None, "nor an invisible one");
 
         let (player, list) = listed("OxideDev");
         let mut invisible = player.clone();

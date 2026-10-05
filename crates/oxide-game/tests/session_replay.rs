@@ -1805,9 +1805,14 @@ fn the_entity_arm_family_reaches_the_feed() {
         "the destroyed orb is gone: {late:?}"
     );
     assert_eq!(
-        frame_of(late, 32).nametag,
+        frame_of(late, 32).nametag.as_deref(),
+        Some("Stand"),
+        "the passenger keeps its name"
+    );
+    assert_eq!(
+        frame_of(late, 31).nametag,
         None,
-        "a riding entity's name hides"
+        "the ridden mount's name hides"
     );
     assert_eq!(
         frame_of(late, 30).nametag.as_deref(),

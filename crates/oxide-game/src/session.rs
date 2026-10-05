@@ -1201,9 +1201,10 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             entity.position =
                                 [f64::from(spawn.x), f64::from(spawn.y), f64::from(spawn.z)];
                             entity.last_tick_position = entity.position;
-                            // The source masks the wire's direction byte with
-                            // `& 3` when it resolves the face
-                            // (`NetHandlerPlayClient.handleSpawnPainting:563-575`).
+                            // The source reduces the wire's direction byte
+                            // modulo 4 when it resolves the face
+                            // (`EnumFacing.getHorizontal:273-276`, called from
+                            // `S10PacketSpawnPainting.readPacketData:38`).
                             entity.data = KindData::Painting {
                                 title: Arc::from(spawn.title.as_str()),
                                 facing: spawn.facing & 0x03,
@@ -1228,7 +1229,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         CollectItem::ID => {
                             let collect = decoded(id, entity::decode_collect_item(body))?;
                             // The collected drop leaves the world
-                            // (`NetHandlerPlayClient.handleCollectItem:840-852`).
+                            // (`NetHandlerPlayClient.handleCollectItem:819-844`).
                             entities.remove(&[collect.collected]);
                         }
                         EntityVelocity::ID => {
@@ -1240,9 +1241,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             entities.remove(&destroy.entity_ids);
                         }
                         entity::Entity::ID => {
-                            // The packet names an entity and nothing else; the
-                            // source's handler reads it and drops it
-                            // (`NetHandlerPlayClient.handleEntity:476-478`).
+                            // The packet names an entity and nothing else
+                            // (`S14PacketEntity.readPacketData:33-36`); the
+                            // source's handler applies its zero deltas as a
+                            // position resync and the on-ground bit
+                            // (`NetHandlerPlayClient.handleEntityMovement:613-631`).
+                            // The session reads the id and drops it.
                             let packet = decoded(id, entity::decode_entity(body))?;
                             debug!(entity_id = packet.entity_id, "ignoring the entity packet");
                         }
