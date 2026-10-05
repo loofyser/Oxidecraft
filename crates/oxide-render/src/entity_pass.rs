@@ -903,9 +903,10 @@ fn nametag_anchor(draw: &EntityDraw) -> Vec3 {
 /// `RendererLivingEntity.java`:513-515), with the sneaking branch's own lift appended inside
 /// the scaled frame (`RendererLivingEntity.java`:516).
 ///
-/// `view_y` is the camera's yaw plus 180 and `view_x` its pitch — the source's
-/// `playerViewY`/`playerViewX` (`RenderManager.java`:260-266), the same pair
-/// [`entity_models::objects::billboard_angles`] takes.
+/// `view_y` is the camera's yaw and `view_x` its pitch — the source's
+/// `playerViewY`/`playerViewX` (`RenderManager.java`:260-261); the source's `+180.0`
+/// applies only to its third-person front view (`:264-266`), a mode this pass does not
+/// have. The same pair [`entity_models::objects::billboard_angles`] takes.
 fn nametag_chain(anchor: Vec3, view_y: f32, view_x: f32, sneaking: bool) -> Mat4 {
     let mut chain = Mat4::from_translation(anchor)
         * Mat4::from_rotation_y((-view_y).to_radians())
@@ -1017,7 +1018,7 @@ pub struct EntityPass {
     item_source: Option<Arc<dyn ItemMeshSource>>,
     /// The block-item meshes: one cached vertex set per distinct block state.
     block_cache: BlockItemCache,
-    /// The camera's yaw in degrees, the source's `playerViewY` minus its own `180`.
+    /// The camera's yaw in degrees, the source's `playerViewY` (`RenderManager.java`:260-261).
     view_yaw: f32,
     /// The camera's pitch in degrees, the source's `playerViewX`.
     view_pitch: f32,
@@ -1548,7 +1549,7 @@ impl EntityPass {
         let half = width / 2;
         let chain = nametag_chain(
             nametag_anchor(draw),
-            self.view_yaw + 180.0,
+            self.view_yaw,
             self.view_pitch,
             draw.pose.sneak,
         );
@@ -1754,8 +1755,8 @@ impl EntityPass {
             draw.position[1] as f32,
             draw.position[2] as f32,
         );
-        // The source's `playerViewY` is the camera's yaw plus 180 (`RenderManager.java`:491).
-        let view_y = self.view_yaw + 180.0;
+        // The source's `playerViewY` is the camera's yaw (`RenderManager.java`:260-261).
+        let view_y = self.view_yaw;
         let view_x = self.view_pitch;
         match (draw.model, &draw.extra) {
             (ModelRef::Arrow, _) => {
@@ -3144,11 +3145,12 @@ mod tests {
     fn the_nametag_chain_maps_the_font_frame_at_known_camera_angles() {
         // The font frame: +u is the text's right and +v its down, in font pixels; the
         // chain scales both by NAMETAG_SCALE and flips them into the world. `view_y` is
-        // the source's playerViewY -- the camera's yaw plus 180 (`RenderManager.java`:260-266).
+        // the source's playerViewY -- the camera's yaw (`RenderManager.java`:260-261); its
+        // `+180.0` applies only to the third-person front view (`:264-266`).
         let anchor = Vec3::new(1.0, 2.3, -4.0);
         let point = |chain: Mat4, u: f32, v: f32| chain.transform_point3(Vec3::new(u, v, 0.0));
         let scale = NAMETAG_SCALE;
-        // playerViewY 0 (a camera at yaw 180): local +u maps to -x and local +v to -y --
+        // playerViewY 0 (a camera at yaw 0): local +u maps to -x and local +v to -y --
         // the text reads left to right and hangs below the anchor.
         let chain = nametag_chain(anchor, 0.0, 0.0, false);
         assert!(close(point(chain, 0.0, 0.0).into(), [1.0, 2.3, -4.0]));

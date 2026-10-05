@@ -2555,6 +2555,69 @@ fn the_nametag_sees_through_walls_standing_but_not_sneaking() {
     );
 }
 
+/// The tag's text keeps the font's own handedness: the source's chain flips both font axes
+/// under the negated camera yaw (`Render.java`:344-346), so at a camera looking along -z the
+/// synthetic `A`'s ink — its cell's left five columns (`nametag_sheet`) — lands left of the
+/// box's centre. A mirroring half turn would land it right.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_nametag_ink_lands_left_of_the_box_centre() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = entity_registry(&device, &queue, [200, 90, 40, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(tag_camera(8.0), 1.0);
+    entities
+        .set_font(&device, &queue, &nametag_sheet())
+        .expect("the synthetic sheet loads");
+
+    let untagged = render_scene(&device, &queue, &target, &depth, |pass| {
+        let draw = player_at_origin(TextureRef::Named("entity/test.png"));
+        entities.draw(&device, pass, std::slice::from_ref(&draw), &registry);
+    });
+    let tagged = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, std::slice::from_ref(&tagged("A")), &registry);
+    });
+
+    // The box: the columns the tag changed. The ink: the near-white columns of the solid
+    // text pass inside it.
+    let (mut box_min, mut box_max) = (SIZE, 0u32);
+    let (mut ink_min, mut ink_max) = (SIZE, 0u32);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            if pixel(&untagged, x, y) != pixel(&tagged, x, y) {
+                box_min = box_min.min(x);
+                box_max = box_max.max(x);
+            }
+            if pixel(&tagged, x, y).iter().all(|channel| *channel >= 250) {
+                ink_min = ink_min.min(x);
+                ink_max = ink_max.max(x);
+            }
+        }
+    }
+    assert!(box_max >= box_min, "the tag drew its box");
+    assert!(ink_max >= ink_min, "the tag drew its glyph");
+    let box_centre = (box_min + box_max) as f32 / 2.0;
+    let ink_centre = (ink_min + ink_max) as f32 / 2.0;
+    eprintln!(
+        "ink side: box x=[{box_min}..{box_max}] centre {box_centre}, \
+         ink x=[{ink_min}..{ink_max}] centre {ink_centre}"
+    );
+    // Measured at the pinning run: ink x=[14..43], centre 28.5, three pixels left of the
+    // box's [8..55], centre 31.5. Mirrored, the ink landed [20..49], centre 34.5.
+    assert!(
+        box_centre - ink_centre >= 2.0,
+        "the glyph's ink sits left of the box's centre: box x=[{box_min}..{box_max}] \
+         centre {box_centre}, ink x=[{ink_min}..{ink_max}] centre {ink_centre}"
+    );
+}
+
 /// The entities sit between the terrain's solid and translucent layers: a translucent quad
 /// in front of an entity lets the entity show through the blend when the entity draws first
 /// (the source's order) and hides it when the order is inverted — the canary that proves the

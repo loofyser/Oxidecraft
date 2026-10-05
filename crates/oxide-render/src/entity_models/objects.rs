@@ -713,8 +713,8 @@ pub enum Billboard {
 }
 
 /// The billboard's turn pair in degrees for the camera's angles
-/// (`RenderSnowball.java`:31-32, `RenderFireball.java`:44-45; `playerViewY` is the
-/// camera's yaw plus 180, `playerViewX` its pitch — `RenderManager.java`:260-266).
+/// (`RenderSnowball.java`:32-33, `RenderFireball.java`:44-45; `playerViewY` is the
+/// camera's yaw and `playerViewX` its pitch — `RenderManager.java`:260-261).
 pub fn billboard_angles(view_y: f32, view_x: f32, kind: Billboard) -> [f32; 2] {
     match kind {
         Billboard::Snowball => [-view_y, view_x],
@@ -1436,19 +1436,21 @@ mod tests {
     }
 
     /// The billboard turns: the snowball family's negated yaw and positive pitch; the
-    /// fireballs' `180 - yaw` with the negated pitch (`RenderSnowball.java`:31-32,
-    /// `RenderFireball.java`:44-45`). `playerViewY` is the camera's yaw plus 180.
+    /// fireballs' `180 - yaw` with the negated pitch (`RenderSnowball.java`:32-33,
+    /// `RenderFireball.java`:44-45`). `playerViewY` is the camera's yaw
+    /// (`RenderManager.java`:260-261).
     #[test]
     fn the_billboards_turn_to_the_camera_by_the_sources_signs() {
-        let view_y = 90.0 + 180.0;
+        // A camera at yaw 90 and a 15-degree pitch: the snowball's pair is [-yaw, +pitch].
+        let view_y = 90.0;
         let view_x = 15.0;
         assert_eq!(
             billboard_angles(view_y, view_x, Billboard::Snowball),
-            [-270.0, 15.0]
+            [-90.0, 15.0]
         );
         assert_eq!(
             billboard_angles(view_y, view_x, Billboard::Fireball),
-            [-90.0, -15.0]
+            [90.0, -15.0]
         );
     }
 
