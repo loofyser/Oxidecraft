@@ -28,6 +28,7 @@
 
 mod assets;
 mod keymap;
+mod skin_worker;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -40,6 +41,9 @@ use anyhow::Context;
 use assets::ClientAssets;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use oxide_assets::skins::SkinCache;
+use oxide_assets::store::Store;
+use oxide_game::entity_view::PlayerListRecord;
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::Aim;
@@ -56,6 +60,7 @@ use oxide_render::fps::FpsCounter;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use oxide_render::sky::SkyParams;
 use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
+use skin_worker::{SkinRequest, SkinUpdate};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{
@@ -415,6 +420,16 @@ struct ClientApp {
     /// and the crack every stage within the render distance, and the click
     /// paths can act on the aim.
     world_overlay: WorldOverlayState,
+    /// The skins the worker resolved, keyed by the hyphenated UUID — the map
+    /// the player renderer draws from.
+    skins: BTreeMap<String, SkinUpdate>,
+    /// The skin worker's request feed, when a session was opened.
+    ///
+    /// Dropping it — the client drops it with the app at exit — closes the
+    /// channel and the worker's loop returns.
+    skin_requests: Option<Sender<SkinRequest>>,
+    /// The worker's updates, drained into [`ClientApp::skins`] once per frame.
+    skin_updates: Option<Receiver<SkinUpdate>>,
     /// The pointer-capture rules.
     capture: Capture,
     /// The `--input-script` replay, when the flag was given.
@@ -720,11 +735,20 @@ impl ClientApp {
         // With a server the assets load before anything opens, so a store that is missing or
         // malformed fails fast; the smoke path without one loads nothing.
         let mut assets = None;
+        let mut skin_requests_tx = None;
+        let mut skin_updates_rx = None;
         let session = match cli.server {
             Some(address) => {
                 let (host, port) = parse_server_address(&address)?;
                 tracing::info!(server = %address, username = %cli.username, "joining the server");
                 let loaded = ClientAssets::load(None)?;
+                // The skin worker opens the store the assets loaded from —
+                // the same root rule — and owns the cache on its own thread.
+                let store = Store::open(assets::default_store_root()?)?;
+                let cache = Arc::new(SkinCache::new(&store));
+                let (requests, updates) = skin_worker::spawn(move |url| cache.fetch(url));
+                skin_requests_tx = Some(requests);
+                skin_updates_rx = Some(updates);
                 let session = spawn_session(
                     host,
                     port,
@@ -779,11 +803,22 @@ impl ClientApp {
             player: PlayerState::default(),
             camera: CameraState::default(),
             world_overlay: WorldOverlayState::default(),
+            skins: BTreeMap::new(),
+            skin_requests: skin_requests_tx,
+            skin_updates: skin_updates_rx,
             overlay_visible,
             dead: false,
             capture: Capture::default(),
             script,
         })
+    }
+
+    /// Drains the skin worker's updates into [`ClientApp::skins`].
+    fn drain_skins(&mut self) {
+        let Some(updates) = self.skin_updates.as_ref() else {
+            return;
+        };
+        store_skins(&mut self.skins, updates.try_iter());
     }
 
     /// Presents one frame, updates the title, and stops once the limit is reached.
@@ -801,11 +836,18 @@ impl ClientApp {
             Some(session) => session.events.try_iter().collect(),
             None => Vec::new(),
         };
+        // The worker's updates land before the frame reads the map.
+        self.drain_skins();
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
         let mut session_ended = false;
         for event in events {
+            if let ClientEvent::PlayerList { entries } = &event {
+                if let Some(requests) = self.skin_requests.as_ref() {
+                    forward_skins(requests, entries);
+                }
+            }
             if let ClientEvent::PlayerTick {
                 tick,
                 x,
@@ -1181,6 +1223,49 @@ fn store_aim(aim: &mut Option<Aim>, report: Option<Aim>) -> bool {
     let moved = *aim != report;
     *aim = report;
     moved
+}
+
+/// The skin requests a player-list report produces: one per entry whose
+/// properties carry a `textures` value, named by the entry's uuid.
+///
+/// An entry without the property produces no request — nothing is fetchable
+/// for it — and the renderer falls back to the UUID default.
+fn skin_requests(entries: &[PlayerListRecord]) -> Vec<SkinRequest> {
+    entries
+        .iter()
+        .filter_map(|record| {
+            let property = record
+                .properties
+                .iter()
+                .find(|(name, _)| name == "textures")
+                .map(|(_, value)| value.clone())?;
+            Some(SkinRequest {
+                uuid: record.uuid.clone(),
+                property: Some(property),
+            })
+        })
+        .collect()
+}
+
+/// Forwards a player-list report to the skin worker: one request per entry
+/// that carries a `textures` property.
+fn forward_skins(requests: &Sender<SkinRequest>, entries: &[PlayerListRecord]) {
+    for request in skin_requests(entries) {
+        // A closed channel means the worker is gone; the frame must not stop
+        // over it.
+        let _ = requests.send(request);
+    }
+}
+
+/// Folds a batch of the worker's updates into the skin map, keyed by uuid:
+/// a later update for one uuid replaces the earlier one.
+fn store_skins(
+    skins: &mut BTreeMap<String, SkinUpdate>,
+    updates: impl IntoIterator<Item = SkinUpdate>,
+) {
+    for update in updates {
+        skins.insert(update.uuid.clone(), update);
+    }
 }
 
 /// The outline the aim draws: the aimed block's cell and its box.
@@ -1718,17 +1803,22 @@ mod tests {
     use super::{
         Aim, CameraState, CameraTick, Capture, CaptureStep, Cli, ClientApp, DEATH_DIM,
         DEATH_RESPAWN, DEATH_TITLE, Directive, Key, MouseButton, PlayerState, ScriptDriver,
-        SkyValues, aim_outline, bound_mouse_button, clear_break_stage, cracks_in_view,
-        frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
-        parse_server_address, store_aim, store_break_stage, void_y_factor,
+        SkinRequest, SkinUpdate, SkyValues, aim_outline, bound_mouse_button, clear_break_stage,
+        cracks_in_view, frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
+        parse_server_address, skin_requests, store_aim, store_break_stage, store_skins,
+        void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
+    use oxide_assets::skins::DefaultModel;
+    use oxide_assets::texture::Texture;
+    use oxide_game::entity_view::PlayerListRecord;
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use winit::event::{ElementState, MouseButton as WinitMouseButton};
     use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
@@ -1788,6 +1878,61 @@ mod tests {
         let cli =
             Cli::try_parse_from(["oxide-client", "--frames", "120"]).expect("the flag parses");
         assert_eq!(cli.frames, Some(120));
+    }
+
+    #[test]
+    fn a_player_list_report_becomes_one_request_per_textured_entry() {
+        let textured = PlayerListRecord {
+            uuid: "00000000-0000-0000-0000-000000000001".to_owned(),
+            name: "OxideDev".to_owned(),
+            properties: vec![("textures".to_owned(), "eyJ4".to_owned())],
+            ..PlayerListRecord::default()
+        };
+        let plain = PlayerListRecord {
+            uuid: "00000000-0000-0000-0000-000000000002".to_owned(),
+            name: "Someone".to_owned(),
+            ..PlayerListRecord::default()
+        };
+        assert_eq!(
+            skin_requests(&[textured, plain]),
+            vec![SkinRequest {
+                uuid: "00000000-0000-0000-0000-000000000001".to_owned(),
+                property: Some("eyJ4".to_owned()),
+            }],
+            "only the entry carrying a textures property is fetchable"
+        );
+    }
+
+    #[test]
+    fn skin_updates_land_in_the_map_by_uuid() {
+        let update = |uuid: &str, fill: u8| SkinUpdate {
+            uuid: uuid.to_owned(),
+            texture: Some(Arc::new(Texture {
+                width: 64,
+                height: 64,
+                rgba: vec![fill; 64 * 64 * 4],
+            })),
+            cape: None,
+            model: DefaultModel::Wide,
+        };
+        let mut skins = BTreeMap::new();
+        store_skins(
+            &mut skins,
+            [
+                update("00000000-0000-0000-0000-000000000001", 0x11),
+                update("00000000-0000-0000-0000-000000000002", 0x22),
+                update("00000000-0000-0000-0000-000000000001", 0x33),
+            ],
+        );
+        assert_eq!(skins.len(), 2, "one entry per uuid");
+        assert_eq!(
+            skins["00000000-0000-0000-0000-000000000001"]
+                .texture
+                .as_ref()
+                .map(|texture| texture.rgba[0]),
+            Some(0x33),
+            "a later update replaces the earlier one"
+        );
     }
 
     #[test]

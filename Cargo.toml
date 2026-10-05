@@ -25,6 +25,7 @@ oxide-world = { path = "crates/oxide-world" }
 oxide-assets = { path = "crates/oxide-assets" }
 oxide-render = { path = "crates/oxide-render" }
 oxide-game = { path = "crates/oxide-game" }
+base64 = "0.23"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

@@ -1567,6 +1567,7 @@ dependencies = [
 name = "oxide-assets"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "fs4",
  "hex",
  "png",

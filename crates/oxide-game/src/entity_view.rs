@@ -283,6 +283,10 @@ pub enum MobExtra {
 /// state the list holds across packets, not one packet's transport shape.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlayerListRecord {
+    /// The profile's hyphenated UUID: the key the list holds the record
+    /// under, carried on the record itself so one that travels alone — a
+    /// `PlayerList` report's entry — still names its player.
+    pub uuid: String,
     /// The account name.
     pub name: String,
     /// The profile properties (name/value pairs; a signed property's
@@ -797,9 +801,9 @@ fn string_at(entity: &Entity, index: u8) -> Option<&str> {
 }
 
 /// The hyphenated form of a profile UUID, the shape the spawn decoder writes
-/// (`oxide-proto-v47`'s `format_uuid`, `entity.rs:1604-1616`): the list and
-/// the spawns must key the same string.
-fn hyphenated(uuid: &[u8; 16]) -> String {
+/// (`oxide-proto-v47`'s `format_uuid`, `entity.rs:1604-1616`): the list keys
+/// it, the spawns carry it, and a record's own `uuid` holds it.
+pub(crate) fn hyphenated(uuid: &[u8; 16]) -> String {
     const HEX: [char; 16] = [
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
     ];
@@ -1618,6 +1622,7 @@ mod tests {
         list.insert(
             uuid,
             PlayerListRecord {
+                uuid: "11111111-1111-1111-1111-111111111111".to_owned(),
                 name: "OxideDev".to_owned(),
                 properties: vec![("textures".to_owned(), "abc".to_owned())],
                 gamemode: 0,
@@ -1627,6 +1632,7 @@ mod tests {
         );
         let key = "11111111-1111-1111-1111-111111111111";
         let record = list.get(key).expect("the add landed");
+        assert_eq!(record.uuid, key, "the record carries its own uuid");
         assert_eq!(record.name, "OxideDev");
         assert_eq!(
             record.properties,

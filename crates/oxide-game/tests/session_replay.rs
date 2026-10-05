@@ -5852,6 +5852,7 @@ fn the_player_list_reports_the_whole_set_once_per_change() {
     assert_eq!(
         sets[0][0],
         PlayerListRecord {
+            uuid: "11111111-1111-1111-1111-111111111111".to_owned(),
             name: "Alpha".to_owned(),
             properties: vec![("textures".to_owned(), "eyJx".to_owned())],
             gamemode: 1,

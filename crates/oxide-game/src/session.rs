@@ -82,7 +82,7 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
-use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord};
+use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
@@ -1354,6 +1354,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         player_list.insert(
                                             entry.uuid,
                                             PlayerListRecord {
+                                                uuid: hyphenated(&entry.uuid),
                                                 name,
                                                 properties: entry.properties,
                                                 // The wire's gamemode runs through

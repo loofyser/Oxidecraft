@@ -10,6 +10,7 @@ pub mod http;
 pub mod mcmeta;
 pub mod model;
 pub mod resources;
+pub mod skins;
 pub mod store;
 pub mod texture;
 pub mod version;
