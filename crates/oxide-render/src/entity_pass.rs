@@ -1663,6 +1663,23 @@ mod tests {
     }
 
     #[test]
+    fn the_dying_squid_keeps_the_corpse_transform_untilted() {
+        // `RenderSquid.rotateCorpse` replaces the base's corpse turn outright
+        // (`RenderSquid.rotateCorpse`:25-34) and carries no death block, so the death ramp
+        // turns nothing: a full-ramp squid's origin still lands where the translate pair
+        // leaves it, seven tenths below the drop's own height (1.5078125 − 0.7).
+        let squid = EntityDraw {
+            death: 1.0,
+            ..mob_draw(ModelRef::Squid)
+        };
+        let origin = body_chain(&squid).transform_point3(Vec3::ZERO);
+        assert!(
+            close(origin.into(), [0.0, 0.807_812_5, 0.0]),
+            "the dying squid's origin at {origin:?} against [0.0, 0.8078125, 0.0]"
+        );
+    }
+
+    #[test]
     fn the_arthropod_death_tilt_lies_at_a_half_turn() {
         // The spiders, the silverfish and the endermite turn a half turn over their death
         // ramp (`RenderSpider.java`:18-21, `RenderSilverfish.java`:16-19,

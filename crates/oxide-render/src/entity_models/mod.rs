@@ -717,12 +717,15 @@ pub fn folded_wave(value: f32, period: f32) -> f32 {
 /// hundred and eighty the spiders, the silverfish and the endermite override it with
 /// (`RenderSpider.getDeathMaxRotation`:18-21, which the cave spider inherits,
 /// `RenderCaveSpider.java`:7; `RenderSilverfish.getDeathMaxRotation`:16-19;
-/// `RenderEndermite.getDeathMaxRotation`:16-19).
+/// `RenderEndermite.getDeathMaxRotation`:16-19). The squid turns none: its `rotateCorpse`
+/// replaces the base's turn pair outright, with no super call and no death block to read a
+/// maximum (`RenderSquid.rotateCorpse`:25-34).
 pub fn death_rotation(reference: ModelRef) -> f32 {
     match reference {
         ModelRef::Spider | ModelRef::CaveSpider | ModelRef::Silverfish | ModelRef::EnderMite => {
             180.0
         }
+        ModelRef::Squid => 0.0,
         _ => 90.0,
     }
 }
@@ -1414,7 +1417,9 @@ mod tests {
         // override keeps it.
         assert_eq!(death_rotation(ModelRef::Zombie), 90.0);
         assert_eq!(death_rotation(ModelRef::Creeper), 90.0);
-        assert_eq!(death_rotation(ModelRef::Squid), 90.0);
+        // The squid turns none: its `rotateCorpse` replaces the base's turn pair outright
+        // (`RenderSquid.rotateCorpse`:25-34), with no super call and no death block.
+        assert_eq!(death_rotation(ModelRef::Squid), 0.0);
         // The spiders — the cave spider through its parent — the silverfish and the
         // endermite turn a half (`RenderSpider.java`:18-21, `RenderCaveSpider.java`:7,
         // `RenderSilverfish.java`:16-19, `RenderEndermite.java`:16-19).
