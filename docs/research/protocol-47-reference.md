@@ -206,7 +206,7 @@ them.
 | 0x0B | Animation (cb) | EID VarInt; Animation UByte (0 swing arm, 1 damage, 2 leave bed, 3 eat/food, 4 crit, 5 magic crit) | opt |
 | 0x0C | Spawn Player | EID VarInt; PlayerUUID UUID(16B); X/Y/Z Int fixed-point; Yaw/Pitch Angle; CurrentItem Short; Metadata | need |
 | 0x0D | Collect Item | CollectedEID VarInt; CollectorEID VarInt | opt |
-| 0x0E | Spawn Object | EID VarInt; Type Byte; X/Y/Z Int fixed-point; Pitch/Yaw Angle; Data Int; VelocityX/Y/Z Short **(present only if Data ≠ 0)** | need |
+| 0x0E | Spawn Object | EID VarInt; Type Byte; X/Y/Z Int fixed-point; Pitch/Yaw Angle; Data Int; VelocityX/Y/Z Short **(present only if Data > 0 — the source's strict gate)** | need |
 | 0x0F | Spawn Mob | EID VarInt; Type UByte; X/Y/Z Int fixed-point; Yaw/Pitch/HeadPitch Angle; VelocityX/Y/Z Short; Metadata | need |
 | 0x10 | Spawn Painting | EID VarInt; Title String (≤13); Location Position (center); Direction UByte (0 −Z, 1 −X, 2 +Z, 3 +X) | opt |
 | 0x11 | Spawn Experience Orb | EID VarInt; X/Y/Z Int fixed-point; Count Short | opt |
@@ -642,7 +642,7 @@ Entity flags (index 0) bits: `0x01` on fire · `0x02` crouched · `0x04` unused 
   74 FallingSand (dragon egg) · 75 ThrownExpBottle · 76 FireworksRocketEntity · 77 LeashKnot · 78 ArmorStand ·
   **90 FishHook** (vanilla handles type 90; `Data` = owner EID — missing from the minecraft-data list).
   `Data` carries the object-specific payload (falling-sand/frame block id+data, minecart/boat variant, potion
-  or arrow sub-type, firework) and a non-zero `Data` is what makes the three trailing velocity shorts present.
+  or arrow sub-type, firework) and a strictly positive `Data` (the source's own `> 0` gate) is what makes the three trailing velocity shorts present.
   Vanilla ignores/zeroes `Data` for frames, leash knots and large fireballs. A dropped **item** has no item
   data in this packet: the client creates an empty item entity and the actual ItemStack arrives via
   Entity Metadata (index 10).
