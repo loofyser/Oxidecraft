@@ -52,7 +52,7 @@ pub enum ModelRef {
         /// The model-parts byte: which of the skin's overlay parts the draw wears.
         parts: u8,
     },
-    /// A zombie: `ModelZombie`'s raised arms over the biped table (`ModelZombie.java`:20).
+    /// A zombie: `ModelZombie`'s raised arms over the biped table (`ModelZombie.java`:31-44).
     Zombie,
     /// A zombie villager: `ModelZombieVillager`'s own head over the biped limbs
     /// (`ModelZombieVillager.java`:25-28).
@@ -60,7 +60,7 @@ pub enum ModelRef {
     /// A skeleton: the two-wide limbs of `ModelSkeleton` (`ModelSkeleton.java`:20-33).
     Skeleton,
     /// A villager: `ModelVillager`'s table, under the profession's own sheet
-    /// (`RenderVillager.getEntityTexture`:32-51).
+    /// (`RenderVillager.getEntityTexture`:32-54).
     Villager {
         /// The profession, `0..5` — the renderer's texture switch.
         profession: u8,
@@ -91,7 +91,7 @@ pub enum ModelRef {
         /// Whether the draw is sheared, which its wool layer reads.
         sheared: bool,
     },
-    /// A mooshroom: `ModelCow` under the mooshroom's own sheet (`RenderMooshroom`:9).
+    /// A mooshroom: `ModelCow` under the mooshroom's own sheet (`RenderMooshroom`:10).
     Mooshroom,
 }
 

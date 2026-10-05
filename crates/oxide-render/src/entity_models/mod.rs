@@ -980,7 +980,8 @@ mod tests {
             model_for(ModelRef::Giant),
             &crate::entity_models::bipeds::MODEL_ZOMBIE
         ));
-        // The mooshroom is the cow's model (`RenderMooshroom`'s `ModelCow`, line 9).
+        // The mooshroom is the cow's model (`RenderMooshroom`'s `ModelCow`,
+        // `RenderManager.java`:145).
         assert!(std::ptr::eq(
             model_for(ModelRef::Mooshroom),
             &crate::entity_models::quadrupeds::MODEL_COW
@@ -1024,7 +1025,7 @@ mod tests {
             }),
             ["entity/sheep/sheep.png", "entity/sheep/sheep_fur.png"]
         );
-        // The professions pick their sheets (`RenderVillager.getEntityTexture`:32-56); any
+        // The professions pick their sheets (`RenderVillager.getEntityTexture`:32-54); any
         // value off the wire falls back to the plain villager sheet, the source's default.
         let sheet = |profession| match textures(ModelRef::Villager {
             profession,
@@ -1078,9 +1079,9 @@ mod tests {
         assert_eq!(sneak_terms(ModelRef::Witch), [0.0, 0.0]);
         assert_eq!(sneak_terms(ModelRef::Pig { saddle: false }), [0.0, 0.0]);
         assert_eq!(sneak_terms(ModelRef::IronGolem), [0.0, 0.0]);
-        // The iron golem leans into its walk (`RenderIronGolem.rotateCorpse`:28-34): on a
+        // The iron golem leans into its walk (`RenderIronGolem.rotateCorpse`:31-37): on a
         // whole stride (limb swing 6.5 of the fold) the lean is six and a half degrees over
-        // the wave's four-thirteenths.
+        // the wave's eleven-thirteenths.
         let walking = Pose {
             limb_swing: 6.5,
             limb_swing_amount: 1.0,

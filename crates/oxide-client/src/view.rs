@@ -263,10 +263,11 @@ fn draw_for(
 /// renderer's extras and the pose's own, plus whether the frame is a child.
 ///
 /// The mapping is each renderer's own: the zombie's villager flag swaps in the villager
-/// zombie's model and sheet (`RenderZombie.getEntityTexture`:101-104), the skeleton
-/// draws its thin-limbed model off the skeleton sheet (`RenderSkeleton`), the villager's
-/// profession picks the sheet out of the renderer's table with its own default
-/// (`RenderVillager.getEntityTexture`:105-126), the witch's nose gate reads the held
+/// zombie's model and sheet (`RenderZombie.getEntityTexture`:66-69 for the sheet,
+/// `RenderZombie.func_82427_a`:71-85 for the model), the skeleton draws its thin-limbed
+/// model off the skeleton sheet (`RenderSkeleton`), the villager's profession picks the
+/// sheet out of the renderer's table with its own default
+/// (`RenderVillager.getEntityTexture`:32-54), the witch's nose gate reads the held
 /// stack (`RenderWitch`, not carried by the frames; [`PoseExtra::Witch`]), the giant
 /// draws the zombie model and sheet sixfold (`RenderGiantZombie`), and the quadrupeds
 /// draw their class sheets (`RenderPig`/`RenderCow`/`RenderSheep`/`RenderMooshroom`).
@@ -382,7 +383,7 @@ fn mob_draw(
 }
 
 /// The villager's sheet for a profession: the renderer's table indexed by the profession
-/// with its own fallback (`RenderVillager.getEntityTexture`:105-126: farmer, librarian,
+/// with its own fallback (`RenderVillager.getEntityTexture`:32-54: farmer, librarian,
 /// priest, smith, butcher; anything else the plain villager sheet).
 fn villager_sheet(profession: u8) -> &'static str {
     match profession {
