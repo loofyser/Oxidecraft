@@ -2,6 +2,7 @@
 
 pub mod clientbound;
 pub mod column;
+pub mod entity;
 pub mod handshake;
 pub mod serverbound;
 pub mod status;
