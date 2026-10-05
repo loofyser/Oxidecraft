@@ -217,10 +217,11 @@ pub enum ModelRef {
     /// turn, `(-1, -1, 1)` flip and `0.0625` draw (`RenderBoat.doRender`:29-49). The
     /// rock from the damage fields is unmodelled (the harness records neither).
     Boat,
-    /// A minecart: the id jitter, the `+0.375` lift, the `180 - yaw` turn and the
-    /// `0.0625` draw around `ModelMinecart`'s six parts (`RenderMinecart.doRender`:
-    /// 34-39, :75-108) with the subclass's default cargo. The rail pose and the rolling
-    /// rock are unmodelled: the cart draws flat on its networked yaw and pitch.
+    /// A minecart: the `+0.375` lift, the `180 - yaw` turn and the `0.0625` draw around
+    /// `ModelMinecart`'s six parts (`RenderMinecart.doRender`:34-39, :75-108) with the
+    /// subclass's default cargo. The id jitter is left at zero — the draw carries no
+    /// entity id — and the rail pose and the rolling rock are unmodelled: the cart draws
+    /// flat on its networked yaw and pitch.
     Minecart {
         /// The subclass's sub-type byte, `0..4` for plain through hopper.
         body: u8,
@@ -1282,6 +1283,38 @@ fn item_tail(gui3d: bool) -> Mat4 {
         * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
 }
 
+/// One copy of a dropped item stack's chain: the bob and lift, the spin and the item
+/// tail, the flat stacks' centring pre-step and per-copy `0.046875` z-step
+/// (`RenderEntityItem.java`:51-57, :138-139), and the 3D stacks' own loop scale (`:125`).
+/// The 3D copies all sit at one spot — the source gives them neither the centring nor the
+/// step; its `j > 0` random jitter stays unmodelled.
+fn dropped_stack_chain(position: Vec3, gui3d: bool, age: f32, copies: u8, copy: u8) -> Mat4 {
+    let hover = 0.0_f32;
+    let bob =
+        entity_models::objects::item_bob(age, hover) + entity_models::objects::ITEM_GROUND_LIFT;
+    let spin = entity_models::objects::item_spin_degrees(age, hover);
+    let centre = if gui3d {
+        0.0
+    } else {
+        entity_models::objects::item_copy_centre(copies)
+    };
+    let mut chain = Mat4::from_translation(position)
+        * Mat4::from_translation(Vec3::new(0.0, bob, 0.0))
+        * Mat4::from_rotation_y(spin.to_radians())
+        * Mat4::from_translation(Vec3::new(0.0, 0.0, centre))
+        * Mat4::from_scale(Vec3::splat(entity_models::objects::dropped_loop_scale(
+            gui3d,
+        )));
+    if !gui3d {
+        chain *= Mat4::from_translation(Vec3::new(
+            0.0,
+            0.0,
+            entity_models::objects::ITEM_COPY_STEP * f32::from(copy),
+        ));
+    }
+    chain * item_tail(gui3d)
+}
+
 /// The dropped item's fields for a draw: whether its model is the 3D kind (the block
 /// items; the loop's own scale and the pre-transform's flat doubling key on it,
 /// `RenderItem.preTransform`:254-257), the age the bob and spin read (the draw's pose
@@ -1294,10 +1327,11 @@ fn item_fields(model: ModelRef, extra: &DrawExtra, pose: &entity_models::Pose) -
     (matches!(model, ModelRef::BlockItem { .. }), pose.age, count)
 }
 
-/// The boat's and the minecart's shared prefix: the world position (a cart's id jitter
-/// already folded into it, the renderer's own translate order), the lift, the
-/// `180 - yaw` turn and the pitch about z (`RenderBoat.doRender`:29-30,
-/// `RenderMinecart.doRender`:34-39, :75-77).
+/// The boat's and the minecart's shared prefix: the world position plus the jitter
+/// argument, the lift, the `180 - yaw` turn and the pitch about z
+/// (`RenderBoat.doRender`:29-30, `RenderMinecart.doRender`:34-39, :75-77). The cart's id
+/// jitter stays at zero: the draw carries no entity id (`RenderMinecart.doRender`:34-39),
+/// so `minecart_jitter` stays for a draw that carries one.
 fn vehicle_prefix(position: Vec3, body_yaw: f32, pitch: f32, lift: f32, jitter: [f32; 3]) -> Mat4 {
     Mat4::from_translation(Vec3::new(
         position.x + jitter[0],
@@ -1524,25 +1558,10 @@ impl EntityPass {
                 }
                 _ => {
                     let (gui3d, age, count) = item_fields(draw.model, extra, &draw.pose);
-                    let hover = 0.0_f32;
-                    let bob = entity_models::objects::item_bob(age, hover)
-                        + entity_models::objects::ITEM_GROUND_LIFT;
-                    let spin = entity_models::objects::item_spin_degrees(age, hover);
                     let copies = entity_models::objects::item_copies(count);
-                    let centre = entity_models::objects::item_copy_centre(copies);
-                    let prefix = Mat4::from_translation(position)
-                        * Mat4::from_translation(Vec3::new(0.0, bob, 0.0))
-                        * Mat4::from_rotation_y(spin.to_radians())
-                        * Mat4::from_translation(Vec3::new(0.0, 0.0, centre));
                     let mesh = source.generated(key);
                     for copy in 0..copies.max(1) {
-                        let chain = prefix
-                            * Mat4::from_translation(Vec3::new(
-                                0.0,
-                                0.0,
-                                entity_models::objects::ITEM_COPY_STEP * f32::from(copy),
-                            ))
-                            * item_tail(gui3d);
+                        let chain = dropped_stack_chain(position, gui3d, age, copies, copy);
                         push_source_group(vertices, built, mesh.clone(), chain, colour);
                     }
                 }
@@ -1578,24 +1597,9 @@ impl EntityPass {
                     }
                     _ => {
                         let (gui3d, age, count) = item_fields(draw.model, extra, &draw.pose);
-                        let hover = 0.0_f32;
-                        let bob = entity_models::objects::item_bob(age, hover)
-                            + entity_models::objects::ITEM_GROUND_LIFT;
-                        let spin = entity_models::objects::item_spin_degrees(age, hover);
                         let copies = entity_models::objects::item_copies(count);
-                        let centre = entity_models::objects::item_copy_centre(copies);
-                        let prefix = Mat4::from_translation(position)
-                            * Mat4::from_translation(Vec3::new(0.0, bob, 0.0))
-                            * Mat4::from_rotation_y(spin.to_radians())
-                            * Mat4::from_translation(Vec3::new(0.0, 0.0, centre));
                         for copy in 0..copies.max(1) {
-                            let chain = prefix
-                                * Mat4::from_translation(Vec3::new(
-                                    0.0,
-                                    0.0,
-                                    entity_models::objects::ITEM_COPY_STEP * f32::from(copy),
-                                ))
-                                * item_tail(gui3d);
+                            let chain = dropped_stack_chain(position, gui3d, age, copies, copy);
                             push_source_group(vertices, built, mesh.clone(), chain, colour);
                         }
                     }
@@ -2627,6 +2631,71 @@ mod tests {
         assert!(
             (between - (-0.1 - (60.0_f32 * 0.3).cos() * 0.1)).abs() < 1.0e-5,
             "the hang shift against the flying draw: {between}"
+        );
+    }
+
+    /// The dropped stack the pass composes: a 3D draw's copies take the loop's own scale
+    /// into the tail at one spot; a flat draw keeps its pre-transform, centring and step
+    /// (`RenderEntityItem.java`:111-141, `RenderItem.preTransform`:254-257,
+    /// `RenderItem.renderItem`:140-157).
+    #[test]
+    fn the_dropped_stack_composes_the_sources_scale_and_arrangement() {
+        let block_draw = EntityDraw {
+            model: ModelRef::BlockItem { block: 1 },
+            position: [0.0, 0.0, 0.0],
+            body_yaw: 0.0,
+            head_yaw: 0.0,
+            head_pitch: 0.0,
+            pose: entity_models::Pose::default(),
+            texture: TextureRef::Named("items/block.png"),
+            light: 1.0,
+            hurt: 0.0,
+            death: 0.0,
+            health: None,
+            extra: DrawExtra::Item {
+                id: 1,
+                count: 1,
+                damage: 0,
+            },
+        };
+        let (gui3d, age, count) =
+            item_fields(block_draw.model, &block_draw.extra, &block_draw.pose);
+        assert!(gui3d, "a block item draws as the 3D model");
+        let copies = entity_models::objects::item_copies(count);
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        // One copy's composed span for the mesh's 16 units: the net draw scale in blocks
+        // (the same measure as the reviewed chain: 0.5-block against the source 0.25).
+        let span = dropped_stack_chain(origin, gui3d, age, copies, 0)
+            .transform_vector3(Vec3::new(16.0, 0.0, 0.0))
+            .length();
+        assert_eq!(span, entity_models::objects::dropped_item_scale(true));
+        let sprite_draw = EntityDraw {
+            model: ModelRef::Sprite {
+                key: "items/test.png",
+            },
+            ..block_draw.clone()
+        };
+        let (flat, flat_age, flat_count) =
+            item_fields(sprite_draw.model, &sprite_draw.extra, &sprite_draw.pose);
+        assert!(!flat, "a sprite item draws as the flat model");
+        let flat_copies = entity_models::objects::item_copies(flat_count);
+        let flat_span = dropped_stack_chain(origin, flat, flat_age, flat_copies, 0)
+            .transform_vector3(Vec3::new(16.0, 0.0, 0.0))
+            .length();
+        assert_eq!(flat_span, entity_models::objects::dropped_item_scale(false));
+        // The 3D copies stack at one spot; the flat copies keep the source's z-step.
+        let at = |copies: u8, copy: u8| {
+            dropped_stack_chain(origin, true, age, copies, copy).transform_point3(Vec3::ZERO)
+        };
+        assert_eq!(at(3, 0), at(3, 1));
+        // The 3D copies take no centring: the copy count leaves the chain where it is.
+        assert_eq!(at(1, 0), at(3, 0));
+        let flat_step = dropped_stack_chain(origin, false, age, 2, 1).transform_point3(Vec3::ZERO)
+            - dropped_stack_chain(origin, false, age, 2, 0).transform_point3(Vec3::ZERO);
+        assert!(
+            (flat_step - Vec3::new(0.0, 0.0, entity_models::objects::ITEM_COPY_STEP)).length()
+                < 1.0e-6,
+            "the flat copies keep the z-step: {flat_step:?}"
         );
     }
 }

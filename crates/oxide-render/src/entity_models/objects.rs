@@ -281,18 +281,20 @@ pub fn painting_vertices(art: &Art) -> Vertices {
                 ([x1, y2, half], [face, back_edge]),
             ];
             push_quad(&mut out, &back_quad, [0.0, 0.0, 1.0]);
+            // Both strips carry the 1/512 side value on all four corners
+            // (`RenderPainting.java`:92-99's `f9`/`f10`).
             let top = [
                 ([x1, y1, -half], [face, side]),
                 ([x2, y1, -half], [face_edge, side]),
-                ([x2, y1, half], [face_edge, back_edge]),
-                ([x1, y1, half], [face, back_edge]),
+                ([x2, y1, half], [face_edge, side]),
+                ([x1, y1, half], [face, side]),
             ];
             push_quad(&mut out, &top, [0.0, 1.0, 0.0]);
             let bottom = [
                 ([x1, y2, half], [face, side]),
                 ([x2, y2, half], [face_edge, side]),
-                ([x2, y2, -half], [face_edge, back_edge]),
-                ([x1, y2, -half], [face, back_edge]),
+                ([x2, y2, -half], [face_edge, side]),
+                ([x1, y2, -half], [face, side]),
             ];
             push_quad(&mut out, &bottom, [0.0, -1.0, 0.0]);
             let left = [
@@ -475,28 +477,28 @@ pub static MODEL_MINECART: Model = Model {
         part!(
             [-9.0, 4.0, 0.0],
             [0.0, 3.0 * std::f32::consts::FRAC_PI_2, 0.0],
-            [-8.0, -7.0, -1.0],
+            [-8.0, -9.0, -1.0],
             [16.0, 8.0, 2.0],
             [0.0, 0.0],
         ),
         part!(
             [9.0, 4.0, 0.0],
             [0.0, std::f32::consts::FRAC_PI_2, 0.0],
-            [-8.0, -7.0, -1.0],
+            [-8.0, -9.0, -1.0],
             [16.0, 8.0, 2.0],
             [0.0, 0.0],
         ),
         part!(
             [0.0, 4.0, -7.0],
             [0.0, std::f32::consts::PI, 0.0],
-            [-8.0, -7.0, -1.0],
+            [-8.0, -9.0, -1.0],
             [16.0, 8.0, 2.0],
             [0.0, 0.0],
         ),
         part!(
             [0.0, 4.0, 7.0],
             [0.0, 0.0, 0.0],
-            [-8.0, -7.0, -1.0],
+            [-8.0, -9.0, -1.0],
             [16.0, 8.0, 2.0],
             [0.0, 0.0],
         ),
@@ -1078,9 +1080,9 @@ mod tests {
         );
     }
 
-    /// The art face's first cell for `Kebab`: the face quad at z = -0.5 with its corners
-    /// and mirrored uvs exactly as `renderPainting` writes them
-    /// (`RenderPainting.java`:77-87).
+    /// The first cell's six quads for `Kebab` with their corners and uvs exactly as
+    /// `renderPainting` writes them — the face's mirrored pair, the back panel's box and
+    /// the four frame strips (`RenderPainting.java`:77-107).
     #[test]
     fn the_art_face_carries_the_sources_mirrored_uvs() {
         let kebab = art_for_title("Kebab");
@@ -1096,12 +1098,38 @@ mod tests {
         assert_eq!(vertices.uvs[2], [1.0 / 16.0, 0.0]);
         assert_eq!(vertices.uvs[3], [0.0, 0.0]);
         assert_eq!(vertices.normals[0], [0.0, 0.0, -1.0]);
-        // The back panel follows, then the four frame strips.
+        // The back panel follows: `(f3, f4, f5, f6) = (0.75, 0.8125, 0, 0.0625)`
+        // (`:88-91`).
         assert_eq!(vertices.normals[4], [0.0, 0.0, 1.0]);
         assert_eq!(vertices.positions[4], [8.0, 8.0, 0.5]);
+        assert_eq!(vertices.uvs[4], [0.75, 0.0]);
+        assert_eq!(vertices.uvs[5], [0.8125, 0.0]);
+        assert_eq!(vertices.uvs[6], [0.8125, 0.0625]);
+        assert_eq!(vertices.uvs[7], [0.75, 0.0625]);
+        // The top and bottom strips: all four corners carry `f9`/`f10`, the 1/512 side
+        // value (`:92-99`).
         assert_eq!(vertices.positions[8], [8.0, 8.0, -0.5]);
         assert_eq!(vertices.normals[8], [0.0, 1.0, 0.0]);
+        assert_eq!(vertices.uvs[8], [0.75, 0.001_953_125]);
+        assert_eq!(vertices.uvs[9], [0.8125, 0.001_953_125]);
+        assert_eq!(vertices.uvs[10], [0.8125, 0.001_953_125]);
+        assert_eq!(vertices.uvs[11], [0.75, 0.001_953_125]);
+        assert_eq!(vertices.normals[12], [0.0, -1.0, 0.0]);
+        assert_eq!(vertices.uvs[12], [0.75, 0.001_953_125]);
+        assert_eq!(vertices.uvs[13], [0.8125, 0.001_953_125]);
+        assert_eq!(vertices.uvs[14], [0.8125, 0.001_953_125]);
+        assert_eq!(vertices.uvs[15], [0.75, 0.001_953_125]);
+        // The side strips: the `0.7519531` far edge against the `0`/`0.0625` near pair
+        // (`:100-107`).
+        assert_eq!(vertices.uvs[16], [0.751_953_1, 0.0]);
+        assert_eq!(vertices.uvs[17], [0.751_953_1, 0.0625]);
+        assert_eq!(vertices.uvs[18], [0.751_953_1, 0.0625]);
+        assert_eq!(vertices.uvs[19], [0.751_953_1, 0.0]);
         assert_eq!(vertices.normals[20], [1.0, 0.0, 0.0]);
+        assert_eq!(vertices.uvs[20], [0.751_953_1, 0.0]);
+        assert_eq!(vertices.uvs[21], [0.751_953_1, 0.0625]);
+        assert_eq!(vertices.uvs[22], [0.751_953_1, 0.0625]);
+        assert_eq!(vertices.uvs[23], [0.751_953_1, 0.0]);
     }
 
     /// The arrow: six quads, the tail's two at x = -7 and the shaft's four, each shaft
@@ -1207,8 +1235,15 @@ mod tests {
             cart.parts[1].rest,
             [0.0, 3.0 * std::f32::consts::FRAC_PI_2, 0.0]
         );
-        assert_eq!(cart.parts[1].boxes[0].origin, [-8.0, -7.0, -1.0]);
+        // The four side panels hang from `-j - 1` with `j = 8` (`ModelMinecart.java`:25-32).
+        assert_eq!(cart.parts[1].boxes[0].origin, [-8.0, -9.0, -1.0]);
         assert_eq!(cart.parts[1].boxes[0].size, [16.0, 8.0, 2.0]);
+        assert_eq!(cart.parts[2].boxes[0].origin, [-8.0, -9.0, -1.0]);
+        assert_eq!(cart.parts[2].boxes[0].size, [16.0, 8.0, 2.0]);
+        assert_eq!(cart.parts[3].boxes[0].origin, [-8.0, -9.0, -1.0]);
+        assert_eq!(cart.parts[3].boxes[0].size, [16.0, 8.0, 2.0]);
+        assert_eq!(cart.parts[4].boxes[0].origin, [-8.0, -9.0, -1.0]);
+        assert_eq!(cart.parts[4].boxes[0].size, [16.0, 8.0, 2.0]);
         assert_eq!(cart.parts[5].boxes[0].uv, [44.0, 10.0]);
         assert_eq!(cart.parts[5].boxes[0].origin, [-9.0, -7.0, -1.0]);
         assert_eq!(cart.parts[5].boxes[0].size, [18.0, 14.0, 1.0]);

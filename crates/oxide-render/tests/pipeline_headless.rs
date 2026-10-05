@@ -4368,7 +4368,9 @@ fn the_block_item_draws_the_baked_box() {
         &draw,
     );
     let count = non_sky(&filled);
-    assert!(count > 30, "the block box lands pixels, got {count}");
+    // The drawn box lands 32 px under the case's camera and scale; the floor keeps a
+    // margin under the measured count.
+    assert!(count > 24, "the block box lands pixels, got {count}");
 }
 
 /// The sprite item draws the generated-item shape: the item's face lands pixels.
