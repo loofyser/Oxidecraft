@@ -14,15 +14,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use oxide_assets::atlas::{AtlasError, build_atlas};
+use oxide_assets::atlas::{Atlas, AtlasError, build_atlas};
 use oxide_assets::extract::Extractor;
 use oxide_assets::font::{Font, FontError};
-use oxide_assets::model::{ModelError, ModelSource};
+use oxide_assets::model::{BakedModel, BakedQuad, ModelError, ModelSource};
 use oxide_assets::resources::{ResourceError, TextureSet};
 use oxide_assets::store::{Store, StoreError};
 use oxide_assets::texture::Texture;
-use oxide_game::mesher::BlockModelSet;
+use oxide_game::mesher::{BlockModelSet, ModelChoice};
 use oxide_game::session::MeshAssets;
+use oxide_render::entity_models::{Vertices, objects};
+use oxide_render::entity_pass::{ItemMesh, ItemMeshSource};
 use oxide_render::sky::SkyTextures;
 use oxide_world::biome::{ColorMap, ColorMapError, TintMaps};
 
@@ -162,6 +164,47 @@ pub const DEFAULT_SKIN_WIDE: &str = "entity/steve.png";
 /// The slim default skin's key, an entry of [`ENTITY_TEXTURES`].
 pub const DEFAULT_SKIN_SLIM: &str = "entity/alex.png";
 
+/// The item frame's own wood: the blockstate file and the variant key the frame's
+/// model resource names (`RenderItemFrame.java`:37's `("item_frame", "normal")`).
+const ITEM_FRAME_STATE: (&str, &str) = ("item_frame", "normal");
+
+/// The blocks texture the baked-model item meshes sample: the client's own name for
+/// the stitched atlas (`TextureMap.java`:30's `textures/atlas/blocks.png`).
+pub const BLOCKS_ATLAS_TEXTURE: &str = "textures/atlas/blocks.png";
+
+/// The object set's own sheets: every key the object draws, the generated item shapes
+/// and the icon quads sample.
+///
+/// The keys are the names the draws and the shapes register and resolve under: the
+/// object geometries' own files (`objects::ARROW_TEXTURE` and its siblings), and the
+/// item sheets under the item table's asset paths (`items.rs`'s sprite entries), which
+/// the generated shape's key and the icon quad's key carry unchanged.
+pub const OBJECT_TEXTURES: [&str; 23] = [
+    "entity/arrow.png",
+    "entity/boat.png",
+    "entity/experience_orb.png",
+    "entity/minecart.png",
+    "painting/paintings_kristoffer_zetterstrand.png",
+    "items/apple",
+    "items/arrow",
+    "items/bow_standby",
+    "items/coal",
+    "items/diamond",
+    "items/diamond_sword",
+    "items/egg",
+    "items/ender_eye",
+    "items/ender_pearl",
+    "items/experience_bottle",
+    "items/fireball",
+    "items/fireworks",
+    "items/gold_ingot",
+    "items/iron_ingot",
+    "items/iron_sword",
+    "items/potion_bottle_drinkable",
+    "items/snowball",
+    "items/stick",
+];
+
 /// Errors from loading the client's assets.
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
@@ -228,10 +271,18 @@ pub struct ClientAssets {
     pub sky_textures: SkyTextures,
     /// The entity textures, keyed by the pass's names.
     pub entity_textures: Vec<(&'static str, Texture)>,
+    /// The object set's own sheets, keyed as the object draws name them.
+    pub object_textures: Vec<(&'static str, Texture)>,
+    /// The blocks atlas's level-0 image, under [`BLOCKS_ATLAS_TEXTURE`]: the sheet the
+    /// block-item meshes sample.
+    pub blocks_atlas: Texture,
     /// The wide default skin, from the entity set.
     pub skin_wide: Texture,
     /// The slim default skin, from the entity set.
     pub skin_slim: Texture,
+    /// The object draws' item mesh source: the baked block models, the sheets and the
+    /// frame's wood.
+    pub item_meshes: ClientItemMeshes,
 }
 
 impl ClientAssets {
@@ -275,28 +326,198 @@ impl ClientAssets {
         let skin_wide = texture(&textures, DEFAULT_SKIN_WIDE)?.clone();
         let skin_slim = texture(&textures, DEFAULT_SKIN_SLIM)?.clone();
 
+        // The object set: the sheets the object draws sample — the geometries' files
+        // and the item table's sprite paths — loaded under the keys the draws and the
+        // shapes name.
+        let mut object_textures = Vec::with_capacity(OBJECT_TEXTURES.len());
+        for key in OBJECT_TEXTURES {
+            object_textures.push((key, texture(&textures, key)?.clone()));
+        }
+        // The blocks atlas's level-0 image, under the name the block-item meshes
+        // sample; and the item frame's wood, baked from the tree's own model
+        // (`RenderItemFrame.java`:37).
+        let blocks_atlas = Texture {
+            width: atlas.width,
+            height: atlas.height,
+            rgba: atlas.levels[0].rgba.clone(),
+        };
+        let frame = bake_item_frame(&models, &atlas);
+        let mesh = Arc::new(MeshAssets {
+            models: block_models,
+            atlas,
+            tint_maps,
+        });
+        let item_meshes = ClientItemMeshes {
+            mesh: Arc::clone(&mesh),
+            sheets: object_textures.clone(),
+            frame,
+        };
+
         tracing::info!(
-            atlas_width = atlas.width,
-            atlas_height = atlas.height,
-            atlas_levels = atlas.level_count,
-            atlas_sprites = atlas.sprites.len(),
+            atlas_width = mesh.atlas.width,
+            atlas_height = mesh.atlas.height,
+            atlas_levels = mesh.atlas.level_count,
+            atlas_sprites = mesh.atlas.sprites.len(),
             sheet_width = sheet.width,
             sheet_height = sheet.height,
             "the client assets were loaded"
         );
         Ok(ClientAssets {
-            mesh: Arc::new(MeshAssets {
-                models: block_models,
-                atlas,
-                tint_maps,
-            }),
+            mesh,
             font,
             sheet,
             sky_textures,
             entity_textures,
+            object_textures,
+            blocks_atlas,
             skin_wide,
             skin_slim,
+            item_meshes,
         })
+    }
+}
+
+/// The item frame's own wood model, baked once: the frame's blockstate's `normal`
+/// variant through the tree's own baker (`RenderItemFrame.java`:37, `:61-75`).
+fn bake_item_frame(models: &ModelSource, atlas: &Atlas) -> Option<ItemMesh> {
+    let states = models.blockstates(ITEM_FRAME_STATE.0).ok()?;
+    let variant = states.variants.get(ITEM_FRAME_STATE.1)?.first()?;
+    let baked = models.bake_variant(variant).ok()?;
+    Some(ItemMesh {
+        vertices: Arc::new(model_vertices(&baked, atlas)),
+        texture: BLOCKS_ATLAS_TEXTURE,
+    })
+}
+
+/// The object draws' mesh source: the client's baked block models, its stitched atlas
+/// and the sheets the generated shapes read, behind the pass's own
+/// [`ItemMeshSource`].
+///
+/// The pass names none of this: it asks for a sprite key, a block state, the frame's
+/// wood or an icon sprite, and this resolves each against the same assets the terrain
+/// and the entity set are built from.
+#[derive(Debug, Clone)]
+pub struct ClientItemMeshes {
+    /// The session's mesh assets: the block models the terrain bakes, and the atlas.
+    mesh: Arc<MeshAssets>,
+    /// The item sheets, keyed as the draws name them.
+    sheets: Vec<(&'static str, Texture)>,
+    /// The item frame's wood, baked at load.
+    frame: Option<ItemMesh>,
+}
+
+impl ItemMeshSource for ClientItemMeshes {
+    /// The generated item shape of a sprite: its pixels through the item model
+    /// generator's own scan (`ItemModelGenerator.java`:17-234), the quads in the
+    /// sheet's own 0..1 space.
+    fn generated(&self, key: &str) -> Option<ItemMesh> {
+        let sheet = self.sheets.iter().find(|entry| entry.0 == key)?;
+        let vertices = objects::generated_item(sheet.1.width, sheet.1.height, &sheet.1.rgba)?;
+        Some(ItemMesh {
+            vertices: Arc::new(vertices),
+            texture: sheet.0,
+        })
+    }
+
+    /// The baked mesh of a block state through the terrain's own model set. The origin
+    /// stands in for a position — a dropped item has no cell of its own — and an
+    /// unresolved state answers the mesher's own fallback cube.
+    fn block_item(&self, block: u16, meta: u8) -> Option<ItemMesh> {
+        match self.mesh.models.model(block, meta, 0, 0, 0) {
+            ModelChoice::Model(model) => Some(ItemMesh {
+                vertices: Arc::new(model_vertices(model, &self.mesh.atlas)),
+                texture: BLOCKS_ATLAS_TEXTURE,
+            }),
+            ModelChoice::Missing => Some(ItemMesh {
+                vertices: Arc::new(missing_cube(&self.mesh.atlas)),
+                texture: BLOCKS_ATLAS_TEXTURE,
+            }),
+        }
+    }
+
+    /// The frame's own wood, baked at load.
+    fn frame_wood(&self) -> Option<ItemMesh> {
+        self.frame.clone()
+    }
+
+    /// The icon quad of a sprite: the source's own one-quad draw, the sprite as the
+    /// whole sheet, the normal up (`RenderFireball.doRender`:46-51).
+    fn icon_quad(&self, key: &str) -> Option<ItemMesh> {
+        let sheet = self.sheets.iter().find(|entry| entry.0 == key)?;
+        let mut vertices = Vertices::default();
+        for ([x, y], [u, v]) in [
+            ([-8.0, -4.0], [0.0, 1.0]),
+            ([8.0, -4.0], [1.0, 1.0]),
+            ([8.0, 12.0], [1.0, 0.0]),
+            ([-8.0, 12.0], [0.0, 0.0]),
+        ] {
+            vertices.positions.push([x, y, 0.0]);
+            vertices.uvs.push([u, v]);
+            vertices.normals.push([0.0, 1.0, 0.0]);
+        }
+        Some(ItemMesh {
+            vertices: Arc::new(vertices),
+            texture: sheet.0,
+        })
+    }
+}
+
+/// The mesher's own fallback for a state the model set did not resolve: the missing
+/// sprite's cube (`objects::missing_block`), its uvs mapped onto the atlas's missing
+/// sprite.
+fn missing_cube(atlas: &Atlas) -> Vertices {
+    let mut mesh = objects::missing_block();
+    let [min, max] = atlas.uv(&atlas.missing);
+    for uv in &mut mesh.uvs {
+        uv[0] = min[0] + uv[0] * (max[0] - min[0]);
+        uv[1] = min[1] + uv[1] * (max[1] - min[1]);
+    }
+    mesh
+}
+
+/// A baked model's quads as one entity vertex set: positions in 1/16 units, uvs mapped
+/// into the atlas's drawn rects, each quad's own normal.
+fn model_vertices(model: &BakedModel, atlas: &Atlas) -> Vertices {
+    let mut out = Vertices::default();
+    for quad in &model.quads {
+        push_model_quad(&mut out, quad, atlas);
+    }
+    out
+}
+
+/// Pushes one baked quad: the mesher's own sprite mapping (`oxide-game`'s `atlas_uv`
+/// rule), the corners scaled from the model's 0..1 block-local units.
+fn push_model_quad(out: &mut Vertices, quad: &BakedQuad, atlas: &Atlas) {
+    let [min, max] = atlas.uv(atlas.drawn(&quad.texture));
+    let normal = quad_normal(&quad.corners);
+    for index in 0..4 {
+        let corner = quad.corners[index];
+        out.positions
+            .push([corner[0] * 16.0, corner[1] * 16.0, corner[2] * 16.0]);
+        let uv = quad.uv[index];
+        out.uvs.push([
+            min[0] + uv[0] * (max[0] - min[0]),
+            min[1] + uv[1] * (max[1] - min[1]),
+        ]);
+        out.normals.push(normal);
+    }
+}
+
+/// The unit normal of a quad's first three corners; the up axis for a degenerate quad.
+fn quad_normal(corners: &[[f32; 3]; 4]) -> [f32; 3] {
+    let edge = |from: [f32; 3], to: [f32; 3]| [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let a = edge(corners[0], corners[1]);
+    let b = edge(corners[1], corners[2]);
+    let [x, y, z] = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    let length = (x * x + y * y + z * z).sqrt();
+    if length > 0.0 {
+        [x / length, y / length, z / length]
+    } else {
+        [0.0, 1.0, 0.0]
     }
 }
 
@@ -534,5 +755,144 @@ mod tests {
                 "the entity texture {key} is in the store"
             );
         }
+    }
+
+    /// The object set's registry: every key the object draws, the generated item
+    /// shapes and the icon quads sample, both key forms pinned — the geometries' own
+    /// files and the item table's asset paths.
+    #[test]
+    fn the_object_set_names_the_sheets_the_object_draws_sample() {
+        assert_eq!(
+            OBJECT_TEXTURES,
+            [
+                "entity/arrow.png",
+                "entity/boat.png",
+                "entity/experience_orb.png",
+                "entity/minecart.png",
+                "painting/paintings_kristoffer_zetterstrand.png",
+                "items/apple",
+                "items/arrow",
+                "items/bow_standby",
+                "items/coal",
+                "items/diamond",
+                "items/diamond_sword",
+                "items/egg",
+                "items/ender_eye",
+                "items/ender_pearl",
+                "items/experience_bottle",
+                "items/fireball",
+                "items/fireworks",
+                "items/gold_ingot",
+                "items/iron_ingot",
+                "items/iron_sword",
+                "items/potion_bottle_drinkable",
+                "items/snowball",
+                "items/stick",
+            ]
+        );
+        // The object geometries' own keys, as `objects.rs` names them.
+        for key in [
+            objects::ARROW_TEXTURE,
+            objects::BOAT_TEXTURE,
+            objects::MINECART_TEXTURE,
+            objects::ORB_TEXTURE,
+            objects::PAINTING_TEXTURE,
+        ] {
+            assert!(OBJECT_TEXTURES.contains(&key), "the object sheet {key}");
+        }
+        // And every sprite an item shape or an icon quad can name.
+        for key in [
+            "items/stick",
+            "items/apple",
+            "items/snowball",
+            "items/egg",
+            "items/ender_pearl",
+            "items/ender_eye",
+            "items/potion_bottle_drinkable",
+            "items/experience_bottle",
+            "items/fireworks",
+            "items/fireball",
+        ] {
+            assert!(OBJECT_TEXTURES.contains(&key), "the item sheet {key}");
+        }
+    }
+
+    /// Every key the object set names exists in the store's extraction tree, and the
+    /// frame's blockstate the wood bakes from is there too.
+    #[test]
+    #[ignore = "reads the asset store; set OXIDECRAFT_STORE and run with -- --ignored"]
+    fn the_object_set_exists_in_the_store() {
+        let root = std::env::var_os(STORE_VAR)
+            .filter(|root| !root.is_empty())
+            .expect("OXIDECRAFT_STORE must name the store root");
+        let store = Store::open(PathBuf::from(root)).expect("the store opens");
+        let tree = Extractor::new(&store, VERSION).root();
+        let textures = TextureSet::load(&tree).expect("the texture tree loads");
+        for key in OBJECT_TEXTURES {
+            assert!(
+                textures.get(store_key(key)).is_some(),
+                "the object texture {key} is in the store"
+            );
+        }
+        let models = ModelSource::open(&tree).expect("the block models load");
+        assert!(
+            models.blockstates(ITEM_FRAME_STATE.0).is_ok(),
+            "the frame's blockstate file is in the store"
+        );
+    }
+
+    /// The live item mesh source: the baked block models, the generated item shapes,
+    /// the icon quads and the frame's wood all build from the store's own tree — the
+    /// path the running client wires into the pass.
+    #[test]
+    #[ignore = "reads the asset store; set OXIDECRAFT_STORE and run with -- --ignored"]
+    fn the_object_meshes_build_from_the_store() {
+        let root = std::env::var_os(STORE_VAR)
+            .filter(|root| !root.is_empty())
+            .expect("OXIDECRAFT_STORE must name the store root");
+        let assets = ClientAssets::load(Some(PathBuf::from(root))).expect("the client assets load");
+        let source = &assets.item_meshes;
+
+        // The sheets the startup uploads are all present.
+        assert_eq!(source.sheets.len(), OBJECT_TEXTURES.len());
+
+        // A block item's state bakes through the terrain's own model set, sampling the
+        // atlas under the blocks texture's name.
+        let stone = source.block_item(1, 0).expect("stone's state bakes");
+        assert_eq!(stone.texture, BLOCKS_ATLAS_TEXTURE);
+        assert_eq!(stone.vertices.positions.len() % 4, 0);
+        assert!(
+            stone.vertices.positions.len() >= 24,
+            "a cube's six quads, got {}",
+            stone.vertices.positions.len()
+        );
+
+        // The generated item shape reads the sprite's own pixels.
+        let apple = source
+            .generated("items/apple")
+            .expect("the apple's shape bakes");
+        assert_eq!(apple.texture, "items/apple");
+        assert!(!apple.vertices.positions.is_empty());
+        assert!(source.generated("items/not_a_sheet").is_none());
+
+        // The frame's own wood, baked at load.
+        let wood = source.frame_wood().expect("the frame's wood bakes");
+        assert!(!wood.vertices.positions.is_empty());
+
+        // The icon quad: the source's own four corners.
+        let icon = source
+            .icon_quad("items/fireball")
+            .expect("the fireball's icon builds");
+        assert_eq!(icon.vertices.positions.len(), 4);
+        assert_eq!(icon.texture, "items/fireball");
+
+        // The atlas image the startup registers under the blocks name is the level-0
+        // stitch itself.
+        assert_eq!(assets.blocks_atlas.width, assets.mesh.atlas.width);
+        assert_eq!(assets.blocks_atlas.height, assets.mesh.atlas.height);
+        assert_eq!(
+            assets.blocks_atlas.rgba.len(),
+            (assets.mesh.atlas.width as usize) * (assets.mesh.atlas.height as usize) * 4
+        );
     }
 }

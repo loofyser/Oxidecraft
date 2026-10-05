@@ -27,6 +27,7 @@
 //! the client reports.
 
 mod assets;
+mod items;
 mod keymap;
 mod skin_worker;
 mod view;
@@ -1744,6 +1745,14 @@ impl ApplicationHandler for ClientApp {
                 renderer.set_entity_texture(key, texture);
             }
             renderer.set_default_skins(&assets.skin_wide, &assets.skin_slim);
+            // The object set: the object sheets and the blocks atlas under the keys the
+            // object draws name, and the item mesh source the draws' shapes, block models,
+            // frame wood and icon quads resolve through.
+            for (key, texture) in &assets.object_textures {
+                renderer.set_entity_texture(key, texture);
+            }
+            renderer.set_entity_texture(assets::BLOCKS_ATLAS_TEXTURE, &assets.blocks_atlas);
+            renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
         }
         self.window = Some(window);
     }

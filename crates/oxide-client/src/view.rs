@@ -16,10 +16,11 @@ use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
 use oxide_game::session::ClientEvent;
 use oxide_render::entity_models::player::CapeMotion;
-use oxide_render::entity_models::{Pose, PoseExtra};
-use oxide_render::entity_pass::{DrawExtra, EntityDraw, ModelRef, TextureRef};
+use oxide_render::entity_models::{Pose, PoseExtra, objects};
+use oxide_render::entity_pass::{DrawExtra, EntityDraw, FrameContent, ModelRef, TextureRef};
 use oxide_world::entity::EntityKind;
 
+use crate::items;
 use crate::skin_worker::SkinUpdate;
 
 /// The all-on parts byte every player draws with this milestone.
@@ -112,6 +113,26 @@ impl View {
             draws.push(draw);
         }
         draws
+    }
+}
+
+/// The draw's own texture for the item geometries: the generated shape and the block
+/// meshes carry their own sheets, so the draw's `texture` field stays a present-but-unused
+/// placeholder — the always-uploaded shadow sprite stands in.
+const ITEM_DRAW_PLACEHOLDER: &str = "misc/shadow.png";
+
+/// The thrown-item sheet a projectile kind draws, when the object set covers it
+/// (`RenderManager.java`:177-183).
+fn projectile_sprite(kind: EntityKind) -> Option<&'static str> {
+    match kind {
+        EntityKind::Snowball => Some("items/snowball"),
+        EntityKind::Egg => Some("items/egg"),
+        EntityKind::EnderPearl => Some("items/ender_pearl"),
+        EntityKind::EyeOfEnder => Some("items/ender_eye"),
+        EntityKind::Potion => Some("items/potion_bottle_drinkable"),
+        EntityKind::XpBottle => Some("items/experience_bottle"),
+        EntityKind::Firework => Some("items/fireworks"),
+        _ => None,
     }
 }
 
@@ -208,6 +229,139 @@ fn draw_for(
             None => {
                 tracing::debug!(kind = ?frame.kind, "the entity kind has no model yet");
                 return None;
+            }
+        },
+        EntityExtra::Item { id, count, damage } => {
+            let model = match items::resolve(*id, *damage) {
+                items::ItemResolution::Block(block) => ModelRef::BlockItem { block },
+                items::ItemResolution::Sprite(key) => ModelRef::Sprite { key },
+                items::ItemResolution::Missing => {
+                    tracing::debug!(id, "the item id has no model");
+                    return None;
+                }
+            };
+            (
+                model,
+                TextureRef::Named(ITEM_DRAW_PLACEHOLDER),
+                DrawExtra::Item {
+                    id: *id,
+                    count: *count,
+                    damage: *damage,
+                },
+                PoseExtra::None,
+                false,
+            )
+        }
+        EntityExtra::Painting { title, facing } => (
+            ModelRef::Painting {
+                art: objects::art_index(title) as u8,
+            },
+            TextureRef::Named(objects::PAINTING_TEXTURE),
+            DrawExtra::Painting { facing: *facing },
+            PoseExtra::None,
+            false,
+        ),
+        EntityExtra::ItemFrame { item, rotation } => {
+            let content = match item {
+                None => FrameContent::Empty,
+                Some(stack) => match items::resolve(stack.id, stack.damage) {
+                    items::ItemResolution::Block(block) => FrameContent::Block(block),
+                    items::ItemResolution::Sprite(key) => FrameContent::Sprite(key),
+                    items::ItemResolution::Missing => FrameContent::Empty,
+                },
+            };
+            (
+                ModelRef::ItemFrame { content },
+                TextureRef::Named(ITEM_DRAW_PLACEHOLDER),
+                DrawExtra::Frame {
+                    rotation: *rotation,
+                },
+                PoseExtra::None,
+                false,
+            )
+        }
+        EntityExtra::Boat => (
+            ModelRef::Boat,
+            TextureRef::Named(objects::BOAT_TEXTURE),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        EntityExtra::Minecart => (
+            ModelRef::Minecart { body: 0 },
+            TextureRef::Named(objects::MINECART_TEXTURE),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        EntityExtra::Orb => (
+            ModelRef::Orb { value: 1 },
+            TextureRef::Named(objects::ORB_TEXTURE),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        EntityExtra::Projectile => match frame.kind {
+            EntityKind::Arrow => (
+                ModelRef::Arrow,
+                TextureRef::Named(objects::ARROW_TEXTURE),
+                DrawExtra::None,
+                PoseExtra::None,
+                false,
+            ),
+            EntityKind::Fireball => (
+                ModelRef::Sprite {
+                    key: "items/fireball",
+                },
+                TextureRef::Named(ITEM_DRAW_PLACEHOLDER),
+                DrawExtra::Projectile {
+                    billboard: objects::Billboard::Fireball,
+                    scale: 2.0,
+                },
+                PoseExtra::None,
+                false,
+            ),
+            // The blaze's small fireball draws under the same class at its own
+            // registration scale (`RenderManager.java`:185).
+            EntityKind::SmallFireball => (
+                ModelRef::Sprite {
+                    key: "items/fireball",
+                },
+                TextureRef::Named(ITEM_DRAW_PLACEHOLDER),
+                DrawExtra::Projectile {
+                    billboard: objects::Billboard::Fireball,
+                    scale: 0.5,
+                },
+                PoseExtra::None,
+                false,
+            ),
+            EntityKind::WitherSkull => (
+                ModelRef::Sprite {
+                    key: "items/fireball",
+                },
+                TextureRef::Named(ITEM_DRAW_PLACEHOLDER),
+                DrawExtra::Projectile {
+                    billboard: objects::Billboard::Fireball,
+                    scale: 1.0,
+                },
+                PoseExtra::None,
+                false,
+            ),
+            kind => {
+                let Some(key) = projectile_sprite(kind) else {
+                    tracing::debug!(kind = ?kind, "the projectile has no sprite");
+                    return None;
+                };
+                (
+                    ModelRef::Sprite { key },
+                    TextureRef::Named(ITEM_DRAW_PLACEHOLDER),
+                    DrawExtra::Projectile {
+                        billboard: objects::Billboard::Snowball,
+                        scale: 0.5,
+                    },
+                    PoseExtra::None,
+                    false,
+                )
             }
         },
         other => {
@@ -695,13 +849,15 @@ fn interpolate_rotation(prev: f32, cur: f32, partial: f32) -> f32 {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
     use std::time::Duration;
 
     use oxide_assets::skins::DefaultModel;
     use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
+    use oxide_proto_v47::entity::MetadataItem;
     use oxide_render::entity_models::PoseExtra;
     use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
-    use oxide_render::entity_pass::{ModelRef, TextureRef};
+    use oxide_render::entity_pass::{FrameContent, ModelRef, TextureRef};
     use oxide_world::entity::EntityKind;
 
     /// The uuid whose default model the rule calls wide (its last bit is zero).
@@ -1991,5 +2147,362 @@ mod tests {
             t0,
         );
         assert_eq!(draws_at(&view, t0, Duration::ZERO).len(), 0);
+    }
+
+    /// An object frame: the player template's pairs with the object kind and its own
+    /// channel.
+    fn object_frame(id: i32, kind: EntityKind, extra: EntityExtra) -> EntityFrame {
+        let mut frame = player_frame(id, UUID_WIDE);
+        frame.uuid = None;
+        frame.kind = kind;
+        frame.extra = extra;
+        frame
+    }
+
+    /// The item entities: the wire table's own split — a block id draws the baked
+    /// model, a sprite id the generated shape, and an id no entry names nothing at all
+    /// (`EntityItem`'s stack, resolved through the renderer's own model table).
+    #[test]
+    fn the_item_entities_resolve_through_the_wire_table() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![
+                object_frame(
+                    1,
+                    EntityKind::Item,
+                    EntityExtra::Item {
+                        id: 5,
+                        count: 3,
+                        damage: 9,
+                    },
+                ),
+                object_frame(
+                    2,
+                    EntityKind::Item,
+                    EntityExtra::Item {
+                        id: 280,
+                        count: 2,
+                        damage: 0,
+                    },
+                ),
+                object_frame(
+                    3,
+                    EntityKind::Item,
+                    EntityExtra::Item {
+                        id: 259,
+                        count: 1,
+                        damage: 0,
+                    },
+                ),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 2, "the id with no model draws nothing");
+        assert_eq!(draws[0].model, ModelRef::BlockItem { block: 5 });
+        assert_eq!(
+            draws[0].extra,
+            DrawExtra::Item {
+                id: 5,
+                count: 3,
+                damage: 9,
+            }
+        );
+        assert_eq!(draws[1].model, ModelRef::Sprite { key: "items/stick" });
+        assert_eq!(
+            draws[1].extra,
+            DrawExtra::Item {
+                id: 280,
+                count: 2,
+                damage: 0,
+            }
+        );
+    }
+
+    /// Every projectile kind maps to its class's billboard: the arrow's own geometry,
+    /// the snowball family's generated shape under `RenderSnowball`'s transform, and
+    /// the fireball family's icon quad under `RenderFireball`'s own scale — the
+    /// ghast's `2.0`, the blaze's small `0.5` and the wither skull's `1.0`
+    /// (`RenderManager.java`:177-186).
+    #[test]
+    fn every_projectile_kind_maps_to_its_billboard() {
+        use oxide_render::entity_models::objects::Billboard;
+
+        let mut view = View::new();
+        let t0 = Instant::now();
+        let kinds = [
+            EntityKind::Arrow,
+            EntityKind::Snowball,
+            EntityKind::Egg,
+            EntityKind::EnderPearl,
+            EntityKind::EyeOfEnder,
+            EntityKind::Potion,
+            EntityKind::XpBottle,
+            EntityKind::Firework,
+            EntityKind::Fireball,
+            EntityKind::SmallFireball,
+            EntityKind::WitherSkull,
+        ];
+        view.observe(
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| object_frame(index as i32 + 1, *kind, EntityExtra::Projectile))
+                .collect(),
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), kinds.len(), "every projectile kind draws");
+        let thrown = || DrawExtra::Projectile {
+            billboard: Billboard::Snowball,
+            scale: 0.5,
+        };
+        let fireball = |scale: f32| DrawExtra::Projectile {
+            billboard: Billboard::Fireball,
+            scale,
+        };
+        let expected: [(ModelRef, TextureRef, DrawExtra); 11] = [
+            (
+                ModelRef::Arrow,
+                TextureRef::Named("entity/arrow.png"),
+                DrawExtra::None,
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/snowball",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite { key: "items/egg" },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/ender_pearl",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/ender_eye",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/potion_bottle_drinkable",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/experience_bottle",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/fireworks",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                thrown(),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/fireball",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                fireball(2.0),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/fireball",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                fireball(0.5),
+            ),
+            (
+                ModelRef::Sprite {
+                    key: "items/fireball",
+                },
+                TextureRef::Named("misc/shadow.png"),
+                fireball(1.0),
+            ),
+        ];
+        for (index, (draw, (model, texture, extra))) in
+            draws.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(&draw.model, model, "kind {index}'s model");
+            assert_eq!(&draw.texture, texture, "kind {index}'s sheet");
+            assert_eq!(&draw.extra, extra, "kind {index}'s billboard");
+        }
+    }
+
+    /// A painting's draw: the art's own table index and the hanging's facing byte
+    /// (`EntityPainting`'s spawn, folded by `EntityHanging`'s yaw rule); an unknown
+    /// title falls back to `Kebab`, the table's first art.
+    #[test]
+    fn a_painting_maps_its_art_and_facing() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            (0..4u8)
+                .map(|facing| {
+                    object_frame(
+                        i32::from(facing) + 1,
+                        EntityKind::Painting,
+                        EntityExtra::Painting {
+                            title: Arc::from("Wither"),
+                            facing,
+                        },
+                    )
+                })
+                .collect(),
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 4);
+        for (facing, draw) in draws.iter().enumerate() {
+            assert_eq!(draw.model, ModelRef::Painting { art: 19 });
+            assert_eq!(draw.texture, TextureRef::Named(objects::PAINTING_TEXTURE));
+            assert_eq!(
+                draw.extra,
+                DrawExtra::Painting {
+                    facing: facing as u8
+                }
+            );
+        }
+        // The unknown title falls back to the first art.
+        view.observe(
+            vec![object_frame(
+                9,
+                EntityKind::Painting,
+                EntityExtra::Painting {
+                    title: Arc::from("no such art"),
+                    facing: 0,
+                },
+            )],
+            t0,
+        );
+        assert_eq!(
+            draws_at(&view, t0, Duration::ZERO)[0].model,
+            ModelRef::Painting { art: 0 }
+        );
+    }
+
+    /// The item frame's content resolution: the empty frame, a block stack's small
+    /// block, an item stack's generated shape, an id with no model's empty frame, and
+    /// the rotation slot riding the draw.
+    #[test]
+    fn the_frame_maps_its_content_and_rotation() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        let frame = |id: i32, item: Option<MetadataItem>, rotation: u8| {
+            object_frame(
+                id,
+                EntityKind::ItemFrame,
+                EntityExtra::ItemFrame { item, rotation },
+            )
+        };
+        view.observe(
+            vec![
+                frame(1, None, 0),
+                frame(
+                    2,
+                    Some(MetadataItem {
+                        id: 5,
+                        count: 1,
+                        damage: 0,
+                    }),
+                    3,
+                ),
+                frame(
+                    3,
+                    Some(MetadataItem {
+                        id: 280,
+                        count: 1,
+                        damage: 0,
+                    }),
+                    7,
+                ),
+                frame(
+                    4,
+                    Some(MetadataItem {
+                        id: 259,
+                        count: 1,
+                        damage: 0,
+                    }),
+                    1,
+                ),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 4);
+        assert_eq!(
+            draws[0].model,
+            ModelRef::ItemFrame {
+                content: FrameContent::Empty
+            }
+        );
+        assert_eq!(
+            draws[1].model,
+            ModelRef::ItemFrame {
+                content: FrameContent::Block(5)
+            }
+        );
+        assert_eq!(
+            draws[2].model,
+            ModelRef::ItemFrame {
+                content: FrameContent::Sprite("items/stick")
+            }
+        );
+        assert_eq!(
+            draws[3].model,
+            ModelRef::ItemFrame {
+                content: FrameContent::Empty
+            }
+        );
+        assert_eq!(draws[1].extra, DrawExtra::Frame { rotation: 3 });
+        assert_eq!(draws[2].extra, DrawExtra::Frame { rotation: 7 });
+    }
+
+    /// The vehicles and the orb map to their own models and sheets.
+    ///
+    /// The wire's cart sub-types are not carried by the game's frames yet — the
+    /// session folds every cart kind to one (`oxide-game`'s spawn mapping) — so every
+    /// cart draws the plain body here; the cargo table itself is pinned in `objects.rs`
+    /// and the pass's own case.
+    #[test]
+    fn the_vehicles_and_orb_map_to_their_models_and_sheets() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![
+                object_frame(1, EntityKind::Boat, EntityExtra::Boat),
+                object_frame(2, EntityKind::Minecart, EntityExtra::Minecart),
+                object_frame(3, EntityKind::XpOrb, EntityExtra::Orb),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 3);
+        assert_eq!(draws[0].model, ModelRef::Boat);
+        assert_eq!(draws[0].texture, TextureRef::Named(objects::BOAT_TEXTURE));
+        assert_eq!(draws[1].model, ModelRef::Minecart { body: 0 });
+        assert_eq!(
+            draws[1].texture,
+            TextureRef::Named(objects::MINECART_TEXTURE)
+        );
+        assert_eq!(draws[2].model, ModelRef::Orb { value: 1 });
+        assert_eq!(draws[2].texture, TextureRef::Named(objects::ORB_TEXTURE));
     }
 }

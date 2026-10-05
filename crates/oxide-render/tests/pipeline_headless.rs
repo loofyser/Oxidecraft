@@ -4190,3 +4190,455 @@ fn block_on<F: Future>(future: F) -> F::Output {
         }
     }
 }
+
+// ---------------------------------------------------------------- the object set
+
+use oxide_render::entity_models::Vertices;
+use oxide_render::entity_pass::{FrameContent, ItemMesh, ItemMeshSource};
+
+/// The object sheets the cases upload: every object draw's sheet is a flat light grey, so
+/// the geometry — not the texture — carries the silhouette.
+fn object_registry(device: &wgpu::Device, queue: &wgpu::Queue) -> TextureRegistry {
+    let mut registry = TextureRegistry::new(device, queue);
+    for key in [
+        "entity/experience_orb.png",
+        "entity/boat.png",
+        "entity/minecart.png",
+        "painting/paintings_kristoffer_zetterstrand.png",
+        "items/test.png",
+        "items/block.png",
+    ] {
+        let colour = if key == "items/block.png" {
+            [120, 120, 120, 255]
+        } else {
+            [210, 210, 210, 255]
+        };
+        registry.set_named(device, queue, key, &flat_sheet(colour));
+    }
+    registry.set_named(
+        device,
+        queue,
+        "misc/shadow.png",
+        &flat_sheet([255, 255, 255, 128]),
+    );
+    registry
+}
+
+/// One quad over the whole sheet: `(min x, min y)` to `(max x, max y)` in 1/16 units at
+/// depth `z`, normal `(0, 0, 1)`. The stub meshes below are all quads — the pass's object
+/// paths carry the transform chains the cases measure, not any atlas mapping.
+fn stub_quad(min: [f32; 2], max: [f32; 2], z: f32) -> Vertices {
+    let mut mesh = Vertices::default();
+    for corner in [
+        [min[0], min[1]],
+        [max[0], min[1]],
+        [max[0], max[1]],
+        [min[0], max[1]],
+    ] {
+        mesh.positions.push([corner[0], corner[1], z]);
+        mesh.uvs.push([0.0, 0.0]);
+        mesh.normals.push([0.0, 0.0, 1.0]);
+    }
+    mesh.uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    mesh
+}
+
+/// The object cases' mesh source: the meshes a client source would build, synthetic —
+/// a generated sprite face, a block box face, the frame wood, the icon quad.
+struct StubSource;
+
+impl ItemMeshSource for StubSource {
+    fn generated(&self, _key: &str) -> Option<ItemMesh> {
+        Some(ItemMesh {
+            vertices: std::sync::Arc::new(stub_quad([-8.0, -8.0], [8.0, 8.0], 0.0)),
+            texture: "items/test.png",
+        })
+    }
+
+    fn block_item(&self, _block: u16, _meta: u8) -> Option<ItemMesh> {
+        Some(ItemMesh {
+            vertices: std::sync::Arc::new(stub_quad([0.0, 0.0], [16.0, 16.0], 8.0)),
+            texture: "items/block.png",
+        })
+    }
+
+    fn frame_wood(&self) -> Option<ItemMesh> {
+        Some(ItemMesh {
+            vertices: std::sync::Arc::new(stub_quad([0.0, 0.0], [16.0, 16.0], 0.0)),
+            texture: "items/test.png",
+        })
+    }
+
+    fn icon_quad(&self, _key: &str) -> Option<ItemMesh> {
+        Some(ItemMesh {
+            vertices: std::sync::Arc::new(stub_quad([-8.0, -4.0], [8.0, 12.0], 0.0)),
+            texture: "items/test.png",
+        })
+    }
+}
+
+/// One object draw at the origin, facing the entity camera, full brightness.
+fn object_draw(model: ModelRef, extra: DrawExtra) -> EntityDraw {
+    EntityDraw {
+        model,
+        position: [0.0; 3],
+        body_yaw: 0.0,
+        head_yaw: 0.0,
+        head_pitch: 0.0,
+        pose: Pose::default(),
+        texture: TextureRef::Named("items/test.png"),
+        light: 1.0,
+        hurt: 0.0,
+        death: 0.0,
+        health: None,
+        extra,
+    }
+}
+
+/// The frame's non-sky pixel count: the object cases read silhouettes by how many pixels
+/// an object lands over the empty sky.
+fn non_sky(pixels: &[u8]) -> usize {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(pixels, x, y) != SKY)
+        .count()
+}
+
+/// Sets an object scene up: the device, the target, the depth, the registry and a pass
+/// with the stub source and the entity camera.
+fn object_scene() -> (
+    wgpu::Device,
+    wgpu::Queue,
+    Target,
+    wgpu::TextureView,
+    TextureRegistry,
+    EntityPass,
+) {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = object_registry(&device, &queue);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    entities.set_item_source(std::sync::Arc::new(StubSource));
+    (device, queue, target, depth, registry, entities)
+}
+
+/// Renders one object draw and returns the frame's pixels.
+fn object_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    depth: &wgpu::TextureView,
+    entities: &mut EntityPass,
+    registry: &TextureRegistry,
+    draw: &EntityDraw,
+) -> Vec<u8> {
+    render_scene(device, queue, target, depth, |pass| {
+        entities.draw(device, pass, std::slice::from_ref(draw), registry);
+    })
+}
+
+/// The dropped block item draws the block's own box through the cache: the box's face
+/// lands pixels above the sky.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_block_item_draws_the_baked_box() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let draw = object_draw(
+        ModelRef::BlockItem { block: 1 },
+        DrawExtra::Item {
+            id: 1,
+            count: 1,
+            damage: 0,
+        },
+    );
+    let filled = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &draw,
+    );
+    let count = non_sky(&filled);
+    assert!(count > 30, "the block box lands pixels, got {count}");
+}
+
+/// The sprite item draws the generated-item shape: the item's face lands pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_sprite_item_draws_the_generated_shape() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let draw = object_draw(
+        ModelRef::Sprite {
+            key: "items/test.png",
+        },
+        DrawExtra::Item {
+            id: 280,
+            count: 1,
+            damage: 0,
+        },
+    );
+    let filled = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &draw,
+    );
+    let count = non_sky(&filled);
+    assert!(count > 30, "the generated face lands pixels, got {count}");
+}
+
+/// The orb draws its icon quad on the camera-facing billboard: pixels above the sky.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_orb_draws_its_icon_quad() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let draw = object_draw(ModelRef::Orb { value: 1 }, DrawExtra::None);
+    let filled = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &draw,
+    );
+    let count = non_sky(&filled);
+    assert!(count > 10, "the orb's quad lands pixels, got {count}");
+}
+
+/// The arrow draws its shaft: the source's six quads land a small silhouette.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_arrow_draws_its_shaft() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let draw = object_draw(ModelRef::Arrow, DrawExtra::None);
+    let filled = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &draw,
+    );
+    let count = non_sky(&filled);
+    assert!(count > 8, "the arrow lands pixels, got {count}");
+}
+
+/// The fireball's icon quad draws half the size of the snowball's generated item under
+/// their registered scales: the two silhouettes are distinct in the same frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_throwable_billboards_draw_their_own_shapes() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let snowball = object_draw(
+        ModelRef::Sprite {
+            key: "items/test.png",
+        },
+        DrawExtra::Projectile {
+            billboard: oxide_render::entity_models::objects::Billboard::Snowball,
+            scale: 0.5,
+        },
+    );
+    let small = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &snowball,
+    );
+    let fireball = object_draw(
+        ModelRef::Sprite {
+            key: "items/test.png",
+        },
+        DrawExtra::Projectile {
+            billboard: oxide_render::entity_models::objects::Billboard::Fireball,
+            scale: 2.0,
+        },
+    );
+    let large = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &fireball,
+    );
+    let (small_count, large_count) = (non_sky(&small), non_sky(&large));
+    assert!(
+        small_count > 0,
+        "the snowball lands pixels, got {small_count}"
+    );
+    assert!(
+        large_count > small_count,
+        "the large fireball's quad is the bigger one: {large_count} against {small_count}"
+    );
+}
+
+/// The painting draws its art quad, then the frame and back its source gives the art:
+/// the visible art's silhouette is the art's own aspect — a square for the first art.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_painting_draws_its_art_quad() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let draw = object_draw(
+        ModelRef::Painting { art: 0 },
+        DrawExtra::Painting { facing: 0 },
+    );
+    let filled = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &draw,
+    );
+    let (min_x, min_y, max_x, max_y) = silhouette(&filled);
+    let (width, height) = (max_x - min_x + 1, max_y - min_y + 1);
+    assert!(
+        width >= 12 && height >= 12,
+        "the first art is 16 by 16 pixels, its quad lands ({min_x}, {min_y})..({max_x}, {max_y})"
+    );
+    assert!(
+        width.abs_diff(height) <= 6,
+        "a square art's silhouette, got {width} by {height}"
+    );
+}
+
+/// The frame draws its wood alone when empty; a block content adds the nested box's
+/// pixels inside it.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_frame_draws_its_content_over_the_wood() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let mut empty = object_draw(
+        ModelRef::ItemFrame {
+            content: FrameContent::Empty,
+        },
+        DrawExtra::Frame { rotation: 0 },
+    );
+    // The frame hangs facing the entity camera: `RenderItemFrame` turns the model by
+    // `180 - rotationYaw`, so the half turn points the frame's own front at the viewer.
+    empty.body_yaw = 180.0;
+    let bare = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &empty,
+    );
+    let bare_count = non_sky(&bare);
+    assert!(
+        bare_count > 30,
+        "the frame's wood lands pixels, got {bare_count}"
+    );
+
+    // The nested block's face re-draws the wood at the frame's centre: its own sheet over
+    // the wood's, so the centre pixels change between the two frames.
+    let mut filled = object_draw(
+        ModelRef::ItemFrame {
+            content: FrameContent::Block(1),
+        },
+        DrawExtra::Frame { rotation: 0 },
+    );
+    filled.body_yaw = 180.0;
+    let with_content = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &filled,
+    );
+    let changed = changed_pixels(&bare, &with_content);
+    assert!(
+        changed > 0,
+        "the nested block's face re-draws the frame's centre, {changed} pixels changed"
+    );
+}
+
+/// The boat draws its multi-box hull: a wide low silhouette.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_boat_draws_its_hull() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let draw = object_draw(ModelRef::Boat, DrawExtra::None);
+    let filled = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &draw,
+    );
+    let count = non_sky(&filled);
+    assert!(count > 100, "the hull's boxes land pixels, got {count}");
+}
+
+/// The minecart's bodies: the plain cart draws its hopper box; the chest cart draws its
+/// cargo in addition, so it lands the more pixels of the two.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_minecart_draws_its_body_and_cargo() {
+    let (device, queue, target, depth, registry, mut entities) = object_scene();
+    let plain = object_draw(
+        ModelRef::Minecart {
+            body: oxide_render::entity_models::objects::MinecartBody::Plain as u8,
+        },
+        DrawExtra::None,
+    );
+    let bare = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &plain,
+    );
+    let bare_count = non_sky(&bare);
+    assert!(
+        bare_count > 50,
+        "the cart's boxes land pixels, got {bare_count}"
+    );
+    let chest = object_draw(
+        ModelRef::Minecart {
+            body: oxide_render::entity_models::objects::MinecartBody::Chest as u8,
+        },
+        DrawExtra::None,
+    );
+    let cargo = object_frame(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        &chest,
+    );
+    let cargo_count = non_sky(&cargo);
+    assert!(
+        cargo_count > bare_count,
+        "the chest cargo adds pixels: {cargo_count} against {bare_count}"
+    );
+}

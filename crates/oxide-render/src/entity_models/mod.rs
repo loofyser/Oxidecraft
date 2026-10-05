@@ -28,6 +28,7 @@ use crate::entity_pass::ModelRef;
 pub mod crawlers;
 pub mod exotics;
 pub mod layers;
+pub mod objects;
 pub mod player;
 pub mod quadrupeds;
 
@@ -457,6 +458,14 @@ pub const SNEAK_MODEL_LIFT: f32 = 0.2;
 /// The model a draw's reference names.
 pub fn model_for(reference: ModelRef) -> &'static Model {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => &objects::EMPTY,
         ModelRef::Player { slim, .. } => {
             if slim {
                 &player::MODEL_PLAYER_SLIM
@@ -507,6 +516,14 @@ pub fn model_for(reference: ModelRef) -> &'static Model {
 /// never set one).
 pub fn texture_size(reference: ModelRef) -> [f32; 2] {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => [16.0, 16.0],
         ModelRef::Player { .. } => player::PLAYER_TEXTURE_SIZE,
         ModelRef::Zombie | ModelRef::ZombieVillager | ModelRef::Giant => [64.0, 64.0],
         ModelRef::Skeleton => [64.0, 32.0],
@@ -550,6 +567,14 @@ pub fn texture_size(reference: ModelRef) -> [f32; 2] {
 /// by a key.
 pub fn textures(reference: ModelRef) -> &'static [&'static str] {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => &[],
         ModelRef::Player { .. } => &[],
         // The zombie's model also draws the zombie pigman's sheet, the kind's own
         // renderer's selection (`RenderPigZombie.java`:11, `:15`).
@@ -647,6 +672,14 @@ pub fn textures(reference: ModelRef) -> &'static [&'static str] {
 /// The model's pose for a draw, dispatched to the model class the reference names.
 pub fn pose(reference: ModelRef, pose: &Pose, out: &mut [Rot]) {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => {}
         ModelRef::Player { parts, .. } => player::pose(pose, parts & !player::PART_CAPE, out),
         ModelRef::Zombie | ModelRef::Giant | ModelRef::ZombieVillager => {
             bipeds::pose_zombie(pose, out);
@@ -690,6 +723,14 @@ pub fn pose(reference: ModelRef, pose: &Pose, out: &mut [Rot]) {
 /// nametag offset stands on.
 pub fn height(reference: ModelRef) -> f32 {
     match reference {
+        ModelRef::Arrow => 0.5,
+        ModelRef::Boat => 0.6,
+        ModelRef::Minecart { .. } => 0.7,
+        // The painting's height is its art's own (`sizeY / 16`); a block stands in here.
+        ModelRef::Painting { .. } => 1.0,
+        ModelRef::Sprite { .. } | ModelRef::BlockItem { .. } => 0.25,
+        ModelRef::Orb { .. } => 0.5,
+        ModelRef::ItemFrame { .. } => 0.75,
         ModelRef::Player { .. } => 1.8,
         ModelRef::Zombie | ModelRef::ZombieVillager | ModelRef::Witch => 1.95,
         ModelRef::Skeleton => 1.95,
@@ -746,6 +787,9 @@ pub fn height(reference: ModelRef) -> f32 {
 /// (`RenderVillager.preRenderCallback`:67); the base renderer's opacity default is one.
 pub fn shadow(reference: ModelRef) -> [f32; 2] {
     match reference {
+        ModelRef::Boat | ModelRef::Minecart { .. } => [0.5, 1.0],
+        ModelRef::Orb { .. } | ModelRef::Sprite { .. } | ModelRef::BlockItem { .. } => [0.15, 0.75],
+        ModelRef::Arrow | ModelRef::Painting { .. } | ModelRef::ItemFrame { .. } => [0.0, 0.0],
         ModelRef::Player { .. }
         | ModelRef::Zombie
         | ModelRef::ZombieVillager
@@ -802,6 +846,14 @@ pub fn shadow(reference: ModelRef) -> [f32; 2] {
 /// `6.0F` at `RenderManager.java`:162); every other scaling class rides its own arm below.
 pub fn render_scale(reference: ModelRef) -> f32 {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => 1.0,
         ModelRef::Player { .. } | ModelRef::Witch => RENDER_SCALE,
         ModelRef::Villager { child, .. } => {
             if child {
@@ -862,6 +914,14 @@ pub fn render_scale(reference: ModelRef) -> f32 {
 /// to when nothing squashes.
 pub fn cube_scale(reference: ModelRef, squish: f32) -> Option<[f32; 3]> {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => None,
         ModelRef::Slime { size } | ModelRef::MagmaCube { size } => {
             Some(crawlers::cube_scale(size, squish))
         }
@@ -885,6 +945,14 @@ pub fn cube_scale(reference: ModelRef, squish: f32) -> Option<[f32; 3]> {
 /// down. Every other class shifts none.
 pub fn corpse_shift(reference: ModelRef, pose: &Pose) -> f32 {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => 0.0,
         ModelRef::Bat { hanging } => {
             if hanging {
                 -0.1
@@ -905,6 +973,14 @@ pub fn corpse_shift(reference: ModelRef, pose: &Pose) -> f32 {
 /// `ModelBiped.render` lift but do not drop, and the classes off `ModelBiped` do neither.
 pub fn sneak_terms(reference: ModelRef) -> [f32; 2] {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => [0.0, 0.0],
         ModelRef::Player { .. } => [SNEAK_POSITION_DROP, SNEAK_MODEL_LIFT],
         ModelRef::Zombie | ModelRef::ZombieVillager | ModelRef::Skeleton | ModelRef::Giant => {
             [0.0, SNEAK_MODEL_LIFT]
@@ -919,6 +995,14 @@ pub fn sneak_terms(reference: ModelRef) -> [f32; 2] {
 /// is running). Every other class adds none.
 pub fn corpse_roll(reference: ModelRef, pose: &Pose) -> f32 {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => 0.0,
         ModelRef::IronGolem if pose.limb_swing_amount >= 0.01 => {
             6.5 * folded_wave(pose.limb_swing + 6.0, 13.0)
         }
@@ -943,6 +1027,14 @@ pub fn folded_wave(value: f32, period: f32) -> f32 {
 /// maximum (`RenderSquid.rotateCorpse`:25-34).
 pub fn death_rotation(reference: ModelRef) -> f32 {
     match reference {
+        ModelRef::Arrow
+        | ModelRef::Boat
+        | ModelRef::Minecart { .. }
+        | ModelRef::Painting { .. }
+        | ModelRef::Sprite { .. }
+        | ModelRef::BlockItem { .. }
+        | ModelRef::Orb { .. }
+        | ModelRef::ItemFrame { .. } => 0.0,
         ModelRef::Spider | ModelRef::CaveSpider | ModelRef::Silverfish | ModelRef::EnderMite => {
             180.0
         }

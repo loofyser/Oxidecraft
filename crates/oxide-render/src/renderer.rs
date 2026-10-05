@@ -12,7 +12,7 @@ use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
 use crate::dim_pass::DimPass;
-use crate::entity_pass::{EntityDraw, EntityPass, TextureRegistry};
+use crate::entity_pass::{EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
 use crate::overlay::OverlayPass;
 use crate::sky::{
@@ -427,6 +427,16 @@ impl Renderer {
     pub fn set_default_skins(&mut self, wide: &Texture, slim: &Texture) {
         self.entity_textures
             .set_defaults(&self.device, &self.queue, wide, slim);
+    }
+
+    /// Sets the source the object draws build their item meshes from.
+    ///
+    /// The client owns the atlas, the baked block models and the item sheets; the pass asks
+    /// this source for the generated item shapes, the block items' baked states, the item
+    /// frame's wood and the icon quads. Until this is called, the object draws' item paths
+    /// draw nothing.
+    pub fn set_item_source(&mut self, source: Arc<dyn ItemMeshSource>) {
+        self.entity_pass.set_item_source(source);
     }
 
     /// Uploads one profile's skin and cape, replacing the profile's entry whole.

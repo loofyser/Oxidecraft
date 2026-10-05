@@ -29,8 +29,10 @@
 //! default skins, and the per-uuid skins and capes the client uploads as fetches land.
 //! [`SkinLookup`] is the resolver both the pass and the later tab list share.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Vec3};
 use oxide_assets::atlas::missing_pixels;
@@ -207,6 +209,69 @@ pub enum ModelRef {
         /// the sheet flickers by it and the pre-render scale rises through it.
         invul_time: u16,
     },
+    /// An arrow: `RenderArrow`'s six quads in the arrow's own scaled space
+    /// (`RenderArrow.java`:56-81), under its `45`-degree roll and `0.05625` pre-scale
+    /// (`:53-55`; no shadow).
+    Arrow,
+    /// A boat: `ModelBoat`'s five parts under the renderer's `+0.25` lift, `180 - yaw`
+    /// turn, `(-1, -1, 1)` flip and `0.0625` draw (`RenderBoat.doRender`:29-49). The
+    /// rock from the damage fields is unmodelled (the harness records neither).
+    Boat,
+    /// A minecart: the id jitter, the `+0.375` lift, the `180 - yaw` turn and the
+    /// `0.0625` draw around `ModelMinecart`'s six parts (`RenderMinecart.doRender`:
+    /// 34-39, :75-108) with the subclass's default cargo. The rail pose and the rolling
+    /// rock are unmodelled: the cart draws flat on its networked yaw and pitch.
+    Minecart {
+        /// The subclass's sub-type byte, `0..4` for plain through hopper.
+        body: u8,
+    },
+    /// A painting: the art's own quads under the `180 - yaw` turn and the `0.0625` draw
+    /// (`RenderPainting.doRender`:29-36; no shadow). The yaw folds the extra's facing
+    /// byte through the source's own `index * 90`.
+    Painting {
+        /// The art's index, `0..26` (`EntityPainting.EnumArt`'s ordinal).
+        art: u8,
+    },
+    /// An item sprite the generated-item shape covers: the snowball family's billboards,
+    /// a dropped sprite item, a frame's flat content. The client's source supplies the
+    /// atlas-mapped shape; the extra names the draw's path.
+    Sprite {
+        /// The sprite's asset key, as the client's atlas holds it.
+        key: &'static str,
+    },
+    /// A block item: the state's own baked model, fetched through the pass's per-state
+    /// cache. The metadata folds out of the draw's item damage — its low four bits
+    /// (`Block.getStateById`'s fold, `Block.java`:174-178) — or zero when the draw
+    /// carries no item extras.
+    BlockItem {
+        /// The block's id.
+        block: u16,
+    },
+    /// An experience orb: the sheet's icon cell for the orb's value, on the renderer's
+    /// one quad (`RenderXPOrb.doRender`:26-65; the pulse reads the draw's pose age).
+    Orb {
+        /// The orb's XP value, watcher 18's short.
+        value: i16,
+    },
+    /// An item frame: its own wood model with the content its variant names
+    /// (`RenderItemFrame.doRender`:52-81, `renderItem`:103-170; no shadow).
+    ItemFrame {
+        /// The content the frame holds.
+        content: FrameContent,
+    },
+}
+
+/// The content an item frame holds: the source's own three cases
+/// (`RenderItemFrame.renderItem`:103-170 draws the nested stack, or the empty frame's
+/// bare wood).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameContent {
+    /// The empty frame: the wood alone.
+    Empty,
+    /// A block stack, whose low four damage bits are its metadata.
+    Block(u16),
+    /// An item sprite the generated-item shape covers.
+    Sprite(&'static str),
 }
 
 /// The texture a draw samples.
@@ -290,6 +355,133 @@ pub enum DrawExtra {
         /// The armour's table index, `0..4`.
         armour: u8,
     },
+    /// A dropped item: the stack the item path draws, with the bob and spin derived
+    /// from the draw's pose age (`RenderEntityItem.doRender`:91-154; no `EntityItem`
+    /// update method carries the rotation — `func_177077_a`:47-48` does).
+    Item {
+        /// The item's id.
+        id: i16,
+        /// The stack's count: the copy count the stack draws.
+        count: u8,
+        /// The stack's damage: a block item's low four bits are its metadata.
+        damage: i16,
+    },
+    /// A thrown item's billboard: the snowball family's generated item in the class's own
+    /// scale, or a fireball's plain icon quad (`RenderSnowball.java`:26-39,
+    /// `RenderFireball.java`:27-55).
+    Projectile {
+        /// Which billboard shape the class draws.
+        billboard: entity_models::objects::Billboard,
+        /// The class's own scale: `0.5` for the snowball family, the fireball
+        /// registrations' `2.0` and `0.5` (`RenderManager.java`:184-185).
+        scale: f32,
+    },
+    /// An item frame's content: the frame's own rotation slot
+    /// (`RenderItemFrame.renderItem`:103-110`.
+    Frame {
+        /// The rotation, `0..8` (`EntityItemFrame.getRotation`).
+        rotation: u8,
+    },
+    /// A painting: the hanging's facing byte, folded by the source's own
+    /// `horizontalIndex * 90` (`EntityHanging.updateFacingWithBoundingBox`:46).
+    Painting {
+        /// The facing byte, `0..4`.
+        facing: u8,
+    },
+}
+
+/// Whether a model belongs to the object set: its geometry takes its own path, not the
+/// mob table's parts and poses.
+pub fn is_object(model: ModelRef) -> bool {
+    matches!(
+        model,
+        ModelRef::Arrow
+            | ModelRef::Boat
+            | ModelRef::Minecart { .. }
+            | ModelRef::Painting { .. }
+            | ModelRef::Sprite { .. }
+            | ModelRef::BlockItem { .. }
+            | ModelRef::Orb { .. }
+            | ModelRef::ItemFrame { .. }
+    )
+}
+
+/// The item meshes the object draws read: the atlas-mapped sprite shapes, the baked block
+/// states and the frame's own wood.
+///
+/// The client implements this over its own sheet and model baker, so neither crate is
+/// named here. Every mesh the trait hands back is in 1/16 model units with its uvs
+/// already mapped into the texture its key names.
+pub trait ItemMeshSource {
+    /// The generated-item mesh of a sprite key: the item model generator's body and its
+    /// alpha-derived edge strips (`ItemModelGenerator.java`:17-234).
+    fn generated(&self, key: &str) -> Option<ItemMesh>;
+    /// The baked mesh of a block item's state — the same models the terrain bakes.
+    fn block_item(&self, block: u16, meta: u8) -> Option<ItemMesh>;
+    /// The item frame's own wood model (`models/block/item_frame`, the frame's own
+    /// block model).
+    fn frame_wood(&self) -> Option<ItemMesh>;
+    /// A sprite's own quad: the icon billboards' one quad over the sprite's region, its
+    /// normal `(0, 1, 0)` (`RenderFireball.doRender`:46-51).
+    fn icon_quad(&self, key: &str) -> Option<ItemMesh>;
+}
+
+/// One source-built item mesh: the vertices and the registry key their uvs sample.
+#[derive(Debug, Clone)]
+pub struct ItemMesh {
+    /// The vertex set, in 1/16 model units.
+    pub vertices: Arc<entity_models::Vertices>,
+    /// The texture registry key the uvs sample.
+    pub texture: &'static str,
+}
+
+/// The damage-to-metadata fold the cache keys on: a block stack's damage carries the
+/// block's metadata in its low four bits (`Block.getStateById`'s fold, `Block.java`:174-178).
+pub fn item_meta(damage: u16) -> u8 {
+    (damage & 0x0F) as u8
+}
+
+/// The cap on distinct block states the cache keeps: distinct block items in view are
+/// few, and a state past the cap draws uncached rather than evicting a kept one.
+pub const BLOCK_ITEM_CACHE_CAP: usize = 256;
+
+/// The per-state cache of block-item meshes: one built vertex set per distinct block
+/// state, built once through the client-supplied source and kept.
+#[derive(Default)]
+pub struct BlockItemCache {
+    /// The entries, keyed by block id and the folded metadata.
+    entries: RefCell<BTreeMap<(u16, u8), Option<ItemMesh>>>,
+}
+
+impl BlockItemCache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The mesh for a block state, built through the source once and kept; a cache at
+    /// its cap answers without storing.
+    pub fn mesh(&self, source: &dyn ItemMeshSource, block: u16, meta: u8) -> Option<ItemMesh> {
+        let mut entries = self.entries.borrow_mut();
+        if let Some(mesh) = entries.get(&(block, meta)) {
+            return mesh.clone();
+        }
+        let mesh = source.block_item(block, meta);
+        if entries.len() < BLOCK_ITEM_CACHE_CAP {
+            entries.insert((block, meta), mesh.clone());
+        }
+        mesh
+    }
+
+    /// The number of states kept.
+    pub fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    /// Whether the cache keeps nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// One entity's draw for a frame, as the window assembles it.
@@ -697,6 +889,14 @@ pub struct EntityPass {
     frame: FrameUniform,
     /// Whether a camera has been set: without one nothing draws.
     camera_set: bool,
+    /// The object draws' mesh source: the client's atlas and model baker, once set.
+    item_source: Option<Arc<dyn ItemMeshSource>>,
+    /// The block-item meshes: one cached vertex set per distinct block state.
+    block_cache: BlockItemCache,
+    /// The camera's yaw in degrees, the source's `playerViewY` minus its own `180`.
+    view_yaw: f32,
+    /// The camera's pitch in degrees, the source's `playerViewX`.
+    view_pitch: f32,
 }
 
 impl EntityPass {
@@ -842,6 +1042,10 @@ impl EntityPass {
             vertex_capacity,
             frame: FrameUniform::default(),
             camera_set: false,
+            item_source: None,
+            block_cache: BlockItemCache::new(),
+            view_yaw: 0.0,
+            view_pitch: 0.0,
         }
     }
 
@@ -862,6 +1066,14 @@ impl EntityPass {
         self.frame.light1 = [lights[1][0], lights[1][1], lights[1][2], 0.0];
         self.write_frame();
         self.camera_set = true;
+        self.view_yaw = camera.pose.yaw;
+        self.view_pitch = camera.pose.pitch;
+    }
+
+    /// Gives the pass the item meshes its object draws read: the client's own atlas and
+    /// model tables, reached through [`ItemMeshSource`] so this crate names neither.
+    pub fn set_item_source(&mut self, source: Arc<dyn ItemMeshSource>) {
+        self.item_source = Some(source);
     }
 
     /// Writes the frame's fog for the frames that follow.
@@ -992,6 +1204,14 @@ impl EntityPass {
             built.shadow = Some(start..vertices.len() as u32);
         }
 
+        // The object models take their own geometry and chains: the mob table's
+        // parts and poses do not apply, and the object set has no hurt combine.
+        if is_object(draw.model) {
+            self.build_object(draw, vertices, &mut built, colour);
+            built.hurt = false;
+            return built;
+        }
+
         // The body: the model's parts posed by the model's own pose. The player's model
         // takes the parts byte with the cape's bit cleared — the cape is its own build
         // through its own sheet.
@@ -1048,6 +1268,377 @@ impl EntityPass {
             }
         }
         built
+    }
+}
+
+/// The item draw path's own tail: the pre-transform's flat doubling, `renderItem`'s
+/// `0.5` scale and centring translate, then the mesh's 1/16 units
+/// (`RenderItem.renderItemModelTransform`:316-320, `RenderItem.renderItem`:140-157).
+fn item_tail(gui3d: bool) -> Mat4 {
+    Mat4::from_scale(Vec3::splat(
+        entity_models::objects::item_pretransform(gui3d)
+            * entity_models::objects::ITEM_RENDER_SCALE,
+    )) * Mat4::from_translation(Vec3::from(entity_models::objects::ITEM_CENTRE))
+        * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
+}
+
+/// The dropped item's fields for a draw: whether its model is the 3D kind (the block
+/// items; the loop's own scale and the pre-transform's flat doubling key on it,
+/// `RenderItem.preTransform`:254-257), the age the bob and spin read (the draw's pose
+/// age; `hoverStart` is zero on the wire path) and the copy count.
+fn item_fields(model: ModelRef, extra: &DrawExtra, pose: &entity_models::Pose) -> (bool, f32, u8) {
+    let count = match extra {
+        DrawExtra::Item { count, .. } => *count,
+        _ => 1,
+    };
+    (matches!(model, ModelRef::BlockItem { .. }), pose.age, count)
+}
+
+/// The boat's and the minecart's shared prefix: the world position (a cart's id jitter
+/// already folded into it, the renderer's own translate order), the lift, the
+/// `180 - yaw` turn and the pitch about z (`RenderBoat.doRender`:29-30,
+/// `RenderMinecart.doRender`:34-39, :75-77).
+fn vehicle_prefix(position: Vec3, body_yaw: f32, pitch: f32, lift: f32, jitter: [f32; 3]) -> Mat4 {
+    Mat4::from_translation(Vec3::new(
+        position.x + jitter[0],
+        position.y + jitter[1],
+        position.z + jitter[2],
+    )) * Mat4::from_translation(Vec3::new(0.0, lift, 0.0))
+        * Mat4::from_rotation_y((180.0 - body_yaw).to_radians())
+        * Mat4::from_rotation_z((-pitch).to_radians())
+}
+
+/// Pushes one raw vertex set as an alpha group through `chain`.
+fn push_group(
+    vertices: &mut Vec<EntityVertex>,
+    built: &mut BuiltDraw,
+    mesh: &entity_models::Vertices,
+    chain: Mat4,
+    colour: [f32; 4],
+    texture: &'static str,
+) {
+    let start = vertices.len() as u32;
+    push_vertices(vertices, mesh, chain, colour);
+    built.layers.push((
+        start..vertices.len() as u32,
+        texture,
+        entity_models::layers::Blend::Alpha,
+    ));
+}
+
+/// Pushes a source-built mesh, when the source had one, as an alpha group through `chain`.
+fn push_source_group(
+    vertices: &mut Vec<EntityVertex>,
+    built: &mut BuiltDraw,
+    mesh: Option<ItemMesh>,
+    chain: Mat4,
+    colour: [f32; 4],
+) {
+    if let Some(mesh) = mesh {
+        push_group(vertices, built, &mesh.vertices, chain, colour, mesh.texture);
+    }
+}
+
+/// The object set's build: every object model's mesh, chain and groups.
+///
+/// Each match arm composes the class's own renderer chain — the root always the draw's
+/// world position, the leaves the mesh's 1/16 units — and lands its groups in the draw's
+/// layer list, which the frame's draw walks through the alpha blend: the object renderers
+/// disable culling and blend the sprites' own alpha.
+impl EntityPass {
+    fn build_object(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+        colour: [f32; 4],
+    ) {
+        let Some(source) = self.item_source.as_deref() else {
+            return;
+        };
+        let position = Vec3::new(
+            draw.position[0] as f32,
+            draw.position[1] as f32,
+            draw.position[2] as f32,
+        );
+        // The source's `playerViewY` is the camera's yaw plus 180 (`RenderManager.java`:491).
+        let view_y = self.view_yaw + 180.0;
+        let view_x = self.view_pitch;
+        match (draw.model, &draw.extra) {
+            (ModelRef::Arrow, _) => {
+                let chain = Mat4::from_translation(position)
+                    * Mat4::from_rotation_y((draw.body_yaw - 90.0).to_radians())
+                    * Mat4::from_rotation_z(draw.head_pitch.to_radians())
+                    * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_4)
+                    * Mat4::from_scale(Vec3::splat(entity_models::objects::ARROW_SCALE))
+                    * Mat4::from_translation(Vec3::new(-4.0, 0.0, 0.0));
+                push_group(
+                    vertices,
+                    built,
+                    &entity_models::objects::arrow_vertices(),
+                    chain,
+                    colour,
+                    entity_models::objects::ARROW_TEXTURE,
+                );
+            }
+            (ModelRef::Boat, _) => {
+                let model = &entity_models::objects::MODEL_BOAT;
+                let mesh = build_vertices(model, &model.rest(), [64.0, 64.0]);
+                let chain = vehicle_prefix(position, draw.body_yaw, 0.0, 0.25, [0.0; 3])
+                    * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
+                    * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                push_group(
+                    vertices,
+                    built,
+                    &mesh,
+                    chain,
+                    colour,
+                    entity_models::objects::BOAT_TEXTURE,
+                );
+            }
+            (ModelRef::Minecart { body }, _) => {
+                let model = &entity_models::objects::MODEL_MINECART;
+                let mesh = build_vertices(model, &model.rest(), [64.0, 64.0]);
+                let prefix =
+                    vehicle_prefix(position, draw.body_yaw, draw.head_pitch, 0.375, [0.0; 3]);
+                let flip = prefix
+                    * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
+                    * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                push_group(
+                    vertices,
+                    built,
+                    &mesh,
+                    flip,
+                    colour,
+                    entity_models::objects::MINECART_TEXTURE,
+                );
+                // The cargo: the subclass's default tile at the renderer's own `0.75`
+                // scale and offset (`RenderMinecart.doRender`:91-100).
+                if let Some(cargo) = entity_models::objects::minecart_cargo(
+                    entity_models::objects::minecart_body(body),
+                ) {
+                    let mesh = self.block_cache.mesh(source, cargo.block, cargo.meta);
+                    let chain = prefix
+                        * Mat4::from_scale(Vec3::splat(0.75))
+                        * Mat4::from_translation(Vec3::new(
+                            -0.5,
+                            (cargo.offset - 8) as f32 / 16.0,
+                            0.5,
+                        ))
+                        * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                    push_source_group(vertices, built, mesh, chain, colour);
+                }
+            }
+            (ModelRef::Painting { art }, extra) => {
+                // The hanging's yaw is its facing's own `horizontalIndex * 90`
+                // (`EntityHanging.updateFacingWithBoundingBox`:46); the art is the
+                // draw's own table index.
+                let facing = match extra {
+                    DrawExtra::Painting { facing } => *facing,
+                    _ => 0,
+                };
+                let art = entity_models::objects::art(art);
+                let chain = Mat4::from_translation(position)
+                    * Mat4::from_rotation_y(
+                        (180.0 - entity_models::objects::painting_yaw(facing)).to_radians(),
+                    )
+                    * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                push_group(
+                    vertices,
+                    built,
+                    &entity_models::objects::painting_vertices(art),
+                    chain,
+                    colour,
+                    entity_models::objects::PAINTING_TEXTURE,
+                );
+            }
+            (ModelRef::Orb { value }, _) => {
+                let corners = entity_models::objects::orb_corners();
+                let uvs = entity_models::objects::orb_uv(entity_models::objects::orb_icon(value));
+                let mut quad = entity_models::Vertices::default();
+                for index in 0..4 {
+                    let corner = corners[index];
+                    quad.positions
+                        .push([corner[0] * 16.0, corner[1] * 16.0, corner[2] * 16.0]);
+                    quad.uvs.push(uvs[index]);
+                    quad.normals.push([0.0, 1.0, 0.0]);
+                }
+                let pair = entity_models::objects::billboard_angles(
+                    view_y,
+                    view_x,
+                    entity_models::objects::Billboard::Fireball,
+                );
+                let chain = Mat4::from_translation(position)
+                    * Mat4::from_rotation_y(pair[0].to_radians())
+                    * Mat4::from_rotation_x(pair[1].to_radians())
+                    * Mat4::from_scale(Vec3::splat(entity_models::objects::ORB_SCALE))
+                    * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                // The pulse rides the draw's age in place of the orb's own tick counter.
+                let pulse = entity_models::objects::orb_colour(draw.pose.age / 2.0);
+                let tint = [
+                    colour[0] * pulse[0],
+                    colour[1] * pulse[1],
+                    colour[2] * pulse[2],
+                    pulse[3],
+                ];
+                push_group(
+                    vertices,
+                    built,
+                    &quad,
+                    chain,
+                    tint,
+                    entity_models::objects::ORB_TEXTURE,
+                );
+            }
+            (ModelRef::Sprite { key }, extra) => match extra {
+                DrawExtra::Projectile { billboard, scale } => {
+                    let pair = entity_models::objects::billboard_angles(view_y, view_x, *billboard);
+                    let chain = Mat4::from_translation(position)
+                        * Mat4::from_scale(Vec3::splat(*scale))
+                        * Mat4::from_rotation_y(pair[0].to_radians())
+                        * Mat4::from_rotation_x(pair[1].to_radians());
+                    match billboard {
+                        entity_models::objects::Billboard::Snowball => {
+                            let chain = chain * item_tail(false);
+                            push_source_group(
+                                vertices,
+                                built,
+                                source.generated(key),
+                                chain,
+                                colour,
+                            );
+                        }
+                        entity_models::objects::Billboard::Fireball => {
+                            let chain = chain * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                            push_source_group(
+                                vertices,
+                                built,
+                                source.icon_quad(key),
+                                chain,
+                                colour,
+                            );
+                        }
+                    }
+                    // The throwable renderers leave their shadow sizes at zero.
+                    built.shadow = None;
+                }
+                _ => {
+                    let (gui3d, age, count) = item_fields(draw.model, extra, &draw.pose);
+                    let hover = 0.0_f32;
+                    let bob = entity_models::objects::item_bob(age, hover)
+                        + entity_models::objects::ITEM_GROUND_LIFT;
+                    let spin = entity_models::objects::item_spin_degrees(age, hover);
+                    let copies = entity_models::objects::item_copies(count);
+                    let centre = entity_models::objects::item_copy_centre(copies);
+                    let prefix = Mat4::from_translation(position)
+                        * Mat4::from_translation(Vec3::new(0.0, bob, 0.0))
+                        * Mat4::from_rotation_y(spin.to_radians())
+                        * Mat4::from_translation(Vec3::new(0.0, 0.0, centre));
+                    let mesh = source.generated(key);
+                    for copy in 0..copies.max(1) {
+                        let chain = prefix
+                            * Mat4::from_translation(Vec3::new(
+                                0.0,
+                                0.0,
+                                entity_models::objects::ITEM_COPY_STEP * f32::from(copy),
+                            ))
+                            * item_tail(gui3d);
+                        push_source_group(vertices, built, mesh.clone(), chain, colour);
+                    }
+                }
+            },
+            (ModelRef::BlockItem { block }, extra) => {
+                // The stack's damage carries the block's metadata in its low four bits
+                // (`Block.getStateById`'s fold, `Block.java`:174-178); draws without an
+                // item extra take the state's own default.
+                let meta = match extra {
+                    DrawExtra::Item { damage, .. } => item_meta((*damage).max(0) as u16),
+                    _ => 0,
+                };
+                let mesh = self.block_cache.mesh(source, block, meta);
+                match extra {
+                    DrawExtra::Projectile { billboard, scale } => {
+                        let pair =
+                            entity_models::objects::billboard_angles(view_y, view_x, *billboard);
+                        let chain = Mat4::from_translation(position)
+                            * Mat4::from_scale(Vec3::splat(*scale))
+                            * Mat4::from_rotation_y(pair[0].to_radians())
+                            * Mat4::from_rotation_x(pair[1].to_radians());
+                        match billboard {
+                            entity_models::objects::Billboard::Snowball => {
+                                let chain = chain * item_tail(true);
+                                push_source_group(vertices, built, mesh, chain, colour);
+                            }
+                            entity_models::objects::Billboard::Fireball => {
+                                let chain = chain * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                                push_source_group(vertices, built, mesh, chain, colour);
+                            }
+                        }
+                        built.shadow = None;
+                    }
+                    _ => {
+                        let (gui3d, age, count) = item_fields(draw.model, extra, &draw.pose);
+                        let hover = 0.0_f32;
+                        let bob = entity_models::objects::item_bob(age, hover)
+                            + entity_models::objects::ITEM_GROUND_LIFT;
+                        let spin = entity_models::objects::item_spin_degrees(age, hover);
+                        let copies = entity_models::objects::item_copies(count);
+                        let centre = entity_models::objects::item_copy_centre(copies);
+                        let prefix = Mat4::from_translation(position)
+                            * Mat4::from_translation(Vec3::new(0.0, bob, 0.0))
+                            * Mat4::from_rotation_y(spin.to_radians())
+                            * Mat4::from_translation(Vec3::new(0.0, 0.0, centre));
+                        for copy in 0..copies.max(1) {
+                            let chain = prefix
+                                * Mat4::from_translation(Vec3::new(
+                                    0.0,
+                                    0.0,
+                                    entity_models::objects::ITEM_COPY_STEP * f32::from(copy),
+                                ))
+                                * item_tail(gui3d);
+                            push_source_group(vertices, built, mesh.clone(), chain, colour);
+                        }
+                    }
+                }
+            }
+            (ModelRef::ItemFrame { content }, extra) => {
+                let prefix = Mat4::from_translation(position)
+                    * Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians());
+                // The wood: the frame's own model, centred in its cell
+                // (`RenderItemFrame.doRender`:70-79).
+                let chain = prefix
+                    * Mat4::from_translation(Vec3::new(-0.5, -0.5, -0.5))
+                    * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+                let wood = source.frame_wood();
+                push_source_group(vertices, built, wood, chain, colour);
+                // The content: the frame's stack at its own `0.4375` depth, under its
+                // rotation slot and half scale (`RenderItemFrame.doRender`:77; `renderItem`:103-110, `:153`). The block contents
+                // draw as small blocks, the item contents as the generated shape.
+                let gui3d = matches!(content, FrameContent::Block(_));
+                let mesh = match content {
+                    FrameContent::Empty => None,
+                    FrameContent::Block(block) => self.block_cache.mesh(source, block, 0),
+                    FrameContent::Sprite(key) => source.generated(key),
+                };
+                let rotation = match extra {
+                    DrawExtra::Frame { rotation } => *rotation,
+                    _ => 0,
+                };
+                let mut chain = prefix
+                    * Mat4::from_translation(Vec3::new(0.0, 0.0, 0.4375))
+                    * Mat4::from_rotation_z(
+                        entity_models::objects::frame_rotation_degrees(rotation).to_radians(),
+                    );
+                if !gui3d {
+                    // A flat content turns back to face the frame's own front
+                    // (`RenderItemFrame.renderItem`:141-146).
+                    chain *= Mat4::from_rotation_y(std::f32::consts::PI);
+                }
+                chain *= Mat4::from_scale(Vec3::splat(0.5)) * item_tail(gui3d);
+                push_source_group(vertices, built, mesh, chain, colour);
+            }
+            _ => {}
+        }
     }
 }
 
