@@ -294,6 +294,15 @@ fn mob_draw(
             PoseExtra::None,
             false,
         ),
+        // The zombie pigman draws the zombie's own model on its own sheet
+        // (`RenderPigZombie.java`:15, `:11`).
+        (EntityKind::PigZombie, _) => (
+            ModelRef::Zombie,
+            TextureRef::Named("entity/zombie_pigman.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
         (EntityKind::Skeleton, _) => (
             ModelRef::Skeleton,
             TextureRef::Named("entity/skeleton/skeleton.png"),
@@ -463,6 +472,161 @@ fn mob_draw(
         (EntityKind::Endermite, _) => (
             ModelRef::EnderMite,
             TextureRef::Named("entity/endermite.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        // The exotic families. The motions the frames do not carry draw pinned at their
+        // rest (the ghast's tentacle sway, the blaze's rod spin, the guardian's spike
+        // and tail phases, the rabbit's hop, the wolf's health-scaled tail droop reads
+        // the health the frames carry at its own watcher).
+        (
+            EntityKind::EntityHorse,
+            MobExtra::Horse {
+                variant,
+                colour,
+                markings,
+                tamed: _,
+                saddle,
+                chested,
+                armour,
+                adult,
+            },
+        ) => (
+            ModelRef::Horse {
+                variant: *variant,
+                colour: *colour,
+                markings: *markings,
+                saddle: *saddle,
+                armour: *armour,
+            },
+            TextureRef::Named(oxide_render::entity_models::exotics::horse_sheet(
+                *variant, *colour,
+            )),
+            DrawExtra::Horse {
+                markings: *markings,
+                armour: *armour,
+            },
+            PoseExtra::Horse {
+                saddle: *saddle,
+                chested: *chested,
+                adult: *adult,
+                variant: *variant,
+            },
+            !*adult,
+        ),
+        (
+            EntityKind::Wolf,
+            MobExtra::Wolf {
+                tamed,
+                collar,
+                angry,
+                sitting,
+                health,
+            },
+        ) => (
+            ModelRef::Wolf {
+                tamed: *tamed,
+                collar: *collar,
+                angry: *angry,
+            },
+            TextureRef::Named(oxide_render::entity_models::exotics::wolf_sheet(
+                *tamed, *angry,
+            )),
+            DrawExtra::Wolf {
+                tamed: *tamed,
+                collar: *collar,
+            },
+            PoseExtra::Wolf {
+                tamed: *tamed,
+                angry: *angry,
+                sitting: *sitting,
+                health: *health,
+            },
+            false,
+        ),
+        (
+            EntityKind::Ozelot,
+            MobExtra::Ocelot {
+                variant,
+                tamed: _,
+                sitting,
+            },
+        ) => (
+            ModelRef::Ocelot {
+                variant: *variant,
+                child: false,
+            },
+            TextureRef::Named(oxide_render::entity_models::exotics::ocelot_sheet(*variant)),
+            DrawExtra::None,
+            PoseExtra::Ocelot { sitting: *sitting },
+            false,
+        ),
+        (EntityKind::Rabbit, MobExtra::Rabbit { variant, child }) => (
+            ModelRef::Rabbit {
+                variant: *variant,
+                child: *child,
+            },
+            TextureRef::Named(oxide_render::entity_models::exotics::rabbit_sheet(*variant)),
+            DrawExtra::None,
+            PoseExtra::Rabbit { hop: 0.0 },
+            *child,
+        ),
+        (EntityKind::Ghast, MobExtra::Ghast { shooting }) => (
+            ModelRef::Ghast {
+                shooting: *shooting,
+            },
+            TextureRef::Named(if *shooting {
+                "entity/ghast/ghast_shooting.png"
+            } else {
+                "entity/ghast/ghast.png"
+            }),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Blaze, _) => (
+            ModelRef::Blaze,
+            TextureRef::Named("entity/blaze.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Guardian, MobExtra::Guardian { elder }) => (
+            ModelRef::Guardian { elder: *elder },
+            TextureRef::Named(if *elder {
+                "entity/guardian_elder.png"
+            } else {
+                "entity/guardian.png"
+            }),
+            DrawExtra::None,
+            PoseExtra::Guardian {
+                spikes: 1.0,
+                tail_phase: 0.0,
+            },
+            false,
+        ),
+        (EntityKind::EnderDragon, _) => (
+            ModelRef::EnderDragon,
+            TextureRef::Named("entity/enderdragon/dragon.png"),
+            DrawExtra::None,
+            PoseExtra::Dragon { anim_time: 0.0 },
+            false,
+        ),
+        (EntityKind::WitherBoss, MobExtra::Wither { invul_time }) => (
+            ModelRef::Wither {
+                invul_time: *invul_time,
+            },
+            // The spawn shield's flicker (`RenderWither.getEntityTexture`:33-37): while
+            // the timer runs, the invulnerable sheet draws except a beat every fifth
+            // tick in the first eighty.
+            TextureRef::Named(
+                if *invul_time > 0 && (*invul_time > 80 || (*invul_time / 5) % 2 != 1) {
+                    "entity/wither/wither_invulnerable.png"
+                } else {
+                    "entity/wither/wither.png"
+                },
+            ),
             DrawExtra::None,
             PoseExtra::None,
             false,
@@ -1073,6 +1237,661 @@ mod tests {
         assert!(draws.iter().all(|draw| !draw.pose.child));
     }
 
+    /// The exotic families' sheets and extras, per their renderers: the horse's colour,
+    /// type and marking/armour tables with its saddle and chest terms
+    /// (`RenderHorse.getEntityTexture`:51-78), the wolf's tamed/angry sheet pair with the
+    /// collar byte (`RenderWolf.getEntityTexture`:46-49), the ocelot's and the rabbit's
+    /// variant tables (`RenderOcelot.getEntityTexture`:23-40,
+    /// `RenderRabbit.getEntityTexture`:27-62), the ghast's shooting sheet
+    /// (`RenderGhast.getEntityTexture`:21-24), the guardian's elder sheet
+    /// (`RenderGuardian.getEntityTexture`:177-180), the dragon, and the wither's
+    /// spawn-shield flicker (`RenderWither.getEntityTexture`:33-37).
+    #[test]
+    fn the_exotic_families_map_to_their_models_sheets_and_extras() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![
+                mob_frame(
+                    1,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 0,
+                        colour: 1,
+                        markings: 2,
+                        tamed: true,
+                        saddle: true,
+                        adult: true,
+                        chested: true,
+                        armour: 3,
+                    }),
+                ),
+                mob_frame(
+                    2,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 0,
+                        colour: 0,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: true,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    3,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 0,
+                        colour: 4,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: true,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    4,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 1,
+                        colour: 0,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: true,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    5,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 2,
+                        colour: 0,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: true,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    6,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 3,
+                        colour: 0,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: true,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    7,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 4,
+                        colour: 0,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: true,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    8,
+                    EntityKind::EntityHorse,
+                    EntityExtra::Mob(MobExtra::Horse {
+                        variant: 0,
+                        colour: 3,
+                        markings: 0,
+                        tamed: false,
+                        saddle: false,
+                        adult: false,
+                        chested: false,
+                        armour: 0,
+                    }),
+                ),
+                mob_frame(
+                    9,
+                    EntityKind::Wolf,
+                    EntityExtra::Mob(MobExtra::Wolf {
+                        tamed: true,
+                        collar: 14,
+                        angry: false,
+                        sitting: false,
+                        health: 20.0,
+                    }),
+                ),
+                mob_frame(
+                    10,
+                    EntityKind::Wolf,
+                    EntityExtra::Mob(MobExtra::Wolf {
+                        tamed: false,
+                        collar: 14,
+                        angry: true,
+                        sitting: false,
+                        health: 20.0,
+                    }),
+                ),
+                mob_frame(
+                    11,
+                    EntityKind::Wolf,
+                    EntityExtra::Mob(MobExtra::Wolf {
+                        tamed: false,
+                        collar: 14,
+                        angry: false,
+                        sitting: false,
+                        health: 20.0,
+                    }),
+                ),
+                mob_frame(
+                    12,
+                    EntityKind::Wolf,
+                    EntityExtra::Mob(MobExtra::Wolf {
+                        tamed: true,
+                        collar: 3,
+                        angry: false,
+                        sitting: true,
+                        health: 8.0,
+                    }),
+                ),
+                mob_frame(
+                    13,
+                    EntityKind::Ozelot,
+                    EntityExtra::Mob(MobExtra::Ocelot {
+                        variant: 0,
+                        tamed: false,
+                        sitting: false,
+                    }),
+                ),
+                mob_frame(
+                    14,
+                    EntityKind::Ozelot,
+                    EntityExtra::Mob(MobExtra::Ocelot {
+                        variant: 2,
+                        tamed: true,
+                        sitting: false,
+                    }),
+                ),
+                mob_frame(
+                    15,
+                    EntityKind::Ozelot,
+                    EntityExtra::Mob(MobExtra::Ocelot {
+                        variant: 3,
+                        tamed: true,
+                        sitting: true,
+                    }),
+                ),
+                mob_frame(
+                    16,
+                    EntityKind::Rabbit,
+                    EntityExtra::Mob(MobExtra::Rabbit {
+                        variant: 0,
+                        child: false,
+                    }),
+                ),
+                mob_frame(
+                    17,
+                    EntityKind::Rabbit,
+                    EntityExtra::Mob(MobExtra::Rabbit {
+                        variant: 3,
+                        child: false,
+                    }),
+                ),
+                mob_frame(
+                    18,
+                    EntityKind::Rabbit,
+                    EntityExtra::Mob(MobExtra::Rabbit {
+                        variant: 99,
+                        child: false,
+                    }),
+                ),
+                mob_frame(
+                    19,
+                    EntityKind::Rabbit,
+                    EntityExtra::Mob(MobExtra::Rabbit {
+                        variant: 1,
+                        child: true,
+                    }),
+                ),
+                mob_frame(
+                    20,
+                    EntityKind::Ghast,
+                    EntityExtra::Mob(MobExtra::Ghast { shooting: false }),
+                ),
+                mob_frame(
+                    21,
+                    EntityKind::Ghast,
+                    EntityExtra::Mob(MobExtra::Ghast { shooting: true }),
+                ),
+                mob_frame(22, EntityKind::Blaze, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(
+                    23,
+                    EntityKind::Guardian,
+                    EntityExtra::Mob(MobExtra::Guardian { elder: false }),
+                ),
+                mob_frame(
+                    24,
+                    EntityKind::Guardian,
+                    EntityExtra::Mob(MobExtra::Guardian { elder: true }),
+                ),
+                mob_frame(
+                    25,
+                    EntityKind::EnderDragon,
+                    EntityExtra::Mob(MobExtra::Other),
+                ),
+                mob_frame(
+                    26,
+                    EntityKind::WitherBoss,
+                    EntityExtra::Mob(MobExtra::Wither { invul_time: 0 }),
+                ),
+                mob_frame(
+                    27,
+                    EntityKind::WitherBoss,
+                    EntityExtra::Mob(MobExtra::Wither { invul_time: 100 }),
+                ),
+                mob_frame(
+                    28,
+                    EntityKind::WitherBoss,
+                    EntityExtra::Mob(MobExtra::Wither { invul_time: 5 }),
+                ),
+                mob_frame(
+                    29,
+                    EntityKind::WitherBoss,
+                    EntityExtra::Mob(MobExtra::Wither { invul_time: 10 }),
+                ),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 29, "every exotic draws");
+        let expected = [
+            (
+                ModelRef::Horse {
+                    variant: 0,
+                    colour: 1,
+                    markings: 2,
+                    saddle: true,
+                    armour: 3,
+                },
+                "entity/horse/horse_creamy.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 0,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/horse_white.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 0,
+                    colour: 4,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/horse_black.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 1,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/donkey.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 2,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/mule.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 3,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/horse_zombie.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 4,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/horse_skeleton.png",
+            ),
+            (
+                ModelRef::Horse {
+                    variant: 0,
+                    colour: 3,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                "entity/horse/horse_brown.png",
+            ),
+            (
+                ModelRef::Wolf {
+                    tamed: true,
+                    collar: 14,
+                    angry: false,
+                },
+                "entity/wolf/wolf_tame.png",
+            ),
+            (
+                ModelRef::Wolf {
+                    tamed: false,
+                    collar: 14,
+                    angry: true,
+                },
+                "entity/wolf/wolf_angry.png",
+            ),
+            (
+                ModelRef::Wolf {
+                    tamed: false,
+                    collar: 14,
+                    angry: false,
+                },
+                "entity/wolf/wolf.png",
+            ),
+            (
+                ModelRef::Wolf {
+                    tamed: true,
+                    collar: 3,
+                    angry: false,
+                },
+                "entity/wolf/wolf_tame.png",
+            ),
+            (
+                ModelRef::Ocelot {
+                    variant: 0,
+                    child: false,
+                },
+                "entity/cat/ocelot.png",
+            ),
+            (
+                ModelRef::Ocelot {
+                    variant: 2,
+                    child: false,
+                },
+                "entity/cat/red.png",
+            ),
+            (
+                ModelRef::Ocelot {
+                    variant: 3,
+                    child: false,
+                },
+                "entity/cat/siamese.png",
+            ),
+            (
+                ModelRef::Rabbit {
+                    variant: 0,
+                    child: false,
+                },
+                "entity/rabbit/brown.png",
+            ),
+            (
+                ModelRef::Rabbit {
+                    variant: 3,
+                    child: false,
+                },
+                "entity/rabbit/white_splotched.png",
+            ),
+            (
+                ModelRef::Rabbit {
+                    variant: 99,
+                    child: false,
+                },
+                "entity/rabbit/caerbannog.png",
+            ),
+            (
+                ModelRef::Rabbit {
+                    variant: 1,
+                    child: true,
+                },
+                "entity/rabbit/white.png",
+            ),
+            (
+                ModelRef::Ghast { shooting: false },
+                "entity/ghast/ghast.png",
+            ),
+            (
+                ModelRef::Ghast { shooting: true },
+                "entity/ghast/ghast_shooting.png",
+            ),
+            (ModelRef::Blaze, "entity/blaze.png"),
+            (ModelRef::Guardian { elder: false }, "entity/guardian.png"),
+            (
+                ModelRef::Guardian { elder: true },
+                "entity/guardian_elder.png",
+            ),
+            (ModelRef::EnderDragon, "entity/enderdragon/dragon.png"),
+            (
+                ModelRef::Wither { invul_time: 0 },
+                "entity/wither/wither.png",
+            ),
+            (
+                ModelRef::Wither { invul_time: 100 },
+                "entity/wither/wither_invulnerable.png",
+            ),
+            (
+                ModelRef::Wither { invul_time: 5 },
+                "entity/wither/wither.png",
+            ),
+            (
+                ModelRef::Wither { invul_time: 10 },
+                "entity/wither/wither_invulnerable.png",
+            ),
+        ];
+        for (draw, (model, sheet)) in draws.iter().zip(expected) {
+            assert_eq!(draw.model, model);
+            assert_eq!(draw.texture, TextureRef::Named(sheet));
+        }
+        // The extras: the horse's marking and armour terms, the wolf's collar byte, and
+        // the two pose terms the arms pin at rest (the ghast's sway, the blaze's spin,
+        // the guardian's spikes, the dragon's flight clock, the rabbit's hop).
+        assert_eq!(
+            draws[0].extra,
+            DrawExtra::Horse {
+                markings: 2,
+                armour: 3
+            }
+        );
+        assert_eq!(
+            draws[0].pose.extra,
+            PoseExtra::Horse {
+                saddle: true,
+                chested: true,
+                adult: true,
+                variant: 0
+            }
+        );
+        assert_eq!(
+            draws[1].extra,
+            DrawExtra::Horse {
+                markings: 0,
+                armour: 0
+            }
+        );
+        assert!(draws[7].pose.child, "the horse's growing age folds it");
+        assert_eq!(
+            draws[8].extra,
+            DrawExtra::Wolf {
+                tamed: true,
+                collar: 14
+            }
+        );
+        assert_eq!(
+            draws[8].pose.extra,
+            PoseExtra::Wolf {
+                tamed: true,
+                angry: false,
+                sitting: false,
+                health: 20.0
+            }
+        );
+        assert_eq!(
+            draws[9].pose.extra,
+            PoseExtra::Wolf {
+                tamed: false,
+                angry: true,
+                sitting: false,
+                health: 20.0
+            }
+        );
+        assert_eq!(
+            draws[11].pose.extra,
+            PoseExtra::Wolf {
+                tamed: true,
+                angry: false,
+                sitting: true,
+                health: 8.0
+            }
+        );
+        assert_eq!(draws[12].pose.extra, PoseExtra::Ocelot { sitting: false });
+        assert_eq!(draws[14].pose.extra, PoseExtra::Ocelot { sitting: true });
+        assert_eq!(draws[15].pose.extra, PoseExtra::Rabbit { hop: 0.0 });
+        assert!(draws[18].pose.child, "the rabbit's growing age folds it");
+        assert_eq!(
+            draws[22].pose.extra,
+            PoseExtra::Guardian {
+                spikes: 1.0,
+                tail_phase: 0.0
+            }
+        );
+        assert_eq!(draws[24].pose.extra, PoseExtra::Dragon { anim_time: 0.0 });
+    }
+
+    /// The roster's own gate: every mob §6.3's spawn-mob table names has a draw — no
+    /// kind falls through to the debug-log arm.
+    ///
+    /// The list is the table's own roster transcribed — creeper `50` through guardian
+    /// `68`, pig `90` through rabbit `101`, villager `120` — each member paired with
+    /// the extras its metadata extracts to (the session's own per-kind results). A
+    /// member the wire can spawn but the mapping cannot draw fails here.
+    #[test]
+    fn every_roster_mob_maps_to_a_draw() {
+        let cases: &[(EntityKind, MobExtra)] = &[
+            // 50..=68.
+            (EntityKind::Creeper, MobExtra::Creeper),
+            (EntityKind::Skeleton, MobExtra::Other),
+            (EntityKind::Spider, MobExtra::Other),
+            (EntityKind::Giant, MobExtra::Other),
+            (EntityKind::Zombie, MobExtra::Zombie { villager: false }),
+            (EntityKind::Slime, MobExtra::Slime { size: 1 }),
+            (EntityKind::Ghast, MobExtra::Ghast { shooting: false }),
+            (EntityKind::PigZombie, MobExtra::Other),
+            (EntityKind::Enderman, MobExtra::Enderman),
+            (EntityKind::CaveSpider, MobExtra::Other),
+            (EntityKind::Silverfish, MobExtra::Other),
+            (EntityKind::Blaze, MobExtra::Other),
+            (EntityKind::LavaSlime, MobExtra::Slime { size: 1 }),
+            (EntityKind::EnderDragon, MobExtra::Other),
+            (EntityKind::WitherBoss, MobExtra::Wither { invul_time: 0 }),
+            (EntityKind::Bat, MobExtra::Bat { hanging: false }),
+            (EntityKind::Witch, MobExtra::Other),
+            (EntityKind::Endermite, MobExtra::Other),
+            (EntityKind::Guardian, MobExtra::Guardian { elder: false }),
+            // 90..=101.
+            (EntityKind::Pig, MobExtra::Pig { saddle: false }),
+            (
+                EntityKind::Sheep,
+                MobExtra::Sheep {
+                    wool: 0,
+                    sheared: false,
+                },
+            ),
+            (EntityKind::Cow, MobExtra::Other),
+            (EntityKind::Chicken, MobExtra::Other),
+            (EntityKind::Squid, MobExtra::Other),
+            (
+                EntityKind::Wolf,
+                MobExtra::Wolf {
+                    tamed: false,
+                    collar: 14,
+                    angry: false,
+                    sitting: false,
+                    health: 20.0,
+                },
+            ),
+            (EntityKind::MushroomCow, MobExtra::Other),
+            (EntityKind::SnowMan, MobExtra::Other),
+            (
+                EntityKind::Ozelot,
+                MobExtra::Ocelot {
+                    variant: 0,
+                    tamed: false,
+                    sitting: false,
+                },
+            ),
+            (EntityKind::VillagerGolem, MobExtra::Other),
+            (
+                EntityKind::EntityHorse,
+                MobExtra::Horse {
+                    variant: 0,
+                    colour: 0,
+                    markings: 0,
+                    tamed: false,
+                    saddle: false,
+                    adult: true,
+                    chested: false,
+                    armour: 0,
+                },
+            ),
+            (
+                EntityKind::Rabbit,
+                MobExtra::Rabbit {
+                    variant: 0,
+                    child: false,
+                },
+            ),
+            // 120.
+            (
+                EntityKind::Villager,
+                MobExtra::Villager {
+                    profession: 0,
+                    child: false,
+                },
+            ),
+        ];
+        assert_eq!(cases.len(), 32, "§6.3's spawn-mob roster is 32 ids");
+        for (index, (kind, mob)) in cases.iter().enumerate() {
+            assert!(
+                mob_draw(*kind, index as i32 + 1, mob).is_some(),
+                "{kind:?} has no model mapping — it would fall through to the debug-log arm"
+            );
+        }
+    }
+
     #[test]
     fn a_child_villager_runs_its_limbs_threefold_and_carries_the_child_term() {
         let mut view = View::new();
@@ -1114,18 +1933,11 @@ mod tests {
     fn an_unmapped_kind_draws_nothing() {
         let mut view = View::new();
         let t0 = Instant::now();
-        // A kind beyond this milestone's kinds, and a mapped kind whose channel is not a
-        // mob's: both draw nothing.
+        // A wire kind the session could not name, and a mapped kind whose channel is not
+        // a mob's: both draw nothing.
         view.observe(
             vec![
-                mob_frame(
-                    1,
-                    EntityKind::Wolf,
-                    EntityExtra::Mob(MobExtra::Wolf {
-                        tamed: false,
-                        collar: 14,
-                    }),
-                ),
+                mob_frame(1, EntityKind::Unknown, EntityExtra::Mob(MobExtra::Other)),
                 mob_frame(2, EntityKind::Pig, EntityExtra::None),
             ],
             t0,

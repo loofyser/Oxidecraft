@@ -207,6 +207,14 @@ pub enum MobExtra {
         /// The collar colour, `0..16`; the source's default is red, `14`
         /// (`EntityWolf.entityInit:133`).
         collar: u8,
+        /// Whether the wolf is angry — its own sheet and tail
+        /// (`EntityWolf.isAngry`, byte 16 bit 1).
+        angry: bool,
+        /// Whether the wolf sits (`EntityTameable.isSitting`, byte 16 bit 0).
+        sitting: bool,
+        /// The wolf's health, float index 18 (`EntityWolf`'s own watcher value),
+        /// which the tamed tail's droop reads.
+        health: f32,
     },
     /// A slime's size — a magma cube's too, which inherits the fold (byte
     /// index 16 — `EntitySlime.getSlimeSize:69`; `EntityMagmaCube.java`:10).
@@ -218,11 +226,20 @@ pub enum MobExtra {
     Ocelot {
         /// The cat type: `0` wild, `1..4` the cat coats.
         variant: u8,
+        /// Whether the cat is tamed (`EntityTameable.isTamed`, byte 16 bit 2) —
+        /// the sitting fold and the scene's own size ladder.
+        tamed: bool,
+        /// Whether the cat sits (`EntityTameable.isSitting`, byte 16 bit 0) —
+        /// the folded leg and tail chain.
+        sitting: bool,
     },
     /// A rabbit's variant (byte index 18 — `EntityRabbit.getRabbitType:417`).
     Rabbit {
         /// The rabbit type.
         variant: u8,
+        /// Whether the rabbit is a child (byte 12, negative = child) —
+        /// the renderer's own hop-shaped child fold.
+        child: bool,
     },
     /// A villager's profession and age (int index 16 through the source's own
     /// fold — `EntityVillager.getProfession:360`; the growing age at byte
@@ -262,6 +279,33 @@ pub enum MobExtra {
         saddle: bool,
         /// Whether the horse is an adult.
         adult: bool,
+        /// The marking: the variant int's high byte (`0..5`) — the marking layer's gate
+        /// (`EntityHorse.getHorseVariant:138`).
+        markings: u8,
+        /// Whether the horse is chested — the flags int 16 bit 3, the mule chests' gate
+        /// (`EntityHorse.getHorseWatchableBoolean:175-178` through `:249`).
+        chested: bool,
+        /// The worn armour's table index (`0..4`) — the armour watcher's slot
+        /// (`RenderHorse.getEntityTexture`:76).
+        armour: u8,
+    },
+    /// A ghast's attacking flag (byte 16 — `EntityGhast.isAttacking`), which swaps its
+    /// sheet (`RenderGhast.getEntityTexture`:21-24).
+    Ghast {
+        /// Whether the ghast is shooting.
+        shooting: bool,
+    },
+    /// A guardian's elder flag (int 16's bit 2 — `EntityGuardian`), the size ladder and
+    /// the elder sheet (`RenderGuardian.getEntityTexture`:177-180).
+    Guardian {
+        /// Whether the guardian is an elder.
+        elder: bool,
+    },
+    /// A wither's spawn invulnerability timer (int 20 — `EntityWither.getInvulTime`),
+    /// which the sheet flickers by.
+    Wither {
+        /// The timer in ticks; zero once the spawn shield drops.
+        invul_time: u16,
     },
     /// A zombie's villager flag (byte index 13 —
     /// `EntityZombie.isVillager:197`).
@@ -692,25 +736,40 @@ fn mob_extra(kind: EntityKind, entity: &Entity) -> MobExtra {
                 sheared: data & 0x10 != 0,
             }
         }
-        // A wolf: byte 16 bit 2 tamed (`EntityTameable.isTamed:116-119`),
-        // byte 20 bits 0–3 the collar (`EntityWolf`, default red `14`).
-        EntityKind::Wolf => MobExtra::Wolf {
-            tamed: byte_at(entity, 16).unwrap_or(0) & 0x04 != 0,
-            collar: (byte_at(entity, 20).unwrap_or(14) & 0x0f) as u8,
-        },
+        // A wolf: byte 16's tamed (bit 2, `EntityTameable.isTamed:116-119`), angry
+        // (bit 1) and sitting (bit 0) flags, byte 20's collar (`EntityWolf`, default
+        // red `14`) and float 18's health, which the tamed tail's droop reads.
+        EntityKind::Wolf => {
+            let flags = byte_at(entity, 16).unwrap_or(0);
+            MobExtra::Wolf {
+                tamed: flags & 0x04 != 0,
+                collar: (byte_at(entity, 20).unwrap_or(14) & 0x0f) as u8,
+                angry: flags & 0x02 != 0,
+                sitting: flags & 0x01 != 0,
+                health: float_at(entity, 18).unwrap_or(20.0),
+            }
+        }
         // A slime or magma cube: byte 16 the size
         // (`EntitySlime.getSlimeSize:69`; `EntityMagmaCube.java`:10 inherits
         // it), default one.
         EntityKind::Slime | EntityKind::LavaSlime => MobExtra::Slime {
             size: byte_at(entity, 16).unwrap_or(1) as u8,
         },
-        // An ocelot: byte 18 the cat type (`EntityOcelot.getCatType:301`).
-        EntityKind::Ozelot => MobExtra::Ocelot {
-            variant: byte_at(entity, 18).unwrap_or(0) as u8,
-        },
-        // A rabbit: byte 18 the rabbit type (`EntityRabbit.getRabbitType:417`).
+        // An ocelot: byte 18 the cat type (`EntityOcelot.getCatType:301`) and byte 16's
+        // tamed (bit 2) and sitting (bit 0) flags (`EntityTameable`).
+        EntityKind::Ozelot => {
+            let flags = byte_at(entity, 16).unwrap_or(0);
+            MobExtra::Ocelot {
+                variant: byte_at(entity, 18).unwrap_or(0) as u8,
+                tamed: flags & 0x04 != 0,
+                sitting: flags & 0x01 != 0,
+            }
+        }
+        // A rabbit: byte 18 the rabbit type (`EntityRabbit.getRabbitType:417`),
+        // byte 12 the growing age (negative = child).
         EntityKind::Rabbit => MobExtra::Rabbit {
             variant: byte_at(entity, 18).unwrap_or(0) as u8,
+            child: byte_at(entity, 12).unwrap_or(0) < 0,
         },
         // A villager: int 16 the profession through the source's own fold
         // (`EntityVillager.getProfession:360`, `max(p % 5, 0)`), byte 12 the
@@ -728,16 +787,38 @@ fn mob_extra(kind: EntityKind, entity: &Entity) -> MobExtra {
         EntityKind::Pig => MobExtra::Pig {
             saddle: byte_at(entity, 16).unwrap_or(0) & 0x01 != 0,
         },
-        // A horse: int 16's bits 1 tamed and 2 saddled
+        // A horse: int 16's bits 1 tamed, 2 saddled and 3 chested
         // (`EntityHorse.getHorseWatchableBoolean:175-178` through `:249`/`:345`),
-        // byte 19 the type (`getHorseType:127`), int 20 the colour/variant
-        // (`getHorseVariant:138`), byte 12 the growing age.
-        EntityKind::EntityHorse => MobExtra::Horse {
-            variant: byte_at(entity, 19).unwrap_or(0) as u8,
-            colour: (int_at(entity, 20).unwrap_or(0) & 0xff) as u8,
-            tamed: int_at(entity, 16).unwrap_or(0) & 0x02 != 0,
-            saddle: int_at(entity, 16).unwrap_or(0) & 0x04 != 0,
-            adult: byte_at(entity, 12).unwrap_or(0) >= 0,
+        // byte 19 the type (`getHorseType:127`), int 20 the colour/variant whose
+        // high byte is the marking (`getHorseVariant:138`), int 22 the worn armour's
+        // table index, byte 12 the growing age.
+        EntityKind::EntityHorse => {
+            let flags = int_at(entity, 16).unwrap_or(0);
+            let variant = int_at(entity, 20).unwrap_or(0);
+            MobExtra::Horse {
+                variant: byte_at(entity, 19).unwrap_or(0) as u8,
+                colour: (variant & 0xff) as u8,
+                tamed: flags & 0x02 != 0,
+                saddle: flags & 0x04 != 0,
+                adult: byte_at(entity, 12).unwrap_or(0) >= 0,
+                markings: ((variant >> 8) & 0xff) as u8,
+                chested: flags & 0x08 != 0,
+                armour: int_at(entity, 22).unwrap_or(0).clamp(0, 4) as u8,
+            }
+        }
+        // A ghast: byte 16 the attacking flag (`EntityGhast.isAttacking`).
+        EntityKind::Ghast => MobExtra::Ghast {
+            shooting: byte_at(entity, 16).unwrap_or(0) != 0,
+        },
+        // A guardian: int 16's bit 2 the elder flag (`EntityGuardian`).
+        EntityKind::Guardian => MobExtra::Guardian {
+            elder: int_at(entity, 16).unwrap_or(0) & 0x04 != 0,
+        },
+        // A wither: int 20 the spawn invulnerability's timer
+        // (`EntityWither.getInvulTime`); negatives and values past the wire's short
+        // clamp to it.
+        EntityKind::WitherBoss => MobExtra::Wither {
+            invul_time: int_at(entity, 20).unwrap_or(0).clamp(0, 65_535) as u16,
         },
         // A zombie: byte 13 the villager flag
         // (`EntityZombie.isVillager:195-198` answers `== 1`).
@@ -1035,7 +1116,10 @@ mod tests {
             extra_for(&entity),
             EntityExtra::Mob(MobExtra::Wolf {
                 tamed: true,
-                collar: 3
+                collar: 3,
+                angry: false,
+                sitting: false,
+                health: 20.0
             })
         );
         entity.metadata = metadata(&[(16, MetadataValue::Byte(0x02))]);
@@ -1043,9 +1127,26 @@ mod tests {
             extra_for(&entity),
             EntityExtra::Mob(MobExtra::Wolf {
                 tamed: false,
-                collar: 14
+                collar: 14,
+                angry: true,
+                sitting: false,
+                health: 20.0
             }),
             "the source's collar default is red, 14"
+        );
+        entity.metadata = metadata(&[
+            (16, MetadataValue::Byte(0x05)),
+            (18, MetadataValue::Float(7.5)),
+        ]);
+        assert_eq!(
+            extra_for(&entity),
+            EntityExtra::Mob(MobExtra::Wolf {
+                tamed: true,
+                collar: 14,
+                angry: false,
+                sitting: true,
+                health: 7.5
+            })
         );
     }
 
@@ -1085,11 +1186,31 @@ mod tests {
         entity.metadata = metadata(&[(18, MetadataValue::Byte(2))]);
         assert_eq!(
             extra_for(&entity),
-            EntityExtra::Mob(MobExtra::Ocelot { variant: 2 })
+            EntityExtra::Mob(MobExtra::Ocelot {
+                variant: 2,
+                tamed: false,
+                sitting: false
+            })
         );
         assert_eq!(
             extra_for(&Entity::new(1, EntityKind::Ozelot)),
-            EntityExtra::Mob(MobExtra::Ocelot { variant: 0 })
+            EntityExtra::Mob(MobExtra::Ocelot {
+                variant: 0,
+                tamed: false,
+                sitting: false
+            })
+        );
+        entity.metadata = metadata(&[
+            (16, MetadataValue::Byte(0x05)),
+            (18, MetadataValue::Byte(1)),
+        ]);
+        assert_eq!(
+            extra_for(&entity),
+            EntityExtra::Mob(MobExtra::Ocelot {
+                variant: 1,
+                tamed: true,
+                sitting: true
+            })
         );
     }
 
@@ -1099,11 +1220,17 @@ mod tests {
         entity.metadata = metadata(&[(18, MetadataValue::Byte(99))]);
         assert_eq!(
             extra_for(&entity),
-            EntityExtra::Mob(MobExtra::Rabbit { variant: 99 })
+            EntityExtra::Mob(MobExtra::Rabbit {
+                variant: 99,
+                child: false
+            })
         );
         assert_eq!(
             extra_for(&Entity::new(1, EntityKind::Rabbit)),
-            EntityExtra::Mob(MobExtra::Rabbit { variant: 0 })
+            EntityExtra::Mob(MobExtra::Rabbit {
+                variant: 0,
+                child: false
+            })
         );
     }
 
@@ -1180,7 +1307,10 @@ mod tests {
                 colour: 0x02,
                 tamed: true,
                 saddle: true,
-                adult: false
+                adult: false,
+                markings: 0x03,
+                chested: false,
+                armour: 0
             })
         );
         assert_eq!(
@@ -1190,7 +1320,10 @@ mod tests {
                 colour: 0,
                 tamed: false,
                 saddle: false,
-                adult: true
+                adult: true,
+                markings: 0,
+                chested: false,
+                armour: 0
             })
         );
     }

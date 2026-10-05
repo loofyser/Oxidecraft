@@ -3541,6 +3541,629 @@ fn the_arthropod_family_draws_its_own_silhouettes() {
     );
 }
 
+/// The exotic quadrupeds draw their own models: the horse's long body with the saddle
+/// boxes and the marking and armour passes the class stacks after it
+/// (`ModelHorse.render`:210-317, `RenderHorse.getEntityTexture`:51-78), the wolf with
+/// the collar layer a tamed one draws (`LayerWolfCollar.java`:20-30), the ocelot on its
+/// cat coats (`RenderOcelot.getEntityTexture`:23-40) and the rabbit on its fur table
+/// (`RenderRabbit.getEntityTexture`:27-62). The layer gates read at pixels: the marking
+/// and armour sheets draw only where the extras name them, the saddle boxes only while
+/// the saddle does, and the collar's dye tint only on the tamed wolf.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_exotic_quadrupeds_draw_their_own_silhouettes() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    // The horse's and the wolf's base sheets are white and the layer sheets carry their
+    // own colours, so a layer's pixels are unmistakable.
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/horse/horse_white.png", [255, 255, 255, 255]),
+            ("entity/horse/horse_markings_white.png", [30, 220, 60, 255]),
+            (
+                "entity/horse/armor/horse_armor_diamond.png",
+                [60, 120, 255, 255],
+            ),
+            ("entity/wolf/wolf_tame.png", [255, 255, 255, 255]),
+            ("entity/wolf/wolf.png", [255, 255, 255, 255]),
+            ("entity/wolf/wolf_collar.png", [255, 255, 255, 255]),
+            ("entity/wolf/wolf_angry.png", [30, 220, 60, 255]),
+            ("entity/cat/ocelot.png", SKIN),
+            ("entity/cat/red.png", [30, 220, 60, 255]),
+            ("entity/rabbit/brown.png", SKIN),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let horse = |markings: u8, armour: u8, saddle: bool| EntityDraw {
+        pose: Pose {
+            extra: PoseExtra::Horse {
+                saddle,
+                chested: false,
+                adult: true,
+                variant: 0,
+            },
+            ..Pose::default()
+        },
+        ..mob_at_origin(
+            ModelRef::Horse {
+                variant: 0,
+                colour: 0,
+                markings,
+                saddle,
+                armour,
+            },
+            "entity/horse/horse_white.png",
+            DrawExtra::Horse { markings, armour },
+        )
+    };
+    let horse_marked = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        horse(1, 0, true),
+    );
+    let horse_armoured = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        horse(0, 3, true),
+    );
+    let horse_saddled = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        horse(0, 0, true),
+    );
+    let horse_bare = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        horse(0, 0, false),
+    );
+
+    // A marked horse: the body stands and the marking sheet reads over it.
+    let (min_x, min_y, max_x, max_y) = silhouette(&horse_marked);
+    assert!(
+        max_x - min_x >= 10 && max_y - min_y >= 10 && model_pixels(&horse_marked) >= 150,
+        "the horse stands, ({min_x}, {min_y})..({max_x}, {max_y}), {} pixels",
+        model_pixels(&horse_marked)
+    );
+    assert!(
+        green_pixels(&horse_marked) >= 8,
+        "the marking sheet reads over the horse, {} pixels",
+        green_pixels(&horse_marked)
+    );
+    // The shadow sprite sits at a quarter white over the sky ([182, 209, 251]) close
+    // enough in blue to fool a loose test; the armour's own blue keeps its red low.
+    let blue = |pixels: &[u8]| {
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let [r, g, b] = pixel(pixels, x, y);
+                r < 150 && b as i32 > r as i32 + 40 && b as i32 > g as i32 + 40
+            })
+            .count()
+    };
+    assert!(
+        blue(&horse_armoured) >= 6,
+        "the armour sheet reads over the horse, {} pixels",
+        blue(&horse_armoured)
+    );
+    // Each layer pass stands alone: the marking-only frame carries no armour colour and
+    // the armour-only frame no marking colour.
+    assert_eq!(blue(&horse_marked), 0, "no armour colour without its byte");
+    assert_eq!(
+        green_pixels(&horse_armoured),
+        0,
+        "no marking colour without its byte"
+    );
+    // A bare horse: no marking, no armour and no saddle boxes.
+    assert_eq!(
+        green_pixels(&horse_bare),
+        0,
+        "no marking layer without its byte"
+    );
+    assert_eq!(blue(&horse_bare), 0, "no armour layer without its byte");
+    assert!(
+        changed_pixels(&horse_saddled, &horse_bare) >= 4,
+        "the saddle boxes draw: {} pixels",
+        changed_pixels(&horse_saddled, &horse_bare)
+    );
+    assert!(
+        changed_pixels(&horse_marked, &horse_bare) >= 12,
+        "the marking pass and the saddle change the frame: {} pixels",
+        changed_pixels(&horse_marked, &horse_bare)
+    );
+    assert!(
+        changed_pixels(&horse_armoured, &horse_bare) >= 12,
+        "the armour pass changes the frame: {} pixels",
+        changed_pixels(&horse_armoured, &horse_bare)
+    );
+
+    // The wolf's collar: the tamed one wears the dye tint, the wild one wears nothing.
+    let wolf = |tamed: bool, angry: bool, collar: u8| EntityDraw {
+        pose: Pose {
+            extra: PoseExtra::Wolf {
+                tamed,
+                angry,
+                sitting: false,
+                health: 20.0,
+            },
+            ..Pose::default()
+        },
+        ..mob_at_origin(
+            ModelRef::Wolf {
+                tamed,
+                collar,
+                angry,
+            },
+            if tamed {
+                "entity/wolf/wolf_tame.png"
+            } else if angry {
+                "entity/wolf/wolf_angry.png"
+            } else {
+                "entity/wolf/wolf.png"
+            },
+            DrawExtra::Wolf { tamed, collar },
+        )
+    };
+    let wolf_tamed = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        wolf(true, false, 14),
+    );
+    let wolf_wild = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        wolf(false, false, 14),
+    );
+    let wolf_angry = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        wolf(false, true, 14),
+    );
+    let red = |pixels: &[u8]| {
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let [r, g, _] = pixel(pixels, x, y);
+                r as i32 > g as i32 + 20
+            })
+            .count()
+    };
+    assert!(
+        red(&wolf_tamed) >= 6,
+        "the tamed wolf's collar carries its dye tint, {} pixels",
+        red(&wolf_tamed)
+    );
+    assert_eq!(red(&wolf_wild), 0, "the wild wolf carries no collar pixels");
+    assert!(
+        changed_pixels(&wolf_tamed, &wolf_wild) >= 8,
+        "the collar layer changes the frame: {} pixels",
+        changed_pixels(&wolf_tamed, &wolf_wild)
+    );
+    assert!(
+        green_pixels(&wolf_angry) >= 6,
+        "the angry wolf draws its own sheet, {} pixels",
+        green_pixels(&wolf_angry)
+    );
+
+    // The two small cats: each stands on its own coat.
+    let ocelot = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Ocelot {
+                variant: 2,
+                child: false,
+            },
+            "entity/cat/ocelot.png",
+            DrawExtra::None,
+        ),
+    );
+    let ocelot_red = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Ocelot {
+                variant: 2,
+                child: false,
+            },
+            "entity/cat/red.png",
+            DrawExtra::None,
+        ),
+    );
+    let rabbit = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Rabbit {
+                variant: 0,
+                child: false,
+            },
+            "entity/rabbit/brown.png",
+            DrawExtra::None,
+        ),
+    );
+    for (name, frame, floor) in [
+        ("the ocelot", &ocelot, 20usize),
+        ("the rabbit", &rabbit, 12),
+    ] {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 3 && max_y - min_y >= 3,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(frame) >= floor && hued_pixels(frame) >= floor / 3,
+            "{name} draws its own sheet's hue: {} hued of {} pixels",
+            hued_pixels(frame),
+            model_pixels(frame)
+        );
+    }
+    assert!(
+        model_pixels(&rabbit) < model_pixels(&horse_bare),
+        "the rabbit is the smaller quadruped: {} against {}",
+        model_pixels(&rabbit),
+        model_pixels(&horse_bare)
+    );
+    assert!(
+        green_pixels(&ocelot_red) >= 6 && changed_pixels(&ocelot, &ocelot_red) >= 8,
+        "the red cat's coat changes the frame: {} green, {} changed",
+        green_pixels(&ocelot_red),
+        changed_pixels(&ocelot, &ocelot_red)
+    );
+}
+
+/// The supernatural set draws its own bodies: the ghast's hanging tentacle fan at its
+/// renderer's own four-and-a-half scale, the blaze's rod cage, and the guardian with its
+/// tail and spikes — the elder drawing its own sheet, as the ghast's shooting state does
+/// (`RenderGhast.getEntityTexture`:21-24, `RenderGuardian.getEntityTexture`:177-180).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_supernatural_family_draws_its_own_silhouettes() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/ghast/ghast.png", SKIN),
+            ("entity/ghast/ghast_shooting.png", [30, 220, 60, 255]),
+            ("entity/blaze.png", SKIN),
+            ("entity/guardian.png", SKIN),
+            ("entity/guardian_elder.png", [30, 220, 60, 255]),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let ghast_rest = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Ghast { shooting: false },
+            "entity/ghast/ghast.png",
+            DrawExtra::None,
+        ),
+    );
+    let ghast_shooting = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Ghast { shooting: true },
+            "entity/ghast/ghast_shooting.png",
+            DrawExtra::None,
+        ),
+    );
+    let blaze = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(ModelRef::Blaze, "entity/blaze.png", DrawExtra::None),
+    );
+    let guardian = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Guardian { elder: false },
+            "entity/guardian.png",
+            DrawExtra::None,
+        ),
+    );
+    let guardian_elder = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Guardian { elder: true },
+            "entity/guardian_elder.png",
+            DrawExtra::None,
+        ),
+    );
+
+    for (name, frame, floor) in [
+        ("the ghast", &ghast_rest, 300usize),
+        ("the blaze", &blaze, 40),
+        ("the guardian", &guardian, 40),
+    ] {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 10 && max_y - min_y >= 10,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(frame) >= floor && hued_pixels(frame) >= floor / 3,
+            "{name} draws its own sheet's hue: {} hued of {} pixels",
+            hued_pixels(frame),
+            model_pixels(frame)
+        );
+    }
+    // The ghast's fan spreads far wider than the blaze's cage.
+    let ghast_width = {
+        let (min_x, _, max_x, _) = silhouette(&ghast_rest);
+        max_x - min_x
+    };
+    let blaze_width = {
+        let (min_x, _, max_x, _) = silhouette(&blaze);
+        max_x - min_x
+    };
+    assert!(
+        ghast_width >= blaze_width + 8,
+        "the ghast spreads wider than the blaze: {ghast_width} against {blaze_width}"
+    );
+    // The two sheet selections read: the shooting ghast carries its sheet's colour and
+    // the elder guardian its own; neither frame equals its base-sheet sibling.
+    assert!(
+        green_pixels(&ghast_shooting) >= 8 && changed_pixels(&ghast_rest, &ghast_shooting) >= 10,
+        "the shooting sheet reads: {} green, {} changed",
+        green_pixels(&ghast_shooting),
+        changed_pixels(&ghast_rest, &ghast_shooting)
+    );
+    assert!(
+        green_pixels(&guardian_elder) >= 8 && changed_pixels(&guardian, &guardian_elder) >= 10,
+        "the elder sheet reads: {} green, {} changed",
+        green_pixels(&guardian_elder),
+        changed_pixels(&guardian, &guardian_elder)
+    );
+    assert!(
+        changed_pixels(&blaze, &guardian) >= 8,
+        "the blaze and the guardian are different bodies: {} pixels",
+        changed_pixels(&blaze, &guardian)
+    );
+}
+
+/// The dragon's wing beat reads the flight clock the pose carries: at rest the wings sit
+/// at one beat of the cycle, half a turn later at the other, and the two frames differ
+/// over the wings and the striding legs (`ModelDragon.setRotationAngles`'s flight sine).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_dragon_flaps_its_wings_at_two_phases() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = mob_registry(&device, &queue, &[("entity/enderdragon/dragon.png", SKIN)]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let dragon = |anim_time: f32| EntityDraw {
+        pose: Pose {
+            extra: PoseExtra::Dragon { anim_time },
+            ..Pose::default()
+        },
+        ..mob_at_origin(
+            ModelRef::EnderDragon,
+            "entity/enderdragon/dragon.png",
+            DrawExtra::None,
+        )
+    };
+    let at_rest = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        dragon(0.0),
+    );
+    let at_half = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        dragon(0.5),
+    );
+
+    for (name, frame) in [
+        ("the dragon at rest", &at_rest),
+        ("the dragon at half", &at_half),
+    ] {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 20 && max_y - min_y >= 12,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(frame) >= 250 && hued_pixels(frame) >= 80,
+            "{name} draws: {} hued of {} pixels",
+            hued_pixels(frame),
+            model_pixels(frame)
+        );
+    }
+    assert!(
+        changed_pixels(&at_rest, &at_half) >= 30,
+        "the wing beat moves the frame: {} pixels",
+        changed_pixels(&at_rest, &at_half)
+    );
+}
+
+/// The wither draws on both its sheets: the base one while the spawn shield is down and
+/// the invulnerable one while it runs — a draw-level sheet selection that also rides the
+/// renderer's own scale ladder (`RenderWither.getEntityTexture`:33-37,
+/// `RenderWither.preRenderCallback`:43-54).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_wither_draws_its_second_sheet() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/wither/wither.png", SKIN),
+            ("entity/wither/wither_invulnerable.png", [30, 220, 60, 255]),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let wither = |invul_time: u16, sheet: &'static str| {
+        mob_at_origin(ModelRef::Wither { invul_time }, sheet, DrawExtra::None)
+    };
+    let shield_down = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        wither(0, "entity/wither/wither.png"),
+    );
+    let shield_up = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        wither(40, "entity/wither/wither_invulnerable.png"),
+    );
+
+    // The wither stands wide on either sheet — the three heads and the ribs — and the
+    // invulnerable sheet's colour reads at its pixels.
+    for (name, frame) in [
+        ("the wither", &shield_down),
+        ("the shielded wither", &shield_up),
+    ] {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 15 && max_y - min_y >= 10,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(frame) >= 120,
+            "{name} draws: {} pixels",
+            model_pixels(frame)
+        );
+    }
+    assert!(
+        hued_pixels(&shield_down) >= 40,
+        "the base sheet's hue reads: {} pixels",
+        hued_pixels(&shield_down)
+    );
+    assert!(
+        green_pixels(&shield_up) >= 8,
+        "the invulnerable sheet reads: {} pixels",
+        green_pixels(&shield_up)
+    );
+    assert!(
+        changed_pixels(&shield_down, &shield_up) >= 10,
+        "the two sheets read differently: {} pixels",
+        changed_pixels(&shield_down, &shield_up)
+    );
+}
+
 /// Blocks the calling thread until `future` resolves; the test has no async runtime.
 ///
 /// The test target cannot reach the private `block_on` in `renderer.rs`, so this is a copy of

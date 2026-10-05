@@ -252,6 +252,138 @@ static SLIME_GEL_LAYER: Layer = Layer {
 /// The slime's layer table.
 static SLIME_LAYERS: [Layer; 1] = [SLIME_GEL_LAYER];
 
+/// The wool-table index a wolf collar draw's byte decodes to: the byte is the dye's
+/// damage value, which counts down against the table's metadata — the source's own
+/// double fold, `byMetadata(byDyeDamage(byte & 15).getMetadata())`
+/// (`LayerWolfCollar.java`:25, `EntityWolf.getCollarColor`:540-543). A fresh wolf's
+/// byte is `14`, which reads the table's orange (the source's own default, MC-71674).
+pub fn wolf_collar_index(extra: &DrawExtra) -> u8 {
+    match extra {
+        DrawExtra::Wolf { collar, .. } => 15 - (collar & 0x0f),
+        _ => 0,
+    }
+}
+
+/// The wolf's collar layer (`LayerWolfCollar.java`:20-30): the wolf's own model on the
+/// collar sheet, tinted by the dye table through the collar byte.
+static WOLF_COLLAR_LAYER: Layer = Layer {
+    model: &super::exotics::MODEL_WOLF,
+    texture: "entity/wolf/wolf_collar.png",
+    texture_size: [64.0, 32.0],
+    active: |extra| matches!(extra, DrawExtra::Wolf { tamed: true, .. }),
+    tint: Tint::Palette {
+        table: &WOOL_COLOURS,
+        index: wolf_collar_index,
+    },
+    pose: super::exotics::pose_wolf,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The wolf's layer table.
+static WOLF_LAYERS: [Layer; 1] = [WOLF_COLLAR_LAYER];
+
+/// The horse's first marking layer, the class's own marking cells redrawn over the
+/// horse. The source folds the stack into one layered texture
+/// (`RenderHorse.getEntityTexture`:76-77, `EntityHorse.getVariantTexturePaths`:774-782);
+/// the port draws the same stack as whole-model passes in the class's order.
+static HORSE_MARKING_WHITE: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/horse_markings_white.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { markings: 1, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's second marking layer (`horse_markings_whitefield`, table index two).
+static HORSE_MARKING_WHITE_FIELD: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/horse_markings_whitefield.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { markings: 2, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's third marking layer (`horse_markings_whitedots`, table index three).
+static HORSE_MARKING_WHITE_DOTS: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/horse_markings_whitedots.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { markings: 3, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's fourth marking layer (`horse_markings_blackdots`, table index four).
+static HORSE_MARKING_BLACK_DOTS: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/horse_markings_blackdots.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { markings: 4, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's iron armour layer: the class's own armour table's first file
+/// (`EntityHorse.java`:53), the third layer of the source's stack. There are no armour
+/// boxes anywhere in the client: the armour is this sheet alone (`EntityHorse.java`:52).
+static HORSE_ARMOUR_IRON: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/armor/horse_armor_iron.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { armour: 1, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's golden armour layer (`horse_armor_gold`, table index two).
+static HORSE_ARMOUR_GOLD: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/armor/horse_armor_gold.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { armour: 2, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's diamond armour layer (`horse_armor_diamond`, table index three).
+static HORSE_ARMOUR_DIAMOND: Layer = Layer {
+    model: &super::exotics::MODEL_HORSE,
+    texture: "entity/horse/armor/horse_armor_diamond.png",
+    texture_size: [128.0, 128.0],
+    active: |extra| matches!(extra, DrawExtra::Horse { armour: 3, .. }),
+    tint: Tint::Sheet,
+    pose: super::exotics::pose_horse,
+    full_bright: false,
+    blend: Blend::Opaque,
+};
+
+/// The horse's layer table: the four markings first, then the three armours, the
+/// source's own stack order (`EntityHorse.getVariantTexturePaths`:774-782).
+static HORSE_LAYERS: [Layer; 7] = [
+    HORSE_MARKING_WHITE,
+    HORSE_MARKING_WHITE_FIELD,
+    HORSE_MARKING_WHITE_DOTS,
+    HORSE_MARKING_BLACK_DOTS,
+    HORSE_ARMOUR_IRON,
+    HORSE_ARMOUR_GOLD,
+    HORSE_ARMOUR_DIAMOND,
+];
+
 /// The layers a model draws, in the source's order after its base model.
 pub fn layers_for(model: ModelRef) -> &'static [Layer] {
     match model {
@@ -260,8 +392,12 @@ pub fn layers_for(model: ModelRef) -> &'static [Layer] {
         ModelRef::Spider | ModelRef::CaveSpider => &SPIDER_LAYERS,
         ModelRef::Enderman => &ENDERMAN_LAYERS,
         ModelRef::Slime { .. } => &SLIME_LAYERS,
+        ModelRef::Wolf { .. } => &WOLF_LAYERS,
+        ModelRef::Horse { .. } => &HORSE_LAYERS,
         // The creeper's charge aura (`RenderCreeper.java`:17) defers; the magma cube's
-        // renderer registers no layer at all.
+        // renderer registers no layer at all. The wither's invulnerable sheet and the
+        // ghast's shooting sheet are their renderers' base-sheet selections, not layers
+        // (`RenderWither.getEntityTexture`:33-37, `RenderGhast.getEntityTexture`:21-24).
         _ => &[],
     }
 }

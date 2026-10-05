@@ -53,7 +53,8 @@ const CLOUDS: &str = "environment/clouds";
 /// set, keyed by its own names.
 ///
 /// The set is the shadow sprite, the two default skins and the mob sheets the kinds of
-/// this milestone draw — the biped family, the core quadrupeds and the crawler
+/// this milestone draw — the biped family (with the zombie pigman's sheet,
+/// `RenderPigZombie.java`:11), the core quadrupeds, the crawler families and the exotic
 /// families, each key the class renderer's own resource location and the layers'
 /// sheets beside theirs.
 ///
@@ -65,11 +66,12 @@ const CLOUDS: &str = "environment/clouds";
 /// layers bind sheets of their own, `textures/entity/spider_eyes.png` and
 /// `textures/entity/enderman/enderman_eyes.png` (`LayerSpiderEyes.java`:11,
 /// `LayerEndermanEyes.java`:11).
-pub const ENTITY_TEXTURES: [&str; 34] = [
+pub const ENTITY_TEXTURES: [&str; 77] = [
     "misc/shadow.png",
     "entity/steve.png",
     "entity/alex.png",
     "entity/zombie/zombie.png",
+    "entity/zombie_pigman.png",
     "entity/zombie/zombie_villager.png",
     "entity/skeleton/skeleton.png",
     "entity/villager/villager.png",
@@ -100,6 +102,58 @@ pub const ENTITY_TEXTURES: [&str; 34] = [
     "entity/bat.png",
     "entity/silverfish.png",
     "entity/endermite.png",
+    // The exotic families: the horse's type, colour, marking and armour tables
+    // (`RenderHorse.getEntityTexture`:51-78, `EntityHorse.java`:53-58), the wolf's
+    // states and the collar sheet (`RenderWolf.getEntityTexture`:46-49,
+    // `LayerWolfCollar.java`:12), the cat coats (`RenderOcelot.getEntityTexture`:23-40),
+    // the rabbit coats with the toast and killer entries
+    // (`RenderRabbit.getEntityTexture`:27-62), the ghast's shooting sheet
+    // (`RenderGhast.getEntityTexture`:21-24), the blaze's, the guardian pair
+    // (`RenderGuardian.getEntityTexture`:177-180), the dragon's
+    // (`RenderDragon.getEntityTexture`:150-153) and the wither's spawn-shield pair
+    // (`RenderWither.getEntityTexture`:33-37).
+    "entity/horse/horse_white.png",
+    "entity/horse/horse_creamy.png",
+    "entity/horse/horse_chestnut.png",
+    "entity/horse/horse_brown.png",
+    "entity/horse/horse_black.png",
+    "entity/horse/horse_gray.png",
+    "entity/horse/horse_darkbrown.png",
+    "entity/horse/donkey.png",
+    "entity/horse/mule.png",
+    "entity/horse/horse_zombie.png",
+    "entity/horse/horse_skeleton.png",
+    "entity/horse/horse_markings_white.png",
+    "entity/horse/horse_markings_whitefield.png",
+    "entity/horse/horse_markings_whitedots.png",
+    "entity/horse/horse_markings_blackdots.png",
+    "entity/horse/armor/horse_armor_iron.png",
+    "entity/horse/armor/horse_armor_gold.png",
+    "entity/horse/armor/horse_armor_diamond.png",
+    "entity/wolf/wolf.png",
+    "entity/wolf/wolf_tame.png",
+    "entity/wolf/wolf_angry.png",
+    "entity/wolf/wolf_collar.png",
+    "entity/cat/ocelot.png",
+    "entity/cat/black.png",
+    "entity/cat/red.png",
+    "entity/cat/siamese.png",
+    "entity/rabbit/brown.png",
+    "entity/rabbit/white.png",
+    "entity/rabbit/black.png",
+    "entity/rabbit/white_splotched.png",
+    "entity/rabbit/gold.png",
+    "entity/rabbit/salt.png",
+    "entity/rabbit/toast.png",
+    "entity/rabbit/caerbannog.png",
+    "entity/ghast/ghast.png",
+    "entity/ghast/ghast_shooting.png",
+    "entity/blaze.png",
+    "entity/guardian.png",
+    "entity/guardian_elder.png",
+    "entity/enderdragon/dragon.png",
+    "entity/wither/wither.png",
+    "entity/wither/wither_invulnerable.png",
 ];
 
 /// The wide default skin's key, an entry of [`ENTITY_TEXTURES`].
@@ -303,6 +357,7 @@ mod tests {
                 "entity/steve.png",
                 "entity/alex.png",
                 "entity/zombie/zombie.png",
+                "entity/zombie_pigman.png",
                 "entity/zombie/zombie_villager.png",
                 "entity/skeleton/skeleton.png",
                 "entity/villager/villager.png",
@@ -333,6 +388,48 @@ mod tests {
                 "entity/bat.png",
                 "entity/silverfish.png",
                 "entity/endermite.png",
+                "entity/horse/horse_white.png",
+                "entity/horse/horse_creamy.png",
+                "entity/horse/horse_chestnut.png",
+                "entity/horse/horse_brown.png",
+                "entity/horse/horse_black.png",
+                "entity/horse/horse_gray.png",
+                "entity/horse/horse_darkbrown.png",
+                "entity/horse/donkey.png",
+                "entity/horse/mule.png",
+                "entity/horse/horse_zombie.png",
+                "entity/horse/horse_skeleton.png",
+                "entity/horse/horse_markings_white.png",
+                "entity/horse/horse_markings_whitefield.png",
+                "entity/horse/horse_markings_whitedots.png",
+                "entity/horse/horse_markings_blackdots.png",
+                "entity/horse/armor/horse_armor_iron.png",
+                "entity/horse/armor/horse_armor_gold.png",
+                "entity/horse/armor/horse_armor_diamond.png",
+                "entity/wolf/wolf.png",
+                "entity/wolf/wolf_tame.png",
+                "entity/wolf/wolf_angry.png",
+                "entity/wolf/wolf_collar.png",
+                "entity/cat/ocelot.png",
+                "entity/cat/black.png",
+                "entity/cat/red.png",
+                "entity/cat/siamese.png",
+                "entity/rabbit/brown.png",
+                "entity/rabbit/white.png",
+                "entity/rabbit/black.png",
+                "entity/rabbit/white_splotched.png",
+                "entity/rabbit/gold.png",
+                "entity/rabbit/salt.png",
+                "entity/rabbit/toast.png",
+                "entity/rabbit/caerbannog.png",
+                "entity/ghast/ghast.png",
+                "entity/ghast/ghast_shooting.png",
+                "entity/blaze.png",
+                "entity/guardian.png",
+                "entity/guardian_elder.png",
+                "entity/enderdragon/dragon.png",
+                "entity/wither/wither.png",
+                "entity/wither/wither_invulnerable.png",
             ]
         );
         assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_WIDE));
@@ -369,6 +466,31 @@ mod tests {
             ModelRef::Bat { hanging: false },
             ModelRef::Silverfish,
             ModelRef::EnderMite,
+            ModelRef::Horse {
+                variant: 0,
+                colour: 0,
+                markings: 1,
+                saddle: true,
+                armour: 2,
+            },
+            ModelRef::Wolf {
+                tamed: true,
+                collar: 12,
+                angry: false,
+            },
+            ModelRef::Ocelot {
+                variant: 0,
+                child: false,
+            },
+            ModelRef::Rabbit {
+                variant: 0,
+                child: false,
+            },
+            ModelRef::Ghast { shooting: true },
+            ModelRef::Blaze,
+            ModelRef::Guardian { elder: true },
+            ModelRef::EnderDragon,
+            ModelRef::Wither { invul_time: 0 },
         ];
         for reference in kinds {
             for key in oxide_render::entity_models::textures(reference) {

@@ -136,6 +136,73 @@ pub enum ModelRef {
     Silverfish,
     /// An endermite: `ModelEnderMite`'s four segments (`ModelEnderMite.java`:13).
     EnderMite,
+    /// A horse: `ModelHorse`'s table (`ModelHorse.java`:65-205) under the class's own
+    /// colour, marking and armour sheets (`RenderHorse.getEntityTexture`:53-78).
+    Horse {
+        /// The horse type: `0` horse, `1` donkey, `2` mule, `3` zombie, `4` skeleton.
+        variant: u8,
+        /// The colour: the variant's low byte (`0..7`).
+        colour: u8,
+        /// The marking: the variant's high byte (`0..5`).
+        markings: u8,
+        /// Whether the draw is saddled — the saddle boxes' gate.
+        saddle: bool,
+        /// The armour's table index: `0` none, `1..3` the worn armour — the armour
+        /// sheet's gate (`EntityHorse.java`:750-761, `RenderHorse.getEntityTexture`:76).
+        armour: u8,
+    },
+    /// A wolf: `ModelWolf`'s table (`ModelWolf.java`:36-66) under the taming's own sheets
+    /// (`RenderWolf.getEntityTexture`:47-49).
+    Wolf {
+        /// Whether the wolf is tamed.
+        tamed: bool,
+        /// The collar colour, `0..16` — the collar layer's palette byte.
+        collar: u8,
+        /// Whether the wolf is angry — its own sheet and tail.
+        angry: bool,
+    },
+    /// An ocelot: `ModelOcelot`'s table (`ModelOcelot.java`:36-70`) under the cat type's
+    /// sheet (`RenderOcelot.getEntityTexture`:23-42).
+    Ocelot {
+        /// The cat type: `0` wild, `1..4` the tamed coats.
+        variant: u8,
+        /// Whether the draw is a child (`ModelOcelot.render`:79-98).
+        child: bool,
+    },
+    /// A rabbit: `ModelRabbit`'s table (`ModelRabbit.java`:49-115`) under the variant's
+    /// sheet (`RenderRabbit.getEntityTexture`:29-64).
+    Rabbit {
+        /// The rabbit type: `0..6` and `99`.
+        variant: u8,
+        /// Whether the draw is a child (`ModelRabbit.render`:131-153).
+        child: bool,
+    },
+    /// A ghast: `ModelGhast`'s body and nine tentacles (`ModelGhast.java`:12-32`) under
+    /// the sheet its attacking flag swaps (`RenderGhast.getEntityTexture`:21-24).
+    Ghast {
+        /// Whether the draw is attacking — the shooting sheet's gate
+        /// (`EntityGhast.isAttacking`, watcher 16's byte).
+        shooting: bool,
+    },
+    /// A blaze: `ModelBlaze`'s head and twelve rods (`ModelBlaze.java`:12-22).
+    Blaze,
+    /// A guardian: `ModelGuardian`'s body, twelve spines, eye and tail
+    /// (`ModelGuardian.java`:16-49`).
+    Guardian {
+        /// Whether the draw is an elder: its own sheet and the renderer's `2.35` scale
+        /// (`RenderGuardian.preRenderCallback`:168-170, `getEntityTexture`:177-180).
+        elder: bool,
+    },
+    /// An ender dragon: `ModelDragon`'s head, body, wings, legs and spine chain
+    /// (`ModelDragon.java`:47-124`).
+    EnderDragon,
+    /// A wither: `ModelWither`'s three ribs and three heads (`ModelWither.java`:13-38`)
+    /// under the sheet its spawn invulnerability flickers (`RenderWither.getEntityTexture`:33-37`).
+    Wither {
+        /// The spawn invulnerability's timer, watcher 20's int (`EntityWither.getInvulTime`:623-626):
+        /// the sheet flickers by it and the pre-render scale rises through it.
+        invul_time: u16,
+    },
 }
 
 /// The texture a draw samples.
@@ -202,6 +269,22 @@ pub enum DrawExtra {
     Bat {
         /// Whether the bat hangs.
         hanging: bool,
+    },
+    /// A wolf: the collar layer's gate and its palette byte
+    /// (`LayerWolfCollar.doRenderLayer`:22-28).
+    Wolf {
+        /// Whether the wolf is tamed — the collar layer's gate.
+        tamed: bool,
+        /// The collar colour, `0..16` — the wool table's index.
+        collar: u8,
+    },
+    /// A horse: the marking and armour sheets the layered stack draws over it
+    /// (`EntityHorse.getVariantTexturePaths`:774-782).
+    Horse {
+        /// The marking's table index, `0..5`.
+        markings: u8,
+        /// The armour's table index, `0..4`.
+        armour: u8,
     },
 }
 

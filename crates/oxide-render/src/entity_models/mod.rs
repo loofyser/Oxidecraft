@@ -26,6 +26,7 @@ use glam::{Mat4, Vec3};
 use crate::entity_pass::ModelRef;
 
 pub mod crawlers;
+pub mod exotics;
 pub mod layers;
 pub mod player;
 pub mod quadrupeds;
@@ -151,6 +152,71 @@ pub enum PoseExtra {
     Bat {
         /// Whether the bat hangs (`getIsBatHanging()`).
         hanging: bool,
+    },
+    /// The horse's own: the saddle gate its boxes' visibility rides, the chested flag
+    /// its saddle ropes and the mule's chests read, and the type that picks the ears
+    /// (`ModelHorse.setLivingAnimations`:480-543, `ModelHorse.render`:294-303).
+    Horse {
+        /// Whether the draw is saddled (`EntityHorse.isHorseSaddled`, watcher 16's
+        /// bit 4).
+        saddle: bool,
+        /// Whether the draw is chested (`EntityHorse.isChested`, watcher 16's bit 8) —
+        /// the source's `flag2`, which draws the two chest boxes (`ModelHorse.java`:217,
+        /// `:312-316`).
+        chested: bool,
+        /// Whether the draw is an adult: the source's `flag`, which holds the saddle
+        /// geometry and the chests (`ModelHorse.java`:215-217`).
+        adult: bool,
+        /// The horse type, `ModelHorse.render`'s `flag3`: `1` and `2` (donkey and mule)
+        /// draw the long ears, every other type the short pair (`ModelHorse.java`:142-149,
+        /// `:294-303`).
+        variant: u8,
+    },
+    /// The wolf's own: the sitting branch, the angry tail and the health-scaled resting
+    /// droop (`ModelWolf.setLivingAnimations`:112-163, `EntityWolf.getTailRotation`:495).
+    Wolf {
+        /// Whether the wolf is tamed (`EntityTameable.isTamed`).
+        tamed: bool,
+        /// Whether the wolf is angry (`EntityWolf.isAngry`).
+        angry: bool,
+        /// Whether the wolf sits (`EntityTameable.isSitting`).
+        sitting: bool,
+        /// The wolf's health (`EntityWolf.getHealth` through byte index 18's float), which
+        /// the tamed tail's droop reads.
+        health: f32,
+    },
+    /// The ocelot's own: the sitting state over the frame's own sneak
+    /// (`ModelOcelot.setLivingAnimations`:174-217).
+    Ocelot {
+        /// Whether the cat sits (`EntityTameable.isSitting`).
+        sitting: bool,
+    },
+    /// The rabbit's own: the hop progress the thighs, feet and arms ride
+    /// (`ModelRabbit.setRotationAngles`:184-187).
+    Rabbit {
+        /// The hop's progress, `0.0..1.0` (`EntityRabbit.func_175521_o`:85-88). The frames
+        /// carry no jump state — the signal is a status byte the store holds unmapped — so
+        /// a draw pins it at the resting zero.
+        hop: f32,
+    },
+    /// The guardian's own: the spines' extension and the tail's folded phase, both the
+    /// entity's client-side counters (`ModelGuardian.setRotationAngles`:82-91,`:126-134`).
+    Guardian {
+        /// The spines' extension: `0.0` extended, `1.0` retracted (`EntityGuardian`'s
+        /// `func_175469_o` through `field_175482_b`/`field_175484_c`, `EntityGuardian.java`:42,`:68,`:302,`:331`).
+        /// No frame input carries the moving or in-water state the source lerps it by, so a
+        /// draw pins the extended state a guardian at rest in water settles to.
+        spikes: f32,
+        /// The tail's folded phase (`EntityGuardian.func_175471_a`): no frame input carries
+        /// the moving state the source lerps it by, so a draw pins the resting zero.
+        tail_phase: f32,
+    },
+    /// The dragon's own: the interpolated `animTime` its whole flight reads
+    /// (`ModelDragon.render`:142-238).
+    Dragon {
+        /// The interpolated `animTime`: advancing `0.2` a tick at rest, locked at `0.5`
+        /// under the AI-disabled flag (`EntityDragon.onLivingUpdate`).
+        anim_time: f32,
     },
 }
 
@@ -422,6 +488,15 @@ pub fn model_for(reference: ModelRef) -> &'static Model {
         ModelRef::Bat { .. } => &crawlers::MODEL_BAT,
         ModelRef::Silverfish => &crawlers::MODEL_SILVERFISH,
         ModelRef::EnderMite => &crawlers::MODEL_ENDERMITE,
+        ModelRef::Horse { .. } => &exotics::MODEL_HORSE,
+        ModelRef::Wolf { .. } => &exotics::MODEL_WOLF,
+        ModelRef::Ocelot { .. } => &exotics::MODEL_OCELOT,
+        ModelRef::Rabbit { .. } => &exotics::MODEL_RABBIT,
+        ModelRef::Ghast { .. } => &exotics::MODEL_GHAST,
+        ModelRef::Blaze => &exotics::MODEL_BLAZE,
+        ModelRef::Guardian { .. } => &exotics::MODEL_GUARDIAN,
+        ModelRef::EnderDragon => &exotics::MODEL_DRAGON,
+        ModelRef::Wither { .. } => &exotics::MODEL_WITHER,
     }
 }
 
@@ -450,7 +525,19 @@ pub fn texture_size(reference: ModelRef) -> [f32; 2] {
         | ModelRef::MagmaCube { .. }
         | ModelRef::Bat { .. }
         | ModelRef::Silverfish
-        | ModelRef::EnderMite => [64.0, 32.0],
+        | ModelRef::EnderMite
+        | ModelRef::Wolf { .. }
+        | ModelRef::Ocelot { .. }
+        | ModelRef::Rabbit { .. }
+        | ModelRef::Ghast { .. }
+        | ModelRef::Blaze => [64.0, 32.0],
+        // The horse's sheet is its class's own `128` square, the guardian's and the
+        // wither's `64` squares, the dragon's `256` (`ModelHorse.java`:67-68,
+        // `ModelGuardian.java`:18-19, `ModelWither.java`:15-16, `ModelDragon.java`:49-50).
+        ModelRef::Horse { .. } => [128.0, 128.0],
+        ModelRef::Guardian { .. } => [64.0, 64.0],
+        ModelRef::Wither { .. } => [64.0, 64.0],
+        ModelRef::EnderDragon => [256.0, 256.0],
     }
 }
 
@@ -462,7 +549,10 @@ pub fn texture_size(reference: ModelRef) -> [f32; 2] {
 pub fn textures(reference: ModelRef) -> &'static [&'static str] {
     match reference {
         ModelRef::Player { .. } => &[],
-        ModelRef::Zombie | ModelRef::Giant => &["entity/zombie/zombie.png"],
+        // The zombie's model also draws the zombie pigman's sheet, the kind's own
+        // renderer's selection (`RenderPigZombie.java`:11, `:15`).
+        ModelRef::Zombie => &["entity/zombie/zombie.png", "entity/zombie_pigman.png"],
+        ModelRef::Giant => &["entity/zombie/zombie.png"],
         ModelRef::ZombieVillager => &["entity/zombie/zombie_villager.png"],
         ModelRef::Skeleton => &["entity/skeleton/skeleton.png"],
         ModelRef::Villager { profession, .. } => match profession {
@@ -495,6 +585,60 @@ pub fn textures(reference: ModelRef) -> &'static [&'static str] {
         ModelRef::Bat { .. } => &["entity/bat.png"],
         ModelRef::Silverfish => &["entity/silverfish.png"],
         ModelRef::EnderMite => &["entity/endermite.png"],
+        // The horse's whole sheet set: the four type sheets, the seven colours, the four
+        // markings and the three armours (`RenderHorse.getEntityTexture`:53-78,
+        // `EntityHorse.java`:53-58) — one draw picks its base among the first two groups
+        // and its layers among the last two; an invalid layered draw names nothing.
+        ModelRef::Horse { .. } => &[
+            "entity/horse/horse_white.png",
+            "entity/horse/horse_creamy.png",
+            "entity/horse/horse_chestnut.png",
+            "entity/horse/horse_brown.png",
+            "entity/horse/horse_black.png",
+            "entity/horse/horse_gray.png",
+            "entity/horse/horse_darkbrown.png",
+            "entity/horse/donkey.png",
+            "entity/horse/mule.png",
+            "entity/horse/horse_zombie.png",
+            "entity/horse/horse_skeleton.png",
+            "entity/horse/horse_markings_white.png",
+            "entity/horse/horse_markings_whitefield.png",
+            "entity/horse/horse_markings_whitedots.png",
+            "entity/horse/horse_markings_blackdots.png",
+            "entity/horse/armor/horse_armor_iron.png",
+            "entity/horse/armor/horse_armor_gold.png",
+            "entity/horse/armor/horse_armor_diamond.png",
+        ],
+        ModelRef::Wolf { .. } => &[
+            "entity/wolf/wolf.png",
+            "entity/wolf/wolf_tame.png",
+            "entity/wolf/wolf_angry.png",
+            "entity/wolf/wolf_collar.png",
+        ],
+        ModelRef::Ocelot { .. } => &[
+            "entity/cat/ocelot.png",
+            "entity/cat/black.png",
+            "entity/cat/red.png",
+            "entity/cat/siamese.png",
+        ],
+        ModelRef::Rabbit { .. } => &[
+            "entity/rabbit/brown.png",
+            "entity/rabbit/white.png",
+            "entity/rabbit/black.png",
+            "entity/rabbit/white_splotched.png",
+            "entity/rabbit/gold.png",
+            "entity/rabbit/salt.png",
+            "entity/rabbit/toast.png",
+            "entity/rabbit/caerbannog.png",
+        ],
+        ModelRef::Ghast { .. } => &["entity/ghast/ghast.png", "entity/ghast/ghast_shooting.png"],
+        ModelRef::Blaze => &["entity/blaze.png"],
+        ModelRef::Guardian { .. } => &["entity/guardian.png", "entity/guardian_elder.png"],
+        ModelRef::EnderDragon => &["entity/enderdragon/dragon.png"],
+        ModelRef::Wither { .. } => &[
+            "entity/wither/wither.png",
+            "entity/wither/wither_invulnerable.png",
+        ],
     }
 }
 
@@ -523,6 +667,15 @@ pub fn pose(reference: ModelRef, pose: &Pose, out: &mut [Rot]) {
         ModelRef::Bat { .. } => crawlers::pose_bat(pose, out),
         ModelRef::Silverfish => crawlers::pose_silverfish(pose, out),
         ModelRef::EnderMite => crawlers::pose_endermite(pose, out),
+        ModelRef::Horse { .. } => exotics::pose_horse(pose, out),
+        ModelRef::Wolf { .. } => exotics::pose_wolf(pose, out),
+        ModelRef::Ocelot { .. } => exotics::pose_ocelot(pose, out),
+        ModelRef::Rabbit { .. } => exotics::pose_rabbit(pose, out),
+        ModelRef::Ghast { .. } => exotics::pose_ghast(pose, out),
+        ModelRef::Blaze => exotics::pose_blaze(pose, out),
+        ModelRef::Guardian { .. } => exotics::pose_guardian(pose, out),
+        ModelRef::EnderDragon => exotics::pose_dragon(pose, out),
+        ModelRef::Wither { .. } => exotics::pose_wither(pose, out),
     }
 }
 
@@ -559,6 +712,28 @@ pub fn height(reference: ModelRef) -> f32 {
         ModelRef::Bat { .. } => 0.9,
         ModelRef::Silverfish => 0.3,
         ModelRef::EnderMite => 0.3,
+        // The horse's own `1.4` by `1.6` (`EntityHorse.java`:91), the wolf's `0.6` by
+        // `0.8` (`EntityWolf.java`:62), the ocelot's and rabbit's `0.6` by `0.7`
+        // (`EntityOcelot.java`:46, `EntityRabbit.java`:56), the ghast's `4.0` square
+        // (`EntityGhast.java`:32), the blaze's inherited default `1.8`
+        // (`Entity.java`:269-270 — the class sets no size), the guardian's `0.85`, the
+        // elder's `1.9975` (`EntityGuardian.java`:56, `:167`), the dragon's `16` by `8`
+        // (`EntityDragon.java`:86) and the wither's `0.9` by `3.5` (`EntityWither.java`:63).
+        ModelRef::Horse { .. } => 1.6,
+        ModelRef::Wolf { .. } => 0.8,
+        ModelRef::Ocelot { .. } => 0.7,
+        ModelRef::Rabbit { .. } => 0.7,
+        ModelRef::Ghast { .. } => 4.0,
+        ModelRef::Blaze => 1.8,
+        ModelRef::Guardian { elder } => {
+            if elder {
+                1.9975
+            } else {
+                0.85
+            }
+        }
+        ModelRef::EnderDragon => 8.0,
+        ModelRef::Wither { .. } => 3.5,
     }
 }
 
@@ -600,6 +775,21 @@ pub fn shadow(reference: ModelRef) -> [f32; 2] {
         ModelRef::MagmaCube { .. } => [0.25, 1.0],
         ModelRef::Bat { .. } => [0.25, 1.0],
         ModelRef::Silverfish | ModelRef::EnderMite => [0.3, 1.0],
+        // The exotic families' registrations: the horse's `0.75F` (`RenderManager.java`:197),
+        // the wolf's, ghast's, blaze's, guardian's and dragon's `0.5F`
+        // (`:146`, `RenderGhast` ctor `:15`, `RenderBlaze` ctor `:13`,
+        // `RenderGuardian` ctor `:26`, `RenderDragon` ctor `:27`), the ocelot's `0.4F`
+        // (`:148`), the rabbit's `0.3F` (`:149`) and the wither's `1.0F`
+        // (`RenderWither` ctor `:17`).
+        ModelRef::Horse { .. } => [0.75, 1.0],
+        ModelRef::Wolf { .. }
+        | ModelRef::Ghast { .. }
+        | ModelRef::Blaze
+        | ModelRef::Guardian { .. }
+        | ModelRef::EnderDragon => [0.5, 1.0],
+        ModelRef::Ocelot { .. } => [0.4, 1.0],
+        ModelRef::Rabbit { .. } => [0.3, 1.0],
+        ModelRef::Wither { .. } => [1.0, 1.0],
     }
 }
 
@@ -628,6 +818,32 @@ pub fn render_scale(reference: ModelRef) -> f32 {
         // (`RenderSlime.preRenderCallback`:32-38) — [`cube_scale`] carries the pair while
         // one squashes.
         ModelRef::Slime { size } | ModelRef::MagmaCube { size } => f32::from(size),
+        // The horse's own type fold: the donkey draws seven eighths, the mule its
+        // ninety-two hundredths, every other type whole
+        // (`RenderHorse.preRenderCallback`:30-44). The guardian elder doubles and a third
+        // (`RenderGuardian.preRenderCallback`:166-172); the ghast's wave settles at four
+        // and a half square (`RenderGhast.preRenderCallback`:30-35); the wither's two
+        // rises as the invulnerability runs out (`RenderWither.preRenderCallback`:43-54).
+        ModelRef::Horse { variant, .. } => match variant {
+            1 => 0.87,
+            2 => 0.92,
+            _ => 1.0,
+        },
+        ModelRef::Guardian { elder } => {
+            if elder {
+                2.35
+            } else {
+                1.0
+            }
+        }
+        ModelRef::Ghast { .. } => 4.5,
+        ModelRef::Wither { invul_time } => {
+            if invul_time > 0 {
+                2.0 - f32::from(invul_time) / 220.0 * 0.5
+            } else {
+                2.0
+            }
+        }
         _ => 1.0,
     }
 }
@@ -1186,6 +1402,80 @@ mod tests {
             ),
             (ModelRef::Silverfish, 0.3, [0.3, 1.0], [64.0, 32.0]),
             (ModelRef::EnderMite, 0.3, [0.3, 1.0], [64.0, 32.0]),
+            // The exotic families: each class's own size (`EntityHorse.java`:91,
+            // `EntityWolf.java`:62, `EntityOcelot.java`:46, `EntityRabbit.java`:56,
+            // `EntityGhast.java`:32, the blaze's inherited default (`Entity.java`:269-270`),
+            // `EntityGuardian.java`:56, `:167`, `EntityDragon.java`:86,
+            // `EntityWither.java`:63), their shadows the renderers' registrations
+            // (`RenderManager.java`:142-166) and their sheets each class's own square
+            // (`ModelHorse.java`:67-68, `ModelGuardian.java`:18-19, `ModelWither.java`:15-16,
+            // `ModelDragon.java`:49-50).
+            (
+                ModelRef::Horse {
+                    variant: 0,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                1.6,
+                [0.75, 1.0],
+                [128.0, 128.0],
+            ),
+            (
+                ModelRef::Wolf {
+                    tamed: false,
+                    collar: 0,
+                    angry: false,
+                },
+                0.8,
+                [0.5, 1.0],
+                [64.0, 32.0],
+            ),
+            (
+                ModelRef::Ocelot {
+                    variant: 0,
+                    child: false,
+                },
+                0.7,
+                [0.4, 1.0],
+                [64.0, 32.0],
+            ),
+            (
+                ModelRef::Rabbit {
+                    variant: 0,
+                    child: false,
+                },
+                0.7,
+                [0.3, 1.0],
+                [64.0, 32.0],
+            ),
+            (
+                ModelRef::Ghast { shooting: false },
+                4.0,
+                [0.5, 1.0],
+                [64.0, 32.0],
+            ),
+            (ModelRef::Blaze, 1.8, [0.5, 1.0], [64.0, 32.0]),
+            (
+                ModelRef::Guardian { elder: false },
+                0.85,
+                [0.5, 1.0],
+                [64.0, 64.0],
+            ),
+            (
+                ModelRef::Guardian { elder: true },
+                1.9975,
+                [0.5, 1.0],
+                [64.0, 64.0],
+            ),
+            (ModelRef::EnderDragon, 8.0, [0.5, 1.0], [256.0, 256.0]),
+            (
+                ModelRef::Wither { invul_time: 0 },
+                3.5,
+                [1.0, 1.0],
+                [64.0, 64.0],
+            ),
         ];
         for (reference, height_wanted, shadow_wanted, size_wanted) in cases {
             assert_eq!(height(reference), height_wanted, "{reference:?}'s height");
@@ -1226,12 +1516,103 @@ mod tests {
             (ModelRef::Bat { hanging: false }, &crawlers::MODEL_BAT),
             (ModelRef::Silverfish, &crawlers::MODEL_SILVERFISH),
             (ModelRef::EnderMite, &crawlers::MODEL_ENDERMITE),
+            // The exotic families draw their own tables (`RenderManager.java`:197-214).
+            (
+                ModelRef::Horse {
+                    variant: 0,
+                    colour: 0,
+                    markings: 0,
+                    saddle: false,
+                    armour: 0,
+                },
+                &exotics::MODEL_HORSE,
+            ),
+            (
+                ModelRef::Wolf {
+                    tamed: false,
+                    collar: 0,
+                    angry: false,
+                },
+                &exotics::MODEL_WOLF,
+            ),
+            (
+                ModelRef::Ocelot {
+                    variant: 0,
+                    child: false,
+                },
+                &exotics::MODEL_OCELOT,
+            ),
+            (
+                ModelRef::Rabbit {
+                    variant: 0,
+                    child: false,
+                },
+                &exotics::MODEL_RABBIT,
+            ),
+            (ModelRef::Ghast { shooting: false }, &exotics::MODEL_GHAST),
+            (ModelRef::Blaze, &exotics::MODEL_BLAZE),
+            (
+                ModelRef::Guardian { elder: false },
+                &exotics::MODEL_GUARDIAN,
+            ),
+            (ModelRef::EnderDragon, &exotics::MODEL_DRAGON),
+            (ModelRef::Wither { invul_time: 0 }, &exotics::MODEL_WITHER),
         ] {
             assert!(
                 std::ptr::eq(model_for(reference), table),
                 "{reference:?} draws its own table"
             );
         }
+        // The exotic scales: the horse's type fold, the guardian elder's doubling, the
+        // ghast's square and the wither's rise (`RenderHorse.preRenderCallback`:30-44,
+        // `RenderGuardian.preRenderCallback`:166-172, `RenderGhast.preRenderCallback`:30-35,
+        // `RenderWither.preRenderCallback`:43-54).
+        assert_eq!(
+            render_scale(ModelRef::Horse {
+                variant: 1,
+                colour: 0,
+                markings: 0,
+                saddle: false,
+                armour: 0
+            }),
+            0.87
+        );
+        assert_eq!(
+            render_scale(ModelRef::Horse {
+                variant: 2,
+                colour: 0,
+                markings: 0,
+                saddle: false,
+                armour: 0
+            }),
+            0.92
+        );
+        assert_eq!(
+            render_scale(ModelRef::Horse {
+                variant: 0,
+                colour: 0,
+                markings: 0,
+                saddle: false,
+                armour: 0
+            }),
+            1.0
+        );
+        assert_eq!(render_scale(ModelRef::Guardian { elder: true }), 2.35);
+        assert_eq!(render_scale(ModelRef::Guardian { elder: false }), 1.0);
+        assert_eq!(render_scale(ModelRef::Ghast { shooting: false }), 4.5);
+        assert_eq!(render_scale(ModelRef::Wither { invul_time: 0 }), 2.0);
+        assert_eq!(
+            render_scale(ModelRef::Wither { invul_time: 11 }),
+            2.0 - 11.0 / 220.0 * 0.5
+        );
+        assert_eq!(
+            render_scale(ModelRef::Wolf {
+                tamed: true,
+                collar: 14,
+                angry: false
+            }),
+            1.0
+        );
     }
 
     #[test]
@@ -1241,7 +1622,10 @@ mod tests {
         // `RenderVillager.java`:11-16, `RenderWitch.java`:11, `RenderGiantZombie.java`:13,
         // `RenderSnowMan.java`:10, `RenderIronGolem.java`:11, `RenderPig.java`:10,
         // `RenderCow.java`:9, `RenderSheep.java`:10, `RenderMooshroom.java`:10.
-        assert_eq!(textures(ModelRef::Zombie), ["entity/zombie/zombie.png"]);
+        assert_eq!(
+            textures(ModelRef::Zombie),
+            ["entity/zombie/zombie.png", "entity/zombie_pigman.png"]
+        );
         assert_eq!(
             textures(ModelRef::ZombieVillager),
             ["entity/zombie/zombie_villager.png"]
@@ -1314,6 +1698,105 @@ mod tests {
         );
         assert_eq!(textures(ModelRef::Silverfish), ["entity/silverfish.png"]);
         assert_eq!(textures(ModelRef::EnderMite), ["entity/endermite.png"]);
+        // The exotic families carry their whole sheet sets: the horse's four type sheets,
+        // seven colours, four markings and three armours in one list
+        // (`RenderHorse.getEntityTexture`:51-78, `EntityHorse.java`:53-58), the wolf's
+        // coats and collar (`RenderWolf.getEntityTexture`:46-49,
+        // `LayerWolfCollar.java`:16), the ocelot's and rabbit's coats
+        // (`RenderOcelot.getEntityTexture`:23-40, `RenderRabbit.getEntityTexture`:41-62`),
+        // the ghast's shooting sheet (`RenderGhast.getEntityTexture`:21-24), the
+        // guardian's elder sheet (`RenderGuardian.getEntityTexture`:177-180) and the
+        // wither's flicker sheet (`RenderWither.getEntityTexture`:33-37).
+        assert_eq!(
+            textures(ModelRef::Horse {
+                variant: 0,
+                colour: 0,
+                markings: 0,
+                saddle: false,
+                armour: 0
+            }),
+            [
+                "entity/horse/horse_white.png",
+                "entity/horse/horse_creamy.png",
+                "entity/horse/horse_chestnut.png",
+                "entity/horse/horse_brown.png",
+                "entity/horse/horse_black.png",
+                "entity/horse/horse_gray.png",
+                "entity/horse/horse_darkbrown.png",
+                "entity/horse/donkey.png",
+                "entity/horse/mule.png",
+                "entity/horse/horse_zombie.png",
+                "entity/horse/horse_skeleton.png",
+                "entity/horse/horse_markings_white.png",
+                "entity/horse/horse_markings_whitefield.png",
+                "entity/horse/horse_markings_whitedots.png",
+                "entity/horse/horse_markings_blackdots.png",
+                "entity/horse/armor/horse_armor_iron.png",
+                "entity/horse/armor/horse_armor_gold.png",
+                "entity/horse/armor/horse_armor_diamond.png"
+            ]
+        );
+        assert_eq!(
+            textures(ModelRef::Wolf {
+                tamed: false,
+                collar: 0,
+                angry: false
+            }),
+            [
+                "entity/wolf/wolf.png",
+                "entity/wolf/wolf_tame.png",
+                "entity/wolf/wolf_angry.png",
+                "entity/wolf/wolf_collar.png"
+            ]
+        );
+        assert_eq!(
+            textures(ModelRef::Ocelot {
+                variant: 0,
+                child: false
+            }),
+            [
+                "entity/cat/ocelot.png",
+                "entity/cat/black.png",
+                "entity/cat/red.png",
+                "entity/cat/siamese.png"
+            ]
+        );
+        assert_eq!(
+            textures(ModelRef::Rabbit {
+                variant: 0,
+                child: false
+            }),
+            [
+                "entity/rabbit/brown.png",
+                "entity/rabbit/white.png",
+                "entity/rabbit/black.png",
+                "entity/rabbit/white_splotched.png",
+                "entity/rabbit/gold.png",
+                "entity/rabbit/salt.png",
+                "entity/rabbit/toast.png",
+                "entity/rabbit/caerbannog.png"
+            ]
+        );
+        assert_eq!(
+            textures(ModelRef::Ghast { shooting: true }),
+            ["entity/ghast/ghast.png", "entity/ghast/ghast_shooting.png"]
+        );
+        assert_eq!(textures(ModelRef::Blaze), ["entity/blaze.png"]);
+        assert_eq!(
+            textures(ModelRef::Guardian { elder: true }),
+            ["entity/guardian.png", "entity/guardian_elder.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::EnderDragon),
+            ["entity/enderdragon/dragon.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::Wither { invul_time: 0 }),
+            [
+                "entity/wither/wither.png",
+                "entity/wither/wither_invulnerable.png"
+            ]
+        );
         // The professions pick their sheets (`RenderVillager.getEntityTexture`:32-54); any
         // value off the wire falls back to the plain villager sheet, the source's default.
         let sheet = |profession| match textures(ModelRef::Villager {
@@ -1427,6 +1910,38 @@ mod tests {
         assert_eq!(death_rotation(ModelRef::CaveSpider), 180.0);
         assert_eq!(death_rotation(ModelRef::Silverfish), 180.0);
         assert_eq!(death_rotation(ModelRef::EnderMite), 180.0);
+        // The exotic families: none overrides the base pair, and the dragon's own corpse
+        // path still turns the base ninety (`RenderDragon.rotateCorpse`:41-52 over
+        // `RendererLivingEntity.getDeathMaxRotation`:473-476).
+        for kind in [
+            ModelRef::Horse {
+                variant: 0,
+                colour: 0,
+                markings: 0,
+                saddle: false,
+                armour: 0,
+            },
+            ModelRef::Wolf {
+                tamed: false,
+                collar: 0,
+                angry: false,
+            },
+            ModelRef::Ocelot {
+                variant: 0,
+                child: false,
+            },
+            ModelRef::Rabbit {
+                variant: 0,
+                child: false,
+            },
+            ModelRef::Ghast { shooting: false },
+            ModelRef::Blaze,
+            ModelRef::Guardian { elder: false },
+            ModelRef::EnderDragon,
+            ModelRef::Wither { invul_time: 0 },
+        ] {
+            assert_eq!(death_rotation(kind), 90.0, "{kind:?} tilts the base ninety");
+        }
     }
 
     #[test]
