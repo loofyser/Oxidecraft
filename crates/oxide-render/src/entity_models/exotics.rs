@@ -23,17 +23,25 @@
 //! the age (`ModelGhast.setRotationAngles`:39-45); the blaze's rods orbit its head by
 //! rotation point, never an angle (`ModelBlaze.setRotationAngles`:43-77); the guardian's
 //! spines and tail ride their own counters (`ModelGuardian.setRotationAngles`:70-135); the
-//! dragon's wings flap on the interpolated `animTime`, its neck and tail a chain of ten-unit
-//! steps (`ModelDragon.render`:138-241); the wither's rib cage swings its middle rib with
-//! the age and drops its third from the second (`ModelWither.setRotationAngles`:64-72).
+//! dragon's wings flap on the interpolated `animTime` — advanced from the frame's age at
+//! the at-rest rate — its whole model riding the flight's own translate and pitch; its
+//! neck and tail a chain of ten-unit steps (`ModelDragon.render`:138-241); the wither's
+//! rib cage swings its middle rib with the age and drops its third from the second
+//! (`ModelWither.setRotationAngles`:64-72).
 //!
 //! The frames carry less than the classes read, and each pose pins the rest where a frame
 //! input is missing: the horse's eating, rearing and mouth fractions pin off (the head keeps
 //! its table lean); the wolf's feeding interest and wet-shake angles pin off; the ocelot's
 //! sprint state bounds to sitting or resting; the rabbit's hop progress is carried; the
 //! guardian's spine extension and tail phase are carried; the dragon's movement ring holds
-//! at zero, so its chain is the resting one and its corpse lean zero; the wither's side
-//! heads pin upright.
+//! at zero, so its chain is the resting one and its corpse lean zero — its corpse path the
+//! ring's own turn through that rest, the yaw turn and the pitch lean both pinned (no
+//! `180 - body_yaw`; `RenderDragon.rotateCorpse`:33-39 replaces it), with the block-back
+//! step — its flight translate and pitch riding the model's own level, ahead of every part
+//! (`ModelDragon.render`:144-147), and its flight clock advancing the frame's age at the
+//! at-rest rate, a fifth of a tick (`EntityDragon.onLivingUpdate`:158-167; the slowed
+//! flag's halving, the motion scale and the AI-disabled `0.5` lock are not carried); the
+//! wither's side heads pin upright.
 
 use super::{Box, Model, Part, Pose, PoseExtra, Rot};
 use std::f32::consts::{FRAC_PI_6, PI};
@@ -2741,7 +2749,7 @@ pub fn pose_horse(pose: &Pose, out: &mut [Rot]) {
     let f10 = (swing * 0.6662 + PI).cos();
     let f11 = f10 * 0.8 * amount;
 
-    // The head and the neck, ears and mane that ride its stride (`:403-427`).
+    // The head and the neck, ears and mane that ride its stride (`:395-400`, `:406-437`).
     let head_point = [0.0, 4.0, -10.0];
     let head_angles = [FRAC_PI_6 + f4, f3 * (PI / 180.0), 0.0];
     out[horse::HEAD].point = head_point;
@@ -2757,12 +2765,12 @@ pub fn pose_horse(pose: &Pose, out: &mut [Rot]) {
         out[slot].point = head_point;
         out[slot].angles = head_angles;
     }
-    // The two mouths (`:429-443`).
+    // The two mouths (`:411-428`).
     out[horse::MUZZLE_UPPER].point = [0.0, 0.02, 0.02];
     out[horse::MUZZLE_UPPER].angles = [0.0, 0.0, 0.0];
     out[horse::MUZZLE_LOWER].point = [0.0, 0.0, 0.0];
     out[horse::MUZZLE_LOWER].angles = [0.0, 0.0, 0.0];
-    // The tail (`:445-459`): the mounting droop, clamped at level.
+    // The tail (`:546-551`, `:569-571`): the mounting droop, clamped at level.
     let f12 = {
         let droop = -1.3089 + amount * 1.5;
         if droop > 0.0 { 0.0 } else { droop }
@@ -2773,7 +2781,7 @@ pub fn pose_horse(pose: &Pose, out: &mut [Rot]) {
     out[horse::TAIL_BASE].angles = [f12, 0.0, 0.0];
     out[horse::TAIL_MIDDLE].angles = [f12, 0.0, 0.0];
     out[horse::TAIL_TIP].angles = [-0.2618 + f12, 0.0, 0.0];
-    // The legs (`:461-541`): the rear pair half the swing, the front pair the whole, hooves
+    // The legs (`:445-478`): the rear pair half the swing, the front pair the whole, hooves
     // hanging from their shins and the shins' pivots following.
     let bl_swing = -f10 * 0.5 * amount;
     let br_swing = f10 * 0.5 * amount;
@@ -2807,8 +2815,8 @@ pub fn pose_horse(pose: &Pose, out: &mut [Rot]) {
     let fr_z = -8.0 + (3.0 * PI / 2.0 - f11).cos() * 7.0;
     out[horse::FRONT_RIGHT_SHIN].point = [-4.0, fr_y, fr_z];
     out[horse::FRONT_RIGHT_HOOF].point = [-4.0, fr_y, fr_z];
-    // The mule's chests and the ridden gear (`:543-572`): the chests pull inward with the
-    // swing, the saddle's ropes follow the gait.
+    // The mule's chests and the ridden gear (`:438-439`, `:480-542`): the chests pull
+    // inward with the swing, the saddle's ropes follow the gait.
     out[horse::MULE_LEFT_CHEST].angles[0] = f11 / 5.0;
     out[horse::MULE_RIGHT_CHEST].angles[0] = -f11 / 5.0;
     if saddle {
@@ -2828,7 +2836,7 @@ pub fn pose_horse(pose: &Pose, out: &mut [Rot]) {
             out[slot].angles = [rope_x, 0.0, -rope_z];
         }
     }
-    // The face gear rides the head (`:403-427`).
+    // The face gear rides the head (`:501-520`).
     for slot in [
         horse::FACE_ROPES,
         horse::LEFT_FACE_METAL,
@@ -3137,7 +3145,29 @@ pub fn pose_guardian(pose: &Pose, out: &mut [Rot]) {
     out[guardian::TAIL_2].point = [0.5, 0.5, 6.0];
 }
 
-/// The dragon's pose (`ModelDragon.render`:138-241).
+/// The flap wave `f1` the dragon's flight reads off the interpolated clock
+/// (`ModelDragon.render`:141-142): one plus the sine a radian late, squared, twice
+/// itself and a twentieth.
+fn dragon_wave(anim_time: f32) -> f32 {
+    let raw = (anim_time * PI * 2.0 - 1.0).sin() + 1.0;
+    (raw * raw + raw * 2.0) * 0.05
+}
+
+/// The dragon's model-level flight transform (`ModelDragon.render`:144-147): the whole
+/// model's translate `(0, f1 - 2, -3)` in blocks and its pitch `f1 * 2` in degrees,
+/// composed by the draw chain ahead of every part — the source writes both once at the
+/// model's own level, never on a part.
+pub fn dragon_flight(pose: &Pose) -> ([f32; 3], f32) {
+    let f1 = dragon_wave(match pose.extra {
+        PoseExtra::Dragon { anim_time } => anim_time,
+        _ => 0.0,
+    });
+    ([0.0, f1 - 2.0, -3.0], f1 * 2.0)
+}
+
+/// The dragon's pose (`ModelDragon.render`:138-241). The flight's model-level translate
+/// and pitch (`:144-147`) are no part's own — the draw chain carries them ahead of every
+/// part ([`dragon_flight`]).
 pub fn pose_dragon(pose: &Pose, out: &mut [Rot]) {
     let f = match pose.extra {
         PoseExtra::Dragon { anim_time } => anim_time,
@@ -3147,9 +3177,7 @@ pub fn pose_dragon(pose: &Pose, out: &mut [Rot]) {
     // neck and tail chains are not carried and pin at zero.
     let f8 = f * PI * 2.0;
     out[dragon::JAW].angles[0] = (f8.sin() + 1.0) * 0.2;
-    let raw = (f8 - 1.0).sin() + 1.0;
-    let f1 = (raw * raw + raw * 2.0) * 0.05;
-    out[dragon::BODY].offset = [0.0, f1 - 2.0, -3.0];
+    let f1 = dragon_wave(f);
     // The wings (`:196-207`): the beat and the fold, the right side the mirror.
     let w = [0.125 - f8.cos() * 0.2, 0.25, (f8.sin() + 0.125) * 0.8];
     out[dragon::WING_LEFT].angles = w;
@@ -4526,13 +4554,13 @@ mod tests {
 
     #[test]
     fn the_dragon_wing_flap_reads_the_interpolated_anim_time() {
+        let pose_at = |anim_time: f32| Pose {
+            extra: PoseExtra::Dragon { anim_time },
+            ..Pose::default()
+        };
         let at = |anim_time: f32| {
-            let pose = Pose {
-                extra: PoseExtra::Dragon { anim_time },
-                ..Pose::default()
-            };
             let mut out = MODEL_DRAGON.rest();
-            pose_dragon(&pose, &mut out);
+            pose_dragon(&pose_at(anim_time), &mut out);
             out
         };
         // A quarter of the flap's turn: the wings level, the tips at their extremes and
@@ -4568,8 +4596,9 @@ mod tests {
             ((PI / 2.0_f32).sin() + 1.0) * 0.2
         ));
         // At the wave's start the wings fold to their own extremes, the jaw half opens and
-        // the whole flight rides the model's own bob two blocks short and three back
-        // (`:144-146`, `:193-196`).
+        // the flight's own model-level translate and pitch read the same wave (`:144-146`,
+        // `:193-196`): the flight is no part's own offset — it rides the draw chain ahead
+        // of every part — and its values are the model's own.
         let zero = at(0.0);
         assert!(close(zero[dragon::WING_LEFT].angles[0], -0.075));
         assert!(close(zero[dragon::WING_LEFT].angles[2], 0.1));
@@ -4578,11 +4607,23 @@ mod tests {
             -((f32::sin(2.0) + 0.5) * 0.75)
         ));
         assert!(close(zero[dragon::JAW].angles[0], 0.2));
-        assert_eq!(
-            zero[dragon::BODY].offset,
-            [0.0, 0.017_109_5 - 2.0, -3.0],
-            "the flap's own translate (`:146`)"
-        );
+        for (slot, rot) in zero.iter().enumerate() {
+            assert_eq!(
+                rot.offset, [0.0; 3],
+                "part {slot} carries no offset of its own: the flight is model-level (`ModelDragon.render`:144-147)"
+            );
+        }
+        // The flight's own model values at the wave's start and a quarter on: the
+        // translate the chain composes ahead of every part and the pitch it turns by
+        // (`:144-147`).
+        let start = dragon_flight(&pose_at(0.0));
+        assert!(close(start.0[0], 0.0));
+        assert!(close(start.0[1], 0.017_109_5 - 2.0));
+        assert!(close(start.0[2], -3.0));
+        assert!(close(start.1, 0.034_218_95));
+        let quarter_flight = dragon_flight(&pose_at(0.25));
+        assert!(close(quarter_flight.0[1], 0.272_656_8 - 2.0));
+        assert!(close(quarter_flight.1, 0.545_313_6));
         // The neck chain steps ten units a spine (`:166-172`): the first pair land on the
         // source's own chain values.
         assert_eq!(zero[dragon::NECK_0].point, [0.0, 20.0, -12.0]);
@@ -4778,6 +4819,7 @@ mod tests {
             ModelRef::Ocelot {
                 variant: 1,
                 child: false,
+                tamed: false,
             },
             ModelRef::Rabbit {
                 variant: 0,

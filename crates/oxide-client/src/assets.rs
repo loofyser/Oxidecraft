@@ -481,6 +481,7 @@ mod tests {
             ModelRef::Ocelot {
                 variant: 0,
                 child: false,
+                tamed: false,
             },
             ModelRef::Rabbit {
                 variant: 0,

@@ -214,8 +214,10 @@ pub enum PoseExtra {
     /// The dragon's own: the interpolated `animTime` its whole flight reads
     /// (`ModelDragon.render`:142-238).
     Dragon {
-        /// The interpolated `animTime`: advancing `0.2` a tick at rest, locked at `0.5`
-        /// under the AI-disabled flag (`EntityDragon.onLivingUpdate`).
+        /// The wing clock: the frame's age advanced at the at-rest rate of `0.2` a tick
+        /// (`EntityDragon.onLivingUpdate`:158-167; the view derives it from the frame's
+        /// age). The slowed flag's halving, the motion factor and the AI-disabled `0.5`
+        /// lock are not carried by the frames, so the clock runs at rest.
         anim_time: f32,
     },
 }
@@ -795,10 +797,9 @@ pub fn shadow(reference: ModelRef) -> [f32; 2] {
 
 /// The pre-render scale the class scales its model by: [`RENDER_SCALE`] for the player, the
 /// villager and the witch (`RenderPlayer`'s, `RenderVillager`'s and `RenderWitch`'s own
-/// callbacks; the mob renderers off `RenderLiving` never scale), the villager child's own
-/// half of it (`RenderVillager.preRenderCallback`:66), and the giant's sixfold one
-/// (`RenderGiantZombie.preRenderCallback`:44, registered with `6.0F` at
-/// `RenderManager.java`:162).
+/// callbacks), the villager child's own half of it (`RenderVillager.preRenderCallback`:66),
+/// and the giant's sixfold one (`RenderGiantZombie.preRenderCallback`:44, registered with
+/// `6.0F` at `RenderManager.java`:162); every other scaling class rides its own arm below.
 pub fn render_scale(reference: ModelRef) -> f32 {
     match reference {
         ModelRef::Player { .. } | ModelRef::Witch => RENDER_SCALE,
@@ -844,6 +845,10 @@ pub fn render_scale(reference: ModelRef) -> f32 {
                 2.0
             }
         }
+        // The tamed cat folds to eight tenths (`RenderOcelot.preRenderCallback`:46-54); the
+        // wild cat draws whole.
+        ModelRef::Ocelot { tamed: true, .. } => 0.8,
+        ModelRef::Ocelot { tamed: false, .. } => 1.0,
         _ => 1.0,
     }
 }
@@ -1436,6 +1441,7 @@ mod tests {
                 ModelRef::Ocelot {
                     variant: 0,
                     child: false,
+                    tamed: false,
                 },
                 0.7,
                 [0.4, 1.0],
@@ -1539,6 +1545,7 @@ mod tests {
                 ModelRef::Ocelot {
                     variant: 0,
                     child: false,
+                    tamed: false,
                 },
                 &exotics::MODEL_OCELOT,
             ),
@@ -1610,6 +1617,24 @@ mod tests {
                 tamed: true,
                 collar: 14,
                 angry: false
+            }),
+            1.0
+        );
+        // The tamed cat folds to its renderer's eight tenths
+        // (`RenderOcelot.preRenderCallback`:46-54); the wild cat draws whole.
+        assert_eq!(
+            render_scale(ModelRef::Ocelot {
+                variant: 2,
+                child: false,
+                tamed: true
+            }),
+            0.8
+        );
+        assert_eq!(
+            render_scale(ModelRef::Ocelot {
+                variant: 0,
+                child: false,
+                tamed: false
             }),
             1.0
         );
@@ -1752,7 +1777,8 @@ mod tests {
         assert_eq!(
             textures(ModelRef::Ocelot {
                 variant: 0,
-                child: false
+                child: false,
+                tamed: false
             }),
             [
                 "entity/cat/ocelot.png",
@@ -1929,6 +1955,7 @@ mod tests {
             ModelRef::Ocelot {
                 variant: 0,
                 child: false,
+                tamed: false,
             },
             ModelRef::Rabbit {
                 variant: 0,

@@ -3796,6 +3796,7 @@ fn the_exotic_quadrupeds_draw_their_own_silhouettes() {
             ModelRef::Ocelot {
                 variant: 2,
                 child: false,
+                tamed: false,
             },
             "entity/cat/ocelot.png",
             DrawExtra::None,
@@ -3812,6 +3813,7 @@ fn the_exotic_quadrupeds_draw_their_own_silhouettes() {
             ModelRef::Ocelot {
                 variant: 2,
                 child: false,
+                tamed: false,
             },
             "entity/cat/red.png",
             DrawExtra::None,

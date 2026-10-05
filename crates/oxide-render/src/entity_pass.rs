@@ -162,12 +162,16 @@ pub enum ModelRef {
         angry: bool,
     },
     /// An ocelot: `ModelOcelot`'s table (`ModelOcelot.java`:36-70`) under the cat type's
-    /// sheet (`RenderOcelot.getEntityTexture`:23-42).
+    /// sheet (`RenderOcelot.getEntityTexture`:23-40) and the taming's own scale
+    /// (`RenderOcelot.preRenderCallback`:46-54).
     Ocelot {
         /// The cat type: `0` wild, `1..4` the tamed coats.
         variant: u8,
         /// Whether the draw is a child (`ModelOcelot.render`:79-98).
         child: bool,
+        /// Whether the cat is tamed — the tamed cat folds to its renderer's eight
+        /// tenths (`RenderOcelot.preRenderCallback`:46-54).
+        tamed: bool,
     },
     /// A rabbit: `ModelRabbit`'s table (`ModelRabbit.java`:49-115`) under the variant's
     /// sheet (`RenderRabbit.getEntityTexture`:29-64).
@@ -1050,8 +1054,9 @@ impl EntityPass {
 /// The body chain for a draw: the source's `renderLivingAt` composition — the interpolated
 /// position, the class's own rotate-corpse shift (the bat's bob and the squid's translate
 /// pair, `RenderBat.rotateCorpse`:39, `RenderSquid.rotateCorpse`:29-33),
-/// the `180 - body_yaw` turn, the death tilt at the renderer's own largest angle with the
-/// class's extra roll, the
+/// the `180 - body_yaw` turn — the dragon's own override replaces it with the movement
+/// ring's pinned turn and its block-back step (`RenderDragon.rotateCorpse`:33-39) — the
+/// death tilt at the renderer's own largest angle with the class's extra roll, the
 /// `(-1, -1, 1)` flip, the class's pre-render scale (the cubes' squash pair riding it
 /// per-axis, `RenderSlime.preRenderCallback`:34-37), the `-1.5078125` model drop and the
 /// model's own sneak lift, then the model's 1/16 units (`Render.doRender`, the renderer's
@@ -1071,14 +1076,35 @@ fn body_chain(draw: &EntityDraw) -> Mat4 {
         Some([x, y, z]) => Vec3::new(x, y, z),
         None => Vec3::splat(entity_models::render_scale(draw.model)),
     };
+    // The class's own rotate-corpse turn: the base `180 - body_yaw` turn every class
+    // takes, save the dragon — its override replaces the base turn outright
+    // (`RenderDragon.rotateCorpse`:33-39) — the movement ring's yaw turn and its pitch
+    // lean (`f1 * 10`) both pin (no frame input carries the ring), leaving the
+    // override's block-back step in the turn's place, in front of the death tilt.
+    let turn = match draw.model {
+        ModelRef::EnderDragon => Mat4::from_translation(Vec3::new(0.0, 0.0, 1.0)),
+        _ => Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians()),
+    };
+    // The model's own level transform in front of its parts (`ModelDragon.render`:144-147):
+    // the dragon's flight — the whole model's translate, then its pitch, on the flap wave —
+    // composes here, ahead of every part and its children. The ghast's per-part spread
+    // cannot carry this one: the dragon's parts nest (head, wings and legs hold children),
+    // so every part's own copy would land the flight twice, and the source composes both
+    // terms as the one model-level matrix ahead of the parts.
+    let (flight, pitch) = match draw.model {
+        ModelRef::EnderDragon => entity_models::exotics::dragon_flight(&draw.pose),
+        _ => ([0.0; 3], 0.0),
+    };
     Mat4::from_translation(position)
         * Mat4::from_translation(Vec3::new(0.0, shift, 0.0))
-        * Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians())
+        * turn
         * Mat4::from_rotation_z(tilt.to_radians())
         * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
         * Mat4::from_scale(scale)
         * Mat4::from_translation(Vec3::new(0.0, MODEL_DROP, 0.0))
         * Mat4::from_translation(Vec3::new(0.0, lift, 0.0))
+        * Mat4::from_translation(Vec3::from(flight))
+        * Mat4::from_rotation_x(pitch.to_radians())
         * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
 }
 
@@ -1759,6 +1785,46 @@ mod tests {
         assert!(
             close(origin.into(), [0.0, 0.807_812_5, 0.0]),
             "the dying squid's origin at {origin:?} against [0.0, 0.8078125, 0.0]"
+        );
+    }
+
+    #[test]
+    fn the_dragon_corpse_drops_the_base_turn_and_steps_a_block_back() {
+        // `RenderDragon.rotateCorpse`:33-39 replaces the base's `180 - body_yaw` turn
+        // outright: the movement ring's turn through its rest — no frame input carries the
+        // ring, so its yaw turn and its pitch lean both pin — and the block-back step.
+        // Only the base's death tilt survives the override.
+        let dragon = EntityDraw {
+            pose: entity_models::Pose {
+                extra: PoseExtra::Dragon { anim_time: 0.0 },
+                ..entity_models::Pose::default()
+            },
+            ..mob_draw(ModelRef::EnderDragon)
+        };
+        // The model's origin: the flip and the drop land it three and a half blocks up
+        // (1.5078125 + 2 - 0.0171094) and the flight and the step leave it two blocks back.
+        let origin = body_chain(&dragon).transform_point3(Vec3::ZERO);
+        assert!(
+            close(origin.into(), [0.0, 3.490_703, -2.0]),
+            "the dragon's origin at {origin:?} against [0.0, 3.490703, -2.0]"
+        );
+        // A point on the model's +x: the base turn would swing it to the other side; the
+        // ring's pinned turn leaves it, so only the flip's mirror shows.
+        let side = body_chain(&dragon).transform_point3(Vec3::new(1.0, 0.0, 0.0));
+        assert!(
+            close(side.into(), [-0.062_5, 3.490_703, -2.0]),
+            "the dragon's side at {side:?} against [-0.0625, 3.490703, -2.0]"
+        );
+        // The death tilt survives: a dying dragon's top point (0, -8, 0) lies down the
+        // flank under the ring's step and the flight's own frame.
+        let dying = EntityDraw {
+            death: 1.0,
+            ..dragon
+        };
+        let top = body_chain(&dying).transform_point3(Vec3::new(0.0, -8.0, 0.0));
+        assert!(
+            close(top.into(), [-3.990_703, 0.0, -2.000_298_6]),
+            "the dying dragon's top at {top:?} against [-3.990703, 0.0, -2.0002986]"
         );
     }
 

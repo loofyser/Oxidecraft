@@ -220,6 +220,18 @@ fn draw_for(
         }
     };
 
+    // The dragon's flight clock rides the frame's age at the source's at-rest rate
+    // (`EntityDragon.onLivingUpdate`:158-167): the wing wave advances a fifth of a tick.
+    // The slowed flag's halving, the motion factor and the AI-disabled `0.5` lock are not
+    // carried by the frames, so the clock runs at the at-rest rate (the exotics ledger
+    // records the same pins).
+    let pose_extra = match pose_extra {
+        PoseExtra::Dragon { .. } => PoseExtra::Dragon {
+            anim_time: (frame.age as f32 + partial) * 0.2,
+        },
+        other => other,
+    };
+
     // A child's limb swing runs three times as fast before the pose reads it
     // (`RendererLivingEntity.doRender`:140-143).
     let mut limb_swing = frame.limb_swing - frame.limb_swing_amount * (1.0 - partial);
@@ -549,13 +561,14 @@ fn mob_draw(
             EntityKind::Ozelot,
             MobExtra::Ocelot {
                 variant,
-                tamed: _,
+                tamed,
                 sitting,
             },
         ) => (
             ModelRef::Ocelot {
                 variant: *variant,
                 child: false,
+                tamed: *tamed,
             },
             TextureRef::Named(oxide_render::entity_models::exotics::ocelot_sheet(*variant)),
             DrawExtra::None,
@@ -1635,6 +1648,7 @@ mod tests {
                 ModelRef::Ocelot {
                     variant: 0,
                     child: false,
+                    tamed: false,
                 },
                 "entity/cat/ocelot.png",
             ),
@@ -1642,6 +1656,7 @@ mod tests {
                 ModelRef::Ocelot {
                     variant: 2,
                     child: false,
+                    tamed: true,
                 },
                 "entity/cat/red.png",
             ),
@@ -1649,6 +1664,7 @@ mod tests {
                 ModelRef::Ocelot {
                     variant: 3,
                     child: false,
+                    tamed: true,
                 },
                 "entity/cat/siamese.png",
             ),
@@ -1788,7 +1804,39 @@ mod tests {
                 tail_phase: 0.0
             }
         );
-        assert_eq!(draws[24].pose.extra, PoseExtra::Dragon { anim_time: 0.0 });
+        assert_eq!(draws[24].pose.extra, PoseExtra::Dragon { anim_time: 20.0 });
+    }
+
+    /// The dragon's wing clock (`PoseExtra::Dragon`): the frames carry the age, and the
+    /// view advances the clock at the source's at-rest rate, `0.2` a tick
+    /// (`EntityDragon.onLivingUpdate`:158-167).
+    #[test]
+    fn the_dragon_wing_clock_advances_with_the_frames_age() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        let mut frame = mob_frame(
+            1,
+            EntityKind::EnderDragon,
+            EntityExtra::Mob(MobExtra::Other),
+        );
+        frame.age = 40;
+        view.observe(vec![frame], t0);
+        let anim_time = |draws: Vec<EntityDraw>| match draws[0].pose.extra {
+            PoseExtra::Dragon { anim_time } => anim_time,
+            _ => panic!("the dragon's draw carries its flight clock"),
+        };
+        // Forty ticks at the at-rest rate: eight waves in.
+        let anim = anim_time(draws_at(&view, t0, Duration::ZERO));
+        assert!(
+            (anim - 8.0).abs() < 1.0e-4,
+            "the clock at {anim} against 8.0"
+        );
+        // The partial tick walks the clock on with the frame's fraction.
+        let anim = anim_time(draws_at(&view, t0, TICK / 4));
+        assert!(
+            (anim - 8.05).abs() < 1.0e-4,
+            "the clock at {anim} against 8.05"
+        );
     }
 
     /// The roster's own gate: every mob §6.3's spawn-mob table names has a draw — no
