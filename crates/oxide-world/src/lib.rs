@@ -6,6 +6,7 @@ pub mod behaviour;
 pub mod biome;
 pub mod chunk;
 pub mod collision;
+pub mod entity;
 pub mod light;
 pub mod noise;
 pub mod sky;
