@@ -29,6 +29,7 @@
 mod assets;
 mod keymap;
 mod skin_worker;
+mod view;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -423,6 +424,9 @@ struct ClientApp {
     /// The skins the worker resolved, keyed by the hyphenated UUID — the map
     /// the player renderer draws from.
     skins: BTreeMap<String, SkinUpdate>,
+    /// The entity feed's own state: the latest frames, their arrival and the
+    /// draws a frame builds from them.
+    view: view::View,
     /// The skin worker's request feed, when a session was opened.
     ///
     /// Dropping it — the client drops it with the app at exit — closes the
@@ -804,6 +808,7 @@ impl ClientApp {
             camera: CameraState::default(),
             world_overlay: WorldOverlayState::default(),
             skins: BTreeMap::new(),
+            view: view::View::new(),
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
             overlay_visible,
@@ -813,12 +818,23 @@ impl ClientApp {
         })
     }
 
-    /// Drains the skin worker's updates into [`ClientApp::skins`].
+    /// Drains the skin worker's updates into [`ClientApp::skins`], and uploads each
+    /// to the renderer's registry — a re-upload replaces, an absent cape clears.
     fn drain_skins(&mut self) {
         let Some(updates) = self.skin_updates.as_ref() else {
             return;
         };
-        store_skins(&mut self.skins, updates.try_iter());
+        let drained: Vec<SkinUpdate> = updates.try_iter().collect();
+        if let Some(renderer) = self.renderer.as_mut() {
+            for update in &drained {
+                renderer.set_skin(
+                    &update.uuid,
+                    update.texture.as_deref(),
+                    update.cape.as_deref(),
+                );
+            }
+        }
+        store_skins(&mut self.skins, drained);
     }
 
     /// Presents one frame, updates the title, and stops once the limit is reached.
@@ -843,6 +859,7 @@ impl ClientApp {
         };
         let mut session_ended = false;
         for event in events {
+            self.view.apply(&event);
             if let ClientEvent::PlayerList { entries } = &event {
                 if let Some(requests) = self.skin_requests.as_ref() {
                     forward_skins(requests, entries);
@@ -981,6 +998,9 @@ impl ClientApp {
                 renderer.set_fog(fog);
                 renderer.set_sky(sky);
             }
+            // The entity draws: the feed interpolated at this frame's fraction, in
+            // the feed's own order, the window's own entity skipped.
+            renderer.set_entities(self.view.entity_draws(Instant::now(), &self.skins));
         }
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
@@ -1718,6 +1738,12 @@ impl ApplicationHandler for ClientApp {
                 return;
             }
             renderer.set_sky_textures(assets.sky_textures.clone());
+            // The entity set: the shadow sprite and the two default skins, under the
+            // keys the pass's draws and the resolver name.
+            for (key, texture) in &assets.entity_textures {
+                renderer.set_entity_texture(key, texture);
+            }
+            renderer.set_default_skins(&assets.skin_wide, &assets.skin_slim);
         }
         self.window = Some(window);
     }

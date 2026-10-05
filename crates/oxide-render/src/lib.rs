@@ -4,6 +4,8 @@ pub mod atlas_texture;
 pub mod camera;
 pub mod debug_text;
 pub mod dim_pass;
+pub mod entity_models;
+pub mod entity_pass;
 pub mod fog;
 pub mod fps;
 pub mod frustum;

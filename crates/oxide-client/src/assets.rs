@@ -49,6 +49,20 @@ const MOON_PHASES: &str = "environment/moon_phases";
 /// The cloud layer's texture path.
 const CLOUDS: &str = "environment/clouds";
 
+/// The entity textures the window uploads once at startup: the entity pass's static
+/// set, keyed by its own names.
+///
+/// This milestone's set is the shadow sprite and the two default skins; the mob
+/// textures arrive with the models that draw them, each added here with the case that
+/// needs it.
+pub const ENTITY_TEXTURES: [&str; 3] = ["misc/shadow.png", "entity/steve.png", "entity/alex.png"];
+
+/// The wide default skin's key, an entry of [`ENTITY_TEXTURES`].
+pub const DEFAULT_SKIN_WIDE: &str = "entity/steve.png";
+
+/// The slim default skin's key, an entry of [`ENTITY_TEXTURES`].
+pub const DEFAULT_SKIN_SLIM: &str = "entity/alex.png";
+
 /// Errors from loading the client's assets.
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
@@ -98,8 +112,8 @@ pub enum AssetError {
     Font(#[from] FontError),
 }
 
-/// The assets one client run loads: what the session meshes with, the overlay's font, and the
-/// sky's textures.
+/// The assets one client run loads: what the session meshes with, the overlay's font,
+/// the sky's textures, and the entity set.
 #[derive(Debug)]
 pub struct ClientAssets {
     /// The atlas, the baked block models and the tint maps.
@@ -113,6 +127,12 @@ pub struct ClientAssets {
     pub sheet: Texture,
     /// The sun, the moon phase sheet and the cloud layer.
     pub sky_textures: SkyTextures,
+    /// The entity textures, keyed by the pass's names.
+    pub entity_textures: Vec<(&'static str, Texture)>,
+    /// The wide default skin, from the entity set.
+    pub skin_wide: Texture,
+    /// The slim default skin, from the entity set.
+    pub skin_slim: Texture,
 }
 
 impl ClientAssets {
@@ -147,6 +167,14 @@ impl ClientAssets {
             moon_phases: texture(&textures, MOON_PHASES)?.clone(),
             clouds: texture(&textures, CLOUDS)?.clone(),
         };
+        // The entity set: the static list's keys, and the two default skins among
+        // them, each refused (by name) rather than defaulted when the tree lacks it.
+        let mut entity_textures = Vec::with_capacity(ENTITY_TEXTURES.len());
+        for key in ENTITY_TEXTURES {
+            entity_textures.push((key, texture(&textures, key)?.clone()));
+        }
+        let skin_wide = texture(&textures, DEFAULT_SKIN_WIDE)?.clone();
+        let skin_slim = texture(&textures, DEFAULT_SKIN_SLIM)?.clone();
 
         tracing::info!(
             atlas_width = atlas.width,
@@ -166,6 +194,9 @@ impl ClientAssets {
             font,
             sheet,
             sky_textures,
+            entity_textures,
+            skin_wide,
+            skin_slim,
         })
     }
 }
@@ -192,4 +223,45 @@ fn texture<'a>(textures: &'a TextureSet, key: &'static str) -> Result<&'a Textur
 fn colormap(textures: &TextureSet, key: &'static str) -> Result<ColorMap, AssetError> {
     let map = texture(textures, key)?;
     ColorMap::from_rgba(&map.rgba).map_err(|source| AssetError::ColourMap { key, source })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The entity set's registry: the static list's own shape here, and the store's
+    //! tree behind `-- --ignored`.
+
+    use super::*;
+
+    #[test]
+    fn the_entity_set_names_the_shadow_and_the_two_default_skins() {
+        // The pass's static set: the shadow sprite first, then the two defaults, under
+        // the keys the resolver falls back to.
+        assert_eq!(
+            ENTITY_TEXTURES,
+            ["misc/shadow.png", "entity/steve.png", "entity/alex.png"]
+        );
+        assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_WIDE));
+        assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_SLIM));
+    }
+
+    /// Every key the static entity set names exists in the store's extraction tree.
+    ///
+    /// The store root is required: `OXIDECRAFT_STORE` must name it, as the other
+    /// real-tree tests require. Run with `-- --ignored`.
+    #[test]
+    #[ignore = "reads the asset store; set OXIDECRAFT_STORE and run with -- --ignored"]
+    fn the_entity_set_exists_in_the_store() {
+        let root = std::env::var_os(STORE_VAR)
+            .filter(|root| !root.is_empty())
+            .expect("OXIDECRAFT_STORE must name the store root");
+        let store = Store::open(PathBuf::from(root)).expect("the store opens");
+        let tree = Extractor::new(&store, VERSION).root();
+        let textures = TextureSet::load(&tree).expect("the texture tree loads");
+        for key in ENTITY_TEXTURES {
+            assert!(
+                textures.get(key).is_some(),
+                "the entity texture {key} is in the store"
+            );
+        }
+    }
 }

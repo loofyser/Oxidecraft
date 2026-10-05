@@ -59,6 +59,10 @@ use oxide_assets::texture::Texture;
 use oxide_render::camera::{
     Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
 };
+use oxide_render::entity_models::Pose;
+use oxide_render::entity_pass::{
+    DrawExtra, EntityDraw, EntityPass, ModelRef, TextureRef, TextureRegistry,
+};
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
@@ -2001,6 +2005,392 @@ fn a_lightmap_change_mid_frame_rewrites_the_lightmap() {
         SIZE / 2,
         noon,
         "the lightmap rewritten back to noon",
+    );
+}
+
+/// The entity cases' synthetic skin: a 64x64 sheet in one flat colour, so every face of the
+/// model reads that colour scaled only by its own shade.
+fn flat_sheet(colour: [u8; 4]) -> Texture {
+    Texture {
+        width: 64,
+        height: 64,
+        rgba: colour.repeat(64 * 64),
+    }
+}
+
+/// The entity cases' camera: level with an entity standing at the origin, looking at it from
+/// +z. Its view rotation is the identity, so the eye-space item lights are already world ones
+/// and the model's shaded faces can be computed directly.
+///
+/// The pose carries the feet position, so it sits [`EYE_HEIGHT`] below the chest's 1.06: the
+/// eye lands level with the chest face at the frame's middle.
+fn entity_camera() -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: [0.0, 1.06 - f64::from(EYE_HEIGHT), 2.5],
+            yaw: 180.0,
+            pitch: 0.0,
+        },
+        fov_degrees: DEFAULT_FOV,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
+}
+
+/// One player draw at the origin: the wide model, every part on, the rest pose, full
+/// brightness, nothing hurting or dying.
+fn player_at_origin(texture: TextureRef) -> EntityDraw {
+    EntityDraw {
+        model: ModelRef::Player {
+            slim: false,
+            parts: 0x7F,
+        },
+        position: [0.0; 3],
+        body_yaw: 0.0,
+        head_yaw: 0.0,
+        head_pitch: 0.0,
+        pose: Pose::default(),
+        texture,
+        light: 1.0,
+        hurt: 0.0,
+        death: 0.0,
+        health: Some((20.0, 20.0)),
+        extra: DrawExtra::None,
+    }
+}
+
+/// The chest's expected shade: the torso's north face met by the second item light, with the
+/// entity camera's identity view rotation.
+///
+/// The normal is `(0, 0, 1)` — the model's north face after the `180 - body_yaw` half turn —
+/// and the light is the eye-space pair rotated into the world, which for this camera is the
+/// pair itself: `(0.2, 1.0, -0.7)` and `(-0.2, 1.0, 0.7)`, normalised.
+fn chest_shade() -> f32 {
+    let light = glam::Vec3::new(-0.2, 1.0, 0.7).normalize();
+    let dot = light.z.max(0.0);
+    (0.4 + 0.6 * dot).min(1.0)
+}
+
+/// The entity texture set the cases upload: a flat skin under the given key and a shadow
+/// quad sprite that is white at half alpha, so the shadow's wash is the pass's own alpha.
+fn entity_registry(device: &wgpu::Device, queue: &wgpu::Queue, skin: [u8; 4]) -> TextureRegistry {
+    let mut registry = TextureRegistry::new(device, queue);
+    registry.set_named(device, queue, "entity/test.png", &flat_sheet(skin));
+    registry.set_named(
+        device,
+        queue,
+        "misc/shadow.png",
+        &flat_sheet([255, 255, 255, 128]),
+    );
+    registry
+}
+
+/// The bounding box of the pixels that are not the sky: `(min x, min y, max x, max y)`.
+fn silhouette(pixels: &[u8]) -> (u32, u32, u32, u32) {
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (SIZE, SIZE, 0, 0);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            if pixel(pixels, x, y) != SKY {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+/// The count of pixels two frames disagree on.
+fn changed_pixels(before: &[u8], after: &[u8]) -> usize {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(before, x, y) != pixel(after, x, y))
+        .count()
+}
+
+/// The entity pass draws the player's own boxes: the chest face comes back in the synthetic
+/// skin's colour under its shade, the silhouette stands out of the empty sky, and the shadow
+/// quad washes the ground below the feet.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_entity_pass_draws_the_player_model() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = entity_registry(&device, &queue, SKIN);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    let draw = player_at_origin(TextureRef::Named("entity/test.png"));
+
+    let empty = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, &[], &registry);
+    });
+    // Nothing drawn: every pixel is the clear sky.
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            expect_pixel_exact(&empty, x, y, SKY, "the empty entity frame");
+        }
+    }
+
+    let filled = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, &[draw], &registry);
+    });
+
+    let (min_x, min_y, max_x, max_y) = silhouette(&filled);
+    assert!(
+        max_x - min_x >= 5 && max_y - min_y >= 20,
+        "the silhouette is a standing model, got ({min_x}, {min_y})..({max_x}, {max_y})"
+    );
+
+    // The chest: the north face at the frame's middle, the skin's colour through the shade.
+    let shade = chest_shade();
+    let chest = [
+        (200.0 * shade).round() as u8,
+        (90.0 * shade).round() as u8,
+        (40.0 * shade).round() as u8,
+    ];
+    expect_pixel(&filled, SIZE / 2, SIZE / 2, chest, "the chest face");
+
+    // The shadow: a way below the middle the ground is washed towards white — the sprite's
+    // half alpha times the pass's own fade over the sky.
+    let shadow = pixel(&filled, SIZE / 2, 53);
+    for (channel, sky) in shadow.iter().zip(SKY) {
+        assert!(
+            *channel >= sky,
+            "the shadow washes the sky, got {shadow:?} against {SKY:?}"
+        );
+    }
+    assert_ne!(shadow, SKY, "the shadow is not the bare sky");
+}
+
+/// The hurt overlay re-draws the model's boxes through the source's `0.7 red + 0.3 x` mix:
+/// the chest pixel moves towards red between the two frames.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hurt_overlay_mixes_red_into_the_chest() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = entity_registry(&device, &queue, SKIN);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    let draw = player_at_origin(TextureRef::Named("entity/test.png"));
+
+    let calm = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, std::slice::from_ref(&draw), &registry);
+    });
+    let hurt = render_scene(&device, &queue, &target, &depth, |pass| {
+        let hurt = EntityDraw {
+            hurt: 1.0,
+            ..draw.clone()
+        };
+        entities.draw(&device, pass, &[hurt], &registry);
+    });
+
+    let shade = chest_shade();
+    let calm_chest = [
+        (200.0 * shade).round() as u8,
+        (90.0 * shade).round() as u8,
+        (40.0 * shade).round() as u8,
+    ];
+    expect_pixel(&calm, SIZE / 2, SIZE / 2, calm_chest, "the calm chest face");
+
+    // The mix runs on the shader's floats: 0.7 of the shaded skin plus 0.3 of red.
+    let mixed = [
+        (0.7 * 200.0 * shade + 0.3 * 255.0).round() as u8,
+        (0.7 * 90.0 * shade).round() as u8,
+        (0.7 * 40.0 * shade).round() as u8,
+    ];
+    expect_pixel(&hurt, SIZE / 2, SIZE / 2, mixed, "the hurt chest face");
+    let (calm_pixel, hurt_pixel) = (
+        pixel(&calm, SIZE / 2, SIZE / 2),
+        pixel(&hurt, SIZE / 2, SIZE / 2),
+    );
+    assert!(
+        hurt_pixel[0] > calm_pixel[0] && hurt_pixel[1] < calm_pixel[1],
+        "the hurt mix is redder: {calm_pixel:?} became {hurt_pixel:?}"
+    );
+}
+
+/// The death ramp tips the model a quarter turn about Z: the standing silhouette — tall and
+/// narrow — becomes one lying along the ground, wider than it was tall, and the chest pixel's
+/// spot in front of the camera is sky again.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_death_tilt_lays_the_model_down() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = entity_registry(&device, &queue, [200, 90, 40, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    let draw = player_at_origin(TextureRef::Named("entity/test.png"));
+
+    let alive = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, std::slice::from_ref(&draw), &registry);
+    });
+    let dead = render_scene(&device, &queue, &target, &depth, |pass| {
+        let fallen = EntityDraw {
+            death: 1.0,
+            ..draw.clone()
+        };
+        entities.draw(&device, pass, &[fallen], &registry);
+    });
+
+    let (min_x, min_y, max_x, max_y) = silhouette(&alive);
+    let (dead_min_x, dead_min_y, dead_max_x, dead_max_y) = silhouette(&dead);
+    let (alive_width, alive_height) = (max_x - min_x, max_y - min_y);
+    let (dead_width, dead_height) = (dead_max_x - dead_min_x, dead_max_y - dead_min_y);
+    // The fall turns the silhouette over: standing the model is taller than it is wide;
+    // fallen it lies wider than it is tall and shorter than it stood. The fallen model's
+    // head projects past the frame's right edge, so the two widths are compared to each
+    // other rather than to a fixed margin.
+    assert!(
+        alive_height > alive_width,
+        "the standing model is taller than wide, got {alive_width} wide by {alive_height} tall"
+    );
+    assert!(
+        dead_width > dead_height,
+        "the fallen model lies wider than tall, got {dead_width} wide by {dead_height} tall"
+    );
+    assert!(
+        dead_width > alive_width,
+        "the fallen model lies wider, alive {alive_width} wide, fallen {dead_width} wide"
+    );
+    assert!(
+        dead_height < alive_height,
+        "the fallen model is shorter, alive {alive_height} tall, fallen {dead_height} tall"
+    );
+    expect_pixel_exact(
+        &dead,
+        SIZE / 2,
+        SIZE / 2,
+        SKY,
+        "the chest spot once the model lies down",
+    );
+    assert!(
+        changed_pixels(&alive, &dead) > 100,
+        "the two death fractions draw different frames"
+    );
+}
+
+/// The entities sit between the terrain's solid and translucent layers: a translucent quad
+/// in front of an entity lets the entity show through the blend when the entity draws first
+/// (the source's order) and hides it when the order is inverted — the canary that proves the
+/// order matters.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_entities_draw_between_the_terrain_layers() {
+    const WATER: [u8; 4] = [0, 255, 0, 128];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    // A translucent quad at z = +1, between the camera (z = 2.5) and the entity (z = 0),
+    // covering the frame; its windings face the camera like every terrain quad.
+    let mut mesh = ChunkMesh::default();
+    push_quad(
+        &mut mesh,
+        Layer::Translucent,
+        [
+            ([-2.0, -2.0, 1.0], [0.0, 0.0]),
+            ([2.0, -2.0, 1.0], [1.0, 0.0]),
+            ([2.0, 2.0, 1.0], [1.0, 1.0]),
+            ([-2.0, 2.0, 1.0], [0.0, 1.0]),
+        ],
+        WATER,
+    );
+
+    let mut terrain = TerrainPass::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+    terrain.set_atlas(&device, &queue, &solid_atlas(4, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, entity_camera(), 1.0);
+    terrain.upload(&device, &queue, (0, 0, 0), &mesh);
+
+    let registry = entity_registry(&device, &queue, [255, 0, 0, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    let draw = player_at_origin(TextureRef::Named("entity/test.png"));
+
+    // The quad alone: its green through the brightest lightmap cell over the sky.
+    let water = render_scene(&device, &queue, &target, &depth, |pass| {
+        terrain.draw_solid(pass);
+        terrain.draw_translucent(pass);
+    });
+    let water_over_sky = [
+        (0.498 * 158.0) as u8,
+        (0.502 * 252.0 + 0.498 * 194.0) as u8,
+        (0.498 * 250.0) as u8,
+    ];
+    expect_pixel(
+        &water,
+        SIZE / 2,
+        SIZE / 2,
+        water_over_sky,
+        "the quad over the sky",
+    );
+
+    // The source's order: solid, entities, translucent. The entity's chest red shows through
+    // the quad's half alpha.
+    let in_order = render_scene(&device, &queue, &target, &depth, |pass| {
+        terrain.draw_solid(pass);
+        entities.draw(&device, pass, std::slice::from_ref(&draw), &registry);
+        terrain.draw_translucent(pass);
+    });
+    let chest_red = (255.0 * chest_shade()).round();
+    let blend = [(0.498 * chest_red) as u8, (0.502 * 252.0) as u8, 0];
+    expect_pixel(
+        &in_order,
+        SIZE / 2,
+        SIZE / 2,
+        blend,
+        "the chest through the water",
+    );
+
+    // The order inverted: the translucent layer writes no depth, so the later entity draws
+    // over it — the fixture must differ from the source's order, or it proves nothing.
+    let inverted = render_scene(&device, &queue, &target, &depth, |pass| {
+        terrain.draw_solid(pass);
+        terrain.draw_translucent(pass);
+        entities.draw(&device, pass, &[draw], &registry);
+    });
+    let raw = [(255.0 * chest_shade()).round() as u8, 0, 0];
+    expect_pixel(
+        &inverted,
+        SIZE / 2,
+        SIZE / 2,
+        raw,
+        "the raw chest over the water",
+    );
+    assert!(
+        changed_pixels(&in_order, &inverted) > 20,
+        "the order fixture differs from its inversion"
     );
 }
 

@@ -12,6 +12,7 @@ use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
 use crate::dim_pass::DimPass;
+use crate::entity_pass::{EntityDraw, EntityPass, TextureRegistry};
 use crate::fog::FogParams;
 use crate::overlay::OverlayPass;
 use crate::sky::{
@@ -29,9 +30,14 @@ enum SceneDraw {
     /// The cloud layer through the source's under-layer arm, before the terrain
     /// (`EntityRenderer.java:1364-1367`).
     CloudsUnder,
-    /// The terrain's layers, the translucent one last (`EntityRenderer.java:1385-1396`,
-    /// `:1460`).
+    /// The terrain's solid layers — the opaque layer and both cutouts — in the source's own
+    /// order (`EntityRenderer.java:1386-1390`).
     Terrain,
+    /// The entity pass, drawn between the terrain's solid and translucent layers
+    /// (`EntityRenderer.java:1402`).
+    Entities,
+    /// The terrain's translucent layer, after the entities (`EntityRenderer.java:1467`).
+    TerrainTranslucent,
     /// The world overlay: the aimed block's outline and the destroy-stage crack, the source's
     /// `"outline"` and `"destroyProgress"` sections after the terrain and before the clouds'
     /// at-or-above arm (`EntityRenderer.java:1412-1416`, `:1431-1437`).
@@ -56,6 +62,8 @@ fn scene_draws(camera: &Camera) -> Vec<SceneDraw> {
         draws.push(SceneDraw::CloudsUnder);
     }
     draws.push(SceneDraw::Terrain);
+    draws.push(SceneDraw::Entities);
+    draws.push(SceneDraw::TerrainTranslucent);
     draws.push(SceneDraw::WorldOverlay);
     if cloud_at_or_above_layer(camera) {
         draws.push(SceneDraw::CloudsAtOrAbove);
@@ -164,6 +172,14 @@ pub struct Renderer {
     overlay: OverlayPass,
     /// The dim quad, drawn over the scene before the overlay text.
     dim: DimPass,
+    /// The entity pass: the boxes and the shadows drawn between the terrain's solid and
+    /// translucent layers.
+    entity_pass: EntityPass,
+    /// The entity textures: the named sprites and the skins the pass samples, and the
+    /// resolver the later tab list shares.
+    entity_textures: TextureRegistry,
+    /// The entities the next frame draws, as the window last set them.
+    entities: Vec<EntityDraw>,
     /// The camera the next frame is drawn with, until a new one is set.
     camera: Option<Camera>,
     /// The fog the next frames are drawn and cleared with, until a new one is set.
@@ -276,6 +292,8 @@ impl Renderer {
         overlay.set_size(&queue, config.width as f32, config.height as f32);
         let dim = DimPass::new(&device, format);
         let depth = DepthTarget::new(&device, config.width, config.height);
+        let entity_textures = TextureRegistry::new(&device, &queue);
+        let entity_pass = EntityPass::new(&device, &queue, format, entity_textures.layout());
 
         Ok(Self {
             surface,
@@ -290,6 +308,9 @@ impl Renderer {
             cloud,
             overlay,
             dim,
+            entity_pass,
+            entity_textures,
+            entities: Vec::new(),
             camera: None,
             fog: None,
         })
@@ -380,6 +401,52 @@ impl Renderer {
         self.terrain.set_lightmap(&self.queue, sun_brightness);
     }
 
+    /// Sets the entities the following frames draw; empty draws none.
+    ///
+    /// The window lays every draw out against the frame it last saw — interpolated positions
+    /// and angles, the poses and the textures — so a frame draws exactly the entities the
+    /// caller last set.
+    pub fn set_entities(&mut self, entities: Vec<EntityDraw>) {
+        self.entities = entities;
+    }
+
+    /// Uploads a named entity texture, replacing whatever the key held.
+    ///
+    /// The client uploads an entity sprite under the key its draws name it by; a key no draw
+    /// names costs nothing, and a draw naming a key with nothing behind it samples the
+    /// placeholder.
+    pub fn set_entity_texture(&mut self, key: &'static str, texture: &Texture) {
+        self.entity_textures
+            .set_named(&self.device, &self.queue, key, texture);
+    }
+
+    /// Uploads the two default skins: the wide fallback and the slim one.
+    ///
+    /// A profile whose skin the client never resolved draws the default its own arm width
+    /// names; until this is called those draws sample the placeholder.
+    pub fn set_default_skins(&mut self, wide: &Texture, slim: &Texture) {
+        self.entity_textures
+            .set_defaults(&self.device, &self.queue, wide, slim);
+    }
+
+    /// Uploads one profile's skin and cape, replacing the profile's entry whole.
+    ///
+    /// A re-upload replaces both textures; a missing cape clears one. A profile with no skin
+    /// yet keeps the default and may still carry a cape.
+    pub fn set_skin(&mut self, uuid: &str, skin: Option<&Texture>, cape: Option<&Texture>) {
+        self.entity_textures
+            .set_skin(&self.device, &self.queue, uuid, skin, cape);
+    }
+
+    /// The entity textures and their skin resolver.
+    ///
+    /// The registry is the reader's window into what the entity pass samples; it resolves a
+    /// profile to the texture its draws and, later, the tab list's head draws use. Section
+    /// `TabList.java`'s reader shares this resolver through [`crate::entity_pass::SkinLookup`].
+    pub fn entity_textures(&self) -> &TextureRegistry {
+        &self.entity_textures
+    }
+
     /// Sets the camera for the next frame.
     ///
     /// The view-projection matrix is built in [`Renderer::render`] from the camera and the
@@ -449,6 +516,7 @@ impl Renderer {
     pub fn set_fog(&mut self, params: FogParams) {
         self.terrain.set_fog(&self.queue, params);
         self.cloud.set_fog(&self.queue, params);
+        self.entity_pass.set_fog(params);
         self.fog = Some(params);
     }
 
@@ -500,6 +568,7 @@ impl Renderer {
             self.terrain.set_camera(&self.queue, camera, aspect);
             self.sky.set_camera(&self.queue, camera, aspect);
             self.cloud.set_camera(&self.queue, camera, aspect);
+            self.entity_pass.set_camera(camera, aspect);
             // The overlay's frame: the outline's pixel width and the crack's projection both
             // follow the surface size, so the frame is built from the same configuration the
             // render pass is.
@@ -548,7 +617,14 @@ impl Renderer {
                         SceneDraw::CloudsUnder | SceneDraw::CloudsAtOrAbove => {
                             self.cloud.draw(&mut pass);
                         }
-                        SceneDraw::Terrain => self.terrain.draw(&mut pass),
+                        SceneDraw::Terrain => self.terrain.draw_solid(&mut pass),
+                        SceneDraw::Entities => self.entity_pass.draw(
+                            &self.device,
+                            &mut pass,
+                            &self.entities,
+                            &self.entity_textures,
+                        ),
+                        SceneDraw::TerrainTranslucent => self.terrain.draw_translucent(&mut pass),
                         SceneDraw::WorldOverlay => self.world_overlay.draw(&mut pass),
                     }
                 }
@@ -703,13 +779,17 @@ mod tests {
         // eye is under the layer (`EntityRenderer.java:1364-1367`) and the at-or-above arm
         // after the translucent layer once the eye is at or above it (`:1474-1478`). The
         // acceptance's mark pose stands at feet 150.0 — eye 151.62 — so its frame carries the
-        // second arm; the wall pose's feet 57.0 leaves the eye under the layer.
+        // second arm; the wall pose's feet 57.0 leaves the eye under the layer. The entities
+        // draw between the solid and translucent terrain layers (`:1402` vs `:1386-1390` and
+        // `:1467`).
         assert_eq!(
             scene_draws(&scene_camera(57.0)),
             [
                 SceneDraw::Sky,
                 SceneDraw::CloudsUnder,
                 SceneDraw::Terrain,
+                SceneDraw::Entities,
+                SceneDraw::TerrainTranslucent,
                 SceneDraw::WorldOverlay
             ]
         );
@@ -718,6 +798,8 @@ mod tests {
             [
                 SceneDraw::Sky,
                 SceneDraw::Terrain,
+                SceneDraw::Entities,
+                SceneDraw::TerrainTranslucent,
                 SceneDraw::WorldOverlay,
                 SceneDraw::CloudsAtOrAbove
             ]

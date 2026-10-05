@@ -721,20 +721,44 @@ impl TerrainPass {
         self.meshes.clear();
     }
 
-    /// Draws every mesh the frame keeps, layer by layer, in the layers' own order.
+    /// Draws every mesh the frame keeps through the solid layers — the opaque layer and both
+    /// cutout layers — in the layers' own order.
     ///
-    /// The opaque and cutout layers draw in the table's order — the table is a hash map, and
-    /// every surface there is opaque and depth-tested, so the order cannot change the picture
-    /// — and the translucent layer draws last, sorted back to front by the distance from the
-    /// eye to the section's centre. Each layer binds the atlas through the sampler its pass
-    /// draws with: the plain cutout through the level-0 bind group, every other layer through
-    /// the mipped one (`EntityRenderer.java:1389-1391`). Sections whose box lies fully outside
-    /// the frame's frustum are skipped, both for their draw and for the translucent order.
+    /// The layers draw in the table's order — the table is a hash map, and every surface here
+    /// is opaque and depth-tested, so the order cannot change the picture. Each layer binds
+    /// the atlas through the sampler its pass draws with: the plain cutout through the
+    /// level-0 bind group, the other two through the mipped one
+    /// (`EntityRenderer.java:1389-1391`). Sections whose box lies fully outside the frame's
+    /// frustum are skipped.
     ///
     /// Nothing draws until a camera and an atlas have both been set: with no atlas the layers
     /// would sample an unbound texture, so the whole draw is skipped, and with no camera there
     /// is no frame to cull or order with.
+    pub fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_layers(pass, &[Layer::Opaque, Layer::CutoutMipped, Layer::Cutout]);
+    }
+
+    /// Draws the translucent layer, sorted back to front by the distance from the eye to each
+    /// section's centre.
+    ///
+    /// The translucent layer draws after every solid layer, so a blended surface lands over
+    /// what stands behind it; like the solid draw, nothing draws until a camera and an atlas
+    /// have both been set.
+    pub fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_layers(pass, &[Layer::Translucent]);
+    }
+
+    /// Draws every mesh the frame keeps, layer by layer, in the layers' own order.
+    ///
+    /// The solid layers first ([`Self::draw_solid`]), then the translucent one
+    /// ([`Self::draw_translucent`]); the frame draws the two around the entity pass.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_solid(pass);
+        self.draw_translucent(pass);
+    }
+
+    /// Draws one run of layers.
+    fn draw_layers(&self, pass: &mut wgpu::RenderPass<'_>, layers: &[Layer]) {
         let (Some(atlas_bind_group), Some(atlas_bind_group_plain), Some(frame)) = (
             self.atlas_bind_group.as_ref(),
             self.atlas_bind_group_plain.as_ref(),
@@ -742,15 +766,15 @@ impl TerrainPass {
         ) else {
             return;
         };
-        for layer in Layer::ALL {
-            let draws = self.draw_list(layer, frame);
+        for layer in layers {
+            let draws = self.draw_list(*layer, frame);
             if draws.is_empty() {
                 continue;
             }
             // The pass picks its texture state with the layer: the plain cutout samples the
             // atlas at level 0, every other layer through the mip chain
             // (`EntityRenderer.java:1389-1391`).
-            let atlas_group = match atlas_sampler(layer) {
+            let atlas_group = match atlas_sampler(*layer) {
                 AtlasSampler::Mipped => atlas_bind_group,
                 AtlasSampler::LevelZero => atlas_bind_group_plain,
             };
@@ -838,7 +862,7 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 /// every face counter-clockwise seen from outside; culling back faces then drops the faces
 /// the camera cannot see. Every layer culls, as the client's cull state is enabled at all
 /// three of its block-layer draws.
-fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
+pub(crate) fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
     wgpu::PrimitiveState {
         topology: wgpu::PrimitiveTopology::TriangleList,
         front_face: wgpu::FrontFace::Ccw,
@@ -856,7 +880,7 @@ fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
 /// is what draws the grass model's overlay over the base cube's coincident faces. `write` is
 /// the client's depth mask: on for its solid layers, off for the translucent one
 /// (`GlStateManager.depthMask(false)`, `EntityRenderer.java:1463`).
-fn depth_state(write: bool) -> wgpu::DepthStencilState {
+pub(crate) fn depth_state(write: bool) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: write,
@@ -868,7 +892,7 @@ fn depth_state(write: bool) -> wgpu::DepthStencilState {
 
 /// The colour target for one attachment in `format`: every channel written, blended when the
 /// layer asks for it.
-fn color_target(
+pub(crate) fn color_target(
     format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
 ) -> Option<wgpu::ColorTargetState> {

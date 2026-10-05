@@ -712,10 +712,10 @@ fn playback(
     Ok(playback)
 }
 
-/// The fallback sprite's pixels: the 16x16 checkerboard of magenta and
-/// black in 8-texel cells the client's own generator builds
-/// (`TextureUtil.java:363-373`), generated here so no file carries it.
-fn missing_pixels() -> Vec<u8> {
+/// The bytes of the "missing texture" sprite: a 16x16 magenta-and-black checkerboard, drawn
+/// where a texture could not be loaded (the client's `"missingno"` fallback, `TextureMap`'s
+/// `missingImage`, `TextureUtil.java:363-373`).
+pub fn missing_pixels() -> Vec<u8> {
     let mut rgba = vec![0u8; (MISSING_SIDE * MISSING_SIDE * 4) as usize];
     for y in 0..MISSING_SIDE {
         for x in 0..MISSING_SIDE {
