@@ -269,8 +269,10 @@ fn draw_for(
 /// sheet out of the renderer's table with its own default
 /// (`RenderVillager.getEntityTexture`:32-54), the witch's nose gate reads the held
 /// stack (`RenderWitch`, not carried by the frames; [`PoseExtra::Witch`]), the giant
-/// draws the zombie model and sheet sixfold (`RenderGiantZombie`), and the quadrupeds
-/// draw their class sheets (`RenderPig`/`RenderCow`/`RenderSheep`/`RenderMooshroom`).
+/// draws the zombie model and sheet sixfold (`RenderGiantZombie`), the quadrupeds
+/// draw their class sheets (`RenderPig`/`RenderCow`/`RenderSheep`/`RenderMooshroom`),
+/// and the crawler families theirs (`RenderCreeper` through `RenderEndermite`), the
+/// bats', cubes' and eyes layers' state riding the terms' extras.
 /// `None` for a kind without a model.
 fn mob_draw(
     kind: EntityKind,
@@ -373,6 +375,94 @@ fn mob_draw(
         (EntityKind::MushroomCow, _) => (
             ModelRef::Mooshroom,
             TextureRef::Named("entity/cow/mooshroom.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Creeper, _) => (
+            ModelRef::Creeper,
+            TextureRef::Named("entity/creeper/creeper.png"),
+            DrawExtra::Creeper,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Spider, _) => (
+            ModelRef::Spider,
+            TextureRef::Named("entity/spider/spider.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::CaveSpider, _) => (
+            ModelRef::CaveSpider,
+            TextureRef::Named("entity/spider/cave_spider.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        // The screaming flag is not read by the frames; the pose pins it off.
+        (EntityKind::Enderman, _) => (
+            ModelRef::Enderman,
+            TextureRef::Named("entity/enderman/enderman.png"),
+            DrawExtra::None,
+            PoseExtra::Enderman { attacking: false },
+            false,
+        ),
+        // The chick's fold is not read by the frames and the flap is client-side
+        // tick state they do not carry; the pose pins the flap at its rest.
+        (EntityKind::Chicken, _) => (
+            ModelRef::Chicken { child: false },
+            TextureRef::Named("entity/chicken.png"),
+            DrawExtra::None,
+            PoseExtra::Chicken { flap: 0.0 },
+            false,
+        ),
+        // The tentacle aim is client-side tick state the frames do not carry.
+        (EntityKind::Squid, _) => (
+            ModelRef::Squid,
+            TextureRef::Named("entity/squid.png"),
+            DrawExtra::None,
+            PoseExtra::Squid {
+                tentacle_angle: 0.0,
+            },
+            false,
+        ),
+        (EntityKind::Slime, MobExtra::Slime { size }) => (
+            ModelRef::Slime { size: *size },
+            TextureRef::Named("entity/slime/slime.png"),
+            // The squash is client-side tick state the frames do not carry; the
+            // pair rests, the draw scaling by the size alone.
+            DrawExtra::Slime {
+                size: *size,
+                squish: 0.0,
+            },
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::LavaSlime, MobExtra::Slime { size }) => (
+            ModelRef::MagmaCube { size: *size },
+            TextureRef::Named("entity/slime/magmacube.png"),
+            DrawExtra::None,
+            PoseExtra::MagmaCube { squish: 0.0 },
+            false,
+        ),
+        (EntityKind::Bat, MobExtra::Bat { hanging }) => (
+            ModelRef::Bat { hanging: *hanging },
+            TextureRef::Named("entity/bat.png"),
+            DrawExtra::Bat { hanging: *hanging },
+            PoseExtra::Bat { hanging: *hanging },
+            false,
+        ),
+        (EntityKind::Silverfish, _) => (
+            ModelRef::Silverfish,
+            TextureRef::Named("entity/silverfish.png"),
+            DrawExtra::None,
+            PoseExtra::None,
+            false,
+        ),
+        (EntityKind::Endermite, _) => (
+            ModelRef::EnderMite,
+            TextureRef::Named("entity/endermite.png"),
             DrawExtra::None,
             PoseExtra::None,
             false,
@@ -769,6 +859,95 @@ mod tests {
     }
 
     #[test]
+    fn the_crawler_families_map_to_their_models_sheets_and_extras() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![
+                mob_frame(1, EntityKind::Creeper, EntityExtra::Mob(MobExtra::Creeper)),
+                mob_frame(2, EntityKind::Spider, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(3, EntityKind::CaveSpider, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(
+                    4,
+                    EntityKind::Enderman,
+                    EntityExtra::Mob(MobExtra::Enderman),
+                ),
+                mob_frame(5, EntityKind::Chicken, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(6, EntityKind::Squid, EntityExtra::Mob(MobExtra::Other)),
+                mob_frame(
+                    7,
+                    EntityKind::Slime,
+                    EntityExtra::Mob(MobExtra::Slime { size: 3 }),
+                ),
+                mob_frame(
+                    8,
+                    EntityKind::LavaSlime,
+                    EntityExtra::Mob(MobExtra::Slime { size: 2 }),
+                ),
+                mob_frame(
+                    9,
+                    EntityKind::Bat,
+                    EntityExtra::Mob(MobExtra::Bat { hanging: true }),
+                ),
+                mob_frame(
+                    10,
+                    EntityKind::Silverfish,
+                    EntityExtra::Mob(MobExtra::Other),
+                ),
+                mob_frame(11, EntityKind::Endermite, EntityExtra::Mob(MobExtra::Other)),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws.len(), 11, "every mapped mob draws");
+        let expected = [
+            (ModelRef::Creeper, "entity/creeper/creeper.png"),
+            (ModelRef::Spider, "entity/spider/spider.png"),
+            (ModelRef::CaveSpider, "entity/spider/cave_spider.png"),
+            (ModelRef::Enderman, "entity/enderman/enderman.png"),
+            (ModelRef::Chicken { child: false }, "entity/chicken.png"),
+            (ModelRef::Squid, "entity/squid.png"),
+            (ModelRef::Slime { size: 3 }, "entity/slime/slime.png"),
+            (
+                ModelRef::MagmaCube { size: 2 },
+                "entity/slime/magmacube.png",
+            ),
+            (ModelRef::Bat { hanging: true }, "entity/bat.png"),
+            (ModelRef::Silverfish, "entity/silverfish.png"),
+            (ModelRef::EnderMite, "entity/endermite.png"),
+        ];
+        for (draw, (model, sheet)) in draws.iter().zip(expected) {
+            assert_eq!(draw.model, model);
+            assert_eq!(draw.texture, TextureRef::Named(sheet));
+        }
+        // The pinned extras ride the draws: the creeper's marker, the bat's hang on
+        // both terms, the cubes' sizes with their squash pairs at rest, and the
+        // client-side-only states held off.
+        assert_eq!(draws[0].extra, DrawExtra::Creeper);
+        assert_eq!(
+            draws[3].pose.extra,
+            PoseExtra::Enderman { attacking: false }
+        );
+        assert_eq!(draws[4].pose.extra, PoseExtra::Chicken { flap: 0.0 });
+        assert_eq!(
+            draws[5].pose.extra,
+            PoseExtra::Squid {
+                tentacle_angle: 0.0
+            }
+        );
+        assert_eq!(
+            draws[6].extra,
+            DrawExtra::Slime {
+                size: 3,
+                squish: 0.0
+            }
+        );
+        assert_eq!(draws[7].pose.extra, PoseExtra::MagmaCube { squish: 0.0 });
+        assert_eq!(draws[8].extra, DrawExtra::Bat { hanging: true });
+        assert_eq!(draws[8].pose.extra, PoseExtra::Bat { hanging: true });
+    }
+
+    #[test]
     fn every_new_kind_maps_to_its_model_sheet_and_extras() {
         let mut view = View::new();
         let t0 = Instant::now();
@@ -941,8 +1120,11 @@ mod tests {
             vec![
                 mob_frame(
                     1,
-                    EntityKind::Bat,
-                    EntityExtra::Mob(MobExtra::Bat { hanging: true }),
+                    EntityKind::Wolf,
+                    EntityExtra::Mob(MobExtra::Wolf {
+                        tamed: false,
+                        collar: 14,
+                    }),
                 ),
                 mob_frame(2, EntityKind::Pig, EntityExtra::None),
             ],

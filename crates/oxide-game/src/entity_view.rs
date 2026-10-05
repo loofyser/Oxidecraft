@@ -208,7 +208,8 @@ pub enum MobExtra {
         /// (`EntityWolf.entityInit:133`).
         collar: u8,
     },
-    /// A slime's size (byte index 16 — `EntitySlime.getSlimeSize:69`).
+    /// A slime's size — a magma cube's too, which inherits the fold (byte
+    /// index 16 — `EntitySlime.getSlimeSize:69`; `EntityMagmaCube.java`:10).
     Slime {
         /// The size, one or more; the source's default is `1`.
         size: u8,
@@ -697,9 +698,10 @@ fn mob_extra(kind: EntityKind, entity: &Entity) -> MobExtra {
             tamed: byte_at(entity, 16).unwrap_or(0) & 0x04 != 0,
             collar: (byte_at(entity, 20).unwrap_or(14) & 0x0f) as u8,
         },
-        // A slime: byte 16 the size (`EntitySlime.getSlimeSize:69`), default
-        // one.
-        EntityKind::Slime => MobExtra::Slime {
+        // A slime or magma cube: byte 16 the size
+        // (`EntitySlime.getSlimeSize:69`; `EntityMagmaCube.java`:10 inherits
+        // it), default one.
+        EntityKind::Slime | EntityKind::LavaSlime => MobExtra::Slime {
             size: byte_at(entity, 16).unwrap_or(1) as u8,
         },
         // An ocelot: byte 18 the cat type (`EntityOcelot.getCatType:301`).
@@ -1059,6 +1061,21 @@ mod tests {
             extra_for(&Entity::new(1, EntityKind::Slime)),
             EntityExtra::Mob(MobExtra::Slime { size: 1 }),
             "the source's default size is one"
+        );
+    }
+
+    #[test]
+    fn the_magma_cube_reads_the_same_size_byte() {
+        let mut entity = Entity::new(1, EntityKind::LavaSlime);
+        entity.metadata = metadata(&[(16, MetadataValue::Byte(2))]);
+        assert_eq!(
+            extra_for(&entity),
+            EntityExtra::Mob(MobExtra::Slime { size: 2 }),
+            "the magma cube inherits the slime's size fold"
+        );
+        assert_eq!(
+            extra_for(&Entity::new(1, EntityKind::LavaSlime)),
+            EntityExtra::Mob(MobExtra::Slime { size: 1 })
         );
     }
 

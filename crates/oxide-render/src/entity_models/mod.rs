@@ -25,6 +25,7 @@ use glam::{Mat4, Vec3};
 
 use crate::entity_pass::ModelRef;
 
+pub mod crawlers;
 pub mod layers;
 pub mod player;
 pub mod quadrupeds;
@@ -120,6 +121,36 @@ pub enum PoseExtra {
         holding: bool,
         /// The entity's own id, the sway's seed (`getEntityId() % 10`).
         entity_id: i32,
+    },
+    /// The magma cube's own: the squash factor its eight segments ride
+    /// (`ModelMagmaCube.setLivingAnimations`:42).
+    MagmaCube {
+        /// The interpolated `squishFactor`; the model clamps it to `0.0..1.0`.
+        squish: f32,
+    },
+    /// The squid's own: the interpolated tentacle angle every tentacle turns about x by
+    /// (`RenderSquid.handleRotationFloat`:39, `ModelSquid.setRotationAngles`:40).
+    Squid {
+        /// The interpolated `tentacleAngle`.
+        tentacle_angle: f32,
+    },
+    /// The chicken's own: the interpolated wing flap the wings turn about z by
+    /// (`RenderChicken.handleRotationFloat`:28, `ModelChicken.setRotationAngles`:91).
+    Chicken {
+        /// The interpolated flap, the source's `(sin(wingRotation) + 1) * destPos`.
+        flap: f32,
+    },
+    /// The enderman's own: the screaming flag, which drops the head five more units
+    /// (`RenderEnderman.doRender`:33, `ModelEnderman.setRotationAngles`:44).
+    Enderman {
+        /// Whether the class renders the attack pose (`isScreaming()`).
+        attacking: bool,
+    },
+    /// The bat's own: the hang flag that folds the wings and turns the head over
+    /// (`RenderBat.rotateCorpse`:35, `ModelBat.setRotationAngles`:75).
+    Bat {
+        /// Whether the bat hangs (`getIsBatHanging()`).
+        hanging: bool,
     },
 }
 
@@ -375,6 +406,22 @@ pub fn model_for(reference: ModelRef) -> &'static Model {
         ModelRef::Pig { .. } => &quadrupeds::MODEL_PIG,
         ModelRef::Cow | ModelRef::Mooshroom => &quadrupeds::MODEL_COW,
         ModelRef::Sheep { .. } => &quadrupeds::MODEL_SHEEP,
+        ModelRef::Creeper => &crawlers::MODEL_CREEPER,
+        ModelRef::Spider | ModelRef::CaveSpider => &crawlers::MODEL_SPIDER,
+        ModelRef::Enderman => &crawlers::MODEL_ENDERMAN,
+        ModelRef::Chicken { child } => {
+            if child {
+                &crawlers::MODEL_CHICKEN_CHILD
+            } else {
+                &crawlers::MODEL_CHICKEN
+            }
+        }
+        ModelRef::Squid => &crawlers::MODEL_SQUID,
+        ModelRef::Slime { .. } => &crawlers::MODEL_SLIME,
+        ModelRef::MagmaCube { .. } => &crawlers::MODEL_MAGMA_CUBE,
+        ModelRef::Bat { .. } => &crawlers::MODEL_BAT,
+        ModelRef::Silverfish => &crawlers::MODEL_SILVERFISH,
+        ModelRef::EnderMite => &crawlers::MODEL_ENDERMITE,
     }
 }
 
@@ -393,6 +440,17 @@ pub fn texture_size(reference: ModelRef) -> [f32; 2] {
         ModelRef::Pig { .. } | ModelRef::Cow | ModelRef::Sheep { .. } | ModelRef::Mooshroom => {
             [64.0, 32.0]
         }
+        ModelRef::Creeper
+        | ModelRef::Spider
+        | ModelRef::CaveSpider
+        | ModelRef::Enderman
+        | ModelRef::Chicken { .. }
+        | ModelRef::Squid
+        | ModelRef::Slime { .. }
+        | ModelRef::MagmaCube { .. }
+        | ModelRef::Bat { .. }
+        | ModelRef::Silverfish
+        | ModelRef::EnderMite => [64.0, 32.0],
     }
 }
 
@@ -422,6 +480,21 @@ pub fn textures(reference: ModelRef) -> &'static [&'static str] {
         ModelRef::Cow => &["entity/cow/cow.png"],
         ModelRef::Sheep { .. } => &["entity/sheep/sheep.png", "entity/sheep/sheep_fur.png"],
         ModelRef::Mooshroom => &["entity/cow/mooshroom.png"],
+        ModelRef::Creeper => &["entity/creeper/creeper.png"],
+        ModelRef::Spider => &["entity/spider/spider.png", "entity/spider_eyes.png"],
+        ModelRef::CaveSpider => &["entity/spider/cave_spider.png", "entity/spider_eyes.png"],
+        ModelRef::Enderman => &[
+            "entity/enderman/enderman.png",
+            "entity/enderman/enderman_eyes.png",
+        ],
+        ModelRef::Chicken { .. } => &["entity/chicken.png"],
+        ModelRef::Squid => &["entity/squid.png"],
+        // The gel layer draws the body's own sheet, so the slime names one key.
+        ModelRef::Slime { .. } => &["entity/slime/slime.png"],
+        ModelRef::MagmaCube { .. } => &["entity/slime/magmacube.png"],
+        ModelRef::Bat { .. } => &["entity/bat.png"],
+        ModelRef::Silverfish => &["entity/silverfish.png"],
+        ModelRef::EnderMite => &["entity/endermite.png"],
     }
 }
 
@@ -440,6 +513,16 @@ pub fn pose(reference: ModelRef, pose: &Pose, out: &mut [Rot]) {
         ModelRef::Pig { .. } => quadrupeds::pose_pig(pose, out),
         ModelRef::Cow | ModelRef::Mooshroom => quadrupeds::pose_quadruped(pose, out),
         ModelRef::Sheep { .. } => quadrupeds::pose_sheep(pose, out),
+        ModelRef::Creeper => crawlers::pose_creeper(pose, out),
+        ModelRef::Spider | ModelRef::CaveSpider => crawlers::pose_spider(pose, out),
+        ModelRef::Enderman => crawlers::pose_enderman(pose, out),
+        ModelRef::Chicken { .. } => crawlers::pose_chicken(pose, out),
+        ModelRef::Squid => crawlers::pose_squid(pose, out),
+        ModelRef::Slime { .. } => crawlers::pose_slime(pose, out),
+        ModelRef::MagmaCube { .. } => crawlers::pose_magma_cube(pose, out),
+        ModelRef::Bat { .. } => crawlers::pose_bat(pose, out),
+        ModelRef::Silverfish => crawlers::pose_silverfish(pose, out),
+        ModelRef::EnderMite => crawlers::pose_endermite(pose, out),
     }
 }
 
@@ -464,6 +547,18 @@ pub fn height(reference: ModelRef) -> f32 {
         ModelRef::IronGolem => 2.9,
         ModelRef::Pig { .. } => 0.9,
         ModelRef::Cow | ModelRef::Sheep { .. } | ModelRef::Mooshroom => 1.3,
+        // The creeper's class sets no size of its own: `Entity`'s constructor's default
+        // stands (`Entity.java`:269-270).
+        ModelRef::Creeper => 1.8,
+        ModelRef::Spider => 0.9,
+        ModelRef::CaveSpider => 0.5,
+        ModelRef::Enderman => 2.9,
+        ModelRef::Chicken { .. } => 0.7,
+        ModelRef::Squid => 0.95,
+        ModelRef::Slime { size } | ModelRef::MagmaCube { size } => 0.51000005 * f32::from(size),
+        ModelRef::Bat { .. } => 0.9,
+        ModelRef::Silverfish => 0.3,
+        ModelRef::EnderMite => 0.3,
     }
 }
 
@@ -492,6 +587,19 @@ pub fn shadow(reference: ModelRef) -> [f32; 2] {
         ModelRef::Pig { .. } | ModelRef::Cow | ModelRef::Sheep { .. } | ModelRef::Mooshroom => {
             [0.7, 1.0]
         }
+        ModelRef::Creeper | ModelRef::Enderman => [0.5, 1.0],
+        ModelRef::Spider => [1.0, 1.0],
+        // The cave spider's constructor shrinks the spider's whole shadow a seventh-tenths
+        // (`RenderCaveSpider.java`:14).
+        ModelRef::CaveSpider => [0.7, 1.0],
+        ModelRef::Chicken { .. } => [0.3, 1.0],
+        ModelRef::Squid => [0.7, 1.0],
+        // The slime's shadow scales with the size (`RenderSlime.java`:24); the magma
+        // cube's does not (its renderer overrides no `doRender`, `RenderMagmaCube.java`).
+        ModelRef::Slime { size } => [0.25 * f32::from(size), 1.0],
+        ModelRef::MagmaCube { .. } => [0.25, 1.0],
+        ModelRef::Bat { .. } => [0.25, 1.0],
+        ModelRef::Silverfish | ModelRef::EnderMite => [0.3, 1.0],
     }
 }
 
@@ -512,7 +620,52 @@ pub fn render_scale(reference: ModelRef) -> f32 {
             }
         }
         ModelRef::Giant => 6.0,
+        // The cave spider's whole model shrinks to seventh tenths (`RenderCaveSpider.java`:23),
+        // the bat's to its renderer's thirty-five hundredths (`RenderBat.java`:32).
+        ModelRef::CaveSpider => 0.7,
+        ModelRef::Bat { .. } => 0.35,
+        // The cube kinds at rest: their squash pair collapses to the size alone
+        // (`RenderSlime.preRenderCallback`:32-38) — [`cube_scale`] carries the pair while
+        // one squashes.
+        ModelRef::Slime { size } | ModelRef::MagmaCube { size } => f32::from(size),
         _ => 1.0,
+    }
+}
+
+/// The cube kinds' own render scale: the size and the frame's squash factor through the
+/// renderer's two-step fold (`RenderSlime.preRenderCallback`:32-38, `RenderMagmaCube.preRenderCallback`:29-36)
+/// — at rest the size alone.
+///
+/// `None` for every other kind, which draw [`render_scale`] instead; for the cubes this
+/// pair carries the whole scale, and [`render_scale`]'s `size` is the value it collapses
+/// to when nothing squashes.
+pub fn cube_scale(reference: ModelRef, squish: f32) -> Option<[f32; 3]> {
+    match reference {
+        ModelRef::Slime { size } | ModelRef::MagmaCube { size } => {
+            Some(crawlers::cube_scale(size, squish))
+        }
+        _ => None,
+    }
+}
+
+/// The y-shift a class's `rotateCorpse` takes before the death tilt, in blocks: the bat
+/// bobs on its age while it flies and hangs an eighth of a block low when it hangs
+/// (`RenderBat.rotateCorpse`:37-44 — `cos(handleRotationFloat * 0.3) * 0.1`, or `-0.1`;
+/// `handleRotationFloat` is the base renderer's own tick count,
+/// `RendererLivingEntity.handleRotationFloat` returning `ticksExisted + partialTicks`).
+///
+/// The source feeds that tick count straight to `cos`, with no conversion between them,
+/// and this follows it. Every other class shifts none.
+pub fn corpse_shift(reference: ModelRef, pose: &Pose) -> f32 {
+    match reference {
+        ModelRef::Bat { hanging } => {
+            if hanging {
+                -0.1
+            } else {
+                (pose.age * 0.3).cos() * 0.1
+            }
+        }
+        _ => 0.0,
     }
 }
 
@@ -965,6 +1118,49 @@ mod tests {
                 [64.0, 32.0],
             ),
             (ModelRef::Mooshroom, 1.3, [0.7, 1.0], [64.0, 32.0]),
+            // The crawler, cube and arthropod families: each class's own size — the creeper
+            // sets none of its own, so `Entity`'s default stands (`Entity.java`:269-270;
+            // `EntitySpider.java`:35, `EntityCaveSpider.java`:18, `EntityEnderman.java`:52,
+            // `EntityChicken.java`:39, `EntitySquid.java`:45, `EntitySlime.java`:56 — the
+            // magma cube inherits the same setter — `EntityBat.java`:22,
+            // `EntitySilverfish.java`:31, `EntityEndermite.java`:29).
+            (ModelRef::Creeper, 1.8, [0.5, 1.0], [64.0, 32.0]),
+            (ModelRef::Spider, 0.9, [1.0, 1.0], [64.0, 32.0]),
+            (ModelRef::CaveSpider, 0.5, [0.7, 1.0], [64.0, 32.0]),
+            (ModelRef::Enderman, 2.9, [0.5, 1.0], [64.0, 32.0]),
+            (
+                ModelRef::Chicken { child: false },
+                0.7,
+                [0.3, 1.0],
+                [64.0, 32.0],
+            ),
+            (ModelRef::Squid, 0.95, [0.7, 1.0], [64.0, 32.0]),
+            (
+                ModelRef::Slime { size: 1 },
+                0.51000005,
+                [0.25, 1.0],
+                [64.0, 32.0],
+            ),
+            (
+                ModelRef::Slime { size: 3 },
+                0.51000005 * 3.0,
+                [0.75, 1.0],
+                [64.0, 32.0],
+            ),
+            (
+                ModelRef::MagmaCube { size: 2 },
+                0.51000005 * 2.0,
+                [0.25, 1.0],
+                [64.0, 32.0],
+            ),
+            (
+                ModelRef::Bat { hanging: false },
+                0.9,
+                [0.25, 1.0],
+                [64.0, 32.0],
+            ),
+            (ModelRef::Silverfish, 0.3, [0.3, 1.0], [64.0, 32.0]),
+            (ModelRef::EnderMite, 0.3, [0.3, 1.0], [64.0, 32.0]),
         ];
         for (reference, height_wanted, shadow_wanted, size_wanted) in cases {
             assert_eq!(height(reference), height_wanted, "{reference:?}'s height");
@@ -986,6 +1182,31 @@ mod tests {
             model_for(ModelRef::Mooshroom),
             &crate::entity_models::quadrupeds::MODEL_COW
         ));
+        // Each crawler family kind draws its own table — the cave spider the spider's, a
+        // chick the child fold of the chicken's (`RenderCaveSpider` extends `RenderSpider`;
+        // `ModelChicken.render`:54-72).
+        for (reference, table) in [
+            (ModelRef::Creeper, &crawlers::MODEL_CREEPER),
+            (ModelRef::Spider, &crawlers::MODEL_SPIDER),
+            (ModelRef::CaveSpider, &crawlers::MODEL_SPIDER),
+            (ModelRef::Enderman, &crawlers::MODEL_ENDERMAN),
+            (ModelRef::Chicken { child: false }, &crawlers::MODEL_CHICKEN),
+            (
+                ModelRef::Chicken { child: true },
+                &crawlers::MODEL_CHICKEN_CHILD,
+            ),
+            (ModelRef::Squid, &crawlers::MODEL_SQUID),
+            (ModelRef::Slime { size: 1 }, &crawlers::MODEL_SLIME),
+            (ModelRef::MagmaCube { size: 2 }, &crawlers::MODEL_MAGMA_CUBE),
+            (ModelRef::Bat { hanging: false }, &crawlers::MODEL_BAT),
+            (ModelRef::Silverfish, &crawlers::MODEL_SILVERFISH),
+            (ModelRef::EnderMite, &crawlers::MODEL_ENDERMITE),
+        ] {
+            assert!(
+                std::ptr::eq(model_for(reference), table),
+                "{reference:?} draws its own table"
+            );
+        }
     }
 
     #[test]
@@ -1025,6 +1246,49 @@ mod tests {
             }),
             ["entity/sheep/sheep.png", "entity/sheep/sheep_fur.png"]
         );
+        // The crawler families' keys are each renderer's own resource location
+        // (`RenderCreeper.java`:12, `RenderSpider.java`:10, `RenderCaveSpider.java`:9,
+        // `RenderEnderman.java`:13, `RenderChicken.java`:10, `RenderSquid.java`:10,
+        // `RenderSlime.java`:11, `RenderMagmaCube.java`:10, `RenderBat.java`:11,
+        // `RenderSilverfish.java`:9, `RenderEndermite.java`:9); the spider's and the
+        // enderman's eyes overlays ride beside their base key (`LayerSpiderEyes.java`:11,
+        // `LayerEndermanEyes.java`:11), and the slime's gel draws the body's already-bound
+        // sheet (`LayerSlimeGel.java`:21-28), so one key names both.
+        assert_eq!(textures(ModelRef::Creeper), ["entity/creeper/creeper.png"]);
+        assert_eq!(
+            textures(ModelRef::Spider),
+            ["entity/spider/spider.png", "entity/spider_eyes.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::CaveSpider),
+            ["entity/spider/cave_spider.png", "entity/spider_eyes.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::Enderman),
+            [
+                "entity/enderman/enderman.png",
+                "entity/enderman/enderman_eyes.png"
+            ]
+        );
+        assert_eq!(
+            textures(ModelRef::Chicken { child: true }),
+            ["entity/chicken.png"]
+        );
+        assert_eq!(textures(ModelRef::Squid), ["entity/squid.png"]);
+        assert_eq!(
+            textures(ModelRef::Slime { size: 2 }),
+            ["entity/slime/slime.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::MagmaCube { size: 4 }),
+            ["entity/slime/magmacube.png"]
+        );
+        assert_eq!(
+            textures(ModelRef::Bat { hanging: true }),
+            ["entity/bat.png"]
+        );
+        assert_eq!(textures(ModelRef::Silverfish), ["entity/silverfish.png"]);
+        assert_eq!(textures(ModelRef::EnderMite), ["entity/endermite.png"]);
         // The professions pick their sheets (`RenderVillager.getEntityTexture`:32-54); any
         // value off the wire falls back to the plain villager sheet, the source's default.
         let sheet = |profession| match textures(ModelRef::Villager {
@@ -1119,5 +1383,55 @@ mod tests {
         assert_eq!(render_scale(ModelRef::Giant), 6.0);
         assert_eq!(render_scale(ModelRef::Zombie), 1.0);
         assert_eq!(render_scale(ModelRef::Cow), 1.0);
+    }
+
+    #[test]
+    fn the_crawler_families_carry_their_own_scales_and_shift() {
+        let rest = Pose::default();
+        // None of these models lifts for a sneak, and none carries a corpse roll: the
+        // models off `ModelBase` never read `isSneak`, and only the bat's `rotateCorpse`
+        // overrides (`RenderBat.rotateCorpse`:35-47).
+        assert_eq!(sneak_terms(ModelRef::Creeper), [0.0, 0.0]);
+        assert_eq!(sneak_terms(ModelRef::Bat { hanging: true }), [0.0, 0.0]);
+        assert_eq!(corpse_roll(ModelRef::Spider, &rest), 0.0);
+        // The bat's shift: an eighth of a block low while it hangs, and on its age wave
+        // while it flies — the tick count fed straight to the cosine, as the source feeds
+        // it (`RenderBat.rotateCorpse`:39, :43).
+        let flying = Pose {
+            age: 60.0,
+            ..Pose::default()
+        };
+        assert_eq!(corpse_shift(ModelRef::Bat { hanging: true }, &flying), -0.1);
+        assert_eq!(
+            corpse_shift(ModelRef::Bat { hanging: false }, &flying),
+            (60.0_f32 * 0.3).cos() * 0.1
+        );
+        assert_eq!(corpse_shift(ModelRef::Squid, &flying), 0.0);
+        // The render scales: the cave spider's seventh tenths and the bat's thirty-five
+        // hundredths shrink the whole model (`RenderCaveSpider.java`:23, `RenderBat.java`:32);
+        // the cubes draw at their size, the squash pair's collapse
+        // (`RenderSlime.preRenderCallback`:34-37).
+        assert_eq!(render_scale(ModelRef::CaveSpider), 0.7);
+        assert_eq!(render_scale(ModelRef::Bat { hanging: false }), 0.35);
+        assert_eq!(render_scale(ModelRef::Slime { size: 4 }), 4.0);
+        assert_eq!(render_scale(ModelRef::MagmaCube { size: 2 }), 2.0);
+        // The cubes' squash pair folds the size and the squish; at rest it is the size
+        // alone, and every other kind names none (`RenderSlime.preRenderCallback`:34-37,
+        // `RenderMagmaCube.preRenderCallback`:31-35).
+        assert_eq!(
+            cube_scale(ModelRef::Slime { size: 1 }, 0.0),
+            Some([1.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            cube_scale(ModelRef::MagmaCube { size: 3 }, 0.0),
+            Some([3.0, 3.0, 3.0])
+        );
+        let f1 = 1.0 / (3.0 * 0.5 + 1.0);
+        let f2 = 1.0 / (f1 + 1.0);
+        assert_eq!(
+            cube_scale(ModelRef::Slime { size: 3 }, 1.0),
+            Some([f2 * 3.0, (1.0 / f2) * 3.0, f2 * 3.0])
+        );
+        assert_eq!(cube_scale(ModelRef::Creeper, 1.0), None);
     }
 }

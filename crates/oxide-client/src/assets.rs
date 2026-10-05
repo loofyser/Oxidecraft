@@ -53,15 +53,19 @@ const CLOUDS: &str = "environment/clouds";
 /// set, keyed by its own names.
 ///
 /// The set is the shadow sprite, the two default skins and the mob sheets the kinds of
-/// this milestone draw — the biped family and the core quadrupeds, each key the class
-/// renderer's own resource location and the layers' sheets beside theirs.
+/// this milestone draw — the biped family, the core quadrupeds and the crawler
+/// families, each key the class renderer's own resource location and the layers'
+/// sheets beside theirs.
 ///
 /// The keys are the renderers' own, which are not always the obvious names: the giant
 /// binds `textures/entity/zombie/zombie.png`, the zombie's own sheet
 /// (`RenderGiantZombie.java`:13), the golem binds `textures/entity/iron_golem.png`, no
-/// subdirectory (`RenderIronGolem.java`:11), and the wool layer binds
-/// `textures/entity/sheep/sheep_fur.png` (`LayerSheepWool.java`:12).
-pub const ENTITY_TEXTURES: [&str; 21] = [
+/// subdirectory (`RenderIronGolem.java`:11), the wool layer binds
+/// `textures/entity/sheep/sheep_fur.png` (`LayerSheepWool.java`:12), and the eyes
+/// layers bind sheets of their own, `textures/entity/spider_eyes.png` and
+/// `textures/entity/enderman/enderman_eyes.png` (`LayerSpiderEyes.java`:11,
+/// `LayerEndermanEyes.java`:11).
+pub const ENTITY_TEXTURES: [&str; 34] = [
     "misc/shadow.png",
     "entity/steve.png",
     "entity/alex.png",
@@ -83,6 +87,19 @@ pub const ENTITY_TEXTURES: [&str; 21] = [
     "entity/cow/mooshroom.png",
     "entity/sheep/sheep.png",
     "entity/sheep/sheep_fur.png",
+    "entity/creeper/creeper.png",
+    "entity/spider/spider.png",
+    "entity/spider_eyes.png",
+    "entity/spider/cave_spider.png",
+    "entity/enderman/enderman.png",
+    "entity/enderman/enderman_eyes.png",
+    "entity/chicken.png",
+    "entity/squid.png",
+    "entity/slime/slime.png",
+    "entity/slime/magmacube.png",
+    "entity/bat.png",
+    "entity/silverfish.png",
+    "entity/endermite.png",
 ];
 
 /// The wide default skin's key, an entry of [`ENTITY_TEXTURES`].
@@ -303,6 +320,19 @@ mod tests {
                 "entity/cow/mooshroom.png",
                 "entity/sheep/sheep.png",
                 "entity/sheep/sheep_fur.png",
+                "entity/creeper/creeper.png",
+                "entity/spider/spider.png",
+                "entity/spider_eyes.png",
+                "entity/spider/cave_spider.png",
+                "entity/enderman/enderman.png",
+                "entity/enderman/enderman_eyes.png",
+                "entity/chicken.png",
+                "entity/squid.png",
+                "entity/slime/slime.png",
+                "entity/slime/magmacube.png",
+                "entity/bat.png",
+                "entity/silverfish.png",
+                "entity/endermite.png",
             ]
         );
         assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_WIDE));
@@ -328,6 +358,17 @@ mod tests {
                 wool: 14,
                 sheared: false,
             },
+            ModelRef::Creeper,
+            ModelRef::Spider,
+            ModelRef::CaveSpider,
+            ModelRef::Enderman,
+            ModelRef::Chicken { child: false },
+            ModelRef::Squid,
+            ModelRef::Slime { size: 1 },
+            ModelRef::MagmaCube { size: 1 },
+            ModelRef::Bat { hanging: false },
+            ModelRef::Silverfish,
+            ModelRef::EnderMite,
         ];
         for reference in kinds {
             for key in oxide_render::entity_models::textures(reference) {

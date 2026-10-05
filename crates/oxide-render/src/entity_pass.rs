@@ -93,6 +93,49 @@ pub enum ModelRef {
     },
     /// A mooshroom: `ModelCow` under the mooshroom's own sheet (`RenderMooshroom`:10).
     Mooshroom,
+    /// A creeper: `ModelCreeper`'s table (`ModelCreeper.java`:16); the charge aura its
+    /// renderer layers on is deferred (`RenderCreeper.java`:17).
+    Creeper,
+    /// A spider: `ModelSpider`'s head, neck, body and eight legs (`ModelSpider.java`:41),
+    /// with the eyes layer (`RenderSpider.java`:15).
+    Spider,
+    /// A cave spider: the spider's table and eyes under the cave spider's own sheet and
+    /// its renderer's seventh-tenths scale and shadow (`RenderCaveSpider.java`:9,`:14,`:23`).
+    CaveSpider,
+    /// An enderman: `ModelEnderman`'s outstretched biped (`ModelEnderman.java`:13), with
+    /// the eyes layer (`RenderEnderman.java`:23).
+    Enderman,
+    /// A chicken: `ModelChicken`'s table (`ModelChicken.java`:18); a child draws the
+    /// folded table its own render builds (`ModelChicken.java`:54-72).
+    Chicken {
+        /// Whether the draw is a child.
+        child: bool,
+    },
+    /// A squid: `ModelSquid`'s body and eight tentacles (`ModelSquid.java`:13).
+    Squid,
+    /// A slime: `ModelSlime(16)`'s inner body under the gel layer (`RenderSlime.java`:16);
+    /// the size rides the renderer's squash pair and the shadow (`:24`, `:32-38`).
+    Slime {
+        /// The slime size, `1..=4`.
+        size: u8,
+    },
+    /// A magma cube: `ModelMagmaCube`'s core and eight segments (`ModelMagmaCube.java`:12);
+    /// the size rides the renderer's squash pair (`RenderMagmaCube.java`:29-36`).
+    MagmaCube {
+        /// The cube size, `1..=4`.
+        size: u8,
+    },
+    /// A bat: `ModelBat`'s nested ears and wings (`ModelBat.java`:26); hanging folds the
+    /// wings and lifts the body (`RenderBat.rotateCorpse`:35-46).
+    Bat {
+        /// Whether the bat hangs.
+        hanging: bool,
+    },
+    /// A silverfish: `ModelSilverfish`'s seven bodies and three wings
+    /// (`ModelSilverfish.java`:21).
+    Silverfish,
+    /// An endermite: `ModelEnderMite`'s four segments (`ModelEnderMite.java`:13).
+    EnderMite,
 }
 
 /// The texture a draw samples.
@@ -138,6 +181,27 @@ pub enum DrawExtra {
     Pig {
         /// Whether the draw is saddled.
         saddle: bool,
+    },
+    /// A creeper: the kind's own marker — the charge flag lives on the entity and only
+    /// the deferred aura layer will read it (`LayerCreeperCharge`).
+    Creeper,
+    /// A chicken: the child fold rides the model table (`ModelChicken.render`:54-72).
+    Chicken {
+        /// Whether the draw is a child.
+        child: bool,
+    },
+    /// A slime: the size and the squash pair the renderer's scale folds
+    /// (`RenderSlime.preRenderCallback`:32-38).
+    Slime {
+        /// The slime size, `1..=4`.
+        size: u8,
+        /// The frame's interpolated `squishFactor`, `0.0..1.0`.
+        squish: f32,
+    },
+    /// A bat: the hang flag the model pose and the corpse shift read (`RenderBat.rotateCorpse`:35-46).
+    Bat {
+        /// Whether the bat hangs.
+        hanging: bool,
     },
 }
 
@@ -528,6 +592,12 @@ pub struct EntityPass {
     hurt_pipeline: wgpu::RenderPipeline,
     /// The shadow pipeline: the flat quad, depth writes off.
     shadow_pipeline: wgpu::RenderPipeline,
+    /// The eyes pipeline: the model fragment with the source's additive pair
+    /// (`LayerSpiderEyes.java`:24, `LayerEndermanEyes.java`:24).
+    eyes_pipeline: wgpu::RenderPipeline,
+    /// The gel pipeline: the model fragment with the source's straight-alpha pair
+    /// (`LayerSlimeGel.java`:26).
+    gel_pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the frame's matrix, eye, fog and lights.
     frame_buffer: wgpu::Buffer,
     /// The bind group the frame uniforms are read through.
@@ -647,6 +717,24 @@ impl EntityPass {
             },
             Some(wgpu::Face::Back),
         );
+        let eyes_pipeline = pipeline(
+            "oxide entity eyes pipeline",
+            FRAGMENT_MODEL,
+            PipelinePlan {
+                blend: Some(additive_blend()),
+                depth_write: true,
+            },
+            None,
+        );
+        let gel_pipeline = pipeline(
+            "oxide entity gel pipeline",
+            FRAGMENT_MODEL,
+            PipelinePlan {
+                blend: Some(alpha_blend()),
+                depth_write: true,
+            },
+            None,
+        );
         let vertex_capacity = INITIAL_VERTEX_BYTES;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxide entity vertices"),
@@ -659,6 +747,8 @@ impl EntityPass {
             model_pipeline,
             hurt_pipeline,
             shadow_pipeline,
+            eyes_pipeline,
+            gel_pipeline,
             frame_buffer,
             frame_bind_group,
             vertex_buffer,
@@ -737,11 +827,17 @@ impl EntityPass {
                 pass.set_pipeline(&self.hurt_pipeline);
                 pass.draw(geometry.body.clone(), 0..1);
             }
-            // The layers draw after the body, each through its own sheet
-            // (`RenderLiving.renderModel`'s layer walk).
-            for (range, key) in &geometry.layers {
+            // The layers draw after the body, each through its own sheet and blend
+            // (`RenderLiving.renderModel`'s layer walk: the eyes additive, the gel
+            // straight-alpha, the rest opaque).
+            for (range, key, blend) in &geometry.layers {
                 let texture = textures.texture_for(&TextureRef::Named(key));
-                pass.set_pipeline(&self.model_pipeline);
+                let pipeline = match blend {
+                    entity_models::layers::Blend::Opaque => &self.model_pipeline,
+                    entity_models::layers::Blend::Alpha => &self.gel_pipeline,
+                    entity_models::layers::Blend::Additive => &self.eyes_pipeline,
+                };
+                pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, &texture.bind_group, &[]);
                 pass.draw(range.clone(), 0..1);
             }
@@ -822,20 +918,23 @@ impl EntityPass {
 
         // The layers draw after the model, in the source's list order
         // (`RenderLiving.renderModel` walks its layer renderers after the main model), each
-        // through its own sheet with its tint multiplied into the vertex colour.
+        // through its own sheet with its tint multiplied into the vertex colour — a
+        // full-bright layer's colours skip the draw's light, as the source pins those
+        // layers' lightmap to its constant (`LayerSpiderEyes.java`:35-38).
         for layer in entity_models::layers::draw_layers(draw.model, &draw.extra, &draw.pose) {
             let layer_vertices = build_vertices(layer.model, &layer.transforms, layer.texture_size);
+            let light = if layer.full_bright { 1.0 } else { draw.light };
             let tint = [
-                draw.light * layer.tint[0],
-                draw.light * layer.tint[1],
-                draw.light * layer.tint[2],
+                light * layer.tint[0],
+                light * layer.tint[1],
+                light * layer.tint[2],
                 1.0,
             ];
             let start = vertices.len() as u32;
             push_vertices(vertices, &layer_vertices, chain, tint);
             built
                 .layers
-                .push((start..vertices.len() as u32, layer.texture));
+                .push((start..vertices.len() as u32, layer.texture, layer.blend));
         }
 
         // The cape: the layer's own box, wave and chain.
@@ -866,8 +965,10 @@ impl EntityPass {
 }
 
 /// The body chain for a draw: the source's `renderLivingAt` composition — the interpolated
-/// position, the `180 - body_yaw` turn, the death tilt with the class's own extra roll, the
-/// `(-1, -1, 1)` flip, the class's pre-render scale, the `-1.5078125` model drop and the
+/// position, the class's own rotate-corpse shift (the bat's bob, `RenderBat.rotateCorpse`:39),
+/// the `180 - body_yaw` turn, the death tilt with the class's own extra roll, the
+/// `(-1, -1, 1)` flip, the class's pre-render scale (the cubes' squash pair riding it
+/// per-axis, `RenderSlime.preRenderCallback`:34-37), the `-1.5078125` model drop and the
 /// model's own sneak lift, then the model's 1/16 units (`Render.doRender`, the renderer's
 /// pre-render callback, `RendererLivingEntity.doRender`).
 fn body_chain(draw: &EntityDraw) -> Mat4 {
@@ -878,15 +979,33 @@ fn body_chain(draw: &EntityDraw) -> Mat4 {
         draw.position[2] as f32,
     );
     let tilt = draw.death * DEATH_MAX_ROTATION + entity_models::corpse_roll(draw.model, &draw.pose);
+    let shift = entity_models::corpse_shift(draw.model, &draw.pose);
     let lift = if draw.pose.sneak { lift } else { 0.0 };
+    let scale = match entity_models::cube_scale(draw.model, squish_of(draw)) {
+        Some([x, y, z]) => Vec3::new(x, y, z),
+        None => Vec3::splat(entity_models::render_scale(draw.model)),
+    };
     Mat4::from_translation(position)
+        * Mat4::from_translation(Vec3::new(0.0, shift, 0.0))
         * Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians())
         * Mat4::from_rotation_z(tilt.to_radians())
         * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
-        * Mat4::from_scale(Vec3::splat(entity_models::render_scale(draw.model)))
+        * Mat4::from_scale(scale)
         * Mat4::from_translation(Vec3::new(0.0, MODEL_DROP, 0.0))
         * Mat4::from_translation(Vec3::new(0.0, lift, 0.0))
         * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
+}
+
+/// The squash factor a cube draw carries this frame: the slime's rides the draw's extras,
+/// the magma cube's its pose's own variant — the interpolated `squishFactor` both their
+/// renderers' scale and their models' segments read (`RenderSlime.preRenderCallback`:34-35,
+/// `ModelMagmaCube.setLivingAnimations`:42-56).
+fn squish_of(draw: &EntityDraw) -> f32 {
+    match (&draw.extra, draw.pose.extra) {
+        (DrawExtra::Slime { squish, .. }, _) => *squish,
+        (_, PoseExtra::MagmaCube { squish }) => squish,
+        _ => 0.0,
+    }
 }
 
 /// The cape layer's chain: the body's, without the model's sneak lift, with the layer's own
@@ -936,8 +1055,9 @@ struct BuiltDraw {
     shadow: Option<Range<u32>>,
     /// The model's range.
     body: Range<u32>,
-    /// The layers' ranges with their sheets' registry keys, in the model's layer order.
-    layers: Vec<(Range<u32>, &'static str)>,
+    /// The layers' ranges with their sheets' registry keys and blends, in the model's layer
+    /// order.
+    layers: Vec<(Range<u32>, &'static str, entity_models::layers::Blend)>,
     /// The cape's range, when both the bit and a texture are present.
     cape: Option<Range<u32>>,
     /// Whether the hurt combine draws over the body.
@@ -1156,6 +1276,40 @@ struct PipelinePlan {
 /// The shadow's blend: source alpha over one-minus-source alpha, the alpha channel kept
 /// (`Render.renderShadow`: `blendFunc(770, 771)`).
 fn shadow_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
+/// The eyes layers' blend: the source's `blendFunc(1, 1)` — the layer's colours added onto
+/// the frame (`LayerSpiderEyes.java`:24, `LayerEndermanEyes.java`:24).
+fn additive_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
+/// The gel layer's blend: the source's `blendFunc(770, 771)` — source alpha over
+/// one-minus-source alpha (`LayerSlimeGel.java`:26).
+fn alpha_blend() -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -1588,6 +1742,78 @@ mod tests {
         assert!(
             (player_shift - -(0.2 * 0.9375 + 0.125)).abs() < 1.0e-4,
             "the player's shift is its scaled lift plus the eighth: {player_shift}"
+        );
+    }
+
+    #[test]
+    fn the_cube_kinds_scale_by_their_squash_pair() {
+        // At rest the pair collapses to the size: a four-cube's chain holds fourfold on
+        // every axis (`RenderSlime.preRenderCallback`:34-37).
+        let rest = body_chain(&mob_draw(ModelRef::Slime { size: 4 }));
+        assert!((rest.x_axis.truncate().length() - 4.0 / 16.0).abs() < 1.0e-5);
+        assert!((rest.y_axis.truncate().length() - 4.0 / 16.0).abs() < 1.0e-5);
+        assert!((rest.z_axis.truncate().length() - 4.0 / 16.0).abs() < 1.0e-5);
+        // Fully squashed, the slime's y stretches and x/z flatten by the renderer's own
+        // fold, off the squish its draw carries.
+        let squished = EntityDraw {
+            extra: DrawExtra::Slime {
+                size: 1,
+                squish: 1.0,
+            },
+            ..mob_draw(ModelRef::Slime { size: 1 })
+        };
+        let chain = body_chain(&squished);
+        let f1 = 1.0 / (1.0 * 0.5 + 1.0);
+        let f2 = 1.0 / (f1 + 1.0);
+        assert!((chain.x_axis.truncate().length() - f2 * 1.0 / 16.0).abs() < 1.0e-5);
+        assert!((chain.y_axis.truncate().length() - (1.0 / f2) * 1.0 / 16.0).abs() < 1.0e-5);
+        // The magma cube's squish rides its pose's own variant, over the same fold
+        // (`RenderMagmaCube.preRenderCallback`:31-35).
+        let magma = EntityDraw {
+            pose: entity_models::Pose {
+                extra: PoseExtra::MagmaCube { squish: 1.0 },
+                ..entity_models::Pose::default()
+            },
+            ..mob_draw(ModelRef::MagmaCube { size: 3 })
+        };
+        let chain = body_chain(&magma);
+        let g1 = 1.0 / (3.0 * 0.5 + 1.0);
+        let g2 = 1.0 / (g1 + 1.0);
+        assert!((chain.x_axis.truncate().length() - g2 * 3.0 / 16.0).abs() < 1.0e-5);
+        assert!((chain.y_axis.truncate().length() - (1.0 / g2) * 3.0 / 16.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn the_bat_bob_and_hang_shift_the_chain() {
+        // The flying bat's chain sits on the age wave (`RenderBat.rotateCorpse`:39): between
+        // two ages of the same draw, the difference is the wave.
+        let bat_at = |age: f32, hanging: bool| EntityDraw {
+            pose: entity_models::Pose {
+                age,
+                ..entity_models::Pose::default()
+            },
+            ..mob_draw(ModelRef::Bat { hanging })
+        };
+        let step =
+            body_chain(&bat_at(60.0, false)).w_axis.y - body_chain(&bat_at(61.0, false)).w_axis.y;
+        let wave = ((60.0_f32 * 0.3).cos() - (61.0_f32 * 0.3).cos()) * 0.1;
+        assert!(
+            (step - wave).abs() < 1.0e-5,
+            "the flying bob is the age wave: {step} against {wave}"
+        );
+        // Hanging sits an eighth of a block low (`:43`) and ignores the age: two ages agree,
+        // and the hanging chain is the flying one less the wave and the eighth.
+        let hang_60 = body_chain(&bat_at(60.0, true)).w_axis.y;
+        let hang_61 = body_chain(&bat_at(61.0, true)).w_axis.y;
+        assert!(
+            (hang_60 - hang_61).abs() < 1.0e-6,
+            "the hang ignores the age: {hang_60} against {hang_61}"
+        );
+        let flying_60 = body_chain(&bat_at(60.0, false)).w_axis.y;
+        let between = hang_60 - flying_60;
+        assert!(
+            (between - (-0.1 - (60.0_f32 * 0.3).cos() * 0.1)).abs() < 1.0e-5,
+            "the hang shift against the flying draw: {between}"
         );
     }
 }

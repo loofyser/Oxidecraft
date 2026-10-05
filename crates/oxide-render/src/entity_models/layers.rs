@@ -16,7 +16,14 @@
 //! (`EnumDyeColor.java`:9-24).
 //!
 //! The layers this milestone draws are the identity set the plan's decision lists: the
-//! sheep's wool and the pig's saddle. Three more identity layers are in the set but draw a
+//! sheep's wool and the pig's saddle, and the crawler, cube and arthropod families' overlays
+//! — the spider's and the enderman's eyes (`LayerSpiderEyes.java`:19-48,
+//! `LayerEndermanEyes.java`:19-38: the body's own model on the eyes sheet, additive, pinned
+//! to the source's constant full-bright lightmap) and the slime's gel
+//! (`LayerSlimeGel.java`:19-32: the body's outer shell on the body's own sheet, alpha
+//! blended). The creeper's charge aura (`LayerCreeperCharge.java`, registered at
+//! `RenderCreeper.java`:17) defers with the render-type tinting; the magma cube draws no
+//! layer. Three more identity layers are in the set but draw a
 //! block through the block renderer — the snow golem's jack-o-lantern
 //! (`LayerSnowmanHead.java`:25-30 draws `Blocks.pumpkin` through the item renderer), the
 //! iron golem's rose (`LayerIronGolemFlower.java`:24-43 draws `Blocks.red_flower`), and the
@@ -85,6 +92,20 @@ impl Tint {
     }
 }
 
+/// The blend a layer's colours land with: the source's own `blendFunc` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blend {
+    /// The source's blend-disabled state: the wool and the saddle draw with no `blendFunc`
+    /// at all (`LayerSheepWool.java`:35-42, `LayerSaddle.java`:16-20).
+    Opaque,
+    /// Straight alpha — the source over one minus its own alpha (`blendFunc(770, 771)`, the
+    /// gel's pair, `LayerSlimeGel.java`:26).
+    Alpha,
+    /// Additive — the source's colours added onto the frame (`blendFunc(1, 1)`, the eyes
+    /// overlays' pair, `LayerSpiderEyes.java`:24, `LayerEndermanEyes.java`:24).
+    Additive,
+}
+
 /// One layer of a model class: the geometry it draws, the sheet it samples and its rules.
 #[derive(Debug, Clone, Copy)]
 pub struct Layer {
@@ -101,6 +122,12 @@ pub struct Layer {
     /// The pose the layer's geometry takes — the frames of its own model, in that model's
     /// part order.
     pub pose: fn(&Pose, &mut [Rot]),
+    /// Whether the layer draws at full brightness, ignoring the entity's own light: the eyes
+    /// overlays pin the lightmap to the source's constant pair of coordinates before they
+    /// draw (`LayerSpiderEyes.java`:35-38, `LayerEndermanEyes.java`:27-30).
+    pub full_bright: bool,
+    /// The blend the layer's colours land with.
+    pub blend: Blend,
 }
 
 /// One layer's resolved draw: its geometry with the frame's transforms, its sheet and the
@@ -117,6 +144,10 @@ pub struct LayerDraw {
     pub texture_size: [f32; 2],
     /// The colour the texels are multiplied by.
     pub tint: [f32; 3],
+    /// Whether the layer draws at full brightness.
+    pub full_bright: bool,
+    /// The blend the layer's colours land with.
+    pub blend: Blend,
 }
 
 /// The wool byte a sheep draw carries.
@@ -145,6 +176,8 @@ static WOOL_LAYER: Layer = Layer {
         index: wool_index,
     },
     pose: super::quadrupeds::pose_sheep,
+    full_bright: false,
+    blend: Blend::Opaque,
 };
 
 /// The sheep's layer table.
@@ -159,16 +192,76 @@ static SADDLE_LAYER: Layer = Layer {
     active: |extra| matches!(extra, DrawExtra::Pig { saddle: true }),
     tint: Tint::Sheet,
     pose: super::quadrupeds::pose_pig,
+    full_bright: false,
+    blend: Blend::Opaque,
 };
 
 /// The pig's layer table.
 static PIG_LAYERS: [Layer; 1] = [SADDLE_LAYER];
+
+/// The spider's eyes layer (`LayerSpiderEyes.java`:19-48): the spider's own model on the
+/// eyes sheet — additive, at the source's constant full-bright lightmap, depth written (the
+/// layer's invisible branch never fires: an invisible draw never reaches the pass). The cave
+/// spider inherits it through `RenderSpider`'s constructor
+/// (`RenderSpider.java`:15, reached by `RenderCaveSpider.java`:13).
+static SPIDER_EYES_LAYER: Layer = Layer {
+    model: &super::crawlers::MODEL_SPIDER,
+    texture: "entity/spider_eyes.png",
+    texture_size: [64.0, 32.0],
+    active: |_| true,
+    tint: Tint::Sheet,
+    pose: super::crawlers::pose_spider,
+    full_bright: true,
+    blend: Blend::Additive,
+};
+
+/// The spider's layer table.
+static SPIDER_LAYERS: [Layer; 1] = [SPIDER_EYES_LAYER];
+
+/// The enderman's eyes layer (`LayerEndermanEyes.java`:19-38): the enderman's own model on
+/// the eyes sheet — additive and full bright, as the spider's.
+static ENDERMAN_EYES_LAYER: Layer = Layer {
+    model: &super::crawlers::MODEL_ENDERMAN,
+    texture: "entity/enderman/enderman_eyes.png",
+    texture_size: [64.0, 32.0],
+    active: |_| true,
+    tint: Tint::Sheet,
+    pose: super::crawlers::pose_enderman,
+    full_bright: true,
+    blend: Blend::Additive,
+};
+
+/// The enderman's layer table.
+static ENDERMAN_LAYERS: [Layer; 1] = [ENDERMAN_EYES_LAYER];
+
+/// The slime's gel layer (`LayerSlimeGel.java`:19-32): the body's outer shell over the inner
+/// body, on the body's own sheet, alpha blended. The layer draws the sheet the base model
+/// already bound — it binds none of its own — so it names the slime's own key
+/// (`RenderSlime.java`:11), and it writes no frames: the shell's one part rests.
+static SLIME_GEL_LAYER: Layer = Layer {
+    model: &super::crawlers::MODEL_SLIME_GEL,
+    texture: "entity/slime/slime.png",
+    texture_size: [64.0, 32.0],
+    active: |_| true,
+    tint: Tint::Sheet,
+    pose: super::crawlers::pose_slime,
+    full_bright: false,
+    blend: Blend::Alpha,
+};
+
+/// The slime's layer table.
+static SLIME_LAYERS: [Layer; 1] = [SLIME_GEL_LAYER];
 
 /// The layers a model draws, in the source's order after its base model.
 pub fn layers_for(model: ModelRef) -> &'static [Layer] {
     match model {
         ModelRef::Sheep { .. } => &SHEEP_LAYERS,
         ModelRef::Pig { .. } => &PIG_LAYERS,
+        ModelRef::Spider | ModelRef::CaveSpider => &SPIDER_LAYERS,
+        ModelRef::Enderman => &ENDERMAN_LAYERS,
+        ModelRef::Slime { .. } => &SLIME_LAYERS,
+        // The creeper's charge aura (`RenderCreeper.java`:17) defers; the magma cube's
+        // renderer registers no layer at all.
         _ => &[],
     }
 }
@@ -193,6 +286,8 @@ fn resolve(layers: &[Layer], extra: &DrawExtra, pose: &Pose) -> Vec<LayerDraw> {
                 texture: layer.texture,
                 texture_size: layer.texture_size,
                 tint: layer.tint.rgb(extra),
+                full_bright: layer.full_bright,
+                blend: layer.blend,
             }
         })
         .collect()
@@ -240,6 +335,8 @@ mod tests {
         active: |_| true,
         tint: Tint::Sheet,
         pose: still,
+        full_bright: false,
+        blend: Blend::Opaque,
     };
     static SECOND: Layer = Layer {
         model: &DOT,
@@ -248,6 +345,8 @@ mod tests {
         active: |extra| matches!(extra, DrawExtra::Pig { saddle: true }),
         tint: Tint::Flat([0.25, 0.5, 0.75]),
         pose: quarter,
+        full_bright: false,
+        blend: Blend::Opaque,
     };
     static PAIR: [Layer; 2] = [FIRST, SECOND];
 
@@ -351,5 +450,53 @@ mod tests {
         assert_eq!(draws[1].texture_size, [32.0, 32.0]);
         assert_eq!(draws[1].tint, [0.25, 0.5, 0.75]);
         assert_eq!(draws[1].transforms[0].angles[2], PI / 2.0);
+    }
+
+    #[test]
+    fn the_eyes_and_gel_layers_are_the_sources_own() {
+        let pose = Pose::default();
+        // The spider: the body's own model on the eyes sheet, additive and full bright
+        // (`LayerSpiderEyes.java`:21-24, :35-38).
+        let spider = draw_layers(ModelRef::Spider, &DrawExtra::None, &pose);
+        assert_eq!(spider.len(), 1);
+        assert_eq!(spider[0].texture, "entity/spider_eyes.png");
+        assert_eq!(spider[0].blend, Blend::Additive);
+        assert!(spider[0].full_bright);
+        assert_eq!(spider[0].model.parts.len(), 11, "the body's own model");
+        // The cave spider inherits the same layer through `RenderSpider`'s constructor.
+        let cave = draw_layers(ModelRef::CaveSpider, &DrawExtra::None, &pose);
+        assert_eq!(cave.len(), 1);
+        assert_eq!(cave[0].texture, "entity/spider_eyes.png");
+        assert_eq!(cave[0].blend, Blend::Additive);
+        // The enderman's own eyes (`LayerEndermanEyes.java`:21-24, :27-30).
+        let enderman = draw_layers(ModelRef::Enderman, &DrawExtra::None, &pose);
+        assert_eq!(enderman.len(), 1);
+        assert_eq!(enderman[0].texture, "entity/enderman/enderman_eyes.png");
+        assert_eq!(enderman[0].blend, Blend::Additive);
+        assert!(enderman[0].full_bright);
+        // The slime's gel: the one-part outer shell on the body's sheet, plain alpha
+        // (`LayerSlimeGel.java`:26).
+        let slime = draw_layers(ModelRef::Slime { size: 1 }, &DrawExtra::None, &pose);
+        assert_eq!(slime.len(), 1);
+        assert_eq!(slime[0].texture, "entity/slime/slime.png");
+        assert_eq!(slime[0].blend, Blend::Alpha);
+        assert!(!slime[0].full_bright);
+        assert_eq!(slime[0].model.parts.len(), 1, "the gel is one body");
+        // The creeper's aura defers; the magma cube and the rest of the families register no
+        // layer at all.
+        for bare in [
+            ModelRef::Creeper,
+            ModelRef::MagmaCube { size: 1 },
+            ModelRef::Chicken { child: false },
+            ModelRef::Squid,
+            ModelRef::Bat { hanging: false },
+            ModelRef::Silverfish,
+            ModelRef::EnderMite,
+        ] {
+            assert!(
+                draw_layers(bare, &DrawExtra::None, &pose).is_empty(),
+                "{bare:?} draws no layer"
+            );
+        }
     }
 }

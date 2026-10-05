@@ -59,7 +59,7 @@ use oxide_assets::texture::Texture;
 use oxide_render::camera::{
     Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
 };
-use oxide_render::entity_models::Pose;
+use oxide_render::entity_models::{Pose, PoseExtra};
 use oxide_render::entity_pass::{
     DrawExtra, EntityDraw, EntityPass, ModelRef, TextureRef, TextureRegistry,
 };
@@ -2018,6 +2018,27 @@ fn flat_sheet(colour: [u8; 4]) -> Texture {
     }
 }
 
+/// The cube case's slime sheet: the gel shell's own cells (the sheet's top half, rows 0..32)
+/// one colour and the inner body's (its bottom half, the rows the body's `v + 16` uvs
+/// address) another, both at the gel's own half alpha, so the wash the layer draws is
+/// neither colour alone.
+fn slime_shell_sheet() -> Texture {
+    const SHELL: [u8; 4] = [200, 60, 40, 128];
+    const BODY: [u8; 4] = [60, 140, 220, 128];
+    let mut rgba = Vec::with_capacity(64 * 64 * 4);
+    for row in 0..64 {
+        let colour = if row < 32 { SHELL } else { BODY };
+        for _ in 0..64 {
+            rgba.extend_from_slice(&colour);
+        }
+    }
+    Texture {
+        width: 64,
+        height: 64,
+        rgba,
+    }
+}
+
 /// The entity cases' camera: level with an entity standing at the origin, looking at it from
 /// +z. Its view rotation is the identity, so the eye-space item lights are already world ones
 /// and the model's shaded faces can be computed directly.
@@ -2903,6 +2924,620 @@ fn the_wool_and_saddle_layers_draw_over_their_models() {
         changed_pixels(&saddled, &bare) >= 6,
         "the saddle layer changes the frame: {} pixels",
         changed_pixels(&saddled, &bare)
+    );
+}
+
+/// The crawler family draws its own models — the creeper's stocky stand, the spider's eight
+/// legs fanned wider than it stands, the cave spider on the spider's model at its pre-render
+/// callback's seventh-tenths scale, the enderman over-topping both on its thirty-unit limbs
+/// (`ModelCreeper.java`:23-44, `ModelSpider.java`:43-77, `ModelSpider.render`:86-96,
+/// `RenderCaveSpider.java`:23, `ModelEnderman.java`:23-36) — and the spiders' and the
+/// enderman's eyes layers draw over their models: the eyes sheet's colours added onto the
+/// body at the source's constant full-bright lightmap (`LayerSpiderEyes.java`:24,:35-38,
+/// `LayerEndermanEyes.java`:24,:27-30), so the addition follows the eyes sheet's own texels
+/// and not the draw's brightness.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_crawler_family_draws_its_own_silhouettes() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let mut registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/creeper/creeper.png", SKIN),
+            ("entity/spider/spider.png", SKIN),
+            ("entity/spider/cave_spider.png", SKIN),
+            ("entity/spider_eyes.png", [0, 0, 0, 255]),
+            ("entity/enderman/enderman.png", SKIN),
+            ("entity/enderman/enderman_eyes.png", [0, 0, 0, 255]),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let frames = [
+        (
+            "the creeper",
+            mob_at_origin(
+                ModelRef::Creeper,
+                "entity/creeper/creeper.png",
+                DrawExtra::Creeper,
+            ),
+        ),
+        (
+            "the spider",
+            mob_at_origin(
+                ModelRef::Spider,
+                "entity/spider/spider.png",
+                DrawExtra::None,
+            ),
+        ),
+        (
+            "the cave spider",
+            mob_at_origin(
+                ModelRef::CaveSpider,
+                "entity/spider/cave_spider.png",
+                DrawExtra::None,
+            ),
+        ),
+        (
+            "the enderman",
+            mob_at_origin(
+                ModelRef::Enderman,
+                "entity/enderman/enderman.png",
+                DrawExtra::None,
+            ),
+        ),
+    ];
+    let mut rendered = Vec::new();
+    for (name, draw) in frames {
+        let frame = render_mob(
+            &device,
+            &queue,
+            &target,
+            &depth,
+            &mut entities,
+            &registry,
+            draw,
+        );
+        let (min_x, min_y, max_x, max_y) = silhouette(&frame);
+        assert!(
+            max_x - min_x >= 4 && max_y - min_y >= 8,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(&frame) >= 60 && hued_pixels(&frame) >= 30,
+            "{name} draws its own sheet's hue: {} hued of {} pixels",
+            hued_pixels(&frame),
+            model_pixels(&frame)
+        );
+        rendered.push((name, frame));
+    }
+
+    // The creeper is taller than wide; the spider's eight-leg spread is the other way
+    // (`ModelCreeper.java`:30-43, `ModelSpider.render`:86-96).
+    let creeper = silhouette(&rendered[0].1);
+    let creeper_height = creeper.3 - creeper.1;
+    assert!(
+        creeper_height > creeper.2 - creeper.0,
+        "the creeper stands taller than wide, got {} wide by {creeper_height} tall",
+        creeper.2 - creeper.0
+    );
+    let spider = silhouette(&rendered[1].1);
+    assert!(
+        spider.2 - spider.0 > spider.3 - spider.1,
+        "the spider spreads wider than it stands, got {} wide by {} tall",
+        spider.2 - spider.0,
+        spider.3 - spider.1
+    );
+    // The cave spider draws the spider's model at the seventh-tenths scale its own pre-render
+    // callback sets (`RenderCaveSpider.java`:23).
+    let cave = silhouette(&rendered[2].1);
+    assert!(
+        cave.2 - cave.0 < spider.2 - spider.0 && cave.3 - cave.1 < spider.3 - spider.1,
+        "the cave spider draws smaller than the spider: ({}, {})..({}, {}) against ({}, {})..({}, {})",
+        cave.0,
+        cave.1,
+        cave.2,
+        cave.3,
+        spider.0,
+        spider.1,
+        spider.2,
+        spider.3
+    );
+    // The enderman over-tops the creeper on its thirty-unit limbs (`ModelEnderman.java`:23-36).
+    let enderman = silhouette(&rendered[3].1);
+    assert!(
+        enderman.3 - enderman.1 > creeper_height + 6,
+        "the enderman over-tops the creeper: {} against {creeper_height} tall",
+        enderman.3 - enderman.1
+    );
+
+    // The eyes layers: a black eyes sheet adds nothing, so the frames under it are the bodies;
+    // the same keys re-uploaded with a bright sheet move those frames by the added texels
+    // alone, at either of the draw's own brightnesses — the layers' lightmap is the source's
+    // constant (`LayerSpiderEyes.java`:35-38, `LayerEndermanEyes.java`:27-30).
+    let draw_spider = || {
+        mob_at_origin(
+            ModelRef::Spider,
+            "entity/spider/spider.png",
+            DrawExtra::None,
+        )
+    };
+    let draw_enderman = || {
+        mob_at_origin(
+            ModelRef::Enderman,
+            "entity/enderman/enderman.png",
+            DrawExtra::None,
+        )
+    };
+    let spider_bright = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        draw_spider(),
+    );
+    let spider_dim = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        EntityDraw {
+            light: 0.25,
+            ..draw_spider()
+        },
+    );
+    let enderman_body = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        draw_enderman(),
+    );
+    // What the eyes add: green and blue in a two-to-one ratio, nothing to red.
+    const EYES: [u8; 4] = [0, 100, 200, 255];
+    registry.set_named(&device, &queue, "entity/spider_eyes.png", &flat_sheet(EYES));
+    registry.set_named(
+        &device,
+        &queue,
+        "entity/enderman/enderman_eyes.png",
+        &flat_sheet(EYES),
+    );
+    let spider_bright_eyes = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        draw_spider(),
+    );
+    let spider_dim_eyes = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        EntityDraw {
+            light: 0.25,
+            ..draw_spider()
+        },
+    );
+    let enderman_eyes = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        draw_enderman(),
+    );
+
+    let mut spider_eyes_pixels = 0usize;
+    let mut moved_with_the_light = 0usize;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let body = pixel(&spider_bright, x, y);
+            let lit = pixel(&spider_bright_eyes, x, y);
+            let (dr, dg, db) = (
+                i32::from(lit[0]) - i32::from(body[0]),
+                i32::from(lit[1]) - i32::from(body[1]),
+                i32::from(lit[2]) - i32::from(body[2]),
+            );
+            if dg < 20 {
+                continue;
+            }
+            spider_eyes_pixels += 1;
+            assert!(
+                dr.abs() <= 2 && db >= 2 * dg - 8,
+                "the eyes add their texels onto the body, got ({dr}, {dg}, {db}) at ({x}, {y})"
+            );
+            let dim_body = pixel(&spider_dim, x, y);
+            let dim_lit = pixel(&spider_dim_eyes, x, y);
+            let (dim_green, dim_blue) = (
+                i32::from(dim_lit[1]) - i32::from(dim_body[1]),
+                i32::from(dim_lit[2]) - i32::from(dim_body[2]),
+            );
+            if (dim_green - dg).abs() > 2 || (dim_blue - db).abs() > 3 {
+                moved_with_the_light += 1;
+            }
+        }
+    }
+    assert!(
+        spider_eyes_pixels >= 40,
+        "the eyes sheet adds over the spider, {spider_eyes_pixels} pixels"
+    );
+    assert!(
+        moved_with_the_light <= (spider_eyes_pixels / 20).max(2),
+        "the eyes' lightmap is constant: {moved_with_the_light} of {spider_eyes_pixels} pixels moved with the draw's brightness"
+    );
+    let mut enderman_eyes_pixels = 0usize;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let body = pixel(&enderman_body, x, y);
+            let lit = pixel(&enderman_eyes, x, y);
+            if i32::from(lit[1]) - i32::from(body[1]) >= 20 {
+                enderman_eyes_pixels += 1;
+            }
+        }
+    }
+    assert!(
+        enderman_eyes_pixels >= 20,
+        "the enderman's eyes sheet adds over it, {enderman_eyes_pixels} pixels"
+    );
+}
+
+/// The cube family: a slime's whole model scales with its size and its squash pair stretches
+/// and pinches the silhouette (`RenderSlime.preRenderCallback`:32-37), and the gel layer
+/// washes the body — the outer shell draws the sheet's own cells over the inner body's at
+/// the layer's half alpha (`LayerSlimeGel.java`:19-32), so the read-back carries neither
+/// colour alone. The magma cube draws its core and eight segments off its own sheet
+/// (`ModelMagmaCube.setLivingAnimations`:42-56).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_cube_family_scales_with_its_size() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let mut registry = TextureRegistry::new(&device, &queue);
+    registry.set_named(
+        &device,
+        &queue,
+        "entity/slime/slime.png",
+        &slime_shell_sheet(),
+    );
+    registry.set_named(
+        &device,
+        &queue,
+        "entity/slime/magmacube.png",
+        &flat_sheet([255, 120, 0, 255]),
+    );
+    // The shadow sprite's texel alpha is zero, so its fragment is discarded and the frames
+    // below carry the models' own silhouettes: the squash's pinch is the model's, not the
+    // ground sprite's.
+    registry.set_named(
+        &device,
+        &queue,
+        "misc/shadow.png",
+        &flat_sheet([255, 255, 255, 0]),
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let slime = |size: u8, squish: f32| {
+        mob_at_origin(
+            ModelRef::Slime { size },
+            "entity/slime/slime.png",
+            DrawExtra::Slime { size, squish },
+        )
+    };
+    let one = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        slime(1, 0.0),
+    );
+    let four = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        slime(4, 0.0),
+    );
+    let squashed = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        slime(1, 1.0),
+    );
+    let magma = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::MagmaCube { size: 2 },
+            "entity/slime/magmacube.png",
+            DrawExtra::None,
+        ),
+    );
+
+    // The size scales the whole model: the four-cube stands taller and covers more.
+    let one_sil = silhouette(&one);
+    let four_sil = silhouette(&four);
+    assert!(
+        four_sil.3 - four_sil.1 > (one_sil.3 - one_sil.1) + 8,
+        "the four-cube stands taller than the one-cube: {} against {}",
+        four_sil.3 - four_sil.1,
+        one_sil.3 - one_sil.1
+    );
+    assert!(
+        model_pixels(&four) > model_pixels(&one),
+        "the four-cube covers more pixels: {} against {}",
+        model_pixels(&four),
+        model_pixels(&one)
+    );
+    // The squash pair at full: the one-cube stretches taller and pinches narrower.
+    let squash_sil = silhouette(&squashed);
+    assert!(
+        squash_sil.3 - squash_sil.1 > (one_sil.3 - one_sil.1) + 3,
+        "the squashed slime stands taller: {} against {}",
+        squash_sil.3 - squash_sil.1,
+        one_sil.3 - one_sil.1
+    );
+    assert!(
+        squash_sil.2 - squash_sil.0 < one_sil.2 - one_sil.0,
+        "the squashed slime pinches narrower: {} against {}",
+        squash_sil.2 - squash_sil.0,
+        one_sil.2 - one_sil.0
+    );
+    // The gel's wash: the shell's colour over the inner body's, neither alone
+    // (`LayerSlimeGel.java`:19-32), at the class's own half alpha and each face's own shade.
+    let shade = chest_shade();
+    let shell = [200.0f32, 60.0, 40.0];
+    let body = [60.0f32, 140.0, 220.0];
+    let alpha = 128.0 / 255.0;
+    let mut inner_only = [0u8; 3];
+    let mut washed = [0u8; 3];
+    for (channel, (inner_only, washed)) in inner_only.iter_mut().zip(washed.iter_mut()).enumerate()
+    {
+        let inner = (body[channel] * shade).round();
+        *inner_only = inner as u8;
+        *washed = (alpha * shell[channel] * shade + (1.0 - alpha) * inner).round() as u8;
+    }
+    let mut washed_pixels = 0usize;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let got = pixel(&one, x, y);
+            if got
+                .iter()
+                .zip(washed)
+                .all(|(&got, want)| (i16::from(got) - i16::from(want)).abs() <= 3)
+            {
+                washed_pixels += 1;
+            }
+        }
+    }
+    assert!(
+        washed_pixels >= 8,
+        "the gel washes the inner body's face, {washed_pixels} pixels carry the blend"
+    );
+    // The spot on the inner body's face reads the wash, not the body's colour alone: were
+    // the layer skipped, its half of the sheet would not read at all.
+    let spot = pixel(&one, SIZE / 2, SIZE / 2 + 18);
+    expect_pixel(&one, SIZE / 2, SIZE / 2 + 18, washed, "the gel wash");
+    assert!(
+        spot.iter()
+            .zip(inner_only)
+            .any(|(&got, want)| (i16::from(got) - i16::from(want)).abs() > 10),
+        "the gel's half of the sheet reads at the shell's face, got {spot:?}"
+    );
+    // The magma cube draws its core and its eight segments off its own sheet.
+    let magma_sil = silhouette(&magma);
+    assert!(
+        magma_sil.2 - magma_sil.0 >= 10 && model_pixels(&magma) >= 150 && hued_pixels(&magma) >= 80,
+        "the magma cube draws its core and segments: {} wide, {} pixels, {} hued",
+        magma_sil.2 - magma_sil.0,
+        model_pixels(&magma),
+        hued_pixels(&magma)
+    );
+}
+
+/// The arthropod family draws its own models: the chicken's head and stocky body with the
+/// child drawing the renderer's own folded table (`ModelChicken.java`:20-44,
+/// `ModelChicken.render`:54-72), the squid's body above its eight-tentacle fan
+/// (`ModelSquid.java`:10-34), the bat — folded flat while it hangs where the flying one beats
+/// its wings, with the hanging frame shifted down the tenth of a block the corpse rotation
+/// adds (`ModelBat.setRotationAngles`:75, `RenderBat.rotateCorpse`:35-46) — and the
+/// silverfish and the endermite as their own small crawling bodies
+/// (`ModelSilverfish.setRotationAngles`:73, `ModelEnderMite.setRotationAngles`:49).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_arthropod_family_draws_its_own_silhouettes() {
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+
+    let registry = mob_registry(
+        &device,
+        &queue,
+        &[
+            ("entity/chicken.png", SKIN),
+            ("entity/squid.png", SKIN),
+            ("entity/bat.png", SKIN),
+            ("entity/silverfish.png", SKIN),
+            ("entity/endermite.png", SKIN),
+        ],
+    );
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+
+    let bat = |hanging: bool| EntityDraw {
+        pose: Pose {
+            extra: PoseExtra::Bat { hanging },
+            ..Pose::default()
+        },
+        ..mob_at_origin(
+            ModelRef::Bat { hanging },
+            "entity/bat.png",
+            DrawExtra::Bat { hanging },
+        )
+    };
+    let chicken = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Chicken { child: false },
+            "entity/chicken.png",
+            DrawExtra::Chicken { child: false },
+        ),
+    );
+    let chick = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Chicken { child: true },
+            "entity/chicken.png",
+            DrawExtra::Chicken { child: true },
+        ),
+    );
+    let squid = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(ModelRef::Squid, "entity/squid.png", DrawExtra::None),
+    );
+    let flying = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        bat(false),
+    );
+    let hanging = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        bat(true),
+    );
+    let silverfish = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(
+            ModelRef::Silverfish,
+            "entity/silverfish.png",
+            DrawExtra::None,
+        ),
+    );
+    let endermite = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        mob_at_origin(ModelRef::EnderMite, "entity/endermite.png", DrawExtra::None),
+    );
+
+    for (name, frame, floor) in [
+        ("the chicken", &chicken, 40usize),
+        ("the chick", &chick, 30),
+        ("the squid", &squid, 80),
+        ("the flying bat", &flying, 8),
+        ("the hanging bat", &hanging, 8),
+        ("the silverfish", &silverfish, 12),
+        ("the endermite", &endermite, 8),
+    ] {
+        let (min_x, min_y, max_x, max_y) = silhouette(frame);
+        assert!(
+            max_x - min_x >= 3 && max_y - min_y >= 3,
+            "{name} stands in the frame, got ({min_x}, {min_y})..({max_x}, {max_y})"
+        );
+        assert!(
+            model_pixels(frame) >= floor && hued_pixels(frame) >= floor / 3,
+            "{name} draws its own sheet's hue: {} hued of {} pixels",
+            hued_pixels(frame),
+            model_pixels(frame)
+        );
+    }
+    // The child folds the table: the same head over a halved body, so the frames differ
+    // (`ModelChicken.render`:54-72).
+    assert!(
+        changed_pixels(&chicken, &chick) >= 15,
+        "the child folds the table, {} pixels changed",
+        changed_pixels(&chicken, &chick)
+    );
+    // The bat's fold: the hanging one's wings lie flat where the flying one beats them, and
+    // the corpse shift rides with the flag (`RenderBat.rotateCorpse`:35-46).
+    assert!(
+        changed_pixels(&flying, &hanging) >= 20,
+        "the hang flag folds the bat, {} pixels changed",
+        changed_pixels(&flying, &hanging)
+    );
+    // Two small crawlers, two bodies.
+    assert!(
+        changed_pixels(&silverfish, &endermite) >= 4,
+        "the silverfish and the endermite are different bodies, {} pixels",
+        changed_pixels(&silverfish, &endermite)
     );
 }
 
