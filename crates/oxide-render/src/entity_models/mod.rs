@@ -655,7 +655,13 @@ pub fn cube_scale(reference: ModelRef, squish: f32) -> Option<[f32; 3]> {
 /// `RendererLivingEntity.handleRotationFloat` returning `ticksExisted + partialTicks`).
 ///
 /// The source feeds that tick count straight to `cos`, with no conversion between them,
-/// and this follows it. Every other class shifts none.
+/// and this follows it.
+///
+/// The squid's `rotateCorpse` adds its own pair of translates around the yaw turn — half a
+/// block up before it, one and a fifth down after (`RenderSquid.rotateCorpse`:25-34) — with
+/// its squid pitch and yaw turns between them, interpolated from the entity's own fields;
+/// the frame carries neither, so both pin at zero and the net is seven tenths of a block
+/// down. Every other class shifts none.
 pub fn corpse_shift(reference: ModelRef, pose: &Pose) -> f32 {
     match reference {
         ModelRef::Bat { hanging } => {
@@ -665,6 +671,7 @@ pub fn corpse_shift(reference: ModelRef, pose: &Pose) -> f32 {
                 (pose.age * 0.3).cos() * 0.1
             }
         }
+        ModelRef::Squid => -0.7,
         _ => 0.0,
     }
 }
@@ -703,6 +710,21 @@ pub fn corpse_roll(reference: ModelRef, pose: &Pose) -> f32 {
 /// `(|value % period - period * 0.5| - period * 0.25) / (period * 0.25)`.
 pub fn folded_wave(value: f32, period: f32) -> f32 {
     ((value % period - period * 0.5).abs() - period * 0.25) / (period * 0.25)
+}
+
+/// The largest death tilt a class's renderer turns to over its death ramp, in degrees: the
+/// base renderer's own ninety (`RendererLivingEntity.getDeathMaxRotation`:473-476), and the
+/// hundred and eighty the spiders, the silverfish and the endermite override it with
+/// (`RenderSpider.getDeathMaxRotation`:18-21, which the cave spider inherits,
+/// `RenderCaveSpider.java`:7; `RenderSilverfish.getDeathMaxRotation`:16-19;
+/// `RenderEndermite.getDeathMaxRotation`:16-19).
+pub fn death_rotation(reference: ModelRef) -> f32 {
+    match reference {
+        ModelRef::Spider | ModelRef::CaveSpider | ModelRef::Silverfish | ModelRef::EnderMite => {
+            180.0
+        }
+        _ => 90.0,
+    }
 }
 
 #[cfg(test)]
@@ -1386,6 +1408,23 @@ mod tests {
     }
 
     #[test]
+    fn the_death_tilts_are_the_renderers_own() {
+        // The base renderer turns ninety degrees over the ramp
+        // (`RendererLivingEntity.getDeathMaxRotation`:473-476); every family without an
+        // override keeps it.
+        assert_eq!(death_rotation(ModelRef::Zombie), 90.0);
+        assert_eq!(death_rotation(ModelRef::Creeper), 90.0);
+        assert_eq!(death_rotation(ModelRef::Squid), 90.0);
+        // The spiders — the cave spider through its parent — the silverfish and the
+        // endermite turn a half (`RenderSpider.java`:18-21, `RenderCaveSpider.java`:7,
+        // `RenderSilverfish.java`:16-19, `RenderEndermite.java`:16-19).
+        assert_eq!(death_rotation(ModelRef::Spider), 180.0);
+        assert_eq!(death_rotation(ModelRef::CaveSpider), 180.0);
+        assert_eq!(death_rotation(ModelRef::Silverfish), 180.0);
+        assert_eq!(death_rotation(ModelRef::EnderMite), 180.0);
+    }
+
+    #[test]
     fn the_crawler_families_carry_their_own_scales_and_shift() {
         let rest = Pose::default();
         // None of these models lifts for a sneak, and none carries a corpse roll: the
@@ -1406,7 +1445,11 @@ mod tests {
             corpse_shift(ModelRef::Bat { hanging: false }, &flying),
             (60.0_f32 * 0.3).cos() * 0.1
         );
-        assert_eq!(corpse_shift(ModelRef::Squid, &flying), 0.0);
+        // The squid's corpse transform: half a block up around its own turn, then one and a
+        // fifth down (`RenderSquid.rotateCorpse`:29-33) — seven tenths down net at zero
+        // squid pitch and yaw, on the age-independent path.
+        assert_eq!(corpse_shift(ModelRef::Squid, &rest), -0.7);
+        assert_eq!(corpse_shift(ModelRef::Squid, &flying), -0.7);
         // The render scales: the cave spider's seventh tenths and the bat's thirty-five
         // hundredths shrink the whole model (`RenderCaveSpider.java`:23, `RenderBat.java`:32);
         // the cubes draw at their size, the squash pair's collapse

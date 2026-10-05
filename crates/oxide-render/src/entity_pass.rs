@@ -965,8 +965,10 @@ impl EntityPass {
 }
 
 /// The body chain for a draw: the source's `renderLivingAt` composition — the interpolated
-/// position, the class's own rotate-corpse shift (the bat's bob, `RenderBat.rotateCorpse`:39),
-/// the `180 - body_yaw` turn, the death tilt with the class's own extra roll, the
+/// position, the class's own rotate-corpse shift (the bat's bob and the squid's translate
+/// pair, `RenderBat.rotateCorpse`:39, `RenderSquid.rotateCorpse`:29-33),
+/// the `180 - body_yaw` turn, the death tilt at the renderer's own largest angle with the
+/// class's extra roll, the
 /// `(-1, -1, 1)` flip, the class's pre-render scale (the cubes' squash pair riding it
 /// per-axis, `RenderSlime.preRenderCallback`:34-37), the `-1.5078125` model drop and the
 /// model's own sneak lift, then the model's 1/16 units (`Render.doRender`, the renderer's
@@ -978,7 +980,8 @@ fn body_chain(draw: &EntityDraw) -> Mat4 {
         draw.position[1] as f32 - sneak_drop(draw),
         draw.position[2] as f32,
     );
-    let tilt = draw.death * DEATH_MAX_ROTATION + entity_models::corpse_roll(draw.model, &draw.pose);
+    let tilt = draw.death * entity_models::death_rotation(draw.model)
+        + entity_models::corpse_roll(draw.model, &draw.pose);
     let shift = entity_models::corpse_shift(draw.model, &draw.pose);
     let lift = if draw.pose.sneak { lift } else { 0.0 };
     let scale = match entity_models::cube_scale(draw.model, squish_of(draw)) {
@@ -1016,7 +1019,7 @@ fn cape_chain(draw: &EntityDraw, angles: [f32; 3]) -> Mat4 {
         draw.position[1] as f32 - sneak_drop(draw),
         draw.position[2] as f32,
     );
-    let death = (draw.death * DEATH_MAX_ROTATION).to_radians();
+    let death = (draw.death * entity_models::death_rotation(draw.model)).to_radians();
     Mat4::from_translation(position)
         * Mat4::from_rotation_y((180.0 - draw.body_yaw).to_radians())
         * Mat4::from_rotation_z(death)
@@ -1072,10 +1075,12 @@ type ShadowQuad = ([[f32; 3]; 4], [[f32; 2]; 4], f32);
 /// The quad is the block the entity stands in, centred on the entity and a whit above the
 /// feet, the sprite sampled from corner to corner with the source's own mapping
 /// (`Render.renderShadowBlock`: `(x - minX) / 2f + 0.5` reads one at the low corner, so the
-/// sprite runs backwards). The alpha is the source's own: the camera's distance fade
-/// `1 - d / 256` times the class's opacity (`Render.doRender`), halved for the block under
-/// the entity and scaled by the feet's light (`Render.renderShadowBlock`'s `d0` for the
-/// block the entity stands in).
+/// sprite runs backwards). The alpha is the source's own: the camera's squared-distance fade
+/// `(1 - d² / 256) * shadowOpaque`, with `d²` the sum of the squared axis offsets
+/// (`Render.doRenderShadowAndFire`:305-306, `RenderManager.getDistanceToCamera`:478-484),
+/// halved for the block under the entity and scaled by the feet's light
+/// (`Render.renderShadowBlock`'s `d0` for the block the entity stands in). The fade reaches
+/// zero at sixteen blocks, so the quad falls away there.
 fn shadow_quad(draw: &EntityDraw, shadow: [f32; 2], eye: [f32; 3]) -> Option<ShadowQuad> {
     let [size, opacity] = shadow;
     let position = Vec3::new(
@@ -1083,8 +1088,8 @@ fn shadow_quad(draw: &EntityDraw, shadow: [f32; 2], eye: [f32; 3]) -> Option<Sha
         draw.position[1] as f32,
         draw.position[2] as f32,
     );
-    let distance = position.distance(Vec3::from(eye));
-    let fade = (1.0 - distance / SHADOW_FADE_DISTANCE) * opacity;
+    let squared_distance = position.distance_squared(Vec3::from(eye));
+    let fade = (1.0 - squared_distance / SHADOW_FADE_DISTANCE) * opacity;
     let alpha = fade * 0.5 * draw.light;
     if alpha <= 0.0 {
         return None;
@@ -1352,15 +1357,14 @@ const MODEL_DROP: f32 = -1.5078125;
 /// The cape layer's own forward offset, in blocks (`LayerCape.doRenderLayer`).
 const CAPE_OFFSET: f32 = 0.125;
 
-/// The death tilt's largest angle in degrees (`RendererLivingEntity.getDeathMaxRotation`).
-const DEATH_MAX_ROTATION: f32 = 90.0;
-
 /// The shadow sprite's key: the shared sheet every shadow quad samples
 /// (`Render.renderShadow`'s `misc/shadow.png`).
 const SHADOW_TEXTURE: &str = "misc/shadow.png";
 
-/// The camera distance at which the shadow's fade reaches zero (`Render.doRender`: the alpha
-/// `(1 - d / 256) * shadowOpaque`).
+/// The squared camera distance at which the shadow's fade reaches zero
+/// (`Render.doRenderShadowAndFire`:305-306 — the alpha `(1 - d² / 256) * shadowOpaque`, with
+/// `d²` the squared distance `RenderManager.getDistanceToCamera`:478-484 measures): zero at
+/// sixteen blocks, nothing past it.
 const SHADOW_FADE_DISTANCE: f32 = 256.0;
 
 /// How far above the feet the shadow quad lies, in blocks (`Render.renderShadowBlock`:
@@ -1556,19 +1560,30 @@ mod tests {
     fn the_shadow_quad_spans_the_block_and_fades_with_distance() {
         let draw = player_draw();
         let shadow = entity_models::shadow(draw.model);
-        let (corners, uvs, alpha) = shadow_quad(&draw, shadow, [0.0, 0.0, 8.0]).unwrap();
-        // The quad spans twice the class's shadow size around the entity, just above the
-        // feet.
-        assert_eq!(corners[0], [-0.5, SHADOW_LIFT, -0.5]);
-        assert_eq!(corners[2], [0.5, SHADOW_LIFT, 0.5]);
-        // The sprite runs backwards: the low corner reads one (`(x - minX) / 2f + 0.5`).
-        assert_eq!(uvs[0], [1.0, 1.0]);
-        assert_eq!(uvs[2], [0.0, 0.0]);
-        // The alpha: the distance fade times the opacity, halved, times the feet's light.
-        let expected = (1.0 - 8.0 / 256.0) * shadow[1] * 0.5 * draw.light;
-        assert!((alpha - expected).abs() < 1.0e-6);
-        // Out past the fade's reach, nothing draws.
-        assert!(shadow_quad(&draw, shadow, [0.0, 0.0, 256.0]).is_none());
+        // The camera's squared distance drives the fade (`Render.doRenderShadowAndFire`:305-306
+        // over `RenderManager.getDistanceToCamera`:478-484): fifteen sixteenths of the
+        // opacity at four blocks (1 - 16/256) and three quarters at eight (1 - 64/256).
+        for (distance, fade) in [(4.0_f32, 0.9375_f32), (8.0, 0.75)] {
+            let (corners, uvs, alpha) = shadow_quad(&draw, shadow, [0.0, 0.0, distance]).unwrap();
+            // The quad spans twice the class's shadow size around the entity, just above the
+            // feet.
+            assert_eq!(corners[0], [-0.5, SHADOW_LIFT, -0.5]);
+            assert_eq!(corners[2], [0.5, SHADOW_LIFT, 0.5]);
+            // The sprite runs backwards: the low corner reads one (`(x - minX) / 2f + 0.5`).
+            assert_eq!(uvs[0], [1.0, 1.0]);
+            assert_eq!(uvs[2], [0.0, 0.0]);
+            // The alpha: the squared-distance fade times the opacity, halved, times the
+            // feet's light.
+            let expected = fade * shadow[1] * 0.5 * draw.light;
+            assert!(
+                (alpha - expected).abs() < 1.0e-6,
+                "at {distance} blocks the alpha reads {alpha} against {expected}"
+            );
+        }
+        // The fade reaches zero at sixteen blocks and the source draws nothing past it
+        // (`Render.doRenderShadowAndFire`:308's guard).
+        assert!(shadow_quad(&draw, shadow, [0.0, 0.0, 16.0]).is_none());
+        assert!(shadow_quad(&draw, shadow, [0.0, 0.0, 17.0]).is_none());
     }
 
     #[test]
@@ -1632,6 +1647,47 @@ mod tests {
             top.into(),
             [angle.sin() * 1.882_324_2, angle.cos() * 1.882_324_2, 0.0]
         ));
+    }
+
+    #[test]
+    fn the_squid_corpse_transform_nets_seven_tenths_down() {
+        // The squid's corpse transform at zero squid pitch and yaw collapses to its
+        // translate pair (`RenderSquid.rotateCorpse`:29-33): half a block up, then one and
+        // a fifth down, so the model's origin lands seven tenths below the drop's own
+        // height (1.5078125 − 0.7 = 0.8078125).
+        let squid = body_chain(&mob_draw(ModelRef::Squid)).transform_point3(Vec3::ZERO);
+        assert!(
+            close(squid.into(), [0.0, 0.807_812_5, 0.0]),
+            "the squid's origin at {squid:?} against [0.0, 0.8078125, 0.0]"
+        );
+    }
+
+    #[test]
+    fn the_arthropod_death_tilt_lies_at_a_half_turn() {
+        // The spiders, the silverfish and the endermite turn a half turn over their death
+        // ramp (`RenderSpider.java`:18-21, `RenderSilverfish.java`:16-19,
+        // `RenderEndermite.java`:16-19); the classes without the override keep the base
+        // quarter turn (`RendererLivingEntity.getDeathMaxRotation`:473-476). At a full ramp
+        // the flipped model's top point (0, -8, 0) lands under the feet at the half turn,
+        // and along the flank at the quarter.
+        let spider = EntityDraw {
+            death: 1.0,
+            ..mob_draw(ModelRef::Spider)
+        };
+        let top = body_chain(&spider).transform_point3(Vec3::new(0.0, -8.0, 0.0));
+        assert!(
+            close(top.into(), [0.0, -2.007_812_5, 0.0]),
+            "the dying spider's top at {top:?} against [0.0, -2.0078125, 0.0]"
+        );
+        let creeper = EntityDraw {
+            death: 1.0,
+            ..mob_draw(ModelRef::Creeper)
+        };
+        let top = body_chain(&creeper).transform_point3(Vec3::new(0.0, -8.0, 0.0));
+        assert!(
+            close(top.into(), [2.007_812_5, 0.0, 0.0]),
+            "the dying creeper's top at {top:?} against [2.0078125, 0.0, 0.0]"
+        );
     }
 
     #[test]

@@ -17,9 +17,11 @@
 //!
 //! The chicken's wings and the squid's tentacles draw at rest: their flap and tentacle floats
 //! are the entities' own client-side tick fields (`RenderChicken.handleRotationFloat`:28-33,
-//! `RenderSquid.handleRotationFloat`:39-42), which the frame does not carry, and the source's
-//! own grounded and at-rest values are both zero (`EntityChicken`'s `destPos`, `EntitySquid`
-//! sets `tentacleAngle = 0.0F` out of water, `EntitySquid.java`:185). The cube family's
+//! `RenderSquid.handleRotationFloat`:39-42), which the frame does not carry. The chicken's
+//! grounded `destPos` is zero, and the squid's own field is zero in water past the half
+//! rotation (`EntitySquid.java`:185) — out of water the same field runs
+//! `|sin(squidRotation)| * π/4` (`EntitySquid.java`:205) — so both draw at the zero this
+//! module pins. The cube family's
 //! squash pair reaches the renderer through the pre-render callbacks (`RenderSlime`:32-37,
 //! `RenderMagmaCube`:29-35) and the magma cube's segments through its living animation
 //! (`ModelMagmaCube.setLivingAnimations`:42-56); the scale formulas and the segment offsets
@@ -1397,13 +1399,15 @@ pub fn pose_creeper(pose: &Pose, out: &mut [Rot]) {
 }
 
 /// The spider's pose (`ModelSpider.setRotationAngles`:104): the head's angles, then the
-/// eight legs' rest fan swung and lifted by the class's own phase pairs.
+/// eight legs' rest fan swung and lifted by the class's own phase pairs — the swings on the
+/// doubled stride phase, the lifts on the single one (`ModelSpider.java`:127-134).
 pub fn pose_spider(pose: &Pose, out: &mut [Rot]) {
     out[spider_slot::HEAD].angles[1] = degrees(pose.head_yaw);
     out[spider_slot::HEAD].angles[0] = degrees(pose.head_pitch);
-    let phase = pose.limb_swing * 0.6662 * 2.0;
-    let swing = |offset: f32| -((phase + offset).cos() * 0.4) * pose.limb_swing_amount;
-    let lift = |offset: f32| (phase + offset).sin().abs() * 0.4 * pose.limb_swing_amount;
+    let swing_phase = pose.limb_swing * 0.6662 * 2.0;
+    let lift_phase = pose.limb_swing * 0.6662;
+    let swing = |offset: f32| -((swing_phase + offset).cos() * 0.4) * pose.limb_swing_amount;
+    let lift = |offset: f32| (lift_phase + offset).sin().abs() * 0.4 * pose.limb_swing_amount;
     let quarter = std::f32::consts::FRAC_PI_2;
     let three_quarters = std::f32::consts::PI * 3.0 / 2.0;
     out[spider_slot::LEG1].angles[1] += swing(0.0);
@@ -2528,39 +2532,55 @@ mod tests {
 
     #[test]
     fn the_spider_fans_its_swing_across_the_eight_legs() {
-        let mut rots = MODEL_SPIDER.rest();
-        let before = MODEL_SPIDER.rest();
-        pose_spider(&stride(90.0, 45.0), &mut rots);
-        assert_eq!(rots[spider_slot::HEAD].angles[1], degrees(90.0));
-        assert_eq!(rots[spider_slot::HEAD].angles[0], degrees(45.0));
-        // The swing pair and the lift pair, in the source's own phase order
-        // (`ModelSpider.setRotationAngles`:127-150).
-        let phase = 0.0_f32 * 0.6662 * 2.0;
-        let swing = |offset: f32| -((phase + offset).cos() * 0.4) * 1.0;
-        let lift = |offset: f32| (phase + offset).sin().abs() * 0.4 * 1.0;
-        let half = std::f32::consts::FRAC_PI_2;
-        let three_halves = std::f32::consts::PI * 3.0 / 2.0;
-        let pairs = [
-            (spider_slot::LEG1, swing(0.0), lift(0.0)),
-            (spider_slot::LEG2, -swing(0.0), -lift(0.0)),
-            (
-                spider_slot::LEG3,
-                swing(std::f32::consts::PI),
-                lift(std::f32::consts::PI),
-            ),
-            (
-                spider_slot::LEG4,
-                -swing(std::f32::consts::PI),
-                -lift(std::f32::consts::PI),
-            ),
-            (spider_slot::LEG5, swing(half), lift(half)),
-            (spider_slot::LEG6, -swing(half), -lift(half)),
-            (spider_slot::LEG7, swing(three_halves), lift(three_halves)),
-            (spider_slot::LEG8, -swing(three_halves), -lift(three_halves)),
-        ];
-        for (slot, y, z) in pairs {
-            assert_eq!(rots[slot].angles[1], before[slot].angles[1] + y);
-            assert_eq!(rots[slot].angles[2], before[slot].angles[2] + z);
+        // Two strides whose phases pull the swing and the lift apart. At 1.0 the leg-1 lift
+        // reads |sin(0.6662)| * 0.4 = 0.2472 where the swing's doubled phase would give
+        // |sin(1.3324)| * 0.4 = 0.3887; at 2.4 the pair reads 0.3998 against 0.0225. The
+        // swing runs `limbSwing * 0.6662F * 2.0F` and the lift `limbSwing * 0.6662F`
+        // (`ModelSpider.setRotationAngles`:127-134), so a lift riding the doubled phase
+        // fails here.
+        for limb_swing in [1.0_f32, 2.4] {
+            let mut rots = MODEL_SPIDER.rest();
+            let before = MODEL_SPIDER.rest();
+            let pose = Pose {
+                limb_swing,
+                limb_swing_amount: 1.0,
+                head_yaw: 90.0,
+                head_pitch: 45.0,
+                ..Pose::default()
+            };
+            pose_spider(&pose, &mut rots);
+            assert_eq!(rots[spider_slot::HEAD].angles[1], degrees(90.0));
+            assert_eq!(rots[spider_slot::HEAD].angles[0], degrees(45.0));
+            // The swing pair and the lift pair, in the source's own phase order
+            // (`ModelSpider.setRotationAngles`:135-150).
+            let swing_phase = limb_swing * 0.6662 * 2.0;
+            let lift_phase = limb_swing * 0.6662;
+            let swing = |offset: f32| -((swing_phase + offset).cos() * 0.4) * 1.0;
+            let lift = |offset: f32| (lift_phase + offset).sin().abs() * 0.4 * 1.0;
+            let half = std::f32::consts::FRAC_PI_2;
+            let three_halves = std::f32::consts::PI * 3.0 / 2.0;
+            let pairs = [
+                (spider_slot::LEG1, swing(0.0), lift(0.0)),
+                (spider_slot::LEG2, -swing(0.0), -lift(0.0)),
+                (
+                    spider_slot::LEG3,
+                    swing(std::f32::consts::PI),
+                    lift(std::f32::consts::PI),
+                ),
+                (
+                    spider_slot::LEG4,
+                    -swing(std::f32::consts::PI),
+                    -lift(std::f32::consts::PI),
+                ),
+                (spider_slot::LEG5, swing(half), lift(half)),
+                (spider_slot::LEG6, -swing(half), -lift(half)),
+                (spider_slot::LEG7, swing(three_halves), lift(three_halves)),
+                (spider_slot::LEG8, -swing(three_halves), -lift(three_halves)),
+            ];
+            for (slot, y, z) in pairs {
+                assert_eq!(rots[slot].angles[1], before[slot].angles[1] + y);
+                assert_eq!(rots[slot].angles[2], before[slot].angles[2] + z);
+            }
         }
     }
 
