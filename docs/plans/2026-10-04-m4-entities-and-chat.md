@@ -977,3 +977,15 @@ The M3 final review's risk list is answered in turn: the stage-map re-key and th
 38. The objects caller's mirror coverage: the helper is pinned and the caller's view yaw now matches the source, but the caller's own value has no mirror-sensitive assertion — the count-level cases are reflection-invariant on the centred quads; a caller-level orientation case (with an asymmetric sheet) rides the next objects-path touch, the live acceptance run as the end-to-end net (Task 22). *(added after execution; ruled ACCEPT-with-note by the Task 13 fix re-review)*
 
 39. The nametag GPU cases drive the pass through the synthetic sheet (the suite's font strategy); no end-to-end visual session of a live nametag — the acceptance run carries that duty (Task 22). *(added after execution; certified by the Task 13 review)*
+
+40. The task's work landed as two commits — `feat: parse and log the chat` (the pipeline core: the component model, the parser, the wrap, the log, and the session event) then the rendering half carrying this section's message — split at the data/render boundary before execution began, each commit gated on its own. *(added after execution)*
+
+41. The chat's recorded clock is the player pose's tick, not the frame's partial: the source subtracts the frame's partial tick when it draws (`GuiIngame.java`:248), so a frame between ticks draws its tick's alpha; the fade-series case pins the series (255·255·254·230·143·63·15·5·2·0, bars the integer half). *(added after execution; recorded by the Task 14 review)*
+
+42. The chat mirror's open and scroll entry points (`ChatView::set_open`, `scroll`) and the renderer's `set_gui_scale` ship wired but uncalled: the open-field screen and its wheel are Task 15's, and the settings store is M6's; the closed box is the form this milestone reaches. *(added after execution; recorded by the Task 14 review)*
+
+43. The wrap splits the flattened runs where the source splits the components its renderer received and restyles each piece with the element's own style plus embedded codes: the two agree for every pinned literal, and the one divergent reading is a `§` restyle crossing an explicit newline inside one JSON text — documented at the wrap, no test covers that corner. *(added after execution; recorded by the Task 14 review)*
+
+44. The parser's deep-input envelope: `serde_json`'s own nesting limit (128) sits above the port's depth cap (16), so a hostile deep payload degrades to raw text before the cap is reached (both paths tested; the cap stays the tree-walk guard for wide-but-shallow trees); the source's post-trim append guard (`GuiUtilRenderComponents.java`:84) is documented but not replicated — a trimmed head always fits the budget it was trimmed to, so its else is unreachable. *(added after execution; recorded by the Task 14 review)*
+
+45. The HUD and chat GPU cases drive the pass through the synthetic sheet and pin pixels on the local adapter (the render family's standing shape); no end-to-end live session of either — the acceptance run carries that duty (Task 22). *(added after execution; certified by the Task 14 review)*
