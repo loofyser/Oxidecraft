@@ -14,6 +14,7 @@ use crate::camera::Camera;
 use crate::dim_pass::DimPass;
 use crate::entity_pass::{EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
+use crate::hud::{HudDraw, HudPass, ScaledResolution, scaled_resolution};
 use crate::overlay::OverlayPass;
 use crate::sky::{
     CloudPass, SkyParams, SkyPass, SkyTextures, cloud_at_or_above_layer, cloud_under_layer,
@@ -135,8 +136,9 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 /// [`Renderer::render`] clears the window to the frame's fog colour — the sky the terrain fades
 /// towards, so the two agree where the terrain ends — and the depth buffer to the far plane,
 /// draws the sky through the sky pass, the cloud layer, the section meshes through the terrain
-/// pass, the world overlay — the aim's outline and the destroy-stage crack — and the debug
-/// overlay over them, then presents the frame. The cloud layer draws exactly
+/// pass, the world overlay — the aim's outline and the destroy-stage crack — and the GUI over
+/// them: the dim quad, the hud's draw list and the debug overlay, then presents the frame. The
+/// cloud layer draws exactly
 /// once, and the entity eye's height places it: the source's under-arm before the terrain while
 /// the eye is under the layer (`EntityRenderer.java:1364-1367`) and its at-or-above arm after
 /// the translucent layer once the eye is at or above it (`:1474-1478`); [`scene_draws`] is the
@@ -172,6 +174,13 @@ pub struct Renderer {
     overlay: OverlayPass,
     /// The dim quad, drawn over the scene before the overlay text.
     dim: DimPass,
+    /// The hud pass, drawing the frame's GUI-space draw list between the dim and the
+    /// debug overlay text.
+    hud: HudPass,
+    /// The gui-scale setting the hud's scaled resolution reads: zero is the source's
+    /// auto scale (`ScaledResolution.java`:22-25). The settings screen that owns the
+    /// option is a later milestone's, so the default stands.
+    gui_scale: u8,
     /// The entity pass: the boxes and the shadows drawn between the terrain's solid and
     /// translucent layers.
     entity_pass: EntityPass,
@@ -291,6 +300,9 @@ impl Renderer {
         let mut overlay = OverlayPass::new(&device, format);
         overlay.set_size(&queue, config.width as f32, config.height as f32);
         let dim = DimPass::new(&device, format);
+        let mut hud = HudPass::new(&device, &queue, format);
+        let scaled = scaled_resolution(config.width, config.height, 0);
+        hud.set_resolution(&queue, scaled.width as f32, scaled.height as f32);
         let depth = DepthTarget::new(&device, config.width, config.height);
         let entity_textures = TextureRegistry::new(&device, &queue);
         let entity_pass = EntityPass::new(&device, &queue, format, entity_textures.layout());
@@ -308,6 +320,8 @@ impl Renderer {
             cloud,
             overlay,
             dim,
+            hud,
+            gui_scale: 0,
             entity_pass,
             entity_textures,
             entities: Vec::new(),
@@ -338,8 +352,9 @@ impl Renderer {
     ///
     /// Call after the surface reported that it went stale: `Outdated` and `Lost` mean it no
     /// longer matches the window, or the driver dropped it, and reconfiguring makes the next
-    /// frame's acquisition succeed. When the size changed, the depth texture and the overlay's
-    /// projection are rebuilt too, because both belong to the surface size.
+    /// frame's acquisition succeed. When the size changed, the depth texture, the overlay's
+    /// projection and the hud's scaled-resolution projection are rebuilt too, because all three
+    /// belong to the surface size.
     pub fn reconfigure(&mut self) {
         self.surface.configure(&self.device, &self.config);
         if self.depth.width != self.config.width || self.depth.height != self.config.height {
@@ -349,6 +364,9 @@ impl Renderer {
                 self.config.width as f32,
                 self.config.height as f32,
             );
+            let scaled = self.scaled_resolution();
+            self.hud
+                .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
         }
     }
 
@@ -382,17 +400,38 @@ impl Renderer {
             .set_atlas(&self.device, &self.queue, atlas);
     }
 
-    /// Uploads the ascii font sheet the debug overlay and the entity pass's nametags draw
-    /// with.
+    /// Uploads the ascii font sheet the debug overlay, the entity pass's nametags and the hud
+    /// draw with.
     ///
-    /// The overlay measures the sheet as it uploads it, so the layout's widths and the
-    /// sampled texels cannot disagree; until this is called the overlay draws nothing and a
-    /// nametag has no glyphs to measure. A sheet that is not a 16x16 grid is [`FontError`]
-    /// and the previous font stays on both passes.
+    /// Every pass measures the sheet as it uploads it, so the layout's widths and the sampled
+    /// texels cannot disagree; until this is called the overlay draws nothing, a nametag has
+    /// no glyphs to measure and the hud's text draws contribute nothing. A sheet that is not
+    /// a 16x16 grid is [`FontError`] and the previous font stays on every pass.
     pub fn set_font(&mut self, sheet: &Texture) -> Result<(), FontError> {
         self.entity_pass
             .set_font(&self.device, &self.queue, sheet)?;
+        self.hud.set_font(&self.device, &self.queue, sheet)?;
         self.overlay.set_font(&self.device, &self.queue, sheet)
+    }
+
+    /// Sets the gui-scale setting the hud's scaled resolution reads.
+    ///
+    /// Zero is the source's auto scale (`ScaledResolution.java`:22-25) and any other value
+    /// caps the factor there (`:27-30`). The projection is rebuilt from the new resolution,
+    /// so the next frame's draw list lays out against it.
+    pub fn set_gui_scale(&mut self, gui_scale: u8) {
+        self.gui_scale = gui_scale;
+        let scaled = self.scaled_resolution();
+        self.hud
+            .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
+    }
+
+    /// The scaled resolution the hud draws at, for the window's own draw assembly.
+    ///
+    /// The same call the hud's projection is built from: the window lays its GUI draws out
+    /// in these units.
+    pub fn scaled_resolution(&self) -> ScaledResolution {
+        scaled_resolution(self.config.width, self.config.height, self.gui_scale)
     }
 
     /// Rewrites the terrain lightmap for a sky brightness.
@@ -542,6 +581,15 @@ impl Renderer {
         self.overlay.upload_text(&self.device, &self.queue, &lines);
     }
 
+    /// Sets the hud draw list drawn this frame; empty draws nothing.
+    ///
+    /// The list is laid out and uploaded on the call, so a frame draws exactly the list the
+    /// caller last set — the window assembles it from the chat and, later milestones, the
+    /// rest of the GUI at [`Renderer::scaled_resolution`]'s units.
+    pub fn set_hud(&mut self, draws: Vec<HudDraw>) {
+        self.hud.set_draws(&self.device, &self.queue, &draws);
+    }
+
     /// Sets the full-frame tint the next frames draw over the scene, or clears it.
     ///
     /// The interim death view's backdrop: a colour here dims the whole frame
@@ -569,8 +617,9 @@ impl Renderer {
     /// the cloud layer once — through the source's under-layer arm before the terrain while the
     /// entity eye is under the layer, or through its at-or-above arm after the terrain once the
     /// eye is at or above it (`EntityRenderer.java:1364-1367`, `:1474-1478`; [`scene_draws`]).
-    /// The overlay pass then draws the debug lines over the result, in a pass without a depth
-    /// attachment, so no terrain can hide the text.
+    /// The overlay pass then draws the frame's GUI over the result, in a pass without a depth
+    /// attachment, so no terrain can hide it: the dim quad first, then the hud's draw list,
+    /// then the debug lines text.
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
@@ -661,6 +710,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             self.dim.draw(&mut overlay_pass);
+            self.hud.draw(&mut overlay_pass);
             self.overlay.draw(&mut overlay_pass);
         }
         self.queue.submit(Some(encoder.finish()));

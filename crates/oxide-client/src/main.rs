@@ -428,6 +428,8 @@ struct ClientApp {
     /// The entity feed's own state: the latest frames, their arrival and the
     /// draws a frame builds from them.
     view: view::View,
+    /// The chat mirror: the session's chat messages and the frame's hud draws for them.
+    chat: view::ChatView,
     /// The skin worker's request feed, when a session was opened.
     ///
     /// Dropping it — the client drops it with the app at exit — closes the
@@ -740,6 +742,7 @@ impl ClientApp {
         // With a server the assets load before anything opens, so a store that is missing or
         // malformed fails fast; the smoke path without one loads nothing.
         let mut assets = None;
+        let mut chat_font = None;
         let mut skin_requests_tx = None;
         let mut skin_updates_rx = None;
         let session = match cli.server {
@@ -747,6 +750,9 @@ impl ClientApp {
                 let (host, port) = parse_server_address(&address)?;
                 tracing::info!(server = %address, username = %cli.username, "joining the server");
                 let loaded = ClientAssets::load(None)?;
+                // The chat mirror measures against the same sheet every other text
+                // surface uses; it gets the font before the window opens.
+                chat_font = Some(loaded.font.clone());
                 // The skin worker opens the store the assets loaded from —
                 // the same root rule — and owns the cache on its own thread.
                 let store = Store::open(assets::default_store_root()?)?;
@@ -810,6 +816,14 @@ impl ClientApp {
             world_overlay: WorldOverlayState::default(),
             skins: BTreeMap::new(),
             view: view::View::new(),
+            chat: match chat_font {
+                Some(font) => {
+                    let mut chat = view::ChatView::new();
+                    chat.set_font(font);
+                    chat
+                }
+                None => view::ChatView::new(),
+            },
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
             overlay_visible,
@@ -914,6 +928,7 @@ impl ClientApp {
                 &mut self.hud,
                 &mut self.sky,
                 &mut self.player,
+                &mut self.chat,
                 &mut self.world_overlay,
                 &mut self.dead,
                 event,
@@ -1003,6 +1018,12 @@ impl ClientApp {
             // the feed's own order, the window's own entity skipped.
             renderer.set_entities(self.view.entity_draws(Instant::now(), &self.skins));
         }
+        // The chat: the mirror ages to the session's tick, and the frame's draws —
+        // bars, text and the record line at the scaled resolution — land in the hud
+        // pass, which draws them between the dim and the debug overlay.
+        self.chat.update(self.player.tick);
+        let scaled = renderer.scaled_resolution();
+        renderer.set_hud(self.chat.draws(scaled));
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
         // text goes. Both are cleared when the respawn arrives.
@@ -1357,11 +1378,13 @@ fn clear_break_stage(stages: &mut BTreeMap<[i32; 3], u8>, x: i32, y: i32, z: i32
 /// Returns whether the session ended, which stops the client. The session
 /// returns `Ok(())` when the server closed the connection, so its end is a
 /// normal exit, not an error.
+#[allow(clippy::too_many_arguments)]
 fn apply_session_event(
     renderer: &mut Renderer,
     hud: &mut HudState,
     sky: &mut SkyState,
     player: &mut PlayerState,
+    chat: &mut view::ChatView,
     world_overlay: &mut WorldOverlayState,
     dead: &mut bool,
     event: ClientEvent,
@@ -1431,10 +1454,10 @@ fn apply_session_event(
             // total.
             false
         }
-        ClientEvent::Chat { .. } => {
-            // The window's chat surface arrives with a later milestone; the
-            // feed is accepted here so the session's event stream stays
-            // total.
+        ClientEvent::Chat { text, position } => {
+            // The chat mirror: the message lands with the tick the player pose last
+            // reported — the clock the log's fade and the record line's hold read.
+            chat.observe(&text, position, player.tick);
             false
         }
         ClientEvent::Aim { aim: report } => {

@@ -8,11 +8,23 @@
 //! skipped — reading the stored frames and the skin worker's updates only; nothing
 //! looks at the world, which the window does not hold
 //! (`RendererLivingEntity.doRender`'s interpolated terms are the model here).
+//!
+//! The same session that feeds the entities feeds the chat: [`ClientEvent::Chat`]
+//! messages land in the mirror ([`ChatView`]), whose [`ChatLog`] holds the split lines,
+//! the fade clocks and the scroll state, and whose [`ChatView::draws`] assembles the
+//! frame's hud draw list at the scaled resolution — the box the source draws at
+//! `GuiNewChat.drawChat`:30-114 and the record line above the hotbar
+//! (`GuiIngame.java`:245-272).
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use oxide_assets::font::Font;
 use oxide_assets::skins::{DefaultModel, default_skin};
+use oxide_game::chat::{
+    self, CHAT_WIDTH, ChatLog, LOG_CAP, STYLE_BOLD, STYLE_ITALIC, STYLE_OBFUSCATED,
+    STYLE_STRIKETHROUGH, STYLE_UNDERLINED, TextComponent,
+};
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
 use oxide_game::session::ClientEvent;
 use oxide_render::entity_models::player::CapeMotion;
@@ -20,6 +32,8 @@ use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
     DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, TextureRef,
 };
+use oxide_render::hud::{HudDraw, ScaledResolution};
+use oxide_render::text::string_width;
 use oxide_world::entity::EntityKind;
 
 use crate::items;
@@ -850,6 +864,276 @@ fn interpolate_rotation(prev: f32, cur: f32, partial: f32) -> f32 {
     prev + difference * partial
 }
 
+/// The sixteen legacy colour codes' characters, the palette's index order
+/// (`ChatComponentStyle.getFormattedText`:87-99 over `EnumChatFormatting`'s table).
+const PALETTE: &[u8; 16] = b"0123456789abcdef";
+
+/// The chat opacity the assembly reads — `GameSettings.chatOpacity`'s default
+/// (`GameSettings.java`:85, `1.0F`). A settings store that owns the option is a later
+/// milestone's, so the default stands.
+const CHAT_OPACITY: f32 = 1.0;
+
+/// The newest line's bar bottom, 28 pixels above the screen's bottom edge: the
+/// `(2, 20)` translate (`GuiNewChat.java`:49-51) under the `height - 48` one
+/// (`GuiIngame.java`:343).
+const CHAT_BASE: f32 = 28.0;
+
+/// The bar's x, the source's translate origin (`GuiNewChat.java`:49-51).
+const CHAT_X: f32 = 2.0;
+
+/// One line's pitch in pixels (`GuiNewChat.java`:348-351).
+const LINE_PITCH: f32 = 9.0;
+
+/// The bar's height: the pitch's own nine (`GuiNewChat.java`:81-82 draws `j2 - 9` to
+/// `j2`).
+const BAR_HEIGHT: f32 = 9.0;
+
+/// The bar's width: the wrap budget plus four (`GuiNewChat.java`:82,
+/// `getChatWidth`:343-346).
+const BAR_WIDTH: f32 = CHAT_WIDTH as f32 + 4.0;
+
+/// The record line's hold in ticks: `recordPlayingUpFor = 60`
+/// (`GuiIngame.java`:1118-1122), decremented once per tick (`:1070-1073`).
+const SYSTEM_HOLD: u64 = 60;
+
+/// The chat mirror: the session's chat messages, and the draws a frame shows for them.
+///
+/// The messages land from [`ClientEvent::Chat`]: a message at position code `2` becomes
+/// the record line above the hotbar, and every other position enters the box's log —
+/// `NetHandlerPlayClient.java`:849-861 sends `2` to `setRecordPlaying` and the rest to
+/// `printChatMessage`. The log ([`ChatLog`]) owns the split, the fade clocks and the
+/// scroll state; the mirror adds what only the frame knows: the scaled resolution and
+/// the per-frame draw assembly.
+///
+/// The assembly is the source's chat block (`GuiIngame.java`:339-347) over
+/// `GuiNewChat.drawChat`:30-114. The box: the newest line's base sits [`CHAT_BASE`]
+/// pixels above the bottom edge with a [`LINE_PITCH`]-pixel pitch, each line a black
+/// bar at `alpha / 2`, four pixels wider than the 320-pixel wrap budget (`:82` over
+/// `GuiNewChat.getChatWidth`:343-346 and `calculateChatboxWidth`:361-366), its text one
+/// pixel below the bar's top at the line's alpha (`GuiNewChat.drawChat`:85). The record
+/// line is centred above the hotbar, holds for [`SYSTEM_HOLD`]
+/// ticks and fades as the tick it arrived at recedes (`GuiIngame.java`:245-272,
+/// `:1118-1122`, `:1166-1169`).
+pub struct ChatView {
+    /// The split lines, the scroll state and the fade clock.
+    log: ChatLog,
+    /// The measured font the wrap and the runs' widths use; the client hands it over
+    /// when the asset store lands.
+    font: Option<Font>,
+    /// Messages that arrived before the font, parsed and waiting — the mirror cannot
+    /// wrap them yet. Bounded at [`LOG_CAP`], oldest dropped first: what the log itself
+    /// would keep.
+    pending: Vec<(TextComponent, u64)>,
+    /// The system line — the newest position-2 message — and the tick it arrived at.
+    system: Option<(String, u64)>,
+    /// The tick a frame draws at; the record line's own fade clock.
+    tick: u64,
+}
+
+impl ChatView {
+    /// An empty mirror, closed, at tick zero, with no font.
+    pub fn new() -> Self {
+        Self {
+            log: ChatLog::new(),
+            font: None,
+            pending: Vec::new(),
+            system: None,
+            tick: 0,
+        }
+    }
+
+    /// Sets the measured font and wraps whatever arrived before it — a message can
+    /// outrun the asset store by a frame.
+    pub fn set_font(&mut self, font: Font) {
+        for (component, tick) in self.pending.drain(..) {
+            self.log.push(&component, tick, CHAT_WIDTH, &font);
+        }
+        self.font = Some(font);
+    }
+
+    /// Folds one [`ClientEvent::Chat`] message in: position `2` replaces the record
+    /// line, everything else enters the log at `tick`
+    /// (`NetHandlerPlayClient.java`:849-861).
+    pub fn observe(&mut self, text: &str, position: i8, tick: u64) {
+        let component = chat::parse_json(text);
+        if position == 2 {
+            // The record line is the message's unformatted text — every element's own
+            // characters, styles cut (`GuiIngame.java`:1166-1169 over
+            // `ChatComponentStyle.java`:72-81).
+            self.system = Some((plain_text(&component), tick));
+            return;
+        }
+        match &self.font {
+            Some(font) => self.log.push(&component, tick, CHAT_WIDTH, font),
+            None => {
+                self.pending.push((component, tick));
+                if self.pending.len() > LOG_CAP {
+                    self.pending.remove(0);
+                }
+            }
+        }
+    }
+
+    /// Ages the mirror to `tick`: the log's fade reads against it and the record line's
+    /// hold counts from its receipt.
+    pub fn update(&mut self, tick: u64) {
+        self.tick = tick;
+        self.log.update(tick);
+    }
+
+    /// Sets whether the chat window is open: the drawn line count and the log's
+    /// pinning follow it (`GuiNewChat.getChatOpen`:305-308). The chat screen that
+    /// opens and scrolls the box is a later milestone's, so nothing calls this yet.
+    #[allow(dead_code)]
+    pub fn set_open(&mut self, open: bool) {
+        self.log.set_open(open);
+    }
+
+    /// Scrolls the box by `amount` lines, the source's own clamp
+    /// (`GuiNewChat.scroll`:222-237). The chat screen's wheel input is a later
+    /// milestone's, so the tests are the only caller for now.
+    #[allow(dead_code)]
+    pub fn scroll(&mut self, amount: i32) {
+        self.log.scroll(amount);
+    }
+
+    /// Resets the scroll (`GuiNewChat.resetScroll`:211-215). Called when the chat
+    /// screen closes, which a later milestone lands.
+    #[allow(dead_code)]
+    pub fn reset_scroll(&mut self) {
+        self.log.reset_scroll();
+    }
+
+    /// The frame's draw list at `resolution`.
+    ///
+    /// The record line first (`GuiIngame.java`:245-272 draws before the chat block at
+    /// `:339-347`), then the box's lines newest first; empty until the font is set —
+    /// nothing can be measured before it.
+    pub fn draws(&self, resolution: ScaledResolution) -> Vec<HudDraw> {
+        let Some(font) = &self.font else {
+            return Vec::new();
+        };
+        let mut draws = Vec::new();
+        self.system_draws(font, resolution, &mut draws);
+        self.box_draws(resolution, &mut draws);
+        draws
+    }
+
+    /// The record line: centred above the hotbar, white, unshadowed, while its sixty
+    /// ticks have not run out (`GuiIngame.java`:245-272).
+    fn system_draws(&self, font: &Font, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
+        let Some((text, received)) = &self.system else {
+            return;
+        };
+        let remaining = SYSTEM_HOLD.saturating_sub(self.tick.saturating_sub(*received));
+        if remaining == 0 {
+            return;
+        }
+        // `l1 = (int)(f2 * 255.0F / 20.0F)` at whole ticks, clamped to 255
+        // (`GuiIngame.java`:248-254), drawn while it clears eight (`:256`); the
+        // source subtracts the frame's partial tick, which this port leaves to the
+        // tick the frame draws at.
+        let alpha = (((remaining as f32) * 255.0 / 20.0) as u32).min(255) as u8;
+        if alpha <= 8 {
+            return;
+        }
+        // The line is centred: the translate's `width / 2` minus half the text's own
+        // width, both integer divisions (`GuiIngame.java`:259, `:269`).
+        let half = (string_width(font, text) / 2) as f32;
+        draws.push(HudDraw::Text {
+            text: text.clone(),
+            x: (resolution.width / 2) as f32 - half,
+            y: resolution.height as f32 - 72.0,
+            scale: 1.0,
+            colour: [1.0, 1.0, 1.0, f32::from(alpha) / 255.0],
+            shadow: false,
+        });
+    }
+
+    /// The box's drawn lines, newest first: one bar and one text each
+    /// (`GuiNewChat.drawChat`:53-91).
+    fn box_draws(&self, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
+        let height = resolution.height as f32;
+        let factor = opacity_factor(CHAT_OPACITY);
+        for (index, line) in self.log.drawn().iter().enumerate() {
+            // The source's opacity multiply and draw gate (`GuiNewChat.java`:75-78).
+            let alpha = (f32::from(line.alpha) * factor) as u8;
+            if alpha <= 3 {
+                continue;
+            }
+            // The bar's top: the newest line's base bottom ([`CHAT_BASE`]) minus the
+            // pitch and the line's own step up the box (`GuiNewChat.java`:81-82 with
+            // `:49-51`).
+            let top = height - CHAT_BASE - LINE_PITCH * (index as f32 + 1.0);
+            draws.push(HudDraw::Rect {
+                x: CHAT_X,
+                y: top,
+                width: BAR_WIDTH,
+                height: BAR_HEIGHT,
+                colour: [0.0, 0.0, 0.0, f32::from(alpha / 2) / 255.0],
+            });
+            draws.push(HudDraw::Text {
+                text: run_text(line.runs),
+                x: CHAT_X,
+                y: top + 1.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, f32::from(alpha) / 255.0],
+                shadow: true,
+            });
+        }
+    }
+}
+
+/// One component's unformatted text: every element's own characters, `§` codes and
+/// styles as sent, depth first — `ChatComponentStyle.getUnformattedText`:72-81, the
+/// walk the record line reads.
+fn plain_text(component: &TextComponent) -> String {
+    let mut text = component.text.clone();
+    for child in &component.children {
+        text.push_str(&plain_text(child));
+    }
+    text
+}
+
+/// One line's runs as the `§`-coded string the text builder draws: the source's
+/// `getFormattedText` shape (`ChatComponentStyle.java`:87-99) with
+/// `ChatStyle.getFormattingCode`:306-346 — each run's colour and style codes in the
+/// source's order, its characters, then a reset.
+fn run_text(runs: &[chat::StyledRun]) -> String {
+    let mut text = String::new();
+    for run in runs {
+        if let Some(index) = run.colour {
+            text.push('§');
+            text.push(char::from(PALETTE[usize::from(index.min(15))]));
+        }
+        if run.styles & STYLE_BOLD != 0 {
+            text.push_str("§l");
+        }
+        if run.styles & STYLE_ITALIC != 0 {
+            text.push_str("§o");
+        }
+        if run.styles & STYLE_UNDERLINED != 0 {
+            text.push_str("§n");
+        }
+        if run.styles & STYLE_OBFUSCATED != 0 {
+            text.push_str("§k");
+        }
+        if run.styles & STYLE_STRIKETHROUGH != 0 {
+            text.push_str("§m");
+        }
+        text.push_str(&run.text);
+        text.push_str("§r");
+    }
+    text
+}
+
+/// The source's chat-opacity factor (`GuiNewChat.java`:38): `chatOpacity * 0.9 + 0.1`,
+/// all f32. At the settings default `1.0` (`GameSettings.java`:85) the sum lands on
+/// `1.0` exactly, so the fade byte passes through untouched.
+fn opacity_factor(chat_opacity: f32) -> f32 {
+    chat_opacity * 0.9 + 0.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,6 +1148,7 @@ mod tests {
     use oxide_render::entity_models::PoseExtra;
     use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
     use oxide_render::entity_pass::{FrameContent, ModelRef, NametagDraw, TextureRef};
+    use oxide_render::hud::scaled_resolution;
     use oxide_world::entity::EntityKind;
 
     /// The uuid whose default model the rule calls wide (its last bit is zero).
@@ -2529,5 +2814,245 @@ mod tests {
         );
         assert_eq!(draws[2].model, ModelRef::Orb { value: 1 });
         assert_eq!(draws[2].texture, TextureRef::Named(objects::ORB_TEXTURE));
+    }
+
+    // ---- the chat mirror ----
+
+    /// A 128x128 synthetic sheet whose `'A'` cell is inked in columns 0..=4: the same
+    /// metric the game's chat suite and the render-side text tests measure with — `'A'`
+    /// advances six font pixels, the space the source's own four, every other blank
+    /// cell one.
+    fn chat_font() -> Font {
+        const SIDE: u32 = 128;
+        const CELL: u32 = 8;
+        let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+        let code = 'A' as u32;
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            for column in 0..=4 {
+                let offset = (((cell_y + row) * SIDE + cell_x + column) * 4) as usize;
+                rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        Font::load(
+            &oxide_assets::texture::Texture {
+                width: SIDE,
+                height: SIDE,
+                rgba,
+            },
+            None,
+        )
+        .expect("the synthetic sheet loads")
+    }
+
+    /// The scaled resolution the draws assemble against: the 1280x720 window at the
+    /// settings default, 427x240 (`ScaledResolution.java`:27-30, `:37-40`).
+    fn chat_resolution() -> ScaledResolution {
+        scaled_resolution(1280, 720, 0)
+    }
+
+    /// The mirror's draws at `tick`: the log's fade and the record line's clock read
+    /// the tick the frame draws at.
+    fn chat_draws(chat: &mut ChatView, tick: u64) -> Vec<HudDraw> {
+        chat.update(tick);
+        chat.draws(chat_resolution())
+    }
+
+    /// A text draw's own fields, for the pins.
+    fn chat_text(draw: &HudDraw) -> (String, f32, f32, f32, [f32; 4], bool) {
+        match draw {
+            HudDraw::Text {
+                text,
+                x,
+                y,
+                scale,
+                colour,
+                shadow,
+            } => (text.clone(), *x, *y, *scale, *colour, *shadow),
+            other => panic!("a text draw: {other:?}"),
+        }
+    }
+
+    /// A rect draw's own fields, for the pins.
+    fn chat_rect(draw: &HudDraw) -> (f32, f32, f32, f32, [f32; 4]) {
+        match draw {
+            HudDraw::Rect {
+                x,
+                y,
+                width,
+                height,
+                colour,
+            } => (*x, *y, *width, *height, *colour),
+            other => panic!("a rect draw: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chat_line_draws_at_its_tick_and_not_past_the_fade() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        // A position-code-1 message — the box's own kind — logged at tick 1000.
+        chat.observe("\"A\"", 1, 1_000);
+
+        assert_eq!(
+            (chat_resolution().width, chat_resolution().height),
+            (427, 240)
+        );
+        let draws = chat_draws(&mut chat, 1_000);
+        assert_eq!(draws.len(), 2, "one bar and its text");
+        // The bar: x 2, top 240 - 37, 324 = the 320 wrap budget plus four wide, nine
+        // tall — the pitch's own — and black at 255 / 2 = 127 over 255
+        // (`GuiNewChat.java`:49-51, `:81-82`).
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (
+                2.0,
+                240.0 - 37.0,
+                324.0,
+                9.0,
+                [0.0, 0.0, 0.0, 127.0 / 255.0]
+            )
+        );
+        // The text: x 2, one pixel below the bar's top, scale one, the line's runs as
+        // their legacy string, white at 255 over 255, shadowed
+        // (`GuiNewChat.java`:83-85).
+        assert_eq!(
+            chat_text(&draws[1]),
+            (
+                "A§r".to_owned(),
+                2.0,
+                240.0 - 36.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            )
+        );
+
+        // The fade at whole ticks (`GuiNewChat.java`:63-68, `:78`): age 197 leaves the
+        // last drawable alpha, five, and its bar halves to two; ages 198 and 200 are
+        // gone — the arithmetic leaves two and zero, under the gate.
+        let draws = chat_draws(&mut chat, 1_000 + 197);
+        assert_eq!(draws.len(), 2, "the last drawn tick");
+        assert_eq!(
+            chat_rect(&draws[0]).4,
+            [0.0, 0.0, 0.0, 2.0 / 255.0],
+            "5 / 2 = 2 at age 197"
+        );
+        assert_eq!(chat_text(&draws[1]).4, [1.0, 1.0, 1.0, 5.0 / 255.0]);
+        assert!(chat_draws(&mut chat, 1_000 + 198).is_empty());
+        assert!(chat_draws(&mut chat, 1_000 + 200).is_empty());
+    }
+
+    #[test]
+    fn the_scroll_shifts_the_drawn_slice() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        for index in 1..=12 {
+            chat.observe(&format!("\"x{index}\""), 1, 0);
+        }
+        let draws = chat_draws(&mut chat, 0);
+        assert_eq!(draws.len(), 20, "ten lines closed, two draws each");
+        assert_eq!(chat_text(&draws[1]).0, "x12§r", "newest first");
+        assert_eq!(chat_text(&draws[19]).0, "x3§r", "the tenth kept line");
+
+        // Two lines of scroll move the slice two older (`GuiNewChat.scroll`:222-237);
+        // the closed window still shows ten, so the oldest kept line is in view.
+        chat.scroll(2);
+        let draws = chat_draws(&mut chat, 0);
+        assert_eq!(draws.len(), 20);
+        assert_eq!(chat_text(&draws[1]).0, "x10§r");
+        assert_eq!(chat_text(&draws[19]).0, "x1§r", "the oldest kept line");
+
+        // Resetting walks it back: the slice starts at the newest again.
+        chat.reset_scroll();
+        let draws = chat_draws(&mut chat, 0);
+        assert_eq!(chat_text(&draws[1]).0, "x12§r");
+    }
+
+    #[test]
+    fn a_position_two_message_draws_above_the_hotbar_and_stays_out_of_the_box() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        chat.observe("\"hi\"", 1, 1_000);
+        chat.observe("\"tip\"", 2, 1_000);
+
+        // The record line draws first (`GuiIngame.java`:245-272 runs before the chat
+        // block at `:339-347`), centred: 427 / 2 - 3 / 2 = 212 (`:259`, `:269`), four
+        // pixels above the box's `height - 68` line, white at full alpha, no shadow
+        // (`:269`).
+        let draws = chat_draws(&mut chat, 1_000);
+        assert_eq!(draws.len(), 3);
+        assert_eq!(
+            chat_text(&draws[0]),
+            (
+                "tip".to_owned(),
+                212.0,
+                240.0 - 72.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                false
+            )
+        );
+        // The position-1 message is not lost: it is the box's own line, and the
+        // position-2 message never entered the box.
+        assert_eq!(
+            chat_rect(&draws[1]),
+            (
+                2.0,
+                240.0 - 37.0,
+                324.0,
+                9.0,
+                [0.0, 0.0, 0.0, 127.0 / 255.0]
+            )
+        );
+        assert_eq!(chat_text(&draws[2]).0, "hi§r");
+
+        // The record line holds sixty ticks (`GuiIngame.java`:1118-1122): its last
+        // full one reads (int)(1 * 255 / 20) = 12, and the next tick is gone.
+        let draws = chat_draws(&mut chat, 1_000 + 59);
+        assert_eq!(chat_text(&draws[0]).4, [1.0, 1.0, 1.0, 12.0 / 255.0]);
+        assert_eq!(draws.len(), 3, "the box's own line is still fading");
+        let draws = chat_draws(&mut chat, 1_000 + 60);
+        assert_eq!(draws.len(), 2, "the record line's sixty ticks are up");
+        assert_eq!(chat_text(&draws[1]).0, "hi§r");
+    }
+
+    #[test]
+    fn a_line_recomposes_its_styles_into_the_legacy_string() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        // The runs recompose the way `getFormattedText` does
+        // (`ChatComponentStyle.java`:87-99, `ChatStyle.getFormattingCode`:306-346):
+        // the colour code, the style codes in the source's order, the characters,
+        // then a reset.
+        chat.observe(
+            "{\"text\":\"A\",\"color\":\"red\",\"bold\":true,\"italic\":true}",
+            1,
+            0,
+        );
+        let draws = chat_draws(&mut chat, 0);
+        assert_eq!(chat_text(&draws[1]).0, "§c§l§oA§r");
+    }
+
+    #[test]
+    fn the_opacity_factor_is_one_at_the_settings_default() {
+        // `chatOpacity * 0.9F + 0.1F` (`GuiNewChat.java`:38) at the source's default
+        // 1.0F (`GameSettings.java`:85): the f32 sum lands on 1.0 exactly, so the
+        // fade byte passes through untouched.
+        assert_eq!(opacity_factor(1.0), 1.0);
+    }
+
+    #[test]
+    fn a_message_before_the_font_waits_for_it() {
+        // The window can see chat before the asset store lands: the mirror holds the
+        // parsed component until the font arrives, then wraps it.
+        let mut chat = ChatView::new();
+        chat.observe("\"A\"", 0, 7);
+        assert!(chat_draws(&mut chat, 7).is_empty(), "nothing measures yet");
+        chat.set_font(chat_font());
+        let draws = chat_draws(&mut chat, 7);
+        assert_eq!(draws.len(), 2);
+        assert_eq!(chat_text(&draws[1]).0, "A§r");
     }
 }

@@ -64,6 +64,7 @@ use oxide_render::entity_pass::{
     DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw, TextureRef, TextureRegistry,
 };
 use oxide_render::fog::{FogParams, fog_colour};
+use oxide_render::hud::{HudDraw, HudPass};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::SKY_COLOR;
@@ -4948,4 +4949,190 @@ fn the_minecart_draws_its_body_and_cargo() {
         cargo_count > bare_count,
         "the chest cargo adds pixels: {cargo_count} against {bare_count}"
     );
+}
+
+/// Runs a pass that only clears the target to `colour`, with no depth attachment, so a
+/// hud pass can follow and blend over the result.
+fn with_clear_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    colour: wgpu::Color,
+) {
+    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("oxide pipeline headless clear pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(colour),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+}
+
+/// The blend of a black bar at `bar_alpha` over the sky: the pipeline's `src_alpha` over
+/// `one_minus_src_alpha` pair leaves every channel at `channel * (1 - bar_alpha / 255)`.
+fn bar_over_sky(bar_alpha: u8) -> [u8; 3] {
+    let alpha = f32::from(bar_alpha) / 255.0;
+    SKY.map(|channel| (f32::from(channel) * (1.0 - alpha)).round() as u8)
+}
+
+/// The hud draws a chat line's shape over the cleared frame: a black bar at the line's
+/// fade alpha and its shadowed text, at the GUI coordinates the chat assembly lays out.
+///
+/// The line is the box's newest: its bar's top sits at `height - 37` scaled pixels — the
+/// `height - 48` block origin (`GuiIngame.java`:343-345) plus the `(2, 20)` translate
+/// (`GuiNewChat.java`:49-51) minus the first pitch step (`:81-82`) — its bar 9 tall and 4
+/// wider than the 320-pixel wrap budget, and its text's ink one pixel below the bar's top
+/// at the bar's left edge (`:85`). The resolution is 64x64 GUI units onto the 64x64
+/// target, so one unit is one pixel and every value lands at its own coordinate.
+///
+/// The counts: the bar covers 48x9 = 432 pixels, the row above it the sky, pinning the y
+/// anchor. The two '|' glyphs ink one column each and their one-font-pixel-down-right
+/// shadow copies land two more columns, both flush with the bar's last row; each shadow
+/// hangs one row lower than its glyph, so two shadow pixels sit below the bar and the
+/// frame's non-sky total is 432 + 2 = 434.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_a_chat_line() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::Rect {
+                x: 2.0,
+                y: 27.0,
+                width: 48.0,
+                height: 9.0,
+                colour: [0.0, 0.0, 0.0, 127.0 / 255.0],
+            },
+            HudDraw::Text {
+                text: "||".to_string(),
+                x: 2.0,
+                y: 28.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+            },
+        ],
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The bar's y anchor: the rows on either side of it are still the sky.
+    expect_pixel(&pixels, 26, 26, SKY, "the row above the bar");
+    expect_pixel(&pixels, 26, 27, bar_over_sky(127), "the bar's top row");
+    expect_pixel(
+        &pixels,
+        2,
+        27,
+        bar_over_sky(127),
+        "the bar's top-left corner",
+    );
+    expect_pixel(&pixels, 49, 31, bar_over_sky(127), "the bar's right column");
+    expect_pixel(&pixels, 26, 35, bar_over_sky(127), "the bar's last row");
+    expect_pixel(&pixels, 26, 36, SKY, "the row below the bar");
+    expect_pixel(&pixels, 1, 31, SKY, "left of the bar");
+    expect_pixel(&pixels, 50, 31, SKY, "right of the bar");
+    // The glyphs and their shadows: ink at each pen, the shadow one pixel down and right
+    // at the source's 63/255, the cell's transparent columns showing the bar through.
+    expect_pixel(&pixels, 2, 28, TEXT, "the first glyph's ink");
+    expect_pixel(
+        &pixels,
+        3,
+        29,
+        SHADOW,
+        "its shadow one pixel down and right",
+    );
+    expect_pixel(
+        &pixels,
+        3,
+        28,
+        bar_over_sky(127),
+        "its transparent neighbour",
+    );
+    expect_pixel(&pixels, 4, 28, TEXT, "the second glyph two advances along");
+    expect_pixel(&pixels, 5, 29, SHADOW, "its shadow");
+    let lit = non_sky(&pixels);
+    assert_eq!(
+        lit, 434,
+        "the bar's 432 pixels plus the two shadow pixels below its last row"
+    );
+}
+
+/// The hud draws the fade series at four alphas: the line alphas of four fade ages, each
+/// a bar of the chat assembly's shape.
+///
+/// The fade (`GuiNewChat.drawChat`:59-68): `d0 = 1 - age / 200`, times ten, clamped to
+/// one, squared, 255 times, truncated — ages 179, 181, 185 and 195 give line alphas 255,
+/// 230, 143 and 15: full, the first tick past it, mid-fade and the tail above the draw
+/// gate. The bar draws at the line's integer half (`l1 / 2`, `:82`): 127, 115, 71 and 7.
+///
+/// The counts: four 32x9 bars, none overlapping, 4 * 288 = 1152 non-sky pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_fade_series_at_four_alphas() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+
+    // (line alpha, bar alpha) at the four ages; the bar alpha is the integer half.
+    let series: [(u8, u8); 4] = [(255, 127), (230, 115), (143, 71), (15, 7)];
+    let draws: Vec<HudDraw> = series
+        .iter()
+        .enumerate()
+        .map(|(index, &(_, bar))| HudDraw::Rect {
+            x: 2.0,
+            y: 2.0 + index as f32 * 11.0,
+            width: 32.0,
+            height: 9.0,
+            colour: [0.0, 0.0, 0.0, f32::from(bar) / 255.0],
+        })
+        .collect();
+    hud.set_draws(&device, &queue, &draws);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    expect_pixel(&pixels, 18, 1, SKY, "above the first bar");
+    expect_pixel(&pixels, 18, 12, SKY, "between the first and second bars");
+    for (index, &(_, bar)) in series.iter().enumerate() {
+        let y = 2 + index as u32 * 11 + 4;
+        expect_pixel(
+            &pixels,
+            18,
+            y,
+            bar_over_sky(bar),
+            "a bar of the fade series at its own alpha",
+        );
+    }
+    let lit = non_sky(&pixels);
+    assert_eq!(lit, 1152, "four bars of 32x9, none overlapping");
 }
