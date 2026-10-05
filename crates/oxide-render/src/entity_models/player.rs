@@ -62,9 +62,9 @@ pub const CAPE_TEXTURE_SIZE: [f32; 2] = [64.0, 32.0];
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CapeMotion {
     /// The entity's displacement over the tick pair the frame spans, in blocks — the
-    /// chasing-position delta in the frame's own terms; the source reads a smoothed chaser
-    /// position and a camera-yaw sensor the window carries no state for, so the wave reads
-    /// the motion the frame holds and the sneak lift alone.
+    /// frame's stand-in for the chasing-position delta the source reads; the window
+    /// carries neither the smoothed chaser nor the camera-yaw sensor the source derives
+    /// it from, so the wave reads this motion and the sneak lift alone.
     pub motion: [f32; 3],
 }
 
@@ -423,9 +423,9 @@ pub fn cape_rot(pose: &Pose, parts: u8) -> Rot {
 ///
 /// `LayerCape.doRenderLayer`'s turns, composed in its order: the chaser lag drives the pitch
 /// `6 + f2/2 + f1` and the yaw pair `180 - f3/2` and `f3/2`; the sneak takes `f1` up a
-/// further 25 degrees. The lag reads the frame's motion between its tick pair — the source's
-/// smoothed chaser delta, with the camera-yaw and walk-distance term the window carries no
-/// state for left out.
+/// further 25 degrees. The lag reads the frame's motion between its tick pair in place of the
+/// source's smoothed chaser delta; the camera-yaw and walk-distance term the window carries no
+/// state for is left out.
 pub fn cape_rotation(pose: &Pose, motion: [f32; 3]) -> [f32; 3] {
     let yaw = pose.body_yaw.to_radians();
     let d3 = yaw.sin();

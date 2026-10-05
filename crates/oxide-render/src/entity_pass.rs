@@ -482,9 +482,14 @@ impl EntityPass {
     /// Builds the pass's pipelines built for colour attachments in `format`.
     ///
     /// The vertex layout is [`vertex_bytes`]' stream; every pipeline tests the depth buffer
-    /// in [`DEPTH_FORMAT`] and culls nothing — the source disables culling for entities.
-    /// Group 0 is the frame's uniform; group 1 is the draw's texture, created by the registry
-    /// against the `layout` handed in, which is the registry's own.
+    /// in [`DEPTH_FORMAT`]. The model and hurt pipelines cull nothing, as the living
+    /// renderer disables culling for the model and its layers and re-enables it only after
+    /// them (`RendererLivingEntity.java:92`, `:192`), while the shadow pipeline culls back
+    /// faces: the shadow draws after that re-enable, under the world pass's own culling
+    /// (`EntityRenderer.java:1328`), and its up-facing quad is wound like the source's, so
+    /// the cull only drops it from below. Group 0 is the frame's uniform; group 1 is the
+    /// draw's texture, created by the registry against the `layout` handed in, which is the
+    /// registry's own.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -527,29 +532,30 @@ impl EntityPass {
             bind_group_layouts: &[&frame_layout, texture_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = |label: &str, fragment: &str, plan: PipelinePlan| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(VS_ENTRY),
-                    buffers: &[vertex_layout()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fragment),
-                    targets: &[color_target(format, plan.blend)],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: primitive_state(None),
-                depth_stencil: Some(depth_state(plan.depth_write)),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            })
-        };
+        let pipeline =
+            |label: &str, fragment: &str, plan: PipelinePlan, cull: Option<wgpu::Face>| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some(VS_ENTRY),
+                        buffers: &[vertex_layout()],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(fragment),
+                        targets: &[color_target(format, plan.blend)],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: primitive_state(cull),
+                    depth_stencil: Some(depth_state(plan.depth_write)),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                })
+            };
         let model_pipeline = pipeline(
             "oxide entity model pipeline",
             FRAGMENT_MODEL,
@@ -557,6 +563,7 @@ impl EntityPass {
                 blend: None,
                 depth_write: true,
             },
+            None,
         );
         let hurt_pipeline = pipeline(
             "oxide entity hurt pipeline",
@@ -565,6 +572,7 @@ impl EntityPass {
                 blend: None,
                 depth_write: true,
             },
+            None,
         );
         let shadow_pipeline = pipeline(
             "oxide entity shadow pipeline",
@@ -573,6 +581,7 @@ impl EntityPass {
                 blend: Some(shadow_blend()),
                 depth_write: false,
             },
+            Some(wgpu::Face::Back),
         );
         let vertex_capacity = INITIAL_VERTEX_BYTES;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {

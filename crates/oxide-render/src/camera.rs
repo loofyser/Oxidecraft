@@ -787,6 +787,39 @@ mod tests {
     }
 
     #[test]
+    fn the_step_at_exactly_four_blocks_still_slides() {
+        // The snap starts only past the boundary (spec P5, `docs/specs/oxidecraft-v1-design.md:92`,
+        // restated in section 9 at `:315`: "snapping when a teleport exceeds 4 blocks").
+        let origin = CameraPose {
+            position: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let exactly = CameraPose {
+            position: [4.0, 64.0, 0.0],
+            yaw: 90.0,
+            pitch: 10.0,
+        };
+        let mid = interpolate_pose(origin, exactly, 0.5);
+        assert_eq!(
+            mid.position,
+            [2.0, 64.0, 0.0],
+            "a step of exactly four blocks interpolates"
+        );
+        assert!((mid.yaw - 45.0).abs() < 1e-4);
+        assert!((mid.pitch - 5.0).abs() < 1e-4);
+        let over = CameraPose {
+            position: [4.1, 64.0, 0.0],
+            ..exactly
+        };
+        assert_eq!(
+            interpolate_pose(origin, over, 0.5),
+            over,
+            "a step past four blocks snaps"
+        );
+    }
+
+    #[test]
     fn the_render_eye_is_the_eye_minus_a_tenth_of_a_block() {
         // `orientCamera`'s first-person branch (`EntityRenderer.java:718-721`) translates
         // the view a tenth of a block back along the view axis; the plain eye — the

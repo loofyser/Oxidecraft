@@ -15,6 +15,7 @@ use std::time::Instant;
 use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_game::entity_view::EntityFrame;
 use oxide_game::session::ClientEvent;
+use oxide_render::entity_models::player::CapeMotion;
 use oxide_render::entity_models::{Pose, PoseExtra};
 use oxide_render::entity_pass::{DrawExtra, EntityDraw, ModelRef, TextureRef};
 use oxide_world::entity::EntityKind;
@@ -114,17 +115,26 @@ impl View {
     }
 }
 
-/// The draw one frame makes, or `None` for a kind with no model yet.
+/// The draw one frame makes, or `None` for a kind with no model yet and for an invisible
+/// entity.
 ///
 /// The model, texture and slim flag come from the skin worker's update for the profile
 /// when one exists — as it stands — else from the uuid's own default model rule
 /// (`DefaultPlayerSkin.isSlimSkin`, `DefaultPlayerSkin.java:41-44`); the renderer's
-/// resolver falls back the same way when the update carries no texture.
+/// resolver falls back the same way when the update carries no texture. The cape layer's
+/// wave reads the frame pair's displacement between its ticks — the window's stand-in for
+/// the smoothed chaser and camera-yaw terms its state cannot produce ([`CapeMotion`]). An
+/// invisible entity yields no draw, model and shadow alike: the source skips both for one
+/// (`RendererLivingEntity.java:248-249`, `Render.java:303`), and the window's shadow rides
+/// the same draw.
 fn draw_for(
     frame: &EntityFrame,
     partial: f32,
     skins: &BTreeMap<String, SkinUpdate>,
 ) -> Option<EntityDraw> {
+    if frame.invisible {
+        return None;
+    }
     if frame.kind != EntityKind::Player {
         tracing::debug!(kind = ?frame.kind, "the entity kind has no model yet");
         return None;
@@ -187,7 +197,16 @@ fn draw_for(
         hurt,
         death,
         child: false,
-        extra: PoseExtra::default(),
+        // The cape layer's wave reads the frame pair's own displacement — the window's
+        // stand-in for the smoothed chaser and camera-yaw terms its state cannot produce
+        // (`CapeMotion`).
+        extra: PoseExtra::Player(CapeMotion {
+            motion: [
+                (frame.pos[0] - frame.prev[0]) as f32,
+                (frame.pos[1] - frame.prev[1]) as f32,
+                (frame.pos[2] - frame.prev[2]) as f32,
+            ],
+        }),
     };
 
     Some(EntityDraw {
@@ -245,6 +264,8 @@ mod tests {
 
     use oxide_assets::skins::DefaultModel;
     use oxide_game::entity_view::{EntityExtra, EntityFrame};
+    use oxide_render::entity_models::PoseExtra;
+    use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
     use oxide_render::entity_pass::{ModelRef, TextureRef};
     use oxide_world::entity::EntityKind;
 
@@ -373,6 +394,63 @@ mod tests {
     }
 
     #[test]
+    fn the_step_at_exactly_four_blocks_still_slides() {
+        // The snap starts only past the boundary (spec P5, `docs/specs/oxidecraft-v1-design.md:92`,
+        // restated in section 9 at `:315`: "snapping when a teleport exceeds 4 blocks").
+        let mut view = View::new();
+        let t0 = Instant::now();
+        let mut edge = player_frame(8, UUID_WIDE);
+        edge.pos = [4.0, 0.0, 0.0];
+        view.observe(vec![edge], t0);
+        assert_eq!(
+            draws_at(&view, t0, TICK / 2)[0].position,
+            [2.0, 0.0, 0.0],
+            "a step of exactly four blocks interpolates"
+        );
+        let mut over = player_frame(8, UUID_WIDE);
+        over.pos = [4.1, 0.0, 0.0];
+        view.observe(vec![over], t0);
+        assert_eq!(
+            draws_at(&view, t0, TICK / 2)[0].position,
+            [4.1, 0.0, 0.0],
+            "a step past four blocks snaps"
+        );
+    }
+
+    #[test]
+    fn the_cape_motion_reads_the_frames_displacement() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        // The pair moves two blocks on x: the draw's cape motion term is the pair's own
+        // displacement, and at pose level the wave turns the box off its rest [6, 180, 0].
+        view.observe(vec![player_frame(8, UUID_WIDE)], t0);
+        let draw = &draws_at(&view, t0, Duration::ZERO)[0];
+        assert_eq!(
+            draw.pose.extra,
+            PoseExtra::Player(CapeMotion {
+                motion: [2.0, 0.0, 0.0]
+            }),
+            "the cape's motion term is the frame pair's displacement"
+        );
+        let PoseExtra::Player(cape) = draw.pose.extra else {
+            panic!("the player's draw carries the cape motion");
+        };
+        let moved = cape_rotation(&draw.pose, cape.motion);
+        assert_eq!(moved, [6.0, 280.0, -100.0]);
+        assert_ne!(moved, cape_rotation(&draw.pose, [0.0; 3]));
+        // A still pair carries no motion at all.
+        let mut still = player_frame(8, UUID_WIDE);
+        still.prev = still.pos;
+        view.observe(vec![still], t0);
+        assert_eq!(
+            draws_at(&view, t0, Duration::ZERO)[0].pose.extra,
+            PoseExtra::Player(CapeMotion {
+                motion: [0.0, 0.0, 0.0]
+            })
+        );
+    }
+
+    #[test]
     fn the_own_entity_is_skipped() {
         let mut view = View::new();
         let t0 = Instant::now();
@@ -390,6 +468,25 @@ mod tests {
                 slim: true
             }
         );
+    }
+
+    #[test]
+    fn an_invisible_frame_draws_nothing() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        // The flag alone: the model and the shadow both hang off the draw, and the
+        // source skips both for an invisible entity (`RendererLivingEntity.java:248-249`,
+        // `Render.java:303`).
+        let mut unseen = player_frame(8, UUID_WIDE);
+        unseen.invisible = true;
+        view.observe(vec![unseen], t0);
+        assert_eq!(
+            draws_at(&view, t0, Duration::ZERO).len(),
+            0,
+            "an invisible entity draws nothing"
+        );
+        view.observe(vec![player_frame(8, UUID_WIDE)], t0);
+        assert_eq!(draws_at(&view, t0, Duration::ZERO).len(), 1);
     }
 
     #[test]

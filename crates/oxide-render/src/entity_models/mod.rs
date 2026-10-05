@@ -267,7 +267,7 @@ fn push_box(b: &Box, world: Mat4, texture: [f32; 2], out: &mut Vertices) {
     let bb = [x2, y1, z1];
     // The six faces, in the table's order, with each face's UV rectangle: `u1, v1, u2, v2`.
     let quads: [([[f32; 3]; 4], [f32; 4]); 6] = [
-        ([f, bb, c, g], [u + d, v + d, u + d + w, v + d + h]),
+        ([f, bb, c, g], [u + d + w, v + d, u + d + w + d, v + d + h]),
         ([a, e, hh, dd], [u, v + d, u + d, v + d + h]),
         ([f, e, a, bb], [u + d, v, u + d + w, v + d]),
         ([c, dd, hh, g], [u + d + w, v + d, u + d + w + w, v]),
@@ -489,7 +489,7 @@ mod tests {
         let vertices = build_vertices(&SMALL_MODEL, &identity(), SHEET);
         let uv = |u: f32, v: f32| [u / 16.0, v / 16.0];
         let expected_positions: [[f32; 3]; 24] = [
-            // East, the (u + d, v + d) cell.
+            // East, the (u + d + w, v + d) cell.
             [1.0, 0.0, 3.0],
             [1.0, 0.0, 0.0],
             [1.0, 2.0, 0.0],
@@ -521,10 +521,10 @@ mod tests {
             [0.0, 2.0, 3.0],
         ];
         let expected_uvs: [[f32; 2]; 24] = [
+            uv(12.0, 10.0),
             uv(9.0, 10.0),
-            uv(8.0, 10.0),
-            uv(8.0, 12.0),
             uv(9.0, 12.0),
+            uv(12.0, 12.0),
             uv(8.0, 10.0),
             uv(5.0, 10.0),
             uv(5.0, 12.0),
@@ -581,10 +581,10 @@ mod tests {
             [1.0, 0.0, 3.0],
         ];
         let expected_uvs: [[f32; 2]; 24] = [
+            uv(12.0, 12.0),
             uv(9.0, 12.0),
-            uv(8.0, 12.0),
-            uv(8.0, 10.0),
             uv(9.0, 10.0),
+            uv(12.0, 10.0),
             uv(8.0, 12.0),
             uv(5.0, 12.0),
             uv(5.0, 10.0),
