@@ -971,3 +971,9 @@ The M3 final review's risk list is answered in turn: the stage-map re-key and th
 35. The cart id jitter pins at zero: the draw carries no entity id yet (`EntityFrame.id` reaches only the view's input), so the pinned jitter helper stays for a draw schema that carries one. *(added after execution; recorded by the Task 12 fix round)*
 
 36. The live item-mesh source (the client's bake over the asset store) is store-verified, while the GPU suite exercises the pass through a test source — the end-to-end visual duty belongs to the acceptance run (Task 22). Also noted: the blocks atlas joins the entity registry as a second upload (a shared binding is cheaper), and unresolved block-item states fall back to the cube. *(added after execution; certified by the Task 12 review)*
+
+37. The camera-mode overrides the pass does not carry: the source's `playerViewY` takes a sleeping-camera override (`RenderManager.java`:246-256) and its `+180` for the third-person front view (`:264-266`); this pass has neither mode, so its billboard yaw is the camera's own (`:260-261`) — a future mode adds the overrides at the billboard consumers. *(added after execution; recorded by the Task 13 fix round)*
+
+38. The objects caller's mirror coverage: the helper is pinned and the caller's view yaw now matches the source, but the caller's own value has no mirror-sensitive assertion — the count-level cases are reflection-invariant on the centred quads; a caller-level orientation case (with an asymmetric sheet) rides the next objects-path touch, the live acceptance run as the end-to-end net (Task 22). *(added after execution; ruled ACCEPT-with-note by the Task 13 fix re-review)*
+
+39. The nametag GPU cases drive the pass through the synthetic sheet (the suite's font strategy); no end-to-end visual session of a live nametag — the acceptance run carries that duty (Task 22). *(added after execution; certified by the Task 13 review)*
