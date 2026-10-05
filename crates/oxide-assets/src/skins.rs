@@ -7,7 +7,7 @@
 //! (`isSlimSkin`, `:41-44`). A profile property's `textures` value carries the
 //! custom skin's URL and model, with an optional cape
 //! (`MinecraftProfileTexture`'s shape, read by `NetworkPlayerInfo.getSkinType`,
-//! `client/network/NetworkPlayerInfo.java:48-59`); the decode walks the JSON by
+//! `client/network/NetworkPlayerInfo.java:87-90`); the decode walks the JSON by
 //! hand, and everything it cannot vouch for is an error the caller treats as
 //! "no custom skin". Fetched textures land in the store's `skins/` directory —
 //! the era's `skinCacheDir` (per-hash files, `SkinManager.loadSkin`,

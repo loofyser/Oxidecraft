@@ -42,8 +42,8 @@ pub struct SkinUpdate {
     pub texture: Option<Arc<Texture>>,
     /// The fetched cape, when the property named one and it arrived.
     pub cape: Option<Arc<Texture>>,
-    /// The model to draw: the property's own, or the UUID default when there
-    /// was no usable property.
+    /// The model to draw: the property's own when its skin arrived, or the
+    /// UUID default otherwise — no usable property, or a failed fetch.
     pub model: DefaultModel,
 }
 
@@ -103,11 +103,19 @@ where
                     },
                     None => None,
                 };
+                // A failed fetch leaves no skin to draw, so the model falls
+                // back to the uuid's default; a fetched skin keeps the
+                // property's own.
+                let model = if texture.is_some() {
+                    profile.model
+                } else {
+                    default_skin(&request.uuid)
+                };
                 SkinUpdate {
                     uuid: request.uuid.clone(),
                     texture,
                     cape,
-                    model: profile.model,
+                    model,
                 }
             }
             // No property, or one the decode refused: the default model for
@@ -334,8 +342,36 @@ mod tests {
         assert_eq!(update.uuid, UUID_WIDE);
         assert!(update.texture.is_none());
         assert!(update.cape.is_none());
-        assert_eq!(update.model, DefaultModel::Wide, "the property's own model");
+        assert_eq!(
+            update.model,
+            DefaultModel::Wide,
+            "the fetch failed: the uuid's default"
+        );
         assert_eq!(stub.calls(), vec![SKIN_URL], "one fetch, no retry");
+    }
+
+    #[test]
+    fn a_failed_fetch_takes_the_uuid_default_model() {
+        // The metadata asks for slim, the uuid rule says wide: the two
+        // disagree, so this vector can tell which model a failed fetch
+        // leaves. With no fetched skin to draw, the update carries the
+        // uuid's default.
+        let stub = Stub::new(&[(SKIN_URL, None)]);
+        let updates = settle(
+            &stub,
+            &[SkinRequest {
+                uuid: UUID_WIDE.to_owned(),
+                property: Some(slim_property()),
+            }],
+        );
+        assert_eq!(updates.len(), 1);
+        let update = &updates[0];
+        assert!(update.texture.is_none(), "the fetch failed");
+        assert_eq!(
+            update.model,
+            DefaultModel::Wide,
+            "the uuid's default, not the property's model"
+        );
     }
 
     #[test]
