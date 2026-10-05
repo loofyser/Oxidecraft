@@ -3146,7 +3146,7 @@ pub fn pose_guardian(pose: &Pose, out: &mut [Rot]) {
 }
 
 /// The flap wave `f1` the dragon's flight reads off the interpolated clock
-/// (`ModelDragon.render`:141-142): one plus the sine a radian late, squared, twice
+/// (`ModelDragon.render`:142-145): one plus the sine a radian late, squared, twice
 /// itself and a twentieth.
 fn dragon_wave(anim_time: f32) -> f32 {
     let raw = (anim_time * PI * 2.0 - 1.0).sin() + 1.0;
@@ -4596,7 +4596,7 @@ mod tests {
             ((PI / 2.0_f32).sin() + 1.0) * 0.2
         ));
         // At the wave's start the wings fold to their own extremes, the jaw half opens and
-        // the flight's own model-level translate and pitch read the same wave (`:144-146`,
+        // the flight's own model-level translate and pitch read the same wave (`:144-147`,
         // `:193-196`): the flight is no part's own offset — it rides the draw chain ahead
         // of every part — and its values are the model's own.
         let zero = at(0.0);
