@@ -1431,6 +1431,12 @@ fn apply_session_event(
             // total.
             false
         }
+        ClientEvent::Chat { .. } => {
+            // The window's chat surface arrives with a later milestone; the
+            // feed is accepted here so the session's event stream stays
+            // total.
+            false
+        }
         ClientEvent::Aim { aim: report } => {
             if store_aim(&mut world_overlay.aim, report) {
                 tracing::debug!(?report, "the aim moved");

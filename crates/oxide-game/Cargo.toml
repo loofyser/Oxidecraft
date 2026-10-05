@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 crossbeam-channel = "0.5"
 rayon = "1"
+serde_json.workspace = true
 oxide-assets.workspace = true
 oxide-proto.workspace = true
 oxide-proto-v47.workspace = true

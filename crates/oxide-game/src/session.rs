@@ -66,7 +66,8 @@ use oxide_proto_v47::serverbound::{
     write_plugin_message,
 };
 use oxide_proto_v47::ui::{
-    ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam, TabHeaderFooter,
+    ChatMessage, ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam,
+    TabHeaderFooter,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
@@ -361,6 +362,17 @@ pub enum ClientEvent {
         header: String,
         /// The footer as sent.
         footer: String,
+    },
+    /// A chat message, from clientbound 0x02.
+    ///
+    /// Reported for every message; the text travels as sent — chat JSON —
+    /// and the position names where it shows.
+    Chat {
+        /// The chat component as JSON, exactly as sent.
+        text: String,
+        /// Where the message shows: 0 the chat box, 1 the system line, 2
+        /// above the hotbar.
+        position: i8,
     },
     /// The player's health, food and saturation, from clientbound 0x06.
     ///
@@ -785,6 +797,16 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     difficulty: join.difficulty,
                                     max_players: join.max_players,
                                     level_type: join.level_type,
+                                },
+                            );
+                        }
+                        ChatMessage::ID => {
+                            let message = decoded(id, ChatMessage::decode(body))?;
+                            report(
+                                events,
+                                ClientEvent::Chat {
+                                    text: message.text,
+                                    position: message.position,
                                 },
                             );
                         }

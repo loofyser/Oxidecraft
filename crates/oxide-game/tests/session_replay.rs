@@ -772,6 +772,14 @@ fn tab_header_footer_frame(header: &str, footer: &str) -> Vec<u8> {
     payload
 }
 
+/// Chat Message: the chat JSON as sent, then the position byte.
+fn chat_message_frame(text: &str, position: i8) -> Vec<u8> {
+    let mut payload = vec![0x02];
+    push_string(&mut payload, text);
+    payload.push(position as u8);
+    payload
+}
+
 /// Runs one feed session: the caller's `head` bytes, `stalls` idle windows,
 /// the `tail` bytes, then `tail_stalls` more idle windows before the end.
 fn run_feed_session(
@@ -5824,6 +5832,36 @@ fn the_tab_text_reports_each_change_once() {
             ("{\"text\":\"one\"}", "{\"text\":\"three\"}"),
         ],
         "the two changes, the raw JSON strings as sent: {events:?}"
+    );
+}
+
+#[test]
+fn the_chat_message_reports_the_raw_json_and_position() {
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            chat_message_frame("{\"text\":\"hello\",\"color\":\"red\"}", 0),
+            chat_message_frame("{\"text\":\"over here\"}", 1),
+            chat_message_frame("plain words, not JSON", 2),
+        ]),
+        framed(&[keep_alive_frame(24)]),
+        0,
+        0,
+    );
+    let chats: Vec<(&str, i8)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Chat { text, position } => Some((text.as_str(), *position)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chats,
+        vec![
+            ("{\"text\":\"hello\",\"color\":\"red\"}", 0),
+            ("{\"text\":\"over here\"}", 1),
+            ("plain words, not JSON", 2),
+        ],
+        "one event per message, the raw text as sent: {events:?}"
     );
 }
 
