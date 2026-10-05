@@ -90,10 +90,13 @@ fn a_player_a_mob_and_an_item_move_for_forty_ticks_and_one_despawns() {
         player.uuid.as_deref(),
         Some("069a79f4-44e9-4726-a5be-fca90e38aaf5")
     );
-    // Twenty ticks of chasing leave the render yaw on the head's 90.
+    // After the teleport the player walks +x, a movement target of -90,
+    // while its body yaw is 90: the ease pulls the render yaw toward -90
+    // but the body bound holds it inside the body's reach, so the tick's
+    // arithmetic seats it on 90 - 75 + 75 x 0.2 = 30 and leaves it there.
     assert!(
-        (player.render_yaw_offset - 90.0).abs() < 0.1,
-        "the render yaw settles on the target, saw {}",
+        (player.render_yaw_offset - 30.0).abs() < 0.01,
+        "the render yaw sits in the body's reach, saw {}",
         player.render_yaw_offset
     );
 
@@ -104,6 +107,10 @@ fn a_player_a_mob_and_an_item_move_for_forty_ticks_and_one_despawns() {
     assert_eq!(mob.last_tick_position, mob.position);
     assert_eq!(mob.yaw, 180.0);
     assert_eq!(mob.last_tick_yaw, 180.0);
+    // The moving mob's head bounds to its body: it faced 0 while walking
+    // +z, then the look at tick 10 turned the body to 180 and the head was
+    // pulled to 75 short of it the short way, 180 + 75 = 255.
+    assert_eq!(mob.head_yaw, 255.0);
     assert_eq!(
         mob.velocity,
         [0.0, 0.0, 0.25],

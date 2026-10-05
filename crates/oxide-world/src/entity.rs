@@ -4,9 +4,11 @@
 //!
 //! The kinds are closed: the session maps wire spawn types to [`EntityKind`]
 //! at its own edge, so this store never sees a wire type. The tick arithmetic
-//! is the source's own, taken from
-//! `EntityLivingBase.onEntityUpdate`/`updateArmSwingProgress`/
-//! `handleStatusUpdate`/`updateDistance` and `EntityOtherPlayerMP.onUpdate`
+//! is the source's own, taken from `EntityLivingBase.onEntityUpdate`/
+//! `updateArmSwingProgress`/`handleStatusUpdate`/`onDeathUpdate`, the
+//! `updateDistance` pair — the base chase and the `EntityLiving` override
+//! that hands mobs to `EntityBodyHelper` — the `rangeChecks` folds and
+//! `EntityOtherPlayerMP.onUpdate`
 //! (`refs/_src/MCP-919/src/minecraft/net/minecraft/`), and every step of it
 //! is asserted against hand arithmetic in the tests below.
 //!
@@ -214,8 +216,9 @@ pub struct Entity {
     pub head_yaw: f32,
     /// The head's yaw at the last tick.
     pub last_tick_head_yaw: f32,
-    /// The body's render yaw in degrees; chased toward the head's yaw and
-    /// bounded by the body yaw every tick.
+    /// The body's render yaw in degrees; chased every tick — players toward
+    /// the movement direction (or the body yaw while swinging, else held),
+    /// mobs toward the head through the body helper.
     pub render_yaw_offset: f32,
     /// The render yaw from before the last tick's chase.
     pub prev_render_yaw_offset: f32,
@@ -245,7 +248,8 @@ pub struct Entity {
     /// The hurt window's remaining ticks (`EntityLivingBase.hurtTime`).
     pub hurt_ticks: u16,
     /// The death animation's ticks since death started
-    /// (`EntityLivingBase.deathTime`); zero while alive.
+    /// (`EntityLivingBase.deathTime`): zero until status 3 starts it, then
+    /// counting up once per tick from the following tick.
     pub death_ticks: u16,
     /// The spawn's kind-specific extras.
     pub data: KindData,
@@ -255,6 +259,16 @@ pub struct Entity {
     /// Whether a swing is in progress
     /// (`EntityLivingBase.isSwingInProgress`).
     swing_in_progress: bool,
+    /// The body helper's held-head tick counter
+    /// (`EntityBodyHelper.rotationTickCounter`).
+    rotation_tick_counter: i32,
+    /// The body helper's own previous head reading
+    /// (`EntityBodyHelper.prevRenderYawHead`) — distinct from the
+    /// [`Entity::last_tick_head_yaw`] pose pair the renderer reads.
+    prev_render_yaw_head: f32,
+    /// Whether status 3 has started the death counter; while it has not,
+    /// `death_ticks` stays at zero.
+    death_started: bool,
 }
 
 /// The entity table: every live entity by id, iterated in ascending id order
@@ -274,6 +288,39 @@ const ARM_SWING_PERIOD_TICKS: i32 = 6;
 /// `maxHurtTime` there, ten ticks (`EntityLivingBase.java:1358-1362`).
 const HURT_WINDOW_TICKS: u16 = 10;
 
+/// The base chase's ease of the wrapped difference into the render yaw
+/// (`EntityLivingBase.java:1915`).
+const CHASE_EASE: f32 = 0.3;
+
+/// The base chase's movement gate on the squared horizontal displacement
+/// (`EntityLivingBase.java:1845`): below it the chase holds instead of
+/// steering by the tick's movement.
+const MOVEMENT_GATE_SQUARED: f32 = 0.0025000002;
+
+/// The body helper's own, smaller movement gate
+/// (`EntityBodyHelper.java:29`).
+const MOB_MOVEMENT_GATE_SQUARED: f64 = 2.500000277905201e-7;
+
+/// The body reach in degrees: how far the render yaw may sit from the body
+/// yaw before the bound pulls it back (`EntityLivingBase.java:1919-1927`,
+/// `EntityBodyHelper.java:73-76`).
+const BODY_REACH_DEGREES: f32 = 75.0;
+
+/// The squared reach past which the base chase's release fires
+/// (`EntityLivingBase.java:1931`).
+const RELEASE_THRESHOLD_SQUARED: f32 = 2500.0;
+
+/// The release's ease (`EntityLivingBase.java:1933`).
+const RELEASE_EASE: f32 = 0.2;
+
+/// How far the held head may drift before the body helper resets its
+/// held-tick counter (`EntityBodyHelper.java:40`).
+const HELD_HEAD_RESET_DEGREES: f32 = 15.0;
+
+/// The held ticks before the body helper's reach starts to decay, a tenth
+/// of the reach per further tick (`EntityBodyHelper.java:48-52`).
+const HELD_DECAY_START_TICKS: i32 = 10;
+
 /// The source's `MathHelper.wrapAngleTo180_float`
 /// (`util/MathHelper.java:212-225`): an angle folded into `[-180, 180)`.
 fn wrap_angle_to_180(value: f32) -> f32 {
@@ -285,6 +332,96 @@ fn wrap_angle_to_180(value: f32) -> f32 {
         value += 360.0;
     }
     value
+}
+
+/// The body helper's own bound (`EntityBodyHelper.java:60-79`): the new
+/// `angle2` such that its wrapped difference from `angle1` stays within
+/// `±reach`. The two comparisons are the source's — a difference of exactly
+/// `-reach` passes, one of exactly `+reach` clamps (to itself).
+fn compute_angle_with_bound(angle1: f32, angle2: f32, reach: f32) -> f32 {
+    let mut difference = wrap_angle_to_180(angle1 - angle2);
+    if difference < -reach {
+        difference = -reach;
+    }
+    if difference >= reach {
+        difference = reach;
+    }
+    angle1 - difference
+}
+
+/// Folds one pose pair's partner within `±180` of its current value — the
+/// source's `rangeChecks` (`EntityLivingBase.java:1867-1906`).
+///
+/// The two while-loops are the source's own in order and condition. The
+/// `next == partner` checks only fire where an f32 step can no longer change
+/// the partner at extreme magnitudes — there the source's loops would never
+/// terminate, and hostile values must stay total here.
+fn fold_pose_pair(current: f32, partner: &mut f32) {
+    while current - *partner < -180.0 {
+        let next = *partner - 360.0;
+        if next == *partner {
+            break;
+        }
+        *partner = next;
+    }
+    while current - *partner >= 180.0 {
+        let next = *partner + 360.0;
+        if next == *partner {
+            break;
+        }
+        *partner = next;
+    }
+}
+
+impl EntityKind {
+    /// Whether this kind is one of the mobs: the `EntityLiving` subclasses
+    /// whose `updateDistance` hands the body to the per-entity
+    /// `EntityBodyHelper` (`EntityLiving.java:288-292`) — every variant that
+    /// mirrors a `MobType` member.
+    fn is_mob(self) -> bool {
+        matches!(
+            self,
+            EntityKind::Creeper
+                | EntityKind::Skeleton
+                | EntityKind::Spider
+                | EntityKind::Giant
+                | EntityKind::Zombie
+                | EntityKind::Slime
+                | EntityKind::Ghast
+                | EntityKind::PigZombie
+                | EntityKind::Enderman
+                | EntityKind::CaveSpider
+                | EntityKind::Silverfish
+                | EntityKind::Blaze
+                | EntityKind::LavaSlime
+                | EntityKind::EnderDragon
+                | EntityKind::WitherBoss
+                | EntityKind::Bat
+                | EntityKind::Witch
+                | EntityKind::Endermite
+                | EntityKind::Guardian
+                | EntityKind::Pig
+                | EntityKind::Sheep
+                | EntityKind::Cow
+                | EntityKind::Chicken
+                | EntityKind::Squid
+                | EntityKind::Wolf
+                | EntityKind::MushroomCow
+                | EntityKind::SnowMan
+                | EntityKind::Ozelot
+                | EntityKind::VillagerGolem
+                | EntityKind::EntityHorse
+                | EntityKind::Rabbit
+                | EntityKind::Villager
+        )
+    }
+
+    /// Whether this kind is a living entity (`EntityLivingBase`): players
+    /// and mobs — the kinds whose tick folds the copied pose pairs
+    /// (`EntityLivingBase.java:1867-1906`).
+    fn is_living(self) -> bool {
+        self == EntityKind::Player || self.is_mob()
+    }
 }
 
 impl Entity {
@@ -323,6 +460,9 @@ impl Entity {
             data: KindData::None,
             swing_progress_ticks: 0,
             swing_in_progress: false,
+            rotation_tick_counter: 0,
+            prev_render_yaw_head: 0.0,
+            death_started: false,
         }
     }
 
@@ -336,6 +476,80 @@ impl Entity {
         {
             self.swing_progress_ticks = -1;
             self.swing_in_progress = true;
+        }
+    }
+
+    /// The base chase, for players — the call site at
+    /// `EntityLivingBase.java:1836-1864` running `updateDistance:1912-1942`.
+    ///
+    /// The target is this tick's movement direction, `atan2(dz, dx)` in
+    /// degrees minus a quarter turn, and it only counts past the squared
+    /// displacement `MOVEMENT_GATE_SQUARED`; a running swing overrides it
+    /// with the body yaw, and otherwise the current render yaw holds. The
+    /// body then eases `CHASE_EASE` of the wrapped way toward the target,
+    /// sits within `BODY_REACH_DEGREES` of the body yaw, and past a squared
+    /// reach of `RELEASE_THRESHOLD_SQUARED` the release eases `RELEASE_EASE`
+    /// of the clamped difference back out.
+    ///
+    /// (The source's negated return value feeds its `movedDistance`, which
+    /// this table does not carry.)
+    fn chase_body_base(&mut self, d0: f64, d1: f64) {
+        let mut target = self.render_yaw_offset;
+        let displacement = (d0 * d0 + d1 * d1) as f32;
+        if displacement > MOVEMENT_GATE_SQUARED {
+            // `(float)MathHelper.atan2(d1, d0) * 180.0F / (float)Math.PI
+            // - 90.0F`, left to right. The source's own `atan2` is a
+            // lookup-table approximation this port does not copy; the
+            // platform's `atan2` stands in at the same place.
+            target = d1.atan2(d0) as f32 * 180.0 / std::f32::consts::PI - 90.0;
+        }
+        if self.swing_progress > 0.0 {
+            target = self.yaw;
+        }
+
+        let step = wrap_angle_to_180(target - self.render_yaw_offset);
+        self.render_yaw_offset += step * CHASE_EASE;
+        let mut difference = wrap_angle_to_180(self.yaw - self.render_yaw_offset);
+        // The source's `< -75` / `>= 75` pair; `clamp` agrees with it for
+        // every value, NaN included.
+        difference = difference.clamp(-BODY_REACH_DEGREES, BODY_REACH_DEGREES);
+        self.render_yaw_offset = self.yaw - difference;
+        if difference * difference > RELEASE_THRESHOLD_SQUARED {
+            self.render_yaw_offset += difference * RELEASE_EASE;
+        }
+    }
+
+    /// The mob chase — `EntityLiving.updateDistance:288-292` handing the
+    /// body to `EntityBodyHelper.updateRenderAngles:24-58`.
+    ///
+    /// While the mob has moved this tick past the helper's own squared gate,
+    /// the body snaps to the body yaw and the head bounds to
+    /// `BODY_REACH_DEGREES` of it. While it has not, the body bounds toward
+    /// the head at the full reach until the head has been held within
+    /// `HELD_HEAD_RESET_DEGREES` for `HELD_DECAY_START_TICKS` ticks, then
+    /// the reach decays a tenth per further held tick; a head that moves
+    /// past the reset threshold restarts the count.
+    fn chase_body_helper(&mut self, d0: f64, d1: f64) {
+        if d0 * d0 + d1 * d1 > MOB_MOVEMENT_GATE_SQUARED {
+            self.render_yaw_offset = self.yaw;
+            self.head_yaw =
+                compute_angle_with_bound(self.render_yaw_offset, self.head_yaw, BODY_REACH_DEGREES);
+            self.prev_render_yaw_head = self.head_yaw;
+            self.rotation_tick_counter = 0;
+        } else {
+            let mut reach = BODY_REACH_DEGREES;
+            if (self.head_yaw - self.prev_render_yaw_head).abs() > HELD_HEAD_RESET_DEGREES {
+                self.rotation_tick_counter = 0;
+                self.prev_render_yaw_head = self.head_yaw;
+            } else {
+                self.rotation_tick_counter = self.rotation_tick_counter.saturating_add(1);
+                if self.rotation_tick_counter > HELD_DECAY_START_TICKS {
+                    let held = (self.rotation_tick_counter - HELD_DECAY_START_TICKS) as f32 / 10.0;
+                    reach = f32::max(1.0 - held, 0.0) * BODY_REACH_DEGREES;
+                }
+            }
+            self.render_yaw_offset =
+                compute_angle_with_bound(self.head_yaw, self.render_yaw_offset, reach);
         }
     }
 }
@@ -474,7 +688,10 @@ impl Entities {
     ///
     /// - `2` (hurt): the limb-swing amount jumps to `1.5` and `hurt_ticks`
     ///   takes the ten-tick hurt window;
-    /// - `3` (dead): the death counter starts.
+    /// - `3` (dead): the death counter starts — seeded at zero like the
+    ///   source's `deathTime` (this status only zeroes the health,
+    ///   `EntityLivingBase.java:1382`), counting up from the following
+    ///   tick.
     ///
     /// Every other status changes nothing here. The statuses with render
     /// meaning outside this table — `6`/`7` (taming), `9` (eat accepted),
@@ -491,7 +708,7 @@ impl Entities {
                 entity.hurt_ticks = HURT_WINDOW_TICKS;
             }
             3 => {
-                entity.death_ticks = 1;
+                entity.death_started = true;
             }
             _ => {}
         }
@@ -545,27 +762,42 @@ impl Entities {
     ///    period, and `swing_progress` is the counter over that period;
     /// 4. the counters: `age` up by one (the world's `++ticksExisted`,
     ///    `World.updateEntityWithOptionalForce:1871`), `hurt_ticks` down
-    ///    (`onEntityUpdate:337-340`), and `death_ticks` up once started
-    ///    (`onDeathUpdate:398-402`);
-    /// 5. the render-yaw chase (`updateDistance:1912-1942`): the partner
-    ///    takes the pre-chase value, then `render_yaw_offset` eases `0.3` of
-    ///    the wrapped way toward `head_yaw` and settles within `±75` of
-    ///    `yaw`, with the source's release past `50` adding `0.2` of the
-    ///    clamped difference; every fold is the source's own
-    ///    `wrapAngleTo180_float`;
-    /// 6. the pose pairs copy: `last_tick_position`, `last_tick_yaw`,
-    ///    `last_tick_pitch` and `last_tick_head_yaw` take the current
-    ///    values.
+    ///    (`onEntityUpdate:337-340`), and `death_ticks` up once status 3 has
+    ///    started it (`onDeathUpdate:398-402`);
+    /// 5. the pose pairs copy for the tick — `last_tick_position`,
+    ///    `last_tick_yaw`, `last_tick_pitch` and `last_tick_head_yaw` take
+    ///    the current values and `prev_render_yaw_offset` the pre-chase
+    ///    render yaw — so every partner holds the state from before this
+    ///    tick's chase, where the source copies them
+    ///    (`EntityLivingBase.onEntityUpdate:379-383`);
+    /// 6. the chase, per kind. Players run the base path: the target is the
+    ///    tick's movement direction (gated on the squared displacement past
+    ///    `0.0025000002`) or the body yaw while a swing runs, else the
+    ///    render yaw holds; the body then eases `0.3` of the wrapped way
+    ///    toward it, sits within `±75` of the body yaw and takes the
+    ///    past-`50` release (`updateDistance:1912-1942`). Mobs hand the body
+    ///    to the body helper (`EntityLiving.java:288-292`): moving, the body
+    ///    snaps to the body yaw and the head bounds to `±75` of it; held,
+    ///    the body bounds toward the head under the helper's decaying reach.
+    ///    Every other kind keeps its render yaw;
+    /// 7. the folds (`rangeChecks:1867-1906`): for the living kinds, every
+    ///    copied partner is folded within `±180` of its current value, so a
+    ///    pair that crossed the angle seam reads the short way.
     pub fn tick(&mut self) {
         for entity in self.map.values_mut() {
             // The swing pair's partner, from before this tick's update.
             entity.last_swing_progress = entity.swing_progress;
 
-            // The limb pair: the distance walked since the previous tick
-            // (the source's posX - prevPosX), scaled and clamped.
-            let dx = entity.position[0] - entity.last_tick_position[0];
-            let dz = entity.position[2] - entity.last_tick_position[2];
-            let mut target = (dx * dx + dz * dz).sqrt() as f32 * 4.0;
+            // The horizontal movement since the previous tick (the source's
+            // posX - prevPosX): the basis the limb pair and both chase paths
+            // measure movement with. It is read before the pair copies
+            // below overwrite it.
+            let d0 = entity.position[0] - entity.last_tick_position[0];
+            let d1 = entity.position[2] - entity.last_tick_position[2];
+
+            // The limb pair: the distance walked since the previous tick,
+            // scaled and clamped.
+            let mut target = (d0 * d0 + d1 * d1).sqrt() as f32 * 4.0;
             if target > 1.0 {
                 target = 1.0;
             }
@@ -589,26 +821,34 @@ impl Entities {
             // The counters.
             entity.age = entity.age.saturating_add(1);
             entity.hurt_ticks = entity.hurt_ticks.saturating_sub(1);
-            if entity.death_ticks > 0 {
+            if entity.death_started {
                 entity.death_ticks = entity.death_ticks.saturating_add(1);
             }
 
-            // The render-yaw chase.
-            entity.prev_render_yaw_offset = entity.render_yaw_offset;
-            let step = wrap_angle_to_180(entity.head_yaw - entity.render_yaw_offset);
-            entity.render_yaw_offset += step * 0.3;
-            let mut diff = wrap_angle_to_180(entity.yaw - entity.render_yaw_offset);
-            diff = diff.clamp(-75.0, 75.0);
-            entity.render_yaw_offset = entity.yaw - diff;
-            if diff * diff > 2500.0 {
-                entity.render_yaw_offset += diff * 0.2;
-            }
-
-            // The pose pairs.
+            // The pose pairs copy for the tick, before the chase changes the
+            // render yaw (and, for a moving mob, the head): the partners
+            // hold the state from before the chase, as the source's copies
+            // do.
             entity.last_tick_position = entity.position;
             entity.last_tick_yaw = entity.yaw;
             entity.last_tick_pitch = entity.pitch;
             entity.last_tick_head_yaw = entity.head_yaw;
+            entity.prev_render_yaw_offset = entity.render_yaw_offset;
+
+            // The chase, per kind.
+            match entity.kind {
+                EntityKind::Player => entity.chase_body_base(d0, d1),
+                kind if kind.is_mob() => entity.chase_body_helper(d0, d1),
+                _ => {}
+            }
+
+            // The folds, for the living kinds.
+            if entity.kind.is_living() {
+                fold_pose_pair(entity.yaw, &mut entity.last_tick_yaw);
+                fold_pose_pair(entity.render_yaw_offset, &mut entity.prev_render_yaw_offset);
+                fold_pose_pair(entity.pitch, &mut entity.last_tick_pitch);
+                fold_pose_pair(entity.head_yaw, &mut entity.last_tick_head_yaw);
+            }
         }
     }
 }
@@ -842,7 +1082,10 @@ mod tests {
 
         entities.apply_status(1, 3);
         let entity = entities.get(1).expect("id 1 is live");
-        assert_eq!(entity.death_ticks, 1);
+        assert_eq!(
+            entity.death_ticks, 0,
+            "the source seeds deathTime at zero; the ticks count it up"
+        );
         assert_eq!(entity.hurt_ticks, 0, "death is not hurt");
     }
 
@@ -1161,11 +1404,20 @@ mod tests {
         );
 
         entities.apply_status(1, 3);
+        assert_eq!(
+            entities.get(1).expect("id 1 is live").death_ticks,
+            0,
+            "the status seeds the counter; it does not count yet"
+        );
+        entities.tick();
         assert_eq!(entities.get(1).expect("id 1 is live").death_ticks, 1);
         entities.tick();
         assert_eq!(entities.get(1).expect("id 1 is live").death_ticks, 2);
-        entities.tick();
-        assert_eq!(entities.get(1).expect("id 1 is live").death_ticks, 3);
+
+        // Another death status does not restart the count — the source
+        // only zeroes the health there.
+        entities.apply_status(1, 3);
+        assert_eq!(entities.get(1).expect("id 1 is live").death_ticks, 2);
     }
 
     #[test]
@@ -1179,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn the_render_yaw_crosses_the_angle_seam_the_short_way() {
+    fn the_mob_body_chases_the_head_across_the_angle_seam() {
         let mut entities = Entities::new();
         let mut entity = spawned(1, EntityKind::Zombie);
         entity.yaw = -170.0;
@@ -1187,46 +1439,92 @@ mod tests {
         entity.render_yaw_offset = 170.0;
         entities.insert(entity);
 
-        // The target is 20 degrees away through 180: -170 - 170 = -340
-        // folds to +20, so the first step is 20 x 0.3 = 6 degrees and the
-        // result is 176, written -184 after the body bound. The long way
-        // would read 170 - 102 = 68.
+        // The still mob's body helper bounds the body to the head: the
+        // wrapped difference from 170 to -170 is +20 the short way, and the
+        // first held tick keeps the full reach, so the body lands on
+        // -170 - 20 = -190 and sits there while the head stays put.
+        for tick in 1..=3 {
+            entities.tick();
+            let entity = entities.get(1).expect("id 1 is live");
+            assert!(
+                (entity.render_yaw_offset + 190.0).abs() < 1e-4,
+                "tick {}: the crossed body, saw {}",
+                tick,
+                entity.render_yaw_offset
+            );
+        }
+        assert_eq!(entities.get(1).expect("id 1 is live").head_yaw, -170.0);
+    }
+
+    #[test]
+    fn the_player_body_chases_toward_the_movement_direction() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Player);
+        entity.position = [0.5, 64.0, 0.0];
+        entity.last_tick_position = [0.0, 64.0, 0.0];
+        entity.yaw = 90.0;
+        entity.head_yaw = 0.0;
+        entity.render_yaw_offset = 170.0;
+        entities.insert(entity);
+
+        // Moving along +x puts the movement target at atan2(0, 0.5) in
+        // degrees minus 90 = -90. The body eases 0.3 of the wrapped step
+        // from 170, landing on 170 + 30 = 200; the body-yaw bound then
+        // clamps the 90-to-200 difference to -75, so the body reads
+        // 90 - (-75) = 165, and the past-50 release pulls 75 x 0.2 = 15 of
+        // it back: 150.
         entities.tick();
         let entity = entities.get(1).expect("id 1 is live");
         assert!(
-            (entity.render_yaw_offset + 184.0).abs() < 1e-4,
+            (entity.render_yaw_offset - 150.0).abs() < 1e-4,
             "after one tick, saw {}",
-            entity.render_yaw_offset
-        );
-
-        entities.tick();
-        let entity = entities.get(1).expect("id 1 is live");
-        assert!(
-            (entity.render_yaw_offset + 179.8).abs() < 1e-4,
-            "after two ticks, saw {}",
-            entity.render_yaw_offset
-        );
-
-        entities.tick();
-        let entity = entities.get(1).expect("id 1 is live");
-        assert!(
-            (entity.render_yaw_offset + 176.86).abs() < 1e-4,
-            "after three ticks, saw {}",
             entity.render_yaw_offset
         );
     }
 
     #[test]
-    fn the_render_yaw_sits_within_the_body_yaws_reach() {
+    fn the_player_body_chases_the_body_yaw_through_a_swing() {
         let mut entities = Entities::new();
-        let mut entity = spawned(1, EntityKind::Pig);
+        let mut entity = spawned(1, EntityKind::Player);
+        entity.yaw = -170.0;
+        entity.head_yaw = 0.0;
+        entity.render_yaw_offset = 170.0;
+        entities.insert(entity);
+        entities.get_mut(1).expect("id 1 is live").swing();
+
+        // The swing starts with the next tick, so the first tick still
+        // holds the render yaw and the body bound alone lands it on
+        // -170 - 20 = -190; from the second tick the running swing hands
+        // the target to the body yaw and the body eases 0.3 of the wrapped
+        // 20 degrees: -190 + 6 = -184.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.render_yaw_offset + 190.0).abs() < 1e-4,
+            "tick 1: the held body, saw {}",
+            entity.render_yaw_offset
+        );
+
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.render_yaw_offset + 184.0).abs() < 1e-4,
+            "tick 2: the swung body, saw {}",
+            entity.render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_player_body_chase_settles_within_the_body_yaws_reach() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Player);
         entity.yaw = 100.0;
         entity.head_yaw = 0.0;
         entity.render_yaw_offset = 0.0;
         entities.insert(entity);
 
-        // The head is right where the render yaw already sits, so the eased
-        // step does nothing; the body bound then clamps the 100-degree
+        // The still player holds its own render yaw as the target, so the
+        // eased step is zero; the body bound then clamps the 100-degree
         // difference to 75 (100 - 75 = 25) and the release past 50 pulls it
         // another 75 x 0.2 = 15: 25 + 15 = 40.
         entities.tick();
@@ -1236,9 +1534,212 @@ mod tests {
             "saw {}",
             entity.render_yaw_offset
         );
-        assert_eq!(
-            entity.prev_render_yaw_offset, 0.0,
-            "the pair holds the pre-chase value"
+        assert!(
+            entity.prev_render_yaw_offset.abs() < 1e-6,
+            "the pair holds the pre-chase value, saw {}",
+            entity.prev_render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_moving_mob_body_chase_bounds_the_head_to_the_body() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Zombie);
+        entity.position = [0.5, 64.0, 0.0];
+        entity.last_tick_position = [0.0, 64.0, 0.0];
+        entity.yaw = 0.0;
+        entity.head_yaw = 170.0;
+        entity.render_yaw_offset = 0.0;
+        entities.insert(entity);
+
+        // A moving mob snaps its body to the body yaw (0) and bounds the
+        // head to 75 of it: the wrapped difference from the head is -170,
+        // clamped to the reach, so the head lands on 0 - (-75) = 75; the
+        // pair keeps the pre-bound head for the renderer to lerp from.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            entity.render_yaw_offset.abs() < 1e-6,
+            "the snapped body, saw {}",
+            entity.render_yaw_offset
+        );
+        assert!(
+            (entity.head_yaw - 75.0).abs() < 1e-4,
+            "the bounded head, saw {}",
+            entity.head_yaw
+        );
+        assert!(
+            (entity.last_tick_head_yaw - 170.0).abs() < 1e-4,
+            "the pair holds the pre-bound head, saw {}",
+            entity.last_tick_head_yaw
+        );
+    }
+
+    #[test]
+    fn the_held_mob_body_chase_decays_after_ten_ticks() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Zombie);
+        entity.yaw = 0.0;
+        entity.head_yaw = 0.0;
+        entity.render_yaw_offset = 90.0;
+        entities.insert(entity);
+
+        // Held with the head steady, the body bounds toward the head at
+        // the full 75 reach for the first ten ticks, ...
+        for tick in 1..=10 {
+            entities.tick();
+            let entity = entities.get(1).expect("id 1 is live");
+            assert!(
+                (entity.render_yaw_offset - 75.0).abs() < 1e-4,
+                "held tick {}: the full reach body, saw {}",
+                tick,
+                entity.render_yaw_offset
+            );
+        }
+
+        // ... then the reach decays a tenth of 75 each held tick — 67.5,
+        // 60, 52.5 — down to zero by the twentieth.
+        let decay = [67.5_f32, 60.0, 52.5];
+        for (index, &expected) in decay.iter().enumerate() {
+            entities.tick();
+            let entity = entities.get(1).expect("id 1 is live");
+            assert!(
+                (entity.render_yaw_offset - expected).abs() < 1e-4,
+                "held tick {}: the decayed body, saw {}",
+                index + 11,
+                entity.render_yaw_offset
+            );
+        }
+        for _ in 0..7 {
+            entities.tick();
+        }
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            entity.render_yaw_offset.abs() < 1e-4,
+            "the decayed body sits on the head, saw {}",
+            entity.render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_pose_pairs_fold_back_across_the_seam() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Player);
+        entity.yaw = -170.0;
+        entity.head_yaw = 170.0;
+        entity.render_yaw_offset = 170.0;
+        entities.insert(entity);
+
+        // The held player's chase lands the body on -170 - 20 = -190 while
+        // the copied partner still reads 170: the fold steps the partner
+        // 360 back, so the pair reads the short way, -190 against -190.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.render_yaw_offset + 190.0).abs() < 1e-4,
+            "the crossed body, saw {}",
+            entity.render_yaw_offset
+        );
+        assert!(
+            (entity.prev_render_yaw_offset + 190.0).abs() < 1e-4,
+            "the folded partner, saw {}",
+            entity.prev_render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_pose_pairs_fold_forward_across_the_seam() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Player);
+        entity.yaw = 170.0;
+        entity.head_yaw = -170.0;
+        entity.render_yaw_offset = -170.0;
+        entities.insert(entity);
+
+        // The held player's chase lands the body on 170 + 20 = 190 while
+        // the copied partner still reads -170: the fold steps the partner
+        // 360 forward, so the pair reads 190 against 190.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.render_yaw_offset - 190.0).abs() < 1e-4,
+            "the crossed body, saw {}",
+            entity.render_yaw_offset
+        );
+        assert!(
+            (entity.prev_render_yaw_offset - 190.0).abs() < 1e-4,
+            "the folded partner, saw {}",
+            entity.prev_render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_fold_keeps_a_half_turn_delta_seated_at_the_boundary() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Zombie);
+        entity.position = [0.5, 64.0, 0.0];
+        entity.last_tick_position = [0.0, 64.0, 0.0];
+        entity.yaw = 190.0;
+        entity.head_yaw = 190.0;
+        entity.render_yaw_offset = 10.0;
+        entities.insert(entity);
+
+        // The moving mob's body snaps to 190, exactly half a turn from the
+        // copied partner, 10. The source's `>= 180` fold fires at exactly
+        // half a turn and seats the partner on 10 + 360 = 370, so the
+        // delta reads -180, not +180.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.prev_render_yaw_offset - 370.0).abs() < 1e-4,
+            "the seated half-turn partner, saw {}",
+            entity.prev_render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_fold_leaves_a_negative_half_turn_delta_alone() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Zombie);
+        entity.position = [0.5, 64.0, 0.0];
+        entity.last_tick_position = [0.0, 64.0, 0.0];
+        entity.yaw = -170.0;
+        entity.head_yaw = -170.0;
+        entity.render_yaw_offset = 10.0;
+        entities.insert(entity);
+
+        // The partner sits exactly half a turn the other way, -180 from
+        // the body: the source's `< -180` test is strict, so the partner
+        // stays put and the pair keeps the -180 delta.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.prev_render_yaw_offset - 10.0).abs() < 1e-4,
+            "the untouched half-turn partner, saw {}",
+            entity.prev_render_yaw_offset
+        );
+    }
+
+    #[test]
+    fn the_fold_pulls_a_delta_past_half_a_turn_back_in_range() {
+        let mut entities = Entities::new();
+        let mut entity = spawned(1, EntityKind::Zombie);
+        entity.position = [0.5, 64.0, 0.0];
+        entity.last_tick_position = [0.0, 64.0, 0.0];
+        entity.yaw = -170.5;
+        entity.head_yaw = -170.5;
+        entity.render_yaw_offset = 10.0;
+        entities.insert(entity);
+
+        // The partner is half a degree past the half turn, -180.5 from the
+        // body, so the fold steps it 360 back: 10 - 360 = -350, a 179.5
+        // degree delta.
+        entities.tick();
+        let entity = entities.get(1).expect("id 1 is live");
+        assert!(
+            (entity.prev_render_yaw_offset + 350.0).abs() < 1e-4,
+            "the pulled-back partner, saw {}",
+            entity.prev_render_yaw_offset
         );
     }
 
