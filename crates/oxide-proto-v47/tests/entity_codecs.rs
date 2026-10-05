@@ -1,5 +1,5 @@
-//! The entity codec fixture corpus: one hand-built byte vector per spawn
-//! packet and the spawn-id table suite.
+//! The entity codec fixture corpus: one hand-built byte vector per spawn,
+//! movement and lifecycle packet and the spawn-id table suite.
 //!
 //! Every field value is hand-picked to catch unit errors — a fixed-point
 //! coordinate with a fraction, a negative angle byte, a mob with two metadata
@@ -10,10 +10,15 @@
 
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::entity::{
-    EntityMetadata, GlobalType, MetadataItem, MetadataValue, MobType, ObjectType, SpawnGlobal,
-    SpawnMob, SpawnObject, SpawnPainting, SpawnPlayer, SpawnXpOrb, decode_entity_metadata,
-    decode_spawn_global, decode_spawn_mob, decode_spawn_object, decode_spawn_painting,
-    decode_spawn_player, decode_spawn_xp_orb,
+    Animation, AttachEntity, CollectItem, DestroyEntities, Entity, EntityEquipment, EntityHeadLook,
+    EntityLook, EntityLookAndRelativeMove, EntityMetadata, EntityRelativeMove, EntityTeleport,
+    EntityVelocity, GlobalType, MAX_DESTROY_BATCH, MetadataItem, MetadataValue, MobType,
+    ObjectType, SpawnGlobal, SpawnMob, SpawnObject, SpawnPainting, SpawnPlayer, SpawnXpOrb,
+    decode_animation, decode_attach_entity, decode_collect_item, decode_destroy_entities,
+    decode_entity, decode_entity_equipment, decode_entity_head_look, decode_entity_look,
+    decode_entity_look_and_relative_move, decode_entity_metadata, decode_entity_relative_move,
+    decode_entity_teleport, decode_entity_velocity, decode_spawn_global, decode_spawn_mob,
+    decode_spawn_object, decode_spawn_painting, decode_spawn_player, decode_spawn_xp_orb,
 };
 
 /// Spawn Player (0x0C): EID 20; UUID; a fractional fixed-point triple; a
@@ -127,6 +132,122 @@ const ENTITY_METADATA: &[u8] = &[
     0x00, 0x01, // byte index 0 = 1
     0x42, 0x00, 0x00, 0x00, 0x40, // int index 2 = 64
     0x7f, // terminator
+];
+
+/// Entity Equipment (0x04): EID 20, a helmet (slot 4) holding item 276 with
+/// no NBT tail.
+const ENTITY_EQUIPMENT_HELMET: &[u8] = &[
+    0x14, // EID 20
+    0x00, 0x04, // slot 4: helmet
+    0x01, 0x14, // item id 276
+    0x01, // count 1
+    0x00, 0x00, // damage 0
+    0x00, // NBT: no data
+];
+
+/// Entity Equipment (0x04) with the empty slot: EID 20, leggings (slot 2),
+/// item id -1.
+const ENTITY_EQUIPMENT_EMPTY: &[u8] = &[
+    0x14, // EID 20
+    0x00, 0x02, // slot 2: leggings
+    0xff, 0xff, // item id -1: the empty slot
+];
+
+/// Animation (0x0B): EID 42 and animation 4, the crit of §2.1's table.
+const ENTITY_ANIMATION: &[u8] = &[
+    0x2a, // EID 42
+    0x04, // animation 4: crit
+];
+
+/// Collect Item (0x0D): collected 300, collector 20.
+const COLLECT_ITEM: &[u8] = &[
+    0xac, 0x02, // collected EID 300
+    0x14, // collector EID 20
+];
+
+/// Entity Velocity (0x12): EID 20 with a negative, a positive and a
+/// fractional axis.
+const ENTITY_VELOCITY: &[u8] = &[
+    0x14, // EID 20
+    0xe0, 0xc0, // x = -8000 / 8000 = -1.0
+    0x1f, 0x40, // y = 8000 / 8000 = 1.0
+    0x00, 0x64, // z = 100 / 8000 = 0.0125
+];
+
+/// Destroy Entities (0x13): three ids — 20, 300 and 100000, the last a
+/// three-byte VarInt.
+const DESTROY_ENTITIES: &[u8] = &[
+    0x03, // count 3
+    0x14, // EID 20
+    0xac, 0x02, // EID 300
+    0xa0, 0x8d, 0x06, // EID 100000
+];
+
+/// Entity (0x14): the bare EID 20.
+const ENTITY: &[u8] = &[
+    0x14, // EID 20
+];
+
+/// Entity Relative Move (0x15): the byte range's corners -128, 0 and 127.
+const ENTITY_RELATIVE_MOVE: &[u8] = &[
+    0x14, // EID 20
+    0x80, // dX = -128 / 32 = -4.0
+    0x00, // dY = 0 / 32 = 0.0
+    0x7f, // dZ = 127 / 32 = 3.96875
+    0x01, // on ground
+];
+
+/// Entity Look (0x16): yaw byte 208 — 292.5 degrees, one whole turn below the
+/// signed read's -67.5 — and pitch byte 64 (90.0).
+const ENTITY_LOOK: &[u8] = &[
+    0x14, // EID 20
+    0xd0, // yaw: 208 * 360 / 256 = 292.5
+    0x40, // pitch: 64 * 360 / 256 = 90.0
+    0x00, // on ground
+];
+
+/// Entity Look And Relative Move (0x17): the deltas 3, -64 and 64 with the
+/// angle bytes 64 (yaw 90.0) and 192 (pitch 270.0).
+const ENTITY_LOOK_AND_RELATIVE_MOVE: &[u8] = &[
+    0x14, // EID 20
+    0x03, // dX = 3 / 32 = 0.09375
+    0xc0, // dY = -64 / 32 = -2.0
+    0x40, // dZ = 64 / 32 = 2.0
+    0x40, // yaw: 90.0
+    0xc0, // pitch: 270.0
+    0x00, // on ground
+];
+
+/// Entity Teleport (0x18): x at the fixed point's smallest step (1/32), y a
+/// whole negative block and z a fractional one; pitch byte 128 (180.0).
+const ENTITY_TELEPORT: &[u8] = &[
+    0x14, // EID 20
+    0x00, 0x00, 0x00, 0x01, // x = 1 / 32 = 0.03125
+    0xff, 0xff, 0xff, 0xe0, // y = -32 / 32 = -1.0
+    0x00, 0x00, 0x00, 0x21, // z = 33 / 32 = 1.03125
+    0x00, // yaw: 0.0
+    0x80, // pitch: 128 * 360 / 256 = 180.0
+    0x01, // on ground
+];
+
+/// Entity Head Look (0x19): EID 20 with head yaw byte 64 (90.0).
+const ENTITY_HEAD_LOOK: &[u8] = &[
+    0x14, // EID 20
+    0x40, // head yaw: 64 * 360 / 256 = 90.0
+];
+
+/// Attach Entity (0x1B): attached 20 held by 25, leash byte 1.
+const ATTACH_ENTITY: &[u8] = &[
+    0x00, 0x00, 0x00, 0x14, // attached EID 20
+    0x00, 0x00, 0x00, 0x19, // holder EID 25
+    0x01, // leash byte 1
+];
+
+/// Attach Entity (0x1B), the detach §2.1 notes: holder -1, leash byte 0.
+const ATTACH_ENTITY_DETACH: &[u8] = &[
+    0x00, 0x00, 0x00, 0x14, // attached EID 20
+    0xff, 0xff, 0xff, 0xff, // holder -1: detach
+    0x00, // leash byte 0
 ];
 
 #[test]
@@ -499,4 +620,268 @@ fn metadata_item_carries_the_slot_shape() {
     assert_eq!(item.id, 276);
     assert_eq!(item.count, 2);
     assert_eq!(item.damage, 42);
+}
+
+#[test]
+fn entity_equipment_decodes_both_slot_shapes() {
+    // A worn slot: item 276 in helmet slot 4, damage 0 and no NBT tail. The
+    // empty shape: item id -1 in slot 2, and nothing follows it.
+    assert_eq!(EntityEquipment::ID, 0x04);
+    let worn = decode_entity_equipment(ENTITY_EQUIPMENT_HELMET).expect("a worn slot decodes");
+    assert_eq!(worn.entity_id, 20);
+    assert_eq!(worn.slot, 4);
+    assert_eq!(
+        worn.item,
+        Some(MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+        })
+    );
+
+    let empty = decode_entity_equipment(ENTITY_EQUIPMENT_EMPTY).expect("an empty slot decodes");
+    assert_eq!(empty.entity_id, 20);
+    assert_eq!(empty.slot, 2);
+    assert_eq!(empty.item, None);
+}
+
+#[test]
+fn animation_decodes_the_byte() {
+    assert_eq!(Animation::ID, 0x0b);
+    let animation = decode_animation(ENTITY_ANIMATION).expect("an animation decodes");
+    assert_eq!(animation.entity_id, 42);
+    assert_eq!(animation.animation, 4, "the crit of §2.1's table");
+}
+
+#[test]
+fn collect_item_decodes_the_pair() {
+    assert_eq!(CollectItem::ID, 0x0d);
+    let pickup = decode_collect_item(COLLECT_ITEM).expect("a pickup decodes");
+    assert_eq!(pickup.collected, 300, "the collected item");
+    assert_eq!(pickup.collector, 20, "the collector");
+}
+
+#[test]
+fn entity_velocity_decodes_the_axes() {
+    assert_eq!(EntityVelocity::ID, 0x12);
+    let velocity = decode_entity_velocity(ENTITY_VELOCITY).expect("a velocity decodes");
+    assert_eq!(velocity.entity_id, 20);
+    assert_eq!(velocity.velocity, [-1.0, 1.0, 0.0125]);
+}
+
+#[test]
+fn destroy_entities_decodes_the_batch() {
+    assert_eq!(DestroyEntities::ID, 0x13);
+    let batch = decode_destroy_entities(DESTROY_ENTITIES).expect("a destroy batch decodes");
+    assert_eq!(batch.entity_ids, vec![20, 300, 100000]);
+}
+
+#[test]
+fn bare_entity_decodes_the_id() {
+    assert_eq!(Entity::ID, 0x14);
+    let entity = decode_entity(ENTITY).expect("the bare id decodes");
+    assert_eq!(entity.entity_id, 20);
+}
+
+#[test]
+fn entity_relative_move_decodes_the_deltas() {
+    assert_eq!(EntityRelativeMove::ID, 0x15);
+    let step = decode_entity_relative_move(ENTITY_RELATIVE_MOVE).expect("a move decodes");
+    assert_eq!(step.entity_id, 20);
+    assert_eq!(step.delta, [-4.0, 0.0, 3.96875]);
+}
+
+#[test]
+fn entity_look_decodes_the_wrap_angle() {
+    assert_eq!(EntityLook::ID, 0x16);
+    let look = decode_entity_look(ENTITY_LOOK).expect("a look decodes");
+    assert_eq!(look.entity_id, 20);
+    assert_eq!(look.yaw, 292.5, "byte 208, one whole turn below -67.5");
+    assert_eq!(look.pitch, 90.0);
+}
+
+#[test]
+fn entity_look_and_relative_move_decodes_both() {
+    assert_eq!(EntityLookAndRelativeMove::ID, 0x17);
+    let both = decode_entity_look_and_relative_move(ENTITY_LOOK_AND_RELATIVE_MOVE)
+        .expect("a look-and-move decodes");
+    assert_eq!(both.entity_id, 20);
+    assert_eq!(both.delta, [0.09375, -2.0, 2.0]);
+    assert_eq!(both.yaw, 90.0);
+    assert_eq!(both.pitch, 270.0);
+}
+
+#[test]
+fn entity_teleport_decodes_the_fixed_point_boundary() {
+    assert_eq!(EntityTeleport::ID, 0x18);
+    let teleport = decode_entity_teleport(ENTITY_TELEPORT).expect("a teleport decodes");
+    assert_eq!(teleport.entity_id, 20);
+    assert_eq!(teleport.x, 0.03125, "the smallest fixed-point step");
+    assert_eq!(teleport.y, -1.0);
+    assert_eq!(teleport.z, 1.03125);
+    assert_eq!(teleport.yaw, 0.0);
+    assert_eq!(teleport.pitch, 180.0);
+    assert!(teleport.on_ground);
+}
+
+#[test]
+fn entity_head_look_decodes_the_head_yaw() {
+    assert_eq!(EntityHeadLook::ID, 0x19);
+    let head = decode_entity_head_look(ENTITY_HEAD_LOOK).expect("a head look decodes");
+    assert_eq!(head.entity_id, 20);
+    assert_eq!(head.head_yaw, 90.0);
+}
+
+#[test]
+fn attach_entity_decodes_the_leash_and_the_detach() {
+    assert_eq!(AttachEntity::ID, 0x1b);
+    let attach = decode_attach_entity(ATTACH_ENTITY).expect("an attach decodes");
+    assert_eq!(attach.attached, 20);
+    assert_eq!(attach.holder, 25);
+    assert!(attach.leash, "leash byte 1 is the leash form");
+
+    let detach = decode_attach_entity(ATTACH_ENTITY_DETACH).expect("a detach decodes");
+    assert_eq!(detach.attached, 20);
+    assert_eq!(detach.holder, -1, "the -1 detach of §2.1's row");
+    assert!(!detach.leash);
+}
+
+#[test]
+fn movement_decodes_refuse_a_truncated_body() {
+    // One byte short of each fixture, the last field cannot be read.
+    assert!(
+        decode_entity_equipment(&ENTITY_EQUIPMENT_HELMET[..ENTITY_EQUIPMENT_HELMET.len() - 1])
+            .is_err()
+    );
+    assert!(
+        decode_entity_equipment(&ENTITY_EQUIPMENT_EMPTY[..ENTITY_EQUIPMENT_EMPTY.len() - 1])
+            .is_err()
+    );
+    assert!(decode_animation(&ENTITY_ANIMATION[..ENTITY_ANIMATION.len() - 1]).is_err());
+    assert!(decode_collect_item(&COLLECT_ITEM[..COLLECT_ITEM.len() - 1]).is_err());
+    assert!(decode_entity_velocity(&ENTITY_VELOCITY[..ENTITY_VELOCITY.len() - 1]).is_err());
+    assert!(decode_destroy_entities(&DESTROY_ENTITIES[..DESTROY_ENTITIES.len() - 1]).is_err());
+    assert!(decode_entity(&ENTITY[..ENTITY.len() - 1]).is_err());
+    assert!(
+        decode_entity_relative_move(&ENTITY_RELATIVE_MOVE[..ENTITY_RELATIVE_MOVE.len() - 1])
+            .is_err()
+    );
+    assert!(decode_entity_look(&ENTITY_LOOK[..ENTITY_LOOK.len() - 1]).is_err());
+    assert!(
+        decode_entity_look_and_relative_move(
+            &ENTITY_LOOK_AND_RELATIVE_MOVE[..ENTITY_LOOK_AND_RELATIVE_MOVE.len() - 1]
+        )
+        .is_err()
+    );
+    assert!(decode_entity_teleport(&ENTITY_TELEPORT[..ENTITY_TELEPORT.len() - 1]).is_err());
+    assert!(decode_entity_head_look(&ENTITY_HEAD_LOOK[..ENTITY_HEAD_LOOK.len() - 1]).is_err());
+    assert!(decode_attach_entity(&ATTACH_ENTITY[..ATTACH_ENTITY.len() - 1]).is_err());
+    assert!(decode_attach_entity(&ATTACH_ENTITY_DETACH[..ATTACH_ENTITY_DETACH.len() - 1]).is_err());
+}
+
+#[test]
+fn movement_decodes_refuse_a_trailing_byte() {
+    for (name, result) in [
+        (
+            "equipment",
+            with_trailing_byte(ENTITY_EQUIPMENT_HELMET, decode_entity_equipment),
+        ),
+        (
+            "equipment empty",
+            with_trailing_byte(ENTITY_EQUIPMENT_EMPTY, decode_entity_equipment),
+        ),
+        (
+            "animation",
+            with_trailing_byte(ENTITY_ANIMATION, decode_animation),
+        ),
+        (
+            "collect",
+            with_trailing_byte(COLLECT_ITEM, decode_collect_item),
+        ),
+        (
+            "velocity",
+            with_trailing_byte(ENTITY_VELOCITY, decode_entity_velocity),
+        ),
+        (
+            "destroy",
+            with_trailing_byte(DESTROY_ENTITIES, decode_destroy_entities),
+        ),
+        ("entity", with_trailing_byte(ENTITY, decode_entity)),
+        (
+            "relative move",
+            with_trailing_byte(ENTITY_RELATIVE_MOVE, decode_entity_relative_move),
+        ),
+        ("look", with_trailing_byte(ENTITY_LOOK, decode_entity_look)),
+        (
+            "look and move",
+            with_trailing_byte(
+                ENTITY_LOOK_AND_RELATIVE_MOVE,
+                decode_entity_look_and_relative_move,
+            ),
+        ),
+        (
+            "teleport",
+            with_trailing_byte(ENTITY_TELEPORT, decode_entity_teleport),
+        ),
+        (
+            "head look",
+            with_trailing_byte(ENTITY_HEAD_LOOK, decode_entity_head_look),
+        ),
+        (
+            "attach",
+            with_trailing_byte(ATTACH_ENTITY, decode_attach_entity),
+        ),
+        (
+            "detach",
+            with_trailing_byte(ATTACH_ENTITY_DETACH, decode_attach_entity),
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(PacketError::Trailing(1))),
+            "{name}: expected a trailing refusal, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn destroy_batch_rides_the_cap() {
+    assert_eq!(MAX_DESTROY_BATCH, 1024);
+    // The cap itself decodes: a two-byte VarInt count (1024 = 0x80 0x08) and
+    // one byte per id.
+    let mut at_cap = vec![0x80, 0x08];
+    at_cap.extend((0..1024u32).map(|id| (id % 100) as u8));
+    let batch = decode_destroy_entities(&at_cap).expect("1024 ids sit within the cap");
+    assert_eq!(batch.entity_ids.len(), 1024);
+    assert_eq!(batch.entity_ids[0], 0);
+    assert_eq!(batch.entity_ids[1023], 23);
+
+    // One past it is refused by the cap; the ids are present, so the refusal
+    // cannot be an end-of-body one.
+    let mut past_cap = vec![0x81, 0x08]; // 1025
+    past_cap.extend(std::iter::repeat_n(0u8, 1025));
+    let error = decode_destroy_entities(&past_cap).expect_err("1025 ids are refused");
+    assert!(
+        error.to_string().contains("destroy batch"),
+        "named refusal, saw: {error}"
+    );
+}
+
+#[test]
+fn movement_decodes_refuse_an_out_of_range_equipment_slot() {
+    // §2.1's row names slots 0–4; -1 and 5 name nothing.
+    for slot in [-1i16, 5] {
+        let mut body = vec![0x14];
+        body.extend_from_slice(&slot.to_be_bytes());
+        let error = decode_entity_equipment(&body).expect_err("an out-of-range slot is refused");
+        assert!(
+            error.to_string().contains("entity equipment slot"),
+            "named refusal, saw: {error}"
+        );
+    }
+
+    // Slot 0 is the lower edge and decodes, with the empty item.
+    let edge = decode_entity_equipment(&[0x14, 0x00, 0x00, 0xff, 0xff])
+        .expect("slot 0 sits inside the range");
+    assert_eq!(edge.slot, 0);
+    assert_eq!(edge.item, None);
 }

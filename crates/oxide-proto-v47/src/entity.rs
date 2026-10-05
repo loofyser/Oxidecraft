@@ -1,12 +1,12 @@
-//! The entity wire surface: the spawn packets, the metadata block, and the
-//! byte-to-unit conversions their handlers apply.
+//! The entity wire surface: the spawn, movement and lifecycle packets, the
+//! metadata block, and the byte-to-unit conversions their handlers apply.
 //!
 //! The spawn type tables (`MobType`, `ObjectType`, `GlobalType`) and the
 //! conversion helpers are pinned to `docs/research/protocol-47-reference.md`
 //! §2.1 and §6.3; the conversions themselves are the expressions the source's
-//! own spawn and velocity handlers apply (`NetHandlerPlayClient.java:300-302`,
-//! `:410-411`, `:508`, `:536-537`), kept here so a decoded field is already in
-//! the unit the rest of the client works in.
+//! own spawn and movement handlers apply (`NetHandlerPlayClient.java:300-302`,
+//! `:410-411`, `:508`, `:536-537`, `:620-625`), kept here so a decoded field is
+//! already in the unit the rest of the client works in.
 
 use std::io::Cursor;
 
@@ -388,7 +388,7 @@ pub enum MetadataValue {
     /// Tag 4: a varint-length UTF-8 string.
     String(String),
     /// Tag 5: an item slot; `None` is the empty slot
-    /// (`PacketBuffer.readItemStackFromBuffer:229-242`).
+    /// (`PacketBuffer.readItemStackFromBuffer:257-271`).
     Item(Option<MetadataItem>),
     /// Tag 6: a block position, three ints. No 1.8 entity class writes it
     /// (§6.1), but the wire shape still decodes.
@@ -505,7 +505,7 @@ fn unknown_metadata_tag(tag: u8) -> PacketError {
 /// Decodes one slot: item id, stack count, damage, then the NBT tail.
 ///
 /// A negative id is the empty slot and closes the value
-/// (`PacketBuffer.readItemStackFromBuffer:229-242`); otherwise the tail is
+/// (`PacketBuffer.readItemStackFromBuffer:257-271`); otherwise the tail is
 /// consumed by [`skip_slot_nbt`], which builds no value for it.
 fn read_slot(cursor: &mut Cursor<&[u8]>) -> Result<Option<MetadataItem>, PacketError> {
     let id = codec::read_i16(&mut *cursor)?;
@@ -543,7 +543,7 @@ enum NbtFrame {
 
 /// Skips one slot's NBT tail, if there is one.
 ///
-/// `PacketBuffer.readNBTTagCompoundFromBuffer:257-271` reads a zero byte as
+/// `PacketBuffer.readNBTTagCompoundFromBuffer:213-227` reads a zero byte as
 /// "no data"; any other byte starts a full named tag that closes the slot's
 /// payload. The tail is consumed as framing only — no value is ever built:
 /// tag ids drive a walk that keeps its own stack, every length is checked
@@ -1118,6 +1118,477 @@ pub fn decode_entity_metadata(body: &[u8]) -> Result<EntityMetadata, PacketError
     })
 }
 
+/// The last equipment slot §2.1's row names: `0` held, `1` boots,
+/// `2` leggings, `3` chestplate, `4` helmet.
+const EQUIPMENT_SLOT_MAX: i16 = 4;
+
+/// Clientbound Entity Equipment (play id 0x04).
+///
+/// One entity's equipment in one slot
+/// (`S04PacketEntityEquipment.readPacketData:29-34`): the entity id, the slot
+/// short and the item. §2.1 rows the slots `0` held, `1` boots, `2` leggings,
+/// `3` chestplate and `4` helmet; a slot outside that range is refused. The
+/// item rides the metadata block's own slot reader, so a negative id is the
+/// empty slot and the NBT tail is skipped rather than converted a second
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityEquipment {
+    /// The entity whose equipment changed.
+    pub entity_id: i32,
+    /// The equipment slot: `0` held, `1` boots, `2` leggings, `3` chestplate,
+    /// `4` helmet.
+    pub slot: i16,
+    /// The slot's item; `None` is the empty slot.
+    pub item: Option<MetadataItem>,
+}
+
+impl EntityEquipment {
+    /// The packet id.
+    pub const ID: i32 = 0x04;
+}
+
+/// Decodes the Entity Equipment payload after the packet id.
+pub fn decode_entity_equipment(body: &[u8]) -> Result<EntityEquipment, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let slot = codec::read_i16(&mut cursor)?;
+    if !(0..=EQUIPMENT_SLOT_MAX).contains(&slot) {
+        return Err(unknown_equipment_slot(slot));
+    }
+    let item = read_slot(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityEquipment {
+        entity_id,
+        slot,
+        item,
+    })
+}
+
+/// The refusal for an equipment slot outside §2.1's `0`–`4`.
+fn unknown_equipment_slot(slot: i16) -> PacketError {
+    PacketError::Codec(codec::CodecError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("entity equipment slot {slot} is outside the 0..=4 range"),
+    )))
+}
+
+/// Clientbound Animation (play id 0x0B).
+///
+/// One entity's one-shot animation
+/// (`S0BPacketAnimation.readPacketData:27-31`): the entity id and the
+/// animation byte, read unsigned as the source reads it. §2.1's table runs
+/// `0` swing arm, `1` damage, `2` leave bed, `3` eat/food, `4` crit,
+/// `5` magic crit; the byte is carried as received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Animation {
+    /// The animating entity.
+    pub entity_id: i32,
+    /// The animation byte.
+    pub animation: u8,
+}
+
+impl Animation {
+    /// The packet id.
+    pub const ID: i32 = 0x0b;
+}
+
+/// Decodes the Animation payload after the packet id.
+pub fn decode_animation(body: &[u8]) -> Result<Animation, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let animation = codec::read_u8(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(Animation {
+        entity_id,
+        animation,
+    })
+}
+
+/// Clientbound Collect Item (play id 0x0D).
+///
+/// One item pickup (`S0DPacketCollectItem.readPacketData:26-30`): the
+/// collected entity's id, then the collector's, each a VarInt. The source's
+/// handler plays the pickup and removes the collected entity
+/// (`NetHandlerPlayClient.java:819-844`); the pair is carried here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectItem {
+    /// The entity being collected.
+    pub collected: i32,
+    /// The entity doing the collecting.
+    pub collector: i32,
+}
+
+impl CollectItem {
+    /// The packet id.
+    pub const ID: i32 = 0x0d;
+}
+
+/// Decodes the Collect Item payload after the packet id.
+pub fn decode_collect_item(body: &[u8]) -> Result<CollectItem, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let collected = read_varint(&mut cursor)?;
+    let collector = read_varint(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(CollectItem {
+        collected,
+        collector,
+    })
+}
+
+/// Clientbound Entity Velocity (play id 0x12).
+///
+/// One entity's velocity (`S12PacketEntityVelocity.readPacketData:68-74`):
+/// the entity id and three shorts, each converted once by [`read_velocity`]
+/// exactly as the source's handler divides them
+/// (`NetHandlerPlayClient.handleEntityVelocity:501-510`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityVelocity {
+    /// The entity whose velocity changed.
+    pub entity_id: i32,
+    /// The velocity in blocks per tick, per axis.
+    pub velocity: [f64; 3],
+}
+
+impl EntityVelocity {
+    /// The packet id.
+    pub const ID: i32 = 0x12;
+}
+
+/// Decodes the Entity Velocity payload after the packet id.
+pub fn decode_entity_velocity(body: &[u8]) -> Result<EntityVelocity, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let velocity = [
+        read_velocity(codec::read_i16(&mut cursor)?),
+        read_velocity(codec::read_i16(&mut cursor)?),
+        read_velocity(codec::read_i16(&mut cursor)?),
+    ];
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityVelocity {
+        entity_id,
+        velocity,
+    })
+}
+
+/// The cap on one destroy batch's entity ids.
+///
+/// The source sizes its array straight from the wire's count with no ceiling
+/// of its own (`S13PacketDestroyEntities.readPacketData:24-32`); this client
+/// refuses a batch that declares more than this many ids, so a hostile count
+/// cannot size the decode's list.
+pub const MAX_DESTROY_BATCH: usize = 1024;
+
+/// Clientbound Destroy Entities (play id 0x13).
+///
+/// The entities to remove: one VarInt count, then that many VarInt ids
+/// (`S13PacketDestroyEntities.readPacketData:24-32`); the source's handler
+/// removes each from its world (`NetHandlerPlayClient.java:654-662`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DestroyEntities {
+    /// The entities to remove, in the packet's order.
+    pub entity_ids: Vec<i32>,
+}
+
+impl DestroyEntities {
+    /// The packet id.
+    pub const ID: i32 = 0x13;
+}
+
+/// Decodes the Destroy Entities payload after the packet id.
+pub fn decode_destroy_entities(body: &[u8]) -> Result<DestroyEntities, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let count = read_varint(&mut cursor)?;
+    if count < 0 {
+        return Err(PacketError::Codec(codec::CodecError::NegativeLength(count)));
+    }
+    let count = count as usize;
+    if count > MAX_DESTROY_BATCH {
+        return Err(destroy_batch_over_cap(count));
+    }
+    // The count is hostile until checked against the cap above; the
+    // reservation is additionally bounded by the bytes still available, since
+    // every id occupies at least one byte.
+    let remaining = body.len().saturating_sub(cursor.position() as usize);
+    let mut entity_ids = Vec::with_capacity(count.min(remaining));
+    for _ in 0..count {
+        entity_ids.push(read_varint(&mut cursor)?);
+    }
+    check_no_trailing(&cursor, body.len())?;
+    Ok(DestroyEntities { entity_ids })
+}
+
+/// The refusal for a destroy batch above [`MAX_DESTROY_BATCH`].
+fn destroy_batch_over_cap(count: usize) -> PacketError {
+    PacketError::Codec(codec::CodecError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("destroy batch carries {count} entity ids, over the {MAX_DESTROY_BATCH} cap"),
+    )))
+}
+
+/// Clientbound Entity (play id 0x14).
+///
+/// A bare entity id (`S14PacketEntity.readPacketData:33-36`), the base of the
+/// relative-move family. The source answers it with its movement handler on
+/// zero deltas (`NetHandlerPlayClient.java:613-631`) — a no-op beyond
+/// confirming the entity exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entity {
+    /// The entity the packet names.
+    pub entity_id: i32,
+}
+
+impl Entity {
+    /// The packet id.
+    pub const ID: i32 = 0x14;
+}
+
+/// Decodes the Entity payload after the packet id.
+pub fn decode_entity(body: &[u8]) -> Result<Entity, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(Entity { entity_id })
+}
+
+/// Clientbound Entity Relative Move (play id 0x15).
+///
+/// One entity's small position step (`S14PacketEntity.java:114-121`, the
+/// `S15PacketEntityRelMove` reader): each axis a signed byte in 1/32-block
+/// units. The source adds the raw bytes to its accumulated 1/32 position and
+/// divides the sum by `32.0`
+/// (`NetHandlerPlayClient.handleEntityMovement:620-625`); converting each
+/// byte once here gives the same delta, with ±127 at ±3.96875. The reader
+/// also reads a trailing ground flag; it is consumed but not carried here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityRelativeMove {
+    /// The moving entity.
+    pub entity_id: i32,
+    /// The position delta in blocks, per axis.
+    pub delta: [f64; 3],
+}
+
+impl EntityRelativeMove {
+    /// The packet id.
+    pub const ID: i32 = 0x15;
+}
+
+/// Decodes the Entity Relative Move payload after the packet id.
+pub fn decode_entity_relative_move(body: &[u8]) -> Result<EntityRelativeMove, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let delta = [
+        codec::read_u8(&mut cursor)? as i8 as f64 / 32.0,
+        codec::read_u8(&mut cursor)? as i8 as f64 / 32.0,
+        codec::read_u8(&mut cursor)? as i8 as f64 / 32.0,
+    ];
+    let _on_ground = codec::read_bool(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityRelativeMove { entity_id, delta })
+}
+
+/// Clientbound Entity Look (play id 0x16).
+///
+/// One entity's new yaw and pitch (`S14PacketEntity.java:149-155`, the
+/// `S16PacketEntityLook` reader), each converted once by [`read_angle`]
+/// exactly as the source's shared movement handler converts them
+/// (`NetHandlerPlayClient.handleEntityMovement:626-627`). The reader also
+/// reads a trailing ground flag; it is consumed but not carried here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityLook {
+    /// The looking entity.
+    pub entity_id: i32,
+    /// The yaw in degrees.
+    pub yaw: f32,
+    /// The pitch in degrees.
+    pub pitch: f32,
+}
+
+impl EntityLook {
+    /// The packet id.
+    pub const ID: i32 = 0x16;
+}
+
+/// Decodes the Entity Look payload after the packet id.
+pub fn decode_entity_look(body: &[u8]) -> Result<EntityLook, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let yaw = read_angle(codec::read_u8(&mut cursor)?);
+    let pitch = read_angle(codec::read_u8(&mut cursor)?);
+    let _on_ground = codec::read_bool(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityLook {
+        entity_id,
+        yaw,
+        pitch,
+    })
+}
+
+/// Clientbound Entity Look And Relative Move (play id 0x17).
+///
+/// The look and relative-move fields together
+/// (`S14PacketEntity.java:185-194`, the `S17PacketEntityLookMove` reader):
+/// the deltas convert like [`EntityRelativeMove`]'s and the angles like
+/// [`EntityLook`]'s. The reader also reads a trailing ground flag; it is
+/// consumed but not carried here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityLookAndRelativeMove {
+    /// The moving and looking entity.
+    pub entity_id: i32,
+    /// The position delta in blocks, per axis.
+    pub delta: [f64; 3],
+    /// The yaw in degrees.
+    pub yaw: f32,
+    /// The pitch in degrees.
+    pub pitch: f32,
+}
+
+impl EntityLookAndRelativeMove {
+    /// The packet id.
+    pub const ID: i32 = 0x17;
+}
+
+/// Decodes the Entity Look And Relative Move payload after the packet id.
+pub fn decode_entity_look_and_relative_move(
+    body: &[u8],
+) -> Result<EntityLookAndRelativeMove, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let delta = [
+        codec::read_u8(&mut cursor)? as i8 as f64 / 32.0,
+        codec::read_u8(&mut cursor)? as i8 as f64 / 32.0,
+        codec::read_u8(&mut cursor)? as i8 as f64 / 32.0,
+    ];
+    let yaw = read_angle(codec::read_u8(&mut cursor)?);
+    let pitch = read_angle(codec::read_u8(&mut cursor)?);
+    let _on_ground = codec::read_bool(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityLookAndRelativeMove {
+        entity_id,
+        delta,
+        yaw,
+        pitch,
+    })
+}
+
+/// Clientbound Entity Teleport (play id 0x18).
+///
+/// One entity's absolute position and pose
+/// (`S18PacketEntityTeleport.readPacketData:49-58`): three fixed-point
+/// coordinates, two angle bytes and the ground flag. The source's teleport
+/// handler divides the coordinates by `32.0` and converts the angles with the
+/// same `(byte * 360) / 256` rule (`NetHandlerPlayClient.java:576-580`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityTeleport {
+    /// The teleporting entity.
+    pub entity_id: i32,
+    /// The x coordinate in blocks.
+    pub x: f64,
+    /// The y coordinate in blocks.
+    pub y: f64,
+    /// The z coordinate in blocks.
+    pub z: f64,
+    /// The yaw in degrees.
+    pub yaw: f32,
+    /// The pitch in degrees.
+    pub pitch: f32,
+    /// Whether the wire reports the entity on the ground.
+    pub on_ground: bool,
+}
+
+impl EntityTeleport {
+    /// The packet id.
+    pub const ID: i32 = 0x18;
+}
+
+/// Decodes the Entity Teleport payload after the packet id.
+pub fn decode_entity_teleport(body: &[u8]) -> Result<EntityTeleport, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let x = read_fixed_point(codec::read_i32(&mut cursor)?);
+    let y = read_fixed_point(codec::read_i32(&mut cursor)?);
+    let z = read_fixed_point(codec::read_i32(&mut cursor)?);
+    let yaw = read_angle(codec::read_u8(&mut cursor)?);
+    let pitch = read_angle(codec::read_u8(&mut cursor)?);
+    let on_ground = codec::read_bool(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityTeleport {
+        entity_id,
+        x,
+        y,
+        z,
+        yaw,
+        pitch,
+        on_ground,
+    })
+}
+
+/// Clientbound Entity Head Look (play id 0x19).
+///
+/// One entity's head yaw (`S19PacketEntityHeadLook.readPacketData:28-32`), an
+/// angle byte converted once by [`read_angle`] exactly as the source's
+/// handler converts it (`NetHandlerPlayClient.java:644`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityHeadLook {
+    /// The looking entity.
+    pub entity_id: i32,
+    /// The head's yaw in degrees.
+    pub head_yaw: f32,
+}
+
+impl EntityHeadLook {
+    /// The packet id.
+    pub const ID: i32 = 0x19;
+}
+
+/// Decodes the Entity Head Look payload after the packet id.
+pub fn decode_entity_head_look(body: &[u8]) -> Result<EntityHeadLook, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let head_yaw = read_angle(codec::read_u8(&mut cursor)?);
+    check_no_trailing(&cursor, body.len())?;
+    Ok(EntityHeadLook {
+        entity_id,
+        head_yaw,
+    })
+}
+
+/// Clientbound Attach Entity (play id 0x1B).
+///
+/// The riding and leash pair (`S1BPacketEntityAttach.readPacketData:29-34`):
+/// two ints and the leash byte, read unsigned. The source's handler branches
+/// on the byte's `0` for a mount and `1` for a leash
+/// (`NetHandlerPlayClient.java:966-1016`); §2.1 notes a holder of `-1` is the
+/// detach. The byte converts once: only `1` is the leash form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachEntity {
+    /// The attached (ridden or leashed) entity.
+    pub attached: i32,
+    /// The holder: the vehicle or the leash holder; `-1` detaches.
+    pub holder: i32,
+    /// Whether the byte named the leash form (`1`) rather than a mount
+    /// (`0`).
+    pub leash: bool,
+}
+
+impl AttachEntity {
+    /// The packet id.
+    pub const ID: i32 = 0x1b;
+}
+
+/// Decodes the Attach Entity payload after the packet id.
+pub fn decode_attach_entity(body: &[u8]) -> Result<AttachEntity, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let attached = codec::read_i32(&mut cursor)?;
+    let holder = codec::read_i32(&mut cursor)?;
+    let leash = codec::read_u8(&mut cursor)? == 1;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(AttachEntity {
+        attached,
+        holder,
+        leash,
+    })
+}
+
 /// The refusal for a spawn type byte no roster names.
 fn unknown_spawn_type(packet: &str, id: u8) -> PacketError {
     PacketError::Codec(codec::CodecError::Io(std::io::Error::new(
@@ -1174,15 +1645,18 @@ fn check_no_trailing(cursor: &Cursor<&[u8]>, len: usize) -> Result<(), PacketErr
 
 #[cfg(test)]
 mod tests {
-    //! Fixed-literal tests for the conversion helpers and the metadata block:
-    //! every expected value is the source's own arithmetic on a hand-picked
-    //! literal, never rebuilt with the helper under test.
+    //! Fixed-literal tests for the conversion helpers, the metadata block and
+    //! the movement decoders' refusals: every expected value is the source's
+    //! own arithmetic on a hand-picked literal, never rebuilt with the helper
+    //! under test.
 
     use std::io::Cursor;
 
     use super::{
-        MAX_METADATA_ENTRIES, MAX_SLOT_NBT_BYTES, Metadata, MetadataItem, MetadataValue,
-        read_angle, read_fixed_point, read_metadata, read_metadata_value, read_velocity,
+        MAX_DESTROY_BATCH, MAX_METADATA_ENTRIES, MAX_SLOT_NBT_BYTES, Metadata, MetadataItem,
+        MetadataValue, decode_destroy_entities, decode_entity_equipment,
+        decode_entity_relative_move, read_angle, read_fixed_point, read_metadata,
+        read_metadata_value, read_velocity,
     };
     use crate::PacketError;
 
@@ -1224,7 +1698,7 @@ mod tests {
     fn metadata_decodes_every_value_type() {
         // One entry per tag type, each at its own index. The header packs the
         // tag in the top three bits and the index in the low five
-        // (`DataWatcher.java:314-315`), the slot is `PacketBuffer.java:229-256`,
+        // (`DataWatcher.java:314-315`), the slot is `PacketBuffer.java:257-271`,
         // and the position and rotation payloads are §6.1's three-int and
         // three-float rows.
         let payload = [
@@ -1335,7 +1809,7 @@ mod tests {
     #[test]
     fn metadata_slots_ride_the_wire_shape_of_the_stack() {
         // An id below zero is the empty slot and consumes nothing more
-        // (`PacketBuffer.java:229-242`); the following entry proves the
+        // (`PacketBuffer.java:257-271`); the following entry proves the
         // cursor stayed aligned.
         let payload = [
             0xa0, 0xff, 0xff, // slot, index 0: id -1, empty
@@ -1457,5 +1931,51 @@ mod tests {
             decode_metadata(&past_cap).is_err(),
             "one past the cap is refused"
         );
+    }
+
+    #[test]
+    fn entity_relative_move_divides_each_axis_by_32() {
+        // The movement handler converts each axis once with `byte / 32.0`
+        // (`NetHandlerPlayClient.java:620-625`): the byte corners ±127 land
+        // at ±3.96875, -128 at -4.0, and one unit is 0.03125.
+        let corners = decode_entity_relative_move(&[0x14, 0x7f, 0x81, 0x80, 0x00])
+            .expect("the corners fixture decodes");
+        assert_eq!(corners.delta, [3.96875, -3.96875, -4.0]);
+        let steps = decode_entity_relative_move(&[0x14, 0x01, 0xff, 0x00, 0x01])
+            .expect("the steps fixture decodes");
+        assert_eq!(steps.delta, [0.03125, -0.03125, 0.0]);
+    }
+
+    #[test]
+    fn destroy_batch_over_the_cap_is_refused() {
+        assert_eq!(MAX_DESTROY_BATCH, 1024);
+        // 1025 declares itself a two-byte VarInt (0x81 0x08); the refusal is
+        // the cap's, named, not an end-of-body one.
+        let error = decode_destroy_entities(&[0x81, 0x08]).expect_err("1025 ids are refused");
+        assert!(
+            error.to_string().contains("destroy batch"),
+            "named refusal, saw: {error}"
+        );
+        // A negative count cannot name a batch either (VarInt -1).
+        assert!(decode_destroy_entities(&[0xff, 0xff, 0xff, 0xff, 0x0f]).is_err());
+    }
+
+    #[test]
+    fn equipment_slot_outside_the_range_is_refused() {
+        // §2.1's row names slots 0–4; -1 and 5 name nothing.
+        for slot in [-1i16, 5] {
+            let mut body = vec![0x14];
+            body.extend_from_slice(&slot.to_be_bytes());
+            let error =
+                decode_entity_equipment(&body).expect_err("an out-of-range slot is refused");
+            assert!(
+                error.to_string().contains("entity equipment slot"),
+                "named refusal, saw: {error}"
+            );
+        }
+        // Slot 0 is the lower edge and decodes.
+        let edge = decode_entity_equipment(&[0x14, 0x00, 0x00, 0xff, 0xff])
+            .expect("slot 0 sits inside the range");
+        assert_eq!(edge.slot, 0);
     }
 }
