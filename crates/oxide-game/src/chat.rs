@@ -143,10 +143,10 @@ pub struct TextComponent {
     pub children: Vec<TextComponent>,
 }
 
-/// The click actions this round acts on: the source's own gate keeps
-/// `OPEN_URL`, `RUN_COMMAND` and `SUGGEST_COMMAND` for chat
-/// (`ClickEvent.java`:102-105); the port narrows that to the three it can
-/// perform, and every other action is dropped.
+/// The click actions the port performs: the source's own gate admits
+/// `OPEN_URL`, `RUN_COMMAND`, `SUGGEST_COMMAND` and `CHANGE_PAGE` for chat
+/// (`ClickEvent.java`:102-105, the flags at `:85-90`); the port keeps the
+/// three it can act on, and every other action is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickAction {
     /// `run_command`: send the value as a chat message.

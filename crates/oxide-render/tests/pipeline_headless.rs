@@ -4987,9 +4987,10 @@ fn bar_over_sky(bar_alpha: u8) -> [u8; 3] {
 ///
 /// The line is the box's newest: its bar's top sits at `height - 37` scaled pixels — the
 /// `height - 48` block origin (`GuiIngame.java`:343-345) plus the `(2, 20)` translate
-/// (`GuiNewChat.java`:49-51) minus the first pitch step (`:81-82`) — its bar 9 tall and 4
-/// wider than the 320-pixel wrap budget, and its text's ink one pixel below the bar's top
-/// at the bar's left edge (`:85`). The resolution is 64x64 GUI units onto the 64x64
+/// (`GuiNewChat.java`:49-51) minus the first pitch step (`:81-82`) — its bar 9 tall and 48
+/// wide (the assembly's bar is the 320-pixel wrap budget plus four, `view.rs`:891-893;
+/// the probe shortens it to fit the 64x64 target), and its text's ink one pixel below the
+/// bar's top at the bar's left edge (`:85`). The resolution is 64x64 GUI units onto the 64x64
 /// target, so one unit is one pixel and every value lands at its own coordinate.
 ///
 /// The counts: the bar covers 48x9 = 432 pixels, the row above it the sky, pinning the y
