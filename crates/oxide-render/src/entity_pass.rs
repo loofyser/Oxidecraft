@@ -1283,11 +1283,12 @@ fn item_tail(gui3d: bool) -> Mat4 {
         * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
 }
 
-/// One copy of a dropped item stack's chain: the bob and lift, the spin and the item
-/// tail, the flat stacks' centring pre-step and per-copy `0.046875` z-step
-/// (`RenderEntityItem.java`:51-57, :138-139), and the 3D stacks' own loop scale (`:125`).
-/// The 3D copies all sit at one spot — the source gives them neither the centring nor the
-/// step; its `j > 0` random jitter stays unmodelled.
+/// One copy of a dropped item stack's chain: the bob and lift, the spin and the drop
+/// path's own tail — `renderItem`'s 2-arg form, so the pre-transform never joins it
+/// (`RenderItem.renderItem`:140-168) — the flat stacks' centring pre-step and per-copy
+/// `0.046875` z-step (`RenderEntityItem.java`:51-57, :138-139), and the 3D stacks' own
+/// loop scale (`:125`). The 3D copies all sit at one spot — the source gives them neither
+/// the centring nor the step; its `j > 0` random jitter stays unmodelled.
 fn dropped_stack_chain(position: Vec3, gui3d: bool, age: f32, copies: u8, copy: u8) -> Mat4 {
     let hover = 0.0_f32;
     let bob =
@@ -1312,12 +1313,15 @@ fn dropped_stack_chain(position: Vec3, gui3d: bool, age: f32, copies: u8, copy: 
             entity_models::objects::ITEM_COPY_STEP * f32::from(copy),
         ));
     }
-    chain * item_tail(gui3d)
+    chain
+        * Mat4::from_scale(Vec3::splat(entity_models::objects::ITEM_RENDER_SCALE))
+        * Mat4::from_translation(Vec3::from(entity_models::objects::ITEM_CENTRE))
+        * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
 }
 
 /// The dropped item's fields for a draw: whether its model is the 3D kind (the block
-/// items; the loop's own scale and the pre-transform's flat doubling key on it,
-/// `RenderItem.preTransform`:254-257), the age the bob and spin read (the draw's pose
+/// items; the loop's own scale keys on it, and the flat copies' centring and step,
+/// `RenderEntityItem.java`:113-141), the age the bob and spin read (the draw's pose
 /// age; `hoverStart` is zero on the wire path) and the copy count.
 fn item_fields(model: ModelRef, extra: &DrawExtra, pose: &entity_models::Pose) -> (bool, f32, u8) {
     let count = match extra {
@@ -2635,9 +2639,9 @@ mod tests {
     }
 
     /// The dropped stack the pass composes: a 3D draw's copies take the loop's own scale
-    /// into the tail at one spot; a flat draw keeps its pre-transform, centring and step
-    /// (`RenderEntityItem.java`:111-141, `RenderItem.preTransform`:254-257,
-    /// `RenderItem.renderItem`:140-157).
+    /// into the tail at one spot; a flat draw keeps its centring and step — neither form
+    /// takes the pre-transform, which the drop loop's 2-arg `renderItem` never runs
+    /// (`RenderEntityItem.java`:111-141, `RenderItem.renderItem`:140-168).
     #[test]
     fn the_dropped_stack_composes_the_sources_scale_and_arrangement() {
         let block_draw = EntityDraw {
@@ -2663,11 +2667,12 @@ mod tests {
         assert!(gui3d, "a block item draws as the 3D model");
         let copies = entity_models::objects::item_copies(count);
         let origin = Vec3::new(0.0, 0.0, 0.0);
-        // One copy's composed span for the mesh's 16 units: the net draw scale in blocks
-        // (the same measure as the reviewed chain: 0.5-block against the source 0.25).
+        // One copy's composed span for the mesh's 16 units: the net draw scale in blocks —
+        // the loop's own 0.5 (3D only) times `renderItem`'s 0.5, so 0.25 for the block form.
         let span = dropped_stack_chain(origin, gui3d, age, copies, 0)
             .transform_vector3(Vec3::new(16.0, 0.0, 0.0))
             .length();
+        assert_eq!(span, 0.25);
         assert_eq!(span, entity_models::objects::dropped_item_scale(true));
         let sprite_draw = EntityDraw {
             model: ModelRef::Sprite {
@@ -2682,6 +2687,9 @@ mod tests {
         let flat_span = dropped_stack_chain(origin, flat, flat_age, flat_copies, 0)
             .transform_vector3(Vec3::new(16.0, 0.0, 0.0))
             .length();
+        // The flat form takes no loop scale and no pre-transform: `renderItem`'s 0.5
+        // alone, so the same mesh spans 0.5 blocks.
+        assert_eq!(flat_span, 0.5);
         assert_eq!(flat_span, entity_models::objects::dropped_item_scale(false));
         // The 3D copies stack at one spot; the flat copies keep the source's z-step.
         let at = |copies: u8, copy: u8| {

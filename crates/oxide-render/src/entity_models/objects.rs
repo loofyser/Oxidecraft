@@ -722,9 +722,10 @@ pub fn billboard_angles(view_y: f32, view_x: f32, kind: Billboard) -> [f32; 2] {
     }
 }
 
-/// The pre-transform the item draw path applies: the flat (generated) models double, the
-/// 3D block models not (`RenderItem.preTransform`:245-259, reached from
-/// `renderItemModelTransform`:316-320 for every transform type).
+/// The pre-transform the transform path applies: the flat (generated) models double, the
+/// 3D block models not (`RenderItem.preTransform`:254-257, reached from
+/// `RenderItem.renderItemModelTransform`:316-320 — the drop loop's 2-arg `renderItem`
+/// never reaches it).
 pub fn item_pretransform(gui3d: bool) -> f32 {
     if gui3d { 1.0 } else { 2.0 }
 }
@@ -743,10 +744,10 @@ pub fn dropped_loop_scale(gui3d: bool) -> f32 {
 }
 
 /// The dropped item draw's net scale: the loop's own scale (3D only) times the render
-/// path's chain — the pre-transform's flat doubling and `renderItem`'s `0.5`
-/// (`RenderEntityItem.java`:113-129` then `RenderItem.renderItem`:140-157`).
+/// path's own `0.5` (`RenderEntityItem.java`:113-129 then `RenderItem.renderItem`:140-168
+/// — the 2-arg form the drop loop calls; the pre-transform never runs on the drop path).
 pub fn dropped_item_scale(gui3d: bool) -> f32 {
-    dropped_loop_scale(gui3d) * item_pretransform(gui3d) * ITEM_RENDER_SCALE
+    dropped_loop_scale(gui3d) * ITEM_RENDER_SCALE
 }
 
 /// The projectile's net scale: the caller's own scale times the pre-transform times the
@@ -1451,15 +1452,15 @@ mod tests {
         );
     }
 
-    /// The item draws' net scale: the dropped item path takes the render path's `0.5`
-    /// with the pre-transform's flat doubling, and the loop's own `0.5` on top for the
-    /// 3D models; the projectile path the pre-transform as well
-    /// (`RenderItem.preTransform`:254-257, `RenderItem.renderItem`:140-145,
+    /// The item draws' net scale: the dropped item path takes `renderItem`'s own `0.5`
+    /// — the 2-arg form, so no pre-transform reaches it — with the loop's own `0.5` on
+    /// top for the 3D models; the projectile path keeps the pre-transform as well
+    /// (`RenderItem.renderItem`:140-168, `RenderItem.preTransform`:254-257,
     /// `RenderEntityItem.java`:113-129).
     #[test]
     fn the_item_draw_scales_are_the_sources_chain() {
         assert_eq!(dropped_item_scale(true), 0.25);
-        assert_eq!(dropped_item_scale(false), 1.0);
+        assert_eq!(dropped_item_scale(false), 0.5);
         assert_eq!(dropped_loop_scale(true), 0.5);
         assert_eq!(dropped_loop_scale(false), 1.0);
         assert_eq!(projectile_item_scale(0.5, false), 0.5);

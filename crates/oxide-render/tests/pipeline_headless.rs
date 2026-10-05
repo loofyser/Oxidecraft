@@ -4398,6 +4398,8 @@ fn the_sprite_item_draws_the_generated_shape() {
         &draw,
     );
     let count = non_sky(&filled);
+    // The corrected flat net (0.5) halves the drawn face: it lands 70 px under the case's
+    // camera — 231 px before the correction. The floor keeps a margin under the count.
     assert!(count > 30, "the generated face lands pixels, got {count}");
 }
 
