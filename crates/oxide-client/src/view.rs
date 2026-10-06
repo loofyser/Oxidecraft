@@ -1620,7 +1620,7 @@ const TAB_CELL: [f32; 4] = [1.0, 1.0, 1.0, 32.0 / 255.0];
 
 /// The header, footer, name and score text colour: the source's `-1` for the header, footer and
 /// name (`GuiPlayerTabOverlay.renderPlayerlist`:152, `:205`, `:231`) and `16777215` for the
-/// score (`:366`) — both opaque white, the score's own yellow coming from its `§e` prefix.
+/// score (`GuiPlayerTabOverlay.drawScoreboardValues`:366`) — both opaque white, the score's own yellow coming from its `§e` prefix.
 const TAB_TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// A spectator's name colour: `-1862270977` = 0x90FFFFFF — white at alpha 144
@@ -1738,7 +1738,7 @@ fn points_of(board: &Scoreboard, record: &PlayerListRecord, objective: &Objectiv
 /// A header or footer side's wrapped lines, when the side draws: the raw chat JSON parsed and
 /// flattened, judged empty on its formatted text — the source nulls a side whose formatted text
 /// has no characters (`NetHandlerPlayClient.java`:1600-1604) — and word-wrapped at `budget`
-/// (`FontRenderer.listFormattedStringToWidth`:844-868), each line back as the `§`-coded string
+/// (`FontRenderer.java`:844-868), each line back as the `§`-coded string
 /// the text builder draws.
 fn tab_lines(raw: &str, budget: i32, font: &Font) -> Option<Vec<String>> {
     let component = chat::parse_json(raw);
@@ -1907,7 +1907,7 @@ impl TabState {
             return Vec::new();
         }
         let width = resolution.width as i32;
-        // The source's own order (`GuiPlayerTabOverlay.PlayerComparator`:392-397):
+        // The source's own order (`GuiPlayerTabOverlay.java`:392-397):
         // non-spectators first, then the team's registered name — the empty string when the
         // entry has no team — then the profile name; the eighty-entry cap follows the sort
         // (`GuiPlayerTabOverlay.renderPlayerlist`:89).
@@ -2020,7 +2020,7 @@ impl TabState {
                 colour: TAB_TINT,
             });
             // The hat overlay draws with every part enabled — the byte this milestone pins
-            // (`EnumPlayerModelParts.HAT`:14, `:24`; [`ALL_PARTS`]) — as the source's second
+            // (`EnumPlayerModelParts.java`:14, `:24`; [`ALL_PARTS`]) — as the source's second
             // eight-by-eight pass over the face (`GuiPlayerTabOverlay.renderPlayerlist`:188-193).
             draws.push(HudDraw::SkinRect {
                 texture: head,
@@ -2111,7 +2111,7 @@ impl TabState {
 }
 
 /// The team an entry belongs to, registered name only: the sort's second key
-/// (`GuiPlayerTabOverlay.PlayerComparator`:396) — the empty string when the entry has no team.
+/// (`GuiPlayerTabOverlay.java`:396) — the empty string when the entry has no team.
 fn team_name<'a>(board: &'a Scoreboard, record: &PlayerListRecord) -> &'a str {
     board
         .member_of

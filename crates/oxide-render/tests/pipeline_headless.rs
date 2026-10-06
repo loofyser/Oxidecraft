@@ -5451,7 +5451,7 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
 /// field's right edge (`GuiPlayerTabOverlay.drawScoreboardValues`:365-366).
 ///
 /// The stand-ins: the probe's own cell width and panel span (the source's cell is
-/// name- and score-dependent and narrower at this width, `:118`), the synthetic
+/// name- and score-dependent and narrower at this width, `GuiPlayerTabOverlay.renderPlayerlist`:118`), the synthetic
 /// font's single `|` glyph for the header, the footer, the names and the score, and the
 /// synthetic sheet's bands for the two latencies; the heads resolve the registry's
 /// default (the placeholder image), so their cells show its texels where a real skin's
