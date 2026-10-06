@@ -1054,7 +1054,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         },
     );
     // The corner of the plane's own grid that sits under the eye, in the pass's local frame:
-    // the grid's origin, lifted to `-(eyeY - HORIZON)` (`RenderGlobal.java:1404`). Its straight
+    // the grid's origin, lifted to `-(eyeY - HORIZON)` `RenderGlobal.java`:1412. Its straight
     // line from the eye the view is built with is the fog's measure.
     let eye = Vec3::new(0.0, EYE_HEIGHT, 0.0) - FIRST_PERSON_OFFSET * camera.forward();
     let plane_y = -((f64::from(high) + f64::from(EYE_HEIGHT)) - f64::from(HORIZON));

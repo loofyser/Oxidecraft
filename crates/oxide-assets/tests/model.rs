@@ -1101,6 +1101,27 @@ fn hostile_model_values_are_refused() {
 }
 
 #[test]
+fn a_negative_face_rotation_is_a_named_error() {
+    // The rotation is parsed signed so a negative value reaches the quarter-turn check and
+    // comes back as the named value error; before the signed parse this same document failed
+    // inside serde as `ModelError::Json`.
+    let error = ModelJson::parse(
+        r##"{"elements": [{"from": [0, 0, 0], "to": [16, 16, 16],
+            "faces": {"up": {"uv": [0,0,16,16], "texture": "#t", "rotation": -90}}}]}"##,
+    )
+    .expect_err("a negative face rotation must be refused");
+    assert!(
+        matches!(error, ModelError::Value { .. }),
+        "the refusal is the named value error, not a parse error: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("element 0") && message.contains("face `up`") && message.contains("-90"),
+        "the message names the element, the face and the value: {message}"
+    );
+}
+
+#[test]
 fn hostile_blockstate_values_are_refused() {
     let cases: [(&str, &str); 5] = [
         (

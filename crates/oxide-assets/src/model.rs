@@ -631,7 +631,10 @@ impl ModelSource {
     /// (0.5, 0.5, 0.5), x first and then y, following the client's
     /// `ModelRotation`; with `uvlock` the uv is re-projected onto the face the
     /// quad ends up on, so the texture stays locked to the block face while
-    /// the geometry turns. Weighted arrays stay arrays: this bakes one entry,
+    /// the geometry turns. The variant's `x` and `y` must be quarter turns —
+    /// multiples of 90, the only values the 1.8 formats produce; a non-quarter
+    /// value is floored to its quarter rather than refused. Weighted arrays
+    /// stay arrays: this bakes one entry,
     /// and the mesher owns the position-based choice between them.
     pub fn bake_variant(&self, variant: &Variant) -> Result<BakedModel, ModelError> {
         let key = (variant.model.clone(), variant.x, variant.y, variant.uvlock);
@@ -771,6 +774,7 @@ impl ModelSource {
             ChainEnd::File { elements, .. } => elements,
         };
 
+        // Floors a non-quarter value to its quarter (`bake_variant`'s precondition note).
         let rotation = VariantRotation {
             quarters_x: (u32::from(variant.x) / 90) % 4,
             quarters_y: (u32::from(variant.y) / 90) % 4,
@@ -1352,15 +1356,19 @@ impl RawFace {
                 ),
             });
         }
-        if let Some(rotation) = self.rotation {
-            if !QUARTER_TURNS.contains(&rotation) {
-                return Err(ModelError::Value {
-                    reason: format!(
-                        "element {index}, face `{name}`: the rotation {rotation} is outside the four quarter turns (0, 90, 180, 270)"
-                    ),
-                });
-            }
-        }
+        let rotation = match self.rotation {
+            None => 0,
+            Some(rotation) => match u16::try_from(rotation) {
+                Ok(quarter) if QUARTER_TURNS.contains(&quarter) => quarter,
+                _ => {
+                    return Err(ModelError::Value {
+                        reason: format!(
+                            "element {index}, face `{name}`: the rotation {rotation} is outside the four quarter turns (0, 90, 180, 270)"
+                        ),
+                    });
+                }
+            },
+        };
         let cullface = match self.cullface.as_deref() {
             None | Some("") => None,
             Some(cullface) => match FaceDir::from_name(cullface) {
@@ -1386,7 +1394,7 @@ impl RawFace {
             uv: self.uv,
             texture: self.texture,
             cullface,
-            rotation: self.rotation.unwrap_or(0),
+            rotation,
             tintindex,
         })
     }
@@ -1627,7 +1635,7 @@ struct RawFace {
     cullface: Option<String>,
     /// The face's own rotation in degrees.
     #[serde(default)]
-    rotation: Option<u16>,
+    rotation: Option<i64>,
     /// The tint index.
     #[serde(default)]
     tintindex: Option<i64>,

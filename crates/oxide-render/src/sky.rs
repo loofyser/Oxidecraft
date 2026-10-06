@@ -14,14 +14,14 @@
 //!   range `setupFog(-1)` installs (`EntityRenderer.java:1348`, `:2009-2010`).
 //! * The below-horizon plane is the same grid generated at `y = -16` with its winding reversed
 //!   (`:291`, `renderSky(worldrenderer, -16.0F, true)`), lifted so it sits at the world horizon:
-//!   the source translates it by `16 - (eyeY - 63)` (`:1404`), reaching `y = -(eyeY - 63)`, and
-//!   tints it `(c * 0.2 + 0.04, c * 0.2 + 0.04, c * 0.6 + 0.1)` (`:1402-1409`). It is fogged
-//!   (`:1349`). There is no alpha fade in the band or the plane; the transparent edge the source
-//!   fades at sunset is the deferred sunset fan (`:1243-1288`).
+//!   the source translates it by `16 - (eyeY - 63)` `RenderGlobal.java`:1412, reaching
+//!   `y = -(eyeY - 63)`, and tints it `(c * 0.2 + 0.04, c * 0.2 + 0.04, c * 0.6 + 0.1)`
+//!   (`:1402-1409`). It is fogged (`:1349`). There is no alpha fade in the band or the plane;
+//!   the transparent edge the source fades at sunset is the deferred sunset fan (`:1243-1288`).
 //! * The void is the source's black box (`:1375-1399`): a `±1` column hanging from one unit under
 //!   the eye down to `-(d0 + 65)` with `d0 = eyeY - 63`, drawn only while the eye is below the
-//!   horizon (`d0 < 0`), together with the same reversed grid lifted to `y = -4` (`:1381`). It is
-//!   fogged too (`:1349`); [`void_box_low`] answers the floor.
+//!   horizon (`d0 < 0`), together with the same reversed grid lifted to `y = -4`
+//!   `RenderGlobal.java`:1358. It is fogged too (`:1349`); [`void_box_low`] answers the floor.
 //! * The sun is a 60 by 60 quad at `y = +100`, textured by `environment/sun` with uvs `0..1`
 //!   (`:1301-1308`); the moon a 40 by 40 quad at `y = -100` whose uv picks the phase's cell from
 //!   the 128x64 4x2 `environment/moon_phases` sheet (`:1309-1323`, [`moon_uv`]). Both are drawn
@@ -123,7 +123,8 @@ pub const BAND_EXTENT: f32 = 384.0;
 pub const BAND_HEIGHT: f32 = 16.0;
 
 /// The height the below-horizon grid is generated at, camera-relative
-/// (`RenderGlobal.java:291`); it is lifted to the world horizon when drawn (`:1404`).
+/// (`RenderGlobal.java:291`); it is lifted to the world horizon when drawn
+/// `RenderGlobal.java`:1412.
 pub const BELOW_HEIGHT: f32 = -16.0;
 
 /// The Overworld's horizon (`World.getHorizon`, `World.java:3702-3705`).
@@ -199,7 +200,7 @@ pub const CLOUD_UV_PER_BLOCK: f64 = 4.8828125E-4;
 pub const CLOUD_DRIFT_PER_TICK: f64 = 0.029999999329447746;
 
 /// The lift that puts the below-horizon grid at the world horizon: the source's
-/// `translate(0, 12, 0)` over the generated `-16` (`RenderGlobal.java:1379`, `:1404`).
+/// `translate(0, 12, 0)` over the generated `-16` `RenderGlobal.java`:1358, `RenderGlobal.java`:291.
 const BELOW_LIFT: f32 = 12.0;
 
 /// The sky projection's far plane as a multiple of the frame's `far_plane`

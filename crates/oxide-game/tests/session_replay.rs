@@ -2711,7 +2711,7 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
 }
 
 #[test]
-fn a_burst_of_six_columns_is_meshed_exactly_once_through_the_pool() {
+fn a_burst_of_six_columns_is_meshed_through_the_pool() {
     // Three plain 0x21 columns and one 0x26 bulk covering three more, applied
     // back to back with a keepalive between. The columns abut, so a session
     // whose boundary refresh marked anything beyond the burst would report a
