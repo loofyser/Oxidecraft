@@ -2370,7 +2370,7 @@ const CHAT_TEXT_CAP: usize = 100;
 /// Whether the chat field accepts a character:
 /// `ChatAllowedCharacters.isAllowedCharacter`:10-13 refuses the format
 /// code `§` (167), everything below the space, and DEL (127), and
-/// `GuiTextField.writeText` (`:132`) filters every append through it.
+/// `GuiTextField.writeText`:132 filters every append through it.
 fn chat_allowed(c: char) -> bool {
     c != '\u{a7}' && c >= ' ' && c != '\u{7f}'
 }
@@ -3752,7 +3752,7 @@ mod tests {
     #[test]
     fn the_arrow_history_recalls_the_sent_messages_newest_first() {
         // `GuiChat.getSentHistory` (`:272-296`) over the sent list
-        // (`GuiNewChat.sentMessages`:190-206): the recall cursor starts
+        // (`GuiNewChat.java`:190-206): the recall cursor starts
         // at the list's end (`GuiChat.initGui`:57), Up walks toward the
         // oldest, Down back to the newest, and a step past the end restores
         // the draft the recall started from.
@@ -3787,7 +3787,7 @@ mod tests {
     fn the_recall_restores_the_draft_and_consecutive_sends_are_folded() {
         // `addToSentMessages` skips a message equal to the previous one
         // (`GuiNewChat.java`:200-206), and the draft typed before the recall
-        // is buffered and restored (`GuiChat.historyBuffer`:283-289).
+        // is buffered and restored (`GuiChat.java`:283-289).
         let mut chat = ChatInput::default();
         for message in ["dup", "dup", "next"] {
             chat.open("");
