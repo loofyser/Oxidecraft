@@ -133,9 +133,17 @@ const DISPLAY_CLEARED: &[u8] = &[
     0x00, // the empty name: clear
 ];
 
-/// Display Scoreboard (0x3D), slot 3: outside the table.
+/// Display Scoreboard (0x3D), slot 3: the first team-coloured sidebar slot
+/// (`sidebar.team.<colour>` — `Scoreboard.java:479-486`): objective "obj".
+const DISPLAY_TEAM_SIDEBAR: &[u8] = &[
+    0x03, // slot 3: the first team slot
+    0x03, b'o', b'b', b'j',
+];
+
+/// Display Scoreboard (0x3D), slot 19: outside the nineteen-entry table
+/// (`Scoreboard.java:20`).
 const DISPLAY_BAD_SLOT: &[u8] = &[
-    0x03, // not a slot
+    0x13, // not a slot
 ];
 
 /// Teams (0x3E), mode 0 create: "red", display "The Reds", prefix "§c",
@@ -403,6 +411,12 @@ fn scoreboard_display_decodes_each_slot_and_a_clearing() {
     assert_eq!(display.slot, ScoreboardDisplay::SLOT_BELOW_NAME, "slot 2");
     assert_eq!(display.objective.as_deref(), Some("obj"), "the objective");
 
+    // The sixteen team-coloured sidebar slots: slot 3 is the first of them
+    // (`Scoreboard.java:20`, `:479-486`).
+    let display = ScoreboardDisplay::decode(DISPLAY_TEAM_SIDEBAR).expect("the fixture decodes");
+    assert_eq!(display.slot, 3, "slot 3: the first team slot");
+    assert_eq!(display.objective.as_deref(), Some("obj"), "the objective");
+
     // The empty name clears the slot (`NetHandlerPlayClient.java:1932-1935`),
     // carried as `None`.
     let display = ScoreboardDisplay::decode(DISPLAY_CLEARED).expect("the fixture decodes");
@@ -413,10 +427,10 @@ fn scoreboard_display_decodes_each_slot_and_a_clearing() {
 #[test]
 fn scoreboard_display_refuses_a_slot_outside_the_table() {
     let error =
-        ScoreboardDisplay::decode(DISPLAY_BAD_SLOT).expect_err("slot 3 is outside the table");
+        ScoreboardDisplay::decode(DISPLAY_BAD_SLOT).expect_err("slot 19 is outside the table");
     assert_eq!(
         refusal_message(error),
-        "unsupported Display Scoreboard slot 3"
+        "unsupported Display Scoreboard slot 19"
     );
 }
 

@@ -2104,6 +2104,7 @@ fn player_at_origin(texture: TextureRef) -> EntityDraw {
         death: 0.0,
         health: Some((20.0, 20.0)),
         nametag: None,
+        below_name: None,
         extra: DrawExtra::None,
     }
 }
@@ -2367,6 +2368,7 @@ fn nametag_sheet() -> Texture {
 fn tagged(text: &str) -> EntityDraw {
     EntityDraw {
         nametag: Some(NametagDraw { text: text.into() }),
+        below_name: None,
         ..player_at_origin(TextureRef::Named("entity/test.png"))
     }
 }
@@ -2757,6 +2759,7 @@ fn mob_at_origin(model: ModelRef, sheet: &'static str, extra: DrawExtra) -> Enti
         death: 0.0,
         health: None,
         nametag: None,
+        below_name: None,
         extra,
     }
 }
@@ -4620,6 +4623,7 @@ fn object_draw(model: ModelRef, extra: DrawExtra) -> EntityDraw {
         death: 0.0,
         health: None,
         nametag: None,
+        below_name: None,
         extra,
     }
 }

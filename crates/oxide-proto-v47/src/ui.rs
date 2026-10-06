@@ -223,11 +223,13 @@ impl ScoreboardScore {
 /// `S3DPacketDisplayScoreboard.readPacketData:35-38`: the slot byte, then the
 /// objective name. An empty name is the source's clearing signal
 /// (`NetHandlerPlayClient.java:1932-1935`) and is carried as `None`; a slot
-/// outside the table is refused by name.
+/// outside the source's own display-slot array of nineteen
+/// (`Scoreboard.java:20`) is refused by name — the wire's byte passes through
+/// there while this client refuses what the array does not hold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoreboardDisplay {
-    /// The slot: 0 the list, 1 the sidebar, 2 below the name (the `SLOT_*`
-    /// constants).
+    /// The slot: 0 the list, 1 the sidebar, 2 below the name, and 3..=18 the
+    /// sixteen team-coloured sidebar slots (the `SLOT_*` constants).
     pub slot: u8,
     /// The objective name; `None` for the empty name, the clearing.
     pub objective: Option<String>,
@@ -242,12 +244,15 @@ impl ScoreboardDisplay {
     pub const SLOT_SIDEBAR: u8 = 1;
     /// Slot 2: below the player's name.
     pub const SLOT_BELOW_NAME: u8 = 2;
+    /// The last slot: 18, white — the last of the sixteen team-coloured
+    /// sidebar slots (`Scoreboard.java:20`, `:479-486`).
+    pub const SLOT_TEAM_LAST: u8 = 18;
 
     /// Decodes the fields after the packet id.
     pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
         let mut cursor = Cursor::new(body);
         let slot = codec::read_u8(&mut cursor)?;
-        if slot > Self::SLOT_BELOW_NAME {
+        if slot > Self::SLOT_TEAM_LAST {
             return Err(unsupported("Display Scoreboard slot", slot.into()));
         }
         let objective = codec::read_string(&mut cursor, 16)?;
@@ -431,10 +436,12 @@ mod tests {
         // 0x3C: action 0 set, 1 remove.
         assert_eq!(ScoreboardScore::MODE_SET, 0);
         assert_eq!(ScoreboardScore::MODE_REMOVE, 1);
-        // 0x3D: position 0 list, 1 sidebar, 2 below name.
+        // 0x3D: position 0 list, 1 sidebar, 2 below name, 3..=18 the
+        // sixteen team-coloured sidebar slots (`Scoreboard.java:20`).
         assert_eq!(ScoreboardDisplay::SLOT_LIST, 0);
         assert_eq!(ScoreboardDisplay::SLOT_SIDEBAR, 1);
         assert_eq!(ScoreboardDisplay::SLOT_BELOW_NAME, 2);
+        assert_eq!(ScoreboardDisplay::SLOT_TEAM_LAST, 18);
         // 0x3E: mode 0 create, 1 remove, 2 update info, 3 add players,
         // 4 remove players.
         assert_eq!(ScoreboardTeam::MODE_CREATE, 0);

@@ -521,6 +521,12 @@ pub struct EntityDraw {
     pub health: Option<(f32, f32)>,
     /// The composed nametag the draw may show, when the session resolved one.
     pub nametag: Option<NametagDraw>,
+    /// The composed slot-2 label the draw may show, when the session resolved
+    /// one: the player's points in the below-name objective and its display
+    /// name (`RenderPlayer.renderOffsetLivingLabel:139-155`). The pass draws it
+    /// as a second world-space line under the nametag; that draw is not wired
+    /// yet.
+    pub below_name: Option<String>,
     /// The kind's own extras.
     pub extra: DrawExtra,
 }
@@ -2714,6 +2720,7 @@ mod tests {
             death: 0.0,
             health: None,
             nametag: None,
+            below_name: None,
             extra: DrawExtra::None,
         }
     }
@@ -3140,6 +3147,7 @@ mod tests {
     fn the_dropped_stack_composes_the_sources_scale_and_arrangement() {
         let block_draw = EntityDraw {
             nametag: None,
+            below_name: None,
             model: ModelRef::BlockItem { block: 1 },
             position: [0.0, 0.0, 0.0],
             body_yaw: 0.0,

@@ -53,13 +53,15 @@ pub struct Team {
     pub players: BTreeSet<String>,
 }
 
-/// The scoreboard: objectives, their scores, the three display slots and the
+/// The scoreboard: objectives, their scores, the display slots and the
 /// teams, with the membership reverse map.
 ///
 /// The maps are keyed by name, as the wire names them, and the mutators below
 /// are the per-mode rules the source's handlers apply. `display` holds the
 /// objective names per slot — slot 0 the list, 1 the sidebar, 2 below the
-/// name (`docs/research/protocol-47-reference.md` §2.1's slot table); the
+/// name (`docs/research/protocol-47-reference.md` §2.1's slot table) and
+/// 3..=18 the sixteen team-coloured sidebar slots of the source's own table
+/// (`Scoreboard.java:20`, `getObjectiveDisplaySlotNumber:463-492`); the
 /// source holds objective pointers there, and a consumer resolves the name
 /// against [`Scoreboard::objectives`] when it draws.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,8 +70,10 @@ pub struct Scoreboard {
     pub objectives: BTreeMap<String, Objective>,
     /// The scores: entry name, then objective name, then the value.
     pub scores: BTreeMap<String, BTreeMap<String, i32>>,
-    /// The display slots: 0 the list, 1 the sidebar, 2 below the name.
-    pub display: [Option<String>; 3],
+    /// The display slots: 0 the list, 1 the sidebar, 2 below the name, and
+    /// 3..=18 the sixteen team-coloured sidebar slots — slot `3 + i` for the
+    /// team colour index `i` (`Scoreboard.java:20`, `:479-486`).
+    pub display: [Option<String>; 19],
     /// The teams, keyed by name.
     pub teams: BTreeMap<String, Team>,
     /// The reverse membership: entry name to team name, kept consistent with
@@ -142,7 +146,7 @@ impl Scoreboard {
 
     /// Sets or clears one display slot (`setObjectiveInDisplaySlot:246-252`;
     /// the empty name clears, `handleDisplayScoreboard:1932-1935`). A slot
-    /// outside the three the wire table names is ignored.
+    /// outside the nineteen the wire table names is ignored.
     pub fn set_display(&mut self, slot: usize, objective: Option<&str>) {
         if let Some(slot) = self.display.get_mut(slot) {
             *slot = objective.map(str::to_owned);
@@ -306,10 +310,10 @@ mod tests {
         board.set_score("Alpha", "kills", 5);
         board.remove_objective("kills");
         assert!(board.objectives.is_empty(), "the objective fell");
-        assert_eq!(
-            board.display,
-            [None, None, None],
-            "the slot that named it cleared"
+        assert!(
+            board.display.iter().all(Option::is_none),
+            "the slot that named it cleared: {:?}",
+            board.display
         );
         assert!(
             board.scores.is_empty(),
@@ -361,23 +365,40 @@ mod tests {
         board.set_display(0, Some("list"));
         board.set_display(1, Some("side"));
         board.set_display(2, Some("below"));
-        assert_eq!(
-            board.display,
-            [
-                Some("list".to_owned()),
-                Some("side".to_owned()),
-                Some("below".to_owned()),
-            ]
-        );
+        assert_eq!(board.display[0], Some("list".to_owned()));
+        assert_eq!(board.display[1], Some("side".to_owned()));
+        assert_eq!(board.display[2], Some("below".to_owned()));
         // The empty name clears the slot (`handleDisplayScoreboard:1932-1935`;
         // the decoder carries the empty name as `None`).
         board.set_display(1, None);
         assert_eq!(board.display[1], None);
-        // A slot outside the three the wire table names is ignored, not a panic.
-        board.set_display(3, Some("nowhere"));
+        // A slot outside the source's own array of nineteen
+        // (`Scoreboard.java:20`) is ignored, not a panic.
+        board.set_display(19, Some("nowhere"));
         board.set_display(usize::MAX, Some("nowhere"));
         assert_eq!(board.display[2], Some("below".to_owned()));
         assert_eq!(board.display[0], Some("list".to_owned()));
+    }
+
+    #[test]
+    fn the_team_display_slots_store_and_clear() {
+        // Slots 3..=18 are the sixteen team-coloured sidebar slots of the
+        // source's own table (`Scoreboard.java:20`): slot `3 + i` for the
+        // colour index `i` (`getObjectiveDisplaySlotNumber:479-486`).
+        let mut board = Scoreboard::new();
+        assert_eq!(board.display.len(), 19, "the source's own array width");
+        board.set_display(3, Some("red-side"));
+        board.set_display(18, Some("white-side"));
+        assert_eq!(board.display[3], Some("red-side".to_owned()));
+        assert_eq!(board.display[18], Some("white-side".to_owned()));
+        // The empty name clears one (`handleDisplayScoreboard:1932-1935`).
+        board.set_display(3, None);
+        assert_eq!(board.display[3], None);
+        assert_eq!(
+            board.display[18],
+            Some("white-side".to_owned()),
+            "the other team slot stays"
+        );
     }
 
     #[test]

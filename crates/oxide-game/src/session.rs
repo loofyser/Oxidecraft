@@ -261,6 +261,10 @@ fn mesh_context(assets: &MeshAssets) -> MeshContext<'_> {
 
 /// Everything the session reports to the window.
 #[derive(Debug, Clone, PartialEq)]
+// The scoreboard report carries the source's own board — its nineteen-slot
+// display table included (`Scoreboard.java:20`) — one rare event per change;
+// boxing the payload would reshape the event's consumers for no measured gain.
+#[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
     /// Login succeeded.
     LoggedIn {
@@ -347,8 +351,9 @@ pub enum ClientEvent {
     ///
     /// Reported once per change to any part of it — an objective, a score, a
     /// display slot, a team or a membership — and not at all for a packet
-    /// that writes what the board already holds. The state is small, so the
-    /// whole of it travels and the window keeps no merge logic.
+    /// that writes what the board already holds. The whole of it travels —
+    /// the source's own nineteen-slot display table included
+    /// (`Scoreboard.java:20`) — and the window keeps no merge logic.
     ScoreboardChanged {
         /// The state as it stands.
         board: Scoreboard,

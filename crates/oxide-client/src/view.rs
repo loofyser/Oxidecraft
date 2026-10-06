@@ -16,6 +16,7 @@
 //! `GuiNewChat.drawChat`:30-114 and the record line above the hotbar
 //! (`GuiIngame.java`:245-272).
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -111,10 +112,15 @@ impl View {
     /// damage and death fractions the pass gates on — one while either window is open, and
     /// the clamped square root of the source's twenty-tick ramp
     /// (`RendererLivingEntity.rotateCorpse`).
+    ///
+    /// `board` resolves each player frame's below-name line ([`below_name_for`]); the
+    /// line's camera-dependent terms — the distance gate and the nametag chain — ride the
+    /// draw pass, where the nametag's own camera terms live.
     pub fn entity_draws(
         &self,
         now: Instant,
         skins: &BTreeMap<String, SkinUpdate>,
+        board: &Scoreboard,
     ) -> Vec<EntityDraw> {
         let Some(arrival) = self.arrival else {
             return Vec::new();
@@ -126,9 +132,10 @@ impl View {
             if Some(frame.id) == self.own {
                 continue;
             }
-            let Some(draw) = draw_for(frame, partial, skins) else {
+            let Some(mut draw) = draw_for(frame, partial, skins) else {
                 continue;
             };
+            draw.below_name = below_name_for(frame, board);
             draws.push(draw);
         }
         draws
@@ -443,6 +450,9 @@ fn draw_for(
         // The frame carries the composed text the session resolved; a frame without a name
         // leaves the field empty and the pass writes nothing.
         nametag: frame.nametag.clone().map(|text| NametagDraw { text }),
+        // The below-name label is the frame's slot-2 composition; the caller fills it once
+        // the draw is built ([`below_name_for`]).
+        below_name: None,
         extra: draw_extra,
     })
 }
@@ -2120,6 +2130,278 @@ fn team_name<'a>(board: &'a Scoreboard, record: &PlayerListRecord) -> &'a str {
         .unwrap_or("")
 }
 
+// ---- the scoreboard: the sidebar and the below-name lines ----
+
+/// The most rows the sidebar draws: the source's own fifteen
+/// (`GuiIngame.renderScoreboard:563`).
+const SIDEBAR_ROWS: usize = 15;
+
+/// One row's pitch: the font's own height, `FontRenderer.FONT_HEIGHT = 9`
+/// (`FontRenderer.java:35`; `GuiIngame.renderScoreboard:581`, `:593`).
+const SIDEBAR_ROW_PITCH: i32 = 9;
+
+/// The sidebar's right margin: the source's own `k1 = 3`
+/// (`GuiIngame.renderScoreboard:583`).
+const SIDEBAR_MARGIN: i32 = 3;
+
+/// The row background: `1342177280` = 0x50000000 — black at alpha 80
+/// (`GuiIngame.renderScoreboard:595`), the title separator's own value too (`:603`).
+const SIDEBAR_BAND: [f32; 4] = [0.0, 0.0, 0.0, 80.0 / 255.0];
+
+/// The title band's background: `1610612736` = 0x60000000 — black at alpha 96
+/// (`GuiIngame.renderScoreboard:602`).
+const SIDEBAR_TITLE_BAND: [f32; 4] = [0.0, 0.0, 0.0, 96.0 / 255.0];
+
+/// The name, number and title colour: `553648127` = 0x20FFFFFF — white at
+/// alpha 32 (`GuiIngame.renderScoreboard:596-597`, `:604`).
+const SIDEBAR_TEXT: [f32; 4] = [1.0, 1.0, 1.0, 32.0 / 255.0];
+
+/// The display name an objective draws with: its value, and the registry name
+/// where the wire sent none — the source's own default, the name the
+/// constructor holds until a display name arrives (`ScoreObjective.java:18`).
+fn objective_display(objective: &Objective) -> &str {
+    if objective.value.is_empty() {
+        &objective.name
+    } else {
+        &objective.value
+    }
+}
+
+/// `String.compareToIgnoreCase` (`Score.java:13`): equal characters pass,
+/// otherwise the pair compares through its uppercase forms first and its
+/// lowercase forms on a tie — the JDK's own fold order.
+fn compare_ignore_case(left: &str, right: &str) -> Ordering {
+    let mut left = left.chars();
+    let mut right = right.chars();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => {
+                let (a, b) = case_pair(a, b);
+                if a != b {
+                    return a.cmp(&b);
+                }
+            }
+        }
+    }
+}
+
+/// One character pair's case fold for [`compare_ignore_case`]:
+/// `Character.toUpperCase` first, `Character.toLowerCase` where uppercase
+/// leaves the pair equal.
+fn case_pair(a: char, b: char) -> (char, char) {
+    let upper = |c: char| c.to_uppercase().next().unwrap_or(c);
+    let (a, b) = (upper(a), upper(b));
+    if a != b {
+        return (a, b);
+    }
+    let lower = |c: char| c.to_lowercase().next().unwrap_or(c);
+    (lower(a), lower(b))
+}
+
+/// The objective the sidebar shows for the window's own account name: the own
+/// team's colour slot when one resolves, else slot 1 (`GuiIngame.java:319-336`).
+///
+/// The team's colour index `i` names slot `3 + i`
+/// (`Scoreboard.getObjectiveDisplaySlotNumber:479-486`); the objective the
+/// board resolves there wins, and every other outcome — no team, the no-colour
+/// sentinel, an empty or unresolvable slot — falls back to slot 1, as the
+/// source's null check does. Neither slot resolving names no sidebar.
+fn sidebar_objective<'a>(board: &'a Scoreboard, own: &str) -> Option<&'a Objective> {
+    let resolved = |slot: usize| {
+        board
+            .display
+            .get(slot)
+            .and_then(Option::as_deref)
+            .and_then(|name| board.objectives.get(name))
+    };
+    let from_colour = board
+        .team_of(own)
+        .and_then(|team| team.colour)
+        .and_then(|colour| resolved(3 + usize::from(colour)));
+    from_colour.or_else(|| resolved(1))
+}
+
+/// The scoreboard sidebar's draws for one frame: the chosen display slot's
+/// objective, its entries, and the title band, as one ordered draw list in the
+/// source's own painter order (`GuiIngame.renderScoreboard:551-607`).
+///
+/// `own` is the window's own account name, the name the source reads its team
+/// through (`GuiIngame.java:320`); the objective's slot is the team's colour
+/// choice ([`sidebar_objective`]). Rows draw bottom first — the draw list runs
+/// from the lowest points to the highest — and the title band closes it in the
+/// top row's own iteration. Every draw carries no shadow, as the source's
+/// four-argument `drawString` does not (`FontRenderer.java:333-336`). The
+/// frame's HUD draw list does not consume the sidebar yet; the tests are the
+/// only caller for now.
+#[allow(dead_code)]
+pub fn sidebar_draws(
+    board: &Scoreboard,
+    own: &str,
+    font: &Font,
+    resolution: ScaledResolution,
+) -> Vec<HudDraw> {
+    let Some(objective) = sidebar_objective(board, own) else {
+        return Vec::new();
+    };
+    let width = resolution.width as i32;
+    let height = resolution.height as i32;
+    // The collection the source sorts (`Scoreboard.getSortedScores:124-140`):
+    // every entry with a score in the objective, points ascending and equal
+    // points by name descending case-insensitively (`Score.scoreComparator:9-15`).
+    let mut sorted: Vec<(&str, i32)> = board
+        .scores
+        .iter()
+        .filter_map(|(entry, scores)| {
+            scores
+                .get(&objective.name)
+                .map(|points| (entry.as_str(), *points))
+        })
+        .collect();
+    sorted.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| compare_ignore_case(right.0, left.0))
+    });
+    // The filter (`GuiIngame.renderScoreboard:555-561`): an entry whose name is
+    // null — none can be, a recorded absence — or starts with `#` never draws.
+    let filtered: Vec<(&str, i32)> = sorted
+        .iter()
+        .copied()
+        .filter(|(entry, _)| !entry.starts_with('#'))
+        .collect();
+    // The clamp and its quirk (`:563-570`): when the filtered list outgrows
+    // fifteen, the source skips `unfiltered - 15` from the FILTERED list — the
+    // skip reads the collection size before the reassignment, so a filter that
+    // removed `k` entries draws `15 - k` rows.
+    let drawn: Vec<(&str, i32)> = if filtered.len() > SIDEBAR_ROWS {
+        filtered
+            .iter()
+            .copied()
+            .skip(sorted.len() - SIDEBAR_ROWS)
+            .collect()
+    } else {
+        filtered
+    };
+    if drawn.is_empty() {
+        return Vec::new();
+    }
+    let count = drawn.len() as i32;
+    // The measured width (`:572-579`): the title, and each drawn row's composed
+    // line — the name, `": "`, then the red number — whose separator and number
+    // count although the draw splits them off.
+    let title = objective_display(objective);
+    let mut widest = string_width(font, title);
+    for (entry, points) in &drawn {
+        let line = format!("{}: §c{}", format_entry(board, entry, entry), points);
+        widest = widest.max(string_width(font, &line));
+    }
+    // The geometry (`:581-585`, `:593-595`): the block is `9n` tall from the
+    // `H/2 + 9n/3` baseline, the text column sits `W - i - 3`, each row's right
+    // edge `W - 1`, and the row tops step nine pixels down from the baseline —
+    // one is the bottom row.
+    let block = count * SIDEBAR_ROW_PITCH;
+    let baseline = height / 2 + block / 3;
+    let left = width - widest - SIDEBAR_MARGIN;
+    let right = width - SIDEBAR_MARGIN + 2;
+    let mut draws = Vec::new();
+    for (index, (entry, points)) in drawn.iter().enumerate() {
+        let row = index as i32 + 1;
+        let top = baseline - row * SIDEBAR_ROW_PITCH;
+        draws.push(HudDraw::Rect {
+            x: (left - 2) as f32,
+            y: top as f32,
+            width: (right - left + 2) as f32,
+            height: SIDEBAR_ROW_PITCH as f32,
+            colour: SIDEBAR_BAND,
+        });
+        draws.push(HudDraw::Text {
+            text: format_entry(board, entry, entry),
+            x: left as f32,
+            y: top as f32,
+            scale: 1.0,
+            colour: SIDEBAR_TEXT,
+            shadow: false,
+        });
+        // The number is the red one unconditionally (`:577`, `:592`): no
+        // render-kind branch lives in the sidebar — the kind's own branch is
+        // the tab list's (`GuiPlayerTabOverlay.drawScoreboardValues:278-362`).
+        let number = format!("§c{points}");
+        draws.push(HudDraw::Text {
+            x: (right - string_width(font, &number)) as f32,
+            y: top as f32,
+            scale: 1.0,
+            colour: SIDEBAR_TEXT,
+            shadow: false,
+            text: number,
+        });
+        // The title band draws in the last row's own iteration (`:599-605`):
+        // the band above the row, its one-pixel separator, then the title,
+        // centred by integer division.
+        if index + 1 == drawn.len() {
+            draws.push(HudDraw::Rect {
+                x: (left - 2) as f32,
+                y: (top - SIDEBAR_ROW_PITCH - 1) as f32,
+                width: (right - left + 2) as f32,
+                height: SIDEBAR_ROW_PITCH as f32,
+                colour: SIDEBAR_TITLE_BAND,
+            });
+            draws.push(HudDraw::Rect {
+                x: (left - 2) as f32,
+                y: (top - 1) as f32,
+                width: (right - left + 2) as f32,
+                height: 1.0,
+                colour: SIDEBAR_BAND,
+            });
+            draws.push(HudDraw::Text {
+                text: title.to_owned(),
+                x: (left + widest / 2 - string_width(font, title) / 2) as f32,
+                y: (top - SIDEBAR_ROW_PITCH) as f32,
+                scale: 1.0,
+                colour: SIDEBAR_TEXT,
+                shadow: false,
+            });
+        }
+    }
+    draws
+}
+
+/// The below-name line one frame shows under its nametag, when it shows one:
+/// the slot-2 objective's points and display name, `"<points> <display name>"`
+/// (`RenderPlayer.renderOffsetLivingLabel:149`).
+///
+/// The line is a player's alone — the override is `RenderPlayer`'s — and never
+/// shows while sneaking: the source's sneaking branch bypasses the override
+/// entirely (`RendererLivingEntity.java:507-538`). The slot-2 objective must
+/// resolve (`RenderPlayer.java:144`); a missing score is no veto — the source's
+/// lookup creates the score at its zero default
+/// (`Scoreboard.getValueFromObjective:96-120`) — so a player with no stored
+/// score draws `"0 <display name>"`. A frame with no account name resolves
+/// none: the score lookup reads the entry name (`RenderPlayer.java:148`), and
+/// a player the list never named has none — the same no-record rule the
+/// nametag follows. The distance gate (`RenderPlayer.java:141`) and the
+/// nametag-visibility chain ride the entity pass, where the nametag's own
+/// camera-dependent terms live.
+fn below_name_for(frame: &EntityFrame, board: &Scoreboard) -> Option<String> {
+    if frame.kind != EntityKind::Player || frame.sneaking {
+        return None;
+    }
+    let name = frame.name.as_deref()?;
+    let objective = board.display[2]
+        .as_deref()
+        .and_then(|name| board.objectives.get(name))?;
+    let points = board
+        .scores
+        .get(name)
+        .and_then(|scores| scores.get(&objective.name))
+        .copied()
+        .unwrap_or(0);
+    Some(format!("{points} {}", objective_display(objective)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2129,7 +2411,7 @@ mod tests {
 
     use oxide_assets::skins::DefaultModel;
 
-    use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
+    use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, display_name};
     use oxide_proto_v47::entity::MetadataItem;
     use oxide_render::entity_models::PoseExtra;
     use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
@@ -2155,6 +2437,7 @@ mod tests {
             id,
             kind: EntityKind::Player,
             uuid: Some(uuid.to_owned()),
+            name: None,
             prev: [0.0, 0.0, 0.0],
             pos: [2.0, 0.0, 0.0],
             prev_yaw: 0.0,
@@ -2200,9 +2483,9 @@ mod tests {
         ClientEvent::EntitiesTick { entities }
     }
 
-    /// The draws at `elapsed` past the arrival.
+    /// The draws at `elapsed` past the arrival, against no scoreboard.
     fn draws_at(view: &View, arrival: Instant, elapsed: Duration) -> Vec<EntityDraw> {
-        view.entity_draws(arrival + elapsed, &BTreeMap::new())
+        view.entity_draws(arrival + elapsed, &BTreeMap::new(), &Scoreboard::new())
     }
 
     #[test]
@@ -2348,7 +2631,7 @@ mod tests {
             player_frame(7, UUID_WIDE),
             player_frame(8, UUID_SLIM),
         ]));
-        let draws = view.entity_draws(t0, &BTreeMap::new());
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &Scoreboard::new());
         assert_eq!(draws.len(), 1, "the window's own entity draws nothing");
         assert_eq!(
             draws[0].texture,
@@ -2419,7 +2702,7 @@ mod tests {
                 model: DefaultModel::Slim,
             },
         );
-        let draw = &view.entity_draws(t0, &skins)[0];
+        let draw = &view.entity_draws(t0, &skins, &Scoreboard::new())[0];
         assert_eq!(
             draw.model,
             ModelRef::Player {
@@ -5058,5 +5341,395 @@ mod tests {
         // under it.
         assert_eq!(draws.len(), 1);
         assert_eq!(chat_rect(&draws[0]), (201.0, 9.0, 24.0, 1.0, TAB_PANEL));
+    }
+
+    // ---- the scoreboard sidebar ----
+
+    /// A board whose slot-1 objective carries `count` entries named `e00`… with
+    /// ascending points above `filtered` `#`-named ones — the clamp cases' fixture.
+    fn filtered_board(count: usize, filtered: usize) -> Scoreboard {
+        let mut board = Scoreboard::new();
+        board.set_objective("side", "Side", "integer");
+        board.set_display(1, Some("side"));
+        for index in 0..filtered {
+            board.set_score(&format!("#{index:02}"), "side", index as i32 + 1);
+        }
+        for index in 0..count {
+            board.set_score(
+                &format!("e{index:02}"),
+                "side",
+                filtered as i32 + index as i32 + 1,
+            );
+        }
+        board
+    }
+
+    /// The sidebar's text draws, in draw order.
+    fn sidebar_texts(draws: &[HudDraw]) -> Vec<String> {
+        draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Text { text, .. } => Some(text.clone()),
+                HudDraw::Rect { .. } | HudDraw::TexturedRect { .. } | HudDraw::SkinRect { .. } => {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_scoreboard_objective_choice_reads_the_own_teams_colour_slot() {
+        let font = chat_font();
+        // The own team's colour index `i` names slot `3 + i`
+        // (`Scoreboard.getObjectiveDisplaySlotNumber:479-486`); the objective the
+        // board resolves there wins, and every other outcome — no team, the
+        // no-colour sentinel, an empty or unresolvable slot — falls back to slot 1
+        // (`GuiIngame.java:319-336`). The drawn title names the objective that won.
+        let title_of = |board: &Scoreboard, own: &str| {
+            let draws = sidebar_draws(board, own, &font, chat_resolution());
+            chat_text(draws.last().expect("a title")).0
+        };
+        let mut board = Scoreboard::new();
+        board.set_objective("side", "Side", "integer");
+        board.set_display(1, Some("side"));
+        board.set_score("Alpha", "side", 3);
+        board.set_objective("red-side", "Red Side", "integer");
+        board.set_score("Alpha", "red-side", 4);
+        // No team at all reads slot 1.
+        assert_eq!(title_of(&board, "Alpha"), "Side");
+        // A team without a colour reads slot 1.
+        board.set_team("red", "Red", "", "", 0, "always", None);
+        board.add_team_players("red", &["Alpha".to_owned()]);
+        assert_eq!(title_of(&board, "Alpha"), "Side", "the no-colour sentinel");
+        // Red is colour index 12 (`EnumChatFormatting.java:24`): slot 15 wins
+        // with its objective even though slot 1 is set too.
+        board.set_team("red", "Red", "", "", 0, "always", Some(12));
+        board.set_display(15, Some("red-side"));
+        assert_eq!(
+            title_of(&board, "Alpha"),
+            "Red Side",
+            "the colour slot wins"
+        );
+        // The colour slot set but cleared falls back to slot 1.
+        board.set_display(15, None);
+        assert_eq!(title_of(&board, "Alpha"), "Side", "the empty colour slot");
+        // A colour slot naming an objective the board does not hold falls back too.
+        board.set_display(15, Some("ghost"));
+        assert_eq!(title_of(&board, "Alpha"), "Side", "the dangling name");
+        // Nothing set names no sidebar; a slot-1 name the board does not resolve
+        // is no objective either.
+        assert!(
+            sidebar_draws(&Scoreboard::new(), "Alpha", &font, chat_resolution()).is_empty(),
+            "nothing set"
+        );
+        let mut dangling = Scoreboard::new();
+        dangling.set_display(1, Some("ghost"));
+        assert!(sidebar_draws(&dangling, "Alpha", &font, chat_resolution()).is_empty());
+    }
+
+    #[test]
+    fn the_scoreboard_geometry_follows_the_sources_baseline() {
+        let font = chat_font();
+        // The source's own numbers at 427x240 (`GuiIngame.renderScoreboard:581-585`,
+        // `:593-595`): three rows, the widest measured line "AAA: §c3" spans 24, so
+        // j1 = 120 + 27/3 = 129, the row tops step 129 - 9j = 120/111/102, the text
+        // column is 427 - 24 - 3 = 400, and each row's right edge 427 - 1 = 426.
+        // Rows draw bottom first; the title band closes the last row's iteration.
+        let mut board = Scoreboard::new();
+        board.set_objective("t", "T", "integer");
+        board.set_display(1, Some("t"));
+        board.set_score("A", "t", 1);
+        board.set_score("AA", "t", 2);
+        board.set_score("AAA", "t", 3);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(chat_resolution().width, 427);
+        assert_eq!(chat_resolution().height, 240);
+        assert_eq!(draws.len(), 3 * 3 + 3, "three rows and the title band");
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (398.0, 120.0, 28.0, 9.0, SIDEBAR_BAND),
+            "the bottom row's background: [l1-2, l) x [k, k+9)"
+        );
+        assert_eq!(
+            chat_text(&draws[1]),
+            ("A".to_owned(), 400.0, 120.0, 1.0, SIDEBAR_TEXT, false),
+            "the bottom name at the text column"
+        );
+        assert_eq!(
+            chat_text(&draws[2]),
+            ("§c1".to_owned(), 425.0, 120.0, 1.0, SIDEBAR_TEXT, false),
+            "the number right-aligned at l - width"
+        );
+        assert_eq!(
+            chat_rect(&draws[3]),
+            (398.0, 111.0, 28.0, 9.0, SIDEBAR_BAND)
+        );
+        assert_eq!(chat_text(&draws[4]).0, "AA");
+        assert_eq!(chat_text(&draws[4]).2, 111.0, "the middle row's top");
+        assert_eq!(chat_text(&draws[5]).0, "§c2");
+        assert_eq!(
+            chat_rect(&draws[6]),
+            (398.0, 102.0, 28.0, 9.0, SIDEBAR_BAND)
+        );
+        assert_eq!(chat_text(&draws[7]).0, "AAA");
+        assert_eq!(chat_text(&draws[8]).0, "§c3");
+        assert_eq!(
+            chat_rect(&draws[9]),
+            (398.0, 92.0, 28.0, 9.0, SIDEBAR_TITLE_BAND),
+            "the title band spans [k-10, k-1)"
+        );
+        assert_eq!(
+            chat_rect(&draws[10]),
+            (398.0, 101.0, 28.0, 1.0, SIDEBAR_BAND),
+            "the one-pixel separator spans [k-1, k)"
+        );
+        assert_eq!(
+            chat_text(&draws[11]),
+            ("T".to_owned(), 412.0, 93.0, 1.0, SIDEBAR_TEXT, false),
+            "the title at l1 + i/2 - width/2, y k - 9"
+        );
+    }
+
+    #[test]
+    fn the_scoreboard_sort_is_points_ascending_and_names_descending_within_a_tie() {
+        let font = chat_font();
+        // The collection order (`Score.scoreComparator`, `Score.java:9-15`): points
+        // ascending, equal points by name descending case-insensitively. Rows draw
+        // bottom first (`GuiIngame.renderScoreboard:587-593`), so the screen reads
+        // points descending top-to-bottom with the tie alphabetically ascending.
+        let mut board = Scoreboard::new();
+        board.set_objective("side", "Side", "integer");
+        board.set_display(1, Some("side"));
+        board.set_score("Ann", "side", 1);
+        board.set_score("Bob", "side", 5);
+        board.set_score("Alice", "side", 5);
+        board.set_score("Zed", "side", 9);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(
+            sidebar_texts(&draws),
+            [
+                "Ann", "§c1", "Bob", "§c5", "Alice", "§c5", "Zed", "§c9", "Side"
+            ],
+            "bottom row first"
+        );
+        let top_down: Vec<String> = (0..4)
+            .rev()
+            .map(|row| chat_text(&draws[1 + 3 * row]).0)
+            .collect();
+        assert_eq!(top_down, ["Zed", "Alice", "Bob", "Ann"], "top-to-bottom");
+    }
+
+    #[test]
+    fn the_scoreboard_clamps_sixteen_entries_to_the_sources_fifteen() {
+        let font = chat_font();
+        // The clamp (`GuiIngame.renderScoreboard:563`): past fifteen, the draw
+        // list skips the difference, keeping the highest points.
+        let board = filtered_board(16, 0);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(draws.len(), 3 * 15 + 3, "fifteen rows and the title band");
+        assert_eq!(
+            chat_text(&draws[1]).0,
+            "e01",
+            "the bottom row past the skip"
+        );
+        assert_eq!(chat_text(&draws[3 * 14 + 1]).0, "e15", "the top row");
+        assert!(!sidebar_texts(&draws).iter().any(|text| text == "e00"));
+    }
+
+    #[test]
+    fn the_scoreboard_filter_quirk_over_skips_by_the_filtered_count() {
+        let font = chat_font();
+        // The clamp's skip reads the UNFILTERED length — the source evaluates
+        // `collection.size()` before the reassignment
+        // (`GuiIngame.renderScoreboard:565`) — so a filter that removed `k`
+        // entries draws `15 - k` rows.
+        let board = filtered_board(18, 2);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(
+            draws.len(),
+            3 * 13 + 3,
+            "eighteen filtered, two # rows: thirteen"
+        );
+        assert_eq!(chat_text(&draws[1]).0, "e05", "the first row past the skip");
+        assert_eq!(chat_text(&draws[3 * 12 + 1]).0, "e17", "the top row");
+        assert!(
+            !sidebar_texts(&draws)
+                .iter()
+                .any(|text| text.starts_with('#'))
+        );
+        let board = filtered_board(18, 3);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(
+            draws.len(),
+            3 * 12 + 3,
+            "eighteen filtered, three # rows: twelve"
+        );
+        assert_eq!(
+            chat_text(&draws[1]).0,
+            "e06",
+            "the skip stepped with the filtered count"
+        );
+    }
+
+    #[test]
+    fn the_scoreboard_draws_the_same_red_number_for_every_objective_kind() {
+        let font = chat_font();
+        // The sidebar's number is RED unconditionally
+        // (`GuiIngame.renderScoreboard:577`, `:592`); the render kind's branch
+        // belongs to the tab list (`GuiPlayerTabOverlay.drawScoreboardValues:278-362`).
+        // The wire's `integer` and `hearts` kinds — the source's `dummy` and
+        // `health` criteria — draw the same literal.
+        for kind in ["integer", "hearts"] {
+            let mut board = Scoreboard::new();
+            board.set_objective("side", "Side", kind);
+            board.set_display(1, Some("side"));
+            board.set_score("Alpha", "side", 7);
+            let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+            assert_eq!(
+                chat_text(&draws[2]),
+                ("§c7".to_owned(), 425.0, 114.0, 1.0, SIDEBAR_TEXT, false),
+                "the {kind} number"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scoreboard_name_carries_its_teams_composition() {
+        let font = chat_font();
+        // Sidebar names compose through the team clauses like the tab list's
+        // (`ScorePlayerTeam.formatPlayerName:95-106`).
+        let mut board = Scoreboard::new();
+        board.set_team("greens", "Greens", "§a<", "§r", 0, "always", Some(10));
+        board.add_team_players("greens", &["Alpha".to_owned()]);
+        board.set_objective("side", "Side", "integer");
+        board.set_display(1, Some("side"));
+        board.set_score("Alpha", "side", 4);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(chat_text(&draws[1]).0, "§a<Alpha§r");
+    }
+
+    #[test]
+    fn the_scoreboard_composition_feeds_the_nametag_the_tab_and_the_sidebar() {
+        // The three name surfaces read one source — the team clauses around the
+        // fallback (`format_entry`, `ScorePlayerTeam.formatString:95-98`): the
+        // frame's nametag composition ([`display_name`]), the tab list's row and
+        // the sidebar's row.
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_team("greens", "Greens", "§a<", "§r", 0, "always", Some(10));
+        board.add_team_players("greens", &["AAAA".to_owned()]);
+        board.set_objective("side", "Side", "integer");
+        board.set_display(1, Some("side"));
+        board.set_score("AAAA", "side", 2);
+        // The frame's composition, straight through `entity_view`.
+        let record = tab_record("AAAA");
+        let nametag = display_name(Some(&record), &board).expect("the record resolves");
+        assert_eq!(nametag, "§a<AAAA§r", "the team's clauses around the name");
+        // The tab list's first row, the same record.
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA")];
+        let tab_draws = tab_frame(&tab, &board, &font);
+        assert_eq!(chat_text(&tab_draws[4]).0, nametag, "the tab name");
+        // The sidebar's first row.
+        let sidebar = sidebar_draws(&board, "AAAA", &font, chat_resolution());
+        assert_eq!(chat_text(&sidebar[1]).0, nametag, "the sidebar name");
+    }
+
+    // ---- the below-name lines ----
+
+    /// A player frame with the account name set: the name the below-name score
+    /// lookup reads.
+    fn named_frame(id: i32, name: &str) -> EntityFrame {
+        let mut frame = player_frame(id, UUID_SLIM);
+        frame.name = Some(Arc::from(name));
+        frame
+    }
+
+    #[test]
+    fn the_scoreboard_below_name_line_composes_the_points_and_the_display_name() {
+        // The composed label is `points + " " + display name`
+        // (`RenderPlayer.renderOffsetLivingLabel:149`); a missing score is no
+        // veto — the lookup creates the zero default
+        // (`Scoreboard.getValueFromObjective:96-120`) — and an objective with
+        // no display value draws its registry name (`ScoreObjective.java:18`).
+        let mut board = Scoreboard::new();
+        board.set_objective("below", "Below", "integer");
+        board.set_display(2, Some("below"));
+        board.set_score("Alpha", "below", 7);
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(vec![named_frame(8, "Alpha")], t0);
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(draws[0].below_name.as_deref(), Some("7 Below"));
+        board.remove_score("Alpha", "below");
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(
+            draws[0].below_name.as_deref(),
+            Some("0 Below"),
+            "the missing score draws at the zero default"
+        );
+        let mut unnamed = Scoreboard::new();
+        unnamed.set_objective("below", "", "integer");
+        unnamed.set_display(2, Some("below"));
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &unnamed);
+        assert_eq!(
+            draws[0].below_name.as_deref(),
+            Some("0 below"),
+            "the registry-name default"
+        );
+    }
+
+    #[test]
+    fn the_scoreboard_below_name_skips_mobs_and_sneaking_players() {
+        // The line is `RenderPlayer`'s override, so only players carry it; the
+        // base renderer's sneaking branch bypasses the override entirely
+        // (`RendererLivingEntity.java:507-538`).
+        let mut board = Scoreboard::new();
+        board.set_objective("below", "Below", "integer");
+        board.set_display(2, Some("below"));
+        board.set_score("Alpha", "below", 7);
+        let mut mob = mob_frame(8, EntityKind::Cow, EntityExtra::Mob(MobExtra::Other));
+        mob.name = Some(Arc::from("Alpha"));
+        let mut sneaking = named_frame(9, "Alpha");
+        sneaking.sneaking = true;
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(vec![mob, sneaking], t0);
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(draws.len(), 2, "both frames draw");
+        assert_eq!(draws[0].below_name, None, "the mob carries no line");
+        assert_eq!(
+            draws[1].below_name, None,
+            "the sneaking player carries none"
+        );
+    }
+
+    #[test]
+    fn no_scoreboard_slot_two_objective_gets_no_below_name_line() {
+        // No slot-2 objective resolves → no lines, even with scores stored; a
+        // slot-2 name the board does not hold resolves none either; and a player
+        // the list never named resolves none — the same no-record rule as the
+        // nametag (`RenderPlayer.java:148` reads the account name the record
+        // alone carries).
+        let mut board = Scoreboard::new();
+        board.set_objective("below", "Below", "integer");
+        board.set_score("Alpha", "below", 7);
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(vec![named_frame(8, "Alpha")], t0);
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(draws[0].below_name, None, "no slot-2 objective, no line");
+        board.set_display(2, Some("below"));
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(draws[0].below_name.as_deref(), Some("7 Below"));
+        board.set_display(2, Some("ghost"));
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(draws[0].below_name, None, "the dangling name resolves none");
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(vec![player_frame(8, UUID_SLIM)], t0);
+        let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
+        assert_eq!(draws[0].below_name, None, "no record name, no line");
     }
 }

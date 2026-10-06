@@ -81,6 +81,9 @@ pub struct EntityFrame {
     pub kind: EntityKind,
     /// The profile UUID; players only.
     pub uuid: Option<String>,
+    /// The player's account name, from the player-list record; `None` for
+    /// every other kind and for a player without a record.
+    pub name: Option<Arc<str>>,
     /// The position at the last tick, in blocks.
     pub prev: [f64; 3],
     /// The position in blocks.
@@ -494,6 +497,7 @@ fn frame_of(
         id: entity.id,
         kind: entity.kind,
         uuid: entity.uuid.clone(),
+        name: player_name(entity, player_list),
         prev: entity.last_tick_position,
         pos: entity.position,
         prev_yaw: entity.last_tick_yaw,
@@ -620,6 +624,24 @@ fn nametag(
     } else {
         None
     }
+}
+
+/// The player's account name from the player-list record, when the list
+/// holds one.
+///
+/// The name the source's below-name lookup reads (`RenderPlayer.java:148`'s
+/// `entityIn.getName()`): the record's own name, not the display-name
+/// composition the nametag draws. `None` for every kind but a player and for
+/// a player the list never named — a frame without a record resolves no
+/// below-name line, the same way it resolves no nametag.
+fn player_name(entity: &Entity, player_list: &PlayerList) -> Option<Arc<str>> {
+    if entity.kind != EntityKind::Player {
+        return None;
+    }
+    let uuid = entity.uuid.as_deref()?;
+    player_list
+        .get(uuid)
+        .map(|record| Arc::from(record.name.as_str()))
 }
 
 /// The kind-specific extras one entity's frame carries.
@@ -1523,6 +1545,30 @@ mod tests {
         let mut entity = Entity::new(7, EntityKind::Player);
         entity.uuid = Some(hyphenated(&[7; 16]));
         assert_eq!(frame_against(&entity, &PlayerList::new()).nametag, None);
+    }
+
+    #[test]
+    fn the_frames_name_is_the_account_name_the_list_holds() {
+        let (entity, list) = listed("OxideDev");
+        assert_eq!(
+            frame_against(&entity, &list).name.as_deref(),
+            Some("OxideDev"),
+            "the account name the below-name score lookup reads"
+        );
+        // The display name does not replace it (`RenderPlayer.java:148`).
+        let mut list = list;
+        assert!(list.set_display_name([7; 16], Some("§bOxideDev".to_owned())));
+        assert_eq!(
+            frame_against(&entity, &list).name.as_deref(),
+            Some("OxideDev"),
+            "the account name, not the display name"
+        );
+        // No record resolves no name, as it resolves no nametag; every other
+        // kind resolves none either.
+        let mut orphan = Entity::new(7, EntityKind::Player);
+        orphan.uuid = Some(hyphenated(&[7; 16]));
+        assert_eq!(frame_against(&orphan, &PlayerList::new()).name, None);
+        assert_eq!(frame_for(&Entity::new(1, EntityKind::Cow)).name, None);
     }
 
     #[test]

@@ -1160,7 +1160,10 @@ impl ClientApp {
             }
             // The entity draws: the feed interpolated at this frame's fraction, in
             // the feed's own order, the window's own entity skipped.
-            renderer.set_entities(self.view.entity_draws(Instant::now(), &self.skins));
+            renderer.set_entities(
+                self.view
+                    .entity_draws(Instant::now(), &self.skins, &self.board),
+            );
         }
         // The chat: the mirror ages to the session's tick, and the frame's draws —
         // bars, text and the record line at the scaled resolution — land in the hud
