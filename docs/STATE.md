@@ -1,6 +1,6 @@
 # Oxidecraft — project state
 
-Updated: 2026-10-02
+Updated: 2026-10-05
 
 This file is the live state of the project. Keep it current before every handoff, long pause, and
 milestone boundary. Anyone picking the work up should be able to read this file plus the
@@ -59,6 +59,14 @@ specification and continue without asking questions that are already answered he
   re-shoot). The milestone's record: `refs/m3-acceptance/`, `refs/m3-task-13-completion/`,
   `refs/m3-task-13-crack/`, `refs/m3-final-review/`, and the M3 ledger
   (`.superpowers/sdd/2026-10-02-m3-player/`).
+- **2026-10-05 update — M4 in progress; Task 17 interrupted.** Milestone M4 (entities and chat) is
+  underway: tasks 1–16 are closed and pushed (head `00df68a`, CI green). Task 17 (the scoreboard
+  sidebar and the below-name scores) has its recon complete; its first pass was interrupted on
+  2026-10-05 mid-run, and that work is held uncommitted in the working tree (nine files,
+  suite-green, pre-gate). The pause handoff
+  `docs/handoff/2026-10-05-m4-task17-stopped.md` carries the resume steps: complete the first pass
+  (gate, one commit, report), then the second pass, the combined review and the close, then
+  Tasks 18–23 (the boss bar, the carry tasks, the acceptance run and the milestone close).
 - M0 delivered and verified: the eight-crate workspace with its enforced dependency graph; the
   VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
   and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
@@ -410,10 +418,12 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 ## Next actions
 
 Milestone M3 is complete and tagged; milestone M4 (spec section 13: entities and chat) is the live
-milestone. The M4 plan is written and approved: `docs/plans/2026-10-04-m4-entities-and-chat.md`
-(twenty-three tasks; independently reviewed, all review findings folded and re-verified; owner
-approved 2026-10-04 with all three open questions answered as recommended). Execution starts on the
-owner's explicit go, task by task in the established loop. The M3 close handoff is
+milestone and execution is underway: tasks 1–16 are closed and pushed (`00df68a`, CI green), and
+Task 17 (the scoreboard sidebar and the below-name scores) is in progress — its first pass was
+interrupted on 2026-10-05 and its work is held uncommitted in the working tree; the pause handoff
+`docs/handoff/2026-10-05-m4-task17-stopped.md` carries the resume steps. The plan:
+`docs/plans/2026-10-04-m4-entities-and-chat.md` (twenty-three tasks; independently reviewed, all
+review findings folded and re-verified; owner approved 2026-10-04). The M3 close handoff is
 `docs/handoff/2026-10-04-m3-close.md`.
 
 The ordered M4 backlog (from the M3 final review's triage and carry-forward; the full list is
