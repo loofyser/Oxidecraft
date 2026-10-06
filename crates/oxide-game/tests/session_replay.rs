@@ -3661,6 +3661,91 @@ fn the_sprint_and_sneak_edges_are_sent_once_per_change() {
 }
 
 #[test]
+fn the_sprint_release_lands_one_tick_after_the_wall_stops_the_walk() {
+    // The sprint release's collision term (`EntityPlayerSP.java`:818-821)
+    // reads the previous move's own flag (`Entity.java`:818): the tick the
+    // walk is pinned at the wall still reports sprinting, and the next tick
+    // releases it and sends the one Stop Sprinting edge. The press lands at
+    // idle-wait 4 and the assertion runs after the quiet stretch, so many
+    // tick boundaries separate them (the house timing rule).
+    let mut head = floor_head();
+    frame(
+        &mut head,
+        &block_change_frame(0, 64, 4, STONE),
+        SERVER_FRAMING,
+    );
+    let flips = vec![
+        (
+            4,
+            InputEvent::Key {
+                key: Key::W,
+                pressed: true,
+            },
+        ),
+        (
+            6,
+            InputEvent::Key {
+                key: Key::ControlLeft,
+                pressed: true,
+            },
+        ),
+    ];
+    let (events, frames) = flip_session(head, Vec::new(), 40, 0, flips);
+    // One packet edge per change: start, then stop — nothing else.
+    let actions: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x0B).collect();
+    assert_eq!(
+        actions,
+        vec![
+            &vec![0x0B, 0x14, 0x03, 0x00], // Start Sprinting (3)
+            &vec![0x0B, 0x14, 0x04, 0x00], // Stop Sprinting (4)
+        ],
+        "one action per change, in order: {frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame[0] == 0x0B || matches!(frame[0], 0x03..=0x06)),
+        "only the actions and the walking report are sent: {frames:?}"
+    );
+    // The per-tick walk: sprinting on the approach, the wall's own tick still
+    // sprinting, the next tick released — and pinned from there on.
+    let ticks: Vec<(f64, bool)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::PlayerTick {
+                z,
+                sprinting,
+                snapped: false,
+                ..
+            } => Some((*z, *sprinting)),
+            _ => None,
+        })
+        .collect();
+    let wall_tick = ticks
+        .iter()
+        .position(|(z, _)| *z > 3.699999)
+        .expect("the walk reaches the wall");
+    assert!(
+        ticks.len() > wall_tick + 1,
+        "the quiet stretch outlasts the wall tick: {ticks:?}"
+    );
+    assert!(
+        ticks[wall_tick].1,
+        "the pinned tick still reports the sprint: {ticks:?}"
+    );
+    assert!(
+        !ticks[wall_tick + 1].1,
+        "the next tick releases it: {ticks:?}"
+    );
+    assert!(
+        ticks[wall_tick + 1..]
+            .iter()
+            .all(|(_, sprinting)| !sprinting),
+        "the release holds while the wall does: {ticks:?}"
+    );
+}
+
+#[test]
 fn a_lone_fresh_press_only_arms_the_flight_toggle() {
     // One fresh jump press in the air does not flip flight: it arms the
     // seven-tick window (`EntityPlayerSP.java:834-838`), so no abilities

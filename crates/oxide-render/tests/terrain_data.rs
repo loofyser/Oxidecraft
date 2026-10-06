@@ -65,6 +65,7 @@ fn pose(yaw: f32, pitch: f32) -> CameraPose {
         position: [0.0, 64.0, 0.0],
         yaw,
         pitch,
+        sneak: false,
     }
 }
 

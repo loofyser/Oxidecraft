@@ -639,7 +639,8 @@ struct PlayerState {
     tick: u64,
 }
 
-/// One `PlayerTick`'s pose: the player's feet and where they look.
+/// One `PlayerTick`'s pose: the player's feet, where they look and whether
+/// they sneak.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Pose {
     /// The feet's x, y and z in blocks.
@@ -648,20 +649,34 @@ struct Pose {
     yaw: f32,
     /// The pitch in degrees.
     pitch: f32,
+    /// Whether the player was sneaking: the eye height the render pose
+    /// composes reads it (`EntityPlayer.getEyeHeight`'s `f -= 0.08F`,
+    /// `EntityPlayer.java`:2335-2338).
+    sneaking: bool,
 }
 
 impl PlayerState {
     /// Folds one `PlayerTick` into the state.
     ///
-    /// The pose it carries becomes current and the old current slides into previous —
-    /// unless the report is snapped, which sets previous to current as well so nothing
-    /// interpolates across a correction. The tick always advances.
-    fn observe(&mut self, tick: u64, position: [f64; 3], yaw: f32, pitch: f32, snapped: bool) {
+    /// The pose it carries — the feet, the facing and the sneak flag — becomes current
+    /// and the old current slides into previous — unless the report is snapped, which
+    /// sets previous to current as well so nothing interpolates across a correction.
+    /// The tick always advances.
+    fn observe(
+        &mut self,
+        tick: u64,
+        position: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+        sneaking: bool,
+        snapped: bool,
+    ) {
         self.previous = self.current;
         self.current = Pose {
             position,
             yaw,
             pitch,
+            sneaking,
         };
         if snapped {
             self.previous = self.current;
@@ -693,7 +708,9 @@ struct CameraState {
     camera_pitch: CameraSensor,
     /// The latest tick's hurt flash (`hurtTime`).
     hurt_time: u32,
-    /// The yaw the last hurt came from (`attackedAtYaw`); zero until M4 tracks attackers.
+    /// The yaw the last hurt came from (`attackedAtYaw`); zero by source design on the
+    /// client (`EntityLivingBase.java`:1362-1363 zeroes it; the non-zero setters are
+    /// server-side, `:961-966`) until M4 tracks attackers.
     attacked_at_yaw: f32,
     /// Whether the latest tick reported the player in water, for the FOV's water term.
     in_water: bool,
@@ -801,11 +818,17 @@ impl CameraState {
 }
 
 /// The camera pose of one reported tick pose.
+///
+/// The sneak flag rides straight through: the eye the pose composes is the entity eye
+/// (`EntityPlayer.getEyeHeight`, `EntityPlayer.java`:2326-2341), so the render path
+/// carries the same standing-or-sneaking height the game side's `Player::eye_height`
+/// does.
 fn camera_pose(pose: Pose) -> CameraPose {
     CameraPose {
         position: pose.position,
         yaw: pose.yaw,
         pitch: pose.pitch,
+        sneak: pose.sneaking,
     }
 }
 
@@ -1884,6 +1907,7 @@ fn apply_session_event(
             z,
             yaw,
             pitch,
+            sneaking,
             tick,
             snapped,
             ..
@@ -1891,7 +1915,7 @@ fn apply_session_event(
             hud.position = [x, y, z];
             hud.yaw = yaw;
             hud.pitch = pitch;
-            player.observe(tick, [x, y, z], yaw, pitch, snapped);
+            player.observe(tick, [x, y, z], yaw, pitch, sneaking, snapped);
             false
         }
         ClientEvent::EntitiesTick { .. } => {
@@ -2784,10 +2808,11 @@ mod tests {
         DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute, Key,
         MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate, SkyValues,
         UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline, apply_overlay_event,
-        bound_mouse_button, chat_opener, chat_wheel_lines, clear_break_stage, command_text,
-        cracks_in_view, escape_route, frame_params, gameplay_key, is_enter_press, is_escape_press,
-        is_f3_press, parse_script, parse_server_address, scaled_cursor, skin_requests, store_aim,
-        store_break_stage, store_skins, tab_held, tooltip_point, void_y_factor,
+        bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines, clear_break_stage,
+        command_text, cracks_in_view, escape_route, frame_params, gameplay_key, interpolate_pose,
+        is_enter_press, is_escape_press, is_f3_press, parse_script, parse_server_address,
+        scaled_cursor, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
+        tooltip_point, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -2975,16 +3000,17 @@ mod tests {
     #[test]
     fn the_pose_state_slides_a_regular_tick_and_collapses_a_snapped_one() {
         let mut player = PlayerState::default();
-        player.observe(1, [0.0, 64.0, 0.0], 0.0, 0.0, false);
-        player.observe(2, [1.5, 64.0, -2.0], 10.0, -5.0, false);
+        player.observe(1, [0.0, 64.0, 0.0], 0.0, 0.0, false, false);
+        player.observe(2, [1.5, 64.0, -2.0], 10.0, -5.0, true, false);
         assert_eq!(
             player.previous.position,
             [0.0, 64.0, 0.0],
             "the previous pose slides into previous"
         );
         assert_eq!(player.current.position, [1.5, 64.0, -2.0]);
+        assert!(player.current.sneaking, "the sneak flag rides the pose");
         assert_eq!(player.tick, 2);
-        player.observe(3, [9.0, 70.0, 9.0], 90.0, 45.0, true);
+        player.observe(3, [9.0, 70.0, 9.0], 90.0, 45.0, false, true);
         assert_eq!(
             player.previous, player.current,
             "a snapped tick collapses the pair: nothing interpolates across a correction"
@@ -2994,11 +3020,29 @@ mod tests {
     }
 
     #[test]
+    fn the_render_pose_carries_the_live_sneak_flag() {
+        // The eye the render pose composes is the entity eye
+        // (`EntityPlayer.getEyeHeight`, `EntityPlayer.java`:2326-2341), so the pose
+        // carries the tick's sneak flag: standing 1.62, sneaking 1.54, and an
+        // interpolated frame keeps the live flag rather than a blend.
+        let mut player = PlayerState::default();
+        player.observe(1, [0.0, 64.0, 0.0], 0.0, 0.0, false, false);
+        let standing = camera_pose(player.current);
+        assert!((standing.eye().y - 65.62).abs() < 1e-6, "standing 1.62");
+        player.observe(2, [0.0, 64.0, 0.0], 0.0, 0.0, true, false);
+        let crouched = camera_pose(player.current);
+        assert!((crouched.eye().y - 65.54).abs() < 1e-6, "sneaking 1.54");
+        let mid = interpolate_pose(camera_pose(player.previous), crouched, 0.5);
+        assert!(mid.sneak, "the live flag carries through the frame");
+        assert!((mid.eye().y - 65.54).abs() < 1e-6);
+    }
+
+    #[test]
     fn the_cloud_offset_is_the_tick_the_session_last_reported() {
         // The client's cloud phase is the session's 20 Hz clock, not a frame counter:
         // the offset a frame draws with is the tick the last PlayerTick carried.
         let mut player = PlayerState::default();
-        player.observe(41, [0.0, 64.0, 0.0], 0.0, 0.0, false);
+        player.observe(41, [0.0, 64.0, 0.0], 0.0, 0.0, false, false);
         let values = SkyValues {
             celestial_angle: 0.25,
             colour: [0.5, 0.6, 0.7],
@@ -3804,6 +3848,24 @@ mod tests {
             snapped: false,
             dead: false,
         }
+    }
+
+    #[test]
+    fn a_hurt_tick_leaves_the_attacker_yaw_term_zero() {
+        // `attackedAtYaw` is zero by source design on the client: the status-2
+        // handler zeroes it (`EntityLivingBase.java`:1362-1363), and the
+        // non-zero setters are server-side (`:961-966`), so the camera's hurt
+        // term reads zero even on a fresh hurt tick.
+        let mut camera = CameraState::default();
+        camera.observe(CameraTick {
+            hurt_time: 10,
+            ..quiet_tick([0.0, 64.0, 0.0])
+        });
+        assert_eq!(camera.hurt_time, 10, "the flash rides the tick");
+        assert_eq!(
+            camera.attacked_at_yaw, 0.0,
+            "the client value is zero by design"
+        );
     }
 
     #[test]

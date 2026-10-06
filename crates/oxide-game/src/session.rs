@@ -2164,7 +2164,8 @@ fn respawn_dimension(dimension: i32) -> Result<i8, SessionError> {
 /// the top of its tick (`Entity.onEntityUpdate`, `Entity.java:420-423`); the
 /// client tick reads the movement input into the sneak flag (`isSneaking`,
 /// `EntityPlayerSP.java:684-688`) and runs the sprint rule once
-/// (`onLivingUpdate`, `:801-820`); the clock advances as [`Clock`] describes.
+/// (`EntityPlayerSP.onLivingUpdate`:801-821; its release's collision term
+/// reads the previous step's flag); the clock advances as [`Clock`] describes.
 /// The tick count is the session's own and is the cloud offset's source (the
 /// source's `cloudTickCounter` advances once per tick, `RenderGlobal.updateClouds`,
 /// `RenderGlobal.java:1138-1146`), reported on every tick either way.
@@ -2220,10 +2221,17 @@ fn step_tick(
     if player.dead {
         player.death_time += 1;
     }
-    // The sneak flag is the held key, and the sprint rule runs once per tick.
+    // The sneak flag is the held key, and the sprint rule runs once per tick,
+    // before the move — so its collision term reads the previous step's flag
+    // (`EntityPlayerSP.java`:818-821; `Entity.java`:818).
     player.sneaking = input.sneak;
     let sprinting = player.sprinting;
-    player.sprinting = player.sprint_tap.update(input, sprinting, player.on_ground);
+    player.sprinting = player.sprint_tap.update(
+        input,
+        sprinting,
+        player.on_ground,
+        player.last_step.collided_horizontally,
+    );
 
     // The double-tap flight toggle (`EntityPlayerSP.onLivingUpdate:823-845`)
     // runs before the movement model consumes `flying`, and its 0x13 goes out
@@ -2238,7 +2246,12 @@ fn step_tick(
     // player, and the report below carries where the step left it. Before Join
     // Game there is no world to move against and the step is skipped.
     if let Some(world) = world {
-        physics::step(player, input, &WorldView(world));
+        // The step's outcome is held for the next tick's sprint release: the
+        // source's sprint rule runs before its move, so the release reads the
+        // previous move's own flag (`EntityPlayerSP.java`:818-821;
+        // `Entity.java`:818).
+        let outcome = physics::step(player, input, &WorldView(world));
+        player.last_step = outcome;
     }
 
     // Landing cancels flight (`EntityPlayerSP.onLivingUpdate:904-908`): the

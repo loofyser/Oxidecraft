@@ -13,10 +13,14 @@ pub struct CameraPose {
     pub yaw: f32,
     /// Pitch in degrees: positive looks down, as vanilla.
     pub pitch: f32,
+    /// Whether the player is sneaking: the eye height the pose composes reads
+    /// it (`EntityPlayer.getEyeHeight`'s `f -= 0.08F`,
+    /// `EntityPlayer.java`:2335-2338).
+    pub sneak: bool,
 }
 
 impl CameraPose {
-    /// The eye position: the pose's feet position plus [`EYE_HEIGHT`].
+    /// The eye position: the pose's feet position plus its eye height.
     ///
     /// This is the entity eye the source's gates measure from (the cloud split at
     /// `EntityRenderer.java:1364` and `:1474`, the raycast origin); the first-person
@@ -24,9 +28,21 @@ impl CameraPose {
     pub fn eye(&self) -> Vec3 {
         Vec3::new(
             self.position[0] as f32,
-            self.position[1] as f32 + EYE_HEIGHT,
+            self.position[1] as f32 + self.eye_height(),
             self.position[2] as f32,
         )
+    }
+
+    /// The eye's height above the feet, in blocks: [`EYE_HEIGHT`] standing and
+    /// [`EYE_HEIGHT_SNEAK`] while sneaking — the render path's own copy of the
+    /// game side's two-value rule (`Player::eye_height`); the two crates share
+    /// no edge.
+    pub fn eye_height(&self) -> f32 {
+        if self.sneak {
+            EYE_HEIGHT_SNEAK
+        } else {
+            EYE_HEIGHT
+        }
     }
 
     /// The unit forward vector for the pose's yaw and pitch.
@@ -57,7 +73,14 @@ pub struct Camera {
 }
 
 /// The eye height above the feet position, as vanilla uses.
+///
+/// `EntityPlayer.getEyeHeight`'s `float f = 1.62F` (`EntityPlayer.java`:2328);
+/// [`EYE_HEIGHT_SNEAK`] is its `f -= 0.08F` (`EntityPlayer.java`:2335-2338).
 pub const EYE_HEIGHT: f32 = 1.62;
+/// The sneaking eye height: `EntityPlayer.getEyeHeight`'s `f -= 0.08F`
+/// (`EntityPlayer.java`:2335-2338) — `1.62 − 0.08` = `1.54`, the same
+/// arithmetic the game side's `Player::eye_height` carries.
+pub const EYE_HEIGHT_SNEAK: f32 = 1.54;
 /// Vanilla's default vertical field of view.
 pub const DEFAULT_FOV: f32 = 70.0;
 /// Vanilla's near plane.
@@ -373,7 +396,10 @@ pub fn hurt_roll(
 ///
 /// A tick-to-tick jump of more than four blocks is a server correction, not movement:
 /// the frame takes the current pose whole instead of sweeping the camera through the
-/// world (spec P5's snap rule). The fraction is expected in `0..=1`; the client clamps it.
+/// world (spec P5's snap rule). The sneak flag is not interpolated — it is the current
+/// pose's own, because the source reads the live entity's eye height
+/// (`float f = entity.getEyeHeight()`, `EntityRenderer.java`:637), never a blend. The
+/// fraction is expected in `0..=1`; the client clamps it.
 pub fn interpolate_pose(prev: CameraPose, cur: CameraPose, partial: f32) -> CameraPose {
     let dx = cur.position[0] - prev.position[0];
     let dy = cur.position[1] - prev.position[1];
@@ -390,6 +416,7 @@ pub fn interpolate_pose(prev: CameraPose, cur: CameraPose, partial: f32) -> Came
         ],
         yaw: prev.yaw + (cur.yaw - prev.yaw) * partial,
         pitch: prev.pitch + (cur.pitch - prev.pitch) * partial,
+        sneak: cur.sneak,
     }
 }
 
@@ -422,9 +449,10 @@ pub fn camera_effect(
 #[cfg(test)]
 mod tests {
     use super::{
-        Camera, CameraPose, CameraSensor, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, FovInputs,
-        FovSmoother, NEAR_PLANE, NO_VIEW_EFFECT, ViewRotation, WalkDistance, bob_rotations,
-        bob_translate, camera_effect, fov, fov_modifier, hurt_roll, interpolate_pose, render_eye,
+        Camera, CameraPose, CameraSensor, DEFAULT_FOV, EYE_HEIGHT, EYE_HEIGHT_SNEAK,
+        FIRST_PERSON_OFFSET, FovInputs, FovSmoother, NEAR_PLANE, NO_VIEW_EFFECT, ViewRotation,
+        WalkDistance, bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll,
+        interpolate_pose, render_eye,
     };
     use glam::{Vec3, Vec4};
 
@@ -440,6 +468,7 @@ mod tests {
                 position: [7.5, 57.0, feet_z],
                 yaw: 180.0,
                 pitch: 0.0,
+                sneak: false,
             },
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
@@ -762,11 +791,13 @@ mod tests {
             position: [0.0, 64.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            sneak: false,
         };
         let far = CameraPose {
             position: [5.0, 64.0, 0.0],
             yaw: 90.0,
             pitch: 10.0,
+            sneak: false,
         };
         assert_eq!(
             interpolate_pose(origin, far, 0.5),
@@ -777,6 +808,7 @@ mod tests {
             position: [3.0, 64.0, 0.0],
             yaw: 90.0,
             pitch: 10.0,
+            sneak: false,
         };
         let mid = interpolate_pose(origin, near, 0.5);
         assert!((mid.position[0] - 1.5).abs() < 1e-9, "the midpoint");
@@ -784,6 +816,26 @@ mod tests {
         assert!((mid.pitch - 5.0).abs() < 1e-4);
         assert_eq!(interpolate_pose(origin, near, 0.0), origin);
         assert_eq!(interpolate_pose(origin, near, 1.0), near);
+        // The sneak flag is not interpolated: the eye reads the live pose's
+        // own flag, so a slide from standing to crouched keeps the crouch.
+        let standing = CameraPose {
+            position: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            sneak: false,
+        };
+        let crouching = CameraPose {
+            position: [2.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            sneak: true,
+        };
+        let mid = interpolate_pose(standing, crouching, 0.5);
+        assert!(mid.sneak, "the live flag carries through the frame");
+        assert!(
+            !interpolate_pose(crouching, standing, 0.5).sneak,
+            "and back to standing"
+        );
     }
 
     #[test]
@@ -794,11 +846,13 @@ mod tests {
             position: [0.0, 64.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            sneak: false,
         };
         let exactly = CameraPose {
             position: [4.0, 64.0, 0.0],
             yaw: 90.0,
             pitch: 10.0,
+            sneak: false,
         };
         let mid = interpolate_pose(origin, exactly, 0.5);
         assert_eq!(
@@ -830,6 +884,7 @@ mod tests {
             position: [1.0, 2.0, 3.0],
             yaw: 90.0,
             pitch: 30.0,
+            sneak: false,
         };
         let eye = pose.eye();
         assert_eq!(EYE_HEIGHT, 1.62, "the eye height the game side carries too");
@@ -845,6 +900,31 @@ mod tests {
         let back = eye - displaced;
         assert!(
             (back - pose.forward() * FIRST_PERSON_OFFSET).length() < 1e-6,
+            "the displacement is exactly the offset along the view axis"
+        );
+        // The crouch literal: the same pose sneaking drops the eye to 1.54,
+        // and the render eye keeps its displacement.
+        let crouched = CameraPose {
+            position: [1.0, 2.0, 3.0],
+            yaw: 90.0,
+            pitch: 30.0,
+            sneak: true,
+        };
+        assert_eq!(EYE_HEIGHT_SNEAK, 1.54, "f -= 0.08F");
+        assert!(
+            (crouched.eye().y - (2.0 + 1.54)).abs() < 1e-6,
+            "the sneak eye drops the 0.08: {}",
+            crouched.eye().y
+        );
+        let crouched_displaced = render_eye(&crouched);
+        assert!(
+            (crouched_displaced.y - 3.59).abs() < 1e-5,
+            "the displacement follows the sneak eye: {}",
+            crouched_displaced.y
+        );
+        let crouched_back = crouched.eye() - crouched_displaced;
+        assert!(
+            (crouched_back - crouched.forward() * FIRST_PERSON_OFFSET).length() < 1e-6,
             "the displacement is exactly the offset along the view axis"
         );
     }
@@ -871,6 +951,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            sneak: false,
         };
         let camera = Camera {
             pose,

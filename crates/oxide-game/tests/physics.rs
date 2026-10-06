@@ -283,6 +283,128 @@ fn walking_into_a_full_block_stops() {
     assert!(player.on_ground);
 }
 
+/// A clear walk never clips: every step's flag stays false — the source's
+/// `d3 != x || d5 != z` is false on open ground (`Entity.java`:818).
+#[test]
+fn a_free_walk_reports_no_horizontal_collision() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 30);
+    let mut player = standing_at(0.5, 0.5);
+    let intent = held(&[Key::W]);
+    let mut outcomes = Vec::new();
+    for _ in 0..40 {
+        outcomes.push(step(&mut player, &intent, &view));
+    }
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| !outcome.collided_horizontally),
+        "a clear run never clips: {outcomes:?}"
+    );
+}
+
+/// A wall stops the walk and the step says so: the first step is clear, and
+/// every step after the box reaches the face reports the collision
+/// (`Entity.java`:818).
+#[test]
+fn walking_into_a_wall_reports_the_horizontal_collision() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 4);
+    for x in -1..=1 {
+        view.column(x, 4, 0, 4, Block::Full);
+    }
+    let mut player = standing_at(0.5, 0.5);
+    let intent = held(&[Key::W]);
+    let first = step(&mut player, &intent, &view);
+    assert!(
+        !first.collided_horizontally,
+        "the first step is still clear of the wall: {first:?}"
+    );
+    let mut last = first;
+    for _ in 1..200 {
+        last = step(&mut player, &intent, &view);
+    }
+    assert!(
+        last.collided_horizontally,
+        "the pinned step reports the collision: {last:?}"
+    );
+    assert!(
+        (player.position[2] - 3.7).abs() < 1e-6,
+        "stopped at the face, got {}",
+        player.position[2]
+    );
+}
+
+/// A diagonal move into a wall: one axis is clipped while the other slides,
+/// and the flag still reports the collision — `d3 != x` holds even though
+/// the z motion passed (`Entity.java`:818).
+#[test]
+fn a_diagonal_into_a_wall_reports_the_clipped_axis() {
+    let mut view = TestView::new();
+    view.ground(-4, 8, -4, 30);
+    for z in -1..=30 {
+        view.column(1, z, 0, 4, Block::Full);
+    }
+    let mut player = standing_at(0.5, 0.5);
+    let intent = held(&[Key::W, Key::A]);
+    for _ in 0..60 {
+        step(&mut player, &intent, &view);
+    }
+    let before = player.position;
+    let outcome = step(&mut player, &intent, &view);
+    assert!(
+        outcome.collided_horizontally,
+        "the clipped x axis is the flag: {outcome:?}"
+    );
+    assert!(
+        (player.position[0] - 0.7).abs() < 1e-6,
+        "x is pinned at the wall face, got {}",
+        player.position[0]
+    );
+    assert!(
+        player.position[2] - before[2] > 1e-6,
+        "z still slides along the wall, got {}",
+        player.position[2] - before[2]
+    );
+}
+
+/// Motion along +x alone, clipped by a wall on that axis alone: the flag is
+/// the x comparison while z never moved (`Entity.java`:818).
+#[test]
+fn a_blocked_x_move_reports_the_collision_on_that_axis_alone() {
+    let mut view = TestView::new();
+    view.ground(-4, 4, -4, 4);
+    for z in -1..=1 {
+        view.column(1, z, 0, 4, Block::Full);
+    }
+    let mut player = standing_at(0.5, 0.5);
+    let intent = held(&[Key::A]);
+    for _ in 0..40 {
+        step(&mut player, &intent, &view);
+    }
+    let before = player.position;
+    let outcome = step(&mut player, &intent, &view);
+    assert!(
+        outcome.collided_horizontally,
+        "the x clip is the flag: {outcome:?}"
+    );
+    assert!(
+        (player.position[0] - 0.7).abs() < 1e-6,
+        "pinned at the wall face, got {}",
+        player.position[0]
+    );
+    assert!(
+        (player.position[2] - before[2]).abs() < 1e-9,
+        "z never moved, got {}",
+        player.position[2] - before[2]
+    );
+    assert!(
+        (player.position[2] - 0.5).abs() < 1e-9,
+        "z stays at the start, got {}",
+        player.position[2]
+    );
+}
+
 /// A half-high slab is climbed without jumping — the `stepHeight` probe
 /// (`Entity.java:721-813`).
 #[test]

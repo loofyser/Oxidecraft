@@ -271,10 +271,19 @@ impl SprintTap {
     ///
     /// `sprinting` is the state the previous tick left; the return value is
     /// the state this tick leaves. The rule is `EntityPlayerSP.onLivingUpdate`'s
-    /// own (`:801-820`); the food gate `flag3`, the item use and blindness
-    /// gates and the horizontal-collision release all need player state this
-    /// client does not carry yet, so they are left out and recorded here.
-    pub fn update(&mut self, input: &Intent, sprinting: bool, on_ground: bool) -> bool {
+    /// own (`EntityPlayerSP.java`:801-821); `collided_horizontally` is the
+    /// previous step's own flag (`Entity.java`:818), read on the tick after
+    /// the move that set it. The food gate `flag3` (`EntityPlayerSP.java`:799)
+    /// and the item use and blindness gates stay unwired and recorded: the
+    /// update is not handed the player's food or flight state, and no
+    /// held-item or potion state exists yet.
+    pub fn update(
+        &mut self,
+        input: &Intent,
+        sprinting: bool,
+        on_ground: bool,
+        collided_horizontally: bool,
+    ) -> bool {
         // The source reads the previous tick's input bits before this tick's
         // input updates (`:782-785`), and runs the window down first (`:727-729`).
         let prev_sneak = self.prev_sneak;
@@ -300,9 +309,11 @@ impl SprintTap {
         if !sprinting && forward_reaches && input.sprint {
             sprinting = true;
         }
-        // The release: the scaled input below the threshold drops sprint
-        // (`:818-820`), which is how sneak releases it.
-        if sprinting && !forward_reaches {
+        // The release (`EntityPlayerSP.java`:818-821): the scaled input below
+        // the threshold, a horizontal collision on the previous move, or the
+        // food gate drops sprint — the last term is the one left unwired, as
+        // the doc records.
+        if sprinting && (!forward_reaches || collided_horizontally) {
             sprinting = false;
         }
         sprinting
@@ -353,7 +364,7 @@ mod tests {
     /// One tick of the sprint rule on the ground: the more precise tests
     /// below pass that state explicitly.
     fn tick(tap: &mut SprintTap, intent: &Intent, sprinting: bool) -> bool {
-        tap.update(intent, sprinting, true)
+        tap.update(intent, sprinting, true, false)
     }
 
     /// Asserts two look values agree to the f32 arithmetic's own rounding.
@@ -520,6 +531,30 @@ mod tests {
             !tick(&mut tap, &intent, sprinting),
             "sneak drops the forward input and releases sprint"
         );
+    }
+
+    #[test]
+    fn the_release_carries_the_collision_clause() {
+        // `EntityPlayerSP.java`:818-821: the release is
+        // `isSprinting() && (moveForward < f || isCollidedHorizontally || !flag3)`.
+        // The collision term is live — the flag is the previous move's own
+        // (`Entity.java`:818), read on the tick after the move that set it.
+        // The `!flag3` row stays unwired: food and `allow_flying` exist on the
+        // player, but this update is not handed them, so the term is assumed
+        // true and recorded rather than read.
+        let sprinting_after = |forward: f32, collided: bool| -> bool {
+            let mut tap = SprintTap::default();
+            let mut intent = Intent::neutral();
+            intent.forward = forward;
+            tap.update(&intent, true, true, collided)
+        };
+        assert!(sprinting_after(1.0, false), "a clear run holds the sprint");
+        assert!(!sprinting_after(0.3, false), "a short forward releases it");
+        assert!(
+            !sprinting_after(1.0, true),
+            "a collision on the previous move releases it"
+        );
+        assert!(!sprinting_after(0.3, true), "either disjunct releases it");
     }
 
     #[test]

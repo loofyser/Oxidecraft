@@ -88,8 +88,9 @@
 //! The modelview the source draws the sky with ends with
 //! `GlStateManager.translate(0.0F, -f, 0.0F)` with `f = getEyeHeight()` (`EntityRenderer.java:738`),
 //! so the local geometry — the band's `+16`, the sun's `+100`, the grids' `±384`, the box's `-1`
-//! — is measured from the ground the entity stands on and the camera sits `EYE_HEIGHT` above the
-//! frame's origin. The sky pass builds its view with the eye at `(0, EYE_HEIGHT, 0)` less the
+//! — is measured from the ground the entity stands on and the camera sits the eye height
+//! (`EYE_HEIGHT` standing, `EYE_HEIGHT_SNEAK` while sneaking) above the frame's origin. The sky
+//! pass builds its view with the eye at `(0, eye height, 0)` less the
 //! first-person backward offset the source's camera transform carries
 //! (`GlStateManager.translate(0.0F, 0.0F, -0.1F)`, `:720`, which the terrain's own view has too);
 //! the below-plane lift and the void floor already carry the absolute eye.
@@ -108,7 +109,7 @@ use glam::{Mat4, Vec3};
 
 use oxide_assets::texture::Texture;
 
-use crate::camera::{Camera, EYE_HEIGHT, FIRST_PERSON_OFFSET};
+use crate::camera::{Camera, FIRST_PERSON_OFFSET};
 use crate::fog::FogParams;
 use crate::terrain_pass::DEPTH_FORMAT;
 
@@ -285,11 +286,12 @@ pub fn cloud_layer_y(eye_y: f32) -> f32 {
 /// The entity eye's height above the world origin: the basis both of the source's cloud gates
 /// read (`entity.posY + (double) entity.getEyeHeight()`, `EntityRenderer.java:1364`, `:1474`).
 ///
-/// The basis is the entity's own eye — the reported feet position plus [`EYE_HEIGHT`]. The
-/// source's guards interpolate nothing and read the entity, not the first-person camera the
-/// view pulls a tenth of a block back along the view axis.
+/// The basis is the entity's own eye — the reported feet position plus the pose's eye
+/// height (`CameraPose::eye_height`: 1.62 standing, 1.54 while sneaking, the game side's
+/// own two-value rule). The source's guards interpolate nothing and read the entity, not
+/// the first-person camera the view pulls a tenth of a block back along the view axis.
 fn entity_eye_y(camera: &Camera) -> f64 {
-    camera.pose.position[1] + f64::from(EYE_HEIGHT)
+    camera.pose.position[1] + f64::from(camera.pose.eye_height())
 }
 
 /// Whether the camera's eye is under the cloud layer, the source's gate for the first draw
@@ -1383,7 +1385,7 @@ impl SkyPass {
     /// Stores the camera and the surface aspect the next draw is built with, and refreshes the
     /// uniform.
     ///
-    /// The view is the camera's pose with the eye at `(0, EYE_HEIGHT, 0)` less
+    /// The view is the camera's pose with the eye at `(0, eye height, 0)` less
     /// [`FIRST_PERSON_OFFSET`] along the view axis: the sky's geometry is measured from the
     /// ground the entity stands on, as the source's own modelview makes it
     /// (`GlStateManager.translate(0.0F, -f, 0.0F)`, `EntityRenderer.java:738`), and every
@@ -1419,11 +1421,14 @@ impl SkyPass {
         let aspect = self.aspect.max(0.01);
         let far_plane = params.far_plane * SKY_FAR_MULTIPLIER;
         // The eye the source's camera transform puts the sky at: the local frame's origin plus
-        // the eye height (`EntityRenderer.java:738`'s closing `translate(0.0F, -f, 0.0F)`), less
-        // the first-person backward offset every normally-played pass carries
+        // the eye height — 1.62 standing, 1.54 while sneaking (`EntityRenderer.java`:738's
+        // closing `translate(0.0F, -f, 0.0F)` reads the live entity's own eye height,
+        // `EntityRenderer.java`:637) — less the first-person backward offset every
+        // normally-played pass carries
         // (`EntityRenderer.setupCameraTransform`'s `translate(0.0F, 0.0F, -0.1F)`, `:720`) — the
         // same offset the terrain's own view has (`crate::camera::FIRST_PERSON_OFFSET`).
-        let eye = Vec3::new(0.0, EYE_HEIGHT, 0.0) - FIRST_PERSON_OFFSET * camera.forward();
+        let eye =
+            Vec3::new(0.0, camera.pose.eye_height(), 0.0) - FIRST_PERSON_OFFSET * camera.forward();
         let view_projection = Mat4::perspective_rh(
             camera.fov_degrees.to_radians(),
             aspect,
@@ -1887,6 +1892,7 @@ mod tests {
                 position: [0.5, 126.0, 0.5],
                 yaw: 0.0,
                 pitch: 0.0,
+                sneak: false,
             },
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
@@ -1909,6 +1915,7 @@ mod tests {
                 position: [0.5, feet_y, 0.5],
                 yaw: 0.0,
                 pitch,
+                sneak: false,
             },
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
@@ -1930,6 +1937,24 @@ mod tests {
         assert_eq!(at_layer.eye().y, 128.0, "the boundary pose's eye");
         assert!(!cloud_under_layer(&at_layer));
         assert!(cloud_at_or_above_layer(&at_layer));
+        // The sneak flag moves the basis: the same pose with the flag set
+        // drops the eye 0.08 under the layer and the two arms swap
+        // (`EntityPlayer.getEyeHeight`'s `f -= 0.08F`,
+        // `EntityPlayer.java`:2335-2338).
+        let crouched = Camera {
+            pose: CameraPose {
+                sneak: true,
+                ..at_layer.pose
+            },
+            ..at_layer
+        };
+        assert!(
+            (crouched.eye().y - 127.92).abs() < 1e-3,
+            "the sneak eye drops the 0.08: {}",
+            crouched.eye().y
+        );
+        assert!(cloud_under_layer(&crouched));
+        assert!(!cloud_at_or_above_layer(&crouched));
         let last_under = at(126.37, 0.0);
         assert!(cloud_under_layer(&last_under));
         assert!(!cloud_at_or_above_layer(&last_under));

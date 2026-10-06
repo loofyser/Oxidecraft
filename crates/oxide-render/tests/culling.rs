@@ -242,6 +242,7 @@ fn the_frustum_matches_the_cameras_own_view_projection() {
             position: [0.0, 64.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            sneak: false,
         },
         fov_degrees: DEFAULT_FOV,
         near: NEAR_PLANE,

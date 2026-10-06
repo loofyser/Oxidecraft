@@ -286,6 +286,7 @@ fn camera_at(feet_y: f64) -> Camera {
             position: [0.5, feet_y, 0.5],
             yaw: 0.0,
             pitch: 0.0,
+            sneak: false,
         },
         fov_degrees: DEFAULT_FOV,
         near: 0.05,

@@ -2872,6 +2872,7 @@ mod tests {
                 position: [0.0, 0.0, 0.0],
                 yaw: 180.0,
                 pitch: 0.0,
+                sneak: false,
             },
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,

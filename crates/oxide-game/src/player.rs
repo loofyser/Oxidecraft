@@ -3,14 +3,20 @@
 use oxide_proto_v47::clientbound::PlayerAbilities;
 
 use crate::input::SprintTap;
+use crate::physics::StepOutcome;
 
 /// The standing eye height above the player's feet, in blocks.
 ///
-/// `EntityPlayer.getEyeHeight` (`EntityPlayer.java:2326-2340`) bases the eye
-/// on `float f = 1.62F`. The source lowers it to 0.2 while sleeping and by
-/// 0.08 while sneaking (`:2330-2337`); M3 carries the standing value, and the
-/// sleeping eye arrives with M6's screens.
+/// `EntityPlayer.getEyeHeight` (`EntityPlayer.java`:2326-2341) bases the eye
+/// on `float f = 1.62F` (`EntityPlayer.java`:2328), lowers it to 0.2 while
+/// sleeping (`EntityPlayer.java`:2330-2333) and by 0.08 while sneaking
+/// (`EntityPlayer.java`:2335-2338). The sleeping eye arrives with M6's
+/// screens; the sneak value is [`EYE_HEIGHT_SNEAK`].
 const EYE_HEIGHT: f64 = 1.62;
+
+/// The sneaking eye height: the source's `f -= 0.08F`
+/// (`EntityPlayer.java`:2335-2338) — `1.62 − 0.08` = `1.54`.
+const EYE_HEIGHT_SNEAK: f64 = 1.54;
 
 /// The default flight speed: `private float flySpeed = 0.05F`
 /// (`PlayerCapabilities.java:23`).
@@ -106,7 +112,8 @@ impl Abilities {
 /// The fields are the surface the movement and physics rules extend.
 /// `position`, `last_tick_position`, `tick`, the look and the flags are what
 /// the per-tick `PlayerTick` event reports; `motion` and `on_ground` are the
-/// physics core's input; `flying` and `in_water` gate the movement rules;
+/// physics core's input; `flying` and `in_water` gate the movement rules,
+/// and `last_step` carries the last step's outcome to the sprint release;
 /// `abilities` is the server's own statement of flight and the speeds it
 /// sets. `last_reported_*`, `position_update_ticks`, `server_sprint_state`
 /// and `server_sneak_state` are the walking report's state, the source's
@@ -136,6 +143,15 @@ pub struct Player {
     pub flying: bool,
     /// Whether the player is in water.
     pub in_water: bool,
+    /// The most recent step's outcome, read by the next tick's sprint release.
+    ///
+    /// The source keeps the same fact as the entity's own
+    /// `isCollidedHorizontally` field (`Entity.java`:109), assigned at the
+    /// end of the move (`Entity.java`:818) and read by the following tick's
+    /// sprint release (`EntityPlayerSP.java`:818-821); the session writes it
+    /// from the step's return and the release reads it before the next step
+    /// runs.
+    pub last_step: StepOutcome,
     /// Ticks left before the held jump may fire again.
     ///
     /// `EntityLivingBase.onLivingUpdate:1949-1952` counts `jumpTicks` down and
@@ -210,11 +226,15 @@ pub struct Player {
     pub hurt_time: u32,
     /// The yaw the last hurt came from (`attackedAtYaw`), for the hurt roll.
     ///
-    /// The client's own status-2 handler zeroes it
-    /// (`EntityLivingBase.handleStatusUpdate:1363`); the attacker-derived value
-    /// is computed server-side in `attackEntityFrom` (`:961`) from the
-    /// attacker's position and is never carried by the status packet, so this
-    /// stays zero until M4 tracks attackers.
+    /// Zero by source design on the client: the status-2 handler zeroes it
+    /// (`EntityLivingBase.java`:1362-1363), the packet-only
+    /// `performHurtAnimation` zeroes it too (`EntityLivingBase.java`:1183-1187,
+    /// reached from `NetHandlerPlayClient.handleAnimation`'s type 1,
+    /// `:879-881`), and the client refuses damage outright
+    /// (`EntityPlayerSP.java`:140-143). The only non-zero setters are the
+    /// server-side branches of `attackEntityFrom` (`EntityLivingBase.java`:961-966,
+    /// the attacker-derived `atan2`), and the status packet never carries them —
+    /// so this stays zero until M4 tracks attackers.
     pub attacked_at_yaw: f32,
 }
 
@@ -232,6 +252,7 @@ impl Player {
             sneaking: false,
             flying: false,
             in_water: false,
+            last_step: StepOutcome::default(),
             jump_ticks: 0,
             tick: 0,
             sprint_tap: SprintTap::default(),
@@ -257,10 +278,20 @@ impl Player {
 
     /// The eye's height above the feet, in blocks.
     ///
-    /// The one place the constant is defined; the interaction raycast and the
-    /// camera read the value from here.
+    /// The source's two-value rule (`EntityPlayer.getEyeHeight`,
+    /// `EntityPlayer.java`:2326-2341): `1.62` standing and `1.54` while
+    /// sneaking (`f -= 0.08F`, `EntityPlayer.java`:2335-2338); sleeping is
+    /// not modelled. The interaction raycast composes its origin from this
+    /// method. The render path carries its own copy of the two values
+    /// (`oxide-render`'s `EYE_HEIGHT` / `EYE_HEIGHT_SNEAK` — the two crates
+    /// share no edge), and the client folds the live sneak flag into the
+    /// render pose.
     pub fn eye_height(&self) -> f64 {
-        EYE_HEIGHT
+        if self.sneaking {
+            EYE_HEIGHT_SNEAK
+        } else {
+            EYE_HEIGHT
+        }
     }
 
     /// Sets the flight state, both copies of it.
@@ -319,11 +350,14 @@ impl Player {
     /// [`EntityStatus::HURT`](oxide_proto_v47::clientbound::EntityStatus::HURT)).
     ///
     /// The source's status-2 branch sets `hurtTime = maxHurtTime = 10` and
-    /// zeroes `attackedAtYaw` (`EntityLivingBase.handleStatusUpdate:1362-1363`).
-    /// The attacker-derived yaw — `attackEntityFrom` computes it from the
-    /// attacker's position (`:961`) — is server-side state that the status
-    /// packet does not carry, so the field stays zero until M4 tracks
-    /// attackers; that split is recorded on [`Player::attacked_at_yaw`].
+    /// zeroes `attackedAtYaw` (`EntityLivingBase.java`:1362-1363) — the same
+    /// zero the packet-only `performHurtAnimation` writes
+    /// (`EntityLivingBase.java`:1183-1187). The attacker-derived yaw is
+    /// server-side state that neither path carries: it is computed only in
+    /// `attackEntityFrom`'s server branches (`EntityLivingBase.java`:961-966),
+    /// and the client refuses damage outright (`EntityPlayerSP.java`:140-143).
+    /// The field stays zero until M4 tracks attackers; that split is recorded
+    /// on [`Player::attacked_at_yaw`].
     pub fn apply_hurt_status(&mut self) {
         self.hurt_time = MAX_HURT_TIME;
         self.attacked_at_yaw = 0.0;
@@ -342,8 +376,9 @@ impl Player {
     /// flips the yaw to -180 (`PlayerControllerMP.flipPlayer:110-113`). This
     /// port keeps the session's own object and clears the same transients in
     /// place: the motion, the pitch, the movement flags and their server
-    /// mirrors, the ground, water, jump and flight-toggle state, the hurt
-    /// flash and the death state. The position and the yaw are left to the
+    /// mirrors, the ground, water, jump and flight-toggle state, the last
+    /// step's outcome, the hurt flash and the death state. The position and
+    /// the yaw are left to the
     /// 0x08 that follows, which carries them absolutely.
     pub fn reset_for_respawn(&mut self) {
         self.motion = [0.0; 3];
@@ -366,6 +401,7 @@ impl Player {
         self.fly_toggle_timer = 0;
         self.prev_jump = false;
         self.sprint_tap = SprintTap::default();
+        self.last_step = StepOutcome::default();
     }
 }
 
@@ -379,11 +415,11 @@ impl Default for Player {
 mod tests {
     //! The pinned literals of the player state.
 
-    use super::{Abilities, MAX_HURT_TIME, Player};
+    use super::{Abilities, EYE_HEIGHT_SNEAK, MAX_HURT_TIME, Player};
 
     #[test]
     fn a_new_player_is_at_the_origin_and_the_eye_is_the_sources_own_height() {
-        let player = Player::new();
+        let mut player = Player::new();
         assert_eq!(player.position, [0.0, 0.0, 0.0]);
         assert_eq!(player.last_tick_position, [0.0, 0.0, 0.0]);
         assert_eq!(player.motion, [0.0, 0.0, 0.0]);
@@ -394,8 +430,12 @@ mod tests {
         assert!(!player.sneaking);
         assert!(!player.flying);
         assert!(!player.in_water);
-        // `EntityPlayer.java:2326-2340`: `float f = 1.62F`.
+        // `EntityPlayer.java`:2326-2341: `float f = 1.62F` standing.
         assert_eq!(player.eye_height(), 1.62);
+        assert_eq!(EYE_HEIGHT_SNEAK, 1.54, "f -= 0.08F");
+        // While sneaking the eye drops by the source's 0.08.
+        player.sneaking = true;
+        assert_eq!(player.eye_height(), 1.54);
         // The abilities start at the source's field initialisers
         // (`PlayerCapabilities.java:23-24`) with every flag false: nothing
         // arrives until a 0x39 does.
@@ -428,8 +468,11 @@ mod tests {
 
     #[test]
     fn the_hurt_status_sets_the_maximum_hurt_time_and_zeroes_the_attacker_yaw() {
-        // `EntityLivingBase.handleStatusUpdate:1362-1363`: status 2 sets
-        // `hurtTime = maxHurtTime = 10` and `attackedAtYaw = 0.0F`.
+        // `EntityLivingBase.java`:1362-1363: status 2 sets
+        // `hurtTime = maxHurtTime = 10` and `attackedAtYaw = 0.0F` — zero by
+        // source design on this side: the non-zero setters are server-side
+        // (`EntityLivingBase.java`:961-966), and the client refuses damage
+        // (`EntityPlayerSP.java`:140-143).
         assert_eq!(MAX_HURT_TIME, 10, "the source's own ten ticks");
         let mut player = Player::new();
         player.hurt_time = 3;
@@ -464,6 +507,7 @@ mod tests {
         player.jump_ticks = 6;
         player.fly_toggle_timer = 5;
         player.prev_jump = true;
+        player.last_step.collided_horizontally = true;
         player.abilities.allow_flying = true;
         // A flight left over from before the death: the abilities say the
         // player is not flying, so the reset must follow them, not the stale
@@ -482,6 +526,10 @@ mod tests {
         assert!(!player.sneaking);
         assert!(!player.server_sprint_state);
         assert!(!player.server_sneak_state);
+        assert!(
+            !player.last_step.collided_horizontally,
+            "the last step's outcome starts over"
+        );
         assert!(!player.flying, "the abilities' own flying value is false");
         assert!(!player.abilities.flying, "both copies agree");
         assert!(!player.on_ground);

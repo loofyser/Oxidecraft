@@ -31,11 +31,11 @@
 //! # What this model does not carry
 //!
 //! * The cobweb drag (`Entity.java:611-621`) has no view concept yet.
-//! * The sprint rule that can *clear* the sprint state — the source's
-//!   `isCollidedHorizontally` clause (`EntityPlayerSP.java:801-820`) — needs
-//!   the collision flag from the previous move; the input layer's
-//!   [`crate::input::SprintTap`] documents leaving it out. `step` reads
-//!   `player.sprinting` and never sets it.
+//! * The sprint rule itself — engage and release (`EntityPlayerSP.java`:801-821)
+//!   — lives with the input layer ([`crate::input::SprintTap`]); `step` reads
+//!   `player.sprinting` and never sets it. The collision flag the release's
+//!   `isCollidedHorizontally` clause reads rides out in [`StepOutcome`] for
+//!   the session to hold across the tick.
 //! * Fall damage (`Entity.updateFallState`), the riding branches, the
 //!   entity-push and the walking stats are not modelled.
 //! * The depth-strider scaling of the water branch
@@ -216,6 +216,20 @@ pub trait CollisionView {
     fn climbable(&self, x: i32, y: i32, z: i32) -> bool;
 }
 
+/// What one [`step`] leaves for the rules that read it next.
+///
+/// The source assigns its `isCollidedHorizontally` field once, at the end of
+/// `Entity.moveEntity` after the collision walk and the step-up selection
+/// (`Entity.java`:816-821, the flag at `Entity.java`:818), and the next
+/// tick's sprint release reads it (`EntityPlayerSP.java`:818-821). The step
+/// surfaces the flag so the session can hold it for that read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StepOutcome {
+    /// Whether the step's horizontal motion was cut by a collision — the
+    /// source's `isCollidedHorizontally` (`Entity.java`:818).
+    pub collided_horizontally: bool,
+}
+
 /// One 1/20 s step of the player movement model.
 ///
 /// The caller supplies the tick's [`Intent`] — the held keys as the input
@@ -224,8 +238,10 @@ pub trait CollisionView {
 /// owns the position, the motion, the ground state, the sneak flag and the
 /// in-water flag; the sprint state machine and the flight toggle stay with
 /// the input layer, and `step` only reads `player.sprinting` and
-/// `player.flying`.
-pub fn step(player: &mut Player, input: &Intent, view: &dyn CollisionView) {
+/// `player.flying`. The step returns the move's [`StepOutcome`] — the
+/// source's `isCollidedHorizontally` (`Entity.java`:818) — for the sprint
+/// release of the following tick to read.
+pub fn step(player: &mut Player, input: &Intent, view: &dyn CollisionView) -> StepOutcome {
     // The held sneak state the collision walk reads; `EntityPlayerSP` sets it
     // from the input before its super call (`EntityPlayerSP.java:723-758`).
     player.sneaking = input.sneak;
@@ -296,16 +312,17 @@ pub fn step(player: &mut Player, input: &Intent, view: &dyn CollisionView) {
     let strafe = input.strafe * 0.98;
     let forward = input.forward * 0.98;
 
-    if player.flying {
+    let collided_horizontally = if player.flying {
         // `EntityPlayer.moveEntityWithHeading:1794-1806` — the fly speed
         // stands in for the air acceleration, and the vertical motion is
         // restored to `d3 * 0.6` of the tick.
         let d3 = player.motion[1];
         let fly_factor = FLY_SPEED * if player.sprinting { 2.0 } else { 1.0 };
-        travel(
+        let flag = travel(
             player, strafe, forward, view, move_speed, fly_factor, in_lava,
         );
         player.motion[1] = d3 * FLY_VERTICAL_RETAIN;
+        flag
     } else {
         travel(
             player,
@@ -315,7 +332,11 @@ pub fn step(player: &mut Player, input: &Intent, view: &dyn CollisionView) {
             move_speed,
             jump_movement_factor,
             in_lava,
-        );
+        )
+    };
+
+    StepOutcome {
+        collided_horizontally,
     }
 }
 
@@ -344,7 +365,8 @@ fn jump(player: &mut Player) {
 /// `EntityLivingBase.moveEntityWithHeading` (`:1602-1682`), with the player's
 /// flight already resolved. The three branches are the source's own:
 /// `!isInWater() || flying` selects the land rules, then `!isInLava()` splits
-/// lava off (`:1606-1733`).
+/// lava off (`:1606-1733`); each branch returns the `isCollidedHorizontally`
+/// flag its move produced.
 fn travel(
     player: &mut Player,
     strafe: f32,
@@ -353,11 +375,11 @@ fn travel(
     move_speed: f32,
     jump_movement_factor: f32,
     in_lava: bool,
-) {
+) -> bool {
     if player.in_water && !player.flying {
-        water(player, strafe, forward, view);
+        water(player, strafe, forward, view)
     } else if in_lava && !player.flying {
-        lava(player, strafe, forward, view);
+        lava(player, strafe, forward, view)
     } else {
         land_or_air(
             player,
@@ -366,7 +388,7 @@ fn travel(
             view,
             move_speed,
             jump_movement_factor,
-        );
+        )
     }
 }
 
@@ -386,7 +408,8 @@ fn ground_friction(player: &Player, view: &dyn CollisionView) -> f32 {
     }
 }
 
-/// The land and air rules (`EntityLivingBase.java:1608-1682`).
+/// The land and air rules (`EntityLivingBase.java`:1608-1682); returns the
+/// move's `isCollidedHorizontally` flag.
 fn land_or_air(
     player: &mut Player,
     strafe: f32,
@@ -394,7 +417,7 @@ fn land_or_air(
     view: &dyn CollisionView,
     move_speed: f32,
     jump_movement_factor: f32,
-) {
+) -> bool {
     let mut f4 = ground_friction(player, view);
     let f = GROUND_ACCEL_FACTOR / (f4 * f4 * f4);
     let f5 = if player.on_ground {
@@ -425,10 +448,13 @@ fn land_or_air(
     player.motion[1] *= DRAG_Y;
     player.motion[0] *= f64::from(f4);
     player.motion[2] *= f64::from(f4);
+
+    collided_horizontally
 }
 
-/// Water (`EntityLivingBase.java:1700-1734`).
-fn water(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView) {
+/// Water (`EntityLivingBase.java`:1700-1734); returns the move's
+/// `isCollidedHorizontally` flag.
+fn water(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView) -> bool {
     let d0 = player.position[1];
     move_flying(player, strafe, forward, WATER_ACCEL);
     let collided_horizontally = move_entity(player, view);
@@ -447,10 +473,13 @@ fn water(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionVie
     {
         player.motion[1] = SWIM_UP;
     }
+
+    collided_horizontally
 }
 
-/// Lava (`EntityLivingBase.java:1684-1698`).
-fn lava(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView) {
+/// Lava (`EntityLivingBase.java`:1684-1698); returns the move's
+/// `isCollidedHorizontally` flag.
+fn lava(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView) -> bool {
     let d1 = player.position[1];
     move_flying(player, strafe, forward, LAVA_ACCEL);
     let collided_horizontally = move_entity(player, view);
@@ -469,6 +498,8 @@ fn lava(player: &mut Player, strafe: f32, forward: f32, view: &dyn CollisionView
     {
         player.motion[1] = SWIM_UP;
     }
+
+    collided_horizontally
 }
 
 /// `Entity.moveFlying` (`Entity.java:1224-1245`): the input vector is
@@ -493,7 +524,8 @@ fn move_flying(player: &mut Player, strafe: f32, forward: f32, friction: f32) {
 
 /// `Entity.moveEntity` (`Entity.java:598-854`), less the `noClip` and cobweb
 /// branches the M3 surface cannot name. Returns the `isCollidedHorizontally`
-/// flag the liquid branches and the ladder boost read after the move.
+/// flag the liquid branches and the ladder boost read after the move — and
+/// the flag [`step`] surfaces in [`StepOutcome`].
 fn move_entity(player: &mut Player, view: &dyn CollisionView) -> bool {
     let mut x = player.motion[0];
     let mut y = player.motion[1];

@@ -1275,6 +1275,13 @@ mod tests {
         [feet[0], feet[1] + 1.62, feet[2]]
     }
 
+    /// The eye a sneaking player at `feet` looks from: the same pose eye
+    /// `1.54` up — `EntityPlayer.getEyeHeight`'s `f -= 0.08F`
+    /// (`EntityPlayer.java`:2335-2338).
+    fn sneak_pose_eye(feet: [f64; 3]) -> [f64; 3] {
+        [feet[0], feet[1] + 1.54, feet[2]]
+    }
+
     /// The aim a player at `feet`, looking at `yaw` and `pitch`, finds in
     /// `world` with the given reach.
     fn aim_in(world: &World, feet: [f64; 3], yaw: f32, pitch: f32, reach: f64) -> Option<Aim> {
@@ -2082,6 +2089,23 @@ mod tests {
         let aim = raycast(&WorldView(&far), forward, dir, CREATIVE_REACH)
             .expect("a forward-displaced eye reaches it");
         assert_eq!((aim.x, aim.y, aim.z), (0, 65, 6));
+        // And while sneaking the composed origin drops to feet + 1.54: the
+        // same slab is met 0.08 lower on its face, so the hit's own y pins
+        // the sneak literal.
+        player.sneaking = true;
+        let sneak_eye = [
+            player.position[0],
+            player.position[1] + player.eye_height(),
+            player.position[2],
+        ];
+        assert_eq!(sneak_eye, sneak_pose_eye([0.5, 64.0, 0.05]));
+        let sneak_aim = raycast(&WorldView(&world), sneak_eye, dir, CREATIVE_REACH)
+            .expect("the sneak eye reaches the slab");
+        assert_eq!(
+            (sneak_aim.x, sneak_aim.y, sneak_aim.z, sneak_aim.face),
+            (0, 65, 5, Face::North)
+        );
+        assert_hit(sneak_aim.hit, [0.5, 65.54, 5.0]);
     }
 
     /// A dig aim at one block with the given rate.
