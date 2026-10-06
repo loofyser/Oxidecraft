@@ -378,7 +378,7 @@ impl ScoreboardTeam {
 ///
 /// The message is the player's plain text, not JSON (`C01PacketChatMessage`),
 /// and it reaches the wire as given: the field's own 100-character cap is the
-/// caller's rule — the chat input and the session's drain enforce it — and
+/// caller's rule — the chat input enforces it and the session's drain guards it — and
 /// the encoder applies no cut of its own. The protocol's string ceiling still
 /// applies through [`write_string`], so an unencodable message is refused
 /// rather than framed with a length prefix the server would misread.

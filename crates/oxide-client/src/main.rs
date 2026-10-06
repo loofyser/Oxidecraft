@@ -2368,7 +2368,7 @@ fn is_f3_press(state: ElementState, key: &WinitKey) -> bool {
 const CHAT_TEXT_CAP: usize = 100;
 
 /// Whether the chat field accepts a character:
-/// `ChatAllowedCharacters.isAllowedCharacter` (`:10-13`) refuses the format
+/// `ChatAllowedCharacters.isAllowedCharacter`:10-13 refuses the format
 /// code `§` (167), everything below the space, and DEL (127), and
 /// `GuiTextField.writeText` (`:132`) filters every append through it.
 fn chat_allowed(c: char) -> bool {
@@ -2393,7 +2393,7 @@ struct ChatInput {
     /// The text, edited in place.
     text: String,
     /// The cursor's byte index into `text`, always on a character boundary
-    /// (the source's cursor is a character index — `GuiTextField`:222-234
+    /// (the source's cursor is a character index — `GuiTextField.setCursorPosition`:310-316
     /// clamps it to the text's length — and the byte index is the port's
     /// form of the same position).
     cursor: usize,
@@ -2431,7 +2431,7 @@ enum ChatKey {
 impl ChatInput {
     /// Opens the field on a default text — `""` from T, `"/"` from the
     /// command key (`Minecraft.java`:2113-2121) — the way
-    /// `GuiTextField.setFocused` (`:698-705`) takes focus: the cursor goes to
+    /// `GuiTextField.setFocused`:698-705 takes focus: the cursor goes to
     /// the text's end and the blink count starts over.
     fn open(&mut self, default: &str) {
         self.open = true;
@@ -2443,23 +2443,21 @@ impl ChatInput {
 
     /// Closes the field and drops its text — the screen's own close; what
     /// was typed and not sent goes with it (the source leaves it on the
-    /// field, and the next open clears the field, `:47-66`).
+    /// field, and the next open clears the field, `GuiChat.java`:47-66).
     fn close(&mut self) {
         self.open = false;
         self.text.clear();
         self.cursor = 0;
     }
 
-    /// Replaces the text with the cursor at its end (`GuiTextField.setText`:
-    /// `:86-101`).
+    /// Replaces the text with the cursor at its end (`GuiTextField.setText`:86-101).
     fn set_text(&mut self, text: &str) {
         self.text.clear();
         self.text.push_str(text);
         self.cursor = self.text.len();
     }
 
-    /// One session tick of the blink counter (`GuiTextField.updateCursorCounter`,
-    /// `:78-81`).
+    /// One session tick of the blink counter (`GuiTextField.updateCursorCounter`:78-81).
     fn tick(&mut self) {
         self.blink = self.blink.wrapping_add(1);
     }
@@ -2555,7 +2553,7 @@ impl ChatInput {
         Some(InputEvent::SendChat { text: message })
     }
 
-    /// One editing key, as `GuiChat.keyTyped` (`:87-138`) reads it: the
+    /// One editing key, as `GuiChat.keyTyped`:87-138 reads it: the
     /// field's own keys are consumed here — the source's Tab completion is
     /// deferred, so Tab is consumed only — every other key is the character
     /// path's, and Enter's send leaves as the event.
@@ -3754,7 +3752,7 @@ mod tests {
     #[test]
     fn the_arrow_history_recalls_the_sent_messages_newest_first() {
         // `GuiChat.getSentHistory` (`:272-296`) over the sent list
-        // (`GuiNewChat.sentMessages`, `:190-206`): the recall cursor starts
+        // (`GuiNewChat.sentMessages`:190-206): the recall cursor starts
         // at the list's end (`GuiChat.initGui`:57), Up walks toward the
         // oldest, Down back to the newest, and a step past the end restores
         // the draft the recall started from.
@@ -3789,7 +3787,7 @@ mod tests {
     fn the_recall_restores_the_draft_and_consecutive_sends_are_folded() {
         // `addToSentMessages` skips a message equal to the previous one
         // (`GuiNewChat.java`:200-206), and the draft typed before the recall
-        // is buffered and restored (`GuiChat.historyBuffer`, `:283-289`).
+        // is buffered and restored (`GuiChat.historyBuffer`:283-289).
         let mut chat = ChatInput::default();
         for message in ["dup", "dup", "next"] {
             chat.open("");

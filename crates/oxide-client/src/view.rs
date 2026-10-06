@@ -1249,8 +1249,8 @@ impl ChatView {
     }
 
     /// The hover tooltip for the state the frame's feed left
-    /// (`GuiScreen.handleComponentHover`'s SHOW_TEXT branch, `:337-339`, over
-    /// `GuiScreen.drawHoveringText`:189-244): the fill and border box at the cursor's
+    /// (`GuiScreen.handleComponentHover`'s SHOW_TEXT branch, `:339-341`, over
+    /// `GuiScreen.drawHoveringText`:189-263): the fill and border box at the cursor's
     /// point, and the hover's text in white, eight and then twelve pixels down
     /// the box's own lines.
     ///
@@ -1272,7 +1272,7 @@ impl ChatView {
             .iter()
             .map(|line| string_width(font, &run_text(line)))
             .collect();
-        // The source's own bounds (`:211-214`): the widest text, and eight
+        // The source's own bounds (`:211-215`): the widest text, and eight
         // pixels plus a ten-pixel line per further line.
         let i = widths.iter().copied().max().unwrap_or(0) as f32;
         let k = if lines.len() > 1 {
@@ -1327,7 +1327,7 @@ impl ChatView {
             height: 1.0,
             colour: TOOLTIP_BORDER_BOTTOM,
         });
-        // The text (`:243-249`): white and shadowed, ten pixels a line with the
+        // The text (`:243-254`): white and shadowed, ten pixels a line with the
         // first line's own extra two.
         let mut ty = i2;
         for (index, line) in lines.iter().enumerate() {
@@ -3581,7 +3581,7 @@ mod tests {
     }
 
     /// The hover tooltip (`GuiScreen.handleComponentHover`'s SHOW_TEXT branch
-    /// over `GuiScreen.drawHoveringText`:189-244): the fill and border box at the cursor's
+    /// over `GuiScreen.drawHoveringText`:189-263): the fill and border box at the cursor's
     /// point — fill `-267386864`, the `0x505000FF` top stop and its halved
     /// `0x5028007F` bottom — and the hover's text in white, eight then twelve
     /// pixels down the box's lines.
