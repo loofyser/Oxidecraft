@@ -61,14 +61,14 @@ use oxide_render::camera::{
 };
 use oxide_render::entity_models::{Pose, PoseExtra};
 use oxide_render::entity_pass::{
-    DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw, SkinLookup, TextureRef,
-    TextureRegistry,
+    BOSS_STATUS_TIME, BossStatus, DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw,
+    SkinLookup, TextureRef, TextureRegistry,
 };
 use oxide_render::fog::{FogParams, fog_colour};
-use oxide_render::hud::{HudDraw, HudPass, HudTexture};
+use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
-use oxide_render::renderer::SKY_COLOR;
+use oxide_render::renderer::{SKY_COLOR, boss_status_step};
 use oxide_render::sky::{
     CloudPass, HORIZON, MOON_HEIGHT, SkyParams, SkyPass, SkyTextures, celestial_rotation,
     star_field,
@@ -95,6 +95,10 @@ const TEXT: [u8; 3] = [255, 255, 255];
 /// The overlay shadow colour as 8-bit unorm bytes: the source's `(0xFFFFFFFF & 0x00FCFCFC) >> 2
 /// | 0xFF000000` is 0xFF3F3F3F, 63 per channel.
 const SHADOW: [u8; 3] = [63, 63, 63];
+/// The boss bar's background band colour as 8-bit unorm bytes.
+const BAR_BACK: [u8; 3] = [0, 0, 255];
+/// The boss bar's fill band colour as 8-bit unorm bytes.
+const BAR_FILL: [u8; 3] = [255, 255, 0];
 /// The stone colour the block's vertices carry: multiplied by the white stand-in atlas's
 /// texel, so the block still reads as stone grey.
 const STONE_COLOUR: [f32; 3] = [0.5, 0.5, 0.5];
@@ -256,16 +260,24 @@ fn overlay_font_sheet() -> Texture {
 
 /// The synthetic icon sheet: `gui/icons` in miniature — an opaque green band where the
 /// below-150 ms latency's window lands (`GuiPlayerTabOverlay.drawPing`:248-250 sets the
-/// level, `:270` draws at `(0, 176 + j * 8)`) and a red one where the no-signal window
-/// (`:244-246`'s level 5) does — over a transparent sheet.
+/// level, `:270` draws at `(0, 176 + j * 8)`), a red one where the no-signal window
+/// (`GuiPlayerTabOverlay.drawPing`:244-246's level 5) does, and the boss bar's two windows
+/// (`GuiIngame`:913-918):
+/// blue across the background slice's `(0, 74, 182, 5)` and yellow across the fill's
+/// `(0, 79, 183, 5)` — over a transparent sheet.
 ///
 /// Generated here; no asset store is read and no sheet pixel is copied.
 fn icon_sheet() -> Texture {
     const SIDE: u32 = 256;
     let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
-    for (v, colour) in [(176u32, [0u8, 255, 0, 255]), (216, [255, 0, 0, 255])] {
-        for y in v..v + 8 {
-            for x in 0..10 {
+    for (v, rows, width, colour) in [
+        (176u32, 8u32, 10u32, [0u8, 255, 0, 255]),
+        (216, 8, 10, [255, 0, 0, 255]),
+        (74, 5, 182, [0, 0, 255, 255]),
+        (79, 5, 183, [255, 255, 0, 255]),
+    ] {
+        for y in v..v + rows {
+            for x in 0..width {
                 let at = ((y * SIDE + x) * 4) as usize;
                 rgba[at..at + 4].copy_from_slice(&colour);
             }
@@ -6058,4 +6070,172 @@ fn the_hud_pass_draws_the_scoreboard_sidebar() {
         lit, 888,
         "the three row bands and the title band 24x9 each, the separator 24x1"
     );
+}
+
+/// A hud pass ready for the boss bar's cases: the 64x64 target, the synthetic font and
+/// icon sheet, and the scaled resolution the bar composes against.
+fn boss_bar_scene() -> (wgpu::Device, wgpu::Queue, Target, HudPass, ScaledResolution) {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_texture(&device, &queue, "gui/icons", &icon_sheet());
+    (device, queue, target, hud, scaled_resolution(SIZE, SIZE, 0))
+}
+
+/// A raised status named `|` at `fraction`, for the bar's cases.
+fn boss_status(fraction: f32) -> BossStatus {
+    BossStatus {
+        name: "|".to_owned(),
+        health_fraction: fraction,
+        colour_modifier: true,
+        time: BOSS_STATUS_TIME,
+    }
+}
+
+/// Renders the boss bar's list over a cleared frame and reads the pixels back.
+fn boss_bar_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    hud: &HudPass,
+) -> Vec<u8> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw_boss_bar(pass));
+    queue.submit(Some(encoder.finish()));
+    read_pixels(device, queue, target)
+}
+
+/// The hud draws the half bar's slices over the cleared frame: the fill's right edge at
+/// the boundary pixel and the background past it (`GuiIngame.renderBossHealth`:901-926).
+///
+/// The shape follows the source's rules: the bar at `x = scaledWidth / 2 - 182 / 2`
+/// (`:908-910`), `y = 12`, five tall (`:912`); the background slice `(0, 74, 182, 5)`
+/// drawn twice identically (`:913-914`); the fill `(0, 79, l, 5)` with
+/// `l = (int)(healthScale * (float)(182 + 1))` — 91 at half (`:911`, `:916-918`). The
+/// resolution is 64x64 GUI units onto the 64x64 target, so one unit is one pixel: the
+/// bar's left edge lands at `32 - 91 = -59`, off the target's left side, and the fill
+/// ends at `-59 + 91 = 32`, so the last visible fill pixel is column 31 and the first
+/// background-only pixel column 32. The name draws above: `32 - 2 / 2 = 31` for the
+/// synthetic `|` glyph (`:921-922`), white and shadowed.
+///
+/// The stand-ins: the synthetic sheet's blue background band and yellow fill band (no
+/// asset store is read) and the synthetic font's single `|` glyph for the name.
+///
+/// The count: the bar spans all 64 visible columns of its five rows — 320 pixels — and
+/// the name adds its eight-row ink column and its eight-row shadow column, 336 non-sky
+/// pixels in all. The pinning run measured the fill [255, 255, 0], the background
+/// [0, 0, 255], the ink [255, 255, 255], the shadow [63, 63, 63] and the 336.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_half_boss_bar() {
+    let (device, queue, target, mut hud, scaled) = boss_bar_scene();
+    hud.set_boss_bar(&device, &queue, Some(&boss_status(0.5)), &scaled);
+    let pixels = boss_bar_frame(&device, &queue, &target, &hud);
+
+    // The bar's vertical span: sky above and below its five rows.
+    expect_pixel(&pixels, 31, 11, SKY, "above the bar");
+    expect_pixel(&pixels, 31, 17, SKY, "below the bar");
+    // The fill's visible span and its edge: the last fill pixel at column 31, the first
+    // background-only pixel at 32 — a fill one pixel narrower or wider lands elsewhere.
+    expect_pixel(&pixels, 0, 14, BAR_FILL, "the fill's visible left edge");
+    expect_pixel(&pixels, 31, 14, BAR_FILL, "the last fill pixel");
+    expect_pixel(&pixels, 32, 14, BAR_BACK, "the first background-only pixel");
+    expect_pixel(
+        &pixels,
+        63,
+        14,
+        BAR_BACK,
+        "the background's visible right edge",
+    );
+    // The name above the bar: its ink column and its one-pixel-down-right shadow.
+    expect_pixel(&pixels, 31, 2, TEXT, "the name's ink top");
+    expect_pixel(&pixels, 32, 3, SHADOW, "the name's shadow");
+    let lit = non_sky(&pixels);
+    assert_eq!(lit, 336, "the bar's 64x5 span and the name's two columns");
+}
+
+/// The hud draws the full bar's slices over the cleared frame: the fill across the whole
+/// visible span, the background under it (`GuiIngame.renderBossHealth`:901-926).
+///
+/// The shape rules are the half bar's; `l` is 183 at full (`:911`), so the fill spans
+/// `-59 .. 124` and every visible column is fill — the background only shows past column
+/// 124, off the target.
+///
+/// The count: the bar's 64x5 span and the name's two columns — the same 336 non-sky
+/// pixels as the half bar. The pinning run measured the fill [255, 255, 0] at both edges
+/// and the 336.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_full_boss_bar() {
+    let (device, queue, target, mut hud, scaled) = boss_bar_scene();
+    hud.set_boss_bar(&device, &queue, Some(&boss_status(1.0)), &scaled);
+    let pixels = boss_bar_frame(&device, &queue, &target, &hud);
+
+    expect_pixel(&pixels, 31, 11, SKY, "above the bar");
+    expect_pixel(&pixels, 31, 17, SKY, "below the bar");
+    expect_pixel(&pixels, 0, 14, BAR_FILL, "the fill's visible left edge");
+    expect_pixel(
+        &pixels,
+        31,
+        14,
+        BAR_FILL,
+        "the fill at the half bar's boundary",
+    );
+    expect_pixel(&pixels, 63, 14, BAR_FILL, "the fill's visible right edge");
+    let lit = non_sky(&pixels);
+    assert_eq!(lit, 336, "the bar's 64x5 span and the name's two columns");
+}
+
+/// The hud stops drawing the boss bar when the countdown's hundred frames are spent: the
+/// raise's frame and the ninety-nine after it draw, and the hundredth finds the spent
+/// status and draws nothing (`GuiIngame.renderBossHealth`:903-905 — the gate runs before
+/// the decrement, so the raise's frame enters at the full hundred).
+///
+/// The cell follows [`boss_status_step`]: the raise sets it, each further frame spends
+/// one of its frames, and the frame that finds zero hides the bar. The resolution is
+/// 64x64 GUI units onto the 64x64 target, so the half bar's boundary lands as in its own
+/// case.
+///
+/// The counts: the drawn frame carries the half bar's 336 non-sky pixels; the spent
+/// frame's frame is the clear alone, zero.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_hides_the_spent_boss_bar() {
+    let (device, queue, target, mut hud, scaled) = boss_bar_scene();
+
+    // The raise's frame draws the bar.
+    let mut cell = None;
+    let raised =
+        boss_status_step(&mut cell, Some(boss_status(0.5))).expect("the raise's frame draws");
+    hud.set_boss_bar(&device, &queue, Some(&raised), &scaled);
+    let pixels = boss_bar_frame(&device, &queue, &target, &hud);
+    expect_pixel(
+        &pixels,
+        31,
+        14,
+        BAR_FILL,
+        "the raise's frame draws the fill",
+    );
+    expect_pixel(&pixels, 32, 14, BAR_BACK, "and the background past it");
+    assert_eq!(non_sky(&pixels), 336, "the half bar's pixels");
+
+    // The countdown: f+1 through f+99 draw; f+100's gate finds the spent status.
+    for frame in 1..BOSS_STATUS_TIME {
+        assert!(
+            boss_status_step(&mut cell, None).is_some(),
+            "frame f+{frame} still draws"
+        );
+    }
+    let spent = boss_status_step(&mut cell, None);
+    assert!(spent.is_none(), "f+100's gate finds the spent status");
+    hud.set_boss_bar(&device, &queue, None, &scaled);
+    let pixels = boss_bar_frame(&device, &queue, &target, &hud);
+    assert_eq!(non_sky(&pixels), 0, "the spent frame draws nothing");
 }

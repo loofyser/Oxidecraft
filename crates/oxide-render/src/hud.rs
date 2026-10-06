@@ -26,8 +26,8 @@ use oxide_assets::font::{Font, FontError};
 use oxide_assets::texture::Texture;
 
 use crate::atlas_texture::AtlasTexture;
-use crate::entity_pass::SkinTexId;
-use crate::text::{TextBuilder, TextVertex};
+use crate::entity_pass::{BossStatus, SkinTexId};
+use crate::text::{TextBuilder, TextVertex, string_width};
 
 /// The hud shader: map scaled GUI pixels to clip space through the orthographic
 /// projection, sample the bound texture and multiply the texel by the vertex colour.
@@ -142,6 +142,67 @@ pub fn scaled_resolution(
 /// `MathHelper.ceiling_double_int` of `value / divisor` (`ScaledResolution.java`:37-40).
 fn ceiling_div(value: u32, divisor: u32) -> u32 {
     (f64::from(value) / f64::from(divisor)).ceil() as u32
+}
+
+/// The icon sheet the boss bar's slices sample: `gui/icons.png` (`Gui.java`:14's `icons`),
+/// under the key the client registers it by.
+const ICONS_TEXTURE: &str = "gui/icons";
+
+/// The boss bar's draws for a status at a scaled resolution (`GuiIngame.renderBossHealth`:901-926).
+///
+/// The source's own composition, in its order: the background slice `(0, 74, 182, 5)` of the
+/// 256-texel sheet, drawn twice identically — a no-op, there is no dim (`:913-914`); the fill
+/// slice `(0, 79, l, 5)` with `l = (int)(healthScale * (float)(182 + 1))`, the truncating cast
+/// of the f32 product, only while `l > 0` (`:911`, `:916-918`); and the name centred above
+/// them, white and shadowed (`:921-922`). The bar sits at `x = scaledWidth / 2 - 91`
+/// (`:908-910`) and `y = 12` (`:912`); the name at `y = 2` (`:922`). Every draw is untinted:
+/// the colour modifier tints the world's brightness and fog, not the GUI
+/// (`EntityRenderer.java`:955-961 and `:1889-1895`).
+///
+/// The name's draw needs the measured font to centre it (`i / 2 - stringWidth / 2`,
+/// `GuiIngame.renderBossHealth`:922); without one the bar's slices still compose and the
+/// name is left out, the same nothing a text draw without a font contributes.
+pub fn boss_bar_draws(
+    status: &BossStatus,
+    scaled: &ScaledResolution,
+    font: Option<&Font>,
+) -> Vec<HudDraw> {
+    let i = scaled.width as i32;
+    let k = i / 2 - 182 / 2;
+    let l = (status.health_fraction * 183.0) as u32;
+    let background = HudDraw::TexturedRect {
+        texture: HudTexture::Named(ICONS_TEXTURE),
+        x: k as f32,
+        y: 12.0,
+        width: 182.0,
+        height: 5.0,
+        uv: [0.0, 74.0 / 256.0, 182.0 / 256.0, 79.0 / 256.0],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    };
+    let mut draws = vec![background.clone(), background];
+    if l > 0 {
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(ICONS_TEXTURE),
+            x: k as f32,
+            y: 12.0,
+            width: l as f32,
+            height: 5.0,
+            uv: [0.0, 79.0 / 256.0, l as f32 / 256.0, 84.0 / 256.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+    }
+    if let Some(font) = font {
+        let width = string_width(font, &status.name);
+        draws.push(HudDraw::Text {
+            text: status.name.clone(),
+            x: (i / 2 - width / 2) as f32,
+            y: 2.0,
+            scale: 1.0,
+            colour: [1.0, 1.0, 1.0, 1.0],
+            shadow: true,
+        });
+    }
+    draws
 }
 
 /// One texture a [`HudDraw::TexturedRect`] samples.
@@ -505,6 +566,14 @@ pub struct HudPass {
     draws: Vec<HudDraw>,
     /// The uploaded geometry of that list.
     geometry: Geometry,
+    /// The boss bar's status and the scaled resolution its draws compose against; `None`
+    /// while the bar is hidden.
+    boss_bar: Option<(BossStatus, ScaledResolution)>,
+    /// The boss bar's composed draw list — a function of `boss_bar` and the current font —
+    /// drawn ahead of the frame's own list.
+    boss_draws: Vec<HudDraw>,
+    /// The uploaded geometry of the boss bar's list.
+    boss_geometry: Geometry,
 }
 
 impl HudPass {
@@ -623,6 +692,9 @@ impl HudPass {
             skin_binds: Vec::new(),
             draws: Vec::new(),
             geometry: Geometry::default(),
+            boss_bar: None,
+            boss_draws: Vec::new(),
+            boss_geometry: Geometry::default(),
         }
     }
 
@@ -704,8 +776,10 @@ impl HudPass {
             bind,
         });
         // The stored list was laid out with the previous sheet's metrics, or with no
-        // sheet at all: lay it out again.
+        // sheet at all: lay it out again. The boss bar's draws compose with the sheet
+        // too (the name's centring), so they compose again.
         self.rebuild(device, queue);
+        self.rebuild_boss(device, queue);
         Ok(())
     }
 
@@ -870,20 +944,70 @@ impl HudPass {
     /// depth attachment; the draws blend over what is under them. A batch whose
     /// texture was never set is skipped.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_geometry(pass, &self.geometry);
+    }
+
+    /// Sets the boss bar's status for the following frames; `None` hides the bar.
+    ///
+    /// The bar's draws compose from the status and the scaled resolution through
+    /// [`boss_bar_draws`] and are laid out ahead of the frame's own hud list, the source's
+    /// order (`GuiIngame.java`:184's `renderBossHealth` call precedes the scoreboard and
+    /// the list). Calling this again with draws equal to the stored ones does nothing, so
+    /// a countdown that moves only the status' own frame count re-uploads nothing.
+    pub fn set_boss_bar(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        status: Option<&BossStatus>,
+        scaled: &ScaledResolution,
+    ) {
+        self.boss_bar = status.map(|status| (status.clone(), *scaled));
+        self.rebuild_boss(device, queue);
+    }
+
+    /// Draws the boss bar's list, or nothing when it is empty.
+    ///
+    /// The same pipeline, projection and bindings as [`HudPass::draw`]; the frame calls
+    /// this first so the bar sits under the frame's own list.
+    pub fn draw_boss_bar(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_geometry(pass, &self.boss_geometry);
+    }
+
+    /// Composes the boss bar's draws from the stored status and the current font and lays
+    /// them out, re-uploading only when the composition changed.
+    fn rebuild_boss(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let draws = match &self.boss_bar {
+            Some((status, scaled)) => {
+                boss_bar_draws(status, scaled, self.font.as_ref().map(|sheet| &sheet.font))
+            }
+            None => Vec::new(),
+        };
+        if self.boss_draws == draws {
+            return;
+        }
+        self.boss_draws = draws;
+        let font = self.font.as_ref().map(|sheet| (&sheet.font, sheet.sheet));
+        let built = build(&self.boss_draws, font);
+        self.boss_geometry.store(device, queue, built);
+    }
+
+    /// Draws one uploaded list: the pipeline, the projection and one bind group per batch;
+    /// a batch whose texture was never set is skipped.
+    fn draw_geometry(&self, pass: &mut wgpu::RenderPass<'_>, geometry: &Geometry) {
         let (Some(vertex_buffer), Some(index_buffer)) = (
-            self.geometry.vertex_buffer.as_ref(),
-            self.geometry.index_buffer.as_ref(),
+            geometry.vertex_buffer.as_ref(),
+            geometry.index_buffer.as_ref(),
         ) else {
             return;
         };
-        if self.geometry.index_count == 0 {
+        if geometry.index_count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.ortho_bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        for batch in &self.geometry.batches {
+        for batch in &geometry.batches {
             let bind = match batch.texture {
                 BatchTexture::White => &self.white_bind,
                 BatchTexture::Font => match &self.font {
@@ -1061,11 +1185,24 @@ mod tests {
     //! The scale rule and the geometry's arithmetic, without a GPU.
 
     use super::{
-        Batch, BatchTexture, BuiltGeometry, HudDraw, HudTexture, MIN_HEIGHT, MIN_WIDTH, SkinTexId,
-        VERTEX_BYTES, WHITE_UV, build, scaled_resolution, vertex_layout,
+        Batch, BatchTexture, BuiltGeometry, HudDraw, HudTexture, ICONS_TEXTURE, MIN_HEIGHT,
+        MIN_WIDTH, SkinTexId, VERTEX_BYTES, WHITE_UV, boss_bar_draws, build, scaled_resolution,
+        vertex_layout,
     };
+    use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
+    use crate::text::string_width;
     use oxide_assets::font::Font;
     use oxide_assets::texture::Texture;
+
+    /// A raised status named `AA` at `fraction`, for the composer's own tests.
+    fn boss_status(fraction: f32) -> BossStatus {
+        BossStatus {
+            name: "AA".to_owned(),
+            health_fraction: fraction,
+            colour_modifier: true,
+            time: BOSS_STATUS_TIME,
+        }
+    }
 
     /// A 128x128 synthetic sheet whose `'A'` cell is inked in columns 0..=4: the same
     /// metric the game's chat suite and the text passes' tests measure with.
@@ -1091,6 +1228,91 @@ mod tests {
             None,
         )
         .expect("the synthetic sheet loads")
+    }
+
+    #[test]
+    fn the_boss_bar_draws_the_sources_slices() {
+        // 427 GUI units wide (1280x720 at the auto scale): the bar's left edge at
+        // 427/2 - 182/2 = 122 (`GuiIngame.java`:908-910), the background slice
+        // (0, 74, 182, 5) drawn twice identically (`:913-914`), and the fill
+        // trunc(0.5 * 183) = 91 wide (`:911`, `:916-918`) over the same y. The name is
+        // centred with integer division: 427/2 - 12/2 = 207 for "AA" (`:921-922`), white
+        // and shadowed. Every draw is untinted (`:923`).
+        let scaled = scaled_resolution(1280, 720, 0);
+        assert_eq!(scaled.width, 427);
+        let font = font();
+        assert_eq!(string_width(&font, "AA"), 12, "the fixture's metric");
+        let draws = boss_bar_draws(&boss_status(0.5), &scaled, Some(&font));
+        assert_eq!(
+            draws.len(),
+            4,
+            "two background slices, the fill and the name"
+        );
+        let background = HudDraw::TexturedRect {
+            texture: HudTexture::Named(ICONS_TEXTURE),
+            x: 122.0,
+            y: 12.0,
+            width: 182.0,
+            height: 5.0,
+            uv: [0.0, 74.0 / 256.0, 182.0 / 256.0, 79.0 / 256.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        };
+        assert_eq!(draws[0], background);
+        assert_eq!(
+            draws[1], background,
+            "the second background draw is identical"
+        );
+        assert_eq!(
+            draws[2],
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named(ICONS_TEXTURE),
+                x: 122.0,
+                y: 12.0,
+                width: 91.0,
+                height: 5.0,
+                uv: [0.0, 79.0 / 256.0, 91.0 / 256.0, 84.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            }
+        );
+        assert_eq!(
+            draws[3],
+            HudDraw::Text {
+                text: "AA".to_owned(),
+                x: 207.0,
+                y: 2.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+            }
+        );
+    }
+
+    #[test]
+    fn the_boss_bar_fill_is_the_truncated_width() {
+        // `l = (int)(healthScale * (float)(182 + 1))` (`GuiIngame.java`:911): the
+        // truncating cast of the f32 product — 183 at full, one pixel wider than the
+        // background — 91 at half, and a fraction under 1/183 truncates to zero, which
+        // the guard drops (`:916`).
+        let scaled = scaled_resolution(1280, 720, 0);
+        let fill_width = |fraction| match &boss_bar_draws(&boss_status(fraction), &scaled, None)[2]
+        {
+            HudDraw::TexturedRect { width, .. } => *width,
+            other => panic!("the fill's draw, not {other:?}"),
+        };
+        assert_eq!(fill_width(1.0), 183.0);
+        assert_eq!(fill_width(0.5), 91.0);
+        assert_eq!(fill_width(0.9), 164.0);
+    }
+
+    #[test]
+    fn the_boss_bar_guards_the_zero_fill() {
+        // The fill draws only while `l > 0` (`GuiIngame.java`:916): a zero fraction — or
+        // one that truncates to zero — composes the two background slices alone.
+        let scaled = scaled_resolution(1280, 720, 0);
+        let draws = boss_bar_draws(&boss_status(0.0), &scaled, None);
+        assert_eq!(draws.len(), 2, "the two background slices, no fill");
+        let draws = boss_bar_draws(&boss_status(0.005), &scaled, None);
+        assert_eq!(draws.len(), 2, "0.005 * 183 truncates to zero, no fill");
     }
 
     #[test]

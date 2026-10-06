@@ -517,7 +517,9 @@ pub struct EntityDraw {
     pub hurt: f32,
     /// The death ramp's fraction, one at its end.
     pub death: f32,
-    /// The health pair for the kinds whose maximum is known, in hearts.
+    /// The health pair `(current, maximum)` for the kinds whose maximum is known, in the
+    /// source's health points — the `getHealth()` / `getMaxHealth()` pair the boss status'
+    /// fraction divides (`BossStatus.java`:12).
     pub health: Option<(f32, f32)>,
     /// The composed nametag the draw may show, when the session resolved one.
     pub nametag: Option<NametagDraw>,
@@ -543,6 +545,75 @@ pub struct NametagDraw {
     /// The composed display text, legacy `§` codes included
     /// (`Entity.getDisplayName().getFormattedText()`, `RendererLivingEntity.java`:503).
     pub text: Arc<str>,
+}
+
+/// The boss bar's status: the values a wither's or a dragon's draw raises for the frame's
+/// bar (`BossStatus.java`:3-17).
+///
+/// The source's own four statics: the display name the bar draws, the health fraction its
+/// fill's width reads, the colour-modifier flag the world-side brightness and fog consume
+/// (not the GUI — `EntityRenderer.java`:955-961 and `:1889-1895`), and the hundred-frame hold
+/// [`BOSS_STATUS_TIME`] sets. One status exists at a time: a second boss's draw overwrites
+/// the first's, exactly as the static does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BossStatus {
+    /// The bar's name: the draw's composed nametag when one is present, else the kind's
+    /// default (`BossStatus.java`:14 through `Entity.getName`:2350-2367).
+    pub name: String,
+    /// The health fraction the fill's width reads: `getHealth() / getMaxHealth()`
+    /// (`BossStatus.java`:12).
+    pub health_fraction: f32,
+    /// The source's `hasColorModifier`: true for the wither alone of this set
+    /// (`RenderWither.java`:26; `RenderDragon.java`:94).
+    pub colour_modifier: bool,
+    /// The frames left: a raise sets [`BOSS_STATUS_TIME`], and the draw's own gate-then-
+    /// decrement spends one per rendered frame (`GuiIngame.java`:903-905).
+    pub time: u32,
+}
+
+/// The wither's default bar name: `EntityList.java`:347's `"WitherBoss"` mapping through
+/// `en_US.lang`:1171.
+pub const WITHER_BOSS_NAME: &str = "Wither";
+
+/// The ender dragon's default bar name: `EntityList.java`:346's `"EnderDragon"` mapping
+/// through `en_US.lang`:1170.
+pub const ENDER_DRAGON_BOSS_NAME: &str = "Ender Dragon";
+
+/// The frame count a raise sets: the source's `statusBarTime = 100` (`BossStatus.java`:13).
+pub const BOSS_STATUS_TIME: u32 = 100;
+
+/// The status a frame's draws raise: the last wither or dragon draw's values, or `None`
+/// when neither draws.
+///
+/// The source's only two writers are the renderers' own `doRender`s
+/// (`RenderWither.java`:26 with the colour modifier, `RenderDragon.java`:94 without), each
+/// run on every rendered frame of its boss and overwriting every field — so the last draw
+/// in order wins. The name is the draw's composed nametag when one is present (a custom
+/// name shows verbatim) and the kind's default otherwise; the fraction is the draw's own
+/// health pair, `health / maximum`; the raise's hold is [`BOSS_STATUS_TIME`]. A boss draw
+/// whose pair the session never resolved raises nothing.
+fn raised_status(draws: &[EntityDraw]) -> Option<BossStatus> {
+    let mut raised = None;
+    for draw in draws {
+        let (default, colour_modifier) = match draw.model {
+            ModelRef::Wither { .. } => (WITHER_BOSS_NAME, true),
+            ModelRef::EnderDragon => (ENDER_DRAGON_BOSS_NAME, false),
+            _ => continue,
+        };
+        let Some((health, maximum)) = draw.health else {
+            continue;
+        };
+        raised = Some(BossStatus {
+            name: draw
+                .nametag
+                .as_ref()
+                .map_or_else(|| default.to_owned(), |tag| tag.text.to_string()),
+            health_fraction: health / maximum,
+            colour_modifier,
+            time: BOSS_STATUS_TIME,
+        });
+    }
+    raised
 }
 
 /// A registered texture's id: `Copy`, stable, and never reused.
@@ -1564,30 +1635,33 @@ impl EntityPass {
             .write_buffer(&self.frame_buffer, 0, &self.frame.to_bytes());
     }
 
-    /// Draws the frame's entities.
+    /// Draws the frame's entities, and raises the frame's boss status when one draws.
     ///
     /// Every draw composes its model-space vertices into world space, uploads them in one
     /// write, then issues the source's own sequence: the model (or the hurt combine in its
     /// place when the damage window is open), the cape when the parts byte wears it and a cape
     /// texture is registered, and the shadow quad under the feet. Nothing draws until a camera
-    /// has been set.
+    /// has been set. A wither's or a dragon's draw raises its [`BossStatus`] — the last such
+    /// draw in order wins — and the value comes back to the caller; `None` when no boss draws
+    /// (or nothing does).
     pub fn draw(
         &mut self,
         device: &wgpu::Device,
         pass: &mut wgpu::RenderPass<'_>,
         draws: &[EntityDraw],
         textures: &TextureRegistry,
-    ) {
+    ) -> Option<BossStatus> {
         if !self.camera_set || draws.is_empty() {
-            return;
+            return None;
         }
+        let raised = raised_status(draws);
         let mut vertices: Vec<EntityVertex> = Vec::new();
         let mut built = Vec::with_capacity(draws.len());
         for draw in draws {
             built.push(self.build(draw, textures, &mut vertices));
         }
         if vertices.is_empty() {
-            return;
+            return raised;
         }
         self.upload(device, &vertices);
         for (draw, geometry) in draws.iter().zip(&built) {
@@ -1659,6 +1733,7 @@ impl EntityPass {
                 pass.draw(range.clone(), 0..1);
             }
         }
+        raised
     }
 
     /// Builds one draw's geometry into `vertices`, returning the ranges to draw.
@@ -2826,6 +2901,102 @@ mod tests {
             below_name: None,
             extra: DrawExtra::None,
         }
+    }
+
+    /// A boss draw at the origin: the given model, health pair and optional tag.
+    fn boss_draw(model: ModelRef, health: Option<(f32, f32)>, nametag: Option<&str>) -> EntityDraw {
+        EntityDraw {
+            model,
+            health,
+            nametag: nametag.map(|text| NametagDraw {
+                text: Arc::from(text),
+            }),
+            ..player_draw()
+        }
+    }
+
+    #[test]
+    fn the_boss_status_raise_reads_the_withers_pair() {
+        // The wither's class constant is 300.0 (`EntityWither.java`:605-608) and the
+        // fraction is the raw `getHealth() / getMaxHealth()` (`BossStatus.java`:12): half
+        // at 150, full at 300, zero at 0. The flag is the wither's own
+        // (`RenderWither.java`:26), the name its default (`EntityList.java`:347 through
+        // `en_US.lang`:1171), and the hold the source's hundred (`BossStatus.java`:13).
+        for (health, fraction) in [(150.0_f32, 0.5_f32), (300.0, 1.0), (0.0, 0.0)] {
+            let draws = [boss_draw(
+                ModelRef::Wither { invul_time: 0 },
+                Some((health, 300.0)),
+                None,
+            )];
+            let status = raised_status(&draws).expect("a wither draw raises");
+            assert_eq!(status.name, WITHER_BOSS_NAME);
+            assert_eq!(status.health_fraction, fraction);
+            assert!(
+                status.colour_modifier,
+                "the wither carries the colour modifier"
+            );
+            assert_eq!(status.time, BOSS_STATUS_TIME);
+        }
+    }
+
+    #[test]
+    fn the_boss_status_raise_reads_the_dragons_pair() {
+        // The bar reads the dragon itself — `RenderDragon.doRender` passes the dragon as
+        // its display data (`:92-94`), no part — whose maximum is 200.0
+        // (`EntityDragon.java`:93-96); its flag is false and its default name its own.
+        let draws = [boss_draw(ModelRef::EnderDragon, Some((100.0, 200.0)), None)];
+        let status = raised_status(&draws).expect("a dragon draw raises");
+        assert_eq!(status.name, ENDER_DRAGON_BOSS_NAME);
+        assert_eq!(status.health_fraction, 0.5);
+        assert!(
+            !status.colour_modifier,
+            "the dragon carries no colour modifier"
+        );
+        assert_eq!(status.time, BOSS_STATUS_TIME);
+    }
+
+    #[test]
+    fn the_boss_status_raise_keeps_a_custom_name() {
+        // A custom name shows verbatim: the display name is the custom text when one is
+        // set (`Entity.getName`:2350-2367) and the draw's tag is that composition.
+        let draws = [boss_draw(
+            ModelRef::Wither { invul_time: 0 },
+            Some((150.0, 300.0)),
+            Some("§cBossy"),
+        )];
+        let status = raised_status(&draws).expect("a named wither draw raises");
+        assert_eq!(status.name, "§cBossy", "the display name shows verbatim");
+    }
+
+    #[test]
+    fn the_boss_status_raise_is_the_last_boss_draws() {
+        // One static status: a second boss's set overwrites every field
+        // (`BossStatus.java`:10-16), so the last draw in order wins, whichever pair it is.
+        let wither = boss_draw(
+            ModelRef::Wither { invul_time: 0 },
+            Some((150.0, 300.0)),
+            Some("Wither"),
+        );
+        let dragon = boss_draw(ModelRef::EnderDragon, Some((200.0, 200.0)), None);
+        let last = raised_status(&[wither.clone(), dragon.clone()]).expect("a boss draws");
+        assert_eq!(last.name, ENDER_DRAGON_BOSS_NAME);
+        assert!(!last.colour_modifier);
+        assert_eq!(last.health_fraction, 1.0);
+        let last = raised_status(&[dragon, wither]).expect("a boss draws");
+        assert_eq!(last.name, "Wither");
+        assert!(last.colour_modifier);
+        assert_eq!(last.health_fraction, 0.5);
+    }
+
+    #[test]
+    fn the_boss_status_raise_needs_a_boss_and_its_pair() {
+        // A frame without a boss draw raises nothing, and neither does a boss draw whose
+        // pair the session never resolved.
+        assert_eq!(raised_status(&[player_draw()]), None);
+        assert_eq!(
+            raised_status(&[boss_draw(ModelRef::EnderDragon, None, None)]),
+            None
+        );
     }
 
     #[test]

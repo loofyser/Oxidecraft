@@ -12,7 +12,7 @@ use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
 use crate::dim_pass::DimPass;
-use crate::entity_pass::{EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
+use crate::entity_pass::{BossStatus, EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
 use crate::hud::{HudDraw, HudPass, ScaledResolution, scaled_resolution};
 use crate::overlay::OverlayPass;
@@ -137,8 +137,8 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
 /// towards, so the two agree where the terrain ends — and the depth buffer to the far plane,
 /// draws the sky through the sky pass, the cloud layer, the section meshes through the terrain
 /// pass, the world overlay — the aim's outline and the destroy-stage crack — and the GUI over
-/// them: the dim quad, the hud's draw list and the debug overlay, then presents the frame. The
-/// cloud layer draws exactly
+/// them: the dim quad, the boss bar, the hud's draw list and the debug overlay, then presents
+/// the frame. The cloud layer draws exactly
 /// once, and the entity eye's height places it: the source's under-arm before the terrain while
 /// the eye is under the layer (`EntityRenderer.java:1364-1367`) and its at-or-above arm after
 /// the translucent layer once the eye is at or above it (`:1474-1478`); [`scene_draws`] is the
@@ -189,6 +189,11 @@ pub struct Renderer {
     entity_textures: TextureRegistry,
     /// The entities the next frame draws, as the window last set them.
     entities: Vec<EntityDraw>,
+    /// The boss bar's status cell: the last raised status and the frames left on it,
+    /// `None` while the bar is hidden. A frame whose pass raises a wither's or a dragon's
+    /// status overwrites it; every other frame's step spends one of its hundred frames
+    /// ([`boss_status_step`]).
+    boss_status: Option<BossStatus>,
     /// The camera the next frame is drawn with, until a new one is set.
     camera: Option<Camera>,
     /// The fog the next frames are drawn and cleared with, until a new one is set.
@@ -325,6 +330,7 @@ impl Renderer {
             entity_pass,
             entity_textures,
             entities: Vec::new(),
+            boss_status: None,
             camera: None,
             fog: None,
         })
@@ -629,14 +635,19 @@ impl Renderer {
     /// entity eye is under the layer, or through its at-or-above arm after the terrain once the
     /// eye is at or above it (`EntityRenderer.java:1364-1367`, `:1474-1478`; [`scene_draws`]).
     /// The overlay pass then draws the frame's GUI over the result, in a pass without a depth
-    /// attachment, so no terrain can hide it: the dim quad first, then the hud's draw list,
-    /// then the debug lines text.
+    /// attachment, so no terrain can hide it: the dim quad first, then the boss bar, then the
+    /// hud's draw list, then the debug lines text.
+    ///
+    /// The boss bar's status cell advances once per frame on this call: a wither's or a
+    /// dragon's raise from the entity pass overwrites it, an untouched status spends one of
+    /// its hundred frames, and a spent one hides the bar ([`boss_status_step`]).
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let mut raised: Option<BossStatus> = None;
         if let Some(camera) = self.camera {
             let aspect = self.config.width as f32 / self.config.height as f32;
             self.terrain.set_camera(&self.queue, camera, aspect);
@@ -692,18 +703,27 @@ impl Renderer {
                             self.cloud.draw(&mut pass);
                         }
                         SceneDraw::Terrain => self.terrain.draw_solid(&mut pass),
-                        SceneDraw::Entities => self.entity_pass.draw(
-                            &self.device,
-                            &mut pass,
-                            &self.entities,
-                            &self.entity_textures,
-                        ),
+                        SceneDraw::Entities => {
+                            raised = self.entity_pass.draw(
+                                &self.device,
+                                &mut pass,
+                                &self.entities,
+                                &self.entity_textures,
+                            );
+                        }
                         SceneDraw::TerrainTranslucent => self.terrain.draw_translucent(&mut pass),
                         SceneDraw::WorldOverlay => self.world_overlay.draw(&mut pass),
                     }
                 }
             }
         }
+        // The status step runs after the scene pass: a raise overwrites the cell whole and
+        // a frame without one spends a frame of the hold, hiding the bar at zero
+        // (`GuiIngame.java`:903-905).
+        let bar = boss_status_step(&mut self.boss_status, raised);
+        let scaled = self.scaled_resolution();
+        self.hud
+            .set_boss_bar(&self.device, &self.queue, bar.as_ref(), &scaled);
         {
             let mut overlay_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("oxide-render overlay pass"),
@@ -721,6 +741,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             self.dim.draw(&mut overlay_pass);
+            self.hud.draw_boss_bar(&mut overlay_pass);
             self.hud.draw(&mut overlay_pass);
             self.overlay.draw(&mut overlay_pass);
         }
@@ -728,6 +749,30 @@ impl Renderer {
         frame.present();
         Ok(())
     }
+}
+
+/// One frame of the boss bar's status cell, and the status the frame draws with.
+///
+/// `raised` is the status the entity pass raised this frame, when a wither or a dragon
+/// drew; it overwrites the cell whole, exactly as the source's static does. The frame's
+/// gate then runs on the cell's value before the decrement (`GuiIngame.java`:903-905): a
+/// status with frames left is returned for the frame's bar and spends one frame; a status
+/// at zero is hidden and returns nothing, and a spent cell keeps returning nothing until a
+/// fresh raise. A frame with neither a raise nor a cell draws no bar.
+pub fn boss_status_step(
+    cell: &mut Option<BossStatus>,
+    raised: Option<BossStatus>,
+) -> Option<BossStatus> {
+    if let Some(status) = raised {
+        *cell = Some(status);
+    }
+    let status = cell.as_mut()?;
+    if status.time == 0 {
+        return None;
+    }
+    let drawn = status.clone();
+    status.time -= 1;
+    Some(drawn)
 }
 
 /// The colour the window is cleared to: the frame's fog colour when one is set, so the sky
@@ -826,11 +871,87 @@ mod tests {
     use wgpu::SurfaceError;
 
     use super::{
-        SKY_COLOR, SceneDraw, SurfaceAction, block_on, classify_surface_error, clear_colour,
-        scene_draws,
+        SKY_COLOR, SceneDraw, SurfaceAction, block_on, boss_status_step, classify_surface_error,
+        clear_colour, scene_draws,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
     use crate::fog::{FogParams, fog_colour};
+
+    /// A raised status at `fraction`, for the countdown's own tests.
+    fn raised_boss(fraction: f32) -> BossStatus {
+        BossStatus {
+            name: "Wither".to_owned(),
+            health_fraction: fraction,
+            colour_modifier: true,
+            time: BOSS_STATUS_TIME,
+        }
+    }
+
+    #[test]
+    fn the_boss_status_cell_holds_the_raise_for_a_hundred_frames() {
+        // The source's gate runs before the decrement (`GuiIngame.java`:903-905), so the
+        // raise's frame draws at the full hundred and the bar draws through f+99; the cell
+        // is spent after that frame and f+100 hides. A post-decrement gate would draw one
+        // frame short.
+        let mut cell = None;
+        let drawn =
+            boss_status_step(&mut cell, Some(raised_boss(0.5))).expect("the raise's frame draws");
+        assert_eq!(
+            drawn.time, BOSS_STATUS_TIME,
+            "the frame enters at the source's hundred"
+        );
+        assert_eq!(
+            cell.as_ref().expect("the cell keeps the status").time,
+            BOSS_STATUS_TIME - 1,
+            "one frame spent"
+        );
+        for frame in 1..BOSS_STATUS_TIME {
+            assert!(
+                boss_status_step(&mut cell, None).is_some(),
+                "frame f+{frame} draws"
+            );
+        }
+        assert!(
+            boss_status_step(&mut cell, None).is_none(),
+            "f+100 hides the bar"
+        );
+        assert!(
+            boss_status_step(&mut cell, None).is_none(),
+            "and a spent cell stays hidden"
+        );
+    }
+
+    #[test]
+    fn the_boss_status_cell_persists_while_re_set() {
+        // A boss that draws every frame re-sets the status every frame
+        // (`BossStatus.java`:13), so the cell never runs out and every frame enters at
+        // the full hundred.
+        let mut cell = None;
+        for frame in 0..250 {
+            let drawn = boss_status_step(&mut cell, Some(raised_boss(0.5)))
+                .unwrap_or_else(|| panic!("frame {frame} draws"));
+            assert_eq!(drawn.time, BOSS_STATUS_TIME);
+        }
+    }
+
+    #[test]
+    fn the_boss_status_cell_overwrites_whole() {
+        // The raise replaces the cell's whole value — name and flag included — exactly as
+        // the source's static does (`BossStatus.java`:10-16).
+        let mut cell = None;
+        assert!(boss_status_step(&mut cell, Some(raised_boss(0.5))).is_some());
+        let dragon = BossStatus {
+            name: "Ender Dragon".to_owned(),
+            health_fraction: 1.0,
+            colour_modifier: false,
+            time: BOSS_STATUS_TIME,
+        };
+        let drawn = boss_status_step(&mut cell, Some(dragon)).expect("the dragon's frame draws");
+        assert_eq!(drawn.name, "Ender Dragon");
+        assert!(!drawn.colour_modifier);
+        assert_eq!(drawn.health_fraction, 1.0);
+    }
 
     /// A camera at `feet_y` with no facing, for the scene order's own tests.
     fn scene_camera(feet_y: f64) -> Camera {
