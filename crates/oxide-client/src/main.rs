@@ -16,8 +16,9 @@
 //! keys, buttons and motion become `InputEvent`s on the session's channel, Escape releases
 //! capture (a second Escape exits), and a window that loses focus clears the held keys. The
 //! grabbed key table is [`keymap`]'s. `--input-script <path>` replays a tick-indexed script
-//! through the same channel and writes one CSV line per session tick to `<path>.log`; the
-//! directive grammar and the log's shape are [`ScriptDriver`]'s.
+//! through the same channel and writes one CSV line per session tick to `<path>.log`, each
+//! tick's tracked-entity section behind its line; the directive grammar, the screen keys'
+//! routing and the log's shape are [`ScriptDriver`]'s.
 //!
 //! The chat rides the same stream: T (or `/`) opens the field while the pointer is grabbed,
 //! its characters arrive as text and its editing keys through [`keymap`], and Enter sends
@@ -54,7 +55,7 @@ use oxide_assets::font::Font;
 use oxide_assets::skins::SkinCache;
 use oxide_assets::store::Store;
 use oxide_game::chat::{ClickAction, ClickEvent};
-use oxide_game::entity_view::PlayerListRecord;
+use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::Aim;
@@ -130,8 +131,8 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     render_distance: u8,
     /// Replay a tick-indexed input script (see [`ScriptDriver`]) and log one CSV line per
-    /// session tick to `<path>.log`. Needs `--server`: the script is injected into the
-    /// session's input channel.
+    /// session tick, each tick's tracked-entity section behind it, to `<path>.log`. Needs
+    /// `--server`: the script is injected into the session's input channel.
     #[arg(long)]
     input_script: Option<PathBuf>,
 }
@@ -189,9 +190,19 @@ enum DirectiveAction {
 /// file order, through the same channel the window's own events use — the
 /// script is capture-independent, so a rig run needs no pointer.
 ///
+/// The screen's keys and buttons are routed as the window routes them: a
+/// fresh `T` opens the chat field, `Tab` holds and releases the player list,
+/// and `Enter` sends the open field and closes it. While the field is open
+/// the screen holds every other event too — a `look`'s delta moves the free
+/// pointer (the position the hover and the click's hit-test read, in the
+/// frame's GUI units) and a `mouse` press is the chat screen's own click,
+/// run by the field's owner ([`ClientApp::chat_click`]) on the tick's own
+/// frame; the pointer's recapture is the window's and a script run has none.
+///
 /// Every tick the session reports is written to `<script path>.log` as one
-/// CSV line, `tick,x,y,z,yaw,pitch,on_ground`, and nothing else — the
-/// measurement record of a rig run. The log starts empty on every run. A snapped report — a server correction such as the join
+/// CSV line, `tick,x,y,z,yaw,pitch,on_ground`; the tick's entity section
+/// follows on the next lines — one `tick,entity,id,x,y,z` line per tracked
+/// entity, in the feed's own order. The log starts empty on every run. A snapped report — a server correction such as the join
 /// teleport — carries the tick it lands on, which can repeat a tick already
 /// logged; apart from that the count is gap-free.
 struct ScriptDriver {
@@ -201,6 +212,12 @@ struct ScriptDriver {
     directives: Vec<Directive>,
     /// How many directives have been applied.
     applied: usize,
+    /// The tick of the last observed player line: the stamp of the entity
+    /// section the session reports immediately behind it.
+    last_tick: Option<u64>,
+    /// Whether a scripted chat-screen press is waiting for the field's owner
+    /// to run the screen's own click.
+    pending_chat_click: bool,
     /// The tick log, one line per tick.
     log: File,
 }
@@ -229,12 +246,17 @@ impl ScriptDriver {
             input_tx,
             directives,
             applied: 0,
+            last_tick: None,
+            pending_chat_click: false,
             log,
         })
     }
 
     /// Observes one session tick: writes its log line, then applies every
     /// directive the tick has reached, in file order.
+    ///
+    /// The tick is remembered as the stamp of the entity section the session
+    /// reports immediately behind it ([`ScriptDriver::observe_entities`]).
     ///
     /// A directive whose tick is behind the first observed one is applied at
     /// once: the session's count starts at zero, but the window sees it only
@@ -243,11 +265,16 @@ impl ScriptDriver {
     /// A `chat` directive drives the window's own field: it opens, the text
     /// goes through the character path and Enter's send leaves for the
     /// session on this tick; a line that arrives while the field is already
-    /// open is refused and logged. A `look` directive's delta is not
-    /// forwarded while the field is open — the mouse then moves the window's
-    /// cursor, the source's screen rule, not the camera. The field's owner
-    /// runs the window's own follow-ups (the pointer rules are the window's;
-    /// a rig run has no pointer to free).
+    /// open is refused and logged.
+    ///
+    /// The screen's own routing is mirrored while the field is open: a
+    /// `look`'s delta moves the free pointer, a `mouse` press queues the
+    /// screen's click for the field's owner, and the field's keys run the
+    /// field machine — `Enter` sends and closes, exactly as the window's own
+    /// key does. While it is closed a fresh `T` opens it and a `Tab` edge
+    /// holds the player list. The field's owner runs the window's own
+    /// follow-ups (the pointer rules are the window's; a rig run has no
+    /// pointer to free).
     ///
     /// A log write failure is returned to the caller. A send failure is not
     /// fatal: a closed channel means the session ended.
@@ -262,7 +289,11 @@ impl ScriptDriver {
         pitch: f32,
         on_ground: bool,
         chat: &mut ChatInput,
+        view: &mut view::ChatView,
+        tab_open: &mut bool,
+        cursor: &mut Option<(f32, f32)>,
     ) -> std::io::Result<()> {
+        self.last_tick = Some(tick);
         writeln!(self.log, "{tick},{x},{y},{z},{yaw},{pitch},{on_ground}")?;
         while let Some(directive) = self.directives.get(self.applied) {
             if directive.tick > tick {
@@ -270,12 +301,89 @@ impl ScriptDriver {
             }
             match &directive.action {
                 DirectiveAction::Input(event) => {
-                    if chat.open && matches!(event, InputEvent::MouseDelta { .. }) {
-                        tracing::debug!(
-                            "a look while the chat is open moves the window's cursor, not the camera"
-                        );
-                    } else if self.input_tx.send(event.clone()).is_err() {
-                        tracing::warn!("the session's input channel is closed; the script stopped");
+                    // The window's own routing, mirrored for the screen's
+                    // keys and buttons (`on_key`, `on_chat_key`,
+                    // `on_mouse_button`): while the field is open the screen
+                    // holds every event; while it is closed the opener keys
+                    // act and everything else flows to the session.
+                    match event {
+                        InputEvent::Key { key, pressed } if chat.open => {
+                            // The screen answers presses only; Enter is the
+                            // field's own send. Tab is consumed (its
+                            // completion is deferred) and every other key is
+                            // the character path's, which a scripted key
+                            // carries no text for.
+                            if *pressed && *key == Key::Enter {
+                                if let ChatKey::Send(send) = chat.key(Key::Enter) {
+                                    if self.input_tx.send(send).is_err() {
+                                        tracing::warn!(
+                                            "the session's input channel is closed; the script stopped"
+                                        );
+                                    }
+                                }
+                                // Enter closes the field either way, and the
+                                // window's own close follows — the view goes
+                                // shut and the free position means nothing.
+                                // (The pointer's recapture is the window's; a
+                                // script run has no pointer.)
+                                if !chat.open {
+                                    view.set_open(false);
+                                    view.reset_scroll();
+                                    *cursor = None;
+                                }
+                            }
+                        }
+                        InputEvent::MouseButton { pressed: true, .. } if chat.open => {
+                            // The press hit-tests the box's runs once the
+                            // field's owner runs it — the window's own click
+                            // (`ClientApp::chat_click`).
+                            self.pending_chat_click = true;
+                        }
+                        InputEvent::MouseDelta { dx, dy } if chat.open => {
+                            // The source's screen rule: while the field is
+                            // open the mouse moves the window's cursor, not
+                            // the camera — the free position the hover and
+                            // the click's hit-test read. The delta is the
+                            // frame's GUI units, the unit the pointer lives
+                            // in.
+                            let (x, y) = cursor.unwrap_or((0.0, 0.0));
+                            *cursor = Some((x + *dx as f32, y + *dy as f32));
+                        }
+                        InputEvent::Key {
+                            key: Key::T,
+                            pressed: true,
+                        } => {
+                            // The chat's opener key, fresh press: an empty
+                            // field opens and the held keys drop — the
+                            // window's own open, capture aside.
+                            chat.open("");
+                            view.set_open(true);
+                            *tab_open = false;
+                            *cursor = None;
+                        }
+                        InputEvent::Key {
+                            key: Key::Tab,
+                            pressed,
+                        } => {
+                            *tab_open = *pressed;
+                        }
+                        InputEvent::Key {
+                            key: Key::T | Key::Enter,
+                            ..
+                        } => {
+                            // Neither is a gameplay key while the field is
+                            // shut; nothing flows.
+                        }
+                        _ if chat.open => {
+                            // The screen holds every other event too.
+                        }
+                        event => {
+                            if self.input_tx.send(event.clone()).is_err() {
+                                tracing::warn!(
+                                    "the session's input channel is closed; the script stopped"
+                                );
+                            }
+                        }
                     }
                 }
                 DirectiveAction::Chat(text) => {
@@ -304,6 +412,41 @@ impl ScriptDriver {
             self.applied += 1;
         }
         Ok(())
+    }
+
+    /// Observes one tick's entity feed: writes the tick's entity section —
+    /// one line per tracked entity, `<tick>,entity,<id>,<x>,<y>,<z>`, in the
+    /// feed's own (ascending-id) order — stamped with the tick of the player
+    /// line the feed follows.
+    ///
+    /// The session reports exactly one feed per tick, immediately behind the
+    /// tick's own line, so the section is one line set per tick; a tick that
+    /// tracks nothing writes no lines, and a feed that arrives before any
+    /// player line has no tick to stamp and writes nothing. A repeated tick
+    /// (a server correction) carries its feed exactly as it carries its
+    /// player line.
+    fn observe_entities(&mut self, entities: &[EntityFrame]) -> std::io::Result<()> {
+        let Some(tick) = self.last_tick else {
+            return Ok(());
+        };
+        for frame in entities {
+            writeln!(
+                self.log,
+                "{tick},entity,{id},{x},{y},{z}",
+                id = frame.id,
+                x = frame.pos[0],
+                y = frame.pos[1],
+                z = frame.pos[2],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Takes the queued chat-screen press, when the last observed tick
+    /// carried one: the field's owner runs the screen's own click with the
+    /// free pointer as it stands ([`ClientApp::chat_click`]).
+    fn take_chat_click(&mut self) -> bool {
+        std::mem::take(&mut self.pending_chat_click)
     }
 }
 
@@ -383,7 +526,9 @@ fn chat_text(code: &str) -> anyhow::Result<String> {
     Ok(text.to_string())
 }
 
-/// Parses a `key <name> down|up` directive.
+/// Parses a `key <name> down|up` directive: the movement keys and the chat
+/// screen's own — `T`, `Tab` and `Enter` — which the replay routes as the
+/// window routes them.
 fn parse_key(arguments: &[&str]) -> anyhow::Result<InputEvent> {
     let [name, edge] = arguments else {
         anyhow::bail!("key takes a key name and down or up, got {arguments:?}");
@@ -396,6 +541,9 @@ fn parse_key(arguments: &[&str]) -> anyhow::Result<InputEvent> {
         "Space" => Key::Space,
         "ShiftLeft" => Key::ShiftLeft,
         "ControlLeft" => Key::ControlLeft,
+        "T" => Key::T,
+        "Tab" => Key::Tab,
+        "Enter" => Key::Enter,
         other => anyhow::bail!("{other:?} is not a bound key"),
     };
     Ok(InputEvent::Key {
@@ -1041,6 +1189,10 @@ impl ClientApp {
             return;
         };
         let mut session_ended = false;
+        // A scripted chat-screen press waits for the loop: the field's owner
+        // runs it once the frame's events are in, through the window's own
+        // click.
+        let mut script_click = false;
         for event in events {
             self.view.apply(&event);
             // The tab list folds its own events in — the player-list entries
@@ -1083,6 +1235,9 @@ impl ClientApp {
                         *pitch,
                         *on_ground,
                         &mut self.chat_input,
+                        &mut self.chat,
+                        &mut self.tab.open,
+                        &mut self.cursor,
                     ) {
                         // The record of the run is broken; stop rather than
                         // pretend the measurement is whole.
@@ -1091,6 +1246,16 @@ impl ClientApp {
                         event_loop.exit();
                         return;
                     }
+                }
+                if self
+                    .script
+                    .as_mut()
+                    .is_some_and(|script| script.take_chat_click())
+                {
+                    // The screen's press: queued here, run below once the
+                    // frame's events are in — the window's own click with
+                    // the free pointer as it stands.
+                    script_click = true;
                 }
                 // The chat field's blink steps on the session's tick — the
                 // source runs its counter from `GuiChat.updateScreen`
@@ -1112,6 +1277,18 @@ impl ClientApp {
                 });
                 self.camera.last_tick_arrival = Some(Instant::now());
             }
+            if let ClientEvent::EntitiesTick { entities } = &event {
+                if let Some(script) = self.script.as_mut() {
+                    if let Err(error) = script.observe_entities(entities) {
+                        // The record of the run is broken; stop rather than
+                        // pretend the measurement is whole.
+                        tracing::error!(%error, "the tick log could not be written");
+                        self.stopped_on_error = true;
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
             session_ended |= apply_session_event(
                 renderer,
                 &mut self.hud,
@@ -1127,6 +1304,19 @@ impl ClientApp {
             tracing::info!("the session ended, exiting");
             event_loop.exit();
             return;
+        }
+        if script_click {
+            // The screen's press, run once the frame's events are in — the
+            // same hit-test and actions as the window's own click, through
+            // the pieces the draw can lend while the renderer is borrowed.
+            let scaled = renderer.scaled_resolution();
+            scripted_chat_click(
+                &mut self.chat,
+                &mut self.chat_input,
+                self.cursor,
+                Some(scaled),
+                self.session.as_ref(),
+            );
         }
         // The camera follows the pose the session last reported. The smoke path
         // without a session stays as M0 left it: no camera, so the frame is the
@@ -2284,6 +2474,43 @@ fn is_enter_press(state: ElementState, physical_key: PhysicalKey) -> bool {
     state == ElementState::Pressed && physical_key == PhysicalKey::Code(KeyCode::Enter)
 }
 
+/// One press of the chat screen, run from the scripted path: the same
+/// hit-test and actions as [`ClientApp::chat_click`], through the disjoint
+/// pieces the frame's draw can lend while the renderer is borrowed.
+///
+/// The free pointer and the scaled resolution are both needed for the
+/// hit-test — no pointer, no click; no renderer, no scale — and the actions
+/// are the window's own: a run command leaves through the session, a suggest
+/// command overwrites the field's text and a link raises the confirm overlay.
+fn scripted_chat_click(
+    chat: &mut view::ChatView,
+    chat_input: &mut ChatInput,
+    cursor: Option<(f32, f32)>,
+    scaled: Option<oxide_render::hud::ScaledResolution>,
+    session: Option<&SessionLink>,
+) {
+    let (Some(point), Some(scaled)) = (cursor, scaled) else {
+        return;
+    };
+    let Some(click) = chat.run_at(point, scaled).and_then(|run| run.click.clone()) else {
+        return;
+    };
+    match &click.action {
+        ClickAction::RunCommand => {
+            let event = InputEvent::SendChat {
+                text: command_text(&click.value),
+            };
+            if let Some(session) = session {
+                if session.input_tx.send(event).is_err() {
+                    tracing::warn!("the session's input channel is closed");
+                }
+            }
+        }
+        ClickAction::SuggestCommand => chat_input.set_text(&click.value),
+        ClickAction::OpenUrl => chat.open_confirm(&click.value),
+    }
+}
+
 /// The command a `run_command` click sends: the value with a leading slash
 /// added when it carries none — the plan's own rule (`/the-value`).
 ///
@@ -2819,11 +3046,12 @@ mod tests {
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
     use oxide_game::chat::{ClickAction, ClickEvent};
-    use oxide_game::entity_view::PlayerListRecord;
+    use oxide_game::entity_view::{EntityExtra, EntityFrame, PlayerListRecord};
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
     use oxide_game::session::ClientEvent;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
+    use oxide_world::entity::EntityKind;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -3496,10 +3724,25 @@ mod tests {
         let (input_tx, input_rx) = unbounded();
         let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
         let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
         // The first tick the window sees may already be past a directive:
         // tick 6 is past the tick-4 press and short of the tick-7 pair.
         driver
-            .observe(6, 1.0, 2.0, 3.0, 0.0, 0.0, true, &mut chat)
+            .observe(
+                6,
+                1.0,
+                2.0,
+                3.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("the tick-4 press is due"),
@@ -3514,7 +3757,19 @@ mod tests {
         );
         // Tick 7 applies the two directives at tick 7, in file order.
         driver
-            .observe(7, 1.5, 2.0, 3.5, 10.0, -2.5, true, &mut chat)
+            .observe(
+                7,
+                1.5,
+                2.0,
+                3.5,
+                10.0,
+                -2.5,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("D down"),
@@ -3533,11 +3788,35 @@ mod tests {
         assert!(input_rx.try_recv().is_err(), "the look is not due yet");
         // Tick 9 applies nothing new; tick 12 applies the look.
         driver
-            .observe(9, 2.0, 2.0, 4.0, 10.0, -2.5, true, &mut chat)
+            .observe(
+                9,
+                2.0,
+                2.0,
+                4.0,
+                10.0,
+                -2.5,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert!(input_rx.try_recv().is_err(), "nothing is due at tick 9");
         driver
-            .observe(12, 2.5, 2.0, 4.5, 40.0, -8.0, false, &mut chat)
+            .observe(
+                12,
+                2.5,
+                2.0,
+                4.5,
+                40.0,
+                -8.0,
+                false,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("the look"),
@@ -3555,6 +3834,147 @@ mod tests {
                 "12,2.5,2,4.5,40,-8,false",
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tracked-entity frame carrying only the fields the entity section
+    /// reads; the rest are a stationary, unlit pig's.
+    fn tracked_frame(id: i32, pos: [f64; 3]) -> EntityFrame {
+        EntityFrame {
+            id,
+            kind: EntityKind::Pig,
+            uuid: None,
+            name: None,
+            prev: pos,
+            pos,
+            prev_yaw: 0.0,
+            yaw: 0.0,
+            prev_pitch: 0.0,
+            pitch: 0.0,
+            prev_head_yaw: 0.0,
+            head_yaw: 0.0,
+            render_yaw_offset: 0.0,
+            prev_render_yaw_offset: 0.0,
+            on_ground: true,
+            invisible: false,
+            sneaking: false,
+            age: 0,
+            limb_swing: 0.0,
+            limb_swing_amount: 0.0,
+            prev_limb_swing_amount: 0.0,
+            swing_progress: 0.0,
+            prev_swing_progress: 0.0,
+            hurt_ticks: 0,
+            death_ticks: 0,
+            brightness: 0.0,
+            health: None,
+            nametag: None,
+            extra: EntityExtra::None,
+        }
+    }
+
+    #[test]
+    fn the_entity_section_follows_each_tick_line() {
+        let dir = std::env::temp_dir().join(format!("oxide-client-feed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("walk.script");
+        std::fs::write(&script_path, "# the section's own shape\n").expect("the script is written");
+        let (input_tx, _input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
+        // Tick 6 tracks two entities: the section follows the tick's line.
+        driver
+            .observe(
+                6,
+                1.0,
+                2.0,
+                3.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        driver
+            .observe_entities(&[
+                tracked_frame(70, [10.5, 64.0, -3.25]),
+                tracked_frame(71, [11.0, 64.0, -3.5]),
+            ])
+            .expect("the entity section writes");
+        // Tick 7 tracks nothing: no lines at all.
+        driver
+            .observe(
+                7,
+                1.5,
+                2.0,
+                3.5,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        driver
+            .observe_entities(&[])
+            .expect("the empty section writes nothing");
+        // Tick 8 tracks one entity: its line carries the new tick.
+        driver
+            .observe(
+                8,
+                2.0,
+                2.0,
+                4.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        driver
+            .observe_entities(&[tracked_frame(72, [0.0, 5.0, 0.0])])
+            .expect("the entity section writes");
+        let log = std::fs::read_to_string(dir.join("walk.script.log")).expect("the log reads");
+        assert_eq!(
+            log.lines().collect::<Vec<&str>>(),
+            [
+                "6,1,2,3,0,0,true",
+                "6,entity,70,10.5,64,-3.25",
+                "6,entity,71,11,64,-3.5",
+                "7,1.5,2,3.5,0,0,true",
+                "8,2,2,4,0,0,true",
+                "8,entity,72,0,5,0",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entity_feed_without_a_player_line_writes_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("oxide-client-feed-first-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("walk.script");
+        std::fs::write(&script_path, "# no directives\n").expect("the script is written");
+        let (input_tx, _input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        // The feed that precedes the first player line has no tick to carry.
+        driver
+            .observe_entities(&[tracked_frame(70, [1.0, 2.0, 3.0])])
+            .expect("the feed is observed");
+        let log = std::fs::read_to_string(dir.join("walk.script.log")).expect("the log reads");
+        assert_eq!(log, "", "nothing was written for the unticked feed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4393,8 +4813,23 @@ mod tests {
         let (input_tx, input_rx) = unbounded();
         let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
         let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
         driver
-            .observe(4, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .observe(
+                4,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert_eq!(
             input_rx.try_recv().expect("the send is due"),
@@ -4419,10 +4854,25 @@ mod tests {
         let (input_tx, input_rx) = unbounded();
         let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
         let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
         chat.open("");
         chat.type_text("mine");
         driver
-            .observe(4, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .observe(
+                4,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert!(input_rx.try_recv().is_err(), "nothing left the field");
         assert_eq!(
@@ -4438,7 +4888,7 @@ mod tests {
         // The source's screen rule: while the chat is open the mouse moves
         // the window's cursor, not the camera, so a scripted look must not
         // travel as a session delta while the field is open — and must while
-        // it is closed.
+        // it is closed. The open look moves the free pointer instead.
         let dir = std::env::temp_dir().join(format!("oxide-client-look-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("the scratch directory is created");
         let script_path = dir.join("look.script");
@@ -4446,8 +4896,23 @@ mod tests {
         let (input_tx, input_rx) = unbounded();
         let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
         let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
         driver
-            .observe(4, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .observe(
+                4,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert_eq!(
             input_rx
@@ -4457,13 +4922,273 @@ mod tests {
         );
         chat.open("");
         driver
-            .observe(8, 0.0, 64.0, 0.0, 0.0, 0.0, true, &mut chat)
+            .observe(
+                8,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
             .expect("the log line writes");
         assert!(
             input_rx.try_recv().is_err(),
             "the open chat took the look: it moves the window's cursor"
         );
         assert!(chat.open, "the refused look left the field open");
+        assert_eq!(
+            cursor,
+            Some((10.0, 0.0)),
+            "the open look moved the free pointer, from the origin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scripted_t_opens_the_field_and_enter_sends_and_closes() {
+        // The screen keys the window routes by hand — T opens, Enter sends —
+        // are routed the same way for the script: through the field machine,
+        // not around it.
+        let dir = std::env::temp_dir().join(format!("oxide-client-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("screen.script");
+        std::fs::write(&script_path, "3 key T down\n4 key T up\n6 key Enter down\n")
+            .expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = true;
+        let mut cursor = Some((5.0, 5.0));
+        driver
+            .observe(
+                3,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(chat.open, "the fresh T press opened the field");
+        assert!(!tab_open, "the screen's open drops the held list");
+        assert_eq!(cursor, None, "the open has no free position yet");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "no event left for the session"
+        );
+        driver
+            .observe(
+                4,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(chat.open, "the T release is no key of the field's");
+        // The field's owner writes the text the way a click's suggest would,
+        // then Enter sends it and closes the field.
+        chat.set_text("hello from oxide");
+        driver
+            .observe(
+                6,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert_eq!(
+            input_rx.try_recv().expect("Enter's send"),
+            InputEvent::SendChat {
+                text: "hello from oxide".to_owned()
+            }
+        );
+        assert!(!chat.open, "the send closed the field");
+        assert!(input_rx.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scripted_tab_holds_the_player_list_and_the_field_consumes_it() {
+        let dir = std::env::temp_dir().join(format!("oxide-client-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("tab.script");
+        std::fs::write(
+            &script_path,
+            "3 key Tab down\n5 key Tab up\n7 key T down\n9 key Tab down\n",
+        )
+        .expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
+        driver
+            .observe(
+                3,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(tab_open, "the Tab press holds the list");
+        driver
+            .observe(
+                5,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(!tab_open, "the Tab release drops it");
+        assert!(input_rx.try_recv().is_err(), "Tab is no session key");
+        driver
+            .observe(
+                7,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(chat.open, "T opened the field");
+        driver
+            .observe(
+                9,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(!tab_open, "the open field consumed the Tab");
+        assert!(chat.open, "the consumed Tab left the field open");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scripted_chat_press_waits_for_the_field_owner() {
+        // While the field is open a mouse press is the screen's own click:
+        // the driver queues it and the field's owner runs it with the free
+        // pointer — the window's path, not a second one.
+        let dir = std::env::temp_dir().join(format!("oxide-client-press-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("press.script");
+        std::fs::write(
+            &script_path,
+            "3 key T down\n5 mouse Left down\n6 mouse Left up\n",
+        )
+        .expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = Some((2.0, 3.0));
+        driver
+            .observe(
+                3,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(!driver.take_chat_click(), "no press yet");
+        driver
+            .observe(
+                5,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(driver.take_chat_click(), "the press queued the click");
+        assert!(!driver.take_chat_click(), "the click is taken once");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the press never left for the session"
+        );
+        driver
+            .observe(
+                6,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(!driver.take_chat_click(), "the release is no click");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
