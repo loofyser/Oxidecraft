@@ -4102,14 +4102,24 @@ fn block_break_animation_frame(entity_id: i32, x: i32, y: i32, z: i32, stage: u8
     payload
 }
 
-/// The destroy stages a session reported, in order: each position with the
-/// stage a set landed, or `None` for a cleared entry.
-fn reported_stages(events: &[ClientEvent]) -> Vec<((i32, i32, i32), Option<u8>)> {
+/// One reported destroy stage: the block's cell, the breaker's entity id, and
+/// the stage a set landed, or `None` for a cleared entry.
+type ReportedStage = ((i32, i32, i32), i32, Option<u8>);
+
+/// The destroy stages a session reported, in order: each position with its
+/// breaker and the stage a set landed, or `None` for a cleared entry.
+fn reported_stages(events: &[ClientEvent]) -> Vec<ReportedStage> {
     events
         .iter()
         .filter_map(|event| match event {
-            ClientEvent::BreakStage { x, y, z, stage } => Some(((*x, *y, *z), Some(*stage))),
-            ClientEvent::BreakCleared { x, y, z } => Some(((*x, *y, *z), None)),
+            ClientEvent::BreakStage {
+                breaker,
+                x,
+                y,
+                z,
+                stage,
+            } => Some(((*x, *y, *z), *breaker, Some(*stage))),
+            ClientEvent::BreakCleared { breaker, x, y, z } => Some(((*x, *y, *z), *breaker, None)),
             _ => None,
         })
         .collect()
@@ -4184,10 +4194,11 @@ fn a_held_press_digs_dirt_at_the_hands_rate_and_removes_it_locally() {
     );
 
     // The stage map stepped 0..8 once each — repeats are not re-reported —
-    // and the completion's reset index cleared it.
-    let expected: Vec<((i32, i32, i32), Option<u8>)> = (0..9)
-        .map(|stage| ((0, 65, 2), Some(stage)))
-        .chain([((0, 65, 2), None)])
+    // and the completion's reset index cleared it, all under the session's
+    // own breaker id.
+    let expected: Vec<ReportedStage> = (0..9)
+        .map(|stage| ((0, 65, 2), OWN_ENTITY_ID, Some(stage)))
+        .chain([((0, 65, 2), OWN_ENTITY_ID, None)])
         .collect();
     assert_eq!(
         reported_stages(&events),
@@ -4256,7 +4267,7 @@ fn a_held_press_on_stone_digs_at_the_slow_rate() {
     assert_eq!(
         stages,
         (0..stages.len() as u8)
-            .map(|stage| ((0, 65, 2), Some(stage)))
+            .map(|stage| ((0, 65, 2), OWN_ENTITY_ID, Some(stage)))
             .collect::<Vec<_>>(),
         "the stages ascend once each: {events:?}"
     );
@@ -4361,13 +4372,24 @@ fn a_creative_press_destroys_the_block_in_one_click() {
 }
 
 #[test]
-fn a_block_break_animation_sets_steps_and_clears_by_position() {
-    // The decoded 0x25 lands on the stage map: 0..=9 sets, reporting only a
-    // change, and anything else clears. The breaker's id is carried but not
-    // filtered on — the map is keyed by position until M4's entity work — so
-    // two breakers on one block share the one entry, and a repeat stage and a
-    // repeat removal report nothing.
+fn a_block_break_animation_sets_and_clears_by_breaker() {
+    // The decoded 0x25 lands on the stage map keyed by the breaker: 0..=9
+    // sets, reporting only a change, and anything else clears — all by
+    // breaker id (`RenderGlobal.sendBlockBreakProgress`:2364-2380). Two
+    // spawned breakers on one block are two entries; a repeat stage and a
+    // repeat removal report nothing; a same-breaker write at a new block
+    // replaces the entry, and the old block is discarded without a clear.
     let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &spawn_player_frame(1, [0x11; 16], 1.5, 64.0, 2.5, 0, 0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &spawn_player_frame(2, [0x22; 16], 2.5, 64.0, 2.5, 0, 0),
+        SERVER_FRAMING,
+    );
     frame(
         &mut tail,
         &block_break_animation_frame(1, 0, 65, 2, 2),
@@ -4385,6 +4407,11 @@ fn a_block_break_animation_sets_steps_and_clears_by_position() {
     );
     frame(
         &mut tail,
+        &block_break_animation_frame(1, 1, 65, 2, 3),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
         &block_break_animation_frame(2, 0, 65, 2, 255),
         SERVER_FRAMING,
     );
@@ -4393,16 +4420,23 @@ fn a_block_break_animation_sets_steps_and_clears_by_position() {
         &block_break_animation_frame(2, 0, 65, 2, 255),
         SERVER_FRAMING,
     );
-    let (events, _frames) = flip_session(dig_head(STONE), tail, 6, 6, Vec::new());
+    frame(
+        &mut tail,
+        &block_break_animation_frame(1, 1, 65, 2, 255),
+        SERVER_FRAMING,
+    );
+    let (events, _frames) = flip_session(dig_head(STONE), tail, 6, 8, Vec::new());
 
     assert_eq!(
         reported_stages(&events),
         vec![
-            ((0, 65, 2), Some(2)),
-            ((0, 65, 2), Some(5)),
-            ((0, 65, 2), None),
+            ((0, 65, 2), 1, Some(2)),
+            ((0, 65, 2), 2, Some(5)),
+            ((1, 65, 2), 1, Some(3)),
+            ((0, 65, 2), 2, None),
+            ((1, 65, 2), 1, None),
         ],
-        "two setters, a repeat, a clear and a no-op: {events:?}"
+        "sets by breaker, a repeat, a replace, clears by breaker: {events:?}"
     );
 }
 
@@ -4434,9 +4468,9 @@ fn the_servers_echo_of_a_predicted_removal_is_idempotent() {
         cleared < echo,
         "the local removal preceded the echo: {events:?}"
     );
-    let expected: Vec<((i32, i32, i32), Option<u8>)> = (0..9)
-        .map(|stage| ((0, 65, 2), Some(stage)))
-        .chain([((0, 65, 2), None)])
+    let expected: Vec<ReportedStage> = (0..9)
+        .map(|stage| ((0, 65, 2), OWN_ENTITY_ID, Some(stage)))
+        .chain([((0, 65, 2), OWN_ENTITY_ID, None)])
         .collect();
     assert_eq!(
         reported_stages(&events),
@@ -4514,8 +4548,8 @@ fn an_aim_change_aborts_the_running_block_and_clears_its_stage() {
     let stages = reported_stages(&events);
     let first: Vec<Option<u8>> = stages
         .iter()
-        .filter(|(position, _)| *position == (0, 65, 2))
-        .map(|(_, stage)| *stage)
+        .filter(|(position, _, _)| *position == (0, 65, 2))
+        .map(|(_, _, stage)| *stage)
         .collect();
     assert!(
         first.len() >= 2,
@@ -4539,12 +4573,17 @@ fn an_aim_change_aborts_the_running_block_and_clears_its_stage() {
 
 #[test]
 fn a_block_break_animation_stage_expires_after_four_hundred_ticks() {
-    // A decoded 0x25 lands stage 4 on a block and nothing refreshes it: the
-    // sweep every twentieth tick removes an entry more than 400 ticks old
-    // (`RenderGlobal.cleanupDamagedBlocks:1131`), so the clear lands 401 to
-    // 420 ticks after the set — here the first sweep past 400, tick 420 —
-    // and exactly once.
+    // A decoded 0x25 from a spawned breaker lands stage 4 on a block and
+    // nothing refreshes it: the sweep every twentieth tick removes an entry
+    // more than 400 ticks old (`RenderGlobal.cleanupDamagedBlocks`:1131), so
+    // the clear lands 401 to 420 ticks after the set — here the first sweep
+    // past 400, tick 420 — and exactly once.
     let mut head = floor_head();
+    frame(
+        &mut head,
+        &spawn_player_frame(1, [0x11; 16], 1.5, 64.0, 2.5, 0, 0),
+        SERVER_FRAMING,
+    );
     frame(
         &mut head,
         &block_break_animation_frame(1, 0, 65, 2, 4),
@@ -4555,7 +4594,7 @@ fn a_block_break_animation_stage_expires_after_four_hundred_ticks() {
     let stages = reported_stages(&events);
     assert_eq!(
         stages,
-        vec![((0, 65, 2), Some(4)), ((0, 65, 2), None)],
+        vec![((0, 65, 2), 1, Some(4)), ((0, 65, 2), 1, None)],
         "one set, then the expiry's one clear: {events:?}"
     );
     let set = events
@@ -4573,6 +4612,71 @@ fn a_block_break_animation_stage_expires_after_four_hundred_ticks() {
     assert!(
         (400..=420).contains(&ticks) && ticks > 400,
         "the expiry lands 401 to 420 ticks after the set, not {ticks}: {events:?}"
+    );
+}
+
+#[test]
+fn a_block_break_animation_for_an_unknown_entity_is_dropped() {
+    // The port-side filter: a 0x25 whose breaker the entity store does not
+    // know is logged and dropped. The source's 0x25 path carries no entity
+    // lookup (`NetHandlerPlayClient.handleBlockBreakAnim`:1331-1335); the
+    // rule follows the entity-keyed handlers' null-guard convention
+    // (`handleEntityVelocity`:501-510, `handleAnimation`:867-872). The
+    // server never echoes the client's own id
+    // (`WorldManager.java`:96-113 excludes the breaker),
+    // so no self-id special case exists.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &block_break_animation_frame(77, 0, 65, 2, 4),
+        SERVER_FRAMING,
+    );
+    let (events, _frames) = flip_session(dig_head(STONE), tail, 4, 8, Vec::new());
+    assert!(
+        reported_stages(&events).is_empty(),
+        "an unknown breaker lands nothing: {events:?}"
+    );
+}
+
+#[test]
+fn a_block_break_animation_for_a_spawned_player_lands_with_that_breaker() {
+    // A breaker the store knows — a spawned player — inserts under its own
+    // id, and the report carries it.
+    let mut tail = Vec::new();
+    frame(
+        &mut tail,
+        &spawn_player_frame(77, [0x77; 16], 1.5, 64.0, 2.5, 0, 0),
+        SERVER_FRAMING,
+    );
+    frame(
+        &mut tail,
+        &block_break_animation_frame(77, 0, 65, 2, 4),
+        SERVER_FRAMING,
+    );
+    let (events, _frames) = flip_session(dig_head(STONE), tail, 4, 8, Vec::new());
+    assert_eq!(
+        reported_stages(&events),
+        vec![((0, 65, 2), 77, Some(4))],
+        "the spawned breaker's stage landed: {events:?}"
+    );
+}
+
+#[test]
+fn the_own_digs_stages_carry_the_own_entity_id() {
+    // The own dig is written locally — it never depends on a 0x25 — and its
+    // stage entries key by the session's own entity id, the one Join Game
+    // named (here 20): the ladder 0..8 and the completion's clear all carry
+    // it.
+    let (events, _frames) =
+        flip_session(dig_head(DIRT), Vec::new(), 4, 60, vec![(2, left_press())]);
+    let expected: Vec<ReportedStage> = (0..9)
+        .map(|stage| ((0, 65, 2), OWN_ENTITY_ID, Some(stage)))
+        .chain([((0, 65, 2), OWN_ENTITY_ID, None)])
+        .collect();
+    assert_eq!(
+        reported_stages(&events),
+        expected,
+        "the own dig's ladder carries the own id: {events:?}"
     );
 }
 
@@ -5170,8 +5274,8 @@ fn a_zero_health_death_cancels_the_dig_and_gates_the_window_input() {
     let stages = reported_stages(&events);
     let dug: Vec<Option<u8>> = stages
         .iter()
-        .filter(|(position, _)| *position == (0, 65, 2))
-        .map(|(_, stage)| *stage)
+        .filter(|(position, _, _)| *position == (0, 65, 2))
+        .map(|(_, _, stage)| *stage)
         .collect();
     assert!(dug.len() >= 2, "the dig stepped: {events:?}");
     assert_eq!(dug.last(), Some(&None), "the death cleared the stage");
@@ -5419,8 +5523,8 @@ fn a_same_dimension_respawn_keeps_the_world_and_restarts_the_player() {
     let stages = reported_stages(&events);
     let dug: Vec<Option<u8>> = stages
         .iter()
-        .filter(|(position, _)| *position == (0, 65, 2))
-        .map(|(_, stage)| *stage)
+        .filter(|(position, _, _)| *position == (0, 65, 2))
+        .map(|(_, _, stage)| *stage)
         .collect();
     assert_eq!(dug.last(), Some(&None), "the stage map dropped the dig");
     // The aim was cleared at the respawn and recomputed against the kept

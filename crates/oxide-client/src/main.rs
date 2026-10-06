@@ -570,13 +570,26 @@ struct WorldOverlayState {
     /// The latest aim the session reported, or `None` when the interaction ray
     /// meets no block: the outline draws its cell, `None` stops it.
     aim: Option<Aim>,
-    /// The live destroy stages the crack draws: one entry per breaking block,
-    /// keyed by the block's cell, holding the sprite stage `0..=9`.
+    /// The live destroy stages the crack draws: one entry per breaking player,
+    /// keyed by the breaker's entity id, holding the block and the sprite
+    /// stage `0..=9`.
     ///
-    /// The session reports each landing and clearing as `BreakStage` and
-    /// `BreakCleared`; the window keeps the map so a frame can hand the pass
-    /// every stage within the render distance.
-    break_stages: BTreeMap<[i32; 3], u8>,
+    /// The source keys its map the same way (`RenderGlobal.damagedBlocks`,
+    /// `RenderGlobal.java`:127), one entry per breaker, so two breakers on one
+    /// block are two entries and the crack pass draws both; the session
+    /// reports each landing and clearing as `BreakStage` and `BreakCleared`,
+    /// and the window keeps the map so a frame can hand the pass every stage
+    /// within the render distance.
+    break_stages: BTreeMap<i32, WindowBreakEntry>,
+}
+
+/// One live destroy stage the window holds for the crack pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowBreakEntry {
+    /// The breaking block's cell.
+    pos: [i32; 3],
+    /// The stage the crack draws, 0..=9.
+    stage: u8,
 }
 
 /// The clock and the sky the session last reported: what each frame's sky parameters and fog
@@ -1683,50 +1696,140 @@ fn aim_outline(aim: Aim) -> Outline {
 }
 
 /// The crack entries a frame draws: the stage map's entries within `render_distance` chunks of
-/// `eye`, in cell order.
+/// `eye`, sorted by the block and then the breaker.
 ///
 /// The overlay itself drops entries beyond the source's 32-block reach
-/// (`RenderGlobal.java:1843-1848`); the window's own filter keeps a stage left behind by a
-/// walked-away block out of the pass at all.
+/// (`RenderGlobal.drawBlockDamageTexture`'s squared-distance removal, `:1845`); the window's
+/// own filter keeps a stage left behind by a walked-away block out of the pass at all. One
+/// entry is one `Crack` and duplicates are kept: two breakers on one block hand the pass two
+/// crack draws, which the multiply blend applies twice — the source's
+/// `damagedBlocks.values()` iteration does exactly this (`RenderGlobal.java`:710, `:735`).
 fn cracks_in_view(
-    stages: &BTreeMap<[i32; 3], u8>,
+    stages: &BTreeMap<i32, WindowBreakEntry>,
     eye: [f64; 3],
     render_distance: u8,
 ) -> Vec<Crack> {
     let limit = f64::from(render_distance) * 16.0;
-    stages
+    let mut entries: Vec<([i32; 3], i32, u8)> = stages
         .iter()
-        .filter(|(block, _)| {
-            let dx = f64::from(block[0]) + 0.5 - eye[0];
-            let dy = f64::from(block[1]) + 0.5 - eye[1];
-            let dz = f64::from(block[2]) + 0.5 - eye[2];
+        .filter(|(_, entry)| {
+            let dx = f64::from(entry.pos[0]) + 0.5 - eye[0];
+            let dy = f64::from(entry.pos[1]) + 0.5 - eye[1];
+            let dz = f64::from(entry.pos[2]) + 0.5 - eye[2];
             dx * dx + dy * dy + dz * dz <= limit * limit
         })
-        .map(|(&block, &stage)| Crack { block, stage })
+        .map(|(&breaker, entry)| (entry.pos, breaker, entry.stage))
+        .collect();
+    entries.sort_unstable();
+    entries
+        .into_iter()
+        .map(|(block, _, stage)| Crack { block, stage })
         .collect()
 }
 
-/// Stores a destroy stage the session reported, and answers whether the map moved.
+/// Stores a destroy stage the session reported under its breaker, and answers whether the map
+/// moved.
 ///
-/// The reports land in the source's `destroyBlockIcons` map, keyed by block position
-/// (`RenderGlobal.java:1789-1794`); a repeat of the stage already stored is no move, so the
-/// caller's log line fires once per change.
+/// The reports land in the source's `damagedBlocks` map, one entry per breaker, keyed by the
+/// breaking player's entity id (`RenderGlobal.java`:127); a same-breaker write at a new
+/// position replaces the entry (`RenderGlobal.java`:2368-2372), and a repeat of the stage
+/// already stored is no move, so the caller's log line fires once per change.
 fn store_break_stage(
-    stages: &mut BTreeMap<[i32; 3], u8>,
+    stages: &mut BTreeMap<i32, WindowBreakEntry>,
+    breaker: i32,
     x: i32,
     y: i32,
     z: i32,
     stage: u8,
 ) -> bool {
-    stages.insert([x, y, z], stage) != Some(stage)
+    match stages.get_mut(&breaker) {
+        Some(entry) => {
+            let moved = entry.pos != [x, y, z] || entry.stage != stage;
+            entry.pos = [x, y, z];
+            entry.stage = stage;
+            moved
+        }
+        None => {
+            stages.insert(
+                breaker,
+                WindowBreakEntry {
+                    pos: [x, y, z],
+                    stage,
+                },
+            );
+            true
+        }
+    }
 }
 
-/// Removes a block's destroy stage, and answers whether the map moved.
+/// Removes a breaker's destroy stage, and answers whether the map moved.
 ///
-/// The session reports the removal when a dig stops or completes; the answer tells the caller
-/// whether the log line is worth writing.
-fn clear_break_stage(stages: &mut BTreeMap<[i32; 3], u8>, x: i32, y: i32, z: i32) -> bool {
-    stages.remove(&[x, y, z]).is_some()
+/// The session reports the removal when a dig stops or completes; the source's remove branch
+/// drops the entry by breaker (`RenderGlobal.sendBlockBreakProgress`:2379), so a removal
+/// cannot touch another breaker's entry on the same block. The answer tells the caller whether
+/// the log line is worth writing.
+fn clear_break_stage(stages: &mut BTreeMap<i32, WindowBreakEntry>, breaker: i32) -> bool {
+    stages.remove(&breaker).is_some()
+}
+
+/// Applies one event the world-overlay state holds, answering whether the
+/// event was one of them.
+///
+/// The three events the overlay state carries — the aim, a destroy stage
+/// landing, and a stage leaving — land here; the frame reads the state
+/// exactly as the assertions do: `aim_outline` over the stored aim and
+/// `cracks_in_view` over the breaker-keyed map, so a test can drive the
+/// window's real wiring without a renderer.
+fn apply_overlay_event(world_overlay: &mut WorldOverlayState, event: &ClientEvent) -> bool {
+    match event {
+        ClientEvent::Aim { aim: report } => {
+            if store_aim(&mut world_overlay.aim, *report) {
+                tracing::debug!(?report, "the aim moved");
+            }
+            true
+        }
+        ClientEvent::BreakStage {
+            breaker,
+            x,
+            y,
+            z,
+            stage,
+        } => {
+            // The crack overlay's own input: the stage lands in the map a
+            // frame hands the pass, and the log line fires once per change.
+            if store_break_stage(
+                &mut world_overlay.break_stages,
+                *breaker,
+                *x,
+                *y,
+                *z,
+                *stage,
+            ) {
+                tracing::debug!(
+                    breaker = *breaker,
+                    x = *x,
+                    y = *y,
+                    z = *z,
+                    stage = *stage,
+                    "a destroy stage landed"
+                );
+            }
+            true
+        }
+        ClientEvent::BreakCleared { breaker, x, y, z } => {
+            if clear_break_stage(&mut world_overlay.break_stages, *breaker) {
+                tracing::debug!(
+                    breaker = *breaker,
+                    x = *x,
+                    y = *y,
+                    z = *z,
+                    "a destroy stage left"
+                );
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Applies one event the session reported: meshes go to the renderer, the pose
@@ -1821,24 +1924,12 @@ fn apply_session_event(
             chat.observe(&text, position, player.tick);
             false
         }
-        ClientEvent::Aim { aim: report } => {
-            if store_aim(&mut world_overlay.aim, report) {
-                tracing::debug!(?report, "the aim moved");
-            }
-            false
-        }
-        ClientEvent::BreakStage { x, y, z, stage } => {
-            // The crack overlay's own input: the stage lands in the map a frame
-            // hands the pass, and the log line fires once per change.
-            if store_break_stage(&mut world_overlay.break_stages, x, y, z, stage) {
-                tracing::debug!(x, y, z, stage, "a destroy stage landed");
-            }
-            false
-        }
-        ClientEvent::BreakCleared { x, y, z } => {
-            if clear_break_stage(&mut world_overlay.break_stages, x, y, z) {
-                tracing::debug!(x, y, z, "a destroy stage left");
-            }
+        ClientEvent::Aim { .. }
+        | ClientEvent::BreakStage { .. }
+        | ClientEvent::BreakCleared { .. } => {
+            // The overlay state's own events; the helper holds the stores the
+            // frame's outline and crack reads consume.
+            apply_overlay_event(world_overlay, &event);
             false
         }
         ClientEvent::Time {
@@ -2692,11 +2783,11 @@ mod tests {
         Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClientApp,
         DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute, Key,
         MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate, SkyValues,
-        UrlOpener, aim_outline, bound_mouse_button, chat_opener, chat_wheel_lines,
-        clear_break_stage, command_text, cracks_in_view, escape_route, frame_params, gameplay_key,
-        is_enter_press, is_escape_press, is_f3_press, parse_script, parse_server_address,
-        scaled_cursor, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
-        tooltip_point, void_y_factor,
+        UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline, apply_overlay_event,
+        bound_mouse_button, chat_opener, chat_wheel_lines, clear_break_stage, command_text,
+        cracks_in_view, escape_route, frame_params, gameplay_key, is_enter_press, is_escape_press,
+        is_f3_press, parse_script, parse_server_address, scaled_cursor, skin_requests, store_aim,
+        store_break_stage, store_skins, tab_held, tooltip_point, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -2706,6 +2797,7 @@ mod tests {
     use oxide_game::entity_view::PlayerListRecord;
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
+    use oxide_game::session::ClientEvent;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -3473,13 +3565,20 @@ mod tests {
 
     #[test]
     fn the_crack_set_is_the_stage_maps_entries_within_the_render_distance() {
-        // The window feeds one crack entry per live destroy stage, in cell order, and keeps
-        // only what the render distance can show; the pass drops the rest itself at the
-        // source's 32-block reach (`RenderGlobal.java:1843-1848`).
+        // The window feeds one crack entry per live destroy stage — one per
+        // breaker — sorted by the block and then the breaker, and keeps only
+        // what the render distance can show; the pass drops the rest itself
+        // at the source's 32-block reach (`RenderGlobal.java`:1845). Two
+        // breakers on one block hand the pass two entries, which the multiply
+        // blend applies twice.
         let mut stages = BTreeMap::new();
-        assert!(store_break_stage(&mut stages, 0, 64, 0, 3));
-        assert!(store_break_stage(&mut stages, 7, 64, 0, 5));
-        assert!(store_break_stage(&mut stages, 140, 64, 0, 9), "far out");
+        assert!(store_break_stage(&mut stages, 7, 0, 64, 0, 3));
+        assert!(
+            store_break_stage(&mut stages, 9, 0, 64, 0, 5),
+            "the same block"
+        );
+        assert!(store_break_stage(&mut stages, 8, 7, 64, 0, 5));
+        assert!(store_break_stage(&mut stages, 5, 140, 64, 0, 9), "far out");
         let eye = [0.5, 64.5, 0.5];
         assert_eq!(
             cracks_in_view(&stages, eye, 8),
@@ -3489,19 +3588,28 @@ mod tests {
                     stage: 3,
                 },
                 Crack {
+                    block: [0, 64, 0],
+                    stage: 5,
+                },
+                Crack {
                     block: [7, 64, 0],
                     stage: 5,
                 },
-            ]
+            ],
+            "both breakers draw, in block order"
         );
         // The boundary cell is inside: its centre sits 128 blocks out, the plane itself.
-        assert!(store_break_stage(&mut stages, 128, 64, 0, 1));
+        assert!(store_break_stage(&mut stages, 6, 128, 64, 0, 1));
         assert_eq!(
             cracks_in_view(&stages, eye, 8),
             vec![
                 Crack {
                     block: [0, 64, 0],
                     stage: 3,
+                },
+                Crack {
+                    block: [0, 64, 0],
+                    stage: 5,
                 },
                 Crack {
                     block: [7, 64, 0],
@@ -3514,38 +3622,156 @@ mod tests {
             ]
         );
         // A wider render distance takes the far one back.
-        assert_eq!(cracks_in_view(&stages, eye, 12).len(), 4);
+        assert_eq!(cracks_in_view(&stages, eye, 12).len(), 5);
     }
 
     #[test]
     fn the_break_stage_store_reports_its_moves() {
-        // The session's stage reports land in a map keyed by the block's cell, and each
-        // report answers whether the entry it wrote changed — the same stage twice is one
-        // landing.
+        // The session's stage reports land in a map keyed by the breaker, and
+        // each report answers whether the entry it wrote changed — the same
+        // stage twice is one landing, and a same-breaker write at a new block
+        // replaces the entry.
         let mut stages = BTreeMap::new();
         assert!(
-            store_break_stage(&mut stages, 1, 2, 3, 4),
+            store_break_stage(&mut stages, 4, 1, 2, 3, 4),
             "a first stage lands"
         );
-        assert_eq!(stages.get(&[1, 2, 3]), Some(&4));
+        assert_eq!(
+            stages.get(&4),
+            Some(&WindowBreakEntry {
+                pos: [1, 2, 3],
+                stage: 4
+            })
+        );
         assert!(
-            !store_break_stage(&mut stages, 1, 2, 3, 4),
+            !store_break_stage(&mut stages, 4, 1, 2, 3, 4),
             "the same stage is no move"
         );
         assert!(
-            store_break_stage(&mut stages, 1, 2, 3, 7),
+            store_break_stage(&mut stages, 4, 1, 2, 3, 7),
             "a later stage moves"
         );
-        assert_eq!(stages.get(&[1, 2, 3]), Some(&7));
-        assert!(
-            clear_break_stage(&mut stages, 1, 2, 3),
-            "the clear removes it"
+        assert_eq!(
+            stages.get(&4),
+            Some(&WindowBreakEntry {
+                pos: [1, 2, 3],
+                stage: 7
+            })
         );
         assert!(
-            !clear_break_stage(&mut stages, 1, 2, 3),
+            store_break_stage(&mut stages, 4, 9, 2, 3, 7),
+            "a new block replaces the entry"
+        );
+        assert_eq!(
+            stages.get(&4),
+            Some(&WindowBreakEntry {
+                pos: [9, 2, 3],
+                stage: 7
+            })
+        );
+        assert!(clear_break_stage(&mut stages, 4), "the clear removes it");
+        assert!(
+            !clear_break_stage(&mut stages, 4),
             "nothing is left to clear"
         );
         assert!(stages.is_empty());
+    }
+
+    #[test]
+    fn overlay_wiring() {
+        // The window's overlay state is driven through the real helper
+        // `apply_session_event` delegates to, and read exactly as the frame
+        // reads it: `aim_outline` over the stored aim and `cracks_in_view`
+        // over the breaker-keyed map. Two breakers on one block are two
+        // entries — the pass multiplies twice — and clearing one leaves the
+        // other.
+        let mut overlay = WorldOverlayState::default();
+        let aim = Aim {
+            x: -3,
+            y: 64,
+            z: 12,
+            face: Face::Up,
+            hit: [-2.5, 65.0, 12.5],
+        };
+        assert!(
+            apply_overlay_event(&mut overlay, &ClientEvent::Aim { aim: Some(aim) }),
+            "the aim is the overlay's own event"
+        );
+        assert_eq!(
+            aim_outline(overlay.aim.expect("the aim landed")),
+            Outline {
+                block: [-3, 64, 12],
+                shape: FULL_CUBE,
+            }
+        );
+        // A look that leaves every block clears it.
+        assert!(apply_overlay_event(
+            &mut overlay,
+            &ClientEvent::Aim { aim: None }
+        ));
+        assert!(overlay.aim.is_none(), "the aim cleared");
+        // Two breakers on one block: both entries land, and both reach the
+        // pass.
+        assert!(apply_overlay_event(
+            &mut overlay,
+            &ClientEvent::BreakStage {
+                breaker: 7,
+                x: 0,
+                y: 64,
+                z: 0,
+                stage: 3,
+            }
+        ));
+        assert!(apply_overlay_event(
+            &mut overlay,
+            &ClientEvent::BreakStage {
+                breaker: 9,
+                x: 0,
+                y: 64,
+                z: 0,
+                stage: 5,
+            }
+        ));
+        let eye = [0.5, 64.5, 0.5];
+        assert_eq!(
+            cracks_in_view(&overlay.break_stages, eye, 8),
+            vec![
+                Crack {
+                    block: [0, 64, 0],
+                    stage: 3,
+                },
+                Crack {
+                    block: [0, 64, 0],
+                    stage: 5,
+                },
+            ],
+            "both breakers draw"
+        );
+        // Clearing one breaker leaves the other.
+        assert!(apply_overlay_event(
+            &mut overlay,
+            &ClientEvent::BreakCleared {
+                breaker: 7,
+                x: 0,
+                y: 64,
+                z: 0,
+            }
+        ));
+        assert_eq!(
+            cracks_in_view(&overlay.break_stages, eye, 8),
+            vec![Crack {
+                block: [0, 64, 0],
+                stage: 5,
+            }],
+            "breaker 9 stands"
+        );
+        // A session event the overlay does not hold reports not-consumed.
+        assert!(!apply_overlay_event(
+            &mut overlay,
+            &ClientEvent::Disconnected {
+                reason: "the session thread ended".into(),
+            }
+        ));
     }
 
     #[test]

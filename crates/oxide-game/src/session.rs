@@ -422,13 +422,15 @@ pub enum ClientEvent {
     },
     /// A destroy stage landed on a block.
     ///
-    /// Reported when the stage map's entry for the position changes — the
+    /// Reported when the stage map's entry for the breaker changes — the
     /// session's own digging writes it, and decoded clientbound 0x25 writes
-    /// it — with the stage the map holds, `0..=9` (the values a set can carry:
-    /// `RenderGlobal.sendBlockBreakProgress`'s `progress >= 0 && progress < 10`,
-    /// `client/renderer/RenderGlobal.java:2364`). The window's crack overlay
-    /// draws from it.
+    /// it — with the breaker's entity id and the stage the map holds, `0..=9`
+    /// (the values a set can carry: `RenderGlobal.sendBlockBreakProgress`'s
+    /// `progress >= 0 && progress < 10`, `RenderGlobal.java`:2364).
+    /// The window's crack overlay draws from it.
     BreakStage {
+        /// The breaking player's entity id.
+        breaker: i32,
         /// The block's x.
         x: i32,
         /// The block's y.
@@ -445,6 +447,8 @@ pub enum ClientEvent {
     /// (`RenderGlobal.sendBlockBreakProgress:2377-2380`), or the entry
     /// expired in the sweep (`cleanupDamagedBlocks:1131`).
     BreakCleared {
+        /// The breaking player's entity id.
+        breaker: i32,
         /// The block's x.
         x: i32,
         /// The block's y.
@@ -645,6 +649,10 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // read: the held flag and the presses queued since the last tick.
         let mut dig = DigState::new();
         let mut stages = BreakStages::new();
+        // The destroy stages' own clock: the counter the stage writes carry
+        // and the twenty-tick sweep cadence read (`RenderGlobal.updateClouds`,
+        // `RenderGlobal.java`:1138-1146).
+        let mut stage_counter: u32 = 0;
         let mut left_held = false;
         let mut left_presses: u32 = 0;
         let mut right_presses: u32 = 0;
@@ -888,6 +896,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         world.as_mut(),
                                         &mut queue,
                                         &mut stages,
+                                        stage_counter,
+                                        player.entity_id,
                                         &mut conn,
                                         events,
                                     )?;
@@ -969,6 +979,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     world.as_mut(),
                                     &mut queue,
                                     &mut stages,
+                                    stage_counter,
+                                    player.entity_id,
                                     &mut conn,
                                     events,
                                 )?;
@@ -1183,20 +1195,34 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             let animation = decoded(id, BlockBreakAnimation::decode(body))?;
                             // The stage map's own rule, from the packet's
                             // reader through `RenderGlobal.sendBlockBreakProgress`
-                            // (`:2364-2380`): 0..=9 sets, anything else removes.
-                            // The breaker's id is carried but not filtered on:
-                            // this client's map is keyed by position until M4's
-                            // entity work.
-                            if animation.stage < 10 {
-                                if stages.set(
-                                    animation.x,
-                                    animation.y,
-                                    animation.z,
+                            // (`:2364-2380`): 0..=9 sets, anything else removes,
+                            // and both key by the breaker id. A breaker the
+                            // entity store does not know is logged and dropped:
+                            // the source's 0x25 path carries no entity lookup
+                            // (`NetHandlerPlayClient.handleBlockBreakAnim`,
+                            // `:1331-1335`), so the filter is this client's
+                            // own, following the entity-keyed handlers'
+                            // null-guard convention (`handleEntityVelocity`:501-510;
+                            // `handleAnimation`:867-872). The
+                            // server never echoes the client's own id
+                            // (`WorldManager.java`:96-113 excludes the breaker),
+                            // so the own dig never arrives here.
+                            if entities.get(animation.entity_id).is_none() {
+                                warn!(
+                                    breaker = animation.entity_id,
+                                    "a block break animation for an unknown entity"
+                                );
+                            } else if animation.stage < 10 {
+                                if stages.insert(
+                                    animation.entity_id,
+                                    [animation.x, animation.y, animation.z],
                                     animation.stage,
+                                    stage_counter,
                                 ) {
                                     report(
                                         events,
                                         ClientEvent::BreakStage {
+                                            breaker: animation.entity_id,
                                             x: animation.x,
                                             y: animation.y,
                                             z: animation.z,
@@ -1204,10 +1230,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         },
                                     );
                                 }
-                            } else if stages.clear(animation.x, animation.y, animation.z) {
+                            } else if stages.clear(animation.entity_id) {
                                 report(
                                     events,
                                     ClientEvent::BreakCleared {
+                                        breaker: animation.entity_id,
                                         x: animation.x,
                                         y: animation.y,
                                         z: animation.z,
@@ -1697,6 +1724,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             world.as_mut(),
                             &mut queue,
                             &mut stages,
+                            stage_counter,
+                            player.entity_id,
                             &mut conn,
                             events,
                         )?;
@@ -1705,8 +1734,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // The stages' own clock: the counter advances once per tick
                 // and the sweep runs every twentieth, reporting the entries it
                 // expired (`RenderGlobal.updateClouds`, `RenderGlobal.java:1138-1146`).
-                for (x, y, z) in stages.tick() {
-                    report(events, ClientEvent::BreakCleared { x, y, z });
+                stage_counter = stage_counter.wrapping_add(1);
+                if stage_counter % 20 == 0 {
+                    for (breaker, [x, y, z]) in stages.sweep(stage_counter) {
+                        report(events, ClientEvent::BreakCleared { breaker, x, y, z });
+                    }
                 }
             }
         }
@@ -2708,17 +2740,20 @@ fn step_dig(
 /// the finish is written before [`apply_block_change`] removes the block
 /// locally, so the local path waits on no server round trip; the stage that
 /// follows carries the reset progress's removal. An abort also clears the
-/// aborted block's entry: the source drops the breaker's damage entry as the
-/// abort goes out (`sendBlockBreakProgress` with a negative progress,
-/// `PlayerControllerMP.java:263`, `:281`), and under this map's position
-/// keying that entry is the aborted block's. A stage with a negative index
-/// clears the position's entry; a set reports only when the stored value
-/// changed.
+/// breaker's entry: the source drops the breaker's damage entry as the abort
+/// goes out (`sendBlockBreakProgress` with a negative progress,
+/// `PlayerControllerMP.java`:263, `:281`). A stage with a negative index
+/// clears the breaker's entry; a set reports only when the stored value
+/// changed. The breaker is the session's own entity id, named at Join Game;
+/// it is absent only before a join, when no dig can run.
+#[allow(clippy::too_many_arguments)]
 fn apply_dig_action<S: Read + Write>(
     action: &DigAction,
     world: Option<&mut World>,
     queue: &mut MeshQueue,
     stages: &mut BreakStages,
+    stage_counter: u32,
+    breaker: Option<i32>,
     conn: &mut Conn<S>,
     events: &Sender<ClientEvent>,
 ) -> Result<(), SessionError> {
@@ -2736,8 +2771,10 @@ fn apply_dig_action<S: Read + Write>(
                     write_player_digging(out, DiggingStatus::Abort, x, y, z, face.wire())
                 }),
             )?;
-            if stages.clear(x, y, z) {
-                report(events, ClientEvent::BreakCleared { x, y, z });
+            if let Some(breaker) = breaker {
+                if stages.clear(breaker) {
+                    report(events, ClientEvent::BreakCleared { breaker, x, y, z });
+                }
             }
             Ok(())
         }
@@ -2755,20 +2792,23 @@ fn apply_dig_action<S: Read + Write>(
             Ok(())
         }
         DigAction::Stage { x, y, z, index } => {
-            if index >= 0 {
-                if stages.set(x, y, z, index as u8) {
-                    report(
-                        events,
-                        ClientEvent::BreakStage {
-                            x,
-                            y,
-                            z,
-                            stage: index as u8,
-                        },
-                    );
+            if let Some(breaker) = breaker {
+                if index >= 0 {
+                    if stages.insert(breaker, [x, y, z], index as u8, stage_counter) {
+                        report(
+                            events,
+                            ClientEvent::BreakStage {
+                                breaker,
+                                x,
+                                y,
+                                z,
+                                stage: index as u8,
+                            },
+                        );
+                    }
+                } else if stages.clear(breaker) {
+                    report(events, ClientEvent::BreakCleared { breaker, x, y, z });
                 }
-            } else if stages.clear(x, y, z) {
-                report(events, ClientEvent::BreakCleared { x, y, z });
             }
             Ok(())
         }

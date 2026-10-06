@@ -235,7 +235,7 @@ impl WorldOverlay {
                 buffers: &[outline_vertex_layout()],
             },
             primitive: primitive_state(None),
-            depth_stencil: Some(depth_state(false)),
+            depth_stencil: Some(outline_depth_stencil()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -256,7 +256,7 @@ impl WorldOverlay {
                 buffers: &[crack_vertex_layout()],
             },
             primitive: primitive_state(Some(wgpu::Face::Back)),
-            depth_stencil: Some(crack_depth_state()),
+            depth_stencil: Some(crack_depth_stencil()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -529,6 +529,27 @@ fn crack_depth_state() -> wgpu::DepthStencilState {
         bias: crack_depth_bias(),
         ..depth_state(true)
     }
+}
+
+/// The outline pipeline's depth state, as the pipeline is built with it:
+/// [`depth_state`] with the writes off — the outline's `depthMask(false)`
+/// (`RenderGlobal.drawSelectionBox`:1884).
+///
+/// The construction site and the descriptor test both read this one function,
+/// so the values the test pins are the values the pipeline is built from.
+fn outline_depth_stencil() -> wgpu::DepthStencilState {
+    depth_state(false)
+}
+
+/// The crack pipeline's depth state, as the pipeline is built with it:
+/// [`crack_depth_state`] — the offset with the writes left on
+/// (`RenderGlobal.postRenderDamagedBlocks` restoring `depthMask(true)`,
+/// `:1815`).
+///
+/// The construction site and the descriptor test both read this one function,
+/// so the values the test pins are the values the pipeline is built from.
+fn crack_depth_stencil() -> wgpu::DepthStencilState {
+    crack_depth_state()
 }
 
 /// The primitive state for a cull mode: triangles, counter-clockwise front faces.
@@ -866,8 +887,9 @@ mod tests {
     use super::{
         CRACK_ALPHA, CRACK_ALPHA_TEST, CRACK_CULL_DISTANCE, Crack, FULL_CUBE, OUTLINE_COLOUR,
         OUTLINE_INFLATION, OUTLINE_WIDTH_PIXELS, Outline, box_edges, crack_blend, crack_bytes,
-        crack_depth_bias, crack_depth_state, crack_vertices, depth_state, edge_quad, outline_blend,
-        outline_box, outline_vertices, primitive_state, stage_uvs, within_view,
+        crack_depth_bias, crack_depth_stencil, crack_vertices, edge_quad, outline_blend,
+        outline_box, outline_depth_stencil, outline_vertices, primitive_state, stage_uvs,
+        within_view,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
     use crate::terrain_pass::DEPTH_FORMAT;
@@ -1154,7 +1176,8 @@ mod tests {
         assert_eq!(crack_depth_bias().constant, -3);
         assert_eq!(crack_depth_bias().slope_scale, -3.0);
         assert_eq!(crack_depth_bias().clamp, 0.0);
-        let depth = crack_depth_state();
+        // The descriptor is read through the crack pipeline's own holder.
+        let depth = crack_depth_stencil();
         assert_eq!(depth.format, DEPTH_FORMAT);
         assert_eq!(depth.depth_compare, CompareFunction::LessEqual);
         assert!(
@@ -1177,7 +1200,8 @@ mod tests {
         assert_eq!(blend.alpha.dst_factor, BlendFactor::Zero);
         assert_eq!(OUTLINE_COLOUR, [0.0, 0.0, 0.0, 0.4]);
         assert_eq!(OUTLINE_WIDTH_PIXELS, 2.0);
-        let depth = depth_state(false);
+        // The descriptor is read through the outline pipeline's own holder.
+        let depth = outline_depth_stencil();
         assert_eq!(depth.format, DEPTH_FORMAT);
         assert_eq!(depth.depth_compare, CompareFunction::LessEqual);
         assert!(

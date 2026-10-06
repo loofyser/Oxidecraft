@@ -50,10 +50,10 @@
 //! release (`:240`, `:274-283`), the finish at completion (`:324-325`) and the
 //! creative instant branch (`:230-235`, `:294-300`). The hand's rate is
 //! [`hand_rate`] — the source's own split — and the destroy stages the
-//! progress names are [`BreakStages`]'s, keyed by position until M4's entity
-//! work.
+//! progress names are [`BreakStages`]'s, keyed by the breaking player's
+//! entity id.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use oxide_world::behaviour::{CollisionShape, Material, behaviour};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
@@ -1057,38 +1057,45 @@ impl DigState {
     }
 }
 
-/// The destroy stages the crack overlay draws from, keyed by block position
-/// until M4's entity work.
+/// The destroy stages the crack overlay draws from, keyed by the breaking
+/// player's entity id.
 ///
-/// The source keys its map by the breaking player's entity id
-/// (`RenderGlobal.damagedBlocks`, `client/renderer/RenderGlobal.java:126-127`),
-/// one `DestroyBlockProgress` per breaker — so two breakers on one block share
-/// one entry only while the position matches (`:2366-2372`). This client has
-/// no entity filtering yet, so the map is keyed by position: a 0x25 from any
-/// entity lands on the block's one entry.
+/// The source keys its map the same way (`RenderGlobal.damagedBlocks`,
+/// `RenderGlobal.java`:127): one `DestroyBlockProgress` per
+/// breaker (`DestroyBlockProgress.java`:8-10), so two breakers on one block
+/// are two entries — the render path iterates `damagedBlocks.values()` and
+/// draws one overlay per entry (`RenderGlobal.java`:710, `:735`).
 ///
-/// A stage lands through [`BreakStages::set`] (0..=9) and is removed by
-/// [`BreakStages::clear`]; [`BreakStages::tick`] advances the counter and,
-/// every twentieth tick, sweeps entries whose last update is more than 400
-/// ticks old (`RenderGlobal.updateClouds`, `:1138-1146`, over
-/// `cleanupDamagedBlocks`'s `cloudTickCounter - i > 400`, `:1131`), so a
-/// removal lands 401 to 420 ticks after the last update.
+/// A stage lands through [`BreakStages::insert`] (0..=9) and is removed by
+/// [`BreakStages::clear`], both keyed by the breaker: the source's set branch
+/// replaces a breaker's entry when its position moves (`RenderGlobal.java`:2368-2372)
+/// and refreshes the entry's tick on every set (`RenderGlobal.java`:2375),
+/// and its remove branch drops by breaker (`RenderGlobal.java`:2379).
+/// [`BreakStages::sweep`] removes every entry more than 400 ticks past its
+/// last update (`cleanupDamagedBlocks`'s `cloudTickCounter - i > 400`,
+/// `RenderGlobal.java`:1131); the caller owns the counter and the twenty-tick
+/// cadence (`updateClouds`, `RenderGlobal.java`:1138-1146), so a removal lands
+/// 401 to 420 ticks after the last update. The removals are sorted by
+/// breaker, so the events a session reports are deterministic where the
+/// source's map iteration is not.
 #[derive(Debug, Clone)]
 pub struct BreakStages {
-    /// The source's `cloudTickCounter`, advanced once per tick.
-    counter: u32,
-    /// The live entries by block position.
-    entries: HashMap<(i32, i32, i32), StageEntry>,
+    /// The live entries by breaker id.
+    entries: BTreeMap<i32, BreakEntry>,
 }
 
-/// One stage entry: the stage and the counter's value at its last update.
+/// One stage entry: the block, the stage and the counter's value at its last
+/// update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StageEntry {
+pub struct BreakEntry {
+    /// The block the breaker is destroying.
+    pub pos: [i32; 3],
     /// The stage the crack overlay draws, 0..=9.
-    stage: u8,
+    pub stage: u8,
     /// The counter when the entry was last updated
-    /// (`DestroyBlockProgress.createdAtCloudUpdateTick`, `:57-60`).
-    last: u32,
+    /// (`DestroyBlockProgress.createdAtCloudUpdateTick`,
+    /// `DestroyBlockProgress.java`:22, refreshed on every set at `RenderGlobal.java`:2375).
+    pub last_update: u32,
 }
 
 impl Default for BreakStages {
@@ -1098,50 +1105,39 @@ impl Default for BreakStages {
 }
 
 impl BreakStages {
-    /// An empty map at counter zero.
+    /// An empty map.
     pub fn new() -> Self {
         Self {
-            counter: 0,
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
         }
     }
 
-    /// The stage a position holds, when it holds one.
-    pub fn stage(&self, x: i32, y: i32, z: i32) -> Option<u8> {
-        self.entries.get(&(x, y, z)).map(|entry| entry.stage)
-    }
-
-    /// How many entries are live.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the map holds no entry.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Lands a stage on a position, answering whether the stored value
+    /// Lands a stage for a breaker, answering whether the stored value
     /// changed.
     ///
-    /// The source's set (`sendBlockBreakProgress:2364-2375`): an entry is
-    /// created when none holds the position, the stage is stored, and the
-    /// last-update tick is refreshed either way.
-    pub fn set(&mut self, x: i32, y: i32, z: i32, stage: u8) -> bool {
-        let counter = self.counter;
-        match self.entries.get_mut(&(x, y, z)) {
+    /// The source's set branch (`RenderGlobal.sendBlockBreakProgress`:2364-2376):
+    /// an entry is created when the breaker holds none; a same-breaker write
+    /// at a new position discards the old entry (`RenderGlobal.java`:2368-2372),
+    /// so only the new landing is a change; the stage is stored and the
+    /// last-update tick is refreshed on every call (`RenderGlobal.java`:2375).
+    /// The answer is true when the entry is new, the position moved, or the
+    /// stage changed.
+    pub fn insert(&mut self, breaker: i32, pos: [i32; 3], stage: u8, counter: u32) -> bool {
+        match self.entries.get_mut(&breaker) {
             Some(entry) => {
-                let changed = entry.stage != stage;
+                let changed = entry.pos != pos || entry.stage != stage;
+                entry.pos = pos;
                 entry.stage = stage;
-                entry.last = counter;
+                entry.last_update = counter;
                 changed
             }
             None => {
                 self.entries.insert(
-                    (x, y, z),
-                    StageEntry {
+                    breaker,
+                    BreakEntry {
+                        pos,
                         stage,
-                        last: counter,
+                        last_update: counter,
                     },
                 );
                 true
@@ -1149,37 +1145,39 @@ impl BreakStages {
         }
     }
 
-    /// Removes a position's entry, answering whether one was held
+    /// Removes a breaker's entry, answering whether one was held
     /// (`sendBlockBreakProgress`'s else branch, `:2377-2380`).
-    pub fn clear(&mut self, x: i32, y: i32, z: i32) -> bool {
-        self.entries.remove(&(x, y, z)).is_some()
+    pub fn clear(&mut self, breaker: i32) -> bool {
+        self.entries.remove(&breaker).is_some()
     }
 
-    /// Advances the counter one tick and sweeps expired entries every
-    /// twentieth tick, answering the positions it removed.
+    /// Sweeps the entries expired at `counter`, answering the removals.
     ///
-    /// The sweep removes an entry when `counter - last > 400`
-    /// (`cleanupDamagedBlocks:1131`); with the sweep every twenty ticks a
-    /// removal lands 401 to 420 ticks after the last update. The positions are
-    /// sorted, so the events a session reports are deterministic where the
-    /// source's map iteration is not.
-    pub fn tick(&mut self) -> Vec<(i32, i32, i32)> {
-        self.counter = self.counter.wrapping_add(1);
-        if self.counter % 20 != 0 {
-            return Vec::new();
-        }
-        let counter = self.counter;
-        let mut removed: Vec<(i32, i32, i32)> = self
+    /// The sweep removes an entry when `counter - last_update > 400`
+    /// (`RenderGlobal.java`:1131); the caller advances the counter once
+    /// per tick and sweeps every twentieth (`updateClouds`, `RenderGlobal.java`:1138-1146), so
+    /// a removal lands 401 to 420 ticks after the last update. The removals
+    /// are `(breaker, position)` pairs, sorted, so the events a session
+    /// reports are deterministic where the source's map iteration is not.
+    pub fn sweep(&mut self, counter: u32) -> Vec<(i32, [i32; 3])> {
+        let mut removed: Vec<(i32, [i32; 3])> = self
             .entries
             .iter()
-            .filter(|(_, entry)| counter.wrapping_sub(entry.last) > 400)
-            .map(|(position, _)| *position)
+            .filter(|(_, entry)| counter.wrapping_sub(entry.last_update) > 400)
+            .map(|(&breaker, entry)| (breaker, entry.pos))
             .collect();
         removed.sort_unstable();
-        for position in &removed {
-            self.entries.remove(position);
+        for (breaker, _) in &removed {
+            self.entries.remove(breaker);
         }
         removed
+    }
+
+    /// Every live entry, by breaker id in ascending order.
+    pub fn entries(&self) -> impl Iterator<Item = (i32, &BreakEntry)> {
+        self.entries
+            .iter()
+            .map(|(&breaker, entry)| (breaker, entry))
     }
 }
 
@@ -2426,67 +2424,145 @@ mod tests {
     }
 
     #[test]
-    fn stages_set_step_and_clear() {
+    fn stages_insert_step_and_clear_by_breaker() {
         // The map's own contract: a new entry changed it, a repeated stage
-        // does not, a step does, and a clear answers whether one was held.
+        // does not, a step does, and a clear answers whether one was held —
+        // all keyed by the breaker id, not the block.
         let mut stages = BreakStages::new();
-        assert!(stages.is_empty(), "a new map is empty");
-        assert!(stages.set(3, 65, 2, 0), "a new entry changed the map");
-        assert_eq!(stages.stage(3, 65, 2), Some(0), "the stage landed");
-        assert!(!stages.set(3, 65, 2, 0), "the same stage is no change");
-        assert!(stages.set(3, 65, 2, 4), "a step changed the map");
-        assert_eq!(stages.stage(3, 65, 2), Some(4), "the step landed");
-        assert_eq!(stages.len(), 1, "one entry");
-        assert!(stages.clear(3, 65, 2), "the entry was held");
-        assert_eq!(stages.stage(3, 65, 2), None, "the entry is gone");
-        assert!(!stages.clear(3, 65, 2), "a second clear is a no-op");
-        assert!(stages.is_empty(), "the map is empty again");
+        assert_eq!(stages.entries().count(), 0, "a new map is empty");
+        assert!(
+            stages.insert(7, [3, 65, 2], 0, 1),
+            "a new entry changed the map"
+        );
+        assert!(
+            !stages.insert(7, [3, 65, 2], 0, 2),
+            "the same stage is no change"
+        );
+        assert!(stages.insert(7, [3, 65, 2], 4, 3), "a step changed the map");
+        assert!(stages.clear(7), "the entry was held");
+        assert!(!stages.clear(7), "a second clear is a no-op");
+        assert_eq!(stages.entries().count(), 0, "the map is empty again");
+    }
+
+    #[test]
+    fn two_breakers_on_one_position_are_two_entries() {
+        // The source keys by breaker id, so two breakers on one block are two
+        // `DestroyBlockProgress` entries (`RenderGlobal.java`:127,
+        // `DestroyBlockProgress.java`:8-10) and the render path draws both
+        // (`RenderGlobal.java`:710). A same-stage write from a different breaker is a distinct
+        // entry.
+        let mut stages = BreakStages::new();
+        assert!(stages.insert(7, [3, 65, 2], 0, 1), "the first breaker");
+        assert!(stages.insert(9, [3, 65, 2], 4, 1), "the second, same block");
+        let entries: Vec<(i32, [i32; 3], u8)> = stages
+            .entries()
+            .map(|(breaker, entry)| (breaker, entry.pos, entry.stage))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![(7, [3, 65, 2], 0), (9, [3, 65, 2], 4)],
+            "both breakers stay live on the one block"
+        );
+    }
+
+    #[test]
+    fn clearing_one_breaker_leaves_the_other() {
+        // Removal is by breaker (`sendBlockBreakProgress`'s else branch,
+        // `RenderGlobal.java`:2379): clearing one breaker's entry cannot
+        // touch another's, even on the same block.
+        let mut stages = BreakStages::new();
+        assert!(stages.insert(7, [3, 65, 2], 0, 1));
+        assert!(stages.insert(9, [3, 65, 2], 4, 1));
+        assert!(stages.clear(7), "breaker 7's entry was held");
+        let remaining: Vec<(i32, [i32; 3])> = stages
+            .entries()
+            .map(|(breaker, entry)| (breaker, entry.pos))
+            .collect();
+        assert_eq!(remaining, vec![(9, [3, 65, 2])], "breaker 9 stands");
+        assert!(!stages.clear(7), "a second clear of 7 is a no-op");
+    }
+
+    #[test]
+    fn the_sweep_expires_each_entry_against_its_own_age() {
+        // The sweep compares each entry's own last update against the counter
+        // (`cleanupDamagedBlocks`'s `cloudTickCounter - i > 400`,
+        // `RenderGlobal.java`:1131): at counter 420 an entry last updated at 1
+        // is 419 ticks old and goes; one updated at 30 is 390 and stays.
+        let mut stages = BreakStages::new();
+        assert!(stages.insert(7, [3, 65, 2], 0, 1), "the old breaker");
+        assert!(stages.insert(9, [4, 65, 2], 4, 30), "the young breaker");
+        assert_eq!(
+            stages.sweep(420),
+            vec![(7, [3, 65, 2])],
+            "only the 419-tick-old entry goes"
+        );
+        let remaining: Vec<(i32, [i32; 3])> = stages
+            .entries()
+            .map(|(breaker, entry)| (breaker, entry.pos))
+            .collect();
+        assert_eq!(remaining, vec![(9, [4, 65, 2])], "the young one survives");
+    }
+
+    #[test]
+    fn a_same_breaker_new_position_replaces_the_entry() {
+        // The source discards a breaker's old entry when the position moves
+        // (`RenderGlobal.sendBlockBreakProgress`:2368-2372): one entry, at the new block,
+        // and the old landing is gone — the breaker-keyed maps on both sides
+        // replace in place, so no clearing event is due for the old block.
+        let mut stages = BreakStages::new();
+        assert!(stages.insert(7, [3, 65, 2], 0, 1));
+        assert!(stages.insert(7, [4, 65, 2], 3, 2), "the move is a change");
+        let entries: Vec<(i32, [i32; 3], u8)> = stages
+            .entries()
+            .map(|(breaker, entry)| (breaker, entry.pos, entry.stage))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![(7, [4, 65, 2], 3)],
+            "one entry, at the new position"
+        );
     }
 
     #[test]
     fn an_entry_expires_at_the_first_sweep_past_four_hundred_ticks() {
-        // The sweep runs every twentieth tick (`RenderGlobal.updateClouds`,
-        // `RenderGlobal.java:1138-1146`) and removes when
-        // `cloudTickCounter - i > 400` (`cleanupDamagedBlocks:1131`): an entry
-        // set at counter 1 is removed at counter 420 — 419 ticks after its
-        // last update, the first sweep past 400.
+        // The caller sweeps every twentieth tick (`RenderGlobal.updateClouds`,
+        // `RenderGlobal.java`:1138-1146) and the sweep removes when
+        // `counter - last_update > 400` (`RenderGlobal.java`:1131): an
+        // entry inserted at counter 1 is removed at the counter-420 sweep —
+        // 419 ticks after its last update, the first sweep past 400.
         let mut stages = BreakStages::new();
-        stages.tick(); // the counter is 1
-        stages.set(2, 65, 2, 5);
+        assert!(stages.insert(7, [2, 65, 2], 5, 1), "the entry");
         let mut removals = Vec::new();
         for counter in 2..=440 {
-            for position in stages.tick() {
-                removals.push((counter, position));
+            if counter % 20 == 0 {
+                removals.extend(stages.sweep(counter));
             }
         }
         assert_eq!(
             removals,
-            vec![(420, (2, 65, 2))],
+            vec![(7, [2, 65, 2])],
             "removed at counter 420, 419 ticks after the last update"
         );
     }
 
     #[test]
     fn an_age_of_exactly_four_hundred_ticks_survives_its_sweep() {
-        // The comparison is strict (`cloudTickCounter - i > 400`,
+        // The comparison is strict (`counter - last_update > 400`,
         // `cleanupDamagedBlocks:1131`), so an entry whose age is exactly 400
-        // at a sweep survives it: one set at counter 20 is swept at 420 with
-        // an age of 400 — kept — and removed at the next sweep, 440.
+        // at a sweep survives it: one inserted at counter 20 is swept at 420
+        // with an age of 400 — kept — and removed at the next sweep, 440.
         let mut stages = BreakStages::new();
-        for _ in 0..20 {
-            stages.tick(); // the counter is 20, and its sweep found nothing
-        }
-        stages.set(2, 65, 2, 5);
+        assert!(stages.insert(7, [2, 65, 2], 5, 20), "the entry");
         let mut removed = None;
         for counter in 21..=460 {
-            if stages.tick().contains(&(2, 65, 2)) {
+            if counter % 20 == 0 && stages.sweep(counter).contains(&(7, [2, 65, 2])) {
                 removed = Some(counter);
             }
         }
         assert_eq!(
             removed,
             Some(440),
-            "an age of exactly 400 at counter 420 is kept; 420 removes it"
+            "an age of exactly 400 at counter 420 is kept; 440 removes it"
         );
     }
 
@@ -2497,15 +2573,11 @@ mod tests {
         // extends its life: an entry refreshed at counter 401 is removed at
         // counter 820, not 420.
         let mut stages = BreakStages::new();
-        stages.tick(); // the counter is 1
-        stages.set(2, 65, 2, 5);
-        for _ in 0..400 {
-            stages.tick(); // the counter is 401
-        }
-        stages.set(2, 65, 2, 6);
+        assert!(stages.insert(7, [2, 65, 2], 5, 1), "the entry");
+        assert!(stages.insert(7, [2, 65, 2], 6, 401), "the refresh");
         let mut removed = None;
         for counter in 402..=840 {
-            if stages.tick().contains(&(2, 65, 2)) {
+            if counter % 20 == 0 && stages.sweep(counter).contains(&(7, [2, 65, 2])) {
                 removed = Some(counter);
             }
         }
@@ -2514,19 +2586,6 @@ mod tests {
             Some(820),
             "removed at counter 820, 419 ticks after the refresh"
         );
-    }
-
-    #[test]
-    fn two_updates_on_one_position_share_one_entry() {
-        // The source keys by breaker id, so two breakers on one block share
-        // one `DestroyBlockProgress` only while the position matches
-        // (`RenderGlobal.java:2366-2372`); this client's map is keyed by
-        // position until M4, so any update lands on the one entry.
-        let mut stages = BreakStages::new();
-        assert!(stages.set(0, 64, 0, 2), "the first update");
-        assert!(stages.set(0, 64, 0, 7), "the second changed the stage");
-        assert_eq!(stages.len(), 1, "one entry for the position");
-        assert_eq!(stages.stage(0, 64, 0), Some(7), "the latest stage");
     }
 
     #[test]
