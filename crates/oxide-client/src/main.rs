@@ -50,6 +50,7 @@ use anyhow::Context;
 use assets::ClientAssets;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use oxide_assets::font::Font;
 use oxide_assets::skins::SkinCache;
 use oxide_assets::store::Store;
 use oxide_game::chat::{ClickAction, ClickEvent};
@@ -58,6 +59,7 @@ use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::Aim;
 use oxide_game::player::MAX_HURT_TIME;
+use oxide_game::scoreboard::Scoreboard;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{
@@ -524,6 +526,20 @@ struct ClientApp {
     /// The chat field: the text, the cursor and the open state the window's
     /// keys and the script's `chat` lines drive.
     chat_input: ChatInput,
+    /// The held player list: the session's entries and header/footer pair, and
+    /// the held-key state the frame's draws gate on.
+    ///
+    /// The key lands in [`ClientApp::on_key`], the session's events in
+    /// [`ClientApp::draw`]'s drain, and the draws join the chat's in the same
+    /// frame.
+    tab: view::TabState,
+    /// The frame's scoreboard mirror: every whole-board report replaces it, and
+    /// the tab list's sort and display slots read it.
+    board: Scoreboard,
+    /// The measured font the frame's text surfaces share: the same value the
+    /// chat mirror measured against, and the one the tab list's assembly reads.
+    /// `None` without a session.
+    font: Option<Font>,
     /// The skin worker's request feed, when a session was opened.
     ///
     /// Dropping it — the client drops it with the app at exit — closes the
@@ -917,15 +933,18 @@ impl ClientApp {
             world_overlay: WorldOverlayState::default(),
             skins: BTreeMap::new(),
             view: view::View::new(),
-            chat: match chat_font {
+            chat: match &chat_font {
                 Some(font) => {
                     let mut chat = view::ChatView::new();
-                    chat.set_font(font);
+                    chat.set_font(font.clone());
                     chat
                 }
                 None => view::ChatView::new(),
             },
             chat_input: ChatInput::default(),
+            tab: view::TabState::new(),
+            board: Scoreboard::default(),
+            font: chat_font,
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
             overlay_visible,
@@ -979,6 +998,13 @@ impl ClientApp {
         let mut session_ended = false;
         for event in events {
             self.view.apply(&event);
+            // The tab list folds its own events in — the player-list entries
+            // and the header and footer pair — and a scoreboard report
+            // becomes the frame's mirror, the board the assembly reads.
+            self.tab.observe(&event);
+            if let ClientEvent::ScoreboardChanged { board } = &event {
+                self.board = board.clone();
+            }
             if let ClientEvent::PlayerList { entries } = &event {
                 if let Some(requests) = self.skin_requests.as_ref() {
                     forward_skins(requests, entries);
@@ -1149,7 +1175,22 @@ impl ClientApp {
             tooltip_point(self.chat_input.open, self.chat.confirm_open(), self.cursor),
             scaled,
         );
-        renderer.set_hud(self.chat.draws(scaled, &self.chat_input));
+        // The chat's draws land first and the held player list follows them —
+        // the source's own painter order (`GuiIngame.renderGameOverlay`:343-358)
+        // — and the list draws only while its key is held and the measured font
+        // is loaded.
+        let mut hud_draws = self.chat.draws(scaled, &self.chat_input);
+        if self.tab.open {
+            if let Some(font) = self.font.as_ref() {
+                hud_draws.extend(self.tab.tab_draws(
+                    &self.board,
+                    font,
+                    scaled,
+                    renderer.entity_textures(),
+                ));
+            }
+        }
+        renderer.set_hud(hud_draws);
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
         // text goes. Both are cleared when the respawn arrives.
@@ -1248,6 +1289,14 @@ impl ClientApp {
             self.on_chat_key(event_loop, event);
             return;
         }
+        // The held player list: a Tab edge while no screen consumes the keys
+        // — the open chat above answers first — sets the held state the
+        // frame's list draws gate on (`Minecraft.java`:1904-1912 sets every
+        // keyboard edge's binding; `GuiIngame.java`:350 reads the held key).
+        if let Some(held) = tab_held(event.state, event.physical_key) {
+            self.tab.open = held;
+            return;
+        }
         if is_f3_press(event.state, &event.logical_key) {
             self.overlay_visible = !self.overlay_visible;
             tracing::info!(
@@ -1311,6 +1360,8 @@ impl ClientApp {
     fn open_chat(&mut self, event_loop: &ActiveEventLoop, default: &str) {
         self.chat_input.open(default);
         self.chat.set_open(true);
+        // The screen's open drops the held keys, the player list's included.
+        self.tab.open = false;
         // The pointer was grabbed until this press: there is no free position
         // yet, so no hover or hit-test point until the mouse moves.
         self.cursor = None;
@@ -1729,20 +1780,22 @@ fn apply_session_event(
             false
         }
         ClientEvent::PlayerList { .. } => {
-            // The window's tab-list surface arrives with a later milestone;
+            // The held player list takes its entries at the frame's drain;
             // the feed is accepted here so the session's event stream stays
             // total.
             false
         }
         ClientEvent::ScoreboardChanged { .. } => {
-            // The window's sidebar surface arrives with a later milestone; the
-            // feed is accepted here so the session's event stream stays total.
+            // The frame's drain keeps each whole-board report as the held
+            // player list's mirror; the window's sidebar surface itself
+            // arrives with a later milestone, and the feed is accepted here
+            // so the session's event stream stays total.
             false
         }
         ClientEvent::TabText { .. } => {
-            // The window's tab-list surface arrives with a later milestone;
-            // the feed is accepted here so the session's event stream stays
-            // total.
+            // The held player list takes the header and footer pair at the
+            // frame's drain, with the entries; the feed is accepted here so
+            // the session's event stream stays total.
             false
         }
         ClientEvent::Chat { text, position } => {
@@ -2054,6 +2107,22 @@ fn chat_opener(
     }
 }
 
+/// The player-list key's own edge: a Tab press holds the list and a release
+/// drops it, and no other key is this key at all.
+///
+/// The source's binding is a held key state — the keyboard loop sets every
+/// edge (`Minecraft.java`:1904-1912) and the list's gate reads the held key
+/// (`GuiIngame.java`:350) — and the state drops when a screen opens or the
+/// focus goes, the source's own unpress of every held key
+/// (`Minecraft.java`:1470-1478).
+fn tab_held(state: ElementState, physical_key: PhysicalKey) -> Option<bool> {
+    if physical_key == PhysicalKey::Code(KeyCode::Tab) {
+        Some(state == ElementState::Pressed)
+    } else {
+        None
+    }
+}
+
 /// The link opener the confirm overlay's Enter path runs — the source's
 /// `openWebLink` (`GuiScreen.java`:727-739) in this milestone: the interim
 /// hands the URL to `xdg-open`, the desktop's own opener, and leaves the
@@ -2252,6 +2321,9 @@ impl ApplicationHandler for ClientApp {
                 renderer.set_entity_texture(key, texture);
             }
             renderer.set_entity_texture(assets::BLOCKS_ATLAS_TEXTURE, &assets.blocks_atlas);
+            // The hud's icon sheet: the tab list's latency bars and heart
+            // glyphs sample it under the name their draws carry.
+            renderer.set_hud_texture(assets::HUD_ICONS, &assets.hud_icons);
             renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
         }
         self.window = Some(window);
@@ -2302,6 +2374,12 @@ impl ApplicationHandler for ClientApp {
                 tracing::info!("the window lost focus, dropping capture");
                 let step = self.capture.focus_lost();
                 self.apply_capture(event_loop, step);
+                // The held list drops with the focus: the source's lost-focus
+                // pause opens the game menu on the same half-second
+                // (`EntityRenderer.java`:1071-1079), and a screen's open
+                // unpresses every held key (`Minecraft.java`:1010-1012,
+                // `Minecraft.java`:1470-1478).
+                self.tab.open = false;
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -2600,8 +2678,8 @@ mod tests {
         UrlOpener, aim_outline, bound_mouse_button, chat_opener, chat_wheel_lines,
         clear_break_stage, command_text, cracks_in_view, escape_route, frame_params, gameplay_key,
         is_enter_press, is_escape_press, is_f3_press, parse_script, parse_server_address,
-        scaled_cursor, skin_requests, store_aim, store_break_stage, store_skins, tooltip_point,
-        void_y_factor,
+        scaled_cursor, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
+        tooltip_point, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -3059,6 +3137,29 @@ mod tests {
             ),
             None,
             "an unbound key sends nothing even while grabbed"
+        );
+    }
+
+    #[test]
+    fn the_tab_key_holds_and_releases_the_player_list() {
+        // The player list's binding is a held key state: the source sets
+        // every keyboard edge's binding (`Minecraft.java`:1904-1912) and the
+        // list's gate reads it (`GuiIngame.java`:350). Only Tab is this key.
+        let tab = PhysicalKey::Code(KeyCode::Tab);
+        assert_eq!(
+            tab_held(ElementState::Pressed, tab),
+            Some(true),
+            "a press holds the list"
+        );
+        assert_eq!(
+            tab_held(ElementState::Released, tab),
+            Some(false),
+            "a release drops it"
+        );
+        assert_eq!(
+            tab_held(ElementState::Pressed, PhysicalKey::Code(KeyCode::KeyT)),
+            None,
+            "no other key is the list's"
         );
     }
 

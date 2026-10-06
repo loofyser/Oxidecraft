@@ -593,6 +593,14 @@ impl Renderer {
             .set_draws(&self.device, &self.queue, &draws, &self.entity_textures);
     }
 
+    /// Registers a hud texture under `name`, for the hud draws that sample a named
+    /// texture; a later call under the same name replaces it, and a draw whose name
+    /// never landed is skipped.
+    pub fn set_hud_texture(&mut self, name: &'static str, texture: &Texture) {
+        self.hud
+            .set_texture(&self.device, &self.queue, name, texture);
+    }
+
     /// Sets the full-frame tint the next frames draw over the scene, or clears it.
     ///
     /// The interim death view's backdrop: a colour here dims the whole frame

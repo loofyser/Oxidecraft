@@ -61,10 +61,11 @@ use oxide_render::camera::{
 };
 use oxide_render::entity_models::{Pose, PoseExtra};
 use oxide_render::entity_pass::{
-    DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw, TextureRef, TextureRegistry,
+    DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw, SkinLookup, TextureRef,
+    TextureRegistry,
 };
 use oxide_render::fog::{FogParams, fog_colour};
-use oxide_render::hud::{HudDraw, HudPass};
+use oxide_render::hud::{HudDraw, HudPass, HudTexture};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::SKY_COLOR;
@@ -245,6 +246,30 @@ fn overlay_font_sheet() -> Texture {
     for row in 0..CELL {
         let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
         rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The synthetic icon sheet: `gui/icons` in miniature — an opaque green band where the
+/// below-150 ms latency's window lands (`GuiPlayerTabOverlay.drawPing`:248-250 sets the
+/// level, `:270` draws at `(0, 176 + j * 8)`) and a red one where the no-signal window
+/// (`:244-246`'s level 5) does — over a transparent sheet.
+///
+/// Generated here; no asset store is read and no sheet pixel is copied.
+fn icon_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for (v, colour) in [(176u32, [0u8, 255, 0, 255]), (216, [255, 0, 0, 255])] {
+        for y in v..v + 8 {
+            for x in 0..10 {
+                let at = ((y * SIDE + x) * 4) as usize;
+                rgba[at..at + 4].copy_from_slice(&colour);
+            }
+        }
     }
     Texture {
         width: SIDE,
@@ -4982,6 +5007,16 @@ fn bar_over_sky(bar_alpha: u8) -> [u8; 3] {
     SKY.map(|channel| (f32::from(channel) * (1.0 - alpha)).round() as u8)
 }
 
+/// The blend of the tab list's white entry cell over the grid's panel over the sky —
+/// `GuiPlayerTabOverlay.renderPlayerlist`:167's `553648127` fill (0x20FFFFFF) over `:159`'s
+/// `Integer.MIN_VALUE` panel: the panel leaves `channel * (1 - 128/255)`, then the cell
+/// adds `255 * 32/255` on what remains of `channel * (1 - 32/255)`.
+fn cell_over_panel_over_sky() -> [u8; 3] {
+    let alpha = 32.0 / 255.0;
+    bar_over_sky(128)
+        .map(|channel| (f32::from(channel) * (1.0 - alpha) + 255.0 * alpha).round() as u8)
+}
+
 /// The hud draws a chat line's shape over the cleared frame: a black bar at the line's
 /// fade alpha and its shadowed text, at the GUI coordinates the chat assembly lays out.
 ///
@@ -5399,5 +5434,285 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
     assert_eq!(
         lit, 865,
         "two bars of 48x9, and the one-glyph line's one shadow pixel"
+    );
+}
+
+/// The hud draws the tab list's shape over the cleared frame: a one-line header and
+/// footer over a two-row grid — the first row with a list-objective score and a full
+/// latency rect, the second with the no-signal one — in the source's painter order
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:145-234).
+///
+/// The shape follows the source's rules: the centred panels at `width / 2 - l1 / 2 - 1`
+/// spanning `l1 + 2` (`:147`, `:159`, `:226`); rows on the nine-pixel pitch with
+/// eight-high cells and the five-pixel column gutter (`:163-167`); the head columns at
+/// `(8, 8)` and `(40, 8)` of the 64-texel skin space (`:186`, `:192`); the name at the
+/// cell's ninth pixel (`:195`); the ten-by-eight latency rect at the cell's right edge
+/// (`GuiPlayerTabOverlay.drawPing`:270); and the `§e` score right-aligned at its
+/// field's right edge (`GuiPlayerTabOverlay.drawScoreboardValues`:365-366).
+///
+/// The stand-ins: the probe's own cell width and panel span (the source's cell is
+/// name- and score-dependent and narrower at this width, `:118`), the synthetic
+/// font's single `|` glyph for the header, the footer, the names and the score, and the
+/// synthetic sheet's bands for the two latencies; the heads resolve the registry's
+/// default (the placeholder image), so their cells show its texels where a real skin's
+/// face and hat regions would sample. The resolution is 64x64 GUI units onto the 64x64
+/// target, so one unit is one pixel and every value lands at its own coordinate.
+///
+/// The count: the header, grid and footer panels span 42 columns by 39 rows — 1638
+/// non-sky pixels — and every cell, head, name, score and bar lands inside them.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_tab_list() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_texture(&device, &queue, "gui/icons", &icon_sheet());
+    let skins = TextureRegistry::new(&device, &queue);
+    let head = skins
+        .resolve("00000000-0000-0000-0000-000000000000", false)
+        .id();
+    let panel = [0.0, 0.0, 0.0, 128.0 / 255.0];
+    let cell = [1.0, 1.0, 1.0, 32.0 / 255.0];
+    let tint = [1.0, 1.0, 1.0, 1.0];
+    let face = [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0];
+    let hat = [40.0 / 64.0, 8.0 / 64.0, 48.0 / 64.0, 16.0 / 64.0];
+    let ping_good = [0.0, 176.0 / 256.0, 10.0 / 256.0, 184.0 / 256.0];
+    let ping_none = [0.0, 216.0 / 256.0, 10.0 / 256.0, 224.0 / 256.0];
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            // The header block: its panel, then the centred line's string.
+            HudDraw::Rect {
+                x: 11.0,
+                y: 9.0,
+                width: 42.0,
+                height: 10.0,
+                colour: panel,
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 31.0,
+                y: 10.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+            },
+            // The grid's panel.
+            HudDraw::Rect {
+                x: 11.0,
+                y: 19.0,
+                width: 42.0,
+                height: 19.0,
+                colour: panel,
+            },
+            // Entry one: the cell, the head (face then hat), the name, the score and
+            // the latency rect.
+            HudDraw::Rect {
+                x: 12.0,
+                y: 20.0,
+                width: 40.0,
+                height: 8.0,
+                colour: cell,
+            },
+            HudDraw::SkinRect {
+                texture: head,
+                x: 12.0,
+                y: 20.0,
+                width: 8.0,
+                height: 8.0,
+                uv: face,
+                colour: tint,
+            },
+            HudDraw::SkinRect {
+                texture: head,
+                x: 12.0,
+                y: 20.0,
+                width: 8.0,
+                height: 8.0,
+                uv: hat,
+                colour: tint,
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 21.0,
+                y: 20.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+            },
+            HudDraw::Text {
+                text: "§e|".to_string(),
+                x: 34.0,
+                y: 20.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+            },
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/icons"),
+                x: 41.0,
+                y: 20.0,
+                width: 10.0,
+                height: 8.0,
+                uv: ping_good,
+                colour: tint,
+            },
+            // Entry two: the cell, the head, the name and the no-signal latency rect.
+            HudDraw::Rect {
+                x: 12.0,
+                y: 29.0,
+                width: 40.0,
+                height: 8.0,
+                colour: cell,
+            },
+            HudDraw::SkinRect {
+                texture: head,
+                x: 12.0,
+                y: 29.0,
+                width: 8.0,
+                height: 8.0,
+                uv: face,
+                colour: tint,
+            },
+            HudDraw::SkinRect {
+                texture: head,
+                x: 12.0,
+                y: 29.0,
+                width: 8.0,
+                height: 8.0,
+                uv: hat,
+                colour: tint,
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 21.0,
+                y: 29.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+            },
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/icons"),
+                x: 41.0,
+                y: 29.0,
+                width: 10.0,
+                height: 8.0,
+                uv: ping_none,
+                colour: tint,
+            },
+            // The footer block: its panel, then the centred line's string.
+            HudDraw::Rect {
+                x: 11.0,
+                y: 38.0,
+                width: 42.0,
+                height: 10.0,
+                colour: panel,
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 31.0,
+                y: 39.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+            },
+        ],
+        &skins,
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The panels' extent: sky above the header and below the footer, the panel blend at
+    // the corners and rows, and the centred header's margins clear while its centre
+    // column is panel.
+    expect_pixel(&pixels, 26, 8, SKY, "the row above the header");
+    expect_pixel(
+        &pixels,
+        11,
+        9,
+        bar_over_sky(128),
+        "the header's top-left corner",
+    );
+    expect_pixel(
+        &pixels,
+        26,
+        9,
+        bar_over_sky(128),
+        "the header band's top row",
+    );
+    expect_pixel(
+        &pixels,
+        26,
+        18,
+        bar_over_sky(128),
+        "the header band's last row",
+    );
+    expect_pixel(&pixels, 26, 19, bar_over_sky(128), "the grid's top row");
+    expect_pixel(
+        &pixels,
+        32,
+        9,
+        bar_over_sky(128),
+        "the header's centre column",
+    );
+    expect_pixel(&pixels, 6, 12, SKY, "the margin left of the centred header");
+    expect_pixel(&pixels, 57, 12, SKY, "the margin right of it");
+    expect_pixel(
+        &pixels,
+        52,
+        47,
+        bar_over_sky(128),
+        "the footer's bottom-right corner",
+    );
+    expect_pixel(&pixels, 26, 48, SKY, "the row below the footer");
+    // The cells: the white 32/255 fill over the grid's panel at both rows, clear of the
+    // head, name, score and bar.
+    expect_pixel(
+        &pixels,
+        30,
+        23,
+        cell_over_panel_over_sky(),
+        "the first cell's bare area",
+    );
+    expect_pixel(
+        &pixels,
+        30,
+        32,
+        cell_over_panel_over_sky(),
+        "the second cell's bare area",
+    );
+    // The heads: the default's texel where the face and hat windows land.
+    expect_pixel(&pixels, 14, 22, [0, 0, 0], "the first head's cell");
+    expect_pixel(&pixels, 16, 31, [0, 0, 0], "the second head's cell");
+    // The names and the score: the ink glyphs at their pens, the score in `§e`'s yellow.
+    expect_pixel(&pixels, 21, 20, TEXT, "the first name's ink");
+    expect_pixel(&pixels, 34, 20, [255, 255, 85], "the score's ink");
+    // The latency rects: the green band under the first cell's level and the no-signal
+    // band under the second's.
+    expect_pixel(&pixels, 41, 20, [0, 255, 0], "the first latency's top-left");
+    expect_pixel(&pixels, 45, 23, [0, 255, 0], "the first latency's band");
+    expect_pixel(
+        &pixels,
+        45,
+        32,
+        [255, 0, 0],
+        "the second latency's no-signal band",
+    );
+    let lit = non_sky(&pixels);
+    assert_eq!(
+        lit, 1638,
+        "the three panels' 42x39 extent; every cell, head, name, score and bar inside"
     );
 }

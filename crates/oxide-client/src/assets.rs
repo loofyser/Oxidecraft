@@ -164,6 +164,10 @@ pub const DEFAULT_SKIN_WIDE: &str = "entity/steve.png";
 /// The slim default skin's key, an entry of [`ENTITY_TEXTURES`].
 pub const DEFAULT_SKIN_SLIM: &str = "entity/alex.png";
 
+/// The hud icon sheet's key, the extraction tree's `gui/icons.png`: the tab list's
+/// latency bars and heart glyphs sample it under the name every draw of it carries.
+pub const HUD_ICONS: &str = "gui/icons";
+
 /// The item frame's own wood: the blockstate file and the variant key the frame's
 /// model resource names (`RenderItemFrame.java`:37's `("item_frame", "normal")`).
 const ITEM_FRAME_STATE: (&str, &str) = ("item_frame", "normal");
@@ -280,6 +284,9 @@ pub struct ClientAssets {
     pub skin_wide: Texture,
     /// The slim default skin, from the entity set.
     pub skin_slim: Texture,
+    /// The hud's icon sheet, under [`HUD_ICONS`]: the tab list's latency bars and
+    /// heart glyphs sample it.
+    pub hud_icons: Texture,
     /// The object draws' item mesh source: the baked block models, the sheets and the
     /// frame's wood.
     pub item_meshes: ClientItemMeshes,
@@ -333,6 +340,9 @@ impl ClientAssets {
         for key in OBJECT_TEXTURES {
             object_textures.push((key, texture(&textures, key)?.clone()));
         }
+        // The hud's icon sheet: the tab list's latency bars and heart glyphs sample
+        // it under the name every draw of it carries.
+        let hud_icons = texture(&textures, HUD_ICONS)?.clone();
         // The blocks atlas's level-0 image, under the name the block-item meshes
         // sample; and the item frame's wood, baked from the tree's own model
         // (`RenderItemFrame.java`:37).
@@ -372,6 +382,7 @@ impl ClientAssets {
             blocks_atlas,
             skin_wide,
             skin_slim,
+            hud_icons,
             item_meshes,
         })
     }

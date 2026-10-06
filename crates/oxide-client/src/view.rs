@@ -1567,112 +1567,91 @@ fn opacity_factor(chat_opacity: f32) -> f32 {
 
 // ---- the tab list ----
 
-// The held player list. Nothing calls it yet — the held key and the per-frame call site land
-// with a later milestone — so the items below carry `dead_code` allowances until then; the
-// tests already drive the whole assembly.
+// The held player list: the window's Tab edge sets the held state, the frame drains the
+// session's events into it and appends its draws after the chat's, and the tests drive the
+// whole assembly.
 
 /// The tab list's top margin in pixels: the source's own `k1 = 10`
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:120).
-#[allow(dead_code)]
 const TAB_TOP: i32 = 10;
 
 /// One row's pitch: the source's own nine-pixel step (`GuiPlayerTabOverlay.renderPlayerlist`:166).
-#[allow(dead_code)]
 const TAB_ROW_PITCH: i32 = 9;
 
 /// The gap between columns: the source's own five (`GuiPlayerTabOverlay.renderPlayerlist`:119).
-#[allow(dead_code)]
 const TAB_GUTTER: i32 = 5;
 
 /// The width the whole block is held under: the source's own fifty-pixel margin
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:118, `:127`, `:137`).
-#[allow(dead_code)]
 const TAB_SIDE_MARGIN: i32 = 50;
 
 /// The rows a column holds before the split: the source's own twenty
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:94).
-#[allow(dead_code)]
 const TAB_ROWS_PER_COLUMN: i32 = 20;
 
 /// The most entries the list keeps, after the sort: the source's own `min(size, 80)`
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:89).
-#[allow(dead_code)]
 const TAB_CAP: usize = 80;
 
 /// The head column's own nine pixels in the cell-width arithmetic
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:118) and the name's offset past the head (`:195`).
-#[allow(dead_code)]
 const TAB_HEAD: i32 = 9;
 
 /// A cell's fixed padding beyond the head, name and score fields: the source's own thirteen
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:118) — a pixel of name-to-score gap, one more to the
 /// ping, the ping's ten and a right margin.
-#[allow(dead_code)]
 const TAB_PADDING: i32 = 13;
 
 /// The score field's width under a hearts objective: the source's own ninety
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:104-106).
-#[allow(dead_code)]
 const TAB_HEARTS_FIELD: i32 = 90;
 
 /// One cell background's height, inside the nine-pixel row pitch
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:167).
-#[allow(dead_code)]
 const TAB_CELL_HEIGHT: i32 = 8;
 
 /// The grid, header and footer backgrounds: `Integer.MIN_VALUE` = 0x80000000 — black at half
 /// alpha (`GuiPlayerTabOverlay.renderPlayerlist`:147, `:159`, `:226`).
-#[allow(dead_code)]
 const TAB_PANEL: [f32; 4] = [0.0, 0.0, 0.0, 128.0 / 255.0];
 
 /// One entry's cell background: `553648127` = 0x20FFFFFF — white at alpha 32
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:167).
-#[allow(dead_code)]
 const TAB_CELL: [f32; 4] = [1.0, 1.0, 1.0, 32.0 / 255.0];
 
 /// The header, footer, name and score text colour: the source's `-1` for the header, footer and
 /// name (`GuiPlayerTabOverlay.renderPlayerlist`:152, `:205`, `:231`) and `16777215` for the
 /// score (`:366`) — both opaque white, the score's own yellow coming from its `§e` prefix.
-#[allow(dead_code)]
 const TAB_TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// A spectator's name colour: `-1862270977` = 0x90FFFFFF — white at alpha 144
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:201).
-#[allow(dead_code)]
 const TAB_SPECTATOR: [f32; 4] = [1.0, 1.0, 1.0, 144.0 / 255.0];
 
 /// The opaque white the heads and icons tint through: the source's own `color(1, 1, 1, 1)`
 /// before every entry's textures (`GuiPlayerTabOverlay.renderPlayerlist`:168, `drawPing`:239-240).
-#[allow(dead_code)]
 const TAB_TINT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// The icon sheet's registered name — the `gui/icons.png` the latency bars and the heart glyphs
 /// sample (`GuiPlayerTabOverlay.drawPing`:240, `drawScoreboardValues`:280).
-#[allow(dead_code)]
 const TAB_ICONS: &str = "gui/icons";
 
 /// The icon sheet's texel size: the legacy sheet is 256×256.
-#[allow(dead_code)]
 const ICONS_SHEET: f32 = 256.0;
 
 /// The face sub-rect of a skin sheet, eight-by-eight at (8, 8), over the source's sixty-four
 /// texel modal space (`GuiPlayerTabOverlay.renderPlayerlist`:186).
-#[allow(dead_code)]
 const TAB_FACE_UV: [f32; 4] = [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0];
 
 /// The hat overlay's sub-rect, eight-by-eight at (40, 8), over the same modal space
 /// (`GuiPlayerTabOverlay.renderPlayerlist`:192).
-#[allow(dead_code)]
 const TAB_HAT_UV: [f32; 4] = [40.0 / 64.0, 8.0 / 64.0, 48.0 / 64.0, 16.0 / 64.0];
 
 /// The gamemode byte a spectator carries: `SPECTATOR(3, "spectator")` (`WorldSettings.java`:141).
-#[allow(dead_code)]
 const SPECTATOR_GAMEMODE: u8 = 3;
 
 /// The latency icon's level from a response time in milliseconds: the source's own walk —
 /// negative is the no-signal five, then the 150/300/600/1000 steps
 /// (`GuiPlayerTabOverlay.drawPing`:244-267).
-#[allow(dead_code)]
 fn latency_level(latency: i32) -> u8 {
     if latency < 0 {
         5
@@ -1691,7 +1670,6 @@ fn latency_level(latency: i32) -> u8 {
 
 /// One latency icon's uv: the ten-by-eight sub-rect at `(0, 176 + 8 * level)` of the icon sheet
 /// (`GuiPlayerTabOverlay.drawPing`:270) — the no-signal X at level five, `(0, 216)`.
-#[allow(dead_code)]
 fn latency_uv(level: u8) -> [f32; 4] {
     let v = 176.0 + 8.0 * f32::from(level);
     [
@@ -1704,7 +1682,6 @@ fn latency_uv(level: u8) -> [f32; 4] {
 
 /// One heart glyph: the nine-by-nine sub-rect at `(u, 0)` of the icon sheet
 /// (`GuiPlayerTabOverlay.drawScoreboardValues`:317-345).
-#[allow(dead_code)]
 fn heart_glyph(u: f32, x: f32, y: f32) -> HudDraw {
     HudDraw::TexturedRect {
         texture: HudTexture::Named(TAB_ICONS),
@@ -1726,7 +1703,6 @@ fn heart_glyph(u: f32, x: f32, y: f32) -> HudDraw {
 /// (`GuiPlayerTabOverlay.drawScoreboardValues`:352): the shortest round-trip digits with a
 /// forced fraction — `29.0`, `28.5` — and scientific form at ten million and up, where Java
 /// prints `1.0E7`.
-#[allow(dead_code)]
 fn java_float_text(value: f32) -> String {
     if value.abs() >= 1.0e7 {
         let scientific = format!("{value:e}");
@@ -1750,7 +1726,6 @@ fn java_float_text(value: f32) -> String {
 /// The points an entry carries in an objective: the stored value, zero where the board holds
 /// none — the source reads through `getValueFromObjective`, which creates the missing score at
 /// its zero default (`Scoreboard.getValueFromObjective`:96-120).
-#[allow(dead_code)]
 fn points_of(board: &Scoreboard, record: &PlayerListRecord, objective: &Objective) -> i32 {
     board
         .scores
@@ -1765,7 +1740,6 @@ fn points_of(board: &Scoreboard, record: &PlayerListRecord, objective: &Objectiv
 /// has no characters (`NetHandlerPlayClient.java`:1600-1604) — and word-wrapped at `budget`
 /// (`FontRenderer.listFormattedStringToWidth`:844-868), each line back as the `§`-coded string
 /// the text builder draws.
-#[allow(dead_code)]
 fn tab_lines(raw: &str, budget: i32, font: &Font) -> Option<Vec<String>> {
     let component = chat::parse_json(raw);
     let runs = chat::flatten(&component);
@@ -1779,7 +1753,6 @@ fn tab_lines(raw: &str, budget: i32, font: &Font) -> Option<Vec<String>> {
 /// One row's score cell for an objective that is not hearts: the number in `§e` yellow,
 /// right-aligned at the field's right edge, shadowed
 /// (`GuiPlayerTabOverlay.drawScoreboardValues`:363-367).
-#[allow(dead_code)]
 fn score_text_draws(points: i32, right: i32, y: i32, font: &Font, draws: &mut Vec<HudDraw>) {
     let text = format!("§e{points}");
     draws.push(HudDraw::Text {
@@ -1799,7 +1772,6 @@ fn score_text_draws(points: i32, right: i32, y: i32, font: &Font, draws: &mut Ve
 /// The source's blink state machine and the per-entry prior value it reads (`:282-307`) are
 /// fields this frame does not carry — no flash pass draws, and the prior value stands at its
 /// zero default.
-#[allow(dead_code)]
 fn heart_draws(points: i32, left: i32, right: i32, y: i32, font: &Font, draws: &mut Vec<HudDraw>) {
     // The half-heart count and the slot count with its ten-slot floor (`:305-306`).
     let hearts = ((points.max(0) as f32) / 2.0).ceil() as i32;
@@ -1862,7 +1834,6 @@ fn heart_draws(points: i32, left: i32, right: i32, y: i32, font: &Font, draws: &
 /// `Minecraft.isIntegratedServerRunning`:2983; `NetworkManager.getIsencrypted`:412), and
 /// against an offline server it draws no heads at all — this port draws every profile's head,
 /// resolved through the skin registry's default fallback.
-#[allow(dead_code)]
 pub struct TabState {
     /// Whether the list draws this frame: the held state the window wires.
     pub open: bool,
@@ -1875,7 +1846,6 @@ pub struct TabState {
     pub footer: String,
 }
 
-#[allow(dead_code)]
 impl TabState {
     /// An unheld list with no entries and no header or footer.
     pub fn new() -> Self {
@@ -2142,7 +2112,6 @@ impl TabState {
 
 /// The team an entry belongs to, registered name only: the sort's second key
 /// (`GuiPlayerTabOverlay.PlayerComparator`:396) — the empty string when the entry has no team.
-#[allow(dead_code)]
 fn team_name<'a>(board: &'a Scoreboard, record: &PlayerListRecord) -> &'a str {
     board
         .member_of
