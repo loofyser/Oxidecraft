@@ -2250,7 +2250,7 @@ pub fn sidebar_draws(
     let height = resolution.height as i32;
     // The collection the source sorts (`Scoreboard.getSortedScores:124-140`):
     // every entry with a score in the objective, points ascending and equal
-    // points by name descending case-insensitively (`Score.scoreComparator:9-15`).
+    // points by name descending case-insensitively (`Score.java`:9-15).
     let mut sorted: Vec<(&str, i32)> = board
         .scores
         .iter()
@@ -5596,7 +5596,7 @@ mod tests {
     fn the_scoreboard_name_carries_its_teams_composition() {
         let font = chat_font();
         // Sidebar names compose through the team clauses like the tab list's
-        // (`ScorePlayerTeam.formatPlayerName:95-106`).
+        // (`ScorePlayerTeam.java`:95-106).
         let mut board = Scoreboard::new();
         board.set_team("greens", "Greens", "§a<", "§r", 0, "always", Some(10));
         board.add_team_players("greens", &["Alpha".to_owned()]);
