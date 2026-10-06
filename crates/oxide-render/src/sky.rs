@@ -1203,6 +1203,12 @@ fn vertex_buffer(
     (buffer, vertices.len() as u32)
 }
 
+/// The eye the sky's view is built from: the local frame's origin plus the pose's live eye
+/// height, less `crate::camera::FIRST_PERSON_OFFSET` along the view axis.
+fn sky_eye(camera: &Camera) -> Vec3 {
+    Vec3::new(0.0, camera.pose.eye_height(), 0.0) - FIRST_PERSON_OFFSET * camera.forward()
+}
+
 /// The sky pass: the pipelines, the frame uniform, the environment textures and the geometry.
 pub struct SkyPass {
     /// The band and the below-horizon plane, in the source's draw order.
@@ -1428,8 +1434,7 @@ impl SkyPass {
         // normally-played pass carries
         // (`EntityRenderer.setupCameraTransform`'s `translate(0.0F, 0.0F, -0.1F)`, `:720`) — the
         // same offset the terrain's own view has (`crate::camera::FIRST_PERSON_OFFSET`).
-        let eye =
-            Vec3::new(0.0, camera.pose.eye_height(), 0.0) - FIRST_PERSON_OFFSET * camera.forward();
+        let eye = sky_eye(camera);
         let view_projection = Mat4::perspective_rh(
             camera.fov_degrees.to_radians(),
             aspect,
@@ -1770,7 +1775,7 @@ mod tests {
     use super::{
         CLOUD_DRIFT_PER_TICK, CLOUD_UV_PER_BLOCK, KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend,
         celestial_rotation, cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_layer_y,
-        cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv, sky_depth_state,
+        cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv, sky_depth_state, sky_eye,
         sky_vertex_layout, star_field, sun_quad_vertices, void_box_low,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
@@ -1971,6 +1976,19 @@ mod tests {
         );
         assert!(cloud_at_or_above_layer(&lifted));
         assert!(!cloud_under_layer(&lifted));
+        // The sky view's own eye reads the same live pose: at pitch 0 it is the eye height
+        // straight up — 1.62 standing, 1.54 while sneaking (`EntityRenderer.java`:738's
+        // closing translate reads the live eye height, `:637`).
+        assert_eq!(
+            sky_eye(&at_layer).y,
+            1.62,
+            "the standing sky eye reads the pose's height"
+        );
+        assert_eq!(
+            sky_eye(&crouched).y,
+            1.54,
+            "the sneaking sky eye reads the live height"
+        );
     }
 
     #[test]
