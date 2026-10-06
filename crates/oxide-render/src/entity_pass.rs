@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use glam::{Mat3, Mat4, Vec3};
 use oxide_assets::atlas::missing_pixels;
@@ -42,6 +43,7 @@ use oxide_assets::texture::Texture;
 use crate::camera::{Camera, render_eye};
 use crate::entity_models::{self, PoseExtra, build_vertices, player};
 use crate::fog::FogParams;
+use crate::hud::SkinTextures;
 use crate::terrain_pass::{color_target, depth_state, primitive_state};
 use crate::text::{self, TextBuilder};
 
@@ -537,8 +539,41 @@ pub struct NametagDraw {
     pub text: Arc<str>,
 }
 
+/// A registered texture's id: `Copy`, stable, and never reused.
+///
+/// Every upload mints one from the process's id sequence ([`mint_skin_id`]) — the
+/// registry's placeholder and two defaults included, minted as it is built — so no two
+/// registered textures ever share an id, and a re-upload mints a fresh one: nothing may
+/// cache an id across frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkinTexId(u64);
+
+impl SkinTexId {
+    /// The id carrying `value`.
+    ///
+    /// The registry hands out ids from its own sequence; a frame that names a texture
+    /// without one — a test's stand-in — builds the value directly.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// The process's registered-texture id sequence.
+///
+/// One sequence covers every upload — the registry's named textures, defaults and
+/// profile skins, and the pass's own nametag sheet — so ids are unique across every
+/// draw path and never reused.
+static NEXT_SKIN_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Mints the next registered-texture id.
+fn mint_skin_id() -> SkinTexId {
+    SkinTexId::new(NEXT_SKIN_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 /// A registered entity texture: the GPU texture and the bind group the pass samples through.
 pub struct RegisteredTexture {
+    /// The id this upload minted ([`SkinTexId`]).
+    id: SkinTexId,
     /// The texture itself, kept so its view stays valid.
     texture: wgpu::Texture,
     /// The view the bind group holds.
@@ -548,8 +583,14 @@ pub struct RegisteredTexture {
 }
 
 impl RegisteredTexture {
-    /// The texture's view, for consumers outside the pipeline binding (the tab list's head
-    /// draws).
+    /// The texture's id: what a draw carries to name it
+    /// ([`crate::hud::HudDraw::SkinRect`] samples it through the hud pass' own binds).
+    pub fn id(&self) -> SkinTexId {
+        self.id
+    }
+
+    /// The texture's view, for consumers outside the pipeline binding (the hud pass'
+    /// skin binds).
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
@@ -751,6 +792,31 @@ impl TextureRegistry {
     fn default_skin(&self, slim: bool) -> &RegisteredTexture {
         &self.defaults[usize::from(slim)]
     }
+
+    /// The registered texture carrying `id`, wherever the registry holds it — the walk
+    /// the hud pass resolves a frame's skin binds through.
+    fn registered(&self, id: SkinTexId) -> Option<&RegisteredTexture> {
+        if self.placeholder.id() == id {
+            return Some(&self.placeholder);
+        }
+        if let Some(texture) = self.defaults.iter().find(|texture| texture.id() == id) {
+            return Some(texture);
+        }
+        if let Some(texture) = self.named.values().find(|texture| texture.id() == id) {
+            return Some(texture);
+        }
+        for entry in self.skins.values() {
+            for texture in [entry.skin.as_ref(), entry.cape.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if texture.id() == id {
+                    return Some(texture);
+                }
+            }
+        }
+        None
+    }
 }
 
 impl SkinLookup for TextureRegistry {
@@ -762,6 +828,12 @@ impl SkinLookup for TextureRegistry {
             },
             None => self.default_skin(slim),
         }
+    }
+}
+
+impl SkinTextures for TextureRegistry {
+    fn skin_view(&self, id: SkinTexId) -> Option<&wgpu::TextureView> {
+        self.registered(id).map(RegisteredTexture::view)
     }
 }
 
@@ -818,7 +890,8 @@ fn placeholder_image() -> Texture {
     }
 }
 
-/// Uploads one RGBA image into a registered texture.
+/// Uploads one RGBA image into a registered texture, minting a fresh id from the
+/// process's sequence ([`SkinTexId`]).
 fn upload_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -873,6 +946,7 @@ fn upload_texture(
         ],
     });
     RegisteredTexture {
+        id: mint_skin_id(),
         texture,
         view,
         bind_group,
@@ -3239,5 +3313,25 @@ mod tests {
         assert_eq!(NAMETAG_SOLID, [1.0, 1.0, 1.0, 1.0]);
         // The deadmau5 term: ten font pixels up (`Render.java`:356-359).
         assert_eq!(NAMETAG_DEADMAU5_LIFT, -10.0);
+    }
+
+    #[test]
+    fn the_id_sequence_never_repeats_an_id() {
+        // Every mint takes the next value of one process-wide sequence, so no two
+        // registered textures ever share an id — a re-upload mints a fresh one
+        // (`SkinTexId`).
+        let ids = [
+            mint_skin_id(),
+            mint_skin_id(),
+            mint_skin_id(),
+            mint_skin_id(),
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            assert!(
+                !ids[..index].contains(id),
+                "mint {index} repeated an earlier id"
+            );
+        }
+        assert_eq!(SkinTexId::new(3), SkinTexId::new(3), "the value is the id");
     }
 }

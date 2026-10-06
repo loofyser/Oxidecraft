@@ -5009,6 +5009,7 @@ fn the_hud_pass_draws_a_chat_line() {
     hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
     hud.set_font(&device, &queue, &overlay_font_sheet())
         .expect("the synthetic sheet is a 16x16 grid");
+    let skins = TextureRegistry::new(&device, &queue);
     hud.set_draws(
         &device,
         &queue,
@@ -5029,6 +5030,7 @@ fn the_hud_pass_draws_a_chat_line() {
                 shadow: true,
             },
         ],
+        &skins,
     );
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5112,7 +5114,8 @@ fn the_hud_pass_draws_the_fade_series_at_four_alphas() {
             colour: [0.0, 0.0, 0.0, f32::from(bar) / 255.0],
         })
         .collect();
-    hud.set_draws(&device, &queue, &draws);
+    let skins = TextureRegistry::new(&device, &queue);
+    hud.set_draws(&device, &queue, &draws, &skins);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
@@ -5166,6 +5169,7 @@ fn the_hud_pass_draws_the_input_line_and_cursor() {
     hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
     hud.set_font(&device, &queue, &overlay_font_sheet())
         .expect("the synthetic sheet is a 16x16 grid");
+    let skins = TextureRegistry::new(&device, &queue);
     hud.set_draws(
         &device,
         &queue,
@@ -5193,6 +5197,7 @@ fn the_hud_pass_draws_the_input_line_and_cursor() {
                 colour: [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0],
             },
         ],
+        &skins,
     );
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5302,10 +5307,12 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
         shadow: true,
     };
 
+    let skins = TextureRegistry::new(&device, &queue);
     hud.set_draws(
         &device,
         &queue,
         &[bar(27.0), text("||", 28.0), bar(18.0), text("|", 19.0)],
+        &skins,
     );
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
@@ -5365,6 +5372,7 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
         &device,
         &queue,
         &[bar(27.0), text("|", 28.0), bar(18.0), text("|||", 19.0)],
+        &skins,
     );
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),

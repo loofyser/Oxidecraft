@@ -25,14 +25,15 @@ use oxide_game::chat::{
     self, CHAT_WIDTH, ChatLog, LOG_CAP, STYLE_BOLD, STYLE_ITALIC, STYLE_OBFUSCATED,
     STYLE_STRIKETHROUGH, STYLE_UNDERLINED, TextComponent,
 };
-use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra};
+use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, PlayerListRecord};
+use oxide_game::scoreboard::{Objective, Scoreboard, format_entry};
 use oxide_game::session::ClientEvent;
 use oxide_render::entity_models::player::CapeMotion;
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
-    DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, TextureRef,
+    DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, SkinLookup, SkinTexId, TextureRef,
 };
-use oxide_render::hud::{HudDraw, ScaledResolution};
+use oxide_render::hud::{HudDraw, HudTexture, ScaledResolution};
 use oxide_render::text::string_width;
 use oxide_world::entity::EntityKind;
 
@@ -1562,6 +1563,592 @@ fn run_text(runs: &[chat::StyledRun]) -> String {
 /// `1.0` exactly, so the fade byte passes through untouched.
 fn opacity_factor(chat_opacity: f32) -> f32 {
     chat_opacity * 0.9 + 0.1
+}
+
+// ---- the tab list ----
+
+// The held player list. Nothing calls it yet — the held key and the per-frame call site land
+// with a later milestone — so the items below carry `dead_code` allowances until then; the
+// tests already drive the whole assembly.
+
+/// The tab list's top margin in pixels: the source's own `k1 = 10`
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:120).
+#[allow(dead_code)]
+const TAB_TOP: i32 = 10;
+
+/// One row's pitch: the source's own nine-pixel step (`GuiPlayerTabOverlay.renderPlayerlist`:166).
+#[allow(dead_code)]
+const TAB_ROW_PITCH: i32 = 9;
+
+/// The gap between columns: the source's own five (`GuiPlayerTabOverlay.renderPlayerlist`:119).
+#[allow(dead_code)]
+const TAB_GUTTER: i32 = 5;
+
+/// The width the whole block is held under: the source's own fifty-pixel margin
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:118, `:127`, `:137`).
+#[allow(dead_code)]
+const TAB_SIDE_MARGIN: i32 = 50;
+
+/// The rows a column holds before the split: the source's own twenty
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:94).
+#[allow(dead_code)]
+const TAB_ROWS_PER_COLUMN: i32 = 20;
+
+/// The most entries the list keeps, after the sort: the source's own `min(size, 80)`
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:89).
+#[allow(dead_code)]
+const TAB_CAP: usize = 80;
+
+/// The head column's own nine pixels in the cell-width arithmetic
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:118) and the name's offset past the head (`:195`).
+#[allow(dead_code)]
+const TAB_HEAD: i32 = 9;
+
+/// A cell's fixed padding beyond the head, name and score fields: the source's own thirteen
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:118) — a pixel of name-to-score gap, one more to the
+/// ping, the ping's ten and a right margin.
+#[allow(dead_code)]
+const TAB_PADDING: i32 = 13;
+
+/// The score field's width under a hearts objective: the source's own ninety
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:104-106).
+#[allow(dead_code)]
+const TAB_HEARTS_FIELD: i32 = 90;
+
+/// One cell background's height, inside the nine-pixel row pitch
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:167).
+#[allow(dead_code)]
+const TAB_CELL_HEIGHT: i32 = 8;
+
+/// The grid, header and footer backgrounds: `Integer.MIN_VALUE` = 0x80000000 — black at half
+/// alpha (`GuiPlayerTabOverlay.renderPlayerlist`:147, `:159`, `:226`).
+#[allow(dead_code)]
+const TAB_PANEL: [f32; 4] = [0.0, 0.0, 0.0, 128.0 / 255.0];
+
+/// One entry's cell background: `553648127` = 0x20FFFFFF — white at alpha 32
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:167).
+#[allow(dead_code)]
+const TAB_CELL: [f32; 4] = [1.0, 1.0, 1.0, 32.0 / 255.0];
+
+/// The header, footer, name and score text colour: the source's `-1` for the header, footer and
+/// name (`GuiPlayerTabOverlay.renderPlayerlist`:152, `:205`, `:231`) and `16777215` for the
+/// score (`:366`) — both opaque white, the score's own yellow coming from its `§e` prefix.
+#[allow(dead_code)]
+const TAB_TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// A spectator's name colour: `-1862270977` = 0x90FFFFFF — white at alpha 144
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:201).
+#[allow(dead_code)]
+const TAB_SPECTATOR: [f32; 4] = [1.0, 1.0, 1.0, 144.0 / 255.0];
+
+/// The opaque white the heads and icons tint through: the source's own `color(1, 1, 1, 1)`
+/// before every entry's textures (`GuiPlayerTabOverlay.renderPlayerlist`:168, `drawPing`:239-240).
+#[allow(dead_code)]
+const TAB_TINT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// The icon sheet's registered name — the `gui/icons.png` the latency bars and the heart glyphs
+/// sample (`GuiPlayerTabOverlay.drawPing`:240, `drawScoreboardValues`:280).
+#[allow(dead_code)]
+const TAB_ICONS: &str = "gui/icons";
+
+/// The icon sheet's texel size: the legacy sheet is 256×256.
+#[allow(dead_code)]
+const ICONS_SHEET: f32 = 256.0;
+
+/// The face sub-rect of a skin sheet, eight-by-eight at (8, 8), over the source's sixty-four
+/// texel modal space (`GuiPlayerTabOverlay.renderPlayerlist`:186).
+#[allow(dead_code)]
+const TAB_FACE_UV: [f32; 4] = [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0];
+
+/// The hat overlay's sub-rect, eight-by-eight at (40, 8), over the same modal space
+/// (`GuiPlayerTabOverlay.renderPlayerlist`:192).
+#[allow(dead_code)]
+const TAB_HAT_UV: [f32; 4] = [40.0 / 64.0, 8.0 / 64.0, 48.0 / 64.0, 16.0 / 64.0];
+
+/// The gamemode byte a spectator carries: `SPECTATOR(3, "spectator")` (`WorldSettings.java`:141).
+#[allow(dead_code)]
+const SPECTATOR_GAMEMODE: u8 = 3;
+
+/// The latency icon's level from a response time in milliseconds: the source's own walk —
+/// negative is the no-signal five, then the 150/300/600/1000 steps
+/// (`GuiPlayerTabOverlay.drawPing`:244-267).
+#[allow(dead_code)]
+fn latency_level(latency: i32) -> u8 {
+    if latency < 0 {
+        5
+    } else if latency < 150 {
+        0
+    } else if latency < 300 {
+        1
+    } else if latency < 600 {
+        2
+    } else if latency < 1000 {
+        3
+    } else {
+        4
+    }
+}
+
+/// One latency icon's uv: the ten-by-eight sub-rect at `(0, 176 + 8 * level)` of the icon sheet
+/// (`GuiPlayerTabOverlay.drawPing`:270) — the no-signal X at level five, `(0, 216)`.
+#[allow(dead_code)]
+fn latency_uv(level: u8) -> [f32; 4] {
+    let v = 176.0 + 8.0 * f32::from(level);
+    [
+        0.0,
+        v / ICONS_SHEET,
+        10.0 / ICONS_SHEET,
+        (v + 8.0) / ICONS_SHEET,
+    ]
+}
+
+/// One heart glyph: the nine-by-nine sub-rect at `(u, 0)` of the icon sheet
+/// (`GuiPlayerTabOverlay.drawScoreboardValues`:317-345).
+#[allow(dead_code)]
+fn heart_glyph(u: f32, x: f32, y: f32) -> HudDraw {
+    HudDraw::TexturedRect {
+        texture: HudTexture::Named(TAB_ICONS),
+        x,
+        y,
+        width: 9.0,
+        height: 9.0,
+        uv: [
+            u / ICONS_SHEET,
+            0.0,
+            (u + 9.0) / ICONS_SHEET,
+            9.0 / ICONS_SHEET,
+        ],
+        colour: TAB_TINT,
+    }
+}
+
+/// A float as `Float.toString` writes the hearts number
+/// (`GuiPlayerTabOverlay.drawScoreboardValues`:352): the shortest round-trip digits with a
+/// forced fraction — `29.0`, `28.5` — and scientific form at ten million and up, where Java
+/// prints `1.0E7`.
+#[allow(dead_code)]
+fn java_float_text(value: f32) -> String {
+    if value.abs() >= 1.0e7 {
+        let scientific = format!("{value:e}");
+        let (mantissa, exponent) = scientific.split_once('e').expect("a scientific form");
+        let mantissa = if mantissa.contains('.') {
+            mantissa.to_owned()
+        } else {
+            format!("{mantissa}.0")
+        };
+        format!("{mantissa}E{exponent}")
+    } else {
+        let text = format!("{value}");
+        if text.contains('.') {
+            text
+        } else {
+            format!("{text}.0")
+        }
+    }
+}
+
+/// The points an entry carries in an objective: the stored value, zero where the board holds
+/// none — the source reads through `getValueFromObjective`, which creates the missing score at
+/// its zero default (`Scoreboard.getValueFromObjective`:96-120).
+#[allow(dead_code)]
+fn points_of(board: &Scoreboard, record: &PlayerListRecord, objective: &Objective) -> i32 {
+    board
+        .scores
+        .get(&record.name)
+        .and_then(|scores| scores.get(&objective.name))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A header or footer side's wrapped lines, when the side draws: the raw chat JSON parsed and
+/// flattened, judged empty on its formatted text — the source nulls a side whose formatted text
+/// has no characters (`NetHandlerPlayClient.java`:1600-1604) — and word-wrapped at `budget`
+/// (`FontRenderer.listFormattedStringToWidth`:844-868), each line back as the `§`-coded string
+/// the text builder draws.
+#[allow(dead_code)]
+fn tab_lines(raw: &str, budget: i32, font: &Font) -> Option<Vec<String>> {
+    let component = chat::parse_json(raw);
+    let runs = chat::flatten(&component);
+    if run_text(&runs).is_empty() {
+        return None;
+    }
+    let lines = chat::wrap(&runs, budget, font);
+    Some(lines.iter().map(|line| run_text(line)).collect())
+}
+
+/// One row's score cell for an objective that is not hearts: the number in `§e` yellow,
+/// right-aligned at the field's right edge, shadowed
+/// (`GuiPlayerTabOverlay.drawScoreboardValues`:363-367).
+#[allow(dead_code)]
+fn score_text_draws(points: i32, right: i32, y: i32, font: &Font, draws: &mut Vec<HudDraw>) {
+    let text = format!("§e{points}");
+    draws.push(HudDraw::Text {
+        x: (right - string_width(font, &text)) as f32,
+        y: y as f32,
+        scale: 1.0,
+        colour: TAB_TEXT,
+        shadow: true,
+        text,
+    });
+}
+
+/// One row's score cell for a hearts objective
+/// (`GuiPlayerTabOverlay.drawScoreboardValues`:278-362): the glyph row while the per-heart scale
+/// stays over three pixels, the plain number otherwise.
+///
+/// The source's blink state machine and the per-entry prior value it reads (`:282-307`) are
+/// fields this frame does not carry — no flash pass draws, and the prior value stands at its
+/// zero default.
+#[allow(dead_code)]
+fn heart_draws(points: i32, left: i32, right: i32, y: i32, font: &Font, draws: &mut Vec<HudDraw>) {
+    // The half-heart count and the slot count with its ten-slot floor (`:305-306`).
+    let hearts = ((points.max(0) as f32) / 2.0).ceil() as i32;
+    let slots = (points / 2).max(10);
+    if hearts <= 0 {
+        return;
+    }
+    let scale = (((right - left - 4) as f32) / (slots as f32)).min(9.0);
+    if scale > 3.0 {
+        // The empty containers beyond the filled hearts, then the filled row: a full heart
+        // while its odd slot sits inside the points, the half heart on it (`:315-346`).
+        for slot in hearts..slots {
+            draws.push(heart_glyph(
+                16.0,
+                left as f32 + slot as f32 * scale,
+                y as f32,
+            ));
+        }
+        for index in 0..hearts {
+            let (full, half) = if index >= 10 {
+                (160.0, 169.0)
+            } else {
+                (52.0, 61.0)
+            };
+            let u = if index * 2 + 1 == points { half } else { full };
+            draws.push(heart_glyph(u, left as f32 + index as f32 * scale, y as f32));
+        }
+    } else {
+        // The number branch: the points over two, `hp` when the suffixed text still fits, in
+        // the red-to-green health blend (`:348-360`).
+        let fraction = (points as f32 / 20.0).clamp(0.0, 1.0);
+        let red = (((1.0 - fraction) * 255.0) as u32) as f32 / 255.0;
+        let green = ((fraction * 255.0) as u32) as f32 / 255.0;
+        let mut text = java_float_text(points as f32 / 2.0);
+        if right - string_width(font, &format!("{text}hp")) >= left {
+            text.push_str("hp");
+        }
+        draws.push(HudDraw::Text {
+            x: ((right + left) / 2 - string_width(font, &text) / 2) as f32,
+            y: y as f32,
+            scale: 1.0,
+            colour: [red, green, 0.0, 1.0],
+            shadow: true,
+            text,
+        });
+    }
+}
+
+/// The tab list's state and its frame assembly.
+///
+/// The session's events land here: [`ClientEvent::PlayerList`] replaces the entry set and
+/// [`ClientEvent::TabText`] the header and footer pair, both as the session reports them, and
+/// [`TabState::observe`] folds them in. The list draws while [`TabState::open`] — the held key
+/// the window wires — and one frame's assembly is [`TabState::tab_draws`], the source's
+/// `renderPlayerlist` (`GuiPlayerTabOverlay.renderPlayerlist`:70-235) in its own painter order,
+/// as one draw list.
+///
+/// The head column is a deliberate difference: the source gates it on an integrated server or
+/// an encrypted connection (`GuiPlayerTabOverlay.renderPlayerlist`:99;
+/// `Minecraft.isIntegratedServerRunning`:2983; `NetworkManager.getIsencrypted`:412), and
+/// against an offline server it draws no heads at all — this port draws every profile's head,
+/// resolved through the skin registry's default fallback.
+#[allow(dead_code)]
+pub struct TabState {
+    /// Whether the list draws this frame: the held state the window wires.
+    pub open: bool,
+    /// The player-list records as the latest [`ClientEvent::PlayerList`] reported them, in the
+    /// event's own ascending-uuid order.
+    pub entries: Vec<PlayerListRecord>,
+    /// The header's raw chat JSON as the latest [`ClientEvent::TabText`] carried it.
+    pub header: String,
+    /// The footer's raw chat JSON, likewise.
+    pub footer: String,
+}
+
+#[allow(dead_code)]
+impl TabState {
+    /// An unheld list with no entries and no header or footer.
+    pub fn new() -> Self {
+        Self {
+            open: false,
+            entries: Vec::new(),
+            header: String::new(),
+            footer: String::new(),
+        }
+    }
+
+    /// Folds one session event in: [`ClientEvent::PlayerList`] replaces the entries,
+    /// [`ClientEvent::TabText`] the header and footer pair. Every other event is ignored — the
+    /// scoreboard the assembly reads travels beside the state, as the frame's own argument.
+    pub fn observe(&mut self, event: &ClientEvent) {
+        match event {
+            ClientEvent::PlayerList { entries } => self.entries = entries.clone(),
+            ClientEvent::TabText { header, footer } => {
+                self.header = header.clone();
+                self.footer = footer.clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// The held list's frame draws at `resolution`, one ordered list in the source's painter
+    /// order (`GuiPlayerTabOverlay.renderPlayerlist`:145-234): the header block, the grid
+    /// background, each row in turn — cell background, head, hat overlay, name, score, ping —
+    /// and the footer block.
+    ///
+    /// The head textures resolve through `skins`, the same resolver the entity pass draws
+    /// through; `slim` picks the default texture for a profile with nothing uploaded
+    /// ([`default_skin`]'s own rule).
+    pub fn tab_draws(
+        &self,
+        board: &Scoreboard,
+        font: &Font,
+        resolution: ScaledResolution,
+        skins: &impl SkinLookup,
+    ) -> Vec<HudDraw> {
+        let head_id = |uuid: &str| {
+            skins
+                .resolve(uuid, default_skin(uuid) == DefaultModel::Slim)
+                .id()
+        };
+        self.tab_draws_with(board, font, resolution, &head_id)
+    }
+
+    /// The assembly behind [`TabState::tab_draws`], its head resolution lifted to `head_id` so
+    /// a test drives every draw without a registry.
+    fn tab_draws_with(
+        &self,
+        board: &Scoreboard,
+        font: &Font,
+        resolution: ScaledResolution,
+        head_id: &dyn Fn(&str) -> SkinTexId,
+    ) -> Vec<HudDraw> {
+        if !self.open {
+            return Vec::new();
+        }
+        let width = resolution.width as i32;
+        // The source's own order (`GuiPlayerTabOverlay.PlayerComparator`:392-397):
+        // non-spectators first, then the team's registered name — the empty string when the
+        // entry has no team — then the profile name; the eighty-entry cap follows the sort
+        // (`GuiPlayerTabOverlay.renderPlayerlist`:89).
+        let mut sorted: Vec<&PlayerListRecord> = self.entries.iter().collect();
+        sorted.sort_by(|left, right| {
+            (left.gamemode == SPECTATOR_GAMEMODE)
+                .cmp(&(right.gamemode == SPECTATOR_GAMEMODE))
+                .then_with(|| team_name(board, left).cmp(team_name(board, right)))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let capped = &sorted[..sorted.len().min(TAB_CAP)];
+        let total = capped.len() as i32;
+        // The name and score fields measure the sorted set before the cap
+        // (`GuiPlayerTabOverlay.renderPlayerlist`:77-87).
+        let objective = board.display[0]
+            .as_deref()
+            .and_then(|name| board.objectives.get(name));
+        let mut name_width = 0;
+        let mut score_width = 0;
+        for record in &sorted {
+            name_width = name_width.max(string_width(font, &self.name_of(board, record)));
+            if let Some(objective) = objective {
+                if objective.kind != "hearts" {
+                    let points = points_of(board, record, objective);
+                    score_width = score_width.max(string_width(font, &format!(" {points}")));
+                }
+            }
+        }
+        let score_field = match objective {
+            None => 0,
+            Some(objective) if objective.kind == "hearts" => TAB_HEARTS_FIELD,
+            Some(_) => score_width,
+        };
+        // The column break (`GuiPlayerTabOverlay.renderPlayerlist`:90-97): the smallest column
+        // count whose rows fit twenty.
+        let mut columns = 1;
+        let mut rows = total;
+        while rows > TAB_ROWS_PER_COLUMN {
+            columns += 1;
+            rows = (total + columns - 1) / columns;
+        }
+        // The cell width and the grid's left edge (`GuiPlayerTabOverlay.renderPlayerlist`:118-121).
+        let cell = (columns * (TAB_HEAD + name_width + score_field + TAB_PADDING))
+            .min(width - TAB_SIDE_MARGIN)
+            / columns;
+        let grid_left = width / 2 - (cell * columns + (columns - 1) * TAB_GUTTER) / 2;
+        let mut panel = cell * columns + (columns - 1) * TAB_GUTTER;
+        let mut top = TAB_TOP;
+        // The header and footer sides (`GuiPlayerTabOverlay.renderPlayerlist`:125-143), both
+        // widening the panel and neither moving the top margin.
+        let header = tab_lines(&self.header, width - TAB_SIDE_MARGIN, font);
+        let footer = tab_lines(&self.footer, width - TAB_SIDE_MARGIN, font);
+        for line in header.as_deref().unwrap_or(&[]) {
+            panel = panel.max(string_width(font, line));
+        }
+        for line in footer.as_deref().unwrap_or(&[]) {
+            panel = panel.max(string_width(font, line));
+        }
+        let mut draws = Vec::new();
+        if let Some(lines) = &header {
+            let height = lines.len() as i32 * TAB_ROW_PITCH;
+            draws.push(HudDraw::Rect {
+                x: (width / 2 - panel / 2 - 1) as f32,
+                y: (top - 1) as f32,
+                width: (panel + 2) as f32,
+                height: (height + 1) as f32,
+                colour: TAB_PANEL,
+            });
+            for (index, line) in lines.iter().enumerate() {
+                draws.push(HudDraw::Text {
+                    text: line.clone(),
+                    x: (width / 2 - string_width(font, line) / 2) as f32,
+                    y: (top + index as i32 * TAB_ROW_PITCH) as f32,
+                    scale: 1.0,
+                    colour: TAB_TEXT,
+                    shadow: true,
+                });
+            }
+            top += height + 1;
+        }
+        draws.push(HudDraw::Rect {
+            x: (width / 2 - panel / 2 - 1) as f32,
+            y: (top - 1) as f32,
+            width: (panel + 2) as f32,
+            height: (rows * TAB_ROW_PITCH + 1) as f32,
+            colour: TAB_PANEL,
+        });
+        let grid_top = top;
+        for (index, record) in capped.iter().enumerate() {
+            let index = index as i32;
+            let column = index / rows;
+            let row = index % rows;
+            let cell_x = grid_left + column * cell + column * TAB_GUTTER;
+            let cell_y = grid_top + row * TAB_ROW_PITCH;
+            draws.push(HudDraw::Rect {
+                x: cell_x as f32,
+                y: cell_y as f32,
+                width: cell as f32,
+                height: TAB_CELL_HEIGHT as f32,
+                colour: TAB_CELL,
+            });
+            let head = head_id(&record.uuid);
+            draws.push(HudDraw::SkinRect {
+                texture: head,
+                x: cell_x as f32,
+                y: cell_y as f32,
+                width: 8.0,
+                height: 8.0,
+                uv: TAB_FACE_UV,
+                colour: TAB_TINT,
+            });
+            // The hat overlay draws with every part enabled — the byte this milestone pins
+            // (`EnumPlayerModelParts.HAT`:14, `:24`; [`ALL_PARTS`]) — as the source's second
+            // eight-by-eight pass over the face (`GuiPlayerTabOverlay.renderPlayerlist`:188-193).
+            draws.push(HudDraw::SkinRect {
+                texture: head,
+                x: cell_x as f32,
+                y: cell_y as f32,
+                width: 8.0,
+                height: 8.0,
+                uv: TAB_HAT_UV,
+                colour: TAB_TINT,
+            });
+            let name_x = cell_x + TAB_HEAD;
+            let spectator = record.gamemode == SPECTATOR_GAMEMODE;
+            let name = self.name_of(board, record);
+            let (text, colour) = if spectator {
+                // The source prefixes its own ITALIC code and draws the alpha colour
+                // (`GuiPlayerTabOverlay.renderPlayerlist`:198-202).
+                (format!("§o{name}"), TAB_SPECTATOR)
+            } else {
+                (name, TAB_TEXT)
+            };
+            draws.push(HudDraw::Text {
+                text,
+                x: name_x as f32,
+                y: cell_y as f32,
+                scale: 1.0,
+                colour,
+                shadow: true,
+            });
+            if let Some(objective) = objective {
+                if !spectator {
+                    let left = name_x + name_width + 1;
+                    let right = left + score_field;
+                    if right - left > 5 {
+                        let points = points_of(board, record, objective);
+                        if objective.kind == "hearts" {
+                            heart_draws(points, left, right, cell_y, font, &mut draws);
+                        } else {
+                            score_text_draws(points, right, cell_y, font, &mut draws);
+                        }
+                    }
+                }
+            }
+            // The ping draws for every row (`GuiPlayerTabOverlay.renderPlayerlist`:219): the
+            // icon sheet at the cell's right edge, ten wide and a pixel in.
+            draws.push(HudDraw::TexturedRect {
+                texture: HudTexture::Named(TAB_ICONS),
+                x: (cell_x + cell - 11) as f32,
+                y: cell_y as f32,
+                width: 10.0,
+                height: 8.0,
+                uv: latency_uv(latency_level(record.latency)),
+                colour: TAB_TINT,
+            });
+        }
+        if let Some(lines) = &footer {
+            let footer_top = grid_top + rows * TAB_ROW_PITCH + 1;
+            let height = lines.len() as i32 * TAB_ROW_PITCH;
+            draws.push(HudDraw::Rect {
+                x: (width / 2 - panel / 2 - 1) as f32,
+                y: (footer_top - 1) as f32,
+                width: (panel + 2) as f32,
+                height: (height + 1) as f32,
+                colour: TAB_PANEL,
+            });
+            for (index, line) in lines.iter().enumerate() {
+                draws.push(HudDraw::Text {
+                    text: line.clone(),
+                    x: (width / 2 - string_width(font, line) / 2) as f32,
+                    y: (footer_top + index as i32 * TAB_ROW_PITCH) as f32,
+                    scale: 1.0,
+                    colour: TAB_TEXT,
+                    shadow: true,
+                });
+            }
+        }
+        draws
+    }
+
+    /// One entry's name, the source's `getPlayerName` (`GuiPlayerTabOverlay.getPlayerName`:48-51):
+    /// the display name's formatted text when the record carries one, else the team-composed
+    /// profile name ([`format_entry`]).
+    fn name_of(&self, board: &Scoreboard, record: &PlayerListRecord) -> String {
+        match &record.display_name {
+            Some(raw) => run_text(&chat::flatten(&chat::parse_json(raw))),
+            None => format_entry(board, &record.name, &record.name),
+        }
+    }
+}
+
+/// The team an entry belongs to, registered name only: the sort's second key
+/// (`GuiPlayerTabOverlay.PlayerComparator`:396) — the empty string when the entry has no team.
+#[allow(dead_code)]
+fn team_name<'a>(board: &'a Scoreboard, record: &PlayerListRecord) -> &'a str {
+    board
+        .member_of
+        .get(&record.name)
+        .map(String::as_str)
+        .unwrap_or("")
 }
 
 #[cfg(test)]
@@ -3953,5 +4540,554 @@ mod tests {
             30 + 2,
             "an open field keeps the fifteen-line window, its line on top"
         );
+    }
+
+    // ---- the tab list ----
+
+    /// A record for the tab fixtures: its name alone carries meaning — a fresh uuid off the
+    /// name, gamemode zero and a low ping.
+    fn tab_record(name: &str) -> PlayerListRecord {
+        PlayerListRecord {
+            uuid: format!("uuid-{name}"),
+            name: name.to_owned(),
+            properties: Vec::new(),
+            gamemode: 0,
+            latency: 1,
+            display_name: None,
+        }
+    }
+
+    /// The tab fixture's draws: held, at the chat resolution, with one stand-in head id.
+    fn tab_frame(tab: &TabState, board: &Scoreboard, font: &Font) -> Vec<HudDraw> {
+        tab.tab_draws_with(board, font, chat_resolution(), &|_| SkinTexId::new(7))
+    }
+
+    /// A skin draw's own texture id, position, size and uv, for the pins.
+    fn tab_skin(draw: &HudDraw) -> (SkinTexId, f32, f32, f32, f32, [f32; 4]) {
+        match draw {
+            HudDraw::SkinRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv,
+                ..
+            } => (*texture, *x, *y, *width, *height, *uv),
+            other => panic!("a skin draw: {other:?}"),
+        }
+    }
+
+    /// A textured draw's own texture, position, size and uv, for the pins.
+    fn tab_texture(draw: &HudDraw) -> (HudTexture, f32, f32, f32, f32, [f32; 4]) {
+        match draw {
+            HudDraw::TexturedRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv,
+                ..
+            } => (*texture, *x, *y, *width, *height, *uv),
+            other => panic!("a textured draw: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_closed_tab_draws_nothing() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.entries = vec![tab_record("AAAA")];
+        assert!(tab_frame(&tab, &Scoreboard::new(), &font).is_empty());
+    }
+
+    #[test]
+    fn three_entries_draw_one_column_at_the_pinned_x() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA"); 3];
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // The names measure twenty-four: the cell is 9 + 24 + 13 = 46, the grid's left edge
+        // 427 / 2 - 46 / 2 = 190, and the panel spans it plus a pixel per side.
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (189.0, 9.0, 48.0, 28.0, TAB_PANEL),
+            "the grid background"
+        );
+        for row in 0..3usize {
+            let base = 1 + 5 * row;
+            let y = 10.0 + row as f32 * 9.0;
+            assert_eq!(
+                chat_rect(&draws[base]),
+                (190.0, y, 46.0, 8.0, TAB_CELL),
+                "row {row} cell"
+            );
+            let (id, x, top, width, height, uv) = tab_skin(&draws[base + 1]);
+            assert_eq!(id, SkinTexId::new(7), "row {row} head id");
+            assert_eq!(
+                (x, top, width, height, uv),
+                (
+                    190.0,
+                    y,
+                    8.0,
+                    8.0,
+                    [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0]
+                ),
+                "row {row} face"
+            );
+            assert_eq!(
+                tab_skin(&draws[base + 2]).5,
+                [40.0 / 64.0, 8.0 / 64.0, 48.0 / 64.0, 16.0 / 64.0],
+                "row {row} hat"
+            );
+            assert_eq!(
+                chat_text(&draws[base + 3]),
+                ("AAAA".to_owned(), 199.0, y, 1.0, TAB_TEXT, true),
+                "row {row} name"
+            );
+            let (texture, x, top, width, height, uv) = tab_texture(&draws[base + 4]);
+            assert_eq!(
+                (texture, x, top, width, height),
+                (HudTexture::Named(TAB_ICONS), 225.0, y, 10.0, 8.0),
+                "row {row} ping"
+            );
+            assert_eq!(uv, latency_uv(0), "row {row} ping level");
+        }
+        assert_eq!(draws.len(), 16, "the grid, then three five-draw rows");
+    }
+
+    #[test]
+    fn twenty_one_entries_split_two_columns_of_eleven() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = (0..21).map(|_| tab_record("A")).collect();
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // The six-wide names: the cell is min(2 * 28, 377) / 2 = 28, eleven rows and the
+        // grid's left edge 213 - (56 + 5) / 2 = 183.
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (182.0, 9.0, 63.0, 100.0, TAB_PANEL),
+            "the two-column grid"
+        );
+        // Column-major: entry 10 closes the first column, entry 11 opens the second.
+        assert_eq!(chat_rect(&draws[1 + 5 * 10]).0, 183.0, "entry 10 x");
+        assert_eq!(chat_rect(&draws[1 + 5 * 10]).1, 100.0, "entry 10 y");
+        assert_eq!(chat_rect(&draws[1 + 5 * 11]).0, 216.0, "entry 11 x");
+        assert_eq!(chat_rect(&draws[1 + 5 * 11]).1, 10.0, "entry 11 y");
+        assert_eq!(chat_rect(&draws[1 + 5 * 20]).0, 216.0, "entry 20 x");
+        assert_eq!(chat_rect(&draws[1 + 5 * 20]).1, 91.0, "entry 20 y");
+        assert_eq!(draws.len(), 1 + 21 * 5);
+    }
+
+    #[test]
+    fn twenty_entries_hold_one_column() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = (0..20).map(|_| tab_record("A")).collect();
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // min(28, 377) = 28 in one column: the left edge 213 - 14 = 199.
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (198.0, 9.0, 30.0, 181.0, TAB_PANEL),
+            "the single-column grid"
+        );
+        let last = 1 + 5 * 19;
+        assert_eq!(chat_rect(&draws[last]), (199.0, 181.0, 28.0, 8.0, TAB_CELL));
+    }
+
+    #[test]
+    fn the_list_keeps_eighty_entries_after_the_sort() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = (0..81)
+            .map(|index| tab_record(&format!("u{index:02}")))
+            .collect();
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // Names u00..u80 sort ascending; the eighty-first falls and eighty rows remain over
+        // four columns of twenty.
+        assert_eq!(draws.len(), 1 + 80 * 5, "the cap held");
+        assert_eq!(
+            chat_rect(&draws[0]).3,
+            20.0 * 9.0 + 1.0,
+            "four columns of twenty"
+        );
+        assert_eq!(
+            chat_text(&draws[1 + 5 * 79 + 3]).0,
+            "u79",
+            "the last kept name"
+        );
+        assert!(
+            !draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "u80")),
+            "the dropped name never draws"
+        );
+    }
+
+    #[test]
+    fn non_spectators_sort_before_spectators_by_team_then_name() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_team("a", "A", "", "", 0, "always", None);
+        board.set_team("b", "B", "", "", 0, "always", None);
+        board.add_team_players("a", &["Beta".to_owned(), "Mid".to_owned()]);
+        board.add_team_players("b", &["Alpha".to_owned()]);
+        let mut tab = TabState::new();
+        tab.open = true;
+        let mut spectator = tab_record("Mid");
+        spectator.gamemode = SPECTATOR_GAMEMODE;
+        spectator.latency = -1;
+        tab.entries = vec![
+            tab_record("Zulu"),
+            spectator,
+            tab_record("Alpha"),
+            tab_record("Beta"),
+        ];
+        let draws = tab_frame(&tab, &board, &font);
+        // No team ("") < team "a" < team "b", and the spectator last despite its team.
+        let names: Vec<String> = (0..4)
+            .map(|row| chat_text(&draws[1 + 5 * row + 3]).0)
+            .collect();
+        assert_eq!(names, vec!["Zulu", "Beta", "Alpha", "§oMid"]);
+        assert_eq!(
+            chat_text(&draws[4]).1,
+            206.0,
+            "the name past the head column"
+        );
+        assert_eq!(
+            chat_text(&draws[1 + 5 * 3 + 3]).4,
+            [1.0, 1.0, 1.0, 144.0 / 255.0],
+            "the spectator's name colour"
+        );
+        // The no-signal X draws on its row like any other ping (`:248-251`).
+        assert_eq!(tab_texture(&draws[1 + 5 * 3 + 4]).5, latency_uv(5));
+    }
+
+    #[test]
+    fn the_header_and_footer_sit_at_the_pinned_positions() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA"); 3];
+        tab.header = "{\"text\":\"hi\"}".to_owned();
+        tab.footer = "{\"text\":\"bye\"}".to_owned();
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // The header block at the top margin: its panel one pixel wider than the grid per
+        // side and one taller than its line, the line centred.
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (189.0, 9.0, 48.0, 10.0, TAB_PANEL),
+            "the header background"
+        );
+        assert_eq!(
+            chat_text(&draws[1]),
+            ("hi§r".to_owned(), 212.0, 10.0, 1.0, TAB_TEXT, true),
+            "the header line"
+        );
+        // The grid follows one pixel under the block, its rows from y 20.
+        assert_eq!(chat_rect(&draws[2]), (189.0, 19.0, 48.0, 28.0, TAB_PANEL));
+        assert_eq!(
+            chat_rect(&draws[3]).1,
+            20.0,
+            "the first row under the header"
+        );
+        // The footer: one pixel under the grid block, 20 + 27 + 1 = 48.
+        assert_eq!(
+            chat_rect(&draws[18]),
+            (189.0, 47.0, 48.0, 10.0, TAB_PANEL),
+            "the footer background"
+        );
+        assert_eq!(
+            chat_text(&draws[19]),
+            ("bye§r".to_owned(), 212.0, 48.0, 1.0, TAB_TEXT, true),
+            "the footer line"
+        );
+        assert_eq!(draws.len(), 20);
+    }
+
+    #[test]
+    fn a_list_objective_scores_right_aligned_in_yellow() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_objective("points", "Points", "integer");
+        board.set_display(0, Some("points"));
+        board.set_score("AAAA", "points", 10);
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA"); 3];
+        let draws = tab_frame(&tab, &board, &font);
+        // The score field measures width(" 10") = 6: the cell is 9 + 24 + 6 + 13 = 52, and the
+        // number right-aligns into the field ending at 221 + 6.
+        for row in 0..3usize {
+            let (text, x, y, scale, colour, shadow) = chat_text(&draws[1 + 6 * row + 4]);
+            assert_eq!(text, "§e10", "row {row}");
+            assert_eq!(x, 225.0, "row {row}");
+            assert_eq!(y, 10.0 + row as f32 * 9.0, "row {row}");
+            assert_eq!((scale, colour, shadow), (1.0, TAB_TEXT, true), "row {row}");
+        }
+        assert_eq!(draws.len(), 1 + 3 * 6, "six draws to a scored row");
+    }
+
+    #[test]
+    fn a_score_field_five_wide_or_narrower_skips_the_scores() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_objective("points", "Points", "integer");
+        board.set_display(0, Some("points"));
+        board.set_score("AAAA", "points", 5);
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA")];
+        let draws = tab_frame(&tab, &board, &font);
+        // width(" 5") = 5 fails the source's `l5 - k5 > 5` gate: the row draws without a
+        // score.
+        assert_eq!(draws.len(), 6, "the grid and one five-draw row");
+        assert!(
+            !draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text.starts_with("§e"))),
+            "no number drew"
+        );
+    }
+
+    #[test]
+    fn a_spectator_row_keeps_its_ping_but_draws_no_score() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_objective("points", "Points", "integer");
+        board.set_display(0, Some("points"));
+        board.set_score("AAAA", "points", 10);
+        let mut tab = TabState::new();
+        tab.open = true;
+        let mut spectator = tab_record("AAAA");
+        spectator.gamemode = SPECTATOR_GAMEMODE;
+        tab.entries = vec![tab_record("AAAA"), spectator];
+        let draws = tab_frame(&tab, &board, &font);
+        assert_eq!(
+            draws.len(),
+            1 + 6 + 5,
+            "the spectator's row loses the score"
+        );
+        assert_eq!(chat_text(&draws[1 + 4]).0, "§e10", "the player's number");
+        assert_eq!(chat_text(&draws[7 + 3]).0, "§oAAAA", "the spectator's name");
+        assert_eq!(
+            chat_text(&draws[7 + 3]).4,
+            TAB_SPECTATOR,
+            "its alpha colour"
+        );
+        assert!(
+            matches!(draws[7 + 4], HudDraw::TexturedRect { .. }),
+            "the ping closes its row"
+        );
+    }
+
+    #[test]
+    fn the_latency_levels_are_the_sources_thresholds() {
+        assert_eq!(latency_level(-1), 5, "the no-signal X");
+        assert_eq!(latency_level(0), 0);
+        assert_eq!(latency_level(149), 0);
+        assert_eq!(latency_level(150), 1);
+        assert_eq!(latency_level(299), 1);
+        assert_eq!(latency_level(300), 2);
+        assert_eq!(latency_level(599), 2);
+        assert_eq!(latency_level(600), 3);
+        assert_eq!(latency_level(999), 3);
+        assert_eq!(latency_level(1000), 4);
+        assert_eq!(latency_level(i32::MAX), 4);
+        // The rects: `(0, 176 + 8 * level, 10, 8)` over the 256 sheet.
+        assert_eq!(
+            latency_uv(0),
+            [0.0, 176.0 / 256.0, 10.0 / 256.0, 184.0 / 256.0]
+        );
+        assert_eq!(
+            latency_uv(4),
+            [0.0, 208.0 / 256.0, 10.0 / 256.0, 216.0 / 256.0]
+        );
+        assert_eq!(
+            latency_uv(5),
+            [0.0, 216.0 / 256.0, 10.0 / 256.0, 224.0 / 256.0],
+            "the X"
+        );
+    }
+
+    #[test]
+    fn a_hearts_objective_draws_the_glyph_row() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_objective("health", "Health", "hearts");
+        board.set_display(0, Some("health"));
+        board.set_score("AAAA", "health", 15);
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA")];
+        let draws = tab_frame(&tab, &board, &font);
+        // The ninety-wide field spans 179..269; eight half-heart slots at 86 / 10, two empty
+        // containers beyond them, then the ping.
+        let scale = 86.0f32 / 10.0;
+        assert_eq!(
+            draws.len(),
+            1 + 4 + 10 + 1,
+            "glyphs between the name and the ping"
+        );
+        // The containers first (slots 8 and 9), then the filled row (`:315-346`).
+        assert_eq!(
+            tab_texture(&draws[5]),
+            (
+                HudTexture::Named(TAB_ICONS),
+                179.0 + 8.0 * scale,
+                10.0,
+                9.0,
+                9.0,
+                [16.0 / 256.0, 0.0, 25.0 / 256.0, 9.0 / 256.0]
+            ),
+            "the first empty container"
+        );
+        assert_eq!(
+            tab_texture(&draws[6]).1,
+            179.0 + 9.0 * scale,
+            "the second container"
+        );
+        assert_eq!(
+            tab_texture(&draws[7]),
+            (
+                HudTexture::Named(TAB_ICONS),
+                179.0,
+                10.0,
+                9.0,
+                9.0,
+                [52.0 / 256.0, 0.0, 61.0 / 256.0, 9.0 / 256.0]
+            ),
+            "the first full heart"
+        );
+        // The half heart rides the last odd slot: 2 * 7 + 1 == 15.
+        assert_eq!(
+            tab_texture(&draws[14]),
+            (
+                HudTexture::Named(TAB_ICONS),
+                179.0 + 7.0 * scale,
+                10.0,
+                9.0,
+                9.0,
+                [61.0 / 256.0, 0.0, 70.0 / 256.0, 9.0 / 256.0]
+            ),
+            "the half heart"
+        );
+    }
+
+    #[test]
+    fn a_long_heart_row_draws_the_number_instead() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_objective("health", "Health", "hearts");
+        board.set_display(0, Some("health"));
+        board.set_score("AAAA", "health", 58);
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA")];
+        let draws = tab_frame(&tab, &board, &font);
+        // Twenty-nine slots push the per-heart scale to 86 / 29 = 2.97, under three: the
+        // number branch, green at the saturated fraction, the suffixed text still fitting.
+        assert_eq!(draws.len(), 1 + 5 + 1, "the number, then the ping");
+        assert_eq!(
+            chat_text(&draws[5]),
+            (
+                "29.0hp".to_owned(),
+                221.0,
+                10.0,
+                1.0,
+                [0.0, 1.0, 0.0, 1.0],
+                true
+            ),
+            "the health number"
+        );
+        assert!(
+            matches!(draws[6], HudDraw::TexturedRect { .. }),
+            "the ping closes the row"
+        );
+    }
+
+    #[test]
+    fn the_hearts_number_formats_like_java() {
+        assert_eq!(java_float_text(29.0), "29.0");
+        assert_eq!(java_float_text(28.5), "28.5");
+        assert_eq!(java_float_text(7.0), "7.0");
+        assert_eq!(java_float_text(1.0e7), "1.0E7");
+        assert_eq!(java_float_text(2.5e7), "2.5E7");
+    }
+
+    #[test]
+    fn the_events_feed_the_list_and_the_pair() {
+        let mut tab = TabState::new();
+        let record = tab_record("AAAA");
+        tab.observe(&ClientEvent::PlayerList {
+            entries: vec![record.clone()],
+        });
+        assert_eq!(tab.entries, vec![record]);
+        tab.observe(&ClientEvent::TabText {
+            header: "{\"text\":\"top\"}".to_owned(),
+            footer: "{\"text\":\"bottom\"}".to_owned(),
+        });
+        assert_eq!(tab.header, "{\"text\":\"top\"}");
+        assert_eq!(tab.footer, "{\"text\":\"bottom\"}");
+        // Every other event leaves the tab state alone.
+        tab.observe(&ClientEvent::ScoreboardChanged {
+            board: Scoreboard::new(),
+        });
+        assert_eq!(tab.entries, vec![tab_record("AAAA")]);
+        // A later report replaces the whole set, an empty one included.
+        tab.observe(&ClientEvent::PlayerList {
+            entries: Vec::new(),
+        });
+        assert!(tab.entries.is_empty());
+    }
+
+    #[test]
+    fn the_name_is_the_display_name_or_the_team_composed_one() {
+        let font = chat_font();
+        let mut board = Scoreboard::new();
+        board.set_team("a", "A", "§4<", ">", 0, "always", None);
+        board.add_team_players("a", &["AAAA".to_owned()]);
+        let mut tab = TabState::new();
+        tab.open = true;
+        let mut nick = tab_record("BBBB");
+        nick.display_name = Some("{\"text\":\"Nick\",\"color\":\"red\"}".to_owned());
+        tab.entries = vec![tab_record("AAAA"), nick];
+        let draws = tab_frame(&tab, &board, &font);
+        // No team sorts first: the display name's formatted text draws as sent; the team's
+        // prefix and suffix wrap the profile name.
+        assert_eq!(chat_text(&draws[4]).0, "§cNick§r");
+        assert_eq!(chat_text(&draws[9]).0, "§4<AAAA>");
+    }
+
+    #[test]
+    fn each_head_carries_the_id_its_resolution_returns() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("Alpha"), tab_record("Beta")];
+        let draws = tab.tab_draws_with(&Scoreboard::new(), &font, chat_resolution(), &|uuid| {
+            assert!(uuid.starts_with("uuid-"), "the record's own uuid: {uuid}");
+            SkinTexId::new(if uuid == "uuid-Alpha" { 1 } else { 2 })
+        });
+        assert_eq!(tab_skin(&draws[2]).0, SkinTexId::new(1), "the first face");
+        assert_eq!(tab_skin(&draws[3]).0, SkinTexId::new(1), "its hat");
+        assert_eq!(tab_skin(&draws[7]).0, SkinTexId::new(2), "the second face");
+    }
+
+    #[test]
+    fn an_empty_held_list_draws_the_degenerate_grid() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // The grid background draws unconditionally (`:159`): a one-pixel strip with nothing
+        // under it.
+        assert_eq!(draws.len(), 1);
+        assert_eq!(chat_rect(&draws[0]), (201.0, 9.0, 24.0, 1.0, TAB_PANEL));
     }
 }

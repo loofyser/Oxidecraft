@@ -585,9 +585,12 @@ impl Renderer {
     ///
     /// The list is laid out and uploaded on the call, so a frame draws exactly the list the
     /// caller last set — the window assembles it from the chat and, later milestones, the
-    /// rest of the GUI at [`Renderer::scaled_resolution`]'s units.
+    /// rest of the GUI at [`Renderer::scaled_resolution`]'s units — and its skin draws
+    /// resolve their ids against the entity texture registry, the same one the entity pass
+    /// samples.
     pub fn set_hud(&mut self, draws: Vec<HudDraw>) {
-        self.hud.set_draws(&self.device, &self.queue, &draws);
+        self.hud
+            .set_draws(&self.device, &self.queue, &draws, &self.entity_textures);
     }
 
     /// Sets the full-frame tint the next frames draw over the scene, or clears it.

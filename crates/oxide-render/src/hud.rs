@@ -16,7 +16,9 @@
 //! so it runs the same pipeline as a textured rect (`Gui.drawRect` and
 //! `drawTexturedModalRect` shapes), and text goes through [`crate::text::TextBuilder`]
 //! in the draw's own scaled units with the source's shadow pass
-//! (`FontRenderer.java`:341-358).
+//! (`FontRenderer.java`:341-358). A skin-textured rect names a registered entity texture
+//! by its id ([`SkinTexId`]), resolved through [`SkinTextures`] against the registry's
+//! current uploads whenever a draw list lands.
 
 use glam::Mat4;
 use oxide_assets::atlas::Atlas;
@@ -24,6 +26,7 @@ use oxide_assets::font::{Font, FontError};
 use oxide_assets::texture::Texture;
 
 use crate::atlas_texture::AtlasTexture;
+use crate::entity_pass::SkinTexId;
 use crate::text::{TextBuilder, TextVertex};
 
 /// The hud shader: map scaled GUI pixels to clip space through the orthographic
@@ -188,6 +191,26 @@ pub enum HudDraw {
         /// The RGBA tint.
         colour: [f32; 4],
     },
+    /// A rectangle of a registered skin texture — the surface that samples a profile's
+    /// skin, like the tab list's head cells. The texture is named by its registry id and
+    /// sampled at `uv`, tinted by `colour` (`Gui.drawScaledCustomSizeModalRect`'s shape
+    /// over a skin sheet bound by `TextureManager`).
+    SkinRect {
+        /// The registered texture's id.
+        texture: SkinTexId,
+        /// The left edge.
+        x: f32,
+        /// The top edge.
+        y: f32,
+        /// The width.
+        width: f32,
+        /// The height.
+        height: f32,
+        /// The uv rectangle `[u0, v0, u1, v1]`, `(0, 0)` the texture's top-left.
+        uv: [f32; 4],
+        /// The RGBA tint.
+        colour: [f32; 4],
+    },
     /// One text draw through the shared builder: the legacy `§`-coded string, the
     /// pen's start, GUI pixels per font pixel and the base RGBA
     /// (`FontRenderer.drawString`'s shape).
@@ -205,6 +228,20 @@ pub enum HudDraw {
         /// Whether the darkened shadow copy draws under the text.
         shadow: bool,
     },
+}
+
+/// The skin textures a frame's head draws name by id.
+///
+/// The ids are the entity texture registry's ([`SkinTexId`]); the pass reads the
+/// registered texture's view for the bind group a [`HudDraw::SkinRect`] samples through.
+/// The registry implements this face, and the pass resolves every draw list's ids
+/// against it on each upload, because a re-upload replaces the GPU texture and mints a
+/// fresh id — a binding kept across frames could sample a texture the registry has
+/// dropped. An id the face does not know leaves its draws out of the frame.
+pub trait SkinTextures {
+    /// The view registered under `id`, or `None` when nothing is — an id from an
+    /// earlier frame whose upload has since been replaced.
+    fn skin_view(&self, id: SkinTexId) -> Option<&wgpu::TextureView>;
 }
 
 /// The font sheet as the pass keeps it: the measured font, the sheet's texel size and
@@ -229,6 +266,8 @@ enum BatchTexture {
     Named(&'static str),
     /// The block atlas.
     Atlas,
+    /// A registered skin texture, by id.
+    Skin(SkinTexId),
 }
 
 /// One consecutive run of draws that samples the same texture.
@@ -267,6 +306,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 HudTexture::Named(name) => BatchTexture::Named(name),
                 HudTexture::Atlas => BatchTexture::Atlas,
             },
+            HudDraw::SkinRect { texture, .. } => BatchTexture::Skin(*texture),
             HudDraw::Text { .. } => BatchTexture::Font,
         };
         match draw {
@@ -281,6 +321,18 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 push_quad(&mut built, (*x, *y), (*width, *height), WHITE_UV, *colour);
             }
             HudDraw::TexturedRect {
+                x,
+                y,
+                width,
+                height,
+                uv,
+                colour,
+                ..
+            } => {
+                open_batch(&mut built, texture);
+                push_quad(&mut built, (*x, *y), (*width, *height), *uv, *colour);
+            }
+            HudDraw::SkinRect {
                 x,
                 y,
                 width,
@@ -446,6 +498,9 @@ pub struct HudPass {
     atlas: Option<wgpu::BindGroup>,
     /// The named textures [`HudPass::set_texture`] registered.
     textures: Vec<(&'static str, wgpu::BindGroup)>,
+    /// The skin bind groups the stored list's head draws sample: one per distinct id,
+    /// rebuilt whenever a draw list lands.
+    skin_binds: Vec<(SkinTexId, wgpu::BindGroup)>,
     /// The last draw list the frame handed over, kept so a late font still lays out.
     draws: Vec<HudDraw>,
     /// The uploaded geometry of that list.
@@ -565,6 +620,7 @@ impl HudPass {
             font: None,
             atlas: None,
             textures: Vec::new(),
+            skin_binds: Vec::new(),
             draws: Vec::new(),
             geometry: Geometry::default(),
         }
@@ -746,13 +802,59 @@ impl HudPass {
     /// bindings the last upload made stay as they are, and the buffers are reused
     /// rather than recreated. Nothing is drawn until [`HudPass::set_resolution`] has
     /// given the pass a projection, and text waits for [`HudPass::set_font`].
-    pub fn set_draws(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &[HudDraw]) {
+    ///
+    /// The skin bind groups are rebuilt whenever the list changes: a re-uploaded skin
+    /// replaces the GPU texture and mints a fresh id, so every upload resolves the
+    /// list's ids against the registry's current state — correctness first. The cost is
+    /// one bind group per distinct id in the list, and the lists that draw heads are
+    /// capped, so a frame names a bounded set.
+    pub fn set_draws(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draws: &[HudDraw],
+        skins: &impl SkinTextures,
+    ) {
         if self.draws == draws {
             return;
         }
         self.draws.clear();
         self.draws.extend_from_slice(draws);
+        self.rebuild_skins(device, skins);
         self.rebuild(device, queue);
+    }
+
+    /// Rebuilds the skin bind groups the stored list's [`HudDraw::SkinRect`]s sample:
+    /// one per distinct id, in first-draw order. An id the face does not know is left
+    /// unbound, and the draw's batch is skipped like a named texture that never landed.
+    fn rebuild_skins(&mut self, device: &wgpu::Device, skins: &impl SkinTextures) {
+        self.skin_binds.clear();
+        for draw in &self.draws {
+            let HudDraw::SkinRect { texture, .. } = draw else {
+                continue;
+            };
+            if self.skin_binds.iter().any(|(id, _)| id == texture) {
+                continue;
+            }
+            let Some(view) = skins.skin_view(*texture) else {
+                continue;
+            };
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oxide hud skin bind group"),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.skin_binds.push((*texture, bind));
+        }
     }
 
     /// Lays the stored draw list out again, with the current font.
@@ -798,6 +900,12 @@ impl HudPass {
                     Some(bind) => bind,
                     None => continue,
                 },
+                BatchTexture::Skin(id) => {
+                    match self.skin_binds.iter().find(|(bound, _)| *bound == id) {
+                        Some((_, bind)) => bind,
+                        None => continue,
+                    }
+                }
             };
             pass.set_bind_group(1, bind, &[]);
             pass.draw_indexed(batch.indices.clone(), 0, 0..1);
@@ -953,7 +1061,7 @@ mod tests {
     //! The scale rule and the geometry's arithmetic, without a GPU.
 
     use super::{
-        Batch, BatchTexture, BuiltGeometry, HudDraw, HudTexture, MIN_HEIGHT, MIN_WIDTH,
+        Batch, BatchTexture, BuiltGeometry, HudDraw, HudTexture, MIN_HEIGHT, MIN_WIDTH, SkinTexId,
         VERTEX_BYTES, WHITE_UV, build, scaled_resolution, vertex_layout,
     };
     use oxide_assets::font::Font;
@@ -1177,6 +1285,59 @@ mod tests {
         );
         assert_eq!(built.vertices[4].uv, [0.0, 0.0]);
         assert_eq!(built.vertices[6].uv, [0.25, 0.25]);
+    }
+
+    #[test]
+    fn skin_rects_batch_under_their_texture_id() {
+        // Two draws of one id share a run and a fresh id opens its own; the quad's
+        // corners sample the draw's uv — the face sub-rect of a skin sheet
+        // (`Gui.drawScaledCustomSizeModalRect`'s shape).
+        let first = SkinTexId::new(7);
+        let second = SkinTexId::new(8);
+        let skin = |texture| HudDraw::SkinRect {
+            texture,
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 8.0,
+            uv: [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0],
+            colour: [1.0; 4],
+        };
+        let draws = [
+            skin(first),
+            skin(first),
+            skin(second),
+            HudDraw::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                colour: [1.0; 4],
+            },
+        ];
+        let built = build(&draws, None);
+        assert_eq!(
+            built
+                .batches
+                .iter()
+                .map(|batch| batch.texture)
+                .collect::<Vec<BatchTexture>>(),
+            vec![
+                BatchTexture::Skin(first),
+                BatchTexture::Skin(second),
+                BatchTexture::White,
+            ],
+            "one run per texture, in draw order"
+        );
+        assert_eq!(built.batches[0].indices, 0..12);
+        assert_eq!(built.batches[1].indices, 12..18);
+        assert_eq!(built.batches[2].indices, 18..24);
+        // The first quad: the draw's rectangle and its face sub-rect at the corners.
+        assert_eq!(built.vertices[0].position, [0.0, 0.0, 0.0]);
+        assert_eq!(built.vertices[0].uv, [0.125, 0.125]);
+        assert_eq!(built.vertices[0].colour, [1.0; 4]);
+        assert_eq!(built.vertices[2].position, [8.0, 8.0, 0.0]);
+        assert_eq!(built.vertices[2].uv, [0.25, 0.25]);
     }
 
     #[test]
