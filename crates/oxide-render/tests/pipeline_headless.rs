@@ -5137,3 +5137,259 @@ fn the_hud_pass_draws_the_fade_series_at_four_alphas() {
     let lit = non_sky(&pixels);
     assert_eq!(lit, 1152, "four bars of 32x9, none overlapping");
 }
+
+/// The hud draws the open input line and its caret: the field's frame, its text at the
+/// assembly's pen and the end caret bar — the shapes `view.rs`'s input line lays out,
+/// mirrored here.
+///
+/// The frame is `(2, height - 14)` to `(width - 2, height - 2)` at `Integer.MIN_VALUE`
+/// (`GuiChat.java`:303) — at this 64x64 probe: `(2, 50, 60, 12)` at half-alpha black.
+/// The text sits at the pen `(4, height - 12)` (`GuiChat.java`:58, the textbox's own
+/// spot with its background drawing off) in the enabled colour 14737632 = 0xE0E0E0
+/// (`GuiTextField.java`:52), and the end caret is the bar straddling `pen - 1`, `i1 - 1`
+/// to `i1 + 1 + 9`, at 0xFFD0D0D0 (`GuiTextField.java`:578) — one pixel wide, eleven
+/// tall, at the pen the one synthetic glyph (the sheet inks only `|`, advance 2) leaves
+/// at 4 + 2 = 6, so 5. The caret draws only in the lit blink phase (`:540`); this case is
+/// the lit one.
+///
+/// The counts: the frame covers 60x12 = 720 pixels, and the glyph's ink rows (52-59), its
+/// shadow column and the caret column (5, rows 51-61) all fall inside it — the frame's
+/// 720 is the whole lit total.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_input_line_and_cursor() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::Rect {
+                x: 2.0,
+                y: 50.0,
+                width: 60.0,
+                height: 12.0,
+                colour: [0.0, 0.0, 0.0, 128.0 / 255.0],
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 4.0,
+                y: 52.0,
+                scale: 1.0,
+                colour: [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0],
+                shadow: true,
+            },
+            HudDraw::Rect {
+                x: 5.0,
+                y: 51.0,
+                width: 1.0,
+                height: 11.0,
+                colour: [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0],
+            },
+        ],
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The frame's anchor: the rows on either side of it are still the sky.
+    expect_pixel(&pixels, 30, 49, SKY, "the row above the frame");
+    expect_pixel(&pixels, 30, 50, bar_over_sky(128), "the frame's top row");
+    expect_pixel(
+        &pixels,
+        2,
+        50,
+        bar_over_sky(128),
+        "the frame's top-left corner",
+    );
+    expect_pixel(
+        &pixels,
+        61,
+        50,
+        bar_over_sky(128),
+        "the frame's last column",
+    );
+    expect_pixel(&pixels, 30, 61, bar_over_sky(128), "the frame's last row");
+    expect_pixel(&pixels, 30, 62, SKY, "the row below the frame");
+    expect_pixel(&pixels, 1, 50, SKY, "left of the frame");
+    expect_pixel(&pixels, 62, 50, SKY, "right of the frame");
+    // The text's ink at the pen, in the field's own colour; the caret bar's column at
+    // pen - 1, from pen_y - 1 down its eleven rows.
+    expect_pixel(
+        &pixels,
+        4,
+        52,
+        [224, 224, 224],
+        "the field text's ink at the pen",
+    );
+    expect_pixel(
+        &pixels,
+        5,
+        51,
+        [208, 208, 208],
+        "the caret's top pixel at pen - 1",
+    );
+    expect_pixel(&pixels, 5, 61, [208, 208, 208], "the caret's last row");
+    expect_pixel(
+        &pixels,
+        6,
+        52,
+        bar_over_sky(128),
+        "right of the caret, the frame alone",
+    );
+    let lit = non_sky(&pixels);
+    assert_eq!(
+        lit, 720,
+        "the frame's 60x12 pixels; text, shadow and caret all land inside it"
+    );
+}
+
+/// The hud draws the open chat's scrolled slice: two lines of the open window at the
+/// assembly's own geometry, and the slice moves when the scroll does.
+///
+/// The lines: an open box draws full alpha from `height - 37` with a nine-pixel pitch
+/// (`GuiNewChat.java`:81-82 minus the first step; the assembly's `line_top`), each a
+/// black bar and its shadowed text one pixel below the bar's top at the bar's left
+/// (`:82`-`:85`). The probe's 48-wide bar is the shortened form of the assembly's 324,
+/// as the chat-line case records.
+///
+/// Slice A (scroll 0) draws `||` at the top slot and `|` beneath; slice B (the scroll one
+/// line back) shows the same box further up its history: the top slot carries the line
+/// that was the lower one (`|`) and a next older line (`|||`) enters below. The pixels
+/// that move prove the slice: (4, 28) is glyph ink in A and bar in B; (4, 19) is bar in
+/// A and glyph in B; (5, 36) a shadow in A and sky in B.
+///
+/// The counts: two 48x9 bars = 864 in both. A adds the top slot's two-glyph shadow
+/// column below its last bar row (row 36 at x 3 and 5) = 2 -> 866; B adds the one-glyph
+/// line's single shadow pixel (row 36 at x 3) = 1 -> 865. The lower slot's shadow
+/// columns land on the top slot's bar rows (row 27) — pixels already non-sky, no add.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_open_box_scrolled_slice() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+
+    let bar = |y: f32| HudDraw::Rect {
+        x: 2.0,
+        y,
+        width: 48.0,
+        height: 9.0,
+        colour: [0.0, 0.0, 0.0, 1.0],
+    };
+    let text = |body: &str, y: f32| HudDraw::Text {
+        text: body.to_string(),
+        x: 2.0,
+        y,
+        scale: 1.0,
+        colour: [1.0, 1.0, 1.0, 1.0],
+        shadow: true,
+    };
+
+    hud.set_draws(
+        &device,
+        &queue,
+        &[bar(27.0), text("||", 28.0), bar(18.0), text("|", 19.0)],
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The slice's span: sky above the lower bar's top and below the upper bar's last row.
+    expect_pixel(&pixels, 26, 17, SKY, "above the slice");
+    expect_pixel(
+        &pixels,
+        26,
+        18,
+        bar_over_sky(255),
+        "the lower slot's top row",
+    );
+    expect_pixel(
+        &pixels,
+        26,
+        26,
+        bar_over_sky(255),
+        "the lower slot's last row",
+    );
+    expect_pixel(&pixels, 26, 27, bar_over_sky(255), "the top slot's top row");
+    expect_pixel(
+        &pixels,
+        26,
+        35,
+        bar_over_sky(255),
+        "the top slot's last row",
+    );
+    expect_pixel(&pixels, 26, 36, SKY, "below the slice");
+    // Slice A's glyphs: `||` up top, `|` below — the second column of the top slot is
+    // ink, the second column of the lower slot is bare bar; the top slot's shadows
+    // hang one row below its bar.
+    expect_pixel(&pixels, 2, 28, TEXT, "the top slot's first glyph");
+    expect_pixel(&pixels, 4, 28, TEXT, "the top slot's second glyph");
+    expect_pixel(
+        &pixels,
+        4,
+        19,
+        bar_over_sky(255),
+        "the lower slot's bare column",
+    );
+    expect_pixel(&pixels, 3, 36, SHADOW, "a shadow below the top slot's bar");
+    expect_pixel(&pixels, 5, 36, SHADOW, "the second shadow column");
+    let lit = non_sky(&pixels);
+    assert_eq!(
+        lit, 866,
+        "two bars of 48x9, and the top slot's two shadow pixels"
+    );
+
+    // The slice scrolled one line: the lower slot's `|` slides up and `|||` enters below.
+    hud.set_draws(
+        &device,
+        &queue,
+        &[bar(27.0), text("|", 28.0), bar(18.0), text("|||", 19.0)],
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The moved slice: the top slot now carries the one-glyph line — its second column
+    // is bare bar where A had ink — and the lower slot the three-glyph one.
+    expect_pixel(&pixels, 2, 28, TEXT, "the top slot's one glyph");
+    expect_pixel(
+        &pixels,
+        4,
+        28,
+        bar_over_sky(255),
+        "no second glyph up top now",
+    );
+    expect_pixel(&pixels, 4, 19, TEXT, "the lower slot's second glyph");
+    expect_pixel(&pixels, 6, 19, TEXT, "the lower slot's third glyph");
+    expect_pixel(&pixels, 5, 36, SKY, "the second shadow column is gone");
+    let lit = non_sky(&pixels);
+    assert_eq!(
+        lit, 865,
+        "two bars of 48x9, and the one-glyph line's one shadow pixel"
+    );
+}

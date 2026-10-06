@@ -36,6 +36,8 @@ use oxide_render::hud::{HudDraw, ScaledResolution};
 use oxide_render::text::string_width;
 use oxide_world::entity::EntityKind;
 
+use crate::CHAT_TEXT_CAP;
+use crate::ChatInput;
 use crate::items;
 use crate::skin_worker::SkinUpdate;
 
@@ -896,6 +898,56 @@ const BAR_WIDTH: f32 = CHAT_WIDTH as f32 + 4.0;
 /// (`GuiIngame.java`:1118-1122), decremented once per tick (`:1070-1073`).
 const SYSTEM_HOLD: u64 = 60;
 
+/// The field's frame: `drawRect(2, height - 14, width - 2, height - 2)` at
+/// `Integer.MIN_VALUE` — black at half alpha (`GuiChat.java`:303). Two pixels in
+/// from each side, twelve tall, its bottom edge two above the screen's.
+const INPUT_FRAME_X: f32 = 2.0;
+const INPUT_FRAME_ABOVE: f32 = 14.0;
+const INPUT_FRAME_HEIGHT: f32 = 12.0;
+
+/// The frame's colour: `Integer.MIN_VALUE` — black at half alpha
+/// (`GuiChat.java`:303).
+const INPUT_SHADE: [f32; 4] = [0.0, 0.0, 0.0, 128.0 / 255.0];
+
+/// The field text's x and the text's distance above the bottom edge: the source's
+/// pen `(4, height - 12)` (`GuiChat.java`:58) — the textbox's own x and y with
+/// `setEnableBackgroundDrawing(false)` (`GuiChat.java`:60).
+const INPUT_PEN_X: f32 = 4.0;
+const INPUT_PEN_ABOVE: f32 = 12.0;
+
+/// The field text's colour: `GuiTextField.enabledColor`, `14737632` = 0xE0E0E0,
+/// opaque (`GuiTextField.java`:52).
+const INPUT_TEXT_COLOUR: [f32; 4] = [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0];
+
+/// The caret bar's colour: `-3092272` = 0xFFD0D0D0 (`GuiTextField.java`:578).
+const INPUT_CARET_COLOUR: [f32; 4] = [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0];
+
+/// The caret bar's height: the source draws `i1 - 1` to `i1 + 1 + 9`
+/// (`GuiTextField.java`:578) — eleven pixels at the nine-pixel font line.
+const INPUT_CARET_HEIGHT: f32 = 11.0;
+
+/// The tooltip's fill: `-267386864` = 0xF0100010 (`GuiScreen.java`:230-235) — the
+/// source's five gradient rects all at this colour union to one flat box.
+const TOOLTIP_FILL: [f32; 4] = [16.0 / 255.0, 0.0, 16.0 / 255.0, 240.0 / 255.0];
+
+/// The tooltip border's top stop: `1347420415` = 0x505000FF (`GuiScreen.java`:236-241).
+const TOOLTIP_BORDER_TOP: [f32; 4] = [80.0 / 255.0, 0.0, 1.0, 80.0 / 255.0];
+
+/// The tooltip border's bottom stop: `(i1 & 16711422) >> 1 | i1 & -16777216` =
+/// 0x5028007F (`GuiScreen.java`:238) — the vertical gradients' lower end, drawn flat
+/// as the milestone's stand-in for the two-stop gradients.
+const TOOLTIP_BORDER_BOTTOM: [f32; 4] = [40.0 / 255.0, 0.0, 127.0 / 255.0, 80.0 / 255.0];
+
+/// The confirm overlay's dim: `drawDefaultBackground`'s first gradient stop,
+/// `-1072689136` = 0xC0101010 (`GuiScreen.java`:668-677) — the same first-stop
+/// stand-in the death view uses.
+const CONFIRM_DIM: [f32; 4] = [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 192.0 / 255.0];
+
+/// The confirm overlay's two-key prompt, drawn in the title's slot
+/// (`GuiYesNo.drawScreen`:72, centred at seventy): the source's own screen is three
+/// buttons, and this milestone's two keys stand in for it.
+const CONFIRM_PROMPT: &str = "Enter opens the link, Escape cancels";
+
 /// The chat mirror: the session's chat messages, and the draws a frame shows for them.
 ///
 /// The messages land from [`ClientEvent::Chat`]: a message at position code `2` becomes
@@ -928,6 +980,15 @@ pub struct ChatView {
     system: Option<(String, u64)>,
     /// The tick a frame draws at; the record line's own fade clock.
     tick: u64,
+    /// The hover tooltip the frame draws: the `show_text` component under the free
+    /// pointer and the scaled point it shows at — fed by [`ChatView::feed_hover`]
+    /// every frame the chat screen is the open one
+    /// (`GuiChat.drawScreen`:305-310 resolves it from the free mouse).
+    tooltip: Option<(TextComponent, (f32, f32))>,
+    /// The confirm overlay's URL while it stands in for the replaced chat screen
+    /// (`GuiScreen.java`:425-429): raised by the window's link click, ended by the
+    /// overlay's two keys.
+    confirm: Option<String>,
 }
 
 impl ChatView {
@@ -939,6 +1000,8 @@ impl ChatView {
             pending: Vec::new(),
             system: None,
             tick: 0,
+            tooltip: None,
+            confirm: None,
         }
     }
 
@@ -1007,15 +1070,33 @@ impl ChatView {
     /// The frame's draw list at `resolution`.
     ///
     /// The record line first (`GuiIngame.java`:245-272 draws before the chat block at
-    /// `:339-347`), then the box's lines newest first; empty until the font is set —
-    /// nothing can be measured before it.
-    pub fn draws(&self, resolution: ScaledResolution) -> Vec<HudDraw> {
+    /// `:339-347`), then the box's lines newest first, then the chat screen's own
+    /// furniture when its state asks for it: the open field's line and the hover
+    /// tooltip (`GuiChat.drawScreen`:303-310), and the confirm overlay — which
+    /// stands in for the replaced screen, so neither the field's line nor the
+    /// tooltip draws under it (`GuiScreen.java`:425-429 swaps the chat screen for
+    /// the confirm one, `Minecraft.java`:1010-1012). With no field line, no
+    /// tooltip and no overlay the frame is the box's frame, unchanged. Empty until
+    /// the font is set — nothing can be measured before it.
+    pub fn draws(&self, resolution: ScaledResolution, input: &ChatInput) -> Vec<HudDraw> {
         let Some(font) = &self.font else {
             return Vec::new();
         };
         let mut draws = Vec::new();
         self.system_draws(font, resolution, &mut draws);
         self.box_draws(resolution, &mut draws);
+        // The chat screen's own furniture draws while it is the screen on top: the
+        // confirm overlay stands in for the replaced chat screen
+        // (`GuiScreen.java`:425-429 swaps it in, `Minecraft.java`:1010-1012), so
+        // neither the field's line nor the tooltip draws under it.
+        if self.confirm.is_some() {
+            self.confirm_draws(font, resolution, &mut draws);
+        } else {
+            if input.open {
+                self.input_draws(font, resolution, input, &mut draws);
+            }
+            self.tooltip_draws(font, resolution, &mut draws);
+        }
         draws
     }
 
@@ -1053,7 +1134,6 @@ impl ChatView {
     /// The box's drawn lines, newest first: one bar and one text each
     /// (`GuiNewChat.drawChat`:53-91).
     fn box_draws(&self, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
-        let height = resolution.height as f32;
         let factor = opacity_factor(CHAT_OPACITY);
         for (index, line) in self.log.drawn().iter().enumerate() {
             // The source's opacity multiply and draw gate (`GuiNewChat.java`:75-78).
@@ -1061,10 +1141,9 @@ impl ChatView {
             if alpha <= 3 {
                 continue;
             }
-            // The bar's top: the newest line's base bottom ([`CHAT_BASE`]) minus the
-            // pitch and the line's own step up the box (`GuiNewChat.java`:81-82 with
-            // `:49-51`).
-            let top = height - CHAT_BASE - LINE_PITCH * (index as f32 + 1.0);
+            // The bar's top: the box's own bottom-anchored step, shared with the
+            // hit-test so the two cannot drift ([`line_top`]).
+            let top = line_top(resolution, index);
             draws.push(HudDraw::Rect {
                 x: CHAT_X,
                 y: top,
@@ -1082,6 +1161,357 @@ impl ChatView {
             });
         }
     }
+
+    /// The open field's own line (`GuiChat.drawScreen`:303-304 over
+    /// `GuiTextField.drawTextBox`:525-592): the frame across the screen's bottom,
+    /// the text at the field's pen, and the caret riding the blink
+    /// ([`ChatInput::cursor_visible`]).
+    fn input_draws(
+        &self,
+        font: &Font,
+        resolution: ScaledResolution,
+        input: &ChatInput,
+        draws: &mut Vec<HudDraw>,
+    ) {
+        let height = resolution.height as f32;
+        draws.push(HudDraw::Rect {
+            x: INPUT_FRAME_X,
+            y: height - INPUT_FRAME_ABOVE,
+            width: resolution.width as f32 - 2.0 * INPUT_FRAME_X,
+            height: INPUT_FRAME_HEIGHT,
+            colour: INPUT_SHADE,
+        });
+        let pen_y = height - INPUT_PEN_ABOVE;
+        let text = input.text.as_str();
+        if text.is_empty() {
+            if input.cursor_visible() {
+                draws.push(HudDraw::Text {
+                    text: "_".to_owned(),
+                    x: INPUT_PEN_X,
+                    y: pen_y,
+                    scale: 1.0,
+                    colour: INPUT_TEXT_COLOUR,
+                    shadow: true,
+                });
+            }
+            return;
+        }
+        // `:551-558`: the prefix up to the cursor draws first; the pen after it
+        // is where the caret and the rest hang.
+        let prefix = &text[..input.cursor];
+        let pen = INPUT_PEN_X + string_width(font, prefix) as f32;
+        if !prefix.is_empty() {
+            draws.push(HudDraw::Text {
+                text: prefix.to_owned(),
+                x: INPUT_PEN_X,
+                y: pen_y,
+                scale: 1.0,
+                colour: INPUT_TEXT_COLOUR,
+                shadow: true,
+            });
+        }
+        // `:571-582`: with the cursor at the text's end — or the field full, the
+        // source's own extra condition — the caret is the bar straddling
+        // `pen - 1`, and the text after the cursor draws from that stepped-back
+        // pen; otherwise the caret is the underscore at the pen.
+        let bar = input.cursor < text.len() || text.chars().count() >= CHAT_TEXT_CAP;
+        let tail = &text[input.cursor..];
+        if bar {
+            if !tail.is_empty() {
+                draws.push(HudDraw::Text {
+                    text: tail.to_owned(),
+                    x: pen - 1.0,
+                    y: pen_y,
+                    scale: 1.0,
+                    colour: INPUT_TEXT_COLOUR,
+                    shadow: true,
+                });
+            }
+            if input.cursor_visible() {
+                draws.push(HudDraw::Rect {
+                    x: pen - 1.0,
+                    y: pen_y - 1.0,
+                    width: 1.0,
+                    height: INPUT_CARET_HEIGHT,
+                    colour: INPUT_CARET_COLOUR,
+                });
+            }
+        } else if input.cursor_visible() {
+            draws.push(HudDraw::Text {
+                text: "_".to_owned(),
+                x: pen,
+                y: pen_y,
+                scale: 1.0,
+                colour: INPUT_TEXT_COLOUR,
+                shadow: true,
+            });
+        }
+    }
+
+    /// The hover tooltip for the state the frame's feed left
+    /// (`GuiScreen.handleComponentHover`'s SHOW_TEXT branch, `:337-339`, over
+    /// `GuiScreen.drawHoveringText`:189-244): the fill and border box at the cursor's
+    /// point, and the hover's text in white, eight and then twelve pixels down
+    /// the box's own lines.
+    ///
+    /// The source splits the hover at its newlines (`:245`); the port wraps the
+    /// formatted text at the GUI width — the bound the source's own overflow
+    /// flip names (`l1 + i > this.width`, `:218-221`) — so a long hover cannot
+    /// run off the screen. The vertical gradient edges draw flat at their first
+    /// stop, the milestone's stand-in as the death view records.
+    fn tooltip_draws(&self, font: &Font, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
+        let Some((component, point)) = &self.tooltip else {
+            return;
+        };
+        let (x, y) = *point;
+        let lines = chat::wrap(&chat::flatten(component), resolution.width as i32, font);
+        if lines.is_empty() {
+            return;
+        }
+        let widths: Vec<i32> = lines
+            .iter()
+            .map(|line| string_width(font, &run_text(line)))
+            .collect();
+        // The source's own bounds (`:211-214`): the widest text, and eight
+        // pixels plus a ten-pixel line per further line.
+        let i = widths.iter().copied().max().unwrap_or(0) as f32;
+        let k = if lines.len() > 1 {
+            8.0 + 2.0 + (lines.len() as f32 - 1.0) * 10.0
+        } else {
+            8.0
+        };
+        let mut l1 = x + 12.0;
+        let mut i2 = y - 12.0;
+        if l1 + i > resolution.width as f32 {
+            l1 -= 28.0 + i;
+        }
+        if i2 + k + 6.0 > resolution.height as f32 {
+            i2 = resolution.height as f32 - k - 6.0;
+        }
+        // The fill: the source's five same-colour gradient rects union to one box
+        // from `(l1 - 4, i2 - 4)` to `(l1 + i + 4, i2 + k + 4)` (`:230-235`).
+        draws.push(HudDraw::Rect {
+            x: l1 - 4.0,
+            y: i2 - 4.0,
+            width: i + 8.0,
+            height: k + 8.0,
+            colour: TOOLTIP_FILL,
+        });
+        // The border (`:236-241`): both edges and the top strip at the top stop,
+        // the bottom strip at its own.
+        draws.push(HudDraw::Rect {
+            x: l1 - 3.0,
+            y: i2 - 2.0,
+            width: 1.0,
+            height: k + 4.0,
+            colour: TOOLTIP_BORDER_TOP,
+        });
+        draws.push(HudDraw::Rect {
+            x: l1 + i + 2.0,
+            y: i2 - 2.0,
+            width: 1.0,
+            height: k + 4.0,
+            colour: TOOLTIP_BORDER_TOP,
+        });
+        draws.push(HudDraw::Rect {
+            x: l1 - 3.0,
+            y: i2 - 3.0,
+            width: i + 6.0,
+            height: 1.0,
+            colour: TOOLTIP_BORDER_TOP,
+        });
+        draws.push(HudDraw::Rect {
+            x: l1 - 3.0,
+            y: i2 + k + 2.0,
+            width: i + 6.0,
+            height: 1.0,
+            colour: TOOLTIP_BORDER_BOTTOM,
+        });
+        // The text (`:243-249`): white and shadowed, ten pixels a line with the
+        // first line's own extra two.
+        let mut ty = i2;
+        for (index, line) in lines.iter().enumerate() {
+            draws.push(HudDraw::Text {
+                text: run_text(line),
+                x: l1,
+                y: ty,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+            });
+            if index == 0 {
+                ty += 2.0;
+            }
+            ty += 10.0;
+        }
+    }
+
+    /// The interim confirm overlay — the port's stand-in for the source's
+    /// screen flow (`clickedLinkURI` and the swap to `GuiConfirmOpenLink`,
+    /// `GuiScreen.java`:403-433): the dim of `drawDefaultBackground`'s first stop
+    /// (`GuiScreen.java`:668-677), the two-key prompt in the title's slot
+    /// (`GuiYesNo.drawScreen`:72) and the URL in the message's — centred, wrapped
+    /// at the source's `width - 50` budget (`initGui`:55), a font line per line
+    /// from ninety down (`GuiYesNo.drawScreen`:73-79).
+    fn confirm_draws(&self, font: &Font, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
+        let Some(url) = &self.confirm else {
+            return;
+        };
+        draws.push(HudDraw::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: resolution.width as f32,
+            height: resolution.height as f32,
+            colour: CONFIRM_DIM,
+        });
+        // The prompt: centred at seventy, the source's integer halving of both
+        // terms (`drawCenteredString` over `GuiYesNo.drawScreen`:72).
+        let half = (string_width(font, CONFIRM_PROMPT) / 2) as f32;
+        draws.push(HudDraw::Text {
+            text: CONFIRM_PROMPT.to_owned(),
+            x: (resolution.width / 2) as f32 - half,
+            y: 70.0,
+            scale: 1.0,
+            colour: [1.0, 1.0, 1.0, 1.0],
+            shadow: true,
+        });
+        // The URL, wrapped at `width - 50` and centred the same way, stepping a
+        // font line per line (`GuiYesNo.drawScreen`:73-79, the source's
+        // `fontRendererObj.listFormattedStringToWidth`).
+        let runs = [chat::StyledRun {
+            text: url.clone(),
+            colour: None,
+            styles: 0,
+            click: None,
+            hover: None,
+        }];
+        let mut y = 90.0;
+        for line in &chat::wrap(&runs, resolution.width as i32 - 50, font) {
+            let text = run_text(line);
+            let half = (string_width(font, &text) / 2) as f32;
+            draws.push(HudDraw::Text {
+                text,
+                x: (resolution.width / 2) as f32 - half,
+                y,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+            });
+            y += font.height() as f32;
+        }
+    }
+
+    /// Feeds one frame's hover: the tooltip of the run under `point` — shown at
+    /// the point — or none. The frame calls this every frame the chat screen is
+    /// the open one, with the free pointer; the feed overwrites the last frame's
+    /// result, and there is no delay
+    /// (`GuiChat.drawScreen`:305-310 resolves the hovered component from the
+    /// free mouse the same way).
+    pub fn feed_hover(&mut self, point: Option<(f32, f32)>, resolution: ScaledResolution) {
+        let mut tooltip = None;
+        if let Some(point) = point {
+            if let Some(run) = self.run_at(point, resolution) {
+                if let Some(chat::HoverEvent::ShowText(component)) = &run.hover {
+                    tooltip = Some((component.as_ref().clone(), point));
+                }
+            }
+        }
+        self.tooltip = tooltip;
+    }
+
+    /// The run under a scaled-GUI point — the box's hit-test for the click path
+    /// (`GuiChat.mouseClicked`:172-186 over `GuiNewChat.getChatComponent`:245-300).
+    ///
+    /// The point is in the frame's own GUI units. Every drawn line's vertical
+    /// band is [`line_top`]'s — the same geometry [`ChatView::box_draws`] lays
+    /// out, so a hit cannot drift from the draws — and within the band the runs
+    /// are walked in draw order: the first whose pen the point has not passed is
+    /// the one under it. A point left of the box's origin hits nothing (the
+    /// source's `j < 0`), and a point past a line's last glyph hits nothing
+    /// either. The source gates on `getChatOpen` (`:247-250`); in this port the
+    /// field's own state is that gate, read by the callers, and a closed chat is
+    /// not asked.
+    pub fn run_at(
+        &self,
+        point: (f32, f32),
+        resolution: ScaledResolution,
+    ) -> Option<&chat::StyledRun> {
+        let font = self.font.as_ref()?;
+        let (x, y) = point;
+        if x < CHAT_X {
+            return None;
+        }
+        let drawn = self.log.drawn();
+        for (index, line) in drawn.iter().enumerate() {
+            let top = line_top(resolution, index);
+            if y < top || y >= top + BAR_HEIGHT {
+                continue;
+            }
+            let mut pen = CHAT_X;
+            for run in line.runs {
+                let width = string_width(font, &run.text) as f32;
+                if x < pen + width {
+                    return Some(run);
+                }
+                pen += width;
+            }
+            return None;
+        }
+        None
+    }
+
+    /// Raises the confirm overlay on `url` — the source's `clickedLinkURI`
+    /// carrying the link into the confirm screen it swaps in
+    /// (`GuiScreen.java`:403-433, `:425-429`). While it is up it stands in for
+    /// the chat screen: the field's line and the tooltip do not draw under it.
+    pub fn open_confirm(&mut self, url: &str) {
+        self.confirm = Some(url.to_owned());
+    }
+
+    /// Whether the confirm overlay is up.
+    pub fn confirm_open(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    /// Cancels the confirm overlay — the source's cancel answer re-displays the
+    /// chat screen it replaced (`GuiScreen.confirmClicked`:713-725 reaches
+    /// `displayGuiScreen(this)` for either answer). The field beneath is
+    /// untouched.
+    pub fn cancel_confirm(&mut self) {
+        self.confirm = None;
+    }
+
+    /// Takes the overlay's URL, clearing it — the Enter path, which opens the
+    /// link once and returns to the chat (`confirmClicked`'s true answer,
+    /// `:713-719`).
+    pub fn take_confirm(&mut self) -> Option<String> {
+        self.confirm.take()
+    }
+}
+
+/// The top edge of the drawn line at `index`, zero the newest — the box's own
+/// bottom-anchored step, shared by [`ChatView::box_draws`] and
+/// [`ChatView::run_at`].
+///
+/// The newest line's base sits [`CHAT_BASE`] pixels above the bottom edge
+/// (`GuiNewChat.java`:49-51 under `GuiIngame.java`:343) and each further line
+/// one [`LINE_PITCH`] up (`GuiNewChat.java`:81-82).
+fn line_top(resolution: ScaledResolution, index: usize) -> f32 {
+    resolution.height as f32 - CHAT_BASE - LINE_PITCH * (index as f32 + 1.0)
+}
+
+/// Puts the chat view's open state back in step with the field's — the frame's
+/// own reconciliation: `chat.set_open(input.open)`.
+///
+/// The window's open and close drive both halves together
+/// (`ClientApp::open_chat` sets the field and the view; `close_chat` clears
+/// both), but the script's `chat` line drives the field alone — a rig run has
+/// no window and no pointer to free — so the frame re-couples them there: the
+/// scripted open draws the open chat, and the scripted send closes it
+/// (`GuiChat` is the screen and its field at once in the source;
+/// `Minecraft.java`:1010-1012 swaps both halves).
+pub fn reconcile_chat_open(chat: &mut ChatView, input: &ChatInput) {
+    chat.set_open(input.open);
 }
 
 /// One component's unformatted text: every element's own characters, `§` codes and
@@ -1150,6 +1580,8 @@ mod tests {
     use oxide_render::entity_pass::{FrameContent, ModelRef, NametagDraw, TextureRef};
     use oxide_render::hud::scaled_resolution;
     use oxide_world::entity::EntityKind;
+
+    use crate::ChatInput;
 
     /// The uuid whose default model the rule calls wide (its last bit is zero).
     const UUID_WIDE: &str = "00000000-0000-0000-0000-000000000000";
@@ -2856,7 +3288,7 @@ mod tests {
     /// the tick the frame draws at.
     fn chat_draws(chat: &mut ChatView, tick: u64) -> Vec<HudDraw> {
         chat.update(tick);
-        chat.draws(chat_resolution())
+        chat.draws(chat_resolution(), &ChatInput::default())
     }
 
     /// A text draw's own fields, for the pins.
@@ -3054,5 +3486,472 @@ mod tests {
         let draws = chat_draws(&mut chat, 7);
         assert_eq!(draws.len(), 2);
         assert_eq!(chat_text(&draws[1]).0, "A§r");
+    }
+
+    // ---- the chat screen: the field's line, the hover and the confirm overlay ----
+
+    /// The open field with `text` typed and the cursor at its end: what a T-open
+    /// and a typed sentence leave behind.
+    fn open_text(text: &str) -> ChatInput {
+        let mut field = ChatInput::default();
+        field.open("");
+        field.type_text(text);
+        field
+    }
+
+    /// The open field's own line — the frame, the text and the caret
+    /// (`GuiChat.drawScreen`:303-304 over `GuiTextField.drawTextBox`:525-592).
+    ///
+    /// The frame is the source's `drawRect(2, height - 14, width - 2, height - 2)`
+    /// at `Integer.MIN_VALUE` (`GuiChat.java`:303); the text sits at the field's pen
+    /// `(4, height - 12)` (`:58`) at the enabled colour — `14737632` =
+    /// `0xE0E0E0` (`GuiTextField.java`:52); the caret rides the blink (`:540`):
+    /// with the cursor at the text's end the underscore at the pen (`:582`), with
+    /// text after it a bar straddling the stepped-back pen (`:571-578`,
+    /// `i1 - 1` to `i1 + 1 + FONT_HEIGHT`).
+    #[test]
+    fn the_input_line_draws_its_text_and_the_caret_in_both_blink_phases() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        let enabled = [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0];
+
+        // The cursor at the end, the blink lit: the underscore at the pen.
+        let field = open_text("AA");
+        let draws = chat.draws(chat_resolution(), &field);
+        assert_eq!(draws.len(), 3, "the frame, the text and the caret");
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (
+                2.0,
+                240.0 - 14.0,
+                427.0 - 4.0,
+                12.0,
+                [0.0, 0.0, 0.0, 128.0 / 255.0]
+            ),
+            "the field's frame at Integer.MIN_VALUE"
+        );
+        assert_eq!(
+            chat_text(&draws[1]),
+            ("AA".to_owned(), 4.0, 240.0 - 12.0, 1.0, enabled, true),
+            "the text at the field's pen"
+        );
+        assert_eq!(
+            chat_text(&draws[2]),
+            ("_".to_owned(), 4.0 + 12.0, 240.0 - 12.0, 1.0, enabled, true),
+            "the end caret is the underscore at the pen"
+        );
+
+        // The cursor mid-text, the blink lit: the bar straddles pen - 1, and the
+        // text after the cursor draws from that stepped-back pen (`:571-575`).
+        let mut field = open_text("AA");
+        field.left();
+        let draws = chat.draws(chat_resolution(), &field);
+        assert_eq!(
+            draws.len(),
+            4,
+            "the frame, the prefix, the tail and the bar"
+        );
+        assert_eq!(chat_text(&draws[1]).0, "A", "the prefix at the pen");
+        assert_eq!(
+            chat_text(&draws[2]),
+            ("A".to_owned(), 9.0, 240.0 - 12.0, 1.0, enabled, true),
+            "the tail from the stepped-back pen"
+        );
+        assert_eq!(
+            chat_rect(&draws[3]),
+            (
+                9.0,
+                240.0 - 13.0,
+                1.0,
+                11.0,
+                [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0]
+            ),
+            "the caret bar: pen - 1, i1 - 1 to i1 + 1 + FONT_HEIGHT"
+        );
+
+        // The blink down: the text stays, the caret goes (`:540`'s
+        // `cursorCounter / 6 % 2 == 0`).
+        let mut field = open_text("AA");
+        for _ in 0..6 {
+            field.tick();
+        }
+        let draws = chat.draws(chat_resolution(), &field);
+        assert_eq!(draws.len(), 2, "the frame and the text, no caret");
+        assert_eq!(chat_text(&draws[1]).0, "AA");
+    }
+
+    /// The hover tooltip (`GuiScreen.handleComponentHover`'s SHOW_TEXT branch
+    /// over `GuiScreen.drawHoveringText`:189-244): the fill and border box at the cursor's
+    /// point — fill `-267386864`, the `0x505000FF` top stop and its halved
+    /// `0x5028007F` bottom — and the hover's text in white, eight then twelve
+    /// pixels down the box's lines.
+    ///
+    /// The source splits the hover at its newlines (`:245`); the port wraps the
+    /// formatted text at the GUI width — the bound the source's own overflow
+    /// flip names (`l1 + i > this.width`, `:218-221`) — so a long hover cannot
+    /// run off the screen. The vertical gradient edges draw flat at their first
+    /// stop, the milestone's stand-in as the death view records for its own.
+    #[test]
+    fn the_hover_tooltip_draws_at_the_cursor_and_wraps_at_the_gui_width() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        // The box's newest line carries a hover whose text wraps: forty 'A's, a
+        // space and forty more — at the 427-pixel cap it breaks at the space.
+        let hover = format!("{}{}{}", "A".repeat(40), " ", "A".repeat(40));
+        chat.observe(
+            &format!(
+                "{{\"text\":\"AA\",\"hoverEvent\":{{\"action\":\"show_text\",\"value\":{{\"text\":\"{hover}\"}}}}}}"
+            ),
+            1,
+            0,
+        );
+        // The pointer sits on the run: the newest line's text row, at its left.
+        chat.feed_hover(Some((2.0, 205.0)), chat_resolution());
+        let draws = chat.draws(chat_resolution(), &ChatInput::default());
+        assert_eq!(
+            draws.len(),
+            2 + 7,
+            "the box's line, then the tooltip's seven"
+        );
+
+        // The fill: (l1 - 4, i2 - 4) with l1 = 2 + 12 = 14, i2 = 205 - 12 = 193,
+        // the widest line's 244 pixels (the continuation " A..." with its reset
+        // `§`; space 4 + forty A's at 6), k = 8 + 2 + 10 = 20.
+        let tooltip = &draws[2..];
+        assert_eq!(
+            chat_rect(&tooltip[0]),
+            (
+                10.0,
+                189.0,
+                252.0,
+                28.0,
+                [16.0 / 255.0, 0.0, 16.0 / 255.0, 240.0 / 255.0]
+            ),
+            "the fill: the source's five same-colour rects as one box"
+        );
+        // The borders (`:236-241`): the two edges, then the top and bottom strips.
+        assert_eq!(
+            chat_rect(&tooltip[1]),
+            (
+                11.0,
+                191.0,
+                1.0,
+                24.0,
+                [80.0 / 255.0, 0.0, 1.0, 80.0 / 255.0]
+            ),
+            "the left edge at the top stop"
+        );
+        assert_eq!(
+            chat_rect(&tooltip[2]),
+            (
+                260.0,
+                191.0,
+                1.0,
+                24.0,
+                [80.0 / 255.0, 0.0, 1.0, 80.0 / 255.0]
+            )
+        );
+        assert_eq!(
+            chat_rect(&tooltip[3]),
+            (
+                11.0,
+                190.0,
+                250.0,
+                1.0,
+                [80.0 / 255.0, 0.0, 1.0, 80.0 / 255.0]
+            )
+        );
+        assert_eq!(
+            chat_rect(&tooltip[4]),
+            (
+                11.0,
+                215.0,
+                250.0,
+                1.0,
+                [40.0 / 255.0, 0.0, 127.0 / 255.0, 80.0 / 255.0]
+            ),
+            "the bottom strip at the halved stop"
+        );
+        // The lines: the first at i2, the second twelve down (`:242-252`), white
+        // and shadowed.
+        assert_eq!(
+            chat_text(&tooltip[5]),
+            (
+                format!("{}§r", "A".repeat(40)),
+                14.0,
+                193.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            )
+        );
+        assert_eq!(
+            chat_text(&tooltip[6]),
+            (
+                format!(" {}§r", "A".repeat(40)),
+                14.0,
+                205.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            ),
+            "the wrapped continuation keeps the space it broke at"
+        );
+
+        // The pointer away from the run: the tooltip is gone again — the feed
+        // overwrites it every frame, and there is no delay.
+        chat.feed_hover(Some((2.0, 100.0)), chat_resolution());
+        assert_eq!(
+            chat.draws(chat_resolution(), &ChatInput::default()).len(),
+            2
+        );
+    }
+
+    /// The scripted open reconciles the box open state: the frame puts the
+    /// view's open flag back in step with the field's
+    /// ([`reconcile_chat_open`]) — the script's `chat` line drives the field
+    /// alone, and the box must follow it (`GuiChat` is the screen and its field
+    /// at once in the source; `Minecraft.java`:1010-1012 swaps both).
+    #[test]
+    fn the_scripted_open_reconciles_the_box_open_state() {
+        // The script's `chat` line drives the field alone; the frame's
+        // reconciliation is what makes the box follow it — the view a windowed
+        // open leaves is what a scripted open must come to. Fifteen lines: an
+        // open window draws all fifteen, a closed one the last ten, so the two
+        // states are distinguishable.
+        let lines: Vec<String> = (1..=15).map(|index| format!("\"x{index}\"")).collect();
+        let mut windowed = ChatView::new();
+        windowed.set_font(chat_font());
+        for line in &lines {
+            windowed.observe(line, 1, 0);
+        }
+        windowed.set_open(true);
+        let mut scripted = ChatView::new();
+        scripted.set_font(chat_font());
+        for line in &lines {
+            scripted.observe(line, 1, 0);
+        }
+        let closed = ChatInput::default();
+        assert_ne!(
+            scripted.draws(chat_resolution(), &closed),
+            windowed.draws(chat_resolution(), &closed),
+            "the scripted open is not there yet"
+        );
+        let field = open_text("");
+        reconcile_chat_open(&mut scripted, &field);
+        assert_eq!(
+            scripted.draws(chat_resolution(), &field),
+            windowed.draws(chat_resolution(), &field),
+            "the reconciliation brings the box up to the windowed open"
+        );
+        // And the close: the scripted send closes the field, and the frame
+        // takes the box back down the same way — to the never-opened view.
+        let mut closed_only = ChatView::new();
+        closed_only.set_font(chat_font());
+        for line in &lines {
+            closed_only.observe(line, 1, 0);
+        }
+        reconcile_chat_open(&mut scripted, &closed);
+        assert_eq!(
+            scripted.draws(chat_resolution(), &closed),
+            closed_only.draws(chat_resolution(), &closed),
+            "the open reconcile comes back down with the field"
+        );
+    }
+
+    /// The confirm overlay — the port's stand-in for the source's confirm screen
+    /// (`GuiScreen.java`:403-433 stores the link and swaps the screen in;
+    /// `GuiYesNo.drawScreen`:69-79 draws it): the dim of
+    /// `drawDefaultBackground`'s first stop (`GuiScreen.java`:668-677), the
+    /// two-key prompt in the title's slot (centred at seventy,
+    /// `GuiYesNo.drawScreen`:72) and the URL wrapped at `width - 50`
+    /// (`GuiYesNo.initGui`:55) from ninety down, a font line per line.
+    #[test]
+    fn the_confirm_overlay_draws_the_dim_the_url_and_the_prompt() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        chat.open_confirm("https://a.example");
+        let draws = chat.draws(chat_resolution(), &ChatInput::default());
+        assert_eq!(draws.len(), 3, "the dim, the prompt and the url");
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (
+                0.0,
+                0.0,
+                427.0,
+                240.0,
+                [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 192.0 / 255.0]
+            ),
+            "the dim at the gradient's first stop"
+        );
+        // The prompt, centred with the source's integer halves: 427 / 2 - 51 / 2
+        // = 213 - 25 = 188; the url's formatted width 16 (one reset `§`) halves
+        // to eight, so 213 - 8 = 205 at the message's ninety.
+        assert_eq!(
+            chat_text(&draws[1]),
+            (
+                "Enter opens the link, Escape cancels".to_owned(),
+                188.0,
+                70.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            )
+        );
+        assert_eq!(
+            chat_text(&draws[2]),
+            (
+                "https://a.example§r".to_owned(),
+                205.0,
+                90.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            )
+        );
+
+        // A url past the width - 50 budget wraps, one font line per line: the
+        // hundred 'A's break at 62 (62 * 6 = 372 <= 377), so 213 - 372 / 2 = 27
+        // and, nine down, 213 - 228 / 2 = 99.
+        chat.cancel_confirm();
+        chat.open_confirm(&"A".repeat(100));
+        let draws = chat.draws(chat_resolution(), &ChatInput::default());
+        assert_eq!(draws.len(), 4, "the dim, the prompt and two url lines");
+        assert_eq!(
+            chat_text(&draws[2]),
+            (
+                format!("{}§r", "A".repeat(62)),
+                27.0,
+                90.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            )
+        );
+        assert_eq!(
+            chat_text(&draws[3]),
+            (
+                format!("{}§r", "A".repeat(38)),
+                99.0,
+                99.0,
+                1.0,
+                [1.0, 1.0, 1.0, 1.0],
+                true
+            )
+        );
+
+        // While the overlay stands in for the replaced screen the field's own
+        // line is not drawn under it (`GuiScreen.java`:425-429 swaps the chat
+        // screen out through `Minecraft.java`:1010-1012).
+        let field = open_text("AA");
+        let draws = chat.draws(chat_resolution(), &field);
+        assert_eq!(draws.len(), 4, "no field line under the overlay");
+        assert_eq!(chat_text(&draws[2]).0, format!("{}§r", "A".repeat(62)));
+    }
+
+    /// The hit-test: the run under a scaled-GUI point
+    /// (`GuiChat.mouseClicked`:172-186 over `GuiNewChat.getChatComponent`:245-300,
+    /// which reads the raw mouse position against the box; the port reads the
+    /// frame's scaled units against the drawn bars, so a hit cannot drift from
+    /// the draws).
+    ///
+    /// The two lines sit at the box's own steps: the newest bar top at
+    /// `240 - 37 = 203` with its text row at 204, the second at 194. A point on
+    /// a line's band hits its run — the first run whose pen it reaches — and a
+    /// point left of the box's origin or past a line's last glyph hits nothing.
+    #[test]
+    fn the_hit_test_maps_a_point_to_the_run_under_it() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        chat.observe("\"AA\"", 1, 0);
+        chat.observe("\"AAAA\"", 1, 0);
+        let resolution = chat_resolution();
+        let run_at = |point| chat.run_at(point, resolution).map(|run| run.text.clone());
+
+        // The newest line's run: "AAAA" draws 24 pixels from the bar's left.
+        assert_eq!(run_at((2.0, 205.0)).as_deref(), Some("AAAA"));
+        assert_eq!(
+            run_at((25.9, 205.0)).as_deref(),
+            Some("AAAA"),
+            "the run's last column"
+        );
+        assert_eq!(run_at((26.0, 205.0)), None, "one past the text is no run");
+        assert_eq!(run_at((1.0, 205.0)), None, "left of the box's origin");
+        assert_eq!(run_at((2.0, 212.0)), None, "below the newest bar");
+
+        // The line boundary: 203 opens the newest line's band, 202 the one under.
+        assert_eq!(run_at((2.0, 203.0)).as_deref(), Some("AAAA"));
+        assert_eq!(
+            run_at((2.0, 202.0)).as_deref(),
+            Some("AA"),
+            "the second line's band"
+        );
+        assert_eq!(run_at((2.0, 194.0)).as_deref(), Some("AA"), "its first row");
+        assert_eq!(run_at((2.0, 193.0)), None, "above the box");
+    }
+
+    /// The absent-state frame is byte-stable: with no field line, no tooltip and
+    /// no overlay set, `draws` is exactly the pre-screen frame the box always
+    /// made — the same two draws the fade test pins.
+    #[test]
+    fn the_absent_state_frame_is_the_old_frame() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        chat.observe("\"AA\"", 1, 0);
+        let draws = chat.draws(chat_resolution(), &ChatInput::default());
+        assert_eq!(
+            draws,
+            vec![
+                HudDraw::Rect {
+                    x: 2.0,
+                    y: 240.0 - 37.0,
+                    width: 324.0,
+                    height: 9.0,
+                    colour: [0.0, 0.0, 0.0, 127.0 / 255.0],
+                },
+                HudDraw::Text {
+                    text: "AA§r".to_owned(),
+                    x: 2.0,
+                    y: 240.0 - 36.0,
+                    scale: 1.0,
+                    colour: [1.0, 1.0, 1.0, 1.0],
+                    shadow: true,
+                },
+            ],
+            "the closed field, no tooltip, no overlay: the old draws, byte for byte"
+        );
+
+        // A fontless mirror draws nothing even with the field open: nothing
+        // measures before the sheet lands.
+        let field = open_text("AA");
+        assert!(ChatView::new().draws(chat_resolution(), &field).is_empty());
+    }
+
+    /// The scripted `chat` drives the field machine directly — open, type and
+    /// send on one tick — so the frame reconciles the mirror's open window from
+    /// the field it draws ([`reconcile_chat_open`]): a stale open window
+    /// follows a closed field, and an open field keeps it open.
+    #[test]
+    fn the_views_window_reconciles_from_the_field() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        for index in 1..=15 {
+            chat.observe(&format!("\"x{index}\""), 1, 0);
+        }
+        chat.set_open(true);
+        let closed = ChatInput::default();
+        let draws = chat.draws(chat_resolution(), &closed);
+        assert_eq!(draws.len(), 30, "the open window draws the fifteen lines");
+        reconcile_chat_open(&mut chat, &closed);
+        let draws = chat.draws(chat_resolution(), &closed);
+        assert_eq!(draws.len(), 20, "the closed field's ten-line window");
+        let field = open_text("");
+        reconcile_chat_open(&mut chat, &field);
+        let draws = chat.draws(chat_resolution(), &field);
+        assert_eq!(
+            draws.len(),
+            30 + 2,
+            "an open field keeps the fifteen-line window, its line on top"
+        );
     }
 }

@@ -42,6 +42,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,7 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_assets::skins::SkinCache;
 use oxide_assets::store::Store;
+use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::PlayerListRecord;
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton};
@@ -70,13 +72,13 @@ use oxide_render::sky::SkyParams;
 use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
 use skin_worker::{SkinRequest, SkinUpdate};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton as WinitMouseButton,
     MouseScrollDelta, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop};
-use winit::keyboard::{Key as WinitKey, NamedKey, PhysicalKey};
+use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// The frame count that bounds a smoke run, read from the environment.
@@ -531,6 +533,13 @@ struct ClientApp {
     skin_updates: Option<Receiver<SkinUpdate>>,
     /// The pointer-capture rules.
     capture: Capture,
+    /// The free pointer's position in the frame's GUI units while the chat is
+    /// open: the hover and the box's hit-test read it, and nothing about it
+    /// reaches the session (`GuiChat.drawScreen`:305-310 reads the free mouse;
+    /// `GuiNewChat.getChatComponent`:256-257 scales it by the factor).
+    cursor: Option<(f32, f32)>,
+    /// The link opener the confirm overlay's Enter runs.
+    opener: UrlOpener,
     /// The `--input-script` replay, when the flag was given.
     script: Option<ScriptDriver>,
 }
@@ -922,6 +931,8 @@ impl ClientApp {
             overlay_visible,
             dead: false,
             capture: Capture::default(),
+            cursor: None,
+            opener: Box::new(spawn_url_opener),
             script,
         })
     }
@@ -1127,10 +1138,18 @@ impl ClientApp {
         }
         // The chat: the mirror ages to the session's tick, and the frame's draws —
         // bars, text and the record line at the scaled resolution — land in the hud
-        // pass, which draws them between the dim and the debug overlay.
+        // pass, which draws them between the dim and the debug overlay. The frame
+        // re-couples the view's open state with the field's (the script drives the
+        // field alone), feeds the hover from the free pointer, and hands the draws
+        // the field the blink and the line read from.
         self.chat.update(self.player.tick);
+        view::reconcile_chat_open(&mut self.chat, &self.chat_input);
         let scaled = renderer.scaled_resolution();
-        renderer.set_hud(self.chat.draws(scaled));
+        self.chat.feed_hover(
+            tooltip_point(self.chat_input.open, self.chat.confirm_open(), self.cursor),
+            scaled,
+        );
+        renderer.set_hud(self.chat.draws(scaled, &self.chat_input));
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
         // text goes. Both are cleared when the respawn arrives.
@@ -1207,10 +1226,22 @@ impl ClientApp {
     /// gameplay keys flow only while the pointer is grabbed.
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         if is_escape_press(event.state, event.repeat, &event.logical_key) {
-            match escape_route(self.chat_input.open, &mut self.capture) {
+            match escape_route(
+                self.chat_input.open,
+                self.chat.confirm_open(),
+                &mut self.capture,
+            ) {
+                EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
                 EscapeRoute::CloseChat => self.close_chat(event_loop),
                 EscapeRoute::Capture(step) => self.apply_capture(event_loop, step),
             }
+            return;
+        }
+        // The confirm overlay is the top screen while it stands in for the
+        // chat: its own keys are the only ones it answers, and the field
+        // beneath takes nothing.
+        if self.chat.confirm_open() {
+            self.on_confirm_key(event.state, event.physical_key);
             return;
         }
         if self.chat_input.open {
@@ -1280,6 +1311,9 @@ impl ClientApp {
     fn open_chat(&mut self, event_loop: &ActiveEventLoop, default: &str) {
         self.chat_input.open(default);
         self.chat.set_open(true);
+        // The pointer was grabbed until this press: there is no free position
+        // yet, so no hover or hit-test point until the mouse moves.
+        self.cursor = None;
         let step = self.capture.chat_open();
         self.apply_capture(event_loop, step);
     }
@@ -1294,8 +1328,68 @@ impl ClientApp {
         self.chat_input.close();
         self.chat.set_open(false);
         self.chat.reset_scroll();
+        // The cursor is captured again: the free position means nothing.
+        self.cursor = None;
         let step = self.capture.chat_close();
         self.apply_capture(event_loop, step);
+    }
+
+    /// Routes one key event to the confirm overlay — the only keys it has.
+    ///
+    /// Enter opens the link: the overlay's URL goes through the opener exactly
+    /// once, and the overlay ends, returning to the chat screen it replaced
+    /// (`GuiScreen.confirmClicked`:713-719's true answer opens the link and
+    /// re-displays the chat). Escape is the cancel and is routed by
+    /// [`escape_route`] before this; every other key is the overlay's own to
+    /// ignore.
+    fn on_confirm_key(&mut self, state: ElementState, physical_key: PhysicalKey) {
+        if !is_enter_press(state, physical_key) {
+            return;
+        }
+        if let Some(url) = self.chat.take_confirm() {
+            (self.opener)(&url);
+        }
+    }
+
+    /// One press of the chat screen: the run under the free pointer acts —
+    /// `GuiChat.mouseClicked`:172-186 (`getChatComponent` hit-tests the drawn
+    /// lines, then `handleComponentClick` acts on the component's click
+    /// event). A press on no run does nothing.
+    fn chat_click(&mut self) {
+        let Some(point) = self.cursor else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let click = self
+            .chat
+            .run_at(point, scaled)
+            .and_then(|run| run.click.clone());
+        if let Some(click) = click {
+            self.apply_chat_click(&click);
+        }
+    }
+
+    /// Acts on one click event — `GuiScreen.handleComponentClick`:445-452 for the
+    /// commands, `:403-433` for the link: a run command is sent through the
+    /// session's chat path, a suggest command overwrites the field's text, and
+    /// a link raises the confirm overlay that asks.
+    fn apply_chat_click(&mut self, click: &ClickEvent) {
+        match &click.action {
+            ClickAction::RunCommand => {
+                self.send_input(InputEvent::SendChat {
+                    text: command_text(&click.value),
+                });
+            }
+            ClickAction::SuggestCommand => {
+                self.chat_input.set_text(&click.value);
+            }
+            ClickAction::OpenUrl => {
+                self.chat.open_confirm(&click.value);
+            }
+        }
     }
 
     /// Routes one mouse button event: the click that grabs, or the gameplay
@@ -1313,6 +1407,14 @@ impl ClientApp {
         button: WinitMouseButton,
     ) {
         if self.chat_input.open {
+            // The screen holds the click. A press with the confirm overlay up
+            // belongs to the overlay, whose own keys are the keyboard's in this
+            // milestone; otherwise the press hit-tests the box's runs —
+            // `GuiChat.mouseClicked`:172-186 — and acts on the one under the
+            // free pointer.
+            if state == ElementState::Pressed && !self.chat.confirm_open() {
+                self.chat_click();
+            }
             return;
         }
         if !self.capture.grabbed() {
@@ -1952,21 +2054,104 @@ fn chat_opener(
     }
 }
 
-/// Where one Escape press goes: the open chat closes and nothing else; a
-/// closed chat leaves the M3 capture rules exactly as they were.
-fn escape_route(chat_open: bool, capture: &mut Capture) -> EscapeRoute {
-    if chat_open {
+/// The link opener the confirm overlay's Enter path runs — the source's
+/// `openWebLink` (`GuiScreen.java`:727-739) in this milestone: the interim
+/// hands the URL to `xdg-open`, the desktop's own opener, and leaves the
+/// process to itself.
+///
+/// The seam is a box so the overlay's tests run with a recording opener and no
+/// process at all.
+type UrlOpener = Box<dyn Fn(&str)>;
+
+/// The interim opener: `xdg-open` with the URL, spawned and left alone. A
+/// spawn failure is logged, never fatal — the link is a side effect, not the
+/// frame's own work.
+fn spawn_url_opener(url: &str) {
+    match Command::new("xdg-open").arg(url).spawn() {
+        Ok(child) => tracing::info!(url, pid = child.id(), "the link opener was spawned"),
+        Err(error) => tracing::warn!(url, %error, "the link opener could not be spawned"),
+    }
+}
+
+/// Whether a key event is a fresh press of Enter — the confirm overlay's open
+/// key.
+///
+/// The source's confirm screen answers with its own buttons; the interim binds
+/// the true answer's open — `confirmClicked`'s `openWebLink` branch
+/// (`GuiScreen.java`:713-719) — to Enter, and Escape cancels on the M3 route.
+fn is_enter_press(state: ElementState, physical_key: PhysicalKey) -> bool {
+    state == ElementState::Pressed && physical_key == PhysicalKey::Code(KeyCode::Enter)
+}
+
+/// The command a `run_command` click sends: the value with a leading slash
+/// added when it carries none — the plan's own rule (`/the-value`).
+///
+/// `GuiScreen.handleComponentClick`:449-452 sends the value through
+/// `sendChatMessage(value, false)`, the same session path Enter takes
+/// (`GuiScreen.java`:481-493), and the server reads a leading slash as the
+/// command path (`NetHandlerPlayServer`:808-811 strips exactly one); a value
+/// that already carries one is sent as it stands.
+fn command_text(value: &str) -> String {
+    if value.starts_with('/') {
+        value.to_owned()
+    } else {
+        format!("/{value}")
+    }
+}
+
+/// A window position in the frame's GUI units: the raw position divided by the
+/// GUI scale factor, floored the way the source's own integer division lands
+/// (`GuiNewChat.getChatComponent`:256-257 — `(int)(mouseX / f)` and the same
+/// for y). A zero factor is no division at all.
+fn scaled_cursor(position: PhysicalPosition<f64>, scale: u32) -> (f32, f32) {
+    if scale == 0 {
+        return (position.x as f32, position.y as f32);
+    }
+    let factor = f64::from(scale);
+    (
+        (position.x / factor).floor() as f32,
+        (position.y / factor).floor() as f32,
+    )
+}
+
+/// The point each frame feeds the chat's hover: the free pointer's scaled
+/// position while the chat screen is the open one — not while the confirm
+/// overlay stands in for it — and none otherwise
+/// (`GuiChat.drawScreen`:305-310 resolves the hover only as the open screen).
+fn tooltip_point(
+    chat_open: bool,
+    confirm_open: bool,
+    cursor: Option<(f32, f32)>,
+) -> Option<(f32, f32)> {
+    if chat_open && !confirm_open {
+        cursor
+    } else {
+        None
+    }
+}
+
+/// Where one Escape press goes: the confirm overlay cancels first — it is the
+/// screen on top, and its cancel re-displays the chat
+/// (`GuiScreen.confirmClicked`:713-725) — then an open chat closes and nothing
+/// else; a closed chat leaves the M3 capture rules exactly as they were.
+fn escape_route(chat_open: bool, confirm_open: bool, capture: &mut Capture) -> EscapeRoute {
+    if confirm_open {
+        EscapeRoute::CancelConfirm
+    } else if chat_open {
         EscapeRoute::CloseChat
     } else {
         EscapeRoute::Capture(capture.escape())
     }
 }
 
-/// The two destinations of an Escape press. The chat's own close is what
+/// The three destinations of an Escape press. The chat's own close is what
 /// makes an Escape while the chat is open close only — capture neither
-/// releases nor exits.
+/// releases nor exits — and the overlay's cancel sits above both: cancel is
+/// the topmost screen's, the M3 capture rules only the free pointer's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeRoute {
+    /// The confirm overlay is cancelled; the chat below it stays open.
+    CancelConfirm,
     /// The open chat closes and nothing else moves.
     CloseChat,
     /// The capture rules run, exactly M3's.
@@ -2086,6 +2271,21 @@ impl ApplicationHandler for ClientApp {
             WindowEvent::KeyboardInput { event, .. } => self.on_key(event_loop, event),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_button(event_loop, state, button);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                // The free pointer's position, in the frame's GUI units, while
+                // the chat is open: the hover and the box's clicks read it,
+                // and nothing about it reaches the session
+                // (`GuiChat.drawScreen`:305-310 reads the live mouse;
+                // `GuiNewChat.getChatComponent`:256-257 divides it by the
+                // scale factor).
+                if self.chat_input.open {
+                    let scale = self
+                        .renderer
+                        .as_ref()
+                        .map_or(1, |renderer| renderer.scaled_resolution().scale_factor);
+                    self.cursor = Some(scaled_cursor(position, scale));
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // The wheel is the chat log's while the chat is open
@@ -2266,9 +2466,8 @@ impl ChatInput {
 
     /// Whether the cursor is in its lit phase (`GuiTextField.java`:540).
     ///
-    /// The frame's draw consumes this in the rendering half; here it is the
-    /// field's own record of the blink.
-    #[allow(dead_code)]
+    /// The frame's draw consumes this ([`view::ChatView::input_draws`]): the
+    /// caret draws only while the phase is lit.
     fn cursor_visible(&self) -> bool {
         (self.blink / 6) % 2 == 0
     }
@@ -2399,22 +2598,26 @@ mod tests {
     use super::{
         Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClientApp,
         DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute, Key,
-        MouseButton, PlayerState, ScriptDriver, SkinRequest, SkinUpdate, SkyValues, aim_outline,
-        bound_mouse_button, chat_opener, chat_wheel_lines, clear_break_stage, cracks_in_view,
-        escape_route, frame_params, gameplay_key, is_escape_press, is_f3_press, parse_script,
-        parse_server_address, skin_requests, store_aim, store_break_stage, store_skins,
+        MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate, SkyValues,
+        UrlOpener, aim_outline, bound_mouse_button, chat_opener, chat_wheel_lines,
+        clear_break_stage, command_text, cracks_in_view, escape_route, frame_params, gameplay_key,
+        is_enter_press, is_escape_press, is_f3_press, parse_script, parse_server_address,
+        scaled_cursor, skin_requests, store_aim, store_break_stage, store_skins, tooltip_point,
         void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
+    use oxide_game::chat::{ClickAction, ClickEvent};
     use oxide_game::entity_view::PlayerListRecord;
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use winit::dpi::PhysicalPosition;
@@ -2737,7 +2940,10 @@ mod tests {
             "the open frees the pointer"
         );
         assert!(!capture.grabbed());
-        assert_eq!(escape_route(true, &mut capture), EscapeRoute::CloseChat);
+        assert_eq!(
+            escape_route(true, false, &mut capture),
+            EscapeRoute::CloseChat
+        );
         assert!(!capture.grabbed(), "the escape itself touches nothing");
         assert_eq!(
             capture.chat_close(),
@@ -2754,14 +2960,40 @@ mod tests {
         let mut capture = Capture::default();
         capture.click();
         assert_eq!(
-            escape_route(false, &mut capture),
+            escape_route(false, false, &mut capture),
             EscapeRoute::Capture(CaptureStep::Release),
             "escape while grabbed releases"
         );
         assert_eq!(
-            escape_route(false, &mut capture),
+            escape_route(false, false, &mut capture),
             EscapeRoute::Capture(CaptureStep::Exit),
             "the second escape exits"
+        );
+    }
+
+    #[test]
+    fn escape_while_the_confirm_overlay_is_up_cancels_it_first() {
+        // The overlay is the topmost screen: Escape cancels it and returns to
+        // the chat — neither answer closes the chat
+        // (`GuiScreen.confirmClicked`:713-725 re-displays `this`, the chat
+        // screen, for both).
+        let mut capture = Capture::default();
+        capture.click();
+        assert_eq!(
+            escape_route(true, true, &mut capture),
+            EscapeRoute::CancelConfirm,
+            "the overlay's cancel comes before the chat's close"
+        );
+        assert!(capture.grabbed(), "the escape itself touches nothing");
+        assert_eq!(
+            escape_route(true, false, &mut capture),
+            EscapeRoute::CloseChat,
+            "with the overlay down the same press closes the chat"
+        );
+        assert_eq!(
+            escape_route(false, false, &mut Capture::default()),
+            EscapeRoute::Capture(CaptureStep::Exit),
+            "a closed chat keeps the M3 rules: the untouched capture's own exit"
         );
     }
 
@@ -3829,5 +4061,200 @@ mod tests {
         );
         assert!(chat.open, "the refused look left the field open");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the chat screen's clicks, the link confirm and the free pointer ----
+
+    /// A link opener that records the URLs it is handed: the source's
+    /// `openWebLink` (`GuiScreen.java`:727-739) replaced in every test that runs
+    /// the overlay's Enter.
+    fn recording_opener() -> (UrlOpener, Rc<RefCell<Vec<String>>>) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&seen);
+        let opener: UrlOpener = Box::new(move |url: &str| {
+            recorder.borrow_mut().push(url.to_owned());
+        });
+        (opener, seen)
+    }
+
+    /// An app without a server or a window, the way the smoke tests build one.
+    fn test_app() -> ClientApp {
+        let cli = Cli::try_parse_from(["oxide-client"]).expect("a bare invocation parses");
+        ClientApp::new(cli).expect("the client builds without a server")
+    }
+
+    #[test]
+    fn the_confirm_keys_open_the_link_once_and_escape_cancels() {
+        // The overlay's two keys: Enter takes the URL through the opener exactly
+        // once — the second press finds the overlay gone
+        // (`GuiScreen.confirmClicked`:713-725 opens and re-displays the chat) —
+        // and the Escape route cancels with no key opening anything after.
+        let mut app = test_app();
+        let (opener, seen) = recording_opener();
+        app.opener = opener;
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        assert!(is_enter_press(ElementState::Pressed, enter));
+        assert!(!is_enter_press(
+            ElementState::Pressed,
+            PhysicalKey::Code(KeyCode::KeyX)
+        ));
+        assert!(
+            !is_enter_press(ElementState::Released, enter),
+            "a release is no press"
+        );
+
+        app.chat.open_confirm("https://a.example");
+        app.on_confirm_key(ElementState::Pressed, enter);
+        assert_eq!(seen.borrow().as_slice(), ["https://a.example".to_owned()]);
+        assert!(!app.chat.confirm_open(), "the open took the overlay");
+        app.on_confirm_key(ElementState::Pressed, enter);
+        assert_eq!(seen.borrow().len(), 1, "nothing opens twice");
+
+        // Escape: the route cancels first, and the Enter after it finds no
+        // overlay — nothing opens in the escape's wake.
+        app.chat.open_confirm("https://b.example");
+        let mut capture = Capture::default();
+        assert_eq!(
+            escape_route(true, true, &mut capture),
+            EscapeRoute::CancelConfirm
+        );
+        assert!(!capture.grabbed(), "the escape itself touches nothing");
+        app.chat.cancel_confirm();
+        assert!(!app.chat.confirm_open());
+        app.on_confirm_key(ElementState::Pressed, enter);
+        assert_eq!(seen.borrow().len(), 1, "zero opened by the escape path");
+    }
+
+    #[test]
+    fn a_run_command_click_sends_the_command_with_one_slash() {
+        // `GuiScreen.handleComponentClick`:449-452 sends the click's value
+        // through `sendChatMessage(value, false)` — the same session path Enter
+        // takes, not the sent-history one — and the server reads a leading slash
+        // as the command path (`NetHandlerPlayServer`:808-811 strips exactly
+        // one); the port adds the slash the plan names (`/the-value`) only when
+        // the value carries none.
+        assert_eq!(command_text("say hi"), "/say hi");
+        assert_eq!(
+            command_text("/say hi"),
+            "/say hi",
+            "a slashed value is not doubled"
+        );
+        let mut app = test_app();
+        let (_events_tx, events_rx) = unbounded();
+        let (input_tx, input_rx) = unbounded();
+        app.session = Some(SessionLink {
+            server: "test".into(),
+            events: events_rx,
+            input_tx,
+        });
+        app.apply_chat_click(&ClickEvent {
+            action: ClickAction::RunCommand,
+            value: "say hi".into(),
+        });
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("the command left on the send path"),
+            InputEvent::SendChat {
+                text: "/say hi".into()
+            }
+        );
+        assert!(input_rx.try_recv().is_err(), "one send, exactly");
+    }
+
+    #[test]
+    fn a_suggest_click_replaces_the_field_text_and_lands_the_cursor_at_its_end() {
+        // `GuiScreen.handleComponentClick`:445-448's `setText(value, true)` over
+        // `GuiChat.setText`:191-198: the field is overwritten and the cursor
+        // lands after the new text; the screen stays open.
+        let mut app = test_app();
+        app.chat_input.open("/");
+        app.chat_input.type_text("draft");
+        app.apply_chat_click(&ClickEvent {
+            action: ClickAction::SuggestCommand,
+            value: "say hi".into(),
+        });
+        assert_eq!(
+            (app.chat_input.text.as_str(), app.chat_input.cursor),
+            ("say hi", 6)
+        );
+        assert!(app.chat_input.open, "the screen stays open");
+    }
+
+    #[test]
+    fn an_open_url_click_raises_the_confirm_overlay() {
+        // `GuiScreen.java`:403-433: with the prompt on, the link is not opened
+        // at the click — the click stores it as `clickedLinkURI` and raises the
+        // screen that asks; the Enter path takes it from there.
+        let mut app = test_app();
+        app.apply_chat_click(&ClickEvent {
+            action: ClickAction::OpenUrl,
+            value: "https://a.example".into(),
+        });
+        assert!(app.chat.confirm_open());
+        assert_eq!(
+            app.chat.take_confirm().as_deref(),
+            Some("https://a.example"),
+            "the stored link the Enter path opens"
+        );
+        assert!(!app.chat.confirm_open(), "taking it clears the overlay");
+    }
+
+    #[test]
+    fn the_tooltip_point_follows_the_open_field_and_steps_aside_for_the_confirm() {
+        // The hover is the chat screen's own (`GuiChat.drawScreen`:305-310
+        // hit-tests the free mouse every frame), so the frame feeds it only
+        // while the chat is the screen on top — not while the confirm overlay
+        // stands in for the replaced one.
+        let point = (3.0, 4.0);
+        assert_eq!(tooltip_point(true, false, Some(point)), Some(point));
+        assert_eq!(tooltip_point(true, false, None), None, "no pointer yet");
+        assert_eq!(tooltip_point(false, false, Some(point)), None, "closed");
+        assert_eq!(
+            tooltip_point(true, true, Some(point)),
+            None,
+            "the overlay is up"
+        );
+    }
+
+    #[test]
+    fn a_window_position_scales_to_the_frames_gui_units() {
+        // `GuiNewChat.getChatComponent`:256-257 divides the raw mouse position
+        // by the scale factor; the port's units are the frame's own, floored the
+        // way the source's integer division lands.
+        assert_eq!(
+            scaled_cursor(PhysicalPosition::new(639.0, 719.0), 3),
+            (213.0, 239.0)
+        );
+        assert_eq!(
+            scaled_cursor(PhysicalPosition::new(639.9, 0.5), 3),
+            (213.0, 0.0),
+            "the division floors"
+        );
+        assert_eq!(
+            scaled_cursor(PhysicalPosition::new(10.0, 20.0), 0),
+            (10.0, 20.0),
+            "a zero factor is no division"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_confirm_overlay_acts_on_nothing() {
+        // While the overlay is up the click belongs to it, and the overlay has
+        // no mouse surface in this milestone: no run is acted on, the overlay
+        // stays, and above all no link opens (that is Enter's, and Enter's
+        // only).
+        let mut app = test_app();
+        let (opener, seen) = recording_opener();
+        app.opener = opener;
+        app.chat.observe("\"AA\"", 1, 0);
+        app.chat.open_confirm("https://a.example");
+        app.chat_input.open("");
+        app.apply_chat_click(&ClickEvent {
+            action: ClickAction::OpenUrl,
+            value: "https://b.example".into(),
+        });
+        assert_eq!(seen.borrow().len(), 0, "clicks never open links");
+        assert!(app.chat.confirm_open(), "the overlay stays up");
     }
 }
