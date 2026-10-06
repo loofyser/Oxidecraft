@@ -2235,9 +2235,8 @@ fn sidebar_objective<'a>(board: &'a Scoreboard, own: &str) -> Option<&'a Objecti
 /// from the lowest points to the highest — and the title band closes it in the
 /// top row's own iteration. Every draw carries no shadow, as the source's
 /// four-argument `drawString` does not (`FontRenderer.java:333-336`). The
-/// frame's HUD draw list does not consume the sidebar yet; the tests are the
-/// only caller for now.
-#[allow(dead_code)]
+/// frame seeds its HUD draw list with these draws, ahead of the chat's and
+/// the held list's — the source's own painter order.
 pub fn sidebar_draws(
     board: &Scoreboard,
     own: &str,

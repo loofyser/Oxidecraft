@@ -536,6 +536,10 @@ struct ClientApp {
     /// The frame's scoreboard mirror: every whole-board report replaces it, and
     /// the tab list's sort and display slots read it.
     board: Scoreboard,
+    /// The window's own account name: what the sidebar reads its team through
+    /// (`GuiIngame.java`:320). Taken from the command line's username before the
+    /// session takes that value for its own handshake.
+    own_name: String,
     /// The measured font the frame's text surfaces share: the same value the
     /// chat mirror measured against, and the one the tab list's assembly reads.
     /// `None` without a session.
@@ -862,6 +866,10 @@ impl ClientApp {
         let mut chat_font = None;
         let mut skin_requests_tx = None;
         let mut skin_updates_rx = None;
+        // The sidebar reads the team through the window's own name; the session
+        // takes the command line's username for its own handshake, so the window
+        // keeps its copy first.
+        let own_name = cli.username.clone();
         let session = match cli.server {
             Some(address) => {
                 let (host, port) = parse_server_address(&address)?;
@@ -944,6 +952,7 @@ impl ClientApp {
             chat_input: ChatInput::default(),
             tab: view::TabState::new(),
             board: Scoreboard::default(),
+            own_name,
             font: chat_font,
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
@@ -1178,11 +1187,16 @@ impl ClientApp {
             tooltip_point(self.chat_input.open, self.chat.confirm_open(), self.cursor),
             scaled,
         );
-        // The chat's draws land first and the held player list follows them —
-        // the source's own painter order (`GuiIngame.renderGameOverlay`:343-358)
-        // — and the list draws only while its key is held and the measured font
-        // is loaded.
-        let mut hud_draws = self.chat.draws(scaled, &self.chat_input);
+        // The hud list runs in the source's own overlay order: the scoreboard
+        // sidebar first (`GuiIngame.java`:336), then the chat's draws
+        // (`GuiIngame.java`:343-346), then the held player list
+        // (`GuiIngame.java`:348-358). The sidebar and the list draw with the
+        // measured font; the list draws only while its key is held.
+        let mut hud_draws = match self.font.as_ref() {
+            Some(font) => view::sidebar_draws(&self.board, &self.own_name, font, scaled),
+            None => Vec::new(),
+        };
+        hud_draws.extend(self.chat.draws(scaled, &self.chat_input));
         if self.tab.open {
             if let Some(font) = self.font.as_ref() {
                 hud_draws.extend(self.tab.tab_draws(

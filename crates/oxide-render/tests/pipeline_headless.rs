@@ -2395,6 +2395,26 @@ fn tag_camera(distance: f64) -> Camera {
     }
 }
 
+/// The below-name case's camera: eight blocks out — inside the line's own squared gate —
+/// with the field of view widened so a block lands about a hundred pixels and the
+/// source's raise is about twenty-eight. The pose aims at the middle of the two-label
+/// stack: the plain box's bottom at 2.0867 to the raised box's top at 2.6027, the raise
+/// 0.276 apart at the anchors.
+fn below_camera() -> Camera {
+    const AIM: f64 = 2.344_7;
+    Camera {
+        pose: CameraPose {
+            position: [0.0, 1.06 - f64::from(EYE_HEIGHT), 8.0],
+            yaw: 180.0,
+            pitch: -((AIM - 1.06) / 8.0).atan().to_degrees() as f32,
+        },
+        fov_degrees: 4.6,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
+}
+
 /// The nametag draws its box and its glyph above the model's head: the silhouette grows
 /// upwards, the solid pass lands near-white texels there, and the untagged frame at the
 /// same pose holds none of it.
@@ -2643,6 +2663,86 @@ fn the_nametag_ink_lands_left_of_the_box_centre() {
         box_centre - ink_centre >= 2.0,
         "the glyph's ink sits left of the box's centre: box x=[{box_min}..{box_max}] \
          centre {box_centre}, ink x=[{ink_min}..{ink_max}] centre {ink_centre}"
+    );
+}
+
+/// The below-name line draws under the tag and raises it: a player draw carrying the
+/// composed line shows the line's ink in the band below the nametag, and the tag's ink a
+/// raise higher than the same draw without the line — the source's override path
+/// (`RenderPlayer.java`:139-155): the line draws first at the plain anchor (`:149`) and
+/// the nametag above it takes the source's own product `FONT_HEIGHT * 1.15F * 0.02666667F`
+/// raise (`:150`, the f32 0.2760000228881836 the unit pin holds bit for bit).
+///
+/// The probe: the camera sits eight blocks out — inside the line's own `d0 < 100.0D`
+/// gate (`:141`) — with the field of view widened so a block is about a hundred pixels;
+/// the raise then lands about twenty-eight pixels, and the frame fits the whole two-label
+/// stack (the plain box's bottom to the raised box's top, 0.516 blocks). The probe's
+/// texts are stand-ins: the nametag is the synthetic sheet's `A` and the line `AA` — two
+/// glyphs the tag's single glyph does not cover, so the line's ink reaches columns the
+/// tag leaves clear, which is where the pair's difference is read. The model itself falls
+/// below the frame's bottom edge.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_below_name_draws_under_the_tag_and_raises_it() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = entity_registry(&device, &queue, [200, 90, 40, 255]);
+    let mut entities = EntityPass::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(below_camera(), 1.0);
+    entities
+        .set_font(&device, &queue, &nametag_sheet())
+        .expect("the synthetic sheet loads");
+
+    let control = tagged("A");
+    let mut with_below = tagged("A");
+    with_below.below_name = Some("AA".to_owned());
+
+    let control_frame = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, std::slice::from_ref(&control), &registry);
+    });
+    let below_frame = render_scene(&device, &queue, &target, &depth, |pass| {
+        entities.draw(&device, pass, std::slice::from_ref(&with_below), &registry);
+    });
+
+    // (1) The line's ink sits in the band under the tag — and the control, which carries
+    // no line, holds the sky at the same pixel.
+    expect_pixel(
+        &below_frame,
+        18,
+        45,
+        TEXT,
+        "the below line's ink under the tag",
+    );
+    expect_pixel(&control_frame, 18, 45, SKY, "the control's same pixel");
+    // (2) The tag's ink shifts up by the raise: the topmost near-white row of each frame.
+    let ink_top = |pixels: &[u8]| -> u32 {
+        (0..SIZE)
+            .find(|&y| (0..SIZE).any(|x| pixel(pixels, x, y).iter().all(|channel| *channel >= 250)))
+            .expect("an inked row")
+    };
+    let raised_top = ink_top(&below_frame);
+    let plain_top = ink_top(&control_frame);
+    let shift = plain_top - raised_top;
+    let changed = changed_pixels(&control_frame, &below_frame);
+    eprintln!(
+        "below name: tag ink top {raised_top}, control ink top {plain_top}, shift {shift} px, \
+         {changed} changed pixels"
+    );
+    // Measured at the pinning run: tag ink top 10, control ink top 36, shift 26 px, 1058
+    // changed pixels.
+    assert!(
+        (26..=29).contains(&shift),
+        "the tag's ink sits the raise above the control's: {plain_top} -> {raised_top}"
+    );
+    assert!(
+        changed >= 100,
+        "the line's box and glyph cover pixels, got {changed}"
     );
 }
 
@@ -5021,6 +5121,32 @@ fn cell_over_panel_over_sky() -> [u8; 3] {
         .map(|channel| (f32::from(channel) * (1.0 - alpha) + 255.0 * alpha).round() as u8)
 }
 
+/// The blend of the sidebar's band at `band_alpha` over the sky: the assembly's black
+/// fill over the cleared frame — the rows at 80/255 and the title band at 96/255
+/// (`view.rs:2149`/:2153) — the same rule [`bar_over_sky`] measures for the chat's bar.
+fn sidebar_band_over_sky(band_alpha: u8) -> [u8; 3] {
+    bar_over_sky(band_alpha)
+}
+
+/// The blend of one sidebar text pass over `band`: the draw's white at the assembly's
+/// 32/255 (`view.rs:2157`) — a `§` run keeps the draw's alpha (`text.rs:230-235`).
+fn sidebar_text_over(band: [u8; 3]) -> [u8; 3] {
+    let alpha = 32.0 / 255.0;
+    std::array::from_fn(|channel| {
+        (f32::from(band[channel]) * (1.0 - alpha) + 255.0 * alpha).round() as u8
+    })
+}
+
+/// The blend of the sidebar's red number over `band`: its `§c` run's (255, 85, 85) at the
+/// draw's 32/255 (`text.rs:82-85`, the code table's twelfth entry).
+fn sidebar_red_over(band: [u8; 3]) -> [u8; 3] {
+    let alpha = 32.0 / 255.0;
+    let source = [255.0_f32, 85.0, 85.0];
+    std::array::from_fn(|channel| {
+        (f32::from(band[channel]) * (1.0 - alpha) + source[channel] * alpha).round() as u8
+    })
+}
+
 /// The hud draws a chat line's shape over the cleared frame: a black bar at the line's
 /// fade alpha and its shadowed text, at the GUI coordinates the chat assembly lays out.
 ///
@@ -5718,5 +5844,218 @@ fn the_hud_pass_draws_the_tab_list() {
     assert_eq!(
         lit, 1638,
         "the three panels' 42x39 extent; every cell, head, name, score and bar inside"
+    );
+}
+
+/// The hud draws the scoreboard sidebar's shape over the cleared frame: the title band,
+/// three entry rows and the red number — the assembly's shapes (`view.rs`'s
+/// `sidebar_draws`; `GuiIngame.renderScoreboard`:551-607) at the case's own numbers.
+///
+/// The shape follows the source's rules: the block `9n` tall from the `H/2 + 9n/3`
+/// baseline (`:581-585`), each row's band spanning `right - left + 2` at the text column
+/// `W - widest - 3` (`:593-595`), the red number right-aligned at its own width off the
+/// row's right edge (`:592`), and the title band with its one-pixel separator closing the
+/// list, the title centred by integer division (`:599-605`). The alphas are the
+/// assembly's constants: the rows' band at 80/255, the title band at 96/255, the text at
+/// 32/255 (`view.rs:2149`/:2153/:2157) — black fills under white text, the number's `§c`
+/// run the table's (255, 85, 85) (`text.rs:82-85`, `FontRenderer.java`:400).
+///
+/// The stand-ins: the probe's own widest (20) and the synthetic font's single `|` glyph
+/// for the names, the title and the number — the number on the middle row alone, where
+/// the assembly draws one per row. The resolution is 64x64 GUI units onto the 64x64
+/// target, so one unit is one pixel and every value lands at its own coordinate.
+///
+/// The count: the three row bands and the title band are 24x9 each and the separator
+/// 24x1 — 4 * 216 + 24 = 888 non-sky pixels, the inks inside them.
+///
+/// The pinning run measured the blends byte for byte: the row band [108, 133, 172], the
+/// title band [99, 121, 156], the number's ink [126, 127, 161], the title's ink
+/// [119, 138, 168], and the 888 lit pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_scoreboard_sidebar() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+
+    let band = [0.0, 0.0, 0.0, 80.0 / 255.0];
+    let title_band = [0.0, 0.0, 0.0, 96.0 / 255.0];
+    let text = [1.0, 1.0, 1.0, 32.0 / 255.0];
+    let rect = |x: f32, y: f32, width: f32, height: f32, colour: [f32; 4]| HudDraw::Rect {
+        x,
+        y,
+        width,
+        height,
+        colour,
+    };
+    let line = |body: &str, x: f32, y: f32| HudDraw::Text {
+        text: body.to_string(),
+        x,
+        y,
+        scale: 1.0,
+        colour: text,
+        shadow: false,
+    };
+    let skins = TextureRegistry::new(&device, &queue);
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            // Row one (the bottom): its band and the name at the text column.
+            rect(39.0, 32.0, 24.0, 9.0, band),
+            line("|", 41.0, 32.0),
+            // Row two: the band, the name and the red number right-aligned at the row's
+            // right edge (63 - the number's width 2).
+            rect(39.0, 23.0, 24.0, 9.0, band),
+            line("|", 41.0, 23.0),
+            line("§c|", 61.0, 23.0),
+            // Row three (the top): its band and name.
+            rect(39.0, 14.0, 24.0, 9.0, band),
+            line("|", 41.0, 14.0),
+            // The title band closing the list: the band, its one-pixel separator and the
+            // centred title (41 + 20/2 - 2/2).
+            rect(39.0, 4.0, 24.0, 9.0, title_band),
+            rect(39.0, 13.0, 24.0, 1.0, band),
+            line("|", 50.0, 5.0),
+        ],
+        &skins,
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The frame around the sidebar: the sky above the title band and below the bottom
+    // row, and either side of the bands.
+    expect_pixel(&pixels, 26, 3, SKY, "above the title band");
+    expect_pixel(&pixels, 26, 41, SKY, "below the bottom row");
+    expect_pixel(&pixels, 38, 33, SKY, "left of the bands");
+    expect_pixel(&pixels, 63, 33, SKY, "right of the bands");
+    // (1) The row band: black at 80/255 over the sky, from the bottom row's first row to
+    // its last, and the middle row's last row above it.
+    expect_pixel(
+        &pixels,
+        40,
+        32,
+        sidebar_band_over_sky(80),
+        "the bottom row's band top",
+    );
+    expect_pixel(
+        &pixels,
+        40,
+        33,
+        sidebar_band_over_sky(80),
+        "the bottom row's band",
+    );
+    expect_pixel(
+        &pixels,
+        40,
+        40,
+        sidebar_band_over_sky(80),
+        "the bottom row's band last row",
+    );
+    expect_pixel(
+        &pixels,
+        40,
+        31,
+        sidebar_band_over_sky(80),
+        "the middle row's band last row",
+    );
+    // (2) The red number's ink: the `§c` run over the band, one glyph column, from its
+    // first row to its last.
+    expect_pixel(
+        &pixels,
+        61,
+        23,
+        sidebar_red_over(sidebar_band_over_sky(80)),
+        "the red number's first row",
+    );
+    expect_pixel(
+        &pixels,
+        61,
+        25,
+        sidebar_red_over(sidebar_band_over_sky(80)),
+        "the red number's ink",
+    );
+    expect_pixel(
+        &pixels,
+        61,
+        30,
+        sidebar_red_over(sidebar_band_over_sky(80)),
+        "the red number's last row",
+    );
+    // (3) Right-aligned: the ink's column is the row's right edge minus its width
+    // (63 - 2 = 61); the band is bare on either side and below the ink.
+    expect_pixel(
+        &pixels,
+        60,
+        25,
+        sidebar_band_over_sky(80),
+        "left of the number",
+    );
+    expect_pixel(
+        &pixels,
+        62,
+        25,
+        sidebar_band_over_sky(80),
+        "right of the number",
+    );
+    expect_pixel(
+        &pixels,
+        61,
+        31,
+        sidebar_band_over_sky(80),
+        "below the number",
+    );
+    // (4) The title: its ink at the centred column, the title band bare at the margin
+    // and at the separator's own row.
+    expect_pixel(
+        &pixels,
+        50,
+        8,
+        sidebar_text_over(sidebar_band_over_sky(96)),
+        "the title's ink",
+    );
+    expect_pixel(
+        &pixels,
+        42,
+        8,
+        sidebar_band_over_sky(96),
+        "the title band at the margin",
+    );
+    expect_pixel(
+        &pixels,
+        40,
+        4,
+        sidebar_band_over_sky(96),
+        "the title band's first row",
+    );
+    expect_pixel(
+        &pixels,
+        40,
+        13,
+        sidebar_band_over_sky(80),
+        "the separator row",
+    );
+    let lit = non_sky(&pixels);
+    eprintln!(
+        "sidebar: band {:?}, title band {:?}, number {:?}, title ink {:?}, {lit} lit",
+        pixel(&pixels, 40, 33),
+        pixel(&pixels, 40, 8),
+        pixel(&pixels, 61, 25),
+        pixel(&pixels, 50, 8)
+    );
+    assert_eq!(
+        lit, 888,
+        "the three row bands and the title band 24x9 each, the separator 24x1"
     );
 }
