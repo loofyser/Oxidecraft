@@ -380,11 +380,13 @@ fn the_snow_layer_row_holds_its_source_values() {
 fn the_barrier_row_holds_its_source_values() {
     // The barrier carries no properties and no blockstate file: Material.barrier
     // (`Material.java:49`), `setBlockUnbreakable()` — hardness -1
-    // (`Block.java:407-409`, the registration at `Blocks.java:433`) — the
+    // (`BlockBarrier.java:13`, `Block.java:407-409`) — the
     // `getRenderType()` -1 that draws nothing (`BlockBarrier.java:19-25`),
-    // `isOpaqueCube()` false (`:27-33`) and `getAmbientOcclusionLightValue()`
-    // 1.0F (`:35-41`), no drops (`:43-48`). `registerBuiltInBlocks` names it
-    // (`BlockModelShapes.java:161`), so it has no blockstate file at all.
+    // `isOpaqueCube()` false (`:27-33`), the `translucent = true` override of
+    // the field's default (`:16`, `Block.java:297`) and
+    // `getAmbientOcclusionLightValue()` 1.0F (`:35-41`), no drops (`:43-48`).
+    // `registerBuiltInBlocks` names it (`BlockModelShapes.java:161`), so it has
+    // no blockstate file at all.
     assert_eq!(
         behaviour(166).map(|row| row.name),
         Some("barrier"),
@@ -405,6 +407,10 @@ fn the_barrier_row_holds_its_source_values() {
     // row keeps both readers on the source's answers.
     assert!(!row.full_cube);
     assert!(!row.occludes, "isOpaqueCube answers false");
+    assert!(
+        row.translucent,
+        "BlockBarrier.java:16 overrides the field true"
+    );
     assert_eq!(row.material, Material::Barrier);
     assert_eq!(row.render_layer, RenderLayer::Solid);
     assert_eq!(row.tint, TintKind::None);

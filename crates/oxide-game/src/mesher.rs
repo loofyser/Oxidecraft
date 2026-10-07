@@ -712,7 +712,8 @@ struct AmbientCorners {
 /// the block's own cell otherwise; the four tangent neighbours of the base are
 /// read first, then the four corner cells, each corner taking the tangent's
 /// value only when *neither* of the two behind-cells it spans is translucent
-/// (`:377-442`, the source's `Block.translucent`, i.e. `!Material.blocksLight()`).
+/// (`:377-442`, the source's `Block.translucent` — `!Material.blocksLight()` at
+/// construction with `BlockBarrier.java:16`'s override, carried per row).
 /// The centre is the neighbour's cell when flag 0 holds or the neighbour is not
 /// opaque, and the block's own cell otherwise (`:444-449`) — "opaque" read
 /// through [`occludes`], the leaves' graphics-level clause included, the same
@@ -750,7 +751,7 @@ fn ambient_corners(
         let value = snapshot.block(x, y, z);
         side[index] = cell_pair(snapshot, (x, y, z), behaviour(value >> 4));
         light[index] = ao_light_value(value >> 4);
-        translucent[index] = !blocks_light(snapshot.block(x + dx, y + dy, z + dz) >> 4);
+        translucent[index] = is_translucent(snapshot.block(x + dx, y + dy, z + dz) >> 4);
     }
     // The source's `i1`, `j1`, `k1` and `l1`: the first tangent of each pair,
     // pushed one cell along the second. Each one answers the first tangent's
@@ -868,12 +869,17 @@ fn ao_light_value(id: u16) -> f32 {
     }
 }
 
-/// `Material.blocksLight()` — the source's `Block.translucent` field inverts it
-/// (`block/Block.java:291-297`, read by `isTranslucent()` at `:215-223`):
-/// whether the block's material blocks light. Air, and an id outside the table,
-/// block nothing — the same non-occluding default the cull rule gives them.
-fn blocks_light(id: u16) -> bool {
-    behaviour(id).is_some_and(|entry| entry.material.blocks_light())
+/// `Block.isTranslucent()` (`block/Block.java:215-223`): the corner
+/// substitution's read of `Block.translucent` (`BlockModelRenderer.java:377-405`).
+/// The row carries the field — `!material.blocksLight()` at construction
+/// (`block/Block.java:291-297`) with `BlockBarrier.java:16`'s `true` the tree's
+/// only override. Air, and an id outside the table, block nothing — the same
+/// non-occluding default the cull rule gives them.
+fn is_translucent(id: u16) -> bool {
+    match behaviour(id) {
+        Some(entry) => entry.translucent,
+        None => true,
+    }
 }
 
 /// `getAoBrightness`: the two channels' four-sample average, with a zero sample

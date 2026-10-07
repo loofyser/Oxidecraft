@@ -1169,6 +1169,65 @@ fn a_concave_corner_multiplies_its_vertex_by_the_cells_light_value() {
 }
 
 #[test]
+fn the_corner_substitution_reads_a_barrier_behind_cell_as_translucent() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Maximum);
+
+    // The stone's top face at (1, 64, 1) with a barrier in every tangent cell
+    // and stone in every diagonal cell: each corner slot answers its tangent's
+    // 1.0 while neither behind-cell is translucent and its diagonal's 0.2 when
+    // either is, so the slot's branch shows as 255 against 204. The four
+    // behind-cells are the fixture's variable. Air reads translucent — 204
+    // through the diagonal; stone reads opaque — 255 through the tangent; an
+    // id outside the table blocks nothing — 204; and the barrier's
+    // `Block.translucent = true` (`BlockBarrier.java:16`, the tree's only
+    // override of the constructor's `!Material.blocksLight()` field,
+    // `Block.java:297`) must answer as air does: 204, where a read through the
+    // material alone answers 255. The barrier tangents also hold their own
+    // light value to 1.0 here — the stone case would otherwise mix in 0.2s.
+    let top_colours = |behind: Option<u16>| -> Vec<[u8; 4]> {
+        let mut blocks = vec![
+            (1, 64, 1, state(STONE, 0)),
+            (2, 65, 1, state(BARRIER, 0)),
+            (0, 65, 1, state(BARRIER, 0)),
+            (1, 65, 2, state(BARRIER, 0)),
+            (1, 65, 0, state(BARRIER, 0)),
+            (2, 65, 2, state(STONE, 0)),
+            (2, 65, 0, state(STONE, 0)),
+            (0, 65, 2, state(STONE, 0)),
+            (0, 65, 0, state(STONE, 0)),
+        ];
+        if let Some(id) = behind {
+            blocks.extend([
+                (2, 66, 1, state(id, 0)),
+                (0, 66, 1, state(id, 0)),
+                (1, 66, 2, state(id, 0)),
+                (1, 66, 0, state(id, 0)),
+            ]);
+        }
+        quads(&mesh_of(&daylight(&blocks), &ctx))
+            .into_iter()
+            .find(|quad| {
+                quad.iter().all(|vertex| {
+                    vertex.position[1] == 65.0
+                        && (1.0..=2.0).contains(&vertex.position[0])
+                        && (1.0..=2.0).contains(&vertex.position[2])
+                })
+            })
+            .expect("the stone's top face")
+            .iter()
+            .map(|vertex| vertex.colour)
+            .collect()
+    };
+
+    assert_eq!(top_colours(None), [[204, 204, 204, 255]; 4]);
+    assert_eq!(top_colours(Some(STONE)), [[255, 255, 255, 255]; 4]);
+    assert_eq!(top_colours(Some(200)), [[204, 204, 204, 255]; 4]);
+    assert_eq!(top_colours(Some(BARRIER)), [[204, 204, 204, 255]; 4]);
+}
+
+#[test]
 fn a_partial_elements_face_takes_the_quad_bounds_paths() {
     let (models, atlas) = loaded();
     let maps = white_maps();

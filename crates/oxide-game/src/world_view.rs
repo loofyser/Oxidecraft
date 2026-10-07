@@ -187,8 +187,9 @@ impl WorldView<'_> {
     /// a neighbour cell: a fence of the same material, or an opaque full-cube
     /// block other than the gourd. The barrier is covered and its row is not a
     /// full cube, so the full-cube arm answers `false` — the source's own
-    /// barrier clause does the same (`:163`); the fence-gate clause (`:164`)
-    /// covers an id outside the covered set, which answers `false`.
+    /// barrier clause does the same (`:164`); the fence-gate clause (`:164`,
+    /// the same `return`) covers an id outside the covered set, which answers
+    /// `false`.
     fn neighbour_connects_fence(&self, row: &BlockBehaviour, x: i32, y: i32, z: i32) -> bool {
         let Some(other) = row_of(self.0, x, y, z) else {
             return false;
@@ -213,10 +214,11 @@ impl WorldView<'_> {
     }
 
     /// `BlockPane.canPaneConnectToBlock` (`BlockPane.java:177-180`): a full
-    /// block, a pane, the glass block. The barrier is not a full block
-    /// (`isFullBlock` is `isOpaqueCube() && isFullCube()`, `Block.java:517`,
-    /// and the barrier answers `isOpaqueCube()` false). The two stained ids
-    /// the source also names are outside the covered set.
+    /// block, a pane, the glass block. The barrier is not a full block:
+    /// `isFullBlock()` returns the constructor-cached `fullBlock`
+    /// (`Block.java:207-210`, set from `isOpaqueCube()` at `:295`), and the
+    /// barrier answers `isOpaqueCube()` false. The two stained ids the source
+    /// also names are outside the covered set.
     fn neighbour_connects_pane(&self, x: i32, y: i32, z: i32) -> bool {
         let Some(other) = row_of(self.0, x, y, z) else {
             return false;
