@@ -23,7 +23,7 @@ use std::time::Instant;
 use oxide_assets::font::Font;
 use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_game::chat::{
-    self, CHAT_WIDTH, ChatLog, LOG_CAP, STYLE_BOLD, STYLE_ITALIC, STYLE_OBFUSCATED,
+    self, CHAT_WIDTH, ChatLog, LOG_CAP, LanguageTable, STYLE_BOLD, STYLE_ITALIC, STYLE_OBFUSCATED,
     STYLE_STRIKETHROUGH, STYLE_UNDERLINED, TextComponent,
 };
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, PlayerListRecord};
@@ -983,6 +983,9 @@ pub struct ChatView {
     /// The measured font the wrap and the runs' widths use; the client hands it over
     /// when the asset store lands.
     font: Option<Font>,
+    /// The language table translation components resolve against; empty until the
+    /// client hands the store's table over.
+    language: LanguageTable,
     /// Messages that arrived before the font, parsed and waiting — the mirror cannot
     /// wrap them yet. Bounded at [`LOG_CAP`], oldest dropped first: what the log itself
     /// would keep.
@@ -1008,6 +1011,7 @@ impl ChatView {
         Self {
             log: ChatLog::new(),
             font: None,
+            language: LanguageTable::new(),
             pending: Vec::new(),
             system: None,
             tick: 0,
@@ -1016,11 +1020,19 @@ impl ChatView {
         }
     }
 
+    /// Sets the language table translation components resolve against. Call it
+    /// before [`ChatView::set_font`]: the messages waiting on the font resolve
+    /// when it lands.
+    pub fn set_language(&mut self, language: LanguageTable) {
+        self.language = language;
+    }
+
     /// Sets the measured font and wraps whatever arrived before it — a message can
     /// outrun the asset store by a frame.
     pub fn set_font(&mut self, font: Font) {
         for (component, tick) in self.pending.drain(..) {
-            self.log.push(&component, tick, CHAT_WIDTH, &font);
+            self.log
+                .push(&component, tick, CHAT_WIDTH, &font, &self.language);
         }
         self.font = Some(font);
     }
@@ -1033,12 +1045,15 @@ impl ChatView {
         if position == 2 {
             // The record line is the message's unformatted text — every element's own
             // characters, styles cut (`GuiIngame.java`:1166-1169 over
-            // `ChatComponentStyle.java`:72-81).
-            self.system = Some((plain_text(&component), tick));
+            // `ChatComponentStyle.java`:72-81) — a translation resolved first, as the
+            // source's own unformatted text resolves it.
+            self.system = Some((plain_text(&chat::resolve(&component, &self.language)), tick));
             return;
         }
         match &self.font {
-            Some(font) => self.log.push(&component, tick, CHAT_WIDTH, font),
+            Some(font) => self
+                .log
+                .push(&component, tick, CHAT_WIDTH, font, &self.language),
             None => {
                 self.pending.push((component, tick));
                 if self.pending.len() > LOG_CAP {

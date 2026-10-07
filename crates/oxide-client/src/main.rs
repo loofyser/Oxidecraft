@@ -1053,6 +1053,7 @@ impl ClientApp {
         // malformed fails fast; the smoke path without one loads nothing.
         let mut assets = None;
         let mut chat_font = None;
+        let mut chat_lang = None;
         let mut skin_requests_tx = None;
         let mut skin_updates_rx = None;
         // The sidebar reads the team through the window's own name; the session
@@ -1065,8 +1066,10 @@ impl ClientApp {
                 tracing::info!(server = %address, username = %cli.username, "joining the server");
                 let loaded = ClientAssets::load(None)?;
                 // The chat mirror measures against the same sheet every other text
-                // surface uses; it gets the font before the window opens.
+                // surface uses; it gets the font before the window opens, and the
+                // language table the received translations resolve against.
                 chat_font = Some(loaded.font.clone());
+                chat_lang = Some(loaded.lang.clone());
                 // The skin worker opens the store the assets loaded from —
                 // the same root rule — and owns the cache on its own thread.
                 let store = Store::open(assets::default_store_root()?)?;
@@ -1133,6 +1136,9 @@ impl ClientApp {
             chat: match &chat_font {
                 Some(font) => {
                     let mut chat = view::ChatView::new();
+                    if let Some(lang) = chat_lang {
+                        chat.set_language(lang);
+                    }
                     chat.set_font(font.clone());
                     chat
                 }

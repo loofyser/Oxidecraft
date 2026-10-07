@@ -141,6 +141,28 @@ pub struct TextComponent {
     /// The child components, drawn after this component's own text, depth
     /// first.
     pub children: Vec<TextComponent>,
+    /// The translation payload when this component is a translation
+    /// component (`ChatComponentTranslation`): the language-table key and
+    /// the format args, carried from the wire's `translate` and `with`
+    /// (`IChatComponent.deserialize`:104-126) until [`resolve`] splices
+    /// them into children.
+    pub translate: Option<Translation>,
+}
+
+/// One translation component's payload: the language-table key and the
+/// format args, each a component (`ChatComponentTranslation.java`:14-33).
+///
+/// The pair is carried from the wire (`IChatComponent.deserialize`:104-126)
+/// and spliced into the component's children by [`resolve`], the source's
+/// `ensureInitialized` step (`ChatComponentTranslation.java`:38-70).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Translation {
+    /// The language-table key, as sent.
+    pub key: String,
+    /// The `with` args, in order. Each is a component whose style inherits
+    /// the translation component's own, the source's `setParentStyle` on
+    /// every arg (`ChatComponentTranslation.java`:26-32).
+    pub args: Vec<TextComponent>,
 }
 
 /// The click actions the port performs: the source's own gate admits
@@ -265,13 +287,22 @@ impl ChatLog {
         self.tick = tick;
     }
 
-    /// Logs one message: the component is [`flatten`]ed and [`wrap`]ped at
-    /// `width`, and each split line is pushed newest first with its receipt
-    /// stamped `tick`. While the chat is open and scrolled, each push pins
-    /// the view by one line (`GuiNewChat.java`:151-160); the log is capped at
-    /// [`LOG_CAP`] (`:162-165`).
-    pub fn push(&mut self, component: &TextComponent, tick: u64, width: i32, font: &Font) {
-        for line in wrap(&flatten(component), width, font) {
+    /// Logs one message: the component is resolved against `table` — every
+    /// translation node spliced into its template's pieces ([`resolve`]) —
+    /// then [`flatten`]ed and [`wrap`]ped at `width`, and each split line is
+    /// pushed newest first with its receipt stamped `tick`. While the chat is
+    /// open and scrolled, each push pins the view by one line
+    /// (`GuiNewChat.java`:151-160); the log is capped at [`LOG_CAP`]
+    /// (`:162-165`).
+    pub fn push(
+        &mut self,
+        component: &TextComponent,
+        tick: u64,
+        width: i32,
+        font: &Font,
+        table: &LanguageTable,
+    ) {
+        for line in wrap(&flatten(&resolve(component, table)), width, font) {
             if self.open && self.scroll > 0 {
                 self.scrolled = true;
                 self.scroll(1);
@@ -456,6 +487,7 @@ fn inherit(parent: &TextComponent) -> TextComponent {
         click: parent.click.clone(),
         hover: parent.hover.clone(),
         children: Vec::new(),
+        translate: None,
     }
 }
 
@@ -551,6 +583,28 @@ fn parse_object(
                 }
             }
         }
+        // The translation branch, after the style keys and the events so each
+        // arg inherits the component's whole style (`ChatComponentTranslation`'s
+        // constructor parents every arg, `:26-32`). The source's order is
+        // `text` first: a component with both keeps its text and the pair is
+        // ignored (`IChatComponent.java`:104-126).
+        if map.get("text").is_none() {
+            if let Some(key) = map.get("translate").and_then(Value::as_str) {
+                let mut args = Vec::new();
+                if let Some(Value::Array(items)) = map.get("with") {
+                    for item in items {
+                        if budget.nodes == 0 {
+                            break;
+                        }
+                        args.push(parse_value(item, &component, depth + 1, budget));
+                    }
+                }
+                component.translate = Some(Translation {
+                    key: budget.take_text(key),
+                    args,
+                });
+            }
+        }
         if let Some(Value::Array(items)) = map.get("extra") {
             for item in items {
                 if budget.nodes == 0 {
@@ -638,6 +692,196 @@ fn flatten_into(component: &TextComponent, runs: &mut Vec<StyledRun>) {
     for child in &component.children {
         flatten_into(child, runs);
     }
+}
+
+/// The client's language table: translation keys to their template strings,
+/// as the store's `en_US.lang` carries them (`StringTranslate`; the chat
+/// keys at `:227-235`).
+///
+/// The loader is this scoped round's own — the chat path resolves against
+/// it, and the full language surface is a later milestone's. The numeric
+/// placeholders the source's own load rewrites (`StringTranslate.java`:50)
+/// are that later surface's too: every chat key uses `%s`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LanguageTable {
+    entries: std::collections::HashMap<String, String>,
+}
+
+impl LanguageTable {
+    /// An empty table: every lookup falls back to the key itself.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parses one `.lang` file's contents the way the source's own load does
+    /// (`StringTranslate.java`:41-54): one `key=value` per line, split at
+    /// the first `=`, `#` comment lines and blanks skipped, nothing trimmed.
+    pub fn from_lang(text: &str) -> Self {
+        let mut entries = std::collections::HashMap::new();
+        for line in text.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                entries.insert(key.to_owned(), value.to_owned());
+            }
+        }
+        Self { entries }
+    }
+
+    /// The template a key resolves to, when the table holds it; a missing
+    /// key is the caller's fallback to make — the key itself, the source's
+    /// own (`StringTranslate.tryTranslateKey`:110-114).
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    /// The number of keys the table holds.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the table holds no keys.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Resolves one component against `table`: every translation node is
+/// replaced by the source's splice — the template's literal pieces and its
+/// `with` args where the node stood (`ChatComponentTranslation.initializeFromFormat`:75-121)
+/// — with the source's missing-key fallback, the key itself
+/// (`StringTranslate.tryTranslateKey`:110-114). Every other node is carried
+/// through; children and hover payloads resolve depth first.
+///
+/// A template the walk cannot substitute — an unsupported specifier, or an
+/// arg index past the list — degrades to the key itself: the source throws
+/// there (`ChatComponentTranslationFormatException`, `:57-68`), and the
+/// port's hostile-input rule never panics.
+pub fn resolve(component: &TextComponent, table: &LanguageTable) -> TextComponent {
+    let mut resolved = match &component.translate {
+        Some(translation) => substituted(component, translation, table),
+        None => component.clone(),
+    };
+    resolved.translate = None;
+    resolved.children = resolved
+        .children
+        .iter()
+        .map(|child| resolve(child, table))
+        .collect();
+    if let Some(HoverEvent::ShowText(shown)) = &resolved.hover {
+        resolved.hover = Some(HoverEvent::ShowText(Box::new(resolve(shown, table))));
+    }
+    resolved
+}
+
+/// The component one translation node resolves to: the template's pieces
+/// spliced in the node's place, then the node's own children — the source's
+/// format children then siblings (`ChatComponentTranslation.iterator`:185-189).
+fn substituted(
+    component: &TextComponent,
+    translation: &Translation,
+    table: &LanguageTable,
+) -> TextComponent {
+    let template = table.get(&translation.key).unwrap_or(&translation.key);
+    let mut resolved = inherit(component);
+    let mut pieces = match format_pieces(template, component, &translation.args) {
+        Some(pieces) => pieces,
+        None => {
+            // The source rethrows its format exception; the port degrades to
+            // the key itself, one literal piece.
+            let mut key_piece = inherit(component);
+            key_piece.text = translation.key.clone();
+            vec![key_piece]
+        }
+    };
+    pieces.extend(component.children.iter().cloned());
+    resolved.children = pieces;
+    resolved
+}
+
+/// Splits one template into its literal pieces and arg components in the
+/// source's own walk (`ChatComponentTranslation.initializeFromFormat`:75-121):
+/// a `%s` (or `%N$s`) placeholder takes the next arg (or arg `N`), `%%` is a
+/// literal `%`, and the text between placeholders is a literal piece. The
+/// source's pattern is `%(?:(\d+)\$)?([A-Za-z%]|$)`; `None` when the walk
+/// cannot substitute — a specifier that is not `s` or `%`, a `%` with
+/// nothing after it, or an arg index past the list.
+fn format_pieces(
+    template: &str,
+    style: &TextComponent,
+    args: &[TextComponent],
+) -> Option<Vec<TextComponent>> {
+    let mut pieces: Vec<TextComponent> = Vec::new();
+    let mut literal = String::new();
+    let mut next_arg = 0usize;
+    let bytes = template.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            let start = index;
+            while index < bytes.len() && bytes[index] != b'%' {
+                index += 1;
+            }
+            literal.push_str(&template[start..index]);
+            continue;
+        }
+        // The placeholder's optional `N$` index, then one specifier byte.
+        let digits_start = index + 1;
+        let mut cursor = digits_start;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        let (digits, specifier) =
+            if cursor > digits_start && cursor < bytes.len() && bytes[cursor] == b'$' {
+                (Some(&template[digits_start..cursor]), cursor + 1)
+            } else {
+                (None, digits_start)
+            };
+        if specifier >= bytes.len() {
+            return None;
+        }
+        match (digits, bytes[specifier]) {
+            (None, b'%') => {
+                literal.push('%');
+                index = specifier + 1;
+            }
+            (digits, b's') => {
+                if !literal.is_empty() {
+                    pieces.push(literal_piece(&mut literal, style));
+                }
+                let arg = match digits {
+                    Some(digits) => digits.parse::<usize>().ok()?.checked_sub(1)?,
+                    None => {
+                        let arg = next_arg;
+                        next_arg += 1;
+                        arg
+                    }
+                };
+                if arg >= args.len() {
+                    return None;
+                }
+                pieces.push(args[arg].clone());
+                if pieces.len() >= MAX_COMPONENT_TOTAL {
+                    return None;
+                }
+                index = specifier + 1;
+            }
+            _ => return None,
+        }
+    }
+    if !literal.is_empty() {
+        pieces.push(literal_piece(&mut literal, style));
+    }
+    Some(pieces)
+}
+
+/// One literal piece of a template: `ChatComponentText(String.format(chunk))`
+/// under the translation's style (`ChatComponentTranslation.java`:93-96).
+fn literal_piece(text: &mut String, style: &TextComponent) -> TextComponent {
+    let mut piece = inherit(style);
+    piece.text = std::mem::take(text);
+    piece
 }
 
 /// Splits one component's text at its `§` codes into runs, the component's
@@ -1323,7 +1567,7 @@ mod tests {
         // 5363 'A's split into 101 lines of 53 and a last line of 10.
         let component = parse_json(&format!("\"{}\"", "A".repeat(53 * 101 + 10)));
         let mut log = ChatLog::new();
-        log.push(&component, 7, 320, &font());
+        log.push(&component, 7, 320, &font(), &LanguageTable::new());
         assert_eq!(log.lines().len(), LOG_CAP);
         assert_eq!(log.lines().front().unwrap().runs[0].text, "A".repeat(10));
         assert_eq!(
@@ -1338,7 +1582,7 @@ mod tests {
     fn a_push_splits_the_component_at_the_budget() {
         let component = parse_json(&format!("\"{}\"", "aaaa ".repeat(41)));
         let mut log = ChatLog::new();
-        log.push(&component, 3, 320, &font());
+        log.push(&component, 3, 320, &font(), &LanguageTable::new());
         let lines: Vec<String> = log
             .lines()
             .iter()
@@ -1385,7 +1629,7 @@ mod tests {
     fn a_closed_log_draws_only_the_lines_the_fade_leaves() {
         let component = parse_json("\"x\"");
         let mut log = ChatLog::new();
-        log.push(&component, 100, 320, &font());
+        log.push(&component, 100, 320, &font(), &LanguageTable::new());
         log.update(100);
         let drawn = log.drawn();
         assert_eq!(drawn.len(), 1);
@@ -1414,7 +1658,7 @@ mod tests {
         let component = parse_json("\"x\"");
         let mut log = ChatLog::new();
         for _ in 0..30 {
-            log.push(&component, 0, 320, &font());
+            log.push(&component, 0, 320, &font(), &LanguageTable::new());
         }
         log.set_open(true);
         log.scroll(5);
@@ -1445,17 +1689,164 @@ mod tests {
         let component = parse_json("\"x\"");
         let mut log = ChatLog::new();
         for _ in 0..30 {
-            log.push(&component, 0, 320, &font());
+            log.push(&component, 0, 320, &font(), &LanguageTable::new());
         }
         log.set_open(true);
         log.scroll(5);
-        log.push(&component, 1, 320, &font());
+        log.push(&component, 1, 320, &font(), &LanguageTable::new());
         assert_eq!(log.scroll_offset(), 6, "the push carried the view along");
         assert!(log.is_scrolled());
         // Not scrolled, the push leaves the offset alone.
         log.reset_scroll();
-        log.push(&component, 2, 320, &font());
+        log.push(&component, 2, 320, &font(), &LanguageTable::new());
         assert_eq!(log.scroll_offset(), 0);
         assert!(!log.is_scrolled());
+    }
+
+    /// The language table the translation pins resolve against: the chat keys
+    /// as the store's `en_US.lang` carries them (`:227-235`).
+    fn lang() -> LanguageTable {
+        LanguageTable::from_lang(
+            "chat.type.text=<%s> %s\n\
+             chat.type.announcement=[%s] %s\n\
+             multiplayer.player.joined=%s joined the game\n",
+        )
+    }
+
+    #[test]
+    fn the_language_table_reads_lang_lines() {
+        let table = LanguageTable::from_lang(
+            "# a comment\n\
+             \n\
+             chat.type.text=<%s> %s\n\
+             key.with=equals=in=value\r\n\
+             no_equals_line\n",
+        );
+        assert_eq!(table.get("chat.type.text"), Some("<%s> %s"));
+        assert_eq!(
+            table.get("key.with"),
+            Some("equals=in=value"),
+            "the split is at the first ="
+        );
+        assert_eq!(
+            table.get("no_equals_line"),
+            None,
+            "a line without = is skipped"
+        );
+        assert_eq!(table.get("missing"), None);
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_translation_component_resolves_to_its_template() {
+        // The wire shape a `/say` broadcast carries (`CommandBroadcast.java`:47;
+        // the serialisation at `IChatComponent.java`:227-249): the announcement
+        // key with the sender and the message as its args.
+        let component = parse_json(
+            "{\"translate\":\"chat.type.announcement\",\"with\":\
+             [{\"text\":\"OxideDev\",\"color\":\"red\"},{\"text\":\"clicked\"}]}",
+        );
+        let runs = flatten(&resolve(&component, &lang()));
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(text, "[OxideDev] clicked");
+        assert_eq!(
+            component.translate.as_ref().map(|pair| pair.key.as_str()),
+            Some("chat.type.announcement"),
+            "the pair is carried on the component"
+        );
+        // The template's literals and the args in the template's order; the
+        // sender keeps its own style — red at palette index 12.
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[0].text, "[");
+        assert_eq!(runs[1].text, "OxideDev");
+        assert_eq!(runs[1].colour, Some(12));
+        assert_eq!(runs[2].text, "] ");
+        assert_eq!(runs[3].text, "clicked");
+        assert_eq!(runs[3].colour, None);
+    }
+
+    #[test]
+    fn the_chat_template_substitutes_its_args_and_siblings() {
+        // Player chat (`NetHandlerPlayServer.java`:814) with an `extra`
+        // sibling: the source's order is the format pieces, then the
+        // component's own children (`ChatComponentTranslation.iterator`:185-189).
+        let component = parse_json(
+            "{\"translate\":\"chat.type.text\",\"with\":\
+             [{\"text\":\"OxideDev\",\"color\":\"red\"},{\"text\":\"hello from oxide\"}],\
+             \"extra\":[{\"text\":\"!\"}]}",
+        );
+        let runs = flatten(&resolve(&component, &lang()));
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(text, "<OxideDev> hello from oxide!");
+    }
+
+    #[test]
+    fn a_missing_key_renders_the_key_itself() {
+        // `StringTranslate.tryTranslateKey`:110-114 returns the key; the
+        // source then walks it as the template.
+        let component = parse_json("{\"translate\":\"chat.missing.key\"}");
+        let runs = flatten(&resolve(&component, &lang()));
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(text, "chat.missing.key", "the key itself, never empty");
+    }
+
+    #[test]
+    fn a_text_component_ignores_its_translate_payload() {
+        // The source's branch order: `text` wins (`IChatComponent.java`:104-126).
+        let component = parse_json(
+            "{\"text\":\"plain\",\"translate\":\"chat.type.text\",\"with\":[{\"text\":\"x\"}]}",
+        );
+        assert_eq!(line_text(&flatten(&resolve(&component, &lang()))), "plain");
+    }
+
+    #[test]
+    fn the_template_walk_takes_indexed_and_escaped_placeholders() {
+        let table = LanguageTable::from_lang("swapped=%2$s %1$s\npercent=100%% done\n");
+        let swapped =
+            parse_json("{\"translate\":\"swapped\",\"with\":[{\"text\":\"a\"},{\"text\":\"b\"}]}");
+        assert_eq!(
+            line_text(&flatten(&resolve(&swapped, &table))),
+            "b a",
+            "an indexed placeholder takes its own arg"
+        );
+        let percent = parse_json("{\"translate\":\"percent\"}");
+        assert_eq!(line_text(&flatten(&resolve(&percent, &table))), "100% done");
+    }
+
+    #[test]
+    fn an_unsubstitutable_template_degrades_to_the_key() {
+        // An arg index past the list and a specifier the source's pattern
+        // cannot take: the source throws
+        // (`ChatComponentTranslationFormatException`); the port degrades to
+        // the key itself, never a panic.
+        let short = parse_json("{\"translate\":\"chat.type.text\",\"with\":[{\"text\":\"only\"}]}");
+        assert_eq!(
+            line_text(&flatten(&resolve(&short, &lang()))),
+            "chat.type.text"
+        );
+        let table = LanguageTable::from_lang("bad.specifier=%d\ntrailing=100%\n");
+        let bad = parse_json("{\"translate\":\"bad.specifier\"}");
+        assert_eq!(line_text(&flatten(&resolve(&bad, &table))), "bad.specifier");
+        let trailing = parse_json("{\"translate\":\"trailing\"}");
+        assert_eq!(line_text(&flatten(&resolve(&trailing, &table))), "trailing");
+    }
+
+    #[test]
+    fn a_pushed_translation_component_yields_text_runs() {
+        // The scene-4 strip's own shape: a `/say` broadcast logged. Before the
+        // fix the log held a line whose runs were empty — the bar without its
+        // text; the pin: non-empty runs carrying the resolved string.
+        let component = parse_json(
+            "{\"translate\":\"chat.type.announcement\",\"with\":[{\"text\":\"Server\",\
+             \"color\":\"red\"},{\"text\":\"M4-CONSOLE-SAY hello from the console\"}]}",
+        );
+        let mut log = ChatLog::new();
+        log.push(&component, 5, 320, &font(), &lang());
+        let line = log.lines().front().expect("one line");
+        assert!(!line.runs.is_empty(), "the pushed line has text");
+        assert_eq!(
+            line_text(&line.runs),
+            "[Server] M4-CONSOLE-SAY hello from the console"
+        );
     }
 }

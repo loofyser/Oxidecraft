@@ -21,6 +21,7 @@ use oxide_assets::model::{BakedModel, BakedQuad, ModelError, ModelSource};
 use oxide_assets::resources::{ResourceError, TextureSet};
 use oxide_assets::store::{Store, StoreError};
 use oxide_assets::texture::Texture;
+use oxide_game::chat::LanguageTable;
 use oxide_game::mesher::{BlockModelSet, ModelChoice};
 use oxide_game::session::MeshAssets;
 use oxide_render::entity_models::{Vertices, objects};
@@ -44,6 +45,9 @@ const GRASS_COLORMAP: &str = "colormap/grass";
 const FOLIAGE_COLORMAP: &str = "colormap/foliage";
 /// The ascii font sheet's texture path.
 const FONT_SHEET: &str = "font/ascii";
+/// The language file's path below the extraction root: the client's own language
+/// table, which the chat path resolves translation components against.
+const LANG_FILE: &str = "assets/minecraft/lang/en_US.lang";
 /// The sun quad's texture path.
 const SUN: &str = "environment/sun";
 /// The moon phase sheet's texture path.
@@ -256,6 +260,14 @@ pub enum AssetError {
     /// The ascii font sheet could not be measured.
     #[error("the font sheet could not be measured: {0}")]
     Font(#[from] FontError),
+    /// The language file could not be read.
+    #[error("the language file {path} could not be read: {source}")]
+    Lang {
+        /// The file's path.
+        path: PathBuf,
+        /// The read error.
+        source: std::io::Error,
+    },
 }
 
 /// The assets one client run loads: what the session meshes with, the overlay's font,
@@ -269,6 +281,9 @@ pub struct ClientAssets {
     pub mesh: Arc<MeshAssets>,
     /// The ascii font measured from the sheet.
     pub font: Font,
+    /// The language table, from the extraction tree's `en_US.lang`: the chat path
+    /// resolves translation components against it.
+    pub lang: LanguageTable,
     /// The ascii font sheet itself, for the overlay's GPU upload.
     pub sheet: Texture,
     /// The sun, the moon phase sheet and the cloud layer.
@@ -319,6 +334,12 @@ impl ClientAssets {
         };
         let sheet = texture(&textures, FONT_SHEET)?.clone();
         let font = Font::load(&sheet, None)?;
+        let lang = LanguageTable::from_lang(
+            &std::fs::read_to_string(tree.join(LANG_FILE)).map_err(|source| AssetError::Lang {
+                path: tree.join(LANG_FILE),
+                source,
+            })?,
+        );
         let sky_textures = SkyTextures {
             sun: texture(&textures, SUN)?.clone(),
             moon_phases: texture(&textures, MOON_PHASES)?.clone(),
@@ -375,6 +396,7 @@ impl ClientAssets {
         Ok(ClientAssets {
             mesh,
             font,
+            lang,
             sheet,
             sky_textures,
             entity_textures,
