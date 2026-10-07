@@ -461,8 +461,11 @@ pub struct BlockBehaviour {
     /// (`block/Block.java:291-297`, read back by `isTranslucent()` at
     /// `:215-223`); one block overrides it — `BlockBarrier.java:16` sets it
     /// true, the tree's only override — so the barrier's behind-cell reads as
-    /// air's does. The field's only reader is the corner substitution
-    /// (`BlockModelRenderer.java:377-405`).
+    /// air's does. The corner substitution is the reader this row's field
+    /// serves (`BlockModelRenderer.java:377-405`); the source also reads the
+    /// field in `registerBlocks()`'s `useNeighborBrightness` bootstrap
+    /// (`Block.java`:1476, the loop `:1464-1485`), which this model reads
+    /// for the corner substitution only.
     pub translucent: bool,
     /// The block's material.
     pub material: Material,

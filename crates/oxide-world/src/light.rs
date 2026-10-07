@@ -116,9 +116,11 @@ pub fn light_at(world: &World, x: i32, y: i32, z: i32) -> u8 {
 /// `World.getLightBrightness` (`World.java:845-848`) looks up in the provider's table.
 ///
 /// The level is `World.getLightFromNeighbors`'s (`:621-624`), the combined light of
-/// `World.getLight` (`:626-679`). The neighbour-brightness term (`:630-657`) fires only for a
-/// block whose `getUseNeighborBrightness` is true, which nothing in the decompiled tree
-/// registers; the direct rule is the whole rule here: a y below zero answers zero (`:658-661`),
+/// `World.getLight` (`:626-679`). The neighbour-brightness term (`:630-657`) fires for blocks
+/// whose `getUseNeighborBrightness` is true — set by `Block.registerBlocks()`'s bootstrap
+/// loop (`Block.java`:1464-1485, live via `Bootstrap.java`:517) for stairs, slabs, farmland,
+/// translucent blocks and zero-light-opacity blocks. This model reads the direct rule only
+/// (the term is not modelled): a y below zero answers zero (`:658-661`),
 /// a y at or above the build height reads the topmost cell (`:662-670`), and the cell's own
 /// value is the sky kind's nibble against the block kind's, greater one wins
 /// (`Chunk.getLightSubtracted`, `Chunk.java:818-841`, with the day-night sky subtraction at
