@@ -4,9 +4,12 @@
 //! in physical pixels with `(0, 0)` at the window's top-left corner, and the pass draws it in
 //! a render pass with no depth attachment: the text is never hidden by the terrain, and wgpu
 //! rejects a pipeline with a depth state in such a pass, so the two cannot drift apart. The
-//! fragment stage multiplies the sampled sheet texel by the vertex colour and blends with the
-//! client's `src_alpha / one_minus_src_alpha` pair, so the sheet's transparent glyph margins
-//! draw nothing; the sheet is sampled nearest and clamp-to-edge, the GUI's own sampler.
+//! fragment stage multiplies the sampled sheet texel by the vertex colour and writes it
+//! straight through — no src-alpha blend — keeping the source's alpha test as a discard (its
+//! `GL_GREATER` 0.1 threshold, `EntityRenderer.java`:1168): the debug overlay's text runs
+//! unblended, the state the world's HUD leaves in force, and the death view's does the same
+//! (its gradient ends `disableBlend()`, `Gui.java`:114). The sheet is sampled nearest and
+//! clamp-to-edge, the GUI's own sampler.
 //!
 //! The pure layout — the quads, their shadow copies and the pen — lives in
 //! [`crate::debug_text`]. The pass draws nothing until [`OverlayPass::set_font`] gives it a
@@ -26,7 +29,9 @@ use crate::debug_text::{GlyphVertex, glyph_geometry};
 /// The overlay shader: map physical pixels to clip space through the orthographic projection,
 /// sample the font sheet and multiply the texel by the vertex colour.
 ///
-/// The sheet's alpha drives the blend, so a fully transparent texel leaves the frame alone.
+/// The fragment writes straight through and discards the fragments at or below the alpha
+/// test's 0.1 threshold, so a fully transparent texel leaves the frame alone and no
+/// full-cell quad paints.
 const SHADER: &str = r#"
 struct Overlay {
     ortho: mat4x4<f32>,
@@ -59,7 +64,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(font_texture, font_sampler, input.uv) * input.color;
+    let texel = textureSample(font_texture, font_sampler, input.uv) * input.color;
+    if (texel.a <= 0.1) {
+        discard;
+    }
+    return texel;
 }
 "#;
 
@@ -157,7 +166,8 @@ impl Geometry {
 
 /// The overlay pipeline and the text it draws.
 pub struct OverlayPass {
-    /// The pipeline: no depth state, no culling, the sheet sampled and blended.
+    /// The pipeline: no depth state, no culling, the sheet sampled and written straight
+    /// through.
     pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the orthographic projection.
     ortho_buffer: wgpu::Buffer,
@@ -179,9 +189,9 @@ impl OverlayPass {
     ///
     /// The pipeline has no depth-stencil state and no culling: it is meant for a pass that
     /// attaches only the colour target the terrain pass has just drawn into, so wgpu rejects
-    /// it in a pass that offers a depth attachment. Its fragment stage blends the sampled
-    /// sheet with `src_alpha / one_minus_src_alpha`, so a transparent glyph texel draws
-    /// nothing.
+    /// it in a pass that offers a depth attachment. Its fragment stage writes the sampled
+    /// sheet straight through and discards the fragments at or below the alpha test's 0.1
+    /// threshold, so a transparent glyph texel draws nothing.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide overlay shader"),
@@ -458,23 +468,12 @@ fn primitive_state() -> wgpu::PrimitiveState {
     }
 }
 
-/// The colour target for one attachment in `format`: the sheet's alpha blends over the frame
-/// with the client's own `src_alpha / one_minus_src_alpha` pair.
+/// The colour target for one attachment in `format`: no blend — the sheet writes straight
+/// through, the source's state for the debug overlay's glyph runs.
 fn color_target(format: wgpu::TextureFormat) -> Option<wgpu::ColorTargetState> {
     Some(wgpu::ColorTargetState {
         format,
-        blend: Some(wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        }),
+        blend: None,
         write_mask: wgpu::ColorWrites::ALL,
     })
 }
@@ -578,16 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn the_pipeline_culls_nothing_and_blends_the_sheet_over_the_frame() {
+    fn the_pipeline_culls_nothing_and_writes_the_sheet_straight_through() {
         let primitive = primitive_state();
         assert_eq!(primitive.topology, PrimitiveTopology::TriangleList);
         assert_eq!(primitive.cull_mode, None, "both windings draw");
         let target = color_target(TextureFormat::Rgba8Unorm).expect("a colour target");
-        let blend = target.blend.expect("the sheet blends over the frame");
-        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::SrcAlpha);
-        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
-        assert_eq!(blend.alpha.src_factor, wgpu::BlendFactor::SrcAlpha);
-        assert_eq!(blend.alpha.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
+        assert_eq!(
+            target.blend, None,
+            "the overlay's glyph runs draw unblended: the source's blend state"
+        );
     }
 
     #[test]

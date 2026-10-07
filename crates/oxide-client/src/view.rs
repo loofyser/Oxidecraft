@@ -1139,6 +1139,7 @@ impl ChatView {
             scale: 1.0,
             colour: [1.0, 1.0, 1.0, f32::from(alpha) / 255.0],
             shadow: false,
+            blend: true,
         });
     }
 
@@ -1169,6 +1170,7 @@ impl ChatView {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, f32::from(alpha) / 255.0],
                 shadow: true,
+                blend: true,
             });
         }
     }
@@ -1203,6 +1205,7 @@ impl ChatView {
                     scale: 1.0,
                     colour: INPUT_TEXT_COLOUR,
                     shadow: true,
+                    blend: true,
                 });
             }
             return;
@@ -1219,6 +1222,7 @@ impl ChatView {
                 scale: 1.0,
                 colour: INPUT_TEXT_COLOUR,
                 shadow: true,
+                blend: true,
             });
         }
         // `:571-582`: with the cursor at the text's end — or the field full, the
@@ -1236,6 +1240,7 @@ impl ChatView {
                     scale: 1.0,
                     colour: INPUT_TEXT_COLOUR,
                     shadow: true,
+                    blend: true,
                 });
             }
             if input.cursor_visible() {
@@ -1255,6 +1260,7 @@ impl ChatView {
                 scale: 1.0,
                 colour: INPUT_TEXT_COLOUR,
                 shadow: true,
+                blend: true,
             });
         }
     }
@@ -1349,6 +1355,7 @@ impl ChatView {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, 1.0],
                 shadow: true,
+                blend: true,
             });
             if index == 0 {
                 ty += 2.0;
@@ -1385,6 +1392,7 @@ impl ChatView {
             scale: 1.0,
             colour: [1.0, 1.0, 1.0, 1.0],
             shadow: true,
+            blend: true,
         });
         // The URL, wrapped at `width - 50` and centred the same way, stepping a
         // font line per line (`GuiYesNo.drawScreen`:73-79, the source's
@@ -1407,6 +1415,7 @@ impl ChatView {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, 1.0],
                 shadow: true,
+                blend: true,
             });
             y += font.height() as f32;
         }
@@ -1772,6 +1781,7 @@ fn score_text_draws(points: i32, right: i32, y: i32, font: &Font, draws: &mut Ve
         colour: TAB_TEXT,
         shadow: true,
         text,
+        blend: true,
     });
 }
 
@@ -1826,6 +1836,7 @@ fn heart_draws(points: i32, left: i32, right: i32, y: i32, font: &Font, draws: &
             colour: [red, green, 0.0, 1.0],
             shadow: true,
             text,
+            blend: true,
         });
     }
 }
@@ -1986,6 +1997,8 @@ impl TabState {
                 height: (height + 1) as f32,
                 colour: TAB_PANEL,
             });
+            // The header's lines follow their own rect: blend stays off
+            // (`GuiPlayerTabOverlay.java`:147-152).
             for (index, line) in lines.iter().enumerate() {
                 draws.push(HudDraw::Text {
                     text: line.clone(),
@@ -1994,6 +2007,7 @@ impl TabState {
                     scale: 1.0,
                     colour: TAB_TEXT,
                     shadow: true,
+                    blend: false,
                 });
             }
             top += height + 1;
@@ -2058,6 +2072,7 @@ impl TabState {
                 scale: 1.0,
                 colour,
                 shadow: true,
+                blend: true,
             });
             if let Some(objective) = objective {
                 if !spectator {
@@ -2095,6 +2110,8 @@ impl TabState {
                 height: (height + 1) as f32,
                 colour: TAB_PANEL,
             });
+            // The footer's lines follow their own rect too
+            // (`GuiPlayerTabOverlay.java`:226-231).
             for (index, line) in lines.iter().enumerate() {
                 draws.push(HudDraw::Text {
                     text: line.clone(),
@@ -2103,6 +2120,7 @@ impl TabState {
                     scale: 1.0,
                     colour: TAB_TEXT,
                     shadow: true,
+                    blend: false,
                 });
             }
         }
@@ -2317,6 +2335,9 @@ pub fn sidebar_draws(
             height: SIDEBAR_ROW_PITCH as f32,
             colour: SIDEBAR_BAND,
         });
+        // The scoreboard's glyph runs draw unblended: the row rects end
+        // `disableBlend()` (`Gui.java`:82-83) and `renderScoreboard` never re-enables it
+        // (`GuiIngame.java`:551-607).
         draws.push(HudDraw::Text {
             text: format_entry(board, entry, entry),
             x: left as f32,
@@ -2324,11 +2345,13 @@ pub fn sidebar_draws(
             scale: 1.0,
             colour: SIDEBAR_TEXT,
             shadow: false,
+            blend: false,
         });
         // The number is the red one unconditionally (`:577`, `:592`): no
         // render-kind branch lives in the sidebar — the kind's own branch is
         // the tab list's (`GuiPlayerTabOverlay.drawScoreboardValues:278-362`).
         let number = format!("§c{points}");
+        // Unblended like the name: the digit's core draws pure `§c` red.
         draws.push(HudDraw::Text {
             x: (right - string_width(font, &number)) as f32,
             y: top as f32,
@@ -2336,6 +2359,7 @@ pub fn sidebar_draws(
             colour: SIDEBAR_TEXT,
             shadow: false,
             text: number,
+            blend: false,
         });
         // The title band draws in the last row's own iteration (`:599-605`):
         // the band above the row, its one-pixel separator, then the title,
@@ -2355,6 +2379,7 @@ pub fn sidebar_draws(
                 height: 1.0,
                 colour: SIDEBAR_BAND,
             });
+            // Unblended, the same run (the title draws in the top row's iteration).
             draws.push(HudDraw::Text {
                 text: title.to_owned(),
                 x: (left + widest / 2 - string_width(font, title) / 2) as f32,
@@ -2362,6 +2387,7 @@ pub fn sidebar_draws(
                 scale: 1.0,
                 colour: SIDEBAR_TEXT,
                 shadow: false,
+                blend: false,
             });
         }
     }
@@ -4139,7 +4165,16 @@ mod tests {
                 scale,
                 colour,
                 shadow,
+                ..
             } => (text.clone(), *x, *y, *scale, *colour, *shadow),
+            other => panic!("a text draw: {other:?}"),
+        }
+    }
+
+    /// A text draw's blend marker, for the pins.
+    fn text_blend(draw: &HudDraw) -> bool {
+        match draw {
+            HudDraw::Text { blend, .. } => *blend,
             other => panic!("a text draw: {other:?}"),
         }
     }
@@ -4754,6 +4789,7 @@ mod tests {
                     scale: 1.0,
                     colour: [1.0, 1.0, 1.0, 1.0],
                     shadow: true,
+                    blend: true,
                 },
             ],
             "the closed field, no tooltip, no overlay: the old draws, byte for byte"
@@ -5516,6 +5552,55 @@ mod tests {
             .map(|row| chat_text(&draws[1 + 3 * row]).0)
             .collect();
         assert_eq!(top_down, ["Zed", "Alice", "Bob", "Ann"], "top-to-bottom");
+    }
+
+    /// The unblended glyph runs carry their marker with the source's values kept: the
+    /// scoreboard's rects leave blend off (`Gui.java`:82-83) and `renderScoreboard` never
+    /// re-enables it (`GuiIngame.java`:551-607), so its name, number and title draws run
+    /// unblended; the tab list's header and footer lines follow their own rects
+    /// (`GuiPlayerTabOverlay.java`:147-152, `:226-231`); its row text and the chat stay
+    /// blended (`:170-173`, `GuiNewChat.java`:84).
+    #[test]
+    fn the_unblended_glyph_runs_carry_their_marker() {
+        let font = chat_font();
+        // The sidebar: one entry plus the title band, so every run draws.
+        let mut board = Scoreboard::new();
+        board.set_objective("demo", "Demo", "integer");
+        board.set_display(1, Some("demo"));
+        board.set_score("AA", "demo", 7);
+        let draws = sidebar_draws(&board, "Alpha", &font, chat_resolution());
+        assert_eq!(chat_text(&draws[1]).0, "AA", "the name");
+        assert!(!text_blend(&draws[1]), "the name's run is unblended");
+        assert_eq!(chat_text(&draws[2]).0, "§c7", "the number");
+        assert_eq!(chat_text(&draws[2]).4, SIDEBAR_TEXT, "its colour kept");
+        assert!(!text_blend(&draws[2]), "the number's run is unblended");
+        assert_eq!(chat_text(&draws[5]).0, "Demo", "the title");
+        assert_eq!(chat_text(&draws[5]).4, SIDEBAR_TEXT, "its colour kept");
+        assert!(!text_blend(&draws[5]), "the title's run is unblended");
+        // The tab list: the header and footer lines follow their rects; a row's name
+        // keeps the blend its row loop enabled.
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA"); 3];
+        tab.header = "{\"text\":\"hi\"}".to_owned();
+        tab.footer = "{\"text\":\"bye\"}".to_owned();
+        let tab_draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        assert_eq!(chat_text(&tab_draws[1]).0, "hi§r", "the header line");
+        assert!(!text_blend(&tab_draws[1]), "the header line is unblended");
+        assert_eq!(chat_text(&tab_draws[19]).0, "bye§r", "the footer line");
+        assert!(!text_blend(&tab_draws[19]), "the footer line is unblended");
+        let name = tab_draws
+            .iter()
+            .find(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "AAAA"))
+            .expect("the row's name draw");
+        assert!(text_blend(name), "the row's name keeps the blend");
+        // The chat: the log re-enables blend around its own text (`GuiNewChat.java`:84).
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        chat.observe("\"A\"", 1, 1_000);
+        let line_draws = chat_draws(&mut chat, 1_000);
+        assert_eq!(chat_text(&line_draws[1]).0, "A§r");
+        assert!(text_blend(&line_draws[1]), "the chat line stays blended");
     }
 
     #[test]

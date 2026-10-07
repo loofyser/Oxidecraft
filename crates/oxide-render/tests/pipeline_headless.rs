@@ -235,6 +235,54 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
     assert!(painted > 0, "the overlay left no pixels in the top-left");
 }
 
+/// The overlay pass discards the sheet's below-threshold texels: the source's alpha test
+/// is kept as a discard (`GL_GREATER` 0.1, `EntityRenderer.java`:1168), so a fragment
+/// whose modulated alpha is at or below the threshold draws nothing — the sheet's faint
+/// texels and its transparent margins leave the frame alone, where a blended pass would
+/// faintly tint the frame and an unblended pass without the test would paint it.
+///
+/// The fixture: the `|` cell's first column at full coverage, its second at 20/255
+/// (below the 0.1 threshold) and its third at 78/255 (above it). The scale is two and
+/// the margin four, so the cell's columns ink physical x 4-5, x 6-7 and x 8-9; the
+/// shadow copies sit two pixels down and right, below y 6, so the assertions stay
+/// clear of them.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_overlay_pass_discards_the_below_threshold_texels() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut overlay = OverlayPass::new(&device, format);
+    overlay.set_size(&queue, SIZE as f32, SIZE as f32);
+    overlay
+        .set_font(&device, &queue, &faint_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    overlay.upload_text(&device, &queue, &["|".to_string()]);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide pipeline headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| overlay.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The full-coverage column writes straight through: exact white.
+    expect_pixel_exact(&pixels, 4, 4, TEXT, "the full-coverage column");
+    expect_pixel_exact(&pixels, 5, 19, TEXT, "its last row");
+    // The below-threshold column draws nothing: the sky stays.
+    expect_pixel_exact(&pixels, 6, 4, SKY, "the below-threshold column");
+    expect_pixel_exact(&pixels, 7, 5, SKY, "its second row");
+    // The above-threshold column draws (its 78/255 is over the 0.1 test): exact white.
+    expect_pixel_exact(&pixels, 8, 4, TEXT, "the above-threshold column");
+    expect_pixel_exact(&pixels, 9, 5, TEXT, "its second row");
+    // The cell's transparent remainder and the frame around it stay sky too.
+    expect_pixel_exact(&pixels, 10, 4, SKY, "the transparent remainder");
+    expect_pixel_exact(&pixels, 20, 4, SKY, "right of the cell");
+    expect_pixel_exact(&pixels, 0, 0, SKY, "the corner above the text");
+}
+
 /// The synthetic overlay font sheet: a 128x128 grid whose `|` cell inks only its first column,
 /// so the glyph's advance is two font pixels and its ink and shadow land on known pixels.
 ///
@@ -250,6 +298,32 @@ fn overlay_font_sheet() -> Texture {
     for row in 0..CELL {
         let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
         rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The synthetic sheet for the discard case: the `|` cell's first column at full
+/// coverage, its second at 20/255 (below the alpha test's 0.1 threshold) and its
+/// third at 78/255 (above it), so the threshold is pinned from both sides.
+///
+/// Generated here; no asset store is read and no Mojang pixel is embedded.
+fn faint_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    // '|' is code 124: column 12, row 7 of the grid.
+    let code = '|' as u32;
+    let cell_x = (code % 16) * CELL;
+    let cell_y = (code / 16) * CELL;
+    for row in 0..CELL {
+        let at = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+        rgba[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+        rgba[at + 4..at + 8].copy_from_slice(&[255, 255, 255, 20]);
+        rgba[at + 8..at + 12].copy_from_slice(&[255, 255, 255, 78]);
     }
     Texture {
         width: SIDE,
@@ -5146,25 +5220,6 @@ fn sidebar_band_over_sky(band_alpha: u8) -> [u8; 3] {
     bar_over_sky(band_alpha)
 }
 
-/// The blend of one sidebar text pass over `band`: the draw's white at the assembly's
-/// 32/255 (`view.rs:2157`) — a `§` run keeps the draw's alpha (`text.rs:230-235`).
-fn sidebar_text_over(band: [u8; 3]) -> [u8; 3] {
-    let alpha = 32.0 / 255.0;
-    std::array::from_fn(|channel| {
-        (f32::from(band[channel]) * (1.0 - alpha) + 255.0 * alpha).round() as u8
-    })
-}
-
-/// The blend of the sidebar's red number over `band`: its `§c` run's (255, 85, 85) at the
-/// draw's 32/255 (`text.rs:82-85`, the code table's twelfth entry).
-fn sidebar_red_over(band: [u8; 3]) -> [u8; 3] {
-    let alpha = 32.0 / 255.0;
-    let source = [255.0_f32, 85.0, 85.0];
-    std::array::from_fn(|channel| {
-        (f32::from(band[channel]) * (1.0 - alpha) + source[channel] * alpha).round() as u8
-    })
-}
-
 /// The hud draws a chat line's shape over the cleared frame: a black bar at the line's
 /// fade alpha and its shadowed text, at the GUI coordinates the chat assembly lays out.
 ///
@@ -5211,6 +5266,7 @@ fn the_hud_pass_draws_a_chat_line() {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, 1.0],
                 shadow: true,
+                blend: true,
             },
         ],
         &skins,
@@ -5371,6 +5427,7 @@ fn the_hud_pass_draws_the_input_line_and_cursor() {
                 scale: 1.0,
                 colour: [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0],
                 shadow: true,
+                blend: true,
             },
             HudDraw::Rect {
                 x: 5.0,
@@ -5488,6 +5545,7 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
         scale: 1.0,
         colour: [1.0, 1.0, 1.0, 1.0],
         shadow: true,
+        blend: true,
     };
 
     let skins = TextureRegistry::new(&device, &queue);
@@ -5650,6 +5708,7 @@ fn the_hud_pass_draws_the_tab_list() {
                 scale: 1.0,
                 colour: tint,
                 shadow: true,
+                blend: true,
             },
             // The grid's panel.
             HudDraw::Rect {
@@ -5693,6 +5752,7 @@ fn the_hud_pass_draws_the_tab_list() {
                 scale: 1.0,
                 colour: tint,
                 shadow: true,
+                blend: true,
             },
             HudDraw::Text {
                 text: "§e|".to_string(),
@@ -5701,6 +5761,7 @@ fn the_hud_pass_draws_the_tab_list() {
                 scale: 1.0,
                 colour: tint,
                 shadow: true,
+                blend: true,
             },
             HudDraw::TexturedRect {
                 texture: HudTexture::Named("gui/icons"),
@@ -5744,6 +5805,7 @@ fn the_hud_pass_draws_the_tab_list() {
                 scale: 1.0,
                 colour: tint,
                 shadow: true,
+                blend: true,
             },
             HudDraw::TexturedRect {
                 texture: HudTexture::Named("gui/icons"),
@@ -5769,6 +5831,7 @@ fn the_hud_pass_draws_the_tab_list() {
                 scale: 1.0,
                 colour: tint,
                 shadow: true,
+                blend: true,
             },
         ],
         &skins,
@@ -5886,9 +5949,9 @@ fn the_hud_pass_draws_the_tab_list() {
 /// The count: the three row bands and the title band are 24x9 each and the separator
 /// 24x1 — 4 * 216 + 24 = 888 non-sky pixels, the inks inside them.
 ///
-/// The pinning run measured the blends byte for byte: the row band [108, 133, 172], the
-/// title band [99, 121, 156], the number's ink [126, 127, 161], the title's ink
-/// [119, 138, 168], and the 888 lit pixels.
+/// The pinning run measured the unblended values byte for byte: the row band
+/// [108, 133, 172], the title band [99, 121, 156], the number's ink [255, 85, 85], the
+/// name and title inks [255, 255, 255], and the 888 lit pixels.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn the_hud_pass_draws_the_scoreboard_sidebar() {
@@ -5918,6 +5981,7 @@ fn the_hud_pass_draws_the_scoreboard_sidebar() {
         scale: 1.0,
         colour: text,
         shadow: false,
+        blend: false,
     };
     let skins = TextureRegistry::new(&device, &queue);
     hud.set_draws(
@@ -5990,27 +6054,15 @@ fn the_hud_pass_draws_the_scoreboard_sidebar() {
     );
     // (2) The red number's ink: the `§c` run over the band, one glyph column, from its
     // first row to its last.
-    expect_pixel(
-        &pixels,
-        61,
-        23,
-        sidebar_red_over(sidebar_band_over_sky(80)),
-        "the red number's first row",
-    );
-    expect_pixel(
-        &pixels,
-        61,
-        25,
-        sidebar_red_over(sidebar_band_over_sky(80)),
-        "the red number's ink",
-    );
-    expect_pixel(
-        &pixels,
-        61,
-        30,
-        sidebar_red_over(sidebar_band_over_sky(80)),
-        "the red number's last row",
-    );
+    expect_pixel_exact(&pixels, 61, 23, [255, 85, 85], "the red number's first row");
+    expect_pixel_exact(&pixels, 61, 25, [255, 85, 85], "the red number's ink");
+    expect_pixel_exact(&pixels, 61, 30, [255, 85, 85], "the red number's last row");
+    // (2b) The names' ink: white at the text column, unblended like the number.
+    expect_pixel_exact(&pixels, 41, 32, TEXT, "the bottom name's first row");
+    expect_pixel_exact(&pixels, 41, 36, TEXT, "the bottom name's ink");
+    expect_pixel_exact(&pixels, 41, 39, TEXT, "the bottom name's last row");
+    expect_pixel_exact(&pixels, 41, 23, TEXT, "the middle name's ink");
+    expect_pixel_exact(&pixels, 41, 14, TEXT, "the top name's ink");
     // (3) Right-aligned: the ink's column is the row's right edge minus its width
     // (63 - 2 = 61); the band is bare on either side and below the ink.
     expect_pixel(
@@ -6036,13 +6088,7 @@ fn the_hud_pass_draws_the_scoreboard_sidebar() {
     );
     // (4) The title: its ink at the centred column, the title band bare at the margin
     // and at the separator's own row.
-    expect_pixel(
-        &pixels,
-        50,
-        8,
-        sidebar_text_over(sidebar_band_over_sky(96)),
-        "the title's ink",
-    );
+    expect_pixel_exact(&pixels, 50, 8, TEXT, "the title's ink");
     expect_pixel(
         &pixels,
         42,

@@ -1,10 +1,14 @@
 //! The hud pass: the frame's GUI-space draw list, at the source's scaled resolution.
 //!
 //! The pass owns the scaled resolution (`ScaledResolution.java`:14-41), the vertex
-//! buffers a frame's [`HudDraw`] list builds, and the pipeline that draws them into the
+//! buffers a frame's [`HudDraw`] list builds, and the pipelines that draw them into the
 //! overlay's own pass — no depth attachment, alpha blended `src_alpha` over
-//! `one_minus_src_alpha`, exactly [`crate::overlay`]'s state, so the frame invokes the
-//! pass after the dim and before the debug overlay.
+//! `one_minus_src_alpha` for its general primitives, with a second, unblended pipeline
+//! for the glyph runs the source draws with blend off ([`HudDraw::Text`]'s `blend`): the
+//! source's `drawString` never enables blend, so a run inherits the last state change —
+//! the scoreboard's rects leave it off (`Gui.java`:82-83) while the chat enables it
+//! around its own text (`GuiNewChat.java`:84). The frame invokes the pass after the dim
+//! and before the debug overlay.
 //!
 //! The scale rule: the factor grows while one more step would keep `320x240` GUI pixels
 //! on both axes (`ScaledResolution.java`:27-30) — the auto scale a zero gui-scale
@@ -32,9 +36,13 @@ use crate::text::{TextBuilder, TextVertex, string_width};
 /// The hud shader: map scaled GUI pixels to clip space through the orthographic
 /// projection, sample the bound texture and multiply the texel by the vertex colour.
 ///
-/// One pipeline serves every primitive: a solid rect samples the one-texel white
-/// texture, so its fragment is exactly its colour, and a glyph's texel alpha drives the
-/// blend, so a fully transparent texel leaves the frame alone.
+/// Two entry points: `fs_main` serves the blended pipeline — a solid rect samples the
+/// one-texel white texture, so its fragment is exactly its colour, and a glyph's texel
+/// alpha drives the blend, so a fully transparent texel leaves the frame alone — and
+/// `fs_main_opaque` serves the unblended pipeline, where the source's alpha test is kept
+/// as a discard (its `GL_GREATER` 0.1 threshold, `EntityRenderer.java`:1168): a fragment
+/// at or below the threshold draws nothing, so a glyph keeps its shape and no full-cell
+/// quad paints.
 const SHADER: &str = r#"
 struct Hud {
     ortho: mat4x4<f32>,
@@ -68,6 +76,15 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(hud_texture, hud_sampler, input.uv) * input.color;
+}
+
+@fragment
+fn fs_main_opaque(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(hud_texture, hud_sampler, input.uv) * input.color;
+    if (texel.a <= 0.1) {
+        discard;
+    }
+    return texel;
 }
 "#;
 
@@ -200,6 +217,7 @@ pub fn boss_bar_draws(
             scale: 1.0,
             colour: [1.0, 1.0, 1.0, 1.0],
             shadow: true,
+            blend: true,
         });
     }
     draws
@@ -288,6 +306,13 @@ pub enum HudDraw {
         colour: [f32; 4],
         /// Whether the darkened shadow copy draws under the text.
         shadow: bool,
+        /// Whether the draw runs through the pass's `src_alpha` blend. The source's own
+        /// blend state at the draw site: `drawString` never enables blend
+        /// (`FontRenderer.java`:343 enables only the alpha test), so a glyph run inherits
+        /// whatever the last state change left — the scoreboard's rects leave it off
+        /// (`Gui.java`:82-83) while the chat enables it around its own text
+        /// (`GuiNewChat.java`:84).
+        blend: bool,
     },
 }
 
@@ -336,6 +361,9 @@ enum BatchTexture {
 struct Batch {
     /// The texture the run samples.
     texture: BatchTexture,
+    /// Whether the run draws through the blended pipeline; the key's second half, so a
+    /// run that changes blend state opens its own batch.
+    blend: bool,
     /// The run's index range into the shared index buffer.
     indices: std::ops::Range<u32>,
 }
@@ -356,19 +384,25 @@ struct BuiltGeometry {
 ///
 /// `font` is the measured font and sheet size the text draws lay out against; a text
 /// draw without one contributes nothing, like the overlay before its sheet. Consecutive
-/// draws that sample the same texture share one batch, and the batches stay in draw
-/// order, so the painter's order survives the batching.
+/// draws that sample the same texture in the same blend state share one batch, and the
+/// batches stay in draw order, so the painter's order survives the batching.
 fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry {
     let mut built = BuiltGeometry::default();
     for draw in draws {
-        let texture = match draw {
-            HudDraw::Rect { .. } => BatchTexture::White,
-            HudDraw::TexturedRect { texture, .. } => match texture {
-                HudTexture::Named(name) => BatchTexture::Named(name),
-                HudTexture::Atlas => BatchTexture::Atlas,
-            },
-            HudDraw::SkinRect { texture, .. } => BatchTexture::Skin(*texture),
-            HudDraw::Text { .. } => BatchTexture::Font,
+        // The batch key: the texture the run samples and its blend state. Every
+        // primitive but the text draws blends (`drawRect` and its siblings enable it for
+        // their own fill); a text draw carries the state its source path left in force.
+        let (texture, blend) = match draw {
+            HudDraw::Rect { .. } => (BatchTexture::White, true),
+            HudDraw::TexturedRect { texture, .. } => (
+                match texture {
+                    HudTexture::Named(name) => BatchTexture::Named(name),
+                    HudTexture::Atlas => BatchTexture::Atlas,
+                },
+                true,
+            ),
+            HudDraw::SkinRect { texture, .. } => (BatchTexture::Skin(*texture), true),
+            HudDraw::Text { blend, .. } => (BatchTexture::Font, *blend),
         };
         match draw {
             HudDraw::Rect {
@@ -378,7 +412,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 height,
                 colour,
             } => {
-                open_batch(&mut built, texture);
+                open_batch(&mut built, texture, blend);
                 push_quad(&mut built, (*x, *y), (*width, *height), WHITE_UV, *colour);
             }
             HudDraw::TexturedRect {
@@ -390,7 +424,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 colour,
                 ..
             } => {
-                open_batch(&mut built, texture);
+                open_batch(&mut built, texture, blend);
                 push_quad(&mut built, (*x, *y), (*width, *height), *uv, *colour);
             }
             HudDraw::SkinRect {
@@ -402,7 +436,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 colour,
                 ..
             } => {
-                open_batch(&mut built, texture);
+                open_batch(&mut built, texture, blend);
                 push_quad(&mut built, (*x, *y), (*width, *height), *uv, *colour);
             }
             HudDraw::Text {
@@ -412,11 +446,12 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 scale,
                 colour,
                 shadow,
+                ..
             } => {
                 let Some((font, sheet)) = font else {
                     continue;
                 };
-                open_batch(&mut built, texture);
+                open_batch(&mut built, texture, blend);
                 let mut builder = TextBuilder::new();
                 builder.push(text, [*x, *y, 0.0], *scale, *colour, *shadow);
                 let (vertices, indices) = builder.geometry(font, sheet);
@@ -432,12 +467,19 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
     built
 }
 
-/// Opens the batch `texture`'s next draws belong to: the last one when it samples the
-/// same texture, a new one otherwise, and returns its position.
-fn open_batch(built: &mut BuiltGeometry, texture: BatchTexture) -> usize {
-    if built.batches.last().map(|batch| batch.texture) != Some(texture) {
+/// Opens the batch `texture` and `blend`'s next draws belong to: the last one when it
+/// samples the same texture in the same blend state, a new one otherwise, and returns
+/// its position.
+fn open_batch(built: &mut BuiltGeometry, texture: BatchTexture, blend: bool) -> usize {
+    if built
+        .batches
+        .last()
+        .map(|batch| (batch.texture, batch.blend))
+        != Some((texture, blend))
+    {
         built.batches.push(Batch {
             texture,
+            blend,
             indices: built.indices.len() as u32..0,
         });
     }
@@ -542,6 +584,9 @@ impl Geometry {
 pub struct HudPass {
     /// The pipeline: GUI-space triangles, sampled texel times vertex colour.
     pipeline: wgpu::RenderPipeline,
+    /// The unblended pipeline: the same vertex stage with `fs_main_opaque` and no blend
+    /// state, for the glyph runs the source draws with blend off.
+    opaque_pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the scaled-resolution orthographic projection.
     ortho_buffer: wgpu::Buffer,
     /// The bind group the pipeline reads the projection through.
@@ -579,11 +624,13 @@ pub struct HudPass {
 impl HudPass {
     /// Builds the pipeline for colour attachments in `format`.
     ///
-    /// The pipeline has no depth-stencil state and no culling: it is meant for the
+    /// The pipelines have no depth-stencil state and no culling: they are meant for the
     /// pass that attaches only the colour target the terrain pass has just drawn into,
-    /// so wgpu rejects it in a pass that offers a depth attachment. Its fragment stage
-    /// blends the sampled texel with `src_alpha / one_minus_src_alpha`, the client's
-    /// own pair.
+    /// so wgpu rejects them in a pass that offers a depth attachment. The blended
+    /// pipeline's fragment stage blends the sampled texel with
+    /// `src_alpha / one_minus_src_alpha`, the client's own pair; the unblended one
+    /// writes the texel straight through, with the alpha test's discard for the glyph
+    /// runs the source draws with blend off.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide hud shader"),
@@ -659,7 +706,29 @@ impl HudPass {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[color_target(format)],
+                targets: &[color_target(format, Some(src_alpha_blend()))],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let opaque_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("oxide hud opaque pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[vertex_layout()],
+            },
+            primitive: primitive_state(),
+            // No depth state: the hud draws in a pass with no depth attachment.
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main_opaque"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[color_target(format, None)],
             }),
             multiview: None,
             cache: None,
@@ -681,6 +750,7 @@ impl HudPass {
         });
         Self {
             pipeline,
+            opaque_pipeline,
             ortho_buffer,
             ortho_bind_group,
             texture_layout,
@@ -991,8 +1061,8 @@ impl HudPass {
         self.boss_geometry.store(device, queue, built);
     }
 
-    /// Draws one uploaded list: the pipeline, the projection and one bind group per batch;
-    /// a batch whose texture was never set is skipped.
+    /// Draws one uploaded list: the batch's pipeline, the projection and one bind group
+    /// per batch; a batch whose texture was never set is skipped.
     fn draw_geometry(&self, pass: &mut wgpu::RenderPass<'_>, geometry: &Geometry) {
         let (Some(vertex_buffer), Some(index_buffer)) = (
             geometry.vertex_buffer.as_ref(),
@@ -1007,7 +1077,16 @@ impl HudPass {
         pass.set_bind_group(0, &self.ortho_bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        let mut blended = true;
         for batch in &geometry.batches {
+            if batch.blend != blended {
+                pass.set_pipeline(if batch.blend {
+                    &self.pipeline
+                } else {
+                    &self.opaque_pipeline
+                });
+                blended = batch.blend;
+            }
             let bind = match batch.texture {
                 BatchTexture::White => &self.white_bind,
                 BatchTexture::Font => match &self.font {
@@ -1105,23 +1184,32 @@ fn primitive_state() -> wgpu::PrimitiveState {
     }
 }
 
+/// The client's own blend pair: `src_alpha` over `one_minus_src_alpha`.
+fn src_alpha_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
 /// The colour target for one attachment in `format`: the fragment's alpha blends over
-/// the frame with the client's own `src_alpha / one_minus_src_alpha` pair.
-fn color_target(format: wgpu::TextureFormat) -> Option<wgpu::ColorTargetState> {
+/// the frame with the client's own `src_alpha / one_minus_src_alpha` pair when `blend`
+/// is set, and writes straight through when it is not (the unblended glyph runs).
+fn color_target(
+    format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+) -> Option<wgpu::ColorTargetState> {
     Some(wgpu::ColorTargetState {
         format,
-        blend: Some(wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        }),
+        blend,
         write_mask: wgpu::ColorWrites::ALL,
     })
 }
@@ -1283,6 +1371,7 @@ mod tests {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, 1.0],
                 shadow: true,
+                blend: true,
             }
         );
     }
@@ -1393,6 +1482,7 @@ mod tests {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, 1.0],
                 shadow: true,
+                blend: true,
             },
         ];
         let built = build(&draws, Some((&font, (128, 128))));
@@ -1405,10 +1495,12 @@ mod tests {
             vec![
                 Batch {
                     texture: BatchTexture::White,
+                    blend: true,
                     indices: 0..6,
                 },
                 Batch {
                     texture: BatchTexture::Font,
+                    blend: true,
                     indices: 6..18,
                 },
             ]
@@ -1440,6 +1532,51 @@ mod tests {
     }
 
     #[test]
+    fn a_glyph_run_that_leaves_blend_opens_its_own_batch() {
+        let font = font();
+        // Two text draws over the same sheet: the second carries the unblended marker
+        // (the source's scoreboard state), so the batch key splits on it even though
+        // the texture is one.
+        let draws = [
+            HudDraw::Text {
+                text: "A".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: false,
+                blend: true,
+            },
+            HudDraw::Text {
+                text: "A".to_owned(),
+                x: 0.0,
+                y: 8.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: false,
+                blend: false,
+            },
+        ];
+        let built = build(&draws, Some((&font, (128, 128))));
+        assert_eq!(
+            built.batches,
+            vec![
+                Batch {
+                    texture: BatchTexture::Font,
+                    blend: true,
+                    indices: 0..6,
+                },
+                Batch {
+                    texture: BatchTexture::Font,
+                    blend: false,
+                    indices: 6..12,
+                },
+            ],
+            "the marker splits the run: one batch per blend state"
+        );
+    }
+
+    #[test]
     fn a_text_draw_without_a_font_contributes_nothing() {
         let draws = [
             HudDraw::Rect {
@@ -1456,6 +1593,7 @@ mod tests {
                 scale: 1.0,
                 colour: [1.0, 1.0, 1.0, 1.0],
                 shadow: false,
+                blend: true,
             },
         ];
         let built = build(&draws, None);
