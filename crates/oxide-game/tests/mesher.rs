@@ -35,6 +35,7 @@ const TALLGRASS: u16 = 31;
 const SPAWNER: u16 = 52;
 const STAIRS: u16 = 67;
 const GLOWSTONE: u16 = 89;
+const SNOW_LAYER: u16 = 78;
 
 /// One state mapper arm's expectation: the block id, the metadata value, and
 /// the literal `(file, key)` the mapper must answer — `None` for the five ids
@@ -445,6 +446,30 @@ fn probe_tree() -> Tree {
         r#"{"variants": {
             "normal": [{"model": "minecraft:probe_cube", "weight": 0},
                        {"model": "minecraft:probe_double", "weight": 0}]
+        }}"#,
+    );
+
+    // The snow layer's thin slab, the snow_height2 model's own element: 2/16
+    // high, the down and up faces on the sprite's full rect and the sides on
+    // its bottom band, each culled against its own side (the up face is not).
+    // `layers=1` names it in the real blockstate file; `layers=8` names the
+    // full cube model.
+    tree.model(
+        "probe_snow",
+        r##"{"textures": {"all": "blocks/probe"}, "elements": [
+            {"from": [0, 0, 0], "to": [16, 2, 16], "faces": {
+                "down": {"uv": [0, 0, 16, 16], "texture": "#all", "cullface": "down"},
+                "up": {"uv": [0, 0, 16, 16], "texture": "#all"},
+                "north": {"uv": [0, 14, 16, 16], "texture": "#all", "cullface": "north"},
+                "south": {"uv": [0, 14, 16, 16], "texture": "#all", "cullface": "south"},
+                "west": {"uv": [0, 14, 16, 16], "texture": "#all", "cullface": "west"},
+                "east": {"uv": [0, 14, 16, 16], "texture": "#all", "cullface": "east"}}}]}"##,
+    );
+    tree.blockstates(
+        "snow_layer",
+        r#"{"variants": {
+            "layers=1": [{"model": "minecraft:probe_snow"}],
+            "layers=8": [{"model": "minecraft:probe_cube"}]
         }}"#,
     );
     tree
@@ -1330,6 +1355,91 @@ fn an_unresolved_state_draws_the_fallback_cube() {
 }
 
 #[test]
+fn a_covered_snow_layer_draws_its_thin_slab() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+
+    // One layer (meta 0, `layers=1`) at (0, 64, 2): the slab's own six faces,
+    // the down and up faces on the sprite's full rect and the sides reading
+    // its bottom band — 14/16 through the top, the snow_height2 model's own
+    // uv. The fallback cube would draw six full-height faces over the
+    // missingno sprite instead.
+    let world = daylight(&[(0, 64, 2, state(SNOW_LAYER, 0))]);
+    let mesh = mesh_of(&world, &ctx);
+    let slab = quads(&mesh);
+    assert_eq!(slab.len(), 6, "the slab's six faces");
+    let [min, max] = sprite_uv("blocks/probe");
+    let band_top = min[1] + 0.875 * (max[1] - min[1]);
+    let full = sprite_corners("blocks/probe");
+    let band = [
+        [min[0], band_top],
+        [min[0], max[1]],
+        [max[0], max[1]],
+        [max[0], band_top],
+    ];
+    // The quads come in the client's face order — down, up, north, south,
+    // west, east — with the sides' own vertex heights: the first and last
+    // corners on the slab's top, the middle pair on its bottom.
+    let heights: [[f32; 4]; 6] = [
+        [0.0; 4],
+        [0.125; 4],
+        [0.125, 0.0, 0.0, 0.125],
+        [0.125, 0.0, 0.0, 0.125],
+        [0.125, 0.0, 0.0, 0.125],
+        [0.125, 0.0, 0.0, 0.125],
+    ];
+    let corners = [&full, &full, &band, &band, &band, &band];
+    for (index, quad) in slab.iter().enumerate() {
+        for (corner, vertex) in quad.iter().enumerate() {
+            assert_eq!(
+                vertex.position[1] - 64.0,
+                heights[index][corner],
+                "quad {index} vertex {corner} sits at the slab's own height"
+            );
+            assert_eq!(
+                vertex.uv, corners[index][corner],
+                "quad {index} vertex {corner} samples the block's own sprite"
+            );
+        }
+    }
+    // Every vertex stays inside the sprite's content rect: a fallback-cube
+    // sample would leave it.
+    for vertex in vertices(&mesh) {
+        assert!(
+            vertex.uv[0] >= min[0]
+                && vertex.uv[0] <= max[0]
+                && vertex.uv[1] >= min[1]
+                && vertex.uv[1] <= max[1],
+            "vertex {:?} samples outside the block's sprite",
+            vertex.uv
+        );
+    }
+
+    // Eight layers (meta 7, `layers=8`) name the full model: the cube the
+    // fallback would draw, but over the block's own sprite.
+    let world = daylight(&[(0, 64, 2, state(SNOW_LAYER, 7))]);
+    let mesh = mesh_of(&world, &ctx);
+    let filled = quads(&mesh);
+    assert_eq!(filled.len(), 6, "the full model's six faces");
+    assert!(
+        filled
+            .iter()
+            .flat_map(|quad| quad.iter())
+            .all(|vertex| vertex.position[1] == 64.0 || vertex.position[1] == 65.0),
+        "the full model fills its cell"
+    );
+    for quad in &filled {
+        for (index, vertex) in quad.iter().enumerate() {
+            assert_eq!(
+                vertex.uv, full[index],
+                "the full model's own sprite, corner for corner"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_section_with_no_quads_is_left_out() {
     let (models, atlas) = loaded();
     let maps = white_maps();
@@ -1451,7 +1561,7 @@ fn the_state_mapper_names_literals() {
     // test, so each arm carries at least one state, and the entries that share
     // an arm carry the values that exercise its own rule: the dropped
     // properties, the suffix, the seamless bit, the axis.
-    let arms: [MapperArm; 28] = [
+    let arms: [MapperArm; 30] = [
         // `Plain`: the registry name and the whole property string.
         (4, 0, Some(("cobblestone", "normal"))),
         (GRASS, 0, Some(("grass", "snowy=false"))),
@@ -1503,6 +1613,11 @@ fn the_state_mapper_names_literals() {
         (DIRT, 2, Some(("podzol", "snowy=false"))),
         // `DoubleSlab`: the seamless bit answers `all` over the variant's file.
         (43, 8, Some(("stone_double_slab", "all"))),
+        // The snow layer: the file is the block's own name and the key its
+        // `layers` property, whose low three metadata bits plus one name the
+        // count (BlockSnow.java:26, :153).
+        (SNOW_LAYER, 0, Some(("snow_layer", "layers=1"))),
+        (SNOW_LAYER, 7, Some(("snow_layer", "layers=8"))),
     ];
     assert_targets(&arms);
 

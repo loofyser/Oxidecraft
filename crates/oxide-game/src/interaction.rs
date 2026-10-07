@@ -548,9 +548,11 @@ fn box_entry(box_: &CollisionBox, from: [f64; 3], to: [f64; 3]) -> Option<(f64, 
 /// its meta here.
 ///
 /// The four liquids can never be aimed — the interaction ray passes them —
-/// but they are replaceable as landing cells. Values outside the covered set
-/// (the snow layer's, the vine block's, fire) carry no table row, and this
-/// client does not replace what it cannot vouch for.
+/// but they are replaceable as landing cells. The snow layer is covered, but
+/// the list below carries no arm for it: a single layer — replaceable in the
+/// source (`BlockSnow.java:159-162`) — is refused here as well. Values
+/// outside the covered set (the vine block's, fire) carry no table row, and
+/// this client does not replace what it cannot vouch for.
 pub fn replaceable(value: u16) -> bool {
     match value >> 4 {
         0 | 8 | 9 | 10 | 11 | 31 | 32 => true,
@@ -1232,8 +1234,8 @@ mod tests {
     /// The double plant's rose variant (meta 4): the override refuses it, so
     /// a placement steps beside it.
     const DOUBLE_PLANT_ROSE: u16 = (175 << 4) | 4;
-    /// The snow layer, id 78: outside the covered set, as the ray tests note
-    /// the covered non-cube blocks.
+    /// The snow layer, id 78: covered, and not replaceable by this client's
+    /// list, as the ray tests note the covered non-cube blocks.
     const SNOW_LAYER: u16 = 78 << 4;
 
     /// One section: every cell's value from `block_at(local x, local y, local
@@ -1416,14 +1418,16 @@ mod tests {
         ] {
             assert!(!replaceable(value), "{value:#06x} is not replaceable");
         }
-        // The values outside the covered set carry no table row, so this
-        // client refuses to replace them: the snow layer's material and the
-        // vine block's are replaceable in the source, fire's too, but nothing
-        // the table cannot vouch for is overwritten blind.
+        // The snow layer is covered, but the replaceable list has no arm for
+        // it: a single layer is refused where the source would replace it
+        // (BlockSnow.java:159-162). The values outside the covered set carry
+        // no table row either — the vine block's material and fire's are
+        // replaceable in the source, but nothing the table cannot vouch for
+        // is overwritten blind.
         for value in [SNOW_LAYER, 106 << 4, FIRE] {
             assert!(
                 !replaceable(value),
-                "{value:#06x} is outside the covered set"
+                "{value:#06x} is not in the replaceable list"
             );
         }
     }

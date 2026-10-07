@@ -8,18 +8,19 @@
 //! (`BlockState`'s constructor sorts its property array by name — `block/state/BlockState.java`).
 
 use oxide_world::behaviour::{
-    LiquidKind, Material, RenderKind, RenderLayer, TintKind, behaviour, covered_ids,
-    liquid_height_percent, liquid_kind, variant_key,
+    CollisionShape, LiquidKind, Material, PropertyKind, RenderKind, RenderLayer, TintKind,
+    behaviour, covered_ids, liquid_height_percent, liquid_kind, variant_key,
 };
 
 /// The covered ids, sorted: the M1 palette table's ids (`oxide-game`'s palette at
 /// M1's head carried all 73) union the non-air ids of the M1 acceptance world scan
-/// (`refs/rig/evidence/m1/task12-world-id-scan.txt`). The scan added no id the
-/// palette did not already carry, so the union is exactly this list.
-const COVERED: [u16; 73] = [
+/// (`refs/rig/evidence/m1/task12-world-id-scan.txt`), plus the snow layer (78),
+/// covered after the M4 acceptance's zoo frame rendered its cell as the fallback
+/// cube. The scan added no id the palette did not already carry.
+const COVERED: [u16; 74] = [
     1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 24, 31, 32, 35, 37, 38, 39,
     40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 64, 65, 67, 72,
-    73, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
+    73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
     162, 175,
 ];
 
@@ -324,6 +325,55 @@ fn the_light_and_visual_columns_hold_their_source_values() {
     assert_eq!(block(31).material, Material::Vine);
 }
 
+#[test]
+fn the_snow_layer_row_holds_its_source_values() {
+    // The snow layer's state is LAYERS, a PropertyInteger 1..=8
+    // (`BlockSnow.java:26`), read from the metadata as `(meta & 7) + 1`
+    // (`:151-153`), so the low three bits name the layer count. The
+    // registration sets hardness 0.1 and light opacity 0 (`Block.java:1336`),
+    // and the class answers non-opaque (`BlockSnow.java:53-56`),
+    // non-full-cube (`:58-61`) and replaceable at one layer (`:159-162`),
+    // with Material.snow (`:30`), the base SOLID layer (`Block.java:828`) and
+    // the layer collision box (`BlockSnow.java:43-48`).
+    assert_eq!(
+        behaviour(78).map(|row| row.name),
+        Some("snow_layer"),
+        "id 78 is the snow layer"
+    );
+    let row = block(78);
+    assert_eq!(row.properties.len(), 1, "one property");
+    let property = row.properties[0];
+    assert_eq!(property.name, "layers");
+    assert_eq!(
+        property.kind,
+        PropertyKind::Enum {
+            offset: 0,
+            bits: 3,
+            values: &["1", "2", "3", "4", "5", "6", "7", "8"],
+        }
+    );
+    for meta in 0..16u8 {
+        assert_eq!(
+            variant_key(row, meta),
+            format!("layers={}", (meta & 7) + 1),
+            "meta {meta} reads its low three bits"
+        );
+    }
+    assert_eq!(row.light_opacity, 0);
+    assert_eq!(row.light_filter, 0);
+    assert_eq!(row.light_emission, 0);
+    assert!(!row.full_cube, "isFullCube answers false");
+    assert!(!row.occludes, "isOpaqueCube answers false");
+    assert_eq!(row.material, Material::Snow);
+    assert_eq!(row.render_layer, RenderLayer::Solid);
+    assert_eq!(row.tint, TintKind::None);
+    assert_eq!(row.render, RenderKind::Model);
+    assert_eq!(row.collision, CollisionShape::SnowLayers);
+    assert_eq!(row.hardness, 0.1);
+    assert!(!row.climbable);
+    assert_eq!(row.slipperiness, 0.60);
+}
+
 /// The covered ids whose `isOpaqueCube()` is true under M2's Fast graphics:
 /// the cull rule's opacity column.
 ///
@@ -331,11 +381,12 @@ fn the_light_and_visual_columns_hold_their_source_values() {
 /// hides a neighbour's face unless its class overrides the predicate:
 /// `BlockMobSpawner.java:57` and `BlockBreakable.java:29` answer false — the
 /// latter covering ice, which extends it and overrides only `isFullCube()`
-/// (`BlockIce.java`) — and the double slab answers `isDouble()`
-/// (`BlockSlab.java:96`), true for the covered id 43. The two leaf ids are the
-/// only other overrides among the covered set: `BlockLeaves.java:278-281`
-/// answers `!fancyGraphics`, which under Fast graphics is true, so they occlude
-/// like the full cubes they are.
+/// (`BlockIce.java`) — the double slab answers `isDouble()`
+/// (`BlockSlab.java:96`), true for the covered id 43, and the snow layer
+/// answers false (`BlockSnow.java:53-56`). The two leaf ids are the only other
+/// overrides among the covered set: `BlockLeaves.java:278-281` answers
+/// `!fancyGraphics`, which under Fast graphics is true, so they occlude like
+/// the full cubes they are.
 const OCCLUDING: [u16; 44] = [
     1, 2, 3, 4, 5, 7, 12, 13, 14, 15, 16, 17, 18, 21, 24, 35, 41, 42, 43, 45, 46, 47, 48, 49, 56,
     57, 58, 61, 62, 73, 80, 82, 86, 87, 88, 89, 98, 99, 100, 110, 129, 155, 161, 162,

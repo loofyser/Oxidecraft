@@ -117,7 +117,7 @@ pub enum RenderLayer {
 ///
 /// The list is the M2 plan's; the covered ids also need `Cactus`, `Clay`,
 /// `CraftedSnow` and `Gourd`, taken from the source's constructors, and the
-/// listed `Stone`, `Snow`, `Piston`, `Portal`, `Web` and `RedstoneLight` are
+/// listed `Stone`, `Piston`, `Portal`, `Web` and `RedstoneLight` are
 /// declared for the ids later milestones add (no covered id uses them yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Material {
@@ -296,7 +296,7 @@ pub enum RenderKind {
 /// `addCollisionBoxesToList`/`getCollisionBoundingBox` overrides; the shapes
 /// are the pure functions in [`crate::collision`], and the classes that read
 /// their neighbours are resolved by the view (`oxide-game`'s `WorldView`).
-/// A class with no covered id today (the snow layer, the cobblestone wall)
+/// A class with no covered id today (the cobblestone wall)
 /// is declared all the same: later milestones add the ids, and the movement
 /// model should not learn a new vocabulary then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2146,6 +2146,38 @@ const TABLE: &[BlockBehaviour] = &[
         climbable: false,
         slipperiness: 0.60,
     },
+    // BlockSnow: LAYERS, a PropertyInteger 1..=8 (BlockSnow.java:26) read from
+    // the metadata as (meta & 7) + 1 (:151-153); the registration sets hardness
+    // 0.1 and light opacity 0 (Block.java:1336), and the class answers
+    // non-opaque (:53-56) and non-full-cube (:58-61), keeps the base SOLID
+    // layer (Block.java:828) and carries Material.snow (:30) with the layer
+    // collision box (:43-48).
+    BlockBehaviour {
+        id: 78,
+        name: "snow_layer",
+        properties: &[PropertyDef {
+            name: "layers",
+            kind: PropertyKind::Enum {
+                offset: 0,
+                bits: 3,
+                values: &["1", "2", "3", "4", "5", "6", "7", "8"],
+            },
+        }],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        material: Material::Snow,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::SnowLayers,
+        hardness: 0.1,
+        climbable: false,
+        slipperiness: 0.60,
+    },
     // BlockIce: translucent with the registration's opacity 3 (Block.java:1337).
     BlockBehaviour {
         id: 79,
@@ -2725,10 +2757,10 @@ const TABLE: &[BlockBehaviour] = &[
 ];
 
 /// The ids [`TABLE`] covers, sorted; the table's ids are this list in order.
-const COVERED: [u16; 73] = [
+const COVERED: [u16; 74] = [
     1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 24, 31, 32, 35, 37, 38, 39,
     40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 64, 65, 67, 72,
-    73, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
+    73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
     162, 175,
 ];
 
@@ -2816,7 +2848,7 @@ mod tests {
     fn the_movement_columns_name_the_sources_classes() {
         // Every covered id's collision class, from its source block class'
         // overrides. The ids that are not the full cube:
-        let classes: [(u16, CollisionShape); 27] = [
+        let classes: [(u16, CollisionShape); 28] = [
             (8, CollisionShape::None),
             (9, CollisionShape::None),
             (10, CollisionShape::None),
@@ -2836,6 +2868,7 @@ mod tests {
             (65, CollisionShape::Ladder),
             (67, CollisionShape::Stairs),
             (72, CollisionShape::None),
+            (78, CollisionShape::SnowLayers),
             (81, CollisionShape::Cactus),
             (83, CollisionShape::None),
             (85, CollisionShape::Fence),

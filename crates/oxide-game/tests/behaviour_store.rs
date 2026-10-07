@@ -106,8 +106,8 @@ fn every_covered_state_resolves_against_the_jar_blockstates() {
     );
     assert_eq!(
         resolved,
-        68 * 16,
-        "the 68 covered ids with a blockstate file"
+        69 * 16,
+        "the 69 covered ids with a blockstate file"
     );
     assert_eq!(built_in, 5 * 16, "the client's five built-in covered ids");
     println!(
