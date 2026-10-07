@@ -756,7 +756,8 @@ impl LanguageTable {
 ///
 /// A template the walk cannot substitute — an unsupported specifier, or an
 /// arg index past the list — degrades to the key itself: the source throws
-/// there (`ChatComponentTranslationFormatException`, `:57-68`), and the
+/// on a bad specifier (`ChatComponentTranslationFormatException`, `:111`)
+/// and silently drops an out-of-range arg placeholder (`:117-120`); the
 /// port's hostile-input rule never panics.
 pub fn resolve(component: &TextComponent, table: &LanguageTable) -> TextComponent {
     let mut resolved = match &component.translate {
@@ -788,8 +789,9 @@ fn substituted(
     let mut pieces = match format_pieces(template, component, &translation.args) {
         Some(pieces) => pieces,
         None => {
-            // The source rethrows its format exception; the port degrades to
-            // the key itself, one literal piece.
+            // The source throws on a bad specifier and silently drops an
+            // out-of-range arg placeholder; the port degrades to the key
+            // itself, one literal piece.
             let mut key_piece = inherit(component);
             key_piece.text = translation.key.clone();
             vec![key_piece]
@@ -1816,9 +1818,10 @@ mod tests {
     #[test]
     fn an_unsubstitutable_template_degrades_to_the_key() {
         // An arg index past the list and a specifier the source's pattern
-        // cannot take: the source throws
-        // (`ChatComponentTranslationFormatException`); the port degrades to
-        // the key itself, never a panic.
+        // cannot take: the source throws on a bad specifier
+        // (`ChatComponentTranslationFormatException`, `:111`) and silently
+        // drops an out-of-range arg placeholder (`:117-120`); the port
+        // degrades to the key itself, never a panic.
         let short = parse_json("{\"translate\":\"chat.type.text\",\"with\":[{\"text\":\"only\"}]}");
         assert_eq!(
             line_text(&flatten(&resolve(&short, &lang()))),
