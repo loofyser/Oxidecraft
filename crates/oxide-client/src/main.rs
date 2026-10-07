@@ -268,10 +268,12 @@ impl ScriptDriver {
     /// open is refused and logged.
     ///
     /// The screen's own routing is mirrored while the field is open: a
-    /// `look`'s delta moves the free pointer, a `mouse` press queues the
-    /// screen's click for the field's owner, and the field's keys run the
-    /// field machine — `Enter` sends and closes, exactly as the window's own
-    /// key does. While it is closed a fresh `T` opens it and a `Tab` edge
+    /// `look`'s delta — one mouse delta in screen pixels — scales into the
+    /// free pointer's GUI units by the frame's scale factor, a `mouse` press
+    /// queues the screen's click for the field's owner, and the field's keys
+    /// run the field machine — `Enter` sends and closes, exactly as the
+    /// window's own key does. While it is closed a fresh `T` opens it and a
+    /// `Tab` edge
     /// holds the player list. The field's owner runs the window's own
     /// follow-ups (the pointer rules are the window's; a rig run has no
     /// pointer to free).
@@ -288,6 +290,7 @@ impl ScriptDriver {
         yaw: f32,
         pitch: f32,
         on_ground: bool,
+        scale: u32,
         chat: &mut ChatInput,
         view: &mut view::ChatView,
         tab_open: &mut bool,
@@ -343,11 +346,13 @@ impl ScriptDriver {
                             // The source's screen rule: while the field is
                             // open the mouse moves the window's cursor, not
                             // the camera — the free position the hover and
-                            // the click's hit-test read. The delta is the
-                            // frame's GUI units, the unit the pointer lives
-                            // in.
+                            // the click's hit-test read. The delta is one
+                            // mouse delta in screen pixels (`parse_look`), so
+                            // it scales into the pointer's GUI units the way
+                            // the window's own position does (`scaled_look`).
                             let (x, y) = cursor.unwrap_or((0.0, 0.0));
-                            *cursor = Some((x + *dx as f32, y + *dy as f32));
+                            let (dx, dy) = scaled_look(*dx, *dy, scale);
+                            *cursor = Some((x + dx, y + dy));
                         }
                         InputEvent::Key {
                             key: Key::T,
@@ -1226,6 +1231,7 @@ impl ClientApp {
             } = &event
             {
                 if let Some(script) = self.script.as_mut() {
+                    let scale = renderer.scaled_resolution().scale_factor;
                     if let Err(error) = script.observe(
                         *tick,
                         *x,
@@ -1234,6 +1240,7 @@ impl ClientApp {
                         *yaw,
                         *pitch,
                         *on_ground,
+                        scale,
                         &mut self.chat_input,
                         &mut self.chat,
                         &mut self.tab.open,
@@ -2542,6 +2549,15 @@ fn scaled_cursor(position: PhysicalPosition<f64>, scale: u32) -> (f32, f32) {
     )
 }
 
+/// A scripted look delta in the frame's GUI units: one mouse delta in screen
+/// pixels (`parse_look`) scaled the way the window's own position is
+/// ([`scaled_cursor`] — the raw divided by the GUI scale factor, floored the
+/// way the source's own integer division lands). A zero factor is no division
+/// at all.
+fn scaled_look(dx: f64, dy: f64, scale: u32) -> (f32, f32) {
+    scaled_cursor(PhysicalPosition::new(dx, dy), scale)
+}
+
 /// The point each frame feeds the chat's hover: the free pointer's scaled
 /// position while the chat screen is the open one — not while the confirm
 /// overlay stands in for it — and none otherwise
@@ -3038,8 +3054,8 @@ mod tests {
         bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines, clear_break_stage,
         command_text, cracks_in_view, escape_route, frame_params, gameplay_key, interpolate_pose,
         is_enter_press, is_escape_press, is_f3_press, parse_script, parse_server_address,
-        scaled_cursor, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
-        tooltip_point, void_y_factor,
+        scaled_cursor, scripted_chat_click, skin_requests, store_aim, store_break_stage,
+        store_skins, tab_held, tooltip_point, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -3738,6 +3754,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -3765,6 +3782,7 @@ mod tests {
                 10.0,
                 -2.5,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -3796,6 +3814,7 @@ mod tests {
                 10.0,
                 -2.5,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -3812,6 +3831,7 @@ mod tests {
                 40.0,
                 -8.0,
                 false,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -3895,6 +3915,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -3917,6 +3938,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -3936,6 +3958,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -4825,6 +4848,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -4868,6 +4892,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -4908,6 +4933,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -4930,6 +4956,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -4974,6 +5001,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -4996,6 +5024,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5015,6 +5044,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5057,6 +5087,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5073,6 +5104,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5090,6 +5122,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5106,6 +5139,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5145,6 +5179,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5161,6 +5196,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5182,6 +5218,7 @@ mod tests {
                 0.0,
                 0.0,
                 true,
+                1,
                 &mut chat,
                 &mut view,
                 &mut tab_open,
@@ -5385,5 +5422,117 @@ mod tests {
         });
         assert_eq!(seen.borrow().len(), 0, "clicks never open links");
         assert!(app.chat.confirm_open(), "the overlay stays up");
+    }
+
+    #[test]
+    fn a_scripted_look_scales_into_the_cursor_and_its_click_runs_the_run() {
+        // The script's look delta is one mouse delta in screen pixels; the
+        // free pointer it moves lives in the frame's GUI units, so the delta
+        // scales by the frame's GUI scale factor the way the window's own
+        // position does (`scaled_cursor`). At the acceptance frame's factor
+        // (3) a raw (180, 621) parks the pointer on the newest line's click
+        // run — "press " spans x 2..36 and "CLICKME" x 36..76 at the frame's
+        // own font metrics — and the press that follows runs the run's
+        // command through the session.
+        let dir =
+            std::env::temp_dir().join(format!("oxide-client-look-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("click.script");
+        std::fs::write(
+            &script_path,
+            "3 key T down\n5 look 180 621\n7 mouse Left down\n7 mouse Left up\n",
+        )
+        .expect("the script is written");
+        let (input_tx, _input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        view.set_font(click_font());
+        view.observe(
+            r#"{"text":"press ","extra":[{"text":"CLICKME","clickEvent":{"action":"run_command","value":"/say clicked"}}]}"#,
+            1,
+            3,
+        );
+        let mut tab_open = false;
+        let mut cursor = None;
+        for tick in [3, 5, 7] {
+            driver
+                .observe(
+                    tick,
+                    0.0,
+                    64.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    true,
+                    3,
+                    &mut chat,
+                    &mut view,
+                    &mut tab_open,
+                    &mut cursor,
+                )
+                .expect("the log line writes");
+        }
+        assert_eq!(
+            cursor,
+            Some((60.0, 207.0)),
+            "the raw look delta scaled into the pointer's GUI units"
+        );
+        assert!(
+            driver.take_chat_click(),
+            "the press queued the screen's click"
+        );
+        let (session_tx, session_rx) = unbounded();
+        let (_event_tx, events) = unbounded();
+        let link = SessionLink {
+            server: "127.0.0.1:25565".to_owned(),
+            events,
+            input_tx: session_tx,
+        };
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 3,
+        };
+        scripted_chat_click(&mut view, &mut chat, cursor, Some(scaled), Some(&link));
+        assert_eq!(
+            session_rx.try_recv().expect("the click's command leaves"),
+            InputEvent::SendChat {
+                text: "/say clicked".to_owned()
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The synthetic sheet the look-and-click test measures against: the
+    /// characters of "press CLICKME" inked to the widths the acceptance
+    /// frame's font measures — five texel columns for the wide letters
+    /// (advance 6) and three for the capital I (advance 4); the space keeps
+    /// the source's 4.
+    fn click_font() -> oxide_assets::font::Font {
+        const SIDE: u32 = 128;
+        const CELL: u32 = 8;
+        let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+        for character in ['p', 'r', 'e', 's', 'C', 'L', 'I', 'K', 'M', 'E'] {
+            let code = character as u32;
+            let cell_x = (code % 16) * CELL;
+            let cell_y = (code / 16) * CELL;
+            let columns = if character == 'I' { 3 } else { 5 };
+            for row in 0..CELL {
+                for column in 0..columns {
+                    let offset = (((cell_y + row) * SIDE + cell_x + column) * 4) as usize;
+                    rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        oxide_assets::font::Font::load(
+            &Texture {
+                width: SIDE,
+                height: SIDE,
+                rgba,
+            },
+            None,
+        )
+        .expect("the synthetic sheet loads")
     }
 }
