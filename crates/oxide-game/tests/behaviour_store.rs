@@ -10,13 +10,14 @@
 //! suffix and drops named properties from the key, and the remaining blocks use
 //! the registry name with the whole property string (`DefaultStateMapper`).
 //!
-//! Five covered ids are the client's built-in blocks, which have no blockstate
+//! Six covered ids are the client's built-in blocks, which have no blockstate
 //! file at all: `BlockModelShapes.registerBuiltInBlocks` names `flowing_water`,
-//! `water`, `flowing_lava`, `lava` and `chest` (with the other chests, signs and
-//! skulls). Their resolution is asserted as the file's absence instead; the
-//! mesher routes the four liquids away from the model path (`RenderKind::Liquid`)
-//! and the chest falls back to the magenta sprite until a block-entity renderer
-//! exists (Decision 8).
+//! `water`, `flowing_lava`, `lava`, `chest` and `barrier` (with the other
+//! chests, signs, skulls and banners). Their resolution is asserted as the
+//! file's absence instead; the mesher routes the four liquids away from the
+//! model path (`RenderKind::Liquid`), draws nothing for the barrier
+//! (`RenderKind::Invisible`) and the chest falls back to the magenta sprite
+//! until a block-entity renderer exists (Decision 8).
 //!
 //! A variant whose only difference from the answer is `uvlock` still satisfies
 //! the check: the test compares keys, not the variants' own rotation, weight or
@@ -61,12 +62,12 @@ fn every_covered_state_resolves_against_the_jar_blockstates() {
                     resolved += 1;
                 }
                 None => {
-                    // No file. The five built-in ids are the only covered states
+                    // No file. The six built-in ids are the only covered states
                     // that may answer so: a state the mapper cannot read — a key
                     // without the property its file is named after — would land
                     // here too, and the exact counts below would catch it.
                     assert!(
-                        matches!(id, 8 | 9 | 10 | 11 | 54),
+                        matches!(id, 8 | 9 | 10 | 11 | 54 | 166),
                         "id {id} ({}) meta {meta} resolves to no file, but it is not built in; \
                          its key is `{}`",
                         block.name,
@@ -85,6 +86,12 @@ fn every_covered_state_resolves_against_the_jar_blockstates() {
                             block.render,
                             RenderKind::Model,
                             "the chest has no blockstate file and its block-entity renderer is not M2's"
+                        );
+                    } else if id == 166 {
+                        assert_eq!(
+                            block.render,
+                            RenderKind::Invisible,
+                            "the barrier is a built-in block with no renderer: it draws nothing"
                         );
                     } else {
                         assert_eq!(
@@ -109,7 +116,7 @@ fn every_covered_state_resolves_against_the_jar_blockstates() {
         69 * 16,
         "the 69 covered ids with a blockstate file"
     );
-    assert_eq!(built_in, 5 * 16, "the client's five built-in covered ids");
+    assert_eq!(built_in, 6 * 16, "the client's six built-in covered ids");
     println!(
         "behaviour store: {resolved} of {} (id, meta) pairs resolved as variant keys in \
          {} blockstate files; {built_in} states are the client's built-in blocks",

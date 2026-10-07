@@ -185,8 +185,10 @@ impl WorldView<'_> {
 
     /// `BlockFence.canConnectTo` (`BlockFence.java:161-165`) for the fence at
     /// a neighbour cell: a fence of the same material, or an opaque full-cube
-    /// block other than the gourd. The source's barrier and fence-gate clauses
-    /// (`:163-164`) cover ids outside the covered set, which answer `false`.
+    /// block other than the gourd. The barrier is covered and its row is not a
+    /// full cube, so the full-cube arm answers `false` — the source's own
+    /// barrier clause does the same (`:163`); the fence-gate clause (`:164`)
+    /// covers an id outside the covered set, which answers `false`.
     fn neighbour_connects_fence(&self, row: &BlockBehaviour, x: i32, y: i32, z: i32) -> bool {
         let Some(other) = row_of(self.0, x, y, z) else {
             return false;
@@ -198,9 +200,10 @@ impl WorldView<'_> {
     }
 
     /// `BlockWall.canConnectTo` (`BlockWall.java:122-126`): the wall itself,
-    /// or an opaque full-cube block other than the gourd. The barrier and
-    /// fence-gate clauses cover ids outside the covered set (the barrier
-    /// answering `false` here as it does there, the gate `true`).
+    /// or an opaque full-cube block other than the gourd. The barrier is
+    /// covered and its row is not a full cube, so it answers `false` here as
+    /// the source's own barrier clause does; the fence-gate clause covers an
+    /// id outside the covered set (the gate answering `true`).
     fn neighbour_connects_wall(&self, x: i32, y: i32, z: i32) -> bool {
         let Some(other) = row_of(self.0, x, y, z) else {
             return false;
@@ -210,8 +213,10 @@ impl WorldView<'_> {
     }
 
     /// `BlockPane.canPaneConnectToBlock` (`BlockPane.java:177-180`): a full
-    /// block, a pane, the glass block. The two stained ids the source also
-    /// names are outside the covered set.
+    /// block, a pane, the glass block. The barrier is not a full block
+    /// (`isFullBlock` is `isOpaqueCube() && isFullCube()`, `Block.java:517`,
+    /// and the barrier answers `isOpaqueCube()` false). The two stained ids
+    /// the source also names are outside the covered set.
     fn neighbour_connects_pane(&self, x: i32, y: i32, z: i32) -> bool {
         let Some(other) = row_of(self.0, x, y, z) else {
             return false;
@@ -260,6 +265,8 @@ mod tests {
     const PANE: u16 = 102 << 4;
     /// The glass block, id 20.
     const GLASS: u16 = 20 << 4;
+    /// The barrier, id 166: covered, and not a full cube.
+    const BARRIER: u16 = 166 << 4;
     /// Ice, id 79: the `0.98` slipperiness.
     const ICE: u16 = 79 << 4;
     /// A ladder, id 65, facing north (metadata 2).
@@ -631,13 +638,16 @@ mod tests {
                 11 => FENCE,
                 12 => PANE,
                 13 => GLASS,
+                14 => BARRIER,
                 _ => AIR,
             }
         });
         let view = WorldView(&world);
         let fence = oxide_world::behaviour::behaviour(85).expect("fence");
         // Fence: a same-material fence and an opaque full cube connect; the
-        // gourd, the pane and air do not (`BlockFence.java:161-165`).
+        // gourd, the pane, air and the barrier do not — the barrier through
+        // the source's own clause, and here through the row's full_cube
+        // (`BlockFence.java:161-165`).
         assert!(view.neighbour_connects_fence(fence, 8, 64, 8));
         assert!(view.neighbour_connects_fence(fence, 9, 64, 8));
         assert!(!view.neighbour_connects_fence(fence, 10, 64, 8));
@@ -651,8 +661,8 @@ mod tests {
         assert!(!view.neighbour_connects_wall(10, 64, 8));
         assert!(!view.neighbour_connects_wall(11, 64, 8));
         assert!(!view.neighbour_connects_wall(14, 64, 8));
-        // Pane: full blocks, panes and glass connect; the fence does not
-        // (`BlockPane.java:177-180`).
+        // Pane: full blocks, panes and glass connect; the fence and the
+        // barrier do not (`BlockPane.java:177-180`).
         assert!(view.neighbour_connects_pane(8, 64, 8));
         assert!(!view.neighbour_connects_pane(11, 64, 8));
         assert!(view.neighbour_connects_pane(12, 64, 8));

@@ -688,8 +688,8 @@ pub fn hand_rate(hardness: f32, tool_not_required: bool) -> f32 {
 ///
 /// In this table's vocabulary those are [`Material::Rock`] and
 /// [`Material::Stone`] (both `Material.rock`), [`Material::Metal`],
-/// [`Material::Snow`], [`Material::CraftedSnow`] and [`Material::Web`]; the
-/// anvil and barrier materials are not covered ids yet.
+/// [`Material::Snow`], [`Material::CraftedSnow`], [`Material::Web`] and
+/// [`Material::Barrier`]; the anvil material is not a covered id yet.
 pub fn tool_not_required(material: Material) -> bool {
     !matches!(
         material,
@@ -699,6 +699,7 @@ pub fn tool_not_required(material: Material) -> bool {
             | Material::Snow
             | Material::CraftedSnow
             | Material::Web
+            | Material::Barrier
     )
 }
 
@@ -2181,6 +2182,10 @@ mod tests {
         assert!(!tool_not_required(Material::Snow), "the snow layer");
         assert!(!tool_not_required(Material::CraftedSnow), "the snow block");
         assert!(!tool_not_required(Material::Web), "web");
+        assert!(!tool_not_required(Material::Barrier), "the barrier");
+        // The barrier's hardness is -1 (`setBlockUnbreakable`): no tick
+        // completes it, either way the material rule answers.
+        assert_eq!(hand_rate(-1.0, tool_not_required(Material::Barrier)), 0.0);
     }
 
     #[test]

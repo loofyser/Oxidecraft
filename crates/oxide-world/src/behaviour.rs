@@ -11,9 +11,11 @@
 //! `covered_ids()` is the M1 palette's id set unioned with the non-air ids the
 //! M1 acceptance world scan reported (`refs/rig/evidence/m1/task12-world-id-scan.txt`);
 //! the scan added no id the palette did not already carry, so the union is those
-//! 73 ids, sorted. The sample wall of the acceptance scene is generated from the
-//! same list. A block outside the set has no row: its renderer draws the M1
-//! magenta and logs once per id (the M2 plan's Decision 8).
+//! 73 ids, sorted, plus the two the M4 acceptance's own frames added on their
+//! evidence — the snow layer (78) and the barrier (166). The sample wall of the
+//! acceptance scene is generated from the same list. A block outside the set has
+//! no row: its renderer draws the M1 magenta and logs once per id (the M2
+//! plan's Decision 8).
 //!
 //! # What the rows are taken from
 //!
@@ -33,7 +35,7 @@
 //!   `BlockDoor.java`, `BlockLadder.java`, `BlockPressurePlate.java`, `BlockIce.java`,
 //!   `BlockSnowBlock.java`, `BlockCactus.java`, `BlockReed.java`, `BlockFence.java`,
 //!   `BlockPumpkin.java`, `BlockHugeMushroom.java`, `BlockPane.java`,
-//!   `BlockMycelium.java`, `BlockTallGrass.java`, `BlockDeadBush.java`,
+//!   `BlockBarrier.java`, `BlockMycelium.java`, `BlockTallGrass.java`, `BlockDeadBush.java`,
 //!   `BlockFlower.java`, `BlockMushroom.java`, `BlockBush.java`, `BlockQuartz.java`,
 //!   `BlockDoublePlant.java`, `BlockLiquid.java`, `BlockStaticLiquid.java`,
 //!   `BlockDynamicLiquid.java`, `BlockFalling.java`) for the property
@@ -116,8 +118,8 @@ pub enum RenderLayer {
 /// covered ids need.
 ///
 /// The list is the M2 plan's; the covered ids also need `Cactus`, `Clay`,
-/// `CraftedSnow` and `Gourd`, taken from the source's constructors, and the
-/// listed `Stone`, `Piston`, `Portal`, `Web` and `RedstoneLight` are
+/// `CraftedSnow`, `Gourd` and `Barrier`, taken from the source's constructors,
+/// and the listed `Stone`, `Piston`, `Portal`, `Web` and `RedstoneLight` are
 /// declared for the ids later milestones add (no covered id uses them yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Material {
@@ -171,6 +173,9 @@ pub enum Material {
     CraftedSnow,
     /// `Material.gourd`, the pumpkin.
     Gourd,
+    /// `Material.barrier`, the barrier: requires a tool and immovable
+    /// (`Material.java:49`).
+    Barrier,
 }
 
 impl Material {
@@ -288,6 +293,11 @@ pub enum RenderKind {
     /// itself (their elements carry `"shade": false`); this value is the
     /// table's own bookkeeping of which blocks are those plants.
     Cross,
+    /// No geometry at all: the block draws nothing. `BlockBarrier.getRenderType()`
+    /// answers `-1` — the render dispatcher's "no render"
+    /// (`BlockBarrier.java:19-25`) — so the mesher emits no quads for it: no
+    /// model, and no fallback cube either.
+    Invisible,
 }
 
 /// The collision shape class a block's id resolves through.
@@ -2703,6 +2713,37 @@ const TABLE: &[BlockBehaviour] = &[
         climbable: false,
         slipperiness: 0.60,
     },
+    // BlockBarrier: no properties, Material.barrier (Material.java:49), and the
+    // registration's `setBlockUnbreakable` — hardness -1 (Blocks.java:433,
+    // Block.java:407-409). `getRenderType()` answers -1, the dispatcher's "no
+    // render" (BlockBarrier.java:19-25): the row's kind draws nothing — no
+    // model, no fallback cube. `isOpaqueCube()` false (:27-33) and
+    // `getAmbientOcclusionLightValue()` 1.0F (:35-41). No blockstate file:
+    // `registerBuiltInBlocks` names it (BlockModelShapes.java:161). The row's
+    // full_cube is false: the source's `isFullCube()` default is true, but the
+    // column's readers are the ambient-occlusion light value and the fence and
+    // wall connection rules, whose own barrier clauses answer false — false
+    // keeps both readers on the source's answers. `render_layer` is inert for
+    // the kind: no bucket is ever chosen.
+    BlockBehaviour {
+        id: 166,
+        name: "barrier",
+        properties: &[],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        material: Material::Barrier,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Invisible,
+        collision: CollisionShape::Full,
+        hardness: -1.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
     // BlockDoublePlant: HALF + VARIANT + FACING (BlockDoublePlant.java:28-39,
     // 281-316), Material.vine. The source tints the grass and fern variants with
     // the grass colour and leaves the rest white (colorMultiplier,
@@ -2757,11 +2798,11 @@ const TABLE: &[BlockBehaviour] = &[
 ];
 
 /// The ids [`TABLE`] covers, sorted; the table's ids are this list in order.
-const COVERED: [u16; 74] = [
+const COVERED: [u16; 75] = [
     1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 24, 31, 32, 35, 37, 38, 39,
     40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 64, 65, 67, 72,
     73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
-    162, 175,
+    162, 166, 175,
 ];
 
 /// The table answers for exactly the covered ids, in order, and every row's

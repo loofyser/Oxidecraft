@@ -16,12 +16,14 @@ use oxide_world::behaviour::{
 /// M1's head carried all 73) union the non-air ids of the M1 acceptance world scan
 /// (`refs/rig/evidence/m1/task12-world-id-scan.txt`), plus the snow layer (78),
 /// covered after the M4 acceptance's zoo frame rendered its cell as the fallback
-/// cube. The scan added no id the palette did not already carry.
-const COVERED: [u16; 74] = [
+/// cube, and the barrier (166), covered after the acceptance's boss frames
+/// rendered its cage the same way. The scan added no id the palette did not
+/// already carry.
+const COVERED: [u16; 75] = [
     1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 24, 31, 32, 35, 37, 38, 39,
     40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 64, 65, 67, 72,
     73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
-    162, 175,
+    162, 166, 175,
 ];
 
 /// The non-air ids the M1 acceptance world scan reported, in the scan's order.
@@ -374,6 +376,49 @@ fn the_snow_layer_row_holds_its_source_values() {
     assert_eq!(row.slipperiness, 0.60);
 }
 
+#[test]
+fn the_barrier_row_holds_its_source_values() {
+    // The barrier carries no properties and no blockstate file: Material.barrier
+    // (`Material.java:49`), `setBlockUnbreakable()` — hardness -1
+    // (`Block.java:407-409`, the registration at `Blocks.java:433`) — the
+    // `getRenderType()` -1 that draws nothing (`BlockBarrier.java:19-25`),
+    // `isOpaqueCube()` false (`:27-33`) and `getAmbientOcclusionLightValue()`
+    // 1.0F (`:35-41`), no drops (`:43-48`). `registerBuiltInBlocks` names it
+    // (`BlockModelShapes.java:161`), so it has no blockstate file at all.
+    assert_eq!(
+        behaviour(166).map(|row| row.name),
+        Some("barrier"),
+        "id 166 is the barrier"
+    );
+    let row = block(166);
+    assert_eq!(row.properties.len(), 0, "no properties");
+    for meta in 0..16u8 {
+        assert_eq!(variant_key(row, meta), "", "meta {meta} names no key");
+    }
+    assert_eq!(row.light_opacity, 0);
+    assert_eq!(row.light_filter, 0);
+    assert_eq!(row.light_emission, 0);
+    // Not a full cube: the source's `isFullCube()` default is true, but this
+    // table's readers of the column are the ambient-occlusion light value —
+    // whose default formula this class overrides back to 1.0 — and the fence
+    // and wall connection rules, whose own barrier clauses answer false; the
+    // row keeps both readers on the source's answers.
+    assert!(!row.full_cube);
+    assert!(!row.occludes, "isOpaqueCube answers false");
+    assert_eq!(row.material, Material::Barrier);
+    assert_eq!(row.render_layer, RenderLayer::Solid);
+    assert_eq!(row.tint, TintKind::None);
+    assert_eq!(
+        row.render,
+        RenderKind::Invisible,
+        "getRenderType answers -1"
+    );
+    assert_eq!(row.collision, CollisionShape::Full);
+    assert_eq!(row.hardness, -1.0, "setBlockUnbreakable");
+    assert!(!row.climbable);
+    assert_eq!(row.slipperiness, 0.60);
+}
+
 /// The covered ids whose `isOpaqueCube()` is true under M2's Fast graphics:
 /// the cull rule's opacity column.
 ///
@@ -382,8 +427,9 @@ fn the_snow_layer_row_holds_its_source_values() {
 /// `BlockMobSpawner.java:57` and `BlockBreakable.java:29` answer false — the
 /// latter covering ice, which extends it and overrides only `isFullCube()`
 /// (`BlockIce.java`) — the double slab answers `isDouble()`
-/// (`BlockSlab.java:96`), true for the covered id 43, and the snow layer
-/// answers false (`BlockSnow.java:53-56`). The two leaf ids are the only other
+/// (`BlockSlab.java:96`), true for the covered id 43, the snow layer
+/// answers false (`BlockSnow.java:53-56`) and the barrier answers false
+/// (`BlockBarrier.java:27-33`). The two leaf ids are the only other
 /// overrides among the covered set: `BlockLeaves.java:278-281` answers
 /// `!fancyGraphics`, which under Fast graphics is true, so they occlude like
 /// the full cubes they are.

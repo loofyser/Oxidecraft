@@ -36,9 +36,10 @@ const SPAWNER: u16 = 52;
 const STAIRS: u16 = 67;
 const GLOWSTONE: u16 = 89;
 const SNOW_LAYER: u16 = 78;
+const BARRIER: u16 = 166;
 
 /// One state mapper arm's expectation: the block id, the metadata value, and
-/// the literal `(file, key)` the mapper must answer — `None` for the five ids
+/// the literal `(file, key)` the mapper must answer — `None` for the six ids
 /// the client builds in.
 type MapperArm = (u16, u8, Option<(&'static str, &'static str)>);
 
@@ -562,6 +563,13 @@ fn the_probe_tree_resolves_every_id_the_tests_mesh() {
     ));
     assert!(matches!(
         models.model(200, 0, 0, 64, 0),
+        ModelChoice::Missing
+    ));
+    // The barrier is the client's built-in block the tests mesh: no file, so
+    // every state is the missing choice — which the row's `Invisible` kind,
+    // not the fallback cube, answers.
+    assert!(matches!(
+        models.model(BARRIER, 0, 0, 64, 0),
         ModelChoice::Missing
     ));
 }
@@ -1148,6 +1156,16 @@ fn a_concave_corner_multiplies_its_vertex_by_the_cells_light_value() {
             [204, 204, 204, 255],
         ]
     );
+
+    // The barrier at that same corner answers 1.0 where the stone answers 0.2:
+    // `BlockBarrier.getAmbientOcclusionLightValue()` is 1.0F
+    // (`BlockBarrier.java:35-41`), and the light-value rule reads a normal cube
+    // as the material blocking movement and the block being a full cube. The
+    // table encodes the override as the row's full_cube false, so every
+    // multiplier stays 1.0 — and the barrier itself draws nothing, so the
+    // found quad is still the stone's top face.
+    let barrier = daylight(&[(0, 64, 0, state(STONE, 0)), (1, 65, 1, state(BARRIER, 0))]);
+    assert_eq!(top_colours(&barrier), [[255, 255, 255, 255]; 4]);
 }
 
 #[test]
@@ -1440,6 +1458,34 @@ fn a_covered_snow_layer_draws_its_thin_slab() {
 }
 
 #[test]
+fn a_covered_barrier_draws_no_geometry_at_all() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+
+    // The barrier has no model — the client builds it in, so no state file
+    // resolves — and its row routes it around the fallback cube too: the
+    // mesher emits nothing at all for its cell. A stone beside it keeps every
+    // face: the barrier hides nothing (`isOpaqueCube()` false).
+    let world = daylight(&[(0, 64, 0, state(STONE, 0)), (4, 64, 0, state(BARRIER, 0))]);
+    let mesh = mesh_of(&world, &ctx);
+    assert_eq!(mesh.vertex_count(), 24, "the stone's six faces alone");
+    for vertex in vertices(&mesh) {
+        assert!(
+            vertex.position[0] < 4.0,
+            "no vertex in the barrier's cell: {:?}",
+            vertex.position
+        );
+    }
+
+    // A column of barrier cells alone meshes to no section at all.
+    let world = daylight(&[(0, 64, 0, state(BARRIER, 0)), (1, 64, 1, state(BARRIER, 0))]);
+    for (section, mesh) in meshes(&world, &ctx) {
+        assert!(mesh.is_none(), "section {section} stays empty");
+    }
+}
+
+#[test]
 fn a_section_with_no_quads_is_left_out() {
     let (models, atlas) = loaded();
     let maps = white_maps();
@@ -1623,7 +1669,7 @@ fn the_state_mapper_names_literals() {
 
     // The remaining states of the arms whose answer turns on the state: the
     // dirt variants, the double slabs' variant and seamless combinations, the
-    // quartz column's three axes, the dead bush block, and the five ids the
+    // quartz column's three axes, the dead bush block, and the six ids the
     // client builds in with no file at all.
     let singles: [MapperArm; 12] = [
         (DIRT, 0, Some(("dirt", "normal"))),
@@ -1640,7 +1686,7 @@ fn the_state_mapper_names_literals() {
         (4, 4, Some(("cobblestone", "normal"))),
     ];
     assert_targets(&singles);
-    for id in [WATER, 9, 10, 11, 54] {
+    for id in [WATER, 9, 10, 11, 54, BARRIER] {
         let row = behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"));
         assert_eq!(blockstate_target(row, 0), None, "id {id} has no file");
     }

@@ -364,7 +364,7 @@ fn target(block: &BlockBehaviour, meta: u8) -> Target {
 /// file after one property's value plus a suffix and drops named properties from
 /// the key (`BlockModelShapes.java:215-330`), and every other block uses the
 /// registry name with the whole property string (`DefaultStateMapper`).
-/// `registerBuiltInBlocks` names the five covered ids with no blockstate file.
+/// `registerBuiltInBlocks` names the six covered ids with no blockstate file.
 fn mapper(id: u16) -> Mapper {
     match id {
         1 | 12 | 98 => Mapper::Name {
@@ -413,7 +413,7 @@ fn mapper(id: u16) -> Mapper {
         43 => Mapper::DoubleSlab,
         155 => Mapper::Quartz,
         32 => Mapper::DeadBush,
-        8 | 9 | 10 | 11 | 54 => Mapper::Builtin,
+        8 | 9 | 10 | 11 | 54 | 166 => Mapper::Builtin,
         _ => Mapper::Plain,
     }
 }

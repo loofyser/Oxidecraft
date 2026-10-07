@@ -67,9 +67,11 @@
 //!
 //! # Known interim state
 //!
-//! The client's remaining built-in blocks still draw the magenta fallback cube
-//! from the atlas's own fallback sprite, as do ids outside the behaviour table
-//! and states the model set could not resolve.
+//! Of the client's built-in covered ids, the chest still draws the magenta
+//! fallback cube from the atlas's own fallback sprite — as do ids outside the
+//! behaviour table and states the model set could not resolve — while the
+//! barrier draws nothing at all: its row's `Invisible` kind answers the
+//! client's `getRenderType()` -1.
 
 mod liquid;
 mod models;
@@ -258,6 +260,12 @@ fn append_block(
     }
     let meta = (value & 0x0F) as u8;
     let block = behaviour(id);
+    if block.is_some_and(|entry| entry.render == RenderKind::Invisible) {
+        // `BlockBarrier.getRenderType()` answers -1: the block draws no
+        // geometry at all — no model, and no fallback cube either — so its
+        // cell is skipped before the model lookup.
+        return;
+    }
     let layer = layer_of(block, ctx.graphics_fast);
     if block.is_some_and(|entry| entry.render == RenderKind::Liquid) {
         // Every liquid row carries its kind, and the table's own tests pin it;
