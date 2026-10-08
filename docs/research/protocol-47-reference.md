@@ -239,7 +239,7 @@ them.
 | 0x2C | Spawn Global Entity | EID VarInt; Type Byte (1 lightning); X/Y/Z Int fixed-point | opt |
 | 0x2D | Open Window | WindowID UByte; WindowType String (e.g. `minecraft:chest`, `minecraft:anvil`, `EntityHorse`); WindowTitle Chat; SlotCount UByte; EntityID Int **only if** WindowType = `EntityHorse` | need |
 | 0x2E | Close Window | WindowID UByte | need |
-| 0x2F | Set Slot | WindowID Byte; Slot Short; SlotData Slot (a negative slot index denotes the cursor in later docs — ⚠ not verified against 1.8.9 source) | need |
+| 0x2F | Set Slot | WindowID Byte; Slot Short; SlotData Slot (the cursor rides window id −1 — the `== −1` branch writes `inventory.setItemStack` (`NetHandlerPlayClient.handleSetSlot`:1133); a negative slot index never occurs) | need |
 | 0x30 | Window Items | WindowID UByte; Count Short; Slots Array of Slot (index 0..count−1; 0–4 crafting, 5–8 armor, 9–35 main, 36–44 hotbar for player inventory) | need |
 | 0x31 | Window Property | WindowID UByte; Property Short; Value Short (furnace progress/fuel, enchant levels, brewing) | opt |
 | 0x32 | Confirm Transaction | WindowID Byte; ActionNumber Short; Accepted Bool | need |
