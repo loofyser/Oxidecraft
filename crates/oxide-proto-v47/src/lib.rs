@@ -8,8 +8,10 @@ pub mod nbt;
 pub mod serverbound;
 pub mod status;
 pub mod ui;
+pub mod window;
 
 pub use nbt::{NbtError, NbtValue, parse};
+pub use window::{MerchantOffer, MerchantOffers, WindowKind};
 
 use oxide_proto::codec::CodecError;
 
