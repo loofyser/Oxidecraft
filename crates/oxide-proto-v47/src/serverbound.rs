@@ -169,9 +169,11 @@ pub fn write_player_position_and_look(
 /// The actions Player Digging carries (`C07PacketPlayerDigging.Action`,
 /// `network/play/client/C07PacketPlayerDigging.java:63-71`).
 ///
-/// The variants' declaration order is the status id on the wire. The source's
-/// fourth action, `DROP_ITEM`, belongs to the drop key and is not written by
-/// this client.
+/// The variants' declaration order is the status id on the wire: the three
+/// block stages the break path writes, then the drop key's two
+/// (`EntityPlayerSP.dropOneItem:279-284`). The sixth action,
+/// `RELEASE_USE_ITEM` (5), belongs to item use, which this client does not
+/// send yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiggingStatus {
     /// Start destroying a block (status 0).
@@ -180,6 +182,10 @@ pub enum DiggingStatus {
     Abort = 1,
     /// Finish destroying a block (status 2).
     Finish = 2,
+    /// Drop the whole selected stack (status 3, `DROP_ALL_ITEMS`).
+    DropAll = 3,
+    /// Drop one item of the selected stack (status 4, `DROP_ITEM`).
+    Drop = 4,
 }
 
 /// Serverbound Player Digging (play id 0x07).
@@ -615,6 +621,32 @@ mod tests {
                 0x00, // the face byte
             ],
             "the abort at a negative z"
+        );
+    }
+
+    #[test]
+    fn player_digging_writes_the_drop_key_statuses() {
+        // Status 3 (`DROP_ALL_ITEMS`) and status 4 (`DROP_ITEM`) at the origin,
+        // facing down — the pair `EntityPlayerSP.dropOneItem:279-284` builds
+        // for the drop key, with `EnumFacing.DOWN`'s ordinal 0
+        // (`util/EnumFacing.java:53-58`).
+        assert_eq!(
+            digging_bytes(DiggingStatus::DropAll, 0, 0, 0, 0),
+            vec![
+                0x07, 0x03, // the id and status 3
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (0, 0, 0)
+                0x00, // the face byte, DOWN
+            ],
+            "the whole selected stack drops"
+        );
+        assert_eq!(
+            digging_bytes(DiggingStatus::Drop, 0, 0, 0, 0),
+            vec![
+                0x07, 0x04, // the id and status 4
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (0, 0, 0)
+                0x00, // the face byte, DOWN
+            ],
+            "one item drops"
         );
     }
 

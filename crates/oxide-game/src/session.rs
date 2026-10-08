@@ -61,10 +61,11 @@ use oxide_proto_v47::entity::{
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
     ClientSettings, ClientStatusAction, DiggingStatus, EntityAction, write_animation,
-    write_client_settings, write_client_status, write_confirm_transaction, write_entity_action,
-    write_keep_alive, write_login_start, write_player, write_player_abilities,
-    write_player_block_placement, write_player_digging, write_player_look, write_player_position,
-    write_player_position_and_look, write_plugin_message,
+    write_click_window, write_client_settings, write_client_status, write_close_window,
+    write_confirm_transaction, write_creative_inventory_action, write_enchant_item,
+    write_entity_action, write_held_item_change, write_keep_alive, write_login_start, write_player,
+    write_player_abilities, write_player_block_placement, write_player_digging, write_player_look,
+    write_player_position, write_player_position_and_look, write_plugin_message, write_update_sign,
 };
 use oxide_proto_v47::ui::{
     ChatMessage, ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam,
@@ -89,6 +90,7 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
+use crate::container::{CLICK_MODE_PICKUP, CLICK_MODE_QUICK_MOVE};
 use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
@@ -114,7 +116,7 @@ const BRAND_CHANNEL: &str = "MC|Brand";
 const TRADE_LIST_CHANNEL: &str = "MC|TrList";
 
 /// Clientbound Held Item Change's play id (0x09): one byte, the selected
-/// hotbar slot (`S09PacketHeldItemChange.readPacketData:29-31`).
+/// hotbar slot (`S09PacketHeldItemChange.readPacketData:24-27`).
 ///
 /// The protocol crate carries the serverbound writer alone, so the reader
 /// lives here beside its caller.
@@ -564,12 +566,14 @@ pub enum ClientEvent {
         /// The title as chat JSON, exactly as sent.
         title: String,
     },
-    /// The server closed a window, from clientbound 0x2E.
+    /// A window left the state: the server closed it (clientbound 0x2E) or the
+    /// view closed its own screen and the session's close put the window away.
     ///
     /// Reported for the live open window alone, which the close cleared — the
     /// carried stack dropped with it
     /// (`handleCloseWindow:1311-1315` reaching
-    /// `EntityPlayerSP.closeScreenAndDropStack:336-341`).
+    /// `EntityPlayerSP.closeScreenAndDropStack:336-341`) — never for window 0,
+    /// the player's own.
     WindowClosed {
         /// The window id the close named.
         window_id: u8,
@@ -601,7 +605,7 @@ pub enum ClientEvent {
     ///
     /// The session sets the inventory's own selection and reports the slot; a
     /// slot outside the hotbar's nine is ignored
-    /// (`NetHandlerPlayClient.handleHeldItemChange:615-621`).
+    /// (`NetHandlerPlayClient.handleHeldItemChange:598-606`).
     HeldItemSlot {
         /// The hotbar slot, 0 through 8.
         slot: i16,
@@ -859,7 +863,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // the wire's apply rules for both.
         let mut windows = Windows::new();
         // The own player's live effects, by effect id: the store 0x1D and
-        // 0x1E maintain (`EntityLivingBase.addPotionEffect:745-762` behind
+        // 0x1E maintain (`EntityLivingBase.addPotionEffect:745-760` behind
         // `NetHandlerPlayClient.handleEntityEffect:1502-1513`).
         let mut effects: BTreeMap<u8, StatusEffect> = BTreeMap::new();
         // The last text every sign carried, by position: what the view draws
@@ -905,6 +909,94 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     );
                                 }
                                 InputEvent::SendChat { text } => chat_messages.push(text),
+                                InputEvent::ClickWindow {
+                                    window_id,
+                                    slot,
+                                    button,
+                                    mode,
+                                } => {
+                                    // One 0x0E per click, carrying the
+                                    // container's own next action number
+                                    // (`Container.getNextTransactionID:561-565`)
+                                    // and the echo the click's branch returned
+                                    // (`PlayerControllerMP.windowClick:534-540`),
+                                    // never the cursor.
+                                    if let Some(request) = click_window_packet(
+                                        &mut windows,
+                                        window_id,
+                                        slot,
+                                        button,
+                                        mode,
+                                    )? {
+                                        send_reply(&mut conn, &request)?;
+                                    }
+                                }
+                                InputEvent::CloseWindow { window_id } => {
+                                    // One 0x0D for a window the state holds —
+                                    // the source's close path writes it for the
+                                    // container the screen stood on
+                                    // (`EntityPlayerSP.closeScreen:330-334`) —
+                                    // and the window leaves the state with it,
+                                    // reporting the same event a wire close
+                                    // does. Window 0 is the player's own and
+                                    // stays; a second close of the same window
+                                    // answers nothing.
+                                    if close_window(&mut windows, window_id) {
+                                        let request =
+                                            payload_of(|out| write_close_window(out, window_id))?;
+                                        send_reply(&mut conn, &request)?;
+                                        if window_id != 0 {
+                                            report(events, ClientEvent::WindowClosed { window_id });
+                                        }
+                                    }
+                                }
+                                InputEvent::CreativeAction { slot, item } => {
+                                    let request = payload_of(|out| {
+                                        write_creative_inventory_action(out, slot, item.as_ref())
+                                    })?;
+                                    send_reply(&mut conn, &request)?;
+                                }
+                                InputEvent::EnchantItem { window_id, index } => {
+                                    let request = payload_of(|out| {
+                                        write_enchant_item(out, window_id, index)
+                                    })?;
+                                    send_reply(&mut conn, &request)?;
+                                }
+                                InputEvent::UpdateSign { x, y, z, lines } => {
+                                    let request =
+                                        payload_of(|out| write_update_sign(out, x, y, z, &lines))?;
+                                    send_reply(&mut conn, &request)?;
+                                }
+                                InputEvent::HeldItemChange { slot } => {
+                                    // The selection rides the model
+                                    // (`EntityPlayerSP.onUpdate`'s own
+                                    // `inventory.currentItem` assignment,
+                                    // `EntityPlayerSP.java:214-219`) and the
+                                    // wire (`PlayerControllerMP.syncCurrentPlayItem:379-388`
+                                    // reaching `C09PacketHeldItemChange:32-36`),
+                                    // and the HUD hears the same value.
+                                    windows.player.inventory.set_selected(slot);
+                                    let request =
+                                        payload_of(|out| write_held_item_change(out, slot))?;
+                                    send_reply(&mut conn, &request)?;
+                                    report(events, ClientEvent::HeldItemSlot { slot });
+                                }
+                                InputEvent::DropItem { whole } => {
+                                    // The drop key's own pair
+                                    // (`EntityPlayerSP.dropOneItem:279-284`):
+                                    // the whole stack is `DROP_ALL_ITEMS`, one
+                                    // item `DROP_ITEM`, both at the origin and
+                                    // facing down.
+                                    let status = if whole {
+                                        DiggingStatus::DropAll
+                                    } else {
+                                        DiggingStatus::Drop
+                                    };
+                                    let request = payload_of(|out| {
+                                        write_player_digging(out, status, 0, 0, 0, 0)
+                                    })?;
+                                    send_reply(&mut conn, &request)?;
+                                }
                                 other => looked |= apply_input(other, &mut intent, &mut player),
                             }
                         }
@@ -1873,7 +1965,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         ConfirmTransaction::ID => {
                             let confirm = decoded(id, ConfirmTransaction::decode(body))?;
                             // The source's own guard
-                            // (`handleConfirmTransaction:1174-1196`): a
+                            // (`handleConfirmTransaction:1174-1193`): a
                             // rejected transaction for a window the session
                             // holds — window 0, or the live open window — is
                             // answered in the same pass with the packet's own
@@ -1895,7 +1987,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         HELD_ITEM_CHANGE_ID => {
                             let slot = decoded(id, decode_held_item_change(body))?;
                             // The source's own guard
-                            // (`handleHeldItemChange:615-621`): a slot inside
+                            // (`handleHeldItemChange:598-606`): a slot inside
                             // the hotbar's nine selects it, and anything else
                             // is ignored.
                             if (0..HOTBAR_SIZE as i16).contains(&slot) {
@@ -1924,7 +2016,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // The store is the own player's alone
                             // (`handleEntityEffect:1502-1513`): a fresh id is
                             // held as it arrived, and one already held
-                            // combines (`EntityLivingBase.addPotionEffect:745-762`
+                            // combines (`EntityLivingBase.addPotionEffect:745-760`
                             // reaching `PotionEffect.combine:63-85`).
                             if Some(effect.entity_id) == player.entity_id {
                                 match effects.get_mut(&effect.effect_id) {
@@ -1971,7 +2063,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             let sign = decoded(id, UpdateSign::decode(body))?;
                             // The last text per position is the view's to
                             // draw; the lines travel as sent
-                            // (`handleUpdateSign:1319-1327`).
+                            // (`handleUpdateSign:1234-1261`).
                             signs.insert(
                                 (sign.x, sign.y, sign.z),
                                 SignText {
@@ -2094,7 +2186,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // The hotbar's pop runs down with the player's own tick: the
                 // source decrements every main-inventory stack once per tick
                 // (`EntityPlayer.onLivingUpdate:617` through
-                // `InventoryPlayer.decrementAnimations:352-363` and
+                // `InventoryPlayer.decrementAnimations:352-361` and
                 // `ItemStack.updateAnimation:486-491`). A tick that moved a
                 // counter republishes window 0, which is where the counters
                 // ride.
@@ -2307,6 +2399,74 @@ fn chat_over_cap(text: &str) -> bool {
     text.chars().count() > CHAT_FIELD_CAP
 }
 
+/// The packet one click owes, or `None` when the click names no container the
+/// state holds.
+///
+/// The source's click path runs against the container the client holds
+/// (`PlayerControllerMP.windowClick:515-543` runs `openContainer.slotClick`
+/// and sends what it returned): a click naming any other window has nothing to
+/// run and sends nothing — the window and its slot are checked before anything
+/// is written — and a click that lands steps the container's own action number
+/// (`Container.getNextTransactionID:561-565`, counting from one in
+/// [`Windows`]) and carries the echo the click's branch produced.
+fn click_window_packet(
+    windows: &mut Windows,
+    window_id: i32,
+    slot: i16,
+    button: i8,
+    mode: i8,
+) -> Result<Option<Vec<u8>>, SessionError> {
+    let Ok(wire_id) = i8::try_from(window_id) else {
+        debug!(window_id, "a click names a window the wire cannot carry");
+        return Ok(None);
+    };
+    if !windows.holds_window(wire_id) {
+        debug!(window_id, "a click names no window the state holds");
+        return Ok(None);
+    }
+    let echo = click_echo(windows, wire_id, slot, mode);
+    let action = windows.next_action_number();
+    Ok(Some(payload_of(|out| {
+        write_click_window(out, wire_id, slot, button, action, echo.as_ref(), mode)
+    })?))
+}
+
+/// The echo one click's packet carries: the click's own branch return in the
+/// source's `Container.slotClick`.
+///
+/// The pickup and the shift quick-move are the two branches that answer with a
+/// stack — the clicked slot's own, read before the click's mutation
+/// (`Container.java:291-296` for the pickup, `:266-271` for the quick-move) —
+/// while every other mode, the click outside every slot (−999) and the drag
+/// leave the source's carrier null (`:446-456`, `:457-491`, `:145-227`). The
+/// stack rides from the state's own snapshot: the session is the container the
+/// view clicks, and nothing is mutated here. The echo is never the cursor
+/// (`PlayerControllerMP.windowClick:534-540`).
+fn click_echo(windows: &Windows, window_id: i8, slot: i16, mode: i8) -> Option<MetadataItem> {
+    if mode != CLICK_MODE_PICKUP && mode != CLICK_MODE_QUICK_MOVE {
+        return None;
+    }
+    let snapshot = windows.snapshot(u8::try_from(window_id).ok()?)?;
+    snapshot.slots.get(usize::try_from(slot).ok()?)?.clone()
+}
+
+/// Whether one close the view sent writes its packet: the state must take the
+/// window, or it must be window 0's own close.
+///
+/// The source's close path writes C0D for the container the screen stood on
+/// (`EntityPlayerSP.closeScreen:330-334`) — window 0 included, which is why the
+/// send cannot simply follow the state's rule — and drops the cursor with the
+/// screen (`closeScreenAndDropStack:336-341`). Every other id is the state's own
+/// call: [`Windows::apply_close`] clears the live open window and refuses —
+/// counting it — a close that names nothing, so a second close of an
+/// already-shut window sends nothing and changes nothing.
+fn close_window(windows: &mut Windows, window_id: u8) -> bool {
+    if window_id == 0 {
+        return true;
+    }
+    windows.apply_close(window_id)
+}
+
 /// Applies one window event to the held input and the player's look, and
 /// answers whether the look moved.
 ///
@@ -2317,9 +2477,9 @@ fn chat_over_cap(text: &str) -> bool {
 /// stops receiving leaves nothing held. A moved look asks for the aim to be
 /// recomputed before the next tick.
 ///
-/// The chat send has no arm here to reach: every [`InputEvent::SendChat`] is
-/// collected by the play loop's drain — and written there — before this sees
-/// it, and its arm below is match completeness only.
+/// The chat send and the click machine's actions have no arm here to reach:
+/// every one of them is applied — and its packet written — by the play loop's
+/// drain before this sees it, and their arm below is match completeness only.
 fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> bool {
     match event {
         InputEvent::Key { key, pressed } => {
@@ -2341,8 +2501,16 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
             false
         }
         // The chat send was already collected and written by the drain; it
-        // carries no held key and no look, so nothing here applies.
-        InputEvent::SendChat { .. } => false,
+        // carries no held key and no look, so nothing here applies. The click
+        // machine's actions were dispatched and written there too.
+        InputEvent::SendChat { .. }
+        | InputEvent::ClickWindow { .. }
+        | InputEvent::CloseWindow { .. }
+        | InputEvent::CreativeAction { .. }
+        | InputEvent::EnchantItem { .. }
+        | InputEvent::UpdateSign { .. }
+        | InputEvent::HeldItemChange { .. }
+        | InputEvent::DropItem { .. } => false,
     }
 }
 

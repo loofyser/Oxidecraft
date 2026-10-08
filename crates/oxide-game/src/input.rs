@@ -18,6 +18,8 @@
 //! upward, so its subtracted pitch term is this convention's added one; the
 //! direction test below pins the whole chain.
 
+use oxide_proto_v47::entity::MetadataItem;
+
 /// One physical key the client binds.
 ///
 /// The source binds many more; these are the movement keys and the sprint key
@@ -117,6 +119,71 @@ pub enum InputEvent {
     SendChat {
         /// The message text, exactly as the field sent it.
         text: String,
+    },
+    /// A slot click on an open container: the view's own click routing —
+    /// `GuiContainer.mouseClicked:428-448` and its `handleMouseClick` table —
+    /// run against the session's windows.
+    ClickWindow {
+        /// The window the click is for; window 0 is the player's own.
+        window_id: i32,
+        /// The slot index the click names, the source's `slotId`; −999 is the
+        /// click outside every slot (`GuiContainer.mouseReleased:617`).
+        slot: i16,
+        /// The clicked button, the source's `clickedButton`; a drag's button
+        /// composes the drag's event and mode in its bits
+        /// (`Container.func_94534_d:700-703`).
+        button: i8,
+        /// The click mode, the source's `mode`/`clickType`: 0 pickup and
+        /// place, 1 shift quick-move, 2 number-key swap, 3 creative pick,
+        /// 4 drop, 5 drag, 6 double-click gather
+        /// (`Container.slotClick:140-494`).
+        mode: i8,
+    },
+    /// The view closed a container screen: the source's close path writes
+    /// Close Window for the container the screen stood on
+    /// (`EntityPlayerSP.closeScreen:330-334`, window 0 included).
+    CloseWindow {
+        /// The window the screen stood on; window 0 is the player's own.
+        window_id: u8,
+    },
+    /// A creative screen's slot write: the set `PlayerControllerMP.sendSlotPacket:557-563`
+    /// sends and the carried stack's own drop `sendPacketDropItem:568-574`
+    /// sends.
+    CreativeAction {
+        /// The slot the write names; −1 is the carried stack's own drop.
+        slot: i16,
+        /// The stack to write, or `None` to clear the slot.
+        item: Option<MetadataItem>,
+    },
+    /// The enchantment screen's offer click
+    /// (`PlayerControllerMP.sendEnchantPacket:549-552`).
+    EnchantItem {
+        /// The window the enchantment screen stands on.
+        window_id: u8,
+        /// The offer's zero-based index.
+        index: i8,
+    },
+    /// The sign editor saved its lines (`GuiEditSign.onGuiClosed:52-60`).
+    UpdateSign {
+        /// The sign's x coordinate.
+        x: i32,
+        /// The sign's y coordinate.
+        y: i32,
+        /// The sign's z coordinate.
+        z: i32,
+        /// The four lines, each as the editor held it.
+        lines: [String; 4],
+    },
+    /// The player's selected hotbar slot moved
+    /// (`PlayerControllerMP.syncCurrentPlayItem:379-388`).
+    HeldItemChange {
+        /// The new selection, 0 through 8.
+        slot: i16,
+    },
+    /// The drop key (`EntityPlayerSP.dropOneItem:279-284`).
+    DropItem {
+        /// Whether the whole stack drops (`true`) or one item (`false`).
+        whole: bool,
     },
 }
 

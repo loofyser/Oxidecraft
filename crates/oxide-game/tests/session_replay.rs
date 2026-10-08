@@ -19,6 +19,7 @@ use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
 use oxide_proto_v47::clientbound::{MapChunkBulk, PlayerPositionAndLook};
 use oxide_proto_v47::column::block_index;
+use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_proto_v47::window::WindowKind;
 use oxide_render::terrain::{ChunkMesh, Vertex};
@@ -6726,7 +6727,7 @@ fn an_open_window_replaces_the_live_one_and_a_close_clears_it() {
 
 #[test]
 fn a_rejected_confirm_for_the_live_window_is_resent_accepted() {
-    // The source's own guard (`NetHandlerPlayClient.handleConfirmTransaction:1174-1196`):
+    // The source's own guard (`NetHandlerPlayClient.handleConfirmTransaction:1174-1193`):
     // window 0 — the player's own, held from Join Game — and the live open
     // window's id answer a rejection with a fresh accepted transaction; an
     // accepted confirmation and a window the session does not hold answer
@@ -6766,7 +6767,7 @@ fn a_held_item_change_selects_a_hotbar_slot() {
     assert_eq!(
         selected,
         vec![3],
-        "only a slot the hotbar holds is selected (`handleHeldItemChange:615-621`): {events:?}"
+        "only a slot the hotbar holds is selected (`handleHeldItemChange:598-606`): {events:?}"
     );
 }
 
@@ -6971,4 +6972,403 @@ fn a_burst_of_window_writes_for_a_closed_window_builds_one_snapshot() {
         panic!("the landing write publishes a snapshot: {:?}", windows[0]);
     };
     assert_eq!(slots[9].as_ref().map(|item| item.id), Some(2));
+}
+
+// -- The M5 click machine's actions ------------------------------------------
+
+/// The compound tag a tailed fixture's item carries: `{k: "v"}` under the
+/// protocol's own framing — `0x0a` compound, an empty name, the `0x08` string
+/// `k` holding `v`, end — eleven bytes the click's echo must re-emit verbatim.
+const TAILED_ITEM_TAG: [u8; 11] = [
+    0x0a, 0x00, 0x00, 0x08, 0x00, 0x01, b'k', 0x00, 0x01, b'v', 0x00,
+];
+
+/// One non-empty slot whose item carries [`TAILED_ITEM_TAG`].
+fn push_tailed_slot(out: &mut Vec<u8>, id: i16, count: u8, damage: i16) {
+    out.extend_from_slice(&id.to_be_bytes());
+    out.push(count);
+    out.extend_from_slice(&damage.to_be_bytes());
+    out.extend_from_slice(&TAILED_ITEM_TAG);
+}
+
+/// One Window Items payload (0x30) of `slot_count` slots whose `slot`-th
+/// carries the tailed item and whose rest are empty.
+fn tailed_window_items_frame(
+    window_id: u8,
+    slot_count: usize,
+    slot: usize,
+    id: i16,
+    count: u8,
+    damage: i16,
+) -> Vec<u8> {
+    let mut payload = vec![0x30, window_id];
+    payload.extend_from_slice(&(slot_count as i16).to_be_bytes());
+    for index in 0..slot_count {
+        if index == slot {
+            push_tailed_slot(&mut payload, id, count, damage);
+        } else {
+            push_slot(&mut payload, None);
+        }
+    }
+    payload
+}
+
+/// One Click Window payload (0x0E): the window, the slot, the button, the
+/// action, the mode and the echo's own slot bytes.
+fn click_frame(
+    window_id: u8,
+    slot: i16,
+    button: u8,
+    action: i16,
+    mode: u8,
+    echo: &[u8],
+) -> Vec<u8> {
+    let mut payload = vec![0x0e, window_id];
+    payload.extend_from_slice(&slot.to_be_bytes());
+    payload.push(button);
+    payload.extend_from_slice(&action.to_be_bytes());
+    payload.push(mode);
+    payload.extend_from_slice(echo);
+    payload
+}
+
+/// The tailed fixture item's slot payload: id 300, one item, damage 42 and the
+/// compound tail.
+fn tailed_echo() -> Vec<u8> {
+    let mut echo = Vec::new();
+    push_tailed_slot(&mut echo, 300, 1, 42);
+    echo
+}
+
+/// The empty slot's payload: the negative id alone.
+fn empty_echo() -> Vec<u8> {
+    (-1i16).to_be_bytes().to_vec()
+}
+
+/// One serverbound Update Sign payload (0x12): the packed position then the
+/// four lines.
+fn sign_save_payload(x: i32, y: i32, z: i32, lines: [&str; 4]) -> Vec<u8> {
+    let mut payload = vec![0x12];
+    payload.extend_from_slice(&packed_position(x, y, z).to_be_bytes());
+    for line in lines {
+        push_string(&mut payload, line);
+    }
+    payload
+}
+
+/// Every Click Window (0x0E) the client wrote, in order.
+fn clicks(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    frames
+        .iter()
+        .filter(|frame| frame[0] == 0x0e)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_click_sends_the_slots_own_echo_and_the_containers_next_action() {
+    // The chest holds the tailed item in slot 0 and the cursor carries another
+    // stack entirely. One pickup click (mode 0) echoes the source's own branch
+    // return — the clicked slot's pre-click stack, NBT tail and all
+    // (`Container.java:291-296`), never the cursor
+    // (`PlayerControllerMP.windowClick:534-540`) — and the action number is the
+    // container's first (`Container.java:24-31`'s `transactionID`, counting
+    // from one in `Windows`). A click naming a window the session does not hold
+    // runs nothing and sends nothing.
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        tailed_window_items_frame(1, 27, 0, 300, 1, 42),
+        set_slot_frame(1, -1, Some((5, 64, 0))),
+    ]);
+    let (_, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (
+                2,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+            (
+                4,
+                InputEvent::ClickWindow {
+                    window_id: 7,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+        ],
+    );
+
+    let clicks = clicks(&frames);
+    assert_eq!(
+        clicks.len(),
+        1,
+        "one held window, one packet; the window the state does not hold sends nothing: {frames:?}"
+    );
+    assert_eq!(
+        clicks[0],
+        click_frame(1, 0, 0, 1, 0, &tailed_echo()),
+        "the echo is the clicked slot's own stack, tail included, not the cursor's 5 × 64"
+    );
+}
+
+#[test]
+fn a_second_click_advances_the_action_and_a_refused_one_burns_nothing() {
+    // Two clicks land on the tailed slot, with a click for a window the state
+    // does not hold between them: the refused click runs nothing — not even
+    // the counter — and the two landing clicks carry actions 1 and 2. The
+    // second click's mode (4, the drop) leaves the source's carrier null even
+    // though the slot it names holds a stack (`Container.java:446-456`), so
+    // its echo is the empty slot.
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        tailed_window_items_frame(1, 27, 0, 300, 1, 42),
+    ]);
+    let (_, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (
+                2,
+                InputEvent::ClickWindow {
+                    window_id: 9,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+            (
+                4,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+            (
+                6,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 4,
+                },
+            ),
+        ],
+    );
+
+    let clicks = clicks(&frames);
+    assert_eq!(clicks.len(), 2, "two clicks land: {frames:?}");
+    assert_eq!(
+        clicks[0],
+        click_frame(1, 0, 0, 1, 0, &tailed_echo()),
+        "the first landing click carries action 1"
+    );
+    assert_eq!(
+        clicks[1],
+        click_frame(1, 0, 0, 2, 4, &empty_echo()),
+        "the second carries action 2 and the drop's null echo"
+    );
+}
+
+#[test]
+fn a_close_goes_out_once_and_takes_the_window_with_it() {
+    // The view's close path sends C0D once for the container the screen stood
+    // on (`EntityPlayerSP.closeScreen:330-334`) — window 0 included — and the
+    // window leaves the state with it (`closeScreenAndDropStack:336-341`). A
+    // second close of the same window is the state's own close guard answering
+    // nothing; only the open window's close reports a `WindowClosed`.
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &vec![None; 27]),
+    ]);
+    let (events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (2, InputEvent::CloseWindow { window_id: 1 }),
+            (4, InputEvent::CloseWindow { window_id: 1 }),
+            (6, InputEvent::CloseWindow { window_id: 0 }),
+        ],
+    );
+
+    let closes: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x0d)
+        .cloned()
+        .collect();
+    assert_eq!(
+        closes,
+        vec![vec![0x0d, 0x01], vec![0x0d, 0x00]],
+        "the open window's close and the player's own; the repeat is dropped: {frames:?}"
+    );
+    let shut: Vec<u8> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::WindowClosed { window_id } => Some(*window_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shut,
+        vec![1],
+        "the open window leaves the state; window 0 never does: {events:?}"
+    );
+}
+
+#[test]
+fn a_held_item_change_moves_the_selection_and_reports_it() {
+    // The view's own change rule (`PlayerControllerMP.syncCurrentPlayItem:379-388`,
+    // the C09 the running controller sends) hands each move here: the session
+    // writes the new selection (`C09PacketHeldItemChange.writePacketData:32-36`)
+    // and the HUD's own selection event reports the same value.
+    let head = feed_head(&[]);
+    let (events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (2, InputEvent::HeldItemChange { slot: 3 }),
+            (4, InputEvent::HeldItemChange { slot: 0 }),
+        ],
+    );
+
+    let changes: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x09)
+        .cloned()
+        .collect();
+    assert_eq!(
+        changes,
+        vec![vec![0x09, 0x00, 0x03], vec![0x09, 0x00, 0x00]],
+        "the selection rides the short, low byte last: {frames:?}"
+    );
+    let reported: Vec<i16> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::HeldItemSlot { slot } => Some(*slot),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![3, 0],
+        "each move reports the HUD's own event: {events:?}"
+    );
+}
+
+#[test]
+fn the_drop_key_sends_the_two_digging_actions() {
+    // The drop key's own pick (`EntityPlayerSP.dropOneItem:279-284`): the whole
+    // stack is `DROP_ALL_ITEMS` (status 3) and one item `DROP_ITEM` (status 4),
+    // both at `BlockPos.ORIGIN` (0, 0, 0) facing down — `EnumFacing.DOWN`'s
+    // ordinal 0.
+    let head = feed_head(&[]);
+    let (_, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (2, InputEvent::DropItem { whole: true }),
+            (4, InputEvent::DropItem { whole: false }),
+        ],
+    );
+
+    let digs: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x07)
+        .cloned()
+        .collect();
+    assert_eq!(
+        digs,
+        vec![
+            digging_frame(0x03, 0, 0, 0, 0),
+            digging_frame(0x04, 0, 0, 0, 0),
+        ],
+        "the drop pair, whole then one: {frames:?}"
+    );
+}
+
+#[test]
+fn the_creative_and_enchant_writes_and_the_sign_save_go_out() {
+    // The screen's three other sends: a creative slot write with the carried
+    // stack's own drop naming slot −1 (`PlayerControllerMP.sendPacketDropItem:568-574`)
+    // and a real slot's write (`sendSlotPacket:557-563`), the enchantment
+    // offer (`sendEnchantPacket:549-552`) and the sign editor's save
+    // (`GuiEditSign.onGuiClosed:52-60`, the lines as the editor held them).
+    let head = feed_head(&[]);
+    let (_, frames) = flip_session(
+        head,
+        Vec::new(),
+        12,
+        0,
+        vec![
+            (
+                2,
+                InputEvent::CreativeAction {
+                    slot: -1,
+                    item: None,
+                },
+            ),
+            (
+                4,
+                InputEvent::CreativeAction {
+                    slot: 5,
+                    item: Some(MetadataItem {
+                        id: 1,
+                        count: 1,
+                        damage: 0,
+                        nbt: None,
+                    }),
+                },
+            ),
+            (
+                6,
+                InputEvent::EnchantItem {
+                    window_id: 0,
+                    index: 2,
+                },
+            ),
+            (
+                8,
+                InputEvent::UpdateSign {
+                    x: 4,
+                    y: 65,
+                    z: -9,
+                    lines: ["one", "two", "", "four"].map(str::to_string),
+                },
+            ),
+        ],
+    );
+
+    let writes: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| matches!(frame[0], 0x10..=0x12))
+        .cloned()
+        .collect();
+    assert_eq!(
+        writes,
+        vec![
+            vec![0x10, 0xff, 0xff, 0xff, 0xff],
+            vec![0x10, 0x00, 0x05, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00],
+            vec![0x11, 0x00, 0x02],
+            sign_save_payload(4, 65, -9, ["one", "two", "", "four"]),
+        ],
+        "the drop, the slot write, the offer and the save, in the flips' own order: {frames:?}"
+    );
 }
