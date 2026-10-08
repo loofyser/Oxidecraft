@@ -2,7 +2,9 @@
 
 use std::io::{self, Write};
 
-use oxide_proto::codec::write_string;
+use oxide_proto::codec::{self, write_string};
+
+use crate::entity::{MetadataItem, write_slot};
 
 /// Serverbound Login Start (id 0x00).
 pub const LOGIN_START_ID: i32 = 0x00;
@@ -354,6 +356,141 @@ pub fn write_plugin_message(mut out: impl Write, channel: &str, data: &[u8]) -> 
     out.write_all(data)
 }
 
+/// Serverbound Held Item Change (play id 0x09).
+pub const HELD_ITEM_CHANGE_ID: i32 = 0x09;
+
+/// Writes Held Item Change (`C09PacketHeldItemChange.writePacketData:32-36`):
+/// the hotbar slot as a short. The server takes slots 0 through 8 and ignores
+/// anything else (`NetHandlerPlayServer.processHeldItemChange:769-777`), so
+/// the writer does not police the range.
+pub fn write_held_item_change(mut out: impl Write, slot: i16) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, HELD_ITEM_CHANGE_ID)?;
+    codec::write_i16(&mut out, slot)
+}
+
+/// Serverbound Close Window (play id 0x0D).
+pub const CLOSE_WINDOW_ID: i32 = 0x0d;
+
+/// Writes Close Window (`C0DPacketCloseWindow.writePacketData:40-43`): the
+/// window id byte. Window 0 is the player's own inventory.
+pub fn write_close_window(mut out: impl Write, window_id: u8) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, CLOSE_WINDOW_ID)?;
+    codec::write_u8(&mut out, window_id)
+}
+
+/// Serverbound Click Window (play id 0x0E).
+pub const CLICK_WINDOW_ID: i32 = 0x0e;
+
+/// Writes Click Window (`C0EPacketClickWindow.writePacketData:67-75`).
+///
+/// The wire order is the source's own: the window id, the slot, the button,
+/// the action number, the mode, then the clicked item. The item is the stack
+/// the source's click returned (`Container.slotClick` behind
+/// `PlayerControllerMP.windowClick:534-540`) and rides [`write_slot`]
+/// verbatim, NBT tail included — the caller passes what it has and nothing
+/// is recomputed from a decoded window. The action number is the container's
+/// next transaction id, the short the server echoes back in its Confirm
+/// Transaction.
+pub fn write_click_window(
+    mut out: impl Write,
+    window_id: i8,
+    slot: i16,
+    button: i8,
+    action: i16,
+    item: Option<&MetadataItem>,
+    mode: i8,
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, CLICK_WINDOW_ID)?;
+    codec::write_u8(&mut out, window_id as u8)?;
+    codec::write_i16(&mut out, slot)?;
+    codec::write_u8(&mut out, button as u8)?;
+    codec::write_i16(&mut out, action)?;
+    codec::write_u8(&mut out, mode as u8)?;
+    write_slot(&mut out, item)
+}
+
+/// Serverbound Confirm Transaction (play id 0x0F).
+pub const CONFIRM_TRANSACTION_ID: i32 = 0x0f;
+
+/// Writes Confirm Transaction
+/// (`C0FPacketConfirmTransaction.writePacketData:46-51`): the window id
+/// byte, the action number short and the accepted flag byte. The accepted
+/// echo is also the source's own answer to a rejected transaction
+/// (`NetHandlerPlayClient.handleConfirmTransaction:1189-1191`).
+pub fn write_confirm_transaction(
+    mut out: impl Write,
+    window_id: i8,
+    action: i16,
+    accepted: bool,
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, CONFIRM_TRANSACTION_ID)?;
+    codec::write_u8(&mut out, window_id as u8)?;
+    codec::write_i16(&mut out, action)?;
+    codec::write_bool(&mut out, accepted)
+}
+
+/// Serverbound Creative Inventory Action (play id 0x10).
+pub const CREATIVE_INVENTORY_ACTION_ID: i32 = 0x10;
+
+/// Writes Creative Inventory Action
+/// (`C10PacketCreativeInventoryAction.writePacketData:44-48`): the slot short
+/// and the stack, verbatim through [`write_slot`].
+///
+/// The two send sites carry the slot `-1` to drop a dragged stack
+/// (`PlayerControllerMP.sendPacketDropItem:568-574`) and the real slot to
+/// set one (`PlayerControllerMP.sendSlotPacket:557-563`), so the slot is not
+/// policed here.
+pub fn write_creative_inventory_action(
+    mut out: impl Write,
+    slot: i16,
+    item: Option<&MetadataItem>,
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, CREATIVE_INVENTORY_ACTION_ID)?;
+    codec::write_i16(&mut out, slot)?;
+    write_slot(&mut out, item)
+}
+
+/// Serverbound Enchant Item (play id 0x11).
+pub const ENCHANT_ITEM_ID: i32 = 0x11;
+
+/// Writes Enchant Item (`C11PacketEnchantItem.writePacketData:43-47`): the
+/// window id and the enchantment's zero-based offer index, what the
+/// enchantment screen's click sends
+/// (`PlayerControllerMP.sendEnchantPacket:549-552`).
+pub fn write_enchant_item(mut out: impl Write, window_id: u8, index: i8) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, ENCHANT_ITEM_ID)?;
+    codec::write_u8(&mut out, window_id)?;
+    codec::write_u8(&mut out, index as u8)
+}
+
+/// Serverbound Update Sign (play id 0x12).
+pub const UPDATE_SIGN_ID: i32 = 0x12;
+
+/// Writes Update Sign (`C12PacketUpdateSign.writePacketData:44-53`): the
+/// sign's Location Position — packed as `BlockPos.toLong` packs it
+/// (`util/BlockPos.java:200-203`), the same packing the digging packet
+/// carries — then the four lines through the crate's string writer.
+///
+/// Each line is a chat component's JSON, the string the source serializes
+/// (`IChatComponent.Serializer.componentToJson`) and the sign editor sends
+/// when it closes (`GuiEditSign.onGuiClosed:52-60`). The writer carries the
+/// line verbatim and refuses only what the protocol's string rule refuses
+/// (`PacketBuffer.writeString:304-317`, the 32767-byte ceiling).
+pub fn write_update_sign(
+    mut out: impl Write,
+    x: i32,
+    y: i32,
+    z: i32,
+    lines: &[String; 4],
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, UPDATE_SIGN_ID)?;
+    out.write_all(&pack_position(x, y, z).to_be_bytes())?;
+    for line in lines {
+        write_string(&mut out, line)?;
+    }
+    Ok(())
+}
+
 /// The locale cut to the wire's seven-byte cap, on a character boundary.
 ///
 /// A locale at or under the cap is returned unchanged; a longer one keeps its
@@ -404,15 +541,18 @@ pub fn player_position_and_look_payload(
 
 #[cfg(test)]
 mod tests {
-    //! Fixed-literal fixtures for the digging and animation packets: every
-    //! byte is hand-packed from the layout the protocol reference records
-    //! (`docs/research/protocol-47-reference.md` §2.2, the S 0x07 and S 0x0A
-    //! rows) and from the source's own packing (`BlockPos.toLong`), never
-    //! rebuilt with the writer's arithmetic, so a wrong shift cannot be
-    //! confirmed by its own twin.
+    //! Fixed-literal fixtures for the digging and animation packets, and the
+    //! window-and-sign writers' id constants: every byte and every id is
+    //! hand-packed from the layout the protocol reference records
+    //! (`docs/research/protocol-47-reference.md` §2.2, the S 0x07, S 0x0A and
+    //! S 0x09–S 0x12 rows) and from the source's own packing
+    //! (`BlockPos.toLong`), never rebuilt with the writer's arithmetic, so a
+    //! wrong shift cannot be confirmed by its own twin.
 
     use super::{
-        DiggingStatus, write_animation, write_player_block_placement, write_player_digging,
+        CLICK_WINDOW_ID, CLOSE_WINDOW_ID, CONFIRM_TRANSACTION_ID, CREATIVE_INVENTORY_ACTION_ID,
+        DiggingStatus, ENCHANT_ITEM_ID, HELD_ITEM_CHANGE_ID, UPDATE_SIGN_ID, write_animation,
+        write_player_block_placement, write_player_digging,
     };
 
     /// The bytes `write_player_block_placement` writes, for byte-exact
@@ -533,5 +673,23 @@ mod tests {
         );
         assert_eq!(&bytes[10..12], &[0xff, 0xff], "the empty held item stack");
         assert_eq!(&bytes[12..15], &[8, 9, 0], "the cursor's three bytes");
+    }
+
+    #[test]
+    fn the_window_and_sign_writer_ids_are_the_section_ids() {
+        // The play-state ids the seven writers prefix, each the reference
+        // §2.2 row's literal: S 0x09 Held Item Change, S 0x0D Close Window,
+        // S 0x0E Click Window, S 0x0F Confirm Transaction, S 0x10 Creative
+        // Inventory Action, S 0x11 Enchant Item and S 0x12 Update Sign.
+        assert_eq!(HELD_ITEM_CHANGE_ID, 0x09, "0x09 Held Item Change");
+        assert_eq!(CLOSE_WINDOW_ID, 0x0d, "0x0D Close Window");
+        assert_eq!(CLICK_WINDOW_ID, 0x0e, "0x0E Click Window");
+        assert_eq!(CONFIRM_TRANSACTION_ID, 0x0f, "0x0F Confirm Transaction");
+        assert_eq!(
+            CREATIVE_INVENTORY_ACTION_ID, 0x10,
+            "0x10 Creative Inventory Action"
+        );
+        assert_eq!(ENCHANT_ITEM_ID, 0x11, "0x11 Enchant Item");
+        assert_eq!(UPDATE_SIGN_ID, 0x12, "0x12 Update Sign");
     }
 }
