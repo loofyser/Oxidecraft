@@ -223,6 +223,17 @@ impl Windows {
         self.cursor = item;
     }
 
+    /// Drops the carried stack with a close of the player's own window.
+    ///
+    /// The source's close path drops the cursor with the screen for every
+    /// close (`EntityPlayerSP.closeScreenAndDropStack:336-341`), window 0
+    /// included. [`Windows::apply_close`] folds that drop into the window it
+    /// clears; the player's own window never leaves the state, so its close
+    /// reaches the drop through here.
+    pub fn drop_cursor(&mut self) {
+        self.set_cursor(None);
+    }
+
     /// Applies one Window Items (0x30).
     ///
     /// The source writes the packet's stacks over the container's slots, index

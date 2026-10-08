@@ -167,7 +167,7 @@ pub fn write_player_position_and_look(
 }
 
 /// The actions Player Digging carries (`C07PacketPlayerDigging.Action`,
-/// `network/play/client/C07PacketPlayerDigging.java:63-71`).
+/// `network/play/client/C07PacketPlayerDigging.java:72-80`).
 ///
 /// The variants' declaration order is the status id on the wire: the three
 /// block stages the break path writes, then the drop key's two

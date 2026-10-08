@@ -7068,19 +7068,20 @@ fn clicks(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
 #[test]
 fn a_click_sends_the_slots_own_echo_and_the_containers_next_action() {
     // The chest holds the tailed item in slot 0 and the cursor carries another
-    // stack entirely. One pickup click (mode 0) echoes the source's own branch
-    // return — the clicked slot's pre-click stack, NBT tail and all
+    // stack entirely — `5 × 64`, written through the wire's window −1. One
+    // pickup click (mode 0) echoes the source's own branch return — the
+    // clicked slot's pre-click stack, NBT tail and all
     // (`Container.java:291-296`), never the cursor
     // (`PlayerControllerMP.windowClick:534-540`) — and the action number is the
-    // container's first (`Container.java:24-31`'s `transactionID`, counting
-    // from one in `Windows`). A click naming a window the session does not hold
-    // runs nothing and sends nothing.
+    // container's first (`Container.java:19`'s `transactionID`, stepped by
+    // `getNextTransactionID:561-565`, counting from one in `Windows`). A click
+    // naming a window the session does not hold runs nothing and sends nothing.
     let head = feed_head(&[
         open_window_frame(1, "minecraft:chest", "Loot", 27, None),
         tailed_window_items_frame(1, 27, 0, 300, 1, 42),
-        set_slot_frame(1, -1, Some((5, 64, 0))),
+        set_slot_frame(-1, 0, Some((5, 64, 0))),
     ]);
-    let (_, frames) = flip_session(
+    let (events, frames) = flip_session(
         head,
         Vec::new(),
         8,
@@ -7105,6 +7106,24 @@ fn a_click_sends_the_slots_own_echo_and_the_containers_next_action() {
                 },
             ),
         ],
+    );
+
+    // The click's premise rides the state, not the fixture: the window −1
+    // write must land, and its own snapshot reads the carried stack back, so
+    // a dead write can never again leave the echo checked against a null
+    // cursor.
+    let carried = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ClientEvent::WindowSnapshot { cursor, .. } => Some(cursor.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the window writes publish snapshots: {events:?}"));
+    assert_eq!(
+        carried.as_ref().map(|item| (item.id, item.count)),
+        Some((5, 64)),
+        "the fixture write must land, or the claim runs against a null cursor: {events:?}"
     );
 
     let clicks = clicks(&frames);
@@ -7230,10 +7249,62 @@ fn a_close_goes_out_once_and_takes_the_window_with_it() {
 }
 
 #[test]
+fn a_close_of_window_zero_drops_the_carried_stack() {
+    // The close path drops the cursor with the screen for every close
+    // (`EntityPlayerSP.closeScreenAndDropStack:336-341`), window 0 included:
+    // the player's own window never leaves the state, but its carried stack
+    // does. The later window-0 write republishes the projection, where the
+    // empty carried stack shows.
+    let head = feed_head(&[set_slot_frame(-1, 0, Some((5, 64, 0)))]);
+    let tail = framed(&[set_slot_frame(0, 9, Some((1, 1, 0)))]);
+    let (events, frames) = flip_session(
+        head,
+        tail,
+        8,
+        0,
+        vec![(2, InputEvent::CloseWindow { window_id: 0 })],
+    );
+
+    let closes: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x0d)
+        .cloned()
+        .collect();
+    assert_eq!(
+        closes,
+        vec![vec![0x0d, 0x00]],
+        "exactly one 0x0D for the player's own close: {frames:?}"
+    );
+    let shut: Vec<u8> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::WindowClosed { window_id } => Some(*window_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shut.is_empty(),
+        "window 0 never reports a close: {events:?}"
+    );
+    let carried = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ClientEvent::WindowSnapshot { cursor, .. } => Some(cursor.clone()),
+            _ => None,
+        })
+        .expect("the window writes publish snapshots");
+    assert_eq!(
+        carried, None,
+        "the close drops the carried stack with the screen: {events:?}"
+    );
+}
+
+#[test]
 fn a_held_item_change_moves_the_selection_and_reports_it() {
     // The view's own change rule (`PlayerControllerMP.syncCurrentPlayItem:379-388`,
     // the C09 the running controller sends) hands each move here: the session
-    // writes the new selection (`C09PacketHeldItemChange.writePacketData:32-36`)
+    // writes the new selection (`C09PacketHeldItemChange.writePacketData:32-35`)
     // and the HUD's own selection event reports the same value.
     let head = feed_head(&[]);
     let (events, frames) = flip_session(

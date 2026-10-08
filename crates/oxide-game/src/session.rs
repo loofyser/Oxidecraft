@@ -969,11 +969,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 }
                                 InputEvent::HeldItemChange { slot } => {
                                     // The selection rides the model
-                                    // (`EntityPlayerSP.onUpdate`'s own
-                                    // `inventory.currentItem` assignment,
-                                    // `EntityPlayerSP.java:214-219`) and the
-                                    // wire (`PlayerControllerMP.syncCurrentPlayItem:379-388`
-                                    // reaching `C09PacketHeldItemChange:32-36`),
+                                    // (`Minecraft.java:2085`'s hotbar keys and
+                                    // `:1879`'s wheel reaching
+                                    // `InventoryPlayer.changeCurrentItem:165`)
+                                    // and the wire
+                                    // (`PlayerControllerMP.syncCurrentPlayItem:379-388`
+                                    // reaching `C09PacketHeldItemChange:32-35`),
                                     // and the HUD hears the same value.
                                     windows.player.inventory.set_selected(slot);
                                     let request =
@@ -2456,12 +2457,14 @@ fn click_echo(windows: &Windows, window_id: i8, slot: i16, mode: i8) -> Option<M
 /// The source's close path writes C0D for the container the screen stood on
 /// (`EntityPlayerSP.closeScreen:330-334`) — window 0 included, which is why the
 /// send cannot simply follow the state's rule — and drops the cursor with the
-/// screen (`closeScreenAndDropStack:336-341`). Every other id is the state's own
+/// screen (`closeScreenAndDropStack:336-341`). Window 0 stays in the state but
+/// its carried stack drops with the close; every other id is the state's own
 /// call: [`Windows::apply_close`] clears the live open window and refuses —
 /// counting it — a close that names nothing, so a second close of an
 /// already-shut window sends nothing and changes nothing.
 fn close_window(windows: &mut Windows, window_id: u8) -> bool {
     if window_id == 0 {
+        windows.drop_cursor();
         return true;
     }
     windows.apply_close(window_id)

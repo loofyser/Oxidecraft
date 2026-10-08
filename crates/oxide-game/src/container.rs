@@ -432,7 +432,7 @@ impl LocalContainer {
         self.reset_drag();
     }
 
-    /// Clears the drag's state (`Container.resetDrag`, `Container.java:711-715`).
+    /// Clears the drag's state (`Container.resetDrag`, `Container.java:713-717`).
     fn reset_drag(&mut self) {
         self.drag_event = 0;
         self.drag_mode = -1;
@@ -1089,7 +1089,7 @@ mod tests {
         assert_eq!(
             container.slots[46].as_ref().map(|s| s.count),
             Some(15),
-            "the full slot gives its share on the second pass (`:466`)"
+            "the full slot gives its share on the second pass (`:467-473`)"
         );
         assert_eq!(
             container.cursor.as_ref().map(|s| s.count),
