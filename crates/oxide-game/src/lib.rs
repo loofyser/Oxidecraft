@@ -13,4 +13,5 @@ pub mod player;
 pub mod scoreboard;
 pub mod session;
 pub mod ticker;
+pub mod windows;
 pub mod world_view;

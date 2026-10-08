@@ -11,13 +11,16 @@ use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::{Aim, Face};
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::{Objective, Scoreboard, Team, entry_colour};
-use oxide_game::session::{ClientEvent, Session, SessionConfig, SessionError, recompute_passes};
+use oxide_game::session::{
+    ClientEvent, Session, SessionConfig, SessionError, StatusEffect, recompute_passes,
+};
 use oxide_game::ticker::TICK_CATCHUP_CAP;
 use oxide_proto::conn::{Conn, DeadlineStream};
 use oxide_proto::frame::{Compression, write_frame};
 use oxide_proto_v47::clientbound::{MapChunkBulk, PlayerPositionAndLook};
 use oxide_proto_v47::column::block_index;
 use oxide_proto_v47::serverbound::ClientSettings;
+use oxide_proto_v47::window::WindowKind;
 use oxide_render::terrain::{ChunkMesh, Vertex};
 use oxide_world::entity::EntityKind;
 use oxide_world::world::World;
@@ -6413,4 +6416,559 @@ fn a_time_update_of_the_smallest_value_freezes_the_clock_without_panicking() {
         .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
         .count();
     assert!(ticks >= 3, "the quiet stretch owes whole steps: {ticks}");
+}
+
+// -- The M5 window and inventory scripts -------------------------------------
+
+/// One slot payload: a non-empty slot's id, count and damage with the
+/// no-data tag byte, or the empty slot's negative id alone.
+fn push_slot(out: &mut Vec<u8>, item: Option<(i16, u8, i16)>) {
+    match item {
+        Some((id, count, damage)) => {
+            out.extend_from_slice(&id.to_be_bytes());
+            out.push(count);
+            out.extend_from_slice(&damage.to_be_bytes());
+            out.push(0);
+        }
+        None => out.extend_from_slice(&(-1i16).to_be_bytes()),
+    }
+}
+
+/// One Set Slot payload (0x2F): the window id, the slot short and the slot.
+fn set_slot_frame(window_id: i8, slot: i16, item: Option<(i16, u8, i16)>) -> Vec<u8> {
+    let mut payload = vec![0x2f, window_id as u8];
+    payload.extend_from_slice(&slot.to_be_bytes());
+    push_slot(&mut payload, item);
+    payload
+}
+
+/// One Window Items payload (0x30): the window id, the count short and the
+/// slots.
+fn window_items_frame(window_id: u8, slots: &[Option<(i16, u8, i16)>]) -> Vec<u8> {
+    let mut payload = vec![0x30, window_id];
+    payload.extend_from_slice(&(slots.len() as i16).to_be_bytes());
+    for item in slots {
+        push_slot(&mut payload, *item);
+    }
+    payload
+}
+
+/// One Open Window payload (0x2D): the window id, the kind string, the title,
+/// the slot count and — only for the horse's kind — the entity id.
+fn open_window_frame(
+    window_id: u8,
+    kind: &str,
+    title: &str,
+    slot_count: u8,
+    entity_id: Option<i32>,
+) -> Vec<u8> {
+    let mut payload = vec![0x2d, window_id];
+    push_string(&mut payload, kind);
+    push_string(&mut payload, title);
+    payload.push(slot_count);
+    if let Some(entity_id) = entity_id {
+        payload.extend_from_slice(&entity_id.to_be_bytes());
+    }
+    payload
+}
+
+/// One Close Window payload (0x2E).
+fn close_window_frame(window_id: u8) -> Vec<u8> {
+    vec![0x2e, window_id]
+}
+
+/// One Window Property payload (0x31): the window id, the property and the
+/// value.
+fn window_property_frame(window_id: u8, property: i16, value: i16) -> Vec<u8> {
+    let mut payload = vec![0x31, window_id];
+    payload.extend_from_slice(&property.to_be_bytes());
+    payload.extend_from_slice(&value.to_be_bytes());
+    payload
+}
+
+/// One Confirm Transaction payload (0x32): the window id, the action short
+/// and the accepted byte.
+fn confirm_transaction_frame(window_id: i8, action: i16, accepted: bool) -> Vec<u8> {
+    let mut payload = vec![0x32, window_id as u8];
+    payload.extend_from_slice(&action.to_be_bytes());
+    payload.push(u8::from(accepted));
+    payload
+}
+
+/// One clientbound Held Item Change payload (0x09): the slot byte.
+fn held_item_change_frame(slot: i8) -> Vec<u8> {
+    vec![0x09, slot as u8]
+}
+
+/// One Set Experience payload (0x1F): the bar float, then the level and total
+/// VarInts.
+fn set_experience_frame(bar: f32, level: i32, total: i32) -> Vec<u8> {
+    let mut payload = vec![0x1f];
+    payload.extend_from_slice(&bar.to_be_bytes());
+    push_varint(&mut payload, level);
+    push_varint(&mut payload, total);
+    payload
+}
+
+/// One Entity Effect payload (0x1D): the entity id, the effect and amplifier
+/// bytes, the duration and the hide-particles byte.
+fn entity_effect_frame(
+    entity_id: i32,
+    effect_id: u8,
+    amplifier: u8,
+    duration: i32,
+    hide_particles: bool,
+) -> Vec<u8> {
+    let mut payload = vec![0x1d];
+    push_varint(&mut payload, entity_id);
+    payload.extend_from_slice(&[effect_id, amplifier]);
+    push_varint(&mut payload, duration);
+    payload.push(u8::from(hide_particles));
+    payload
+}
+
+/// One Remove Entity Effect payload (0x1E): the entity id and the effect.
+fn remove_entity_effect_frame(entity_id: i32, effect_id: u8) -> Vec<u8> {
+    let mut payload = vec![0x1e];
+    push_varint(&mut payload, entity_id);
+    payload.push(effect_id);
+    payload
+}
+
+/// The packed block position the sign packets carry: x and z as 26 signed
+/// bits, y as 12.
+fn packed_position(x: i32, y: i32, z: i32) -> i64 {
+    (i64::from(x) << 38) | ((i64::from(y) & 0xfff) << 26) | (i64::from(z) & 0x3ff_ffff)
+}
+
+/// One Update Sign payload (0x33): the packed position and the four lines.
+fn update_sign_frame(x: i32, y: i32, z: i32, lines: [&str; 4]) -> Vec<u8> {
+    let mut payload = vec![0x33];
+    payload.extend_from_slice(&packed_position(x, y, z).to_be_bytes());
+    for line in lines {
+        push_string(&mut payload, line);
+    }
+    payload
+}
+
+/// One Open Sign Editor payload (0x36): the packed position.
+fn sign_editor_open_frame(x: i32, y: i32, z: i32) -> Vec<u8> {
+    let mut payload = vec![0x36];
+    payload.extend_from_slice(&packed_position(x, y, z).to_be_bytes());
+    payload
+}
+
+/// The window events of `events`, in order, with everything else dropped.
+fn window_events(events: &[ClientEvent]) -> Vec<&ClientEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ClientEvent::WindowOpened { .. }
+                    | ClientEvent::WindowClosed { .. }
+                    | ClientEvent::WindowSnapshot { .. }
+            )
+        })
+        .collect()
+}
+
+/// Every Confirm Transaction the client wrote, as (window, action, accepted).
+fn confirmations(payloads: &[Vec<u8>]) -> Vec<(i8, i16, bool)> {
+    payloads
+        .iter()
+        .filter(|payload| payload.first() == Some(&0x0f))
+        .map(|payload| {
+            (
+                payload[1] as i8,
+                i16::from_be_bytes([payload[2], payload[3]]),
+                payload[4] != 0,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_window_zero_items_and_set_slot_publish_the_projected_snapshot() {
+    // Join Game opens window 0; the server names its contents as one Window
+    // Items — the 45-slot layout with the crafting result, the armour band and
+    // the hotbar — and one later Set Slot grows a hotbar stack.
+    let mut slots: Vec<Option<(i16, u8, i16)>> = vec![None; 45];
+    slots[0] = Some((1, 1, 0));
+    slots[5] = Some((298, 1, 0));
+    slots[36] = Some((1, 2, 0));
+    let head = feed_head(&[
+        window_items_frame(0, &slots),
+        set_slot_frame(0, 36, Some((1, 5, 0))),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let windows = window_events(&events);
+    assert!(windows.len() >= 2, "each change publishes: {events:?}");
+
+    let ClientEvent::WindowSnapshot {
+        window_id,
+        slots,
+        cursor,
+        properties,
+        hotbar_pop,
+    } = windows[0]
+    else {
+        panic!("the window items publish a snapshot: {:?}", windows[0]);
+    };
+    assert_eq!(*window_id, 0, "the projection is window 0's");
+    assert_eq!(slots.len(), 45, "the container's whole layout");
+    assert_eq!(
+        slots[0].as_ref().map(|item| item.id),
+        Some(1),
+        "the crafting result"
+    );
+    assert_eq!(
+        slots[5].as_ref().map(|item| item.id),
+        Some(298),
+        "the armour band"
+    );
+    assert_eq!(
+        slots[36].as_ref().map(|item| (item.id, item.count)),
+        Some((1, 2)),
+        "the hotbar"
+    );
+    assert!(slots[44].is_none(), "the rest of the hotbar is empty");
+    assert!(cursor.is_none(), "nothing is carried");
+    assert!(
+        properties.is_empty(),
+        "window 0's container has no properties"
+    );
+    assert_eq!(hotbar_pop, &[0; 9], "a whole-set write carries no pop");
+
+    let ClientEvent::WindowSnapshot {
+        slots, hotbar_pop, ..
+    } = windows[1]
+    else {
+        panic!("the set slot publishes a snapshot: {:?}", windows[1]);
+    };
+    assert_eq!(
+        slots[36].as_ref().map(|item| (item.id, item.count)),
+        Some((1, 5)),
+        "the write landed"
+    );
+    assert_eq!(
+        hotbar_pop[0], 5,
+        "the grown stack popped (`NetHandlerPlayClient.java:1158`)"
+    );
+    assert!(
+        hotbar_pop[1..].iter().all(|pop| *pop == 0),
+        "no other hotbar slot popped"
+    );
+}
+
+#[test]
+fn an_open_window_replaces_the_live_one_and_a_close_clears_it() {
+    // A chest: the server opens window 1, names its contents, writes a slot
+    // and a property, then closes it. One write naming the closed window lands
+    // nowhere.
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &vec![None; 27]),
+        set_slot_frame(1, 3, Some((4, 1, 0))),
+        window_property_frame(1, 0, 40),
+        close_window_frame(1),
+        set_slot_frame(1, 0, Some((5, 1, 0))),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let windows = window_events(&events);
+    assert_eq!(
+        windows.len(),
+        5,
+        "the open, the items, the two writes and the close publish; the write after the close lands nowhere: {events:?}"
+    );
+
+    let ClientEvent::WindowOpened {
+        window_id,
+        kind,
+        title,
+    } = windows[0]
+    else {
+        panic!("the open publishes first: {:?}", windows[0]);
+    };
+    assert_eq!(
+        (*window_id, kind, title.as_str()),
+        (1, &WindowKind::Chest, "Loot")
+    );
+
+    let ClientEvent::WindowSnapshot {
+        window_id, slots, ..
+    } = windows[1]
+    else {
+        panic!("the items publish a snapshot: {:?}", windows[1]);
+    };
+    assert_eq!(*window_id, 1, "the open window's own snapshot");
+    assert_eq!(slots.len(), 27, "its own vector, sized by the packet");
+    assert!(slots.iter().all(Option::is_none), "every slot is empty");
+
+    let ClientEvent::WindowSnapshot {
+        slots, properties, ..
+    } = windows[3]
+    else {
+        panic!("the property write publishes a snapshot: {:?}", windows[3]);
+    };
+    assert_eq!(properties, &vec![40], "the property grew the vector");
+    assert_eq!(
+        slots[3].as_ref().map(|item| item.id),
+        Some(4),
+        "the slot write is still there"
+    );
+
+    let ClientEvent::WindowClosed { window_id } = windows[4] else {
+        panic!("the close publishes: {:?}", windows[4]);
+    };
+    assert_eq!(*window_id, 1);
+}
+
+#[test]
+fn a_rejected_confirm_for_the_live_window_is_resent_accepted() {
+    // The source's own guard (`NetHandlerPlayClient.handleConfirmTransaction:1174-1196`):
+    // window 0 — the player's own, held from Join Game — and the live open
+    // window's id answer a rejection with a fresh accepted transaction; an
+    // accepted confirmation and a window the session does not hold answer
+    // nothing.
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        confirm_transaction_frame(1, 7, false),
+        confirm_transaction_frame(1, 8, true),
+        confirm_transaction_frame(2, 9, false),
+        confirm_transaction_frame(0, 10, false),
+        confirm_transaction_frame(-1, 11, false),
+    ]);
+    let (_, outgoing) = run_feed_session(head, Vec::new(), 0, 0);
+    let sent = confirmations(&client_payloads(&outgoing));
+    assert_eq!(
+        sent,
+        vec![(1i8, 7i16, true), (0i8, 10i16, true)],
+        "the two rejections the guard admits are re-sent accepted, with the packet's own action"
+    );
+}
+
+#[test]
+fn a_held_item_change_selects_a_hotbar_slot() {
+    let head = feed_head(&[
+        held_item_change_frame(3),
+        held_item_change_frame(9),
+        held_item_change_frame(-1),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let selected: Vec<i16> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::HeldItemSlot { slot } => Some(*slot),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        selected,
+        vec![3],
+        "only a slot the hotbar holds is selected (`handleHeldItemChange:615-621`): {events:?}"
+    );
+}
+
+#[test]
+fn set_experience_publishes_the_bar_level_and_total() {
+    let head = feed_head(&[set_experience_frame(0.5, 12, 345)]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let experience: Vec<(f32, i32, i32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Experience { bar, level, total } => Some((*bar, *level, *total)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(experience, vec![(0.5, 12, 345)], "{events:?}");
+}
+
+#[test]
+fn the_players_own_effects_combine_and_remove() {
+    // The own entity's id is 20 (`join_game_frame`): the effects that land on
+    // it are the store's, and the same effect id combines the way the source's
+    // own `PotionEffect.combine:63-85` does — a stronger amplifier replaces the
+    // pair, a removal drops the id, and another entity's effects land nowhere.
+    let head = feed_head(&[
+        entity_effect_frame(20, 1, 0, 200, true),
+        entity_effect_frame(20, 1, 1, 50, true),
+        entity_effect_frame(21, 2, 0, 100, true),
+        entity_effect_frame(20, 3, 2, 300, true),
+        remove_entity_effect_frame(20, 3),
+        remove_entity_effect_frame(20, 4),
+        remove_entity_effect_frame(21, 1),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let effects: Vec<Vec<StatusEffect>> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Effects { effects } => Some(effects.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        effects.len(),
+        4,
+        "three additions and the one removal that landed: {events:?}"
+    );
+    assert_eq!(
+        effects[0],
+        vec![StatusEffect {
+            effect_id: 1,
+            amplifier: 0,
+            duration: 200,
+        }]
+    );
+    assert_eq!(
+        effects[1],
+        vec![StatusEffect {
+            effect_id: 1,
+            amplifier: 1,
+            duration: 50,
+        }],
+        "a stronger amplifier replaces the pair, duration and all"
+    );
+    assert_eq!(
+        effects[2],
+        vec![
+            StatusEffect {
+                effect_id: 1,
+                amplifier: 1,
+                duration: 50,
+            },
+            StatusEffect {
+                effect_id: 3,
+                amplifier: 2,
+                duration: 300,
+            },
+        ],
+        "the store holds both, ascending by effect id"
+    );
+    assert_eq!(
+        effects[3],
+        vec![StatusEffect {
+            effect_id: 1,
+            amplifier: 1,
+            duration: 50,
+        }],
+        "the removal drops the third effect alone"
+    );
+}
+
+#[test]
+fn an_own_metadata_air_change_publishes_the_air_supply() {
+    let head = feed_head(&[
+        entity_metadata_frame(20, &[(1, 1, vec![0x01, 0x2c])]),
+        entity_metadata_frame(21, &[(1, 1, vec![0x00, 0x2c])]),
+        entity_metadata_frame(20, &[(0, 0, meta_byte(0))]),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let air: Vec<i16> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Air { air } => Some(*air),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        air,
+        vec![300],
+        "the own id's index 1 lands; another entity's and an own block without one report nothing: {events:?}"
+    );
+}
+
+#[test]
+fn a_merchant_trade_list_publishes_its_offers() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1i32.to_be_bytes());
+    body.push(2);
+    for (uses, max_uses) in [(0i32, 7i32), (3, 12)] {
+        push_slot(&mut body, Some((388, 1, 0)));
+        push_slot(&mut body, Some((266, 1, 0)));
+        body.push(0);
+        body.push(0);
+        body.extend_from_slice(&uses.to_be_bytes());
+        body.extend_from_slice(&max_uses.to_be_bytes());
+    }
+    let head = feed_head(&[plugin_message_frame("MC|TrList", &body)]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let offers = events
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::MerchantOffers { offers } => Some(offers.clone()),
+            _ => None,
+        })
+        .expect("the trade list publishes its offers");
+    assert_eq!(offers.len(), 2, "both offers: {events:?}");
+    assert_eq!(offers[0].first.as_ref().map(|item| item.id), Some(388));
+    assert_eq!(offers[0].output.as_ref().map(|item| item.id), Some(266));
+    assert!(offers[0].second.is_none(), "no second item was named");
+    assert_eq!((offers[0].uses, offers[0].max_uses), (0, 7));
+    assert_eq!((offers[1].uses, offers[1].max_uses), (3, 12));
+}
+
+#[test]
+fn a_sign_update_and_editor_open_publish_the_position() {
+    let head = feed_head(&[
+        update_sign_frame(4, 65, -9, ["first", "", "third", ""]),
+        sign_editor_open_frame(4, 65, -9),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let signs: Vec<&ClientEvent> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ClientEvent::SignTextChanged { .. } | ClientEvent::SignEditorOpen { .. }
+            )
+        })
+        .collect();
+    assert_eq!(signs.len(), 2, "both packets report: {events:?}");
+    let ClientEvent::SignTextChanged { x, y, z, lines } = signs[0] else {
+        panic!("the update publishes first: {:?}", signs[0]);
+    };
+    assert_eq!(
+        (*x, *y, *z, lines),
+        (
+            4,
+            65,
+            -9,
+            &[
+                "first".to_string(),
+                String::new(),
+                "third".to_string(),
+                String::new()
+            ]
+        ),
+        "the packed position round-trips, negative z and all"
+    );
+    let ClientEvent::SignEditorOpen { x, y, z } = signs[1] else {
+        panic!("the editor open publishes behind it: {:?}", signs[1]);
+    };
+    assert_eq!((*x, *y, *z), (4, 65, -9));
+}
+
+#[test]
+fn a_burst_of_window_writes_for_a_closed_window_builds_one_snapshot() {
+    // A hostile flood of writes for a window the session does not hold: every
+    // frame is read and dropped with the counter, and no snapshot is built on
+    // the way — the projection is per change, not per frame. The one write
+    // that lands publishes once.
+    let mut payloads: Vec<Vec<u8>> = (0..200)
+        .map(|slot| set_slot_frame(9, slot, Some((1, 1, 0))))
+        .collect();
+    payloads.push(set_slot_frame(0, 9, Some((2, 1, 0))));
+    let head = feed_head(&payloads);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let windows = window_events(&events);
+    assert_eq!(
+        windows.len(),
+        1,
+        "one landing write, one snapshot: {events:?}"
+    );
+    let ClientEvent::WindowSnapshot { slots, .. } = windows[0] else {
+        panic!("the landing write publishes a snapshot: {:?}", windows[0]);
+    };
+    assert_eq!(slots[9].as_ref().map(|item| item.id), Some(2));
 }

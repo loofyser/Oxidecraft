@@ -33,6 +33,7 @@
 //! about thirty seconds.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -54,20 +55,25 @@ use oxide_proto_v47::clientbound::{
 use oxide_proto_v47::entity::{
     self, Animation, AttachEntity, CollectItem, DestroyEntities, EntityEquipment, EntityHeadLook,
     EntityLook, EntityLookAndRelativeMove, EntityMetadata, EntityRelativeMove, EntityTeleport,
-    EntityVelocity, MobType, ObjectType, SpawnGlobal, SpawnMob, SpawnObject, SpawnPainting,
-    SpawnPlayer, SpawnXpOrb,
+    EntityVelocity, MetadataItem, MetadataValue, MobType, ObjectType, SpawnGlobal, SpawnMob,
+    SpawnObject, SpawnPainting, SpawnPlayer, SpawnXpOrb,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
     ClientSettings, ClientStatusAction, DiggingStatus, EntityAction, write_animation,
-    write_client_settings, write_client_status, write_entity_action, write_keep_alive,
-    write_login_start, write_player, write_player_abilities, write_player_block_placement,
-    write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
-    write_plugin_message,
+    write_client_settings, write_client_status, write_confirm_transaction, write_entity_action,
+    write_keep_alive, write_login_start, write_player, write_player_abilities,
+    write_player_block_placement, write_player_digging, write_player_look, write_player_position,
+    write_player_position_and_look, write_plugin_message,
 };
 use oxide_proto_v47::ui::{
     ChatMessage, ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam,
     TabHeaderFooter, write_chat,
+};
+use oxide_proto_v47::window::{
+    CloseWindow, ConfirmTransaction, EntityEffect, MerchantOffer, MerchantOffers, OpenWindow,
+    RemoveEntityEffect, SetExperience, SetSlot, SignEditorOpen, UpdateSign, WindowItems,
+    WindowKind, WindowProperty,
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
@@ -97,10 +103,26 @@ use crate::physics;
 use crate::player::{Abilities, Player};
 use crate::scoreboard::{Scoreboard, colour_from_wire};
 use crate::ticker::Ticker;
+use crate::windows::{HOTBAR_SIZE, OpenWindowState, Windows};
 use crate::world_view::WorldView;
 
 /// The plugin channel a vanilla client announces itself on.
 const BRAND_CHANNEL: &str = "MC|Brand";
+
+/// The merchant trade list's own custom-payload channel
+/// (`NetHandlerPlayClient.handleCustomPayload:1826-1845`).
+const TRADE_LIST_CHANNEL: &str = "MC|TrList";
+
+/// Clientbound Held Item Change's play id (0x09): one byte, the selected
+/// hotbar slot (`S09PacketHeldItemChange.readPacketData:29-31`).
+///
+/// The protocol crate carries the serverbound writer alone, so the reader
+/// lives here beside its caller.
+const HELD_ITEM_CHANGE_ID: i32 = 0x09;
+
+/// The own entity's metadata index the air supply rides
+/// (`Entity.java:286-287`: index 1 of the own block, a short).
+const AIR_METADATA_INDEX: u8 = 1;
 
 /// The brand payload, as the capture records the vanilla client sending it: a
 /// length-prefixed `vanilla`.
@@ -527,6 +549,150 @@ pub enum ClientEvent {
         /// The kick reason as chat JSON, as the server sent it.
         reason: String,
     },
+    /// A window the server opened, from clientbound 0x2D.
+    ///
+    /// Window 0 is the player's own and is never announced — the state holds
+    /// it from Join Game — and the server opens at most one further window at
+    /// a time (`NetHandlerPlayClient.handleOpenWindow:1092-1120`). The title
+    /// travels as sent — chat JSON — and the kind names the screen the window
+    /// belongs to.
+    WindowOpened {
+        /// The window id the server assigned.
+        window_id: u8,
+        /// The window's kind, from its type string.
+        kind: WindowKind,
+        /// The title as chat JSON, exactly as sent.
+        title: String,
+    },
+    /// The server closed a window, from clientbound 0x2E.
+    ///
+    /// Reported for the live open window alone, which the close cleared — the
+    /// carried stack dropped with it
+    /// (`handleCloseWindow:1311-1315` reaching
+    /// `EntityPlayerSP.closeScreenAndDropStack:336-341`).
+    WindowClosed {
+        /// The window id the close named.
+        window_id: u8,
+    },
+    /// One window's state after a change.
+    ///
+    /// Built per change — a whole-set write, a slot write, a property write,
+    /// the hotbar pop's tick — and never per frame: a write that lands
+    /// nowhere reports nothing. Window 0's snapshot projects the crafting
+    /// slots and the inventory into the container's 45-slot layout
+    /// (`ContainerPlayer.java:36-67`), and an opened window projects its own
+    /// slot vector. `hotbar_pop` is the source's `animationsToGo`, which the
+    /// HUD's pop math reads (`GuiIngame.java:1043-1053`).
+    WindowSnapshot {
+        /// The window the snapshot belongs to.
+        window_id: u8,
+        /// The window's slots, window 0's 45-slot layout included.
+        slots: Vec<Option<MetadataItem>>,
+        /// The carried stack (`InventoryPlayer.getItemStack`), which rides
+        /// every window.
+        cursor: Option<MetadataItem>,
+        /// The window's properties by index: a furnace's burn and cook state,
+        /// an enchanting table's levels.
+        properties: Vec<i16>,
+        /// The hotbar's pop, one counter per slot, window 0's own.
+        hotbar_pop: [u8; 9],
+    },
+    /// The selected hotbar slot, from clientbound 0x09.
+    ///
+    /// The session sets the inventory's own selection and reports the slot; a
+    /// slot outside the hotbar's nine is ignored
+    /// (`NetHandlerPlayClient.handleHeldItemChange:615-621`).
+    HeldItemSlot {
+        /// The hotbar slot, 0 through 8.
+        slot: i16,
+    },
+    /// The player's experience, from clientbound 0x1F.
+    Experience {
+        /// The bar's fill, 0 through 1.
+        bar: f32,
+        /// The player's level.
+        level: i32,
+        /// The player's total experience.
+        total: i32,
+    },
+    /// The own player's air supply, from clientbound 0x1C's metadata index 1.
+    ///
+    /// The air rides the own entity's metadata block (`Entity.java:286-287`,
+    /// index 1) and arrives as the source's own short.
+    Air {
+        /// The air in ticks; 300 is a full breath.
+        air: i16,
+    },
+    /// The own player's live effects, after an addition or a removal
+    /// (clientbound 0x1D and 0x1E).
+    ///
+    /// The store holds the own player's effects alone, ascending by effect
+    /// id; a later effect on a held id combines into the one held, the
+    /// source's own rule (`PotionEffect.combine:63-85`).
+    Effects {
+        /// Every effect the player holds, ascending by id.
+        effects: Vec<StatusEffect>,
+    },
+    /// The server opened a sign's editor, from clientbound 0x36.
+    SignEditorOpen {
+        /// The sign's world x.
+        x: i32,
+        /// The sign's world y.
+        y: i32,
+        /// The sign's world z.
+        z: i32,
+    },
+    /// A sign's text arrived, from clientbound 0x33.
+    ///
+    /// The lines travel as sent — chat JSON — and the session's sign map holds
+    /// the last text per position for the view that draws the sign.
+    SignTextChanged {
+        /// The sign's world x.
+        x: i32,
+        /// The sign's world y.
+        y: i32,
+        /// The sign's world z.
+        z: i32,
+        /// The four lines, as sent.
+        lines: [String; 4],
+    },
+    /// A merchant's trade list, from the `MC|TrList` custom payload.
+    ///
+    /// Read through the payload's own decoder
+    /// (`NetHandlerPlayClient.handleCustomPayload:1826-1845` reaching
+    /// `MerchantRecipeList.readFromBuf:76-106`); the merchant screen that
+    /// shows it is a later task's.
+    MerchantOffers {
+        /// The offers, in wire order.
+        offers: Vec<MerchantOffer>,
+    },
+}
+
+/// One status effect the player holds.
+///
+/// The store's unit: the effect's id, its amplifier and the ticks left —
+/// `PotionEffect`'s own `potionID`, `amplifier` and `duration`. The source's
+/// ambient and particles flags are carried by neither this type nor
+/// [`ClientEvent::Effects`]: the wire's hide-particles byte feeds the source's
+/// `showParticles`, and no consumer of this event reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusEffect {
+    /// The effect's id.
+    pub effect_id: u8,
+    /// The effect's amplifier: 0 is level I.
+    pub amplifier: u8,
+    /// The effect's remaining duration in ticks.
+    pub duration: i32,
+}
+
+/// One sign's last text, keyed by its position in the session's sign map.
+///
+/// The lines are the source's chat components as sent; the sign they are drawn
+/// on is the world's, and an entry arrives only from clientbound 0x33.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SignText {
+    /// The four lines, as sent.
+    pub lines: [String; 4],
 }
 
 /// Something went wrong in the session.
@@ -689,6 +855,16 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // 0x01), in send order (`GuiChat.keyTyped`:104-137 sends on the
         // Enter press, one message per press).
         let mut chat_messages: Vec<String> = Vec::new();
+        // The player's own window and the one window a server may open, with
+        // the wire's apply rules for both.
+        let mut windows = Windows::new();
+        // The own player's live effects, by effect id: the store 0x1D and
+        // 0x1E maintain (`EntityLivingBase.addPotionEffect:745-762` behind
+        // `NetHandlerPlayClient.handleEntityEffect:1502-1513`).
+        let mut effects: BTreeMap<u8, StatusEffect> = BTreeMap::new();
+        // The last text every sign carried, by position: what the view draws
+        // the sign's front face from.
+        let mut signs: BTreeMap<(i32, i32, i32), SignText> = BTreeMap::new();
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -1411,6 +1587,20 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         }
                         EntityMetadata::ID => {
                             let metadata = decoded(id, entity::decode_entity_metadata(body))?;
+                            // The player's own block carries the air supply at
+                            // index 1 (`Entity.java:286-287`); the own-id path
+                            // reads it the way the status branch above reads
+                            // the hurt flash, and the store takes the block as
+                            // it stands.
+                            if Some(metadata.entity_id) == player.entity_id {
+                                for (index, value) in &metadata.metadata.entries {
+                                    if *index == AIR_METADATA_INDEX {
+                                        if let MetadataValue::Short(air) = value {
+                                            report(events, ClientEvent::Air { air: *air });
+                                        }
+                                    }
+                                }
+                            }
                             entities.apply_metadata(metadata.entity_id, metadata.metadata);
                         }
                         PlayerListItem::ID => {
@@ -1611,9 +1801,218 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             }
                             tab_text = Some(next);
                         }
+                        OpenWindow::ID => {
+                            let open = decoded(id, OpenWindow::decode(body))?;
+                            // The server opens at most one window at a time;
+                            // the fresh container replaces whatever stood
+                            // (`handleOpenWindow:1092-1120`), and the slot
+                            // count names the vector its Window Items will
+                            // fill.
+                            windows.apply_open(OpenWindowState {
+                                window_id: open.window_id,
+                                kind: open.kind,
+                                title: open.title.clone(),
+                                slots: vec![None; usize::from(open.slot_count)],
+                                properties: Vec::new(),
+                                entity_id: open.entity_id,
+                            });
+                            report(
+                                events,
+                                ClientEvent::WindowOpened {
+                                    window_id: open.window_id,
+                                    kind: open.kind,
+                                    title: open.title,
+                                },
+                            );
+                        }
+                        CloseWindow::ID => {
+                            let close = decoded(id, CloseWindow::decode(body))?;
+                            // Only a close naming the live open window changes
+                            // anything: it clears the window and drops the
+                            // carried stack with it
+                            // (`handleCloseWindow:1311-1315`).
+                            if windows.apply_close(close.window_id) {
+                                report(
+                                    events,
+                                    ClientEvent::WindowClosed {
+                                        window_id: close.window_id,
+                                    },
+                                );
+                            }
+                        }
+                        SetSlot::ID => {
+                            let slot = decoded(id, SetSlot::decode(body))?;
+                            // The state's own branches: window −1 is the
+                            // carried stack, window 0 the player's layout and
+                            // the rest the open window's
+                            // (`handleSetSlot:1133-1168`).
+                            if windows.apply_set_slot(slot.window_id, slot.slot, slot.item) {
+                                report_window_snapshot(
+                                    &windows,
+                                    slot_window(slot.window_id),
+                                    events,
+                                );
+                            }
+                        }
+                        WindowItems::ID => {
+                            let items = decoded(id, WindowItems::decode(body))?;
+                            if windows.apply_window_items(items.window_id, items.slots) {
+                                report_window_snapshot(&windows, items.window_id, events);
+                            }
+                        }
+                        WindowProperty::ID => {
+                            let property = decoded(id, WindowProperty::decode(body))?;
+                            if windows.apply_property(
+                                property.window_id,
+                                property.property,
+                                property.value,
+                            ) {
+                                report_window_snapshot(&windows, property.window_id, events);
+                            }
+                        }
+                        ConfirmTransaction::ID => {
+                            let confirm = decoded(id, ConfirmTransaction::decode(body))?;
+                            // The source's own guard
+                            // (`handleConfirmTransaction:1174-1196`): a
+                            // rejected transaction for a window the session
+                            // holds — window 0, or the live open window — is
+                            // answered in the same pass with the packet's own
+                            // action and the accepted flag set. The accepted
+                            // case and a window the state does not hold answer
+                            // nothing.
+                            if !confirm.accepted && windows.holds_window(confirm.window_id) {
+                                let reply = payload_of(|out| {
+                                    write_confirm_transaction(
+                                        out,
+                                        confirm.window_id,
+                                        confirm.action,
+                                        true,
+                                    )
+                                })?;
+                                send_reply(&mut conn, &reply)?;
+                            }
+                        }
+                        HELD_ITEM_CHANGE_ID => {
+                            let slot = decoded(id, decode_held_item_change(body))?;
+                            // The source's own guard
+                            // (`handleHeldItemChange:615-621`): a slot inside
+                            // the hotbar's nine selects it, and anything else
+                            // is ignored.
+                            if (0..HOTBAR_SIZE as i16).contains(&slot) {
+                                windows.player.inventory.set_selected(slot);
+                                report(events, ClientEvent::HeldItemSlot { slot });
+                            } else {
+                                debug!(
+                                    slot = slot,
+                                    "a held item change outside the hotbar is ignored"
+                                );
+                            }
+                        }
+                        SetExperience::ID => {
+                            let experience = decoded(id, SetExperience::decode(body))?;
+                            report(
+                                events,
+                                ClientEvent::Experience {
+                                    bar: experience.bar,
+                                    level: experience.level,
+                                    total: experience.total,
+                                },
+                            );
+                        }
+                        EntityEffect::ID => {
+                            let effect = decoded(id, EntityEffect::decode(body))?;
+                            // The store is the own player's alone
+                            // (`handleEntityEffect:1502-1513`): a fresh id is
+                            // held as it arrived, and one already held
+                            // combines (`EntityLivingBase.addPotionEffect:745-762`
+                            // reaching `PotionEffect.combine:63-85`).
+                            if Some(effect.entity_id) == player.entity_id {
+                                match effects.get_mut(&effect.effect_id) {
+                                    Some(held) => {
+                                        combine_effect(held, effect.amplifier, effect.duration)
+                                    }
+                                    None => {
+                                        effects.insert(
+                                            effect.effect_id,
+                                            StatusEffect {
+                                                effect_id: effect.effect_id,
+                                                amplifier: effect.amplifier,
+                                                duration: effect.duration,
+                                            },
+                                        );
+                                    }
+                                }
+                                report(
+                                    events,
+                                    ClientEvent::Effects {
+                                        effects: effect_list(&effects),
+                                    },
+                                );
+                            }
+                        }
+                        RemoveEntityEffect::ID => {
+                            let remove = decoded(id, RemoveEntityEffect::decode(body))?;
+                            // A removal for the own id drops the effect the id
+                            // names — `removePotionEffectClient:788-791` is a
+                            // plain map removal — and reports the store only
+                            // when something left it.
+                            if Some(remove.entity_id) == player.entity_id
+                                && effects.remove(&remove.effect_id).is_some()
+                            {
+                                report(
+                                    events,
+                                    ClientEvent::Effects {
+                                        effects: effect_list(&effects),
+                                    },
+                                );
+                            }
+                        }
+                        UpdateSign::ID => {
+                            let sign = decoded(id, UpdateSign::decode(body))?;
+                            // The last text per position is the view's to
+                            // draw; the lines travel as sent
+                            // (`handleUpdateSign:1319-1327`).
+                            signs.insert(
+                                (sign.x, sign.y, sign.z),
+                                SignText {
+                                    lines: sign.lines.clone(),
+                                },
+                            );
+                            report(
+                                events,
+                                ClientEvent::SignTextChanged {
+                                    x: sign.x,
+                                    y: sign.y,
+                                    z: sign.z,
+                                    lines: sign.lines,
+                                },
+                            );
+                        }
+                        SignEditorOpen::ID => {
+                            let editor = decoded(id, SignEditorOpen::decode(body))?;
+                            report(
+                                events,
+                                ClientEvent::SignEditorOpen {
+                                    x: editor.x,
+                                    y: editor.y,
+                                    z: editor.z,
+                                },
+                            );
+                        }
                         PluginMessage::ID => {
                             let message = decoded(id, PluginMessage::decode(body))?;
-                            debug!(channel = %message.channel, bytes = message.data.len(), "plugin message");
+                            if message.channel == TRADE_LIST_CHANNEL {
+                                let trade_list =
+                                    decoded(id, MerchantOffers::decode(&message.data))?;
+                                report(
+                                    events,
+                                    ClientEvent::MerchantOffers {
+                                        offers: trade_list.offers,
+                                    },
+                                );
+                            } else {
+                                debug!(channel = %message.channel, bytes = message.data.len(), "plugin message");
+                            }
                         }
                         PlayDisconnect::ID => {
                             let disconnect = decoded(id, PlayDisconnect::decode(body))?;
@@ -1692,6 +2091,16 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // The aim follows the tick's own state: a step that moved the
                 // player, and any world change behind it, is read here.
                 update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
+                // The hotbar's pop runs down with the player's own tick: the
+                // source decrements every main-inventory stack once per tick
+                // (`EntityPlayer.onLivingUpdate:617` through
+                // `InventoryPlayer.decrementAnimations:352-363` and
+                // `ItemStack.updateAnimation:486-491`). A tick that moved a
+                // counter republishes window 0, which is where the counters
+                // ride.
+                if windows.tick_hotbar_pop() {
+                    report_window_snapshot(&windows, 0, events);
+                }
                 // Nothing the window presses reaches the interaction while the
                 // death view is up: a click is the respawn request then, and
                 // the presses and the dig step run only while alive.
@@ -2523,6 +2932,64 @@ fn decoded<T>(id: i32, result: Result<T, PacketError>) -> Result<T, SessionError
 /// Reports one event; a window that stopped listening is not an error here.
 fn report(events: &Sender<ClientEvent>, event: ClientEvent) {
     let _ = events.send(event);
+}
+
+/// The window one landed slot write belongs to, for the snapshot it reports.
+///
+/// The wire's window −1 is the carried stack, which rides every window; the
+/// write reports window 0, the projection that always exists. Window 0 reports
+/// itself, and any other id the state admitted is the live open window's.
+fn slot_window(window_id: i8) -> u8 {
+    u8::try_from(window_id).unwrap_or(0)
+}
+
+/// Reports one window's snapshot, built from the state's own projection.
+///
+/// The projection is built here, per change — never per frame — and a window
+/// the state does not hold reports nothing.
+fn report_window_snapshot(windows: &Windows, window_id: u8, events: &Sender<ClientEvent>) {
+    if let Some(snapshot) = windows.snapshot(window_id) {
+        report(
+            events,
+            ClientEvent::WindowSnapshot {
+                window_id: snapshot.window_id,
+                slots: snapshot.slots,
+                cursor: snapshot.cursor,
+                properties: snapshot.properties,
+                hotbar_pop: snapshot.hotbar_pop,
+            },
+        );
+    }
+}
+
+/// Combines a fresh effect into the one held.
+///
+/// The source's own rule (`PotionEffect.combine:63-85`): a stronger amplifier
+/// replaces the pair — duration and all — an equal one keeps the longer
+/// duration, and anything else leaves the pair alone.
+fn combine_effect(held: &mut StatusEffect, amplifier: u8, duration: i32) {
+    if amplifier > held.amplifier {
+        held.amplifier = amplifier;
+        held.duration = duration;
+    } else if amplifier == held.amplifier && held.duration < duration {
+        held.duration = duration;
+    }
+}
+
+/// The store's effects, ascending by effect id.
+fn effect_list(effects: &BTreeMap<u8, StatusEffect>) -> Vec<StatusEffect> {
+    effects.values().copied().collect()
+}
+
+/// Decodes the clientbound Held Item Change body: the slot byte alone.
+fn decode_held_item_change(body: &[u8]) -> Result<i16, PacketError> {
+    let [slot] = body else {
+        return Err(PacketError::Codec(CodecError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the held item change body is one slot byte",
+        ))));
+    };
+    Ok(i16::from(*slot as i8))
 }
 
 /// Reports the player list when it changed against the set it started from.

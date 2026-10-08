@@ -2237,6 +2237,19 @@ fn apply_session_event(
             tracing::debug!(id, "keepalive answered");
             false
         }
+        // The M5 window and inventory events: the screens and the HUD that
+        // read them arrive with later tasks, so nothing consumes them yet and
+        // the session stays up.
+        ClientEvent::WindowOpened { .. }
+        | ClientEvent::WindowClosed { .. }
+        | ClientEvent::WindowSnapshot { .. }
+        | ClientEvent::HeldItemSlot { .. }
+        | ClientEvent::Experience { .. }
+        | ClientEvent::Air { .. }
+        | ClientEvent::Effects { .. }
+        | ClientEvent::SignEditorOpen { .. }
+        | ClientEvent::SignTextChanged { .. }
+        | ClientEvent::MerchantOffers { .. } => false,
         ClientEvent::Disconnected { reason } => {
             tracing::info!(%reason, "the session ended");
             true
