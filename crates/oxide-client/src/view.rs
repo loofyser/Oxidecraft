@@ -40,8 +40,8 @@ use oxide_world::entity::EntityKind;
 
 use crate::CHAT_TEXT_CAP;
 use crate::ChatInput;
-use crate::items;
 use crate::skin_worker::SkinUpdate;
+use oxide_client::items;
 
 /// The all-on parts byte every player draws with this milestone.
 ///
@@ -3811,7 +3811,7 @@ mod tests {
                     3,
                     EntityKind::Item,
                     EntityExtra::Item {
-                        id: 259,
+                        id: 1000,
                         count: 1,
                         damage: 0,
                     },
@@ -4059,7 +4059,7 @@ mod tests {
                 frame(
                     4,
                     Some(MetadataItem {
-                        id: 259,
+                        id: 1000,
                         count: 1,
                         damage: 0,
                         nbt: None,

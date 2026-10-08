@@ -34,7 +34,6 @@
 //! the client reports.
 
 mod assets;
-mod items;
 mod keymap;
 mod skin_worker;
 mod view;
