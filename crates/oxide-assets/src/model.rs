@@ -22,7 +22,14 @@
 //! path the tree's blockstate files resolve, plus the locations the client
 //! stitches beyond the variant scan (`ModelBakery.LOCATIONS_BUILTIN_TEXTURES`:
 //! the four liquid flow/still sprites, the ten destroy stages and the four
-//! empty armour-slot sprites). Item models are not walked: M2 draws terrain.
+//! empty armour-slot sprites).
+//!
+//! [`ModelSource::item_model`] and [`ModelSource::bake_item`] resolve the
+//! item tree the way the client's item pass does (`ModelBakery`'s item walk,
+//! `ItemModelGenerator`, `ModelChest`, `ItemCameraTransforms`): a generated
+//! item's `layer0…4` layers through the `builtin/generated` bake, a block
+//! item's block model, the folded chest trio's box model, and the display
+//! transforms every class carries, completed from the source's own defaults.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +52,20 @@ const NAMESPACE: &str = "minecraft";
 
 /// What every blockstate variant's model name is relative to.
 const BLOCK_MODEL_PREFIX: &str = "block/";
+
+/// What an item's model name is relative to: the client resolves an item
+/// registration's name to `item/<name>` (`ModelBakery.getItemLocation`).
+const ITEM_MODEL_PREFIX: &str = "item/";
+
+/// The three model names the folded chest trio registers under, as
+/// `models/item/<name>.json` writes them.
+const CHEST_ITEM_MODEL: &str = "item/chest";
+
+/// The trapped chest's model name.
+const TRAPPED_CHEST_ITEM_MODEL: &str = "item/trapped_chest";
+
+/// The ender chest's model name.
+const ENDER_CHEST_ITEM_MODEL: &str = "item/ender_chest";
 
 /// What marks a parent as one the client builds itself.
 const BUILTIN_PREFIX: &str = "builtin/";
@@ -289,6 +310,14 @@ pub enum ModelError {
         /// The name as written.
         name: String,
     },
+    /// An item model the baker has no geometry for: the missing marker, the
+    /// animated compass or clock, or a `builtin/entity` id outside the folded
+    /// chest trio (their icons draw the missing sprite; recorded).
+    #[error("the item model `{name}` bakes no geometry")]
+    NoItemGeometry {
+        /// The item model's name, as written.
+        name: String,
+    },
 }
 
 /// One variant of one blockstate: the model to bake and how to rotate it.
@@ -365,32 +394,104 @@ pub struct Element {
 }
 
 /// One of a model's display transforms, as the file writes the numbers.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The applier's own rules stay with the applier: the client scales a stated
+/// translation by 1/16 and clamps it to ±1.5, and clamps a stated scale to ±4
+/// (`ItemTransformVec3f.Deserializer`), and a draw applies the transform as
+/// translate, then the rotations y, x and z in that order, then scale
+/// (`ItemCameraTransforms.applyTransform`); the composition is pinned with the
+/// draw.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
-    /// The rotation in degrees.
+    /// The rotation in degrees, x, y, z.
     pub rotation: [f32; 3],
-    /// The translation in the file's units (the client scales it by 1/16 and
-    /// clamps it; M2 does not consume display).
+    /// The translation in the file's units (the applier scales it by 1/16).
     pub translation: [f32; 3],
     /// The scale.
     pub scale: [f32; 3],
 }
 
-/// A model's `display` section, parsed and unused this milestone.
-#[derive(Debug, Clone, PartialEq, Default)]
+impl Transform {
+    /// The source's own default transform: rotation (0, 0, 0), translation
+    /// (0, 0, 0), scale (1, 1, 1) (`ItemTransformVec3f.DEFAULT`).
+    pub const DEFAULT: Transform = Transform {
+        rotation: [0.0, 0.0, 0.0],
+        translation: [0.0, 0.0, 0.0],
+        scale: [1.0, 1.0, 1.0],
+    };
+}
+
+/// One of the seven camera transform slots a model can carry
+/// (`ItemCameraTransforms.TransformType`), in the source's own order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransformType {
+    /// The fallback slot (`ItemCameraTransforms.getTransform`'s default arm).
+    None,
+    /// The third-person slot.
+    ThirdPerson,
+    /// The first-person slot.
+    FirstPerson,
+    /// The head slot.
+    Head,
+    /// The gui slot.
+    Gui,
+    /// The ground slot.
+    Ground,
+    /// The fixed (item frame) slot.
+    Fixed,
+}
+
+/// A model's display section, completed: the seven camera transform slots,
+/// every absent one filled from the source's own default.
+///
+/// The source fills an absent key as it deserializes
+/// (`ItemCameraTransforms.func_181683_a` returns `ItemTransformVec3f.DEFAULT`),
+/// and a stated transform that equals the default reads as unstated when a
+/// chain resolves (`func_181687_c`). `none` is never a JSON key; it is the
+/// source's own fallback slot (`getTransform`'s default arm).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Display {
     /// The third-person transform.
-    pub thirdperson: Option<Transform>,
+    pub third_person: Transform,
     /// The first-person transform.
-    pub firstperson: Option<Transform>,
+    pub first_person: Transform,
     /// The head transform.
-    pub head: Option<Transform>,
+    pub head: Transform,
     /// The gui transform.
-    pub gui: Option<Transform>,
+    pub gui: Transform,
     /// The ground transform.
-    pub ground: Option<Transform>,
+    pub ground: Transform,
     /// The fixed (item frame) transform.
-    pub fixed: Option<Transform>,
+    pub fixed: Transform,
+    /// The none (fallback) transform, always the source's default.
+    pub none: Transform,
+}
+
+impl Display {
+    /// The source's own default set: every slot the identity transform
+    /// (`ItemCameraTransforms.DEFAULT`, `ItemTransformVec3f.DEFAULT`).
+    pub const DEFAULT: Display = Display {
+        third_person: Transform::DEFAULT,
+        first_person: Transform::DEFAULT,
+        head: Transform::DEFAULT,
+        gui: Transform::DEFAULT,
+        ground: Transform::DEFAULT,
+        fixed: Transform::DEFAULT,
+        none: Transform::DEFAULT,
+    };
+
+    /// The transform a camera type's slot carries.
+    pub fn get(&self, slot: TransformType) -> Transform {
+        match slot {
+            TransformType::None => self.none,
+            TransformType::ThirdPerson => self.third_person,
+            TransformType::FirstPerson => self.first_person,
+            TransformType::Head => self.head,
+            TransformType::Gui => self.gui,
+            TransformType::Ground => self.ground,
+            TransformType::Fixed => self.fixed,
+        }
+    }
 }
 
 /// One model file, as parsed.
@@ -404,7 +505,8 @@ pub struct ModelJson {
     pub elements: Vec<Element>,
     /// Whether ambient occlusion applies; the client's default is true.
     pub ambient_occlusion: bool,
-    /// The display section, when the file states one.
+    /// The display section, completed — an absent slot carries the source's
+    /// default — when the file states one.
     pub display: Option<Display>,
 }
 
@@ -438,6 +540,143 @@ pub struct BakedModel {
     pub particle: Option<String>,
     /// True only for a model whose chain ends at `builtin/missing`.
     pub missing: bool,
+}
+
+/// The folded `builtin/entity` trio: the chest items whose icons draw through
+/// the chest model rather than a baked model of their own
+/// (`TileEntityItemStackRenderer.renderByItem`'s chest branches).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinItem {
+    /// The plain chest.
+    Chest,
+    /// The trapped chest.
+    TrappedChest,
+    /// The ender chest.
+    EnderChest,
+}
+
+impl BuiltinItem {
+    /// The trio member a model resource names, when it names one: the three
+    /// `models/item/<name>.json` files whose parent is `builtin/entity`.
+    fn from_model_name(resource: &str) -> Option<Self> {
+        match resource {
+            CHEST_ITEM_MODEL => Some(BuiltinItem::Chest),
+            TRAPPED_CHEST_ITEM_MODEL => Some(BuiltinItem::TrappedChest),
+            ENDER_CHEST_ITEM_MODEL => Some(BuiltinItem::EnderChest),
+            _ => None,
+        }
+    }
+
+    /// The icon sheet the trio's draw binds, as the texture tree keys it.
+    ///
+    /// The names are the TESRs' own `ResourceLocation`s with the `.png` the
+    /// tree's keys drop (`TileEntityChestRenderer`'s `textureNormal` and
+    /// `textureTrapped`, `TileEntityEnderChestRenderer`'s
+    /// `ENDER_CHEST_TEXTURE`). The christmas sheets the chest renderer picks
+    /// for December 24–26 are not folded (recorded).
+    pub fn icon_sheet(self) -> &'static str {
+        match self {
+            BuiltinItem::Chest => "entity/chest/normal",
+            BuiltinItem::TrappedChest => "entity/chest/trapped",
+            BuiltinItem::EnderChest => "entity/chest/ender",
+        }
+    }
+}
+
+/// One box of the chest model: the corners `ModelBox` builds, in 1/16 units,
+/// and the rotation point its renderer places it by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChestBox {
+    /// The box's first corner (`ModelBox.posX1/posY1/posZ1`).
+    pub from: [f32; 3],
+    /// The box's second corner, the first plus the box's size
+    /// (`ModelBox.posX2/posY2/posZ2`).
+    pub to: [f32; 3],
+    /// The rotation point the renderer translates the box by before drawing
+    /// it (`ModelRenderer.render`).
+    pub origin: [f32; 3],
+}
+
+/// The chest model's own scale: the renderers draw every box at 1/16
+/// (`ModelChest.renderAll`'s argument).
+pub const CHEST_MODEL_SCALE: f32 = 0.0625;
+
+/// The chest trio's small model: the boxes `ModelChest` builds, in its own
+/// render order — the lid, the knob, the base.
+///
+/// Each box is the `addBox` call's corners and the renderer's rotation point,
+/// in 1/16 units, before [`CHEST_MODEL_SCALE`]; the draw composes the two.
+/// The lid's rotation (the open angle) is draw state and stays with the draw.
+pub const CHEST_MODEL: [ChestBox; 3] = [
+    // The lid: addBox(0, -5, -14, 14, 5, 14), rotation point (1, 7, 15).
+    ChestBox {
+        from: [0.0, -5.0, -14.0],
+        to: [14.0, 0.0, 0.0],
+        origin: [1.0, 7.0, 15.0],
+    },
+    // The knob: addBox(-1, -2, -15, 2, 4, 1), rotation point (8, 7, 15).
+    ChestBox {
+        from: [-1.0, -2.0, -15.0],
+        to: [1.0, 2.0, -14.0],
+        origin: [8.0, 7.0, 15.0],
+    },
+    // The base: addBox(0, 0, 0, 14, 10, 14), rotation point (1, 6, 1).
+    ChestBox {
+        from: [0.0, 0.0, 0.0],
+        to: [14.0, 10.0, 14.0],
+        origin: [1.0, 6.0, 1.0],
+    },
+];
+
+/// Where one item's model comes from, resolved against the tree.
+///
+/// The classes are the client's item pass's own (`ModelBakery.bakeItemModels`
+/// splits the item locations three ways: the generated items go through
+/// `ItemModelGenerator`, the `builtin/entity` ids become builtin models, and
+/// the rest bake as their own model).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemModelSource {
+    /// A block item: its chain resolves to a block model's geometry. Carries
+    /// the block model's resource name.
+    Block(String),
+    /// A generated item: its `layer0…4` texture paths in order, stopping at
+    /// the first layer that does not resolve
+    /// (`ItemModelGenerator.makeItemModel`).
+    Generated(Vec<String>),
+    /// One of the folded chest trio, drawn through the chest model.
+    Builtin(BuiltinItem),
+    /// Nothing resolves.
+    Missing,
+}
+
+/// The item model sources one name list resolves to, in the list's order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemModelSet {
+    /// One source per name, in the input order.
+    pub sources: Vec<ItemModelSource>,
+    /// How many of them resolved to [`ItemModelSource::Missing`].
+    pub missing: usize,
+}
+
+/// One item's baked model: its geometry, its resolved textures and its
+/// completed display transforms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BakedItem {
+    /// The geometry quads: a generated item's layer planes or a block item's
+    /// baked faces. Empty for the chest trio, whose geometry is
+    /// [`BakedItem::boxes`].
+    pub quads: Vec<BakedQuad>,
+    /// The chest trio's box model ([`CHEST_MODEL`]); empty for the other
+    /// classes.
+    pub boxes: Vec<ChestBox>,
+    /// The resolved texture paths the item's draw samples, the particle first
+    /// when the chain resolves one, then the geometry's own textures, each
+    /// once, in first-seen order (`ModelBakery.getItemsTextureLocations` adds
+    /// the particle and then the layers or the element faces).
+    pub textures: Vec<String>,
+    /// The display transforms, completed: every slot resolved through the
+    /// chain, an absent slot filled from the source's default.
+    pub display: Display,
 }
 
 /// Where a parent chain ends, and what the end carries.
@@ -525,6 +764,38 @@ impl Chain {
             }
             other => other,
         }
+    }
+
+    /// The display transforms of this chain, resolved the way the source
+    /// resolves them (`ModelBlock.getTransform`): each slot is the first
+    /// model's own, walking the chain from the leaf; a slot no model states —
+    /// and a stated transform that equals the default, which
+    /// `ItemCameraTransforms.func_181687_c` reads as unstated — stays the
+    /// source's default.
+    fn display(&self) -> Display {
+        Display {
+            third_person: self.display_slot(TransformType::ThirdPerson),
+            first_person: self.display_slot(TransformType::FirstPerson),
+            head: self.display_slot(TransformType::Head),
+            gui: self.display_slot(TransformType::Gui),
+            ground: self.display_slot(TransformType::Ground),
+            fixed: self.display_slot(TransformType::Fixed),
+            none: Transform::DEFAULT,
+        }
+    }
+
+    /// One slot of [`Chain::display`].
+    fn display_slot(&self, slot: TransformType) -> Transform {
+        for model in &self.models {
+            let stated = model
+                .display
+                .map(|display| display.get(slot))
+                .unwrap_or(Transform::DEFAULT);
+            if stated != Transform::DEFAULT {
+                return stated;
+            }
+        }
+        Transform::DEFAULT
     }
 }
 
@@ -647,6 +918,126 @@ impl ModelSource {
         Ok(baked)
     }
 
+    /// Resolves one item model name into its source.
+    ///
+    /// `name` is the name the item registry states: a bare name is the item
+    /// tree's own (`ModelBakery.getItemLocation` maps an item registration's
+    /// name to `item/<name>`), a path that already names one is taken as
+    /// written. Anything that does not resolve — an absent file, a broken or
+    /// foreign chain, a builtin outside the folded set — degrades to
+    /// [`ItemModelSource::Missing`] rather than failing: the source's own item
+    /// walk skips an item that does not bake with a warning
+    /// (`ModelBakery.bakeItemModels`), and the client's item pass never fails
+    /// its load over one.
+    pub fn item_model(&self, name: &str) -> ItemModelSource {
+        let Ok(resource) = item_model_resource(name) else {
+            return ItemModelSource::Missing;
+        };
+        let Ok(chain) = self.chain_for_resource(&resource) else {
+            return ItemModelSource::Missing;
+        };
+        match &chain.end {
+            ChainEnd::Builtin(Builtin::Generated) => {
+                ItemModelSource::Generated(chain_layers(&chain))
+            }
+            ChainEnd::Builtin(Builtin::Entity) => match BuiltinItem::from_model_name(&resource) {
+                Some(item) => ItemModelSource::Builtin(item),
+                None => ItemModelSource::Missing,
+            },
+            ChainEnd::Builtin(_) => ItemModelSource::Missing,
+            ChainEnd::File { .. } => ItemModelSource::Block(block_member(&chain, &resource)),
+        }
+    }
+
+    /// Resolves a list of item model names, counting the misses.
+    pub fn item_models(&self, names: &[&str]) -> ItemModelSet {
+        let sources: Vec<ItemModelSource> =
+            names.iter().map(|name| self.item_model(name)).collect();
+        let missing = sources
+            .iter()
+            .filter(|source| matches!(source, ItemModelSource::Missing))
+            .count();
+        ItemModelSet { sources, missing }
+    }
+
+    /// Bakes one item model by name.
+    ///
+    /// The classes bake the way the source's item pass bakes them
+    /// (`ModelBakery.bakeItemModels`): a generated item bakes one layer plane
+    /// per resolved `layer0…4` through the same path
+    /// [`ModelSource::bake_variant`] uses for `builtin/generated`, a block
+    /// item bakes its chain's elements, and the folded chest trio bakes its
+    /// box list ([`CHEST_MODEL`]). Every class's display transforms complete
+    /// through its chain.
+    ///
+    /// A name that resolves to no geometry errors: a name the chain cannot
+    /// resolve answers the chain's own error, and the builtin ends outside
+    /// the trio — the missing marker, the animated compass or clock, a
+    /// `builtin/entity` id that is not one of the trio — answer
+    /// [`ModelError::NoItemGeometry`]. The resolution
+    /// ([`ModelSource::item_model`]) is where a miss degrades to
+    /// [`ItemModelSource::Missing`] instead.
+    pub fn bake_item(&self, name: &str) -> Result<BakedItem, ModelError> {
+        let resource = item_model_resource(name)?;
+        let chain = self.chain_for_resource(&resource)?;
+        let display = chain.display();
+        match &chain.end {
+            ChainEnd::Builtin(Builtin::Generated) => {
+                let quads = generated_quads(&chain);
+                let mut textures = Vec::new();
+                if let Some(particle) = chain.texture("particle") {
+                    push_texture(&mut textures, &particle);
+                }
+                for quad in &quads {
+                    push_texture(&mut textures, &quad.texture);
+                }
+                Ok(BakedItem {
+                    quads,
+                    boxes: Vec::new(),
+                    textures,
+                    display,
+                })
+            }
+            ChainEnd::Builtin(Builtin::Entity) => match BuiltinItem::from_model_name(&resource) {
+                Some(item) => Ok(BakedItem {
+                    quads: Vec::new(),
+                    boxes: CHEST_MODEL.to_vec(),
+                    textures: vec![item.icon_sheet().to_string()],
+                    display,
+                }),
+                None => Err(ModelError::NoItemGeometry {
+                    name: name.to_string(),
+                }),
+            },
+            ChainEnd::Builtin(_) => Err(ModelError::NoItemGeometry {
+                name: name.to_string(),
+            }),
+            ChainEnd::File { .. } => {
+                let variant = Variant {
+                    model: resource.clone(),
+                    x: 0,
+                    y: 0,
+                    uvlock: false,
+                    weight: 1,
+                };
+                let baked = self.bake(&chain, &variant)?;
+                let mut textures = Vec::new();
+                if let Some(particle) = &baked.particle {
+                    push_texture(&mut textures, particle);
+                }
+                for quad in &baked.quads {
+                    push_texture(&mut textures, &quad.texture);
+                }
+                Ok(BakedItem {
+                    quads: baked.quads,
+                    boxes: Vec::new(),
+                    textures,
+                    display,
+                })
+            }
+        }
+    }
+
     /// Every texture path the tree's blockstate files resolve, for the atlas.
     ///
     /// The set is the resolved texture of every face of every element of every
@@ -695,14 +1086,22 @@ impl ModelSource {
     /// accepted, the path is taken relative to `models/block/`, and the chain
     /// walks the `parent` fields from there. `builtin/*` ends a chain.
     fn chain_for(&self, model: &str) -> Result<Chain, ModelError> {
-        let resource = block_model_resource(model)?;
-        if let Some(chain) = self.chains.borrow().get(&resource) {
+        self.chain_for_resource(&block_model_resource(model)?)
+    }
+
+    /// The chain a model resource names, resolved and cached.
+    ///
+    /// `resource` is a path below `models/` (`block/stone`, `item/chest`);
+    /// the chain walks the `parent` fields from there. `builtin/*` ends a
+    /// chain.
+    fn chain_for_resource(&self, resource: &str) -> Result<Chain, ModelError> {
+        if let Some(chain) = self.chains.borrow().get(resource) {
             return Ok(chain.clone());
         }
 
         let mut paths = Vec::new();
         let mut models = Vec::new();
-        let mut current = resource.clone();
+        let mut current = resource.to_string();
         let end = loop {
             if let Some(position) = paths.iter().position(|path| path == &current) {
                 let mut cycle = paths[position..].to_vec();
@@ -739,7 +1138,9 @@ impl ModelSource {
         };
 
         let chain = Chain { paths, models, end };
-        self.chains.borrow_mut().insert(resource, chain.clone());
+        self.chains
+            .borrow_mut()
+            .insert(resource.to_string(), chain.clone());
         Ok(chain)
     }
 
@@ -1132,8 +1533,8 @@ fn bake_face(
 
 /// The quads `builtin/generated` draws: one flat plane per layer the model's
 /// chain defines, front face only, in the client's `ItemModelGenerator`
-/// shape. M2 does not consume item rendering; this is here so the builtin
-/// bakes to something whole.
+/// shape. The builtin bake and the item bake
+/// ([`ModelSource::bake_item`]) both consume it.
 fn generated_quads(chain: &Chain) -> Vec<BakedQuad> {
     let south_uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
     let mut quads = Vec::new();
@@ -1158,6 +1559,39 @@ fn generated_quads(chain: &Chain) -> Vec<BakedQuad> {
     quads
 }
 
+/// A generated chain's `layer0…4` texture paths, in order, stopping at the
+/// first layer that does not resolve (`ItemModelGenerator.makeItemModel`
+/// reads the layers in order and stops where one is absent).
+fn chain_layers(chain: &Chain) -> Vec<String> {
+    let mut layers = Vec::new();
+    for variable in LAYERS {
+        let Some(texture) = chain.texture(variable) else {
+            break;
+        };
+        layers.push(texture);
+    }
+    layers
+}
+
+/// Adds one resolved texture path to a baked item's list, once, skipping the
+/// client's missing sprite, which the atlas builds itself.
+fn push_texture(textures: &mut Vec<String>, path: &str) {
+    if path != MISSING_SPRITE && !textures.iter().any(|texture| texture == path) {
+        textures.push(path.to_string());
+    }
+}
+
+/// The block model an item's chain draws through: the first model in the
+/// chain under `block/`, or the item's own model when the chain names none.
+fn block_member(chain: &Chain, resource: &str) -> String {
+    chain
+        .paths
+        .iter()
+        .find(|path| path.starts_with(BLOCK_MODEL_PREFIX))
+        .map(String::to_string)
+        .unwrap_or_else(|| resource.to_string())
+}
+
 /// Adds one resolved texture path to the set, skipping the client's missing
 /// sprite, which the atlas builds itself.
 fn collect_texture(chain: &Chain, variable: &str, paths: &mut BTreeSet<String>) {
@@ -1172,6 +1606,18 @@ fn collect_texture(chain: &Chain, variable: &str, paths: &mut BTreeSet<String>) 
 /// the way the client prefixes it.
 fn block_model_resource(model: &str) -> Result<String, ModelError> {
     Ok(format!("{BLOCK_MODEL_PREFIX}{}", path_of(model)?))
+}
+
+/// The resource path an item model name states: a bare name is the item
+/// tree's own, `item/` prefixed the way the client prefixes it; a path that
+/// already names one is taken as written.
+fn item_model_resource(name: &str) -> Result<String, ModelError> {
+    let path = path_of(name)?;
+    if path.contains('/') {
+        Ok(path.to_string())
+    } else {
+        Ok(format!("{ITEM_MODEL_PREFIX}{path}"))
+    }
 }
 
 /// The resource path a parent name states.
@@ -1433,15 +1879,35 @@ impl RawElementRotation {
 }
 
 impl Display {
-    /// Converts the parsed display section.
+    /// Converts the parsed display section, filling every absent slot with
+    /// the source's own default (`ItemCameraTransforms.func_181683_a`).
     fn from_raw(raw: RawDisplay) -> Self {
         Self {
-            thirdperson: raw.thirdperson.map(Transform::from_raw),
-            firstperson: raw.firstperson.map(Transform::from_raw),
-            head: raw.head.map(Transform::from_raw),
-            gui: raw.gui.map(Transform::from_raw),
-            ground: raw.ground.map(Transform::from_raw),
-            fixed: raw.fixed.map(Transform::from_raw),
+            third_person: raw
+                .thirdperson
+                .map(Transform::from_raw)
+                .unwrap_or(Transform::DEFAULT),
+            first_person: raw
+                .firstperson
+                .map(Transform::from_raw)
+                .unwrap_or(Transform::DEFAULT),
+            head: raw
+                .head
+                .map(Transform::from_raw)
+                .unwrap_or(Transform::DEFAULT),
+            gui: raw
+                .gui
+                .map(Transform::from_raw)
+                .unwrap_or(Transform::DEFAULT),
+            ground: raw
+                .ground
+                .map(Transform::from_raw)
+                .unwrap_or(Transform::DEFAULT),
+            fixed: raw
+                .fixed
+                .map(Transform::from_raw)
+                .unwrap_or(Transform::DEFAULT),
+            none: Transform::DEFAULT,
         }
     }
 }
@@ -1681,4 +2147,96 @@ struct RawTransform {
 /// The default scale.
 fn ones() -> [f32; 3] {
     [1.0, 1.0, 1.0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_transform_is_the_sources_identity() {
+        // `ItemTransformVec3f.DEFAULT` and the three default arrays its
+        // deserializer fills absent fields from.
+        assert_eq!(Transform::DEFAULT.rotation, [0.0, 0.0, 0.0]);
+        assert_eq!(Transform::DEFAULT.translation, [0.0, 0.0, 0.0]);
+        assert_eq!(Transform::DEFAULT.scale, [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn every_camera_type_defaults_to_the_identity() {
+        // `ItemCameraTransforms.DEFAULT` fills all seven slots with
+        // `ItemTransformVec3f.DEFAULT`, and the enum is the source's own
+        // order (`TransformType`).
+        for slot in [
+            TransformType::None,
+            TransformType::ThirdPerson,
+            TransformType::FirstPerson,
+            TransformType::Head,
+            TransformType::Gui,
+            TransformType::Ground,
+            TransformType::Fixed,
+        ] {
+            assert_eq!(Display::DEFAULT.get(slot), Transform::DEFAULT, "{slot:?}");
+        }
+    }
+
+    #[test]
+    fn the_chest_model_pins_the_sources_boxes() {
+        // `ModelChest`'s three `addBox` calls and their rotation points.
+        assert_eq!(CHEST_MODEL.len(), 3);
+        assert_eq!(CHEST_MODEL[0].from, [0.0, -5.0, -14.0]);
+        assert_eq!(CHEST_MODEL[0].to, [14.0, 0.0, 0.0]);
+        assert_eq!(CHEST_MODEL[0].origin, [1.0, 7.0, 15.0]);
+        assert_eq!(CHEST_MODEL[1].from, [-1.0, -2.0, -15.0]);
+        assert_eq!(CHEST_MODEL[1].to, [1.0, 2.0, -14.0]);
+        assert_eq!(CHEST_MODEL[1].origin, [8.0, 7.0, 15.0]);
+        assert_eq!(CHEST_MODEL[2].from, [0.0, 0.0, 0.0]);
+        assert_eq!(CHEST_MODEL[2].to, [14.0, 10.0, 14.0]);
+        assert_eq!(CHEST_MODEL[2].origin, [1.0, 6.0, 1.0]);
+        assert_eq!(CHEST_MODEL_SCALE, 0.0625);
+    }
+
+    #[test]
+    fn the_item_tree_prefixes_bare_names_and_keeps_item_paths() {
+        assert_eq!(item_model_resource("stone").expect("a name"), "item/stone");
+        assert_eq!(
+            item_model_resource("item/stone").expect("a name"),
+            "item/stone"
+        );
+        assert_eq!(
+            item_model_resource("minecraft:stone").expect("a name"),
+            "item/stone"
+        );
+        assert_eq!(
+            item_model_resource("minecraft:item/stone").expect("a name"),
+            "item/stone"
+        );
+        assert!(matches!(
+            item_model_resource("othermod:stone"),
+            Err(ModelError::ForeignNamespace { .. })
+        ));
+    }
+
+    #[test]
+    fn the_trio_pins_the_sources_sheets() {
+        assert_eq!(BuiltinItem::Chest.icon_sheet(), "entity/chest/normal");
+        assert_eq!(
+            BuiltinItem::TrappedChest.icon_sheet(),
+            "entity/chest/trapped"
+        );
+        assert_eq!(BuiltinItem::EnderChest.icon_sheet(), "entity/chest/ender");
+        assert_eq!(
+            BuiltinItem::from_model_name("item/chest"),
+            Some(BuiltinItem::Chest)
+        );
+        assert_eq!(
+            BuiltinItem::from_model_name("item/trapped_chest"),
+            Some(BuiltinItem::TrappedChest)
+        );
+        assert_eq!(
+            BuiltinItem::from_model_name("item/ender_chest"),
+            Some(BuiltinItem::EnderChest)
+        );
+        assert_eq!(BuiltinItem::from_model_name("item/banner"), None);
+    }
 }

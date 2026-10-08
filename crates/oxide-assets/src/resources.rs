@@ -22,6 +22,9 @@ const TEXTURES_DIR: &str = "assets/minecraft/textures";
 /// The extension a texture file carries, with the case the jar uses.
 const PNG_EXTENSION: &str = "png";
 
+/// The suffix an item texture path may carry, which the tree's keys drop.
+const PNG_SUFFIX: &str = ".png";
+
 /// The suffix an animation sidecar's name carries, after its texture's name.
 const MCMETA_SUFFIX: &str = ".png.mcmeta";
 
@@ -175,6 +178,20 @@ impl TextureSet {
         self.textures.get(path)
     }
 
+    /// The sheet an item's resolved texture path names, when the set holds
+    /// it.
+    ///
+    /// The path is the item-model resolution's own naming: a generated item's
+    /// layer (`items/diamond_sword`), a block item's resolved face texture
+    /// (`blocks/planks_acacia`), or the chest trio's icon sheet with the
+    /// TESR's own `.png` on it (`entity/chest/normal.png`,
+    /// `TileEntityChestRenderer`). The tree keys textures extensionless, so
+    /// this naming path drops a `.png` suffix before the lookup; a path
+    /// without one reads as itself.
+    pub fn item_texture(&self, path: &str) -> Option<&Texture> {
+        self.textures.get(item_texture_key(path))
+    }
+
     /// The animation a sidecar beside the texture states, when there is one.
     ///
     /// A sidecar that holds no `animation` object — the 1.8 tree's four
@@ -203,6 +220,13 @@ fn key_for(relative: &Path) -> Result<String, ResourceError> {
         });
     };
     Ok(key.to_string())
+}
+
+/// The key an item texture path names: the path with a `.png` suffix
+/// dropped, so the TESRs' own sheet names read the tree's extensionless
+/// keys.
+fn item_texture_key(path: &str) -> &str {
+    path.strip_suffix(PNG_SUFFIX).unwrap_or(path)
 }
 
 /// Every file under `dir`, recursively, sorted, as paths relative to `dir`.
@@ -242,4 +266,23 @@ fn collect_into(dir: &Path, prefix: &Path, files: &mut Vec<PathBuf>) -> Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_item_texture_naming_path_drops_a_png_suffix() {
+        assert_eq!(item_texture_key("items/stick"), "items/stick");
+        assert_eq!(item_texture_key("items/stick.png"), "items/stick");
+        assert_eq!(
+            item_texture_key("entity/chest/normal.png"),
+            "entity/chest/normal"
+        );
+        assert_eq!(
+            item_texture_key("blocks/planks_acacia"),
+            "blocks/planks_acacia"
+        );
+    }
 }
