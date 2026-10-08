@@ -122,9 +122,9 @@ build, see "Redo").
 
 ## Milestone summary
 
-M3 (the player) closed and tagged `m3` on 2026-10-04; its state entry and acceptance record are
-in `docs/STATE.md` ("M3 evidence"). M3 added no image-metric classes; its one frame-cost finding
-is build-side: under the identical movement segment the release build holds a flat ≈144 fps
-while the debug build collapses late (median 80.8, tail ≤ 50) — recorded in the milestone's
-completion report. The M2 baseline (textured terrain, tagged `m2` 2026-10-02) above stands as the
-comparison point for M9's full protocol.
+M4 (entities and chat) closed and tagged `m4` on 2026-10-07; its state entry and acceptance record
+are in `docs/STATE.md` ("M4 evidence"). M4 added no image-metric classes; its one
+performance-relevant observation is the mesh pump's drain under the server's entity flood
+(idle-gated, ≈1.2 columns/s; captures soak past it) — recorded in the milestone's acceptance
+report. The M2 baseline (textured terrain, tagged `m2` 2026-10-02) above stands as the comparison
+point for M9's full protocol.

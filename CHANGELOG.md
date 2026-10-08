@@ -7,6 +7,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Milestone M4: entities and chat
+
+Delivered and tagged `m4` on 2026-10-07. The client is a participant among entities: the entity
+spawn, metadata, movement and lifecycle packets; the entity table and the per-tick feed; skins
+with the cape channel; the mob families (biped, quadruped, crawler, cube, arthropod and exotic)
+with their walk, look and swing animations; the object entities (dropped and thrown items,
+arrows, boats, minecarts, item frames, paintings, XP orbs); nametags with the source's distance
+rule; and the HUD surfaces — chat with wrapping and click and hover events, the input field, the
+tab list, the scoreboard sidebar with the below-name lines, and the boss bar — carried through a
+live acceptance run whose every headline number was re-derived from the recorded artifacts; the
+defects the run surfaced (a snow layer's fallback cube, the barrier's render kind, the scripted
+click's cursor space, the sidebar's blended glyph run, the chat translation components, and the
+barrier's translucent read) were fixed in the milestone's scoped fix rounds. The documented
+classes and the operator's by-eye list are in `docs/STATE.md`.
+
+### Added
+
+- The entity packet set — spawns, metadata, movement, lifecycle and the object spawns — with the
+  entity table, the per-tick feed and the session tracking.
+- Skins: the fetch, cache and fallback rules, the cape channel and the part toggles' default.
+- The entity draws: the player model, the biped/quadruped/crawler/cube/arthropod/exotic mob
+  families, the object entities, and nametags with the source's scale, background and 64/32 range
+  rules.
+- The chat surfaces: the parser with translation components, wrapping, fade and scrollback; the
+  input field with key routing, the send path and the click and hover event handling (the click
+  proven end-to-end at the server).
+- The HUD surfaces: the tab list (entries, heads, latency bars), the scoreboard sidebar with the
+  red scores and the below-name lines, and the boss bar (the 1.8 single status).
+- The acceptance machinery: the script-mode entity tick log and the scene scripts under
+  `refs/m4-acceptance/` (local evidence, not shipped).
+
+New dependencies: `base64` 0.23.1 (`oxide-assets`, the skin and cape property decode);
+`serde_json` becomes a direct `oxide-game` dependency. The milestone's corrected documents ride
+its commits.
+
 ### Milestone M3: the player
 
 Delivered and tagged `m3` on 2026-10-04. The client is a participant in the world: the 20 Hz tick

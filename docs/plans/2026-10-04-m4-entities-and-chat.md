@@ -858,13 +858,15 @@ test: add the M4 acceptance evidence machinery to the script log
 - Modify: `CHANGELOG.md` — the milestone's entry (the M2/M3 style: what landed, the two dependencies, the divergences and their retirements).
 - Modify (only if a ruling corrects it): `docs/specs/oxidecraft-v1-design.md` — the revision-history line bumps; otherwise untouched and the close says so.
 
-- [ ] **Step 1: Final whole-branch review.** Freeze the milestone diff (`m3^{commit}`..HEAD) to a file; run one final whole-branch review over it plus the ledger's deferred-minor and parked lines; verify its claims against primary sources; on findings, one fix dispatch and one scoped re-review; adjudicate residuals. (The close bar carries: no Critical or Important findings; every deferred item triaged with a disposition.)
-- [ ] **Step 2: The docs sweep** (the files above, one movement; the handoff written for a fresh session).
-- [ ] **Step 3: The content gate + truth pass.** The six-command set on the committed content; the milestone-boundary prose sweep over `docs/` (the established pass, run at each close); explicit paths staged.
-- [ ] **Step 4: Close commit, tag, push.** `docs: close out milestone M4 (entities and chat)`; annotated tag `m4` with message `M4: entities and chat`; `git push origin main --follow-tags`; `git ls-remote origin main` read back.
-- [ ] **Step 5: CI on the pushed head.** `gh run list --commit <sha>` — all jobs green; a failure routes back through a scoped fix.
-- [ ] **Step 6: The run-record follow-up.** Mirror M3's: update STATE's CI bullet with the run id; commit `docs: record the M4 close-out CI run`; push; confirm green.
-- [ ] **Step 7: Ledger close.** Mark the plan complete in the ledger; collect the milestone's rulings for the owner's summary.
+- [x] **Step 1: Final whole-branch review.** Freeze the milestone diff (`m3^{commit}`..HEAD) to a file; run one final whole-branch review over it plus the ledger's deferred-minor and parked lines; verify its claims against primary sources; on findings, one fix dispatch and one scoped re-review; adjudicate residuals. (The close bar carries: no Critical or Important findings; every deferred item triaged with a disposition.)
+- [x] **Step 2: The docs sweep** (the files above, one movement; the handoff written for a fresh session).
+- [x] **Step 3: The content gate + truth pass.** The six-command set on the committed content; the milestone-boundary prose sweep over `docs/` (the established pass, run at each close); explicit paths staged.
+- [x] **Step 4: Close commit, tag, push.** `docs: close out milestone M4 (entities and chat)`; annotated tag `m4` with message `M4: entities and chat`; `git push origin main --follow-tags`; `git ls-remote origin main` read back.
+- [x] **Step 5: CI on the pushed head.** `gh run list --commit <sha>` — all jobs green; a failure routes back through a scoped fix.
+- [x] **Step 6: The run-record follow-up.** Mirror M3's: update STATE's CI bullet with the run id; commit `docs: record the M4 close-out CI run`; push; confirm green.
+- [x] **Step 7: Ledger close.** Mark the plan complete in the ledger; collect the milestone's rulings for the owner's summary.
+
+*(Executed 2026-10-07: Step 1's final whole-branch review over the frozen milestone diff (`35f2d217..103549e`, 80 commits) returned **approved** — 0 Critical / 0 Important; the deferred triage 0 material / 2 landed as records / 35 re-carried / 50 open with named triggers; the two record/route minors carried by the sweep corrections (`refs/m4-task-23/final-review.md`). Steps 2–3's docs sweep, content gate and prose pass landed in this close commit; Step 4's tag `m4` marks it; Step 5's CI run id is recorded by Step 6's follow-up commit.)*
 
 **Verification:** `gh run list --commit` on both pushed heads; `git ls-remote origin main` equals local HEAD; worktree clean; both rig ports free.
 
