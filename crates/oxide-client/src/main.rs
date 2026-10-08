@@ -2717,6 +2717,12 @@ impl ApplicationHandler for ClientApp {
             // The hud's icon sheet: the tab list's latency bars and heart
             // glyphs sample it under the name their draws carry.
             renderer.set_hud_texture(assets::HUD_ICONS, &assets.hud_icons);
+            // The GUI sheets: the widgets, the container family, the book sheets,
+            // the SGA glyph sheet and the chest trio's icon sheets, under the keys
+            // the screens and the chest item model name them.
+            for (key, texture) in &assets.gui_sheets {
+                renderer.set_hud_texture(key, texture);
+            }
             renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
         }
         self.window = Some(window);

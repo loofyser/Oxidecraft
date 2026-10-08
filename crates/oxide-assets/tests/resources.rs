@@ -273,6 +273,21 @@ fn the_real_extraction_tree_loads() {
         );
     }
 
+    // Every sheet the client registers with the hud pass is in the tree — the
+    // gui sheets, the book, the SGA glyph sheet and the chest trio's icon
+    // sheets, one real container sheet among them. A wrong key fails here,
+    // naming it, rather than loading silently.
+    for key in oxide_assets::resources::GUI_SHEETS {
+        assert!(
+            set.get(key).is_some(),
+            "the gui sheet {key} is not in the real tree's set"
+        );
+    }
+    assert!(
+        set.get("gui/container/generic_54").is_some(),
+        "the generic container frame is in the real tree's set"
+    );
+
     // The water sidecar states frametime 2; the real tree's sidecars attach.
     let water = set
         .animation("blocks/water_still")

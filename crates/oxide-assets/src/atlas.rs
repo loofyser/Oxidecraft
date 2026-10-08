@@ -29,8 +29,10 @@
 //! one frame — its first playback entry — and its reductions are that
 //! frame's own pixels at the frame's place, matching the clone, which
 //! generates a sprite's mipmaps from its frames (`TextureMap.java:179`,
-//! `TextureAtlasSprite.generateMipmaps :330-374`) and uploads the first
-//! frame's chain (`:235`).
+//! `TextureAtlasSprite.generateMipmaps :330-374`) and uploads frame-index
+//! 0's chain (`TextureMap.java:235`, `getFrameTextureData(0)`); that row is
+//! the one `playback[0]` names only because all four shipped liquid frame
+//! lists start at row 0.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -281,14 +283,19 @@ pub enum AtlasError {
     },
 }
 
-/// Stitches `paths` into one atlas whose filtering keeps `mipmap_levels`
-/// levels.
+/// Stitches the block set and the item set into one atlas whose filtering
+/// keeps `mipmap_levels` levels.
 ///
-/// `paths` is the complete set of textures to stitch and `textures` holds
-/// every one of them. The atlas adds exactly one sprite of its own: the
-/// generated fallback, in [`Atlas::missing`] and in the index under
-/// `missingno` — a `paths` entry naming `missingno` resolves to it rather
-/// than being an error. Any other path the set does not hold is
+/// `paths` is the block model set's complete texture list — the client hands
+/// over `ModelSource::texture_paths` — and `item_paths` is the item registry's
+/// sprite list beside it: the generated items' layer sheets and every other
+/// item sprite the atlas carries. The two sets are one set to the stitch (one
+/// atlas holds blocks and items, the survey's §1.4 decision): the union is
+/// walked in sorted order, a path in both sets is one sprite, and every path of
+/// either set must be held by `textures`. The atlas adds exactly one sprite of
+/// its own: the generated fallback, in [`Atlas::missing`] and in the index
+/// under `missingno` — a path naming `missingno` resolves to it rather than
+/// being an error. Any other path neither set holds is
 /// [`AtlasError::MissingTexture`].
 ///
 /// The layout is deterministic: sprites are sorted by cell side descending
@@ -307,14 +314,16 @@ pub enum AtlasError {
 pub fn build_atlas(
     textures: &TextureSet,
     paths: &BTreeSet<String>,
+    item_paths: &BTreeSet<String>,
     mipmap_levels: u32,
 ) -> Result<Atlas, AtlasError> {
     let fallback = missing_pixels();
 
-    // Classify every requested path, in the set's own (sorted) order, so the
-    // same input fails on the same path every time.
-    let mut plans: Vec<Plan> = Vec::with_capacity(paths.len() + 1);
-    for path in paths {
+    // Classify every requested path — the block set and the item set beside
+    // it — in the sets' own (sorted, unioned) order, so the same input fails
+    // on the same path every time.
+    let mut plans: Vec<Plan> = Vec::with_capacity(paths.len() + item_paths.len() + 1);
+    for path in paths.union(item_paths) {
         let Some(texture) = textures.get(path) else {
             if path == MISSING_SPRITE {
                 // The fallback is in every atlas already.
@@ -390,8 +399,10 @@ pub fn build_atlas(
     // one frame — its first playback entry — and its reductions are that
     // frame's own pixels at the frame's place: the clone generates every
     // sprite's mipmaps from its frames (`TextureMap.java:179`) and uploads
-    // the first frame's chain (`:235`), so a minified liquid samples its
-    // frame's averaging rather than an empty cell.
+    // frame-index 0's chain (`:235`, `getFrameTextureData(0)`) — the row
+    // `playback[0]` names only because all four shipped liquid frame lists
+    // start at row 0 — so a minified liquid samples its frame's averaging
+    // rather than an empty cell.
     let mut mips: Vec<Mip> = plans
         .iter()
         .zip(&regions)

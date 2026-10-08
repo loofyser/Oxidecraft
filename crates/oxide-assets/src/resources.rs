@@ -31,6 +31,57 @@ const MCMETA_SUFFIX: &str = ".png.mcmeta";
 /// The key prefix of the unicode glyph pages the loader skips.
 const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 
+/// The GUI sheets the client registers with the hud pass, keyed as the
+/// texture tree keys them: extensionless, below `textures/`.
+///
+/// Every name is one of the source's own `ResourceLocation`s with the
+/// `textures/` prefix and the `.png` suffix dropped, verified against the
+/// reference tree in-task (a wrong key fails the store test rather than
+/// loading silently):
+///
+/// - `gui/widgets` — the buttons' and the in-game hud's sheet
+///   (`GuiButton.java`:11, `GuiIngame.java`:48).
+/// - the container family: `gui/container/generic_54` (`GuiChest.java`:12),
+///   `dispenser` (`GuiDispenser.java`:11), `hopper` (`GuiHopper.java`:14),
+///   `furnace` (`GuiFurnace.java`:12), `brewing_stand`
+///   (`GuiBrewingStand.java`:11), `crafting_table` (`GuiCrafting.java`:13),
+///   `enchanting_table` (`GuiEnchantment.java`:28), `anvil`
+///   (`GuiRepair.java`:25), `beacon` (`GuiBeacon.java`:27), `villager`
+///   (`GuiMerchant.java`:29) and `horse`
+///   (`GuiScreenHorseInventory.java`:12), all under `gui/container/`.
+/// - `gui/book` — the written book's frame (`GuiScreenBook.java`:33).
+/// - `entity/enchanting_table_book` — the enchanting table's book render
+///   (`GuiEnchantment.java`:33, `TileEntityEnchantmentTableRenderer.java`:13).
+/// - `font/ascii_sga` — the SGA glyph sheet (`Minecraft.java`:515).
+/// - the chest trio's icon sheets — `entity/chest/normal`,
+///   `entity/chest/trapped` and `entity/chest/ender`
+///   (`TileEntityChestRenderer.java`:17-19,
+///   `TileEntityEnderChestRenderer.java`:10) — the names the item model's
+///   chest resolution carries (`BuiltinItem::icon_sheet`).
+///
+/// The hud's icon sheet, `gui/icons`, already travels under its own
+/// client-side name and is not repeated here.
+pub const GUI_SHEETS: [&str; 18] = [
+    "gui/widgets",
+    "gui/container/generic_54",
+    "gui/container/dispenser",
+    "gui/container/hopper",
+    "gui/container/furnace",
+    "gui/container/brewing_stand",
+    "gui/container/crafting_table",
+    "gui/container/enchanting_table",
+    "gui/container/anvil",
+    "gui/container/beacon",
+    "gui/container/villager",
+    "gui/container/horse",
+    "gui/book",
+    "entity/enchanting_table_book",
+    "font/ascii_sga",
+    "entity/chest/normal",
+    "entity/chest/trapped",
+    "entity/chest/ender",
+];
+
 /// Errors from loading a texture tree.
 #[derive(Debug, thiserror::Error)]
 pub enum ResourceError {
@@ -283,6 +334,37 @@ mod tests {
         assert_eq!(
             item_texture_key("blocks/planks_acacia"),
             "blocks/planks_acacia"
+        );
+    }
+
+    /// The list names the source's own sheets: the widgets sheet, the eleven
+    /// container frames, the two book sheets, the SGA glyph sheet and the chest
+    /// trio's icon sheets — extensionless keys, `gui/icons` not among them (the
+    /// hud's icon sheet travels under its own client-side name).
+    #[test]
+    fn the_gui_sheet_list_names_the_sources_own_sheets() {
+        assert_eq!(
+            GUI_SHEETS,
+            [
+                "gui/widgets",
+                "gui/container/generic_54",
+                "gui/container/dispenser",
+                "gui/container/hopper",
+                "gui/container/furnace",
+                "gui/container/brewing_stand",
+                "gui/container/crafting_table",
+                "gui/container/enchanting_table",
+                "gui/container/anvil",
+                "gui/container/beacon",
+                "gui/container/villager",
+                "gui/container/horse",
+                "gui/book",
+                "entity/enchanting_table_book",
+                "font/ascii_sga",
+                "entity/chest/normal",
+                "entity/chest/trapped",
+                "entity/chest/ender",
+            ]
         );
     }
 }

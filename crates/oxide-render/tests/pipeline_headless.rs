@@ -86,6 +86,12 @@ const SIZE: u32 = 64;
 const BYTES_PER_ROW: u32 = 256;
 /// The sky colour as 8-bit unorm bytes: 0.62, 0.76 and 0.98 of 255, rounded.
 const SKY: [u8; 3] = [158, 194, 250];
+/// The icon case's checkerboard texels: the stand-in sprite's own two colours at level 0.
+const CHECKER_A: [u8; 4] = [254, 0, 0, 255];
+const CHECKER_B: [u8; 4] = [0, 0, 254, 255];
+/// The two colours' average: every texel of the stand-in's reduced level, and the value a
+/// minified sample blends in.
+const CHECKER_AVERAGE: [u8; 4] = [127, 0, 127, 255];
 /// The stone block's top face as 8-bit unorm bytes: 0.50 grey of 255, rounded.
 const STONE: [u8; 3] = [128, 128, 128];
 /// The buried face's colour, which must never reach the target.
@@ -5926,6 +5932,161 @@ fn the_hud_pass_draws_the_tab_list() {
         lit, 1638,
         "the three panels' 42x39 extent; every cell, head, name, score and bar inside"
     );
+}
+
+/// The icon case's stand-in atlas: a 16x16 level-0 checkerboard of [`CHECKER_A`] and
+/// [`CHECKER_B`] texels and its 8x8 reduced level, every texel the two colours' average —
+/// what the stitcher's own per-sprite reduction of a checkerboard produces — under one
+/// sprite covering the whole image.
+///
+/// The pixels are generated here; no asset store is read and no Mojang pixel is embedded.
+fn checkerboard_atlas() -> Atlas {
+    const SIDE: u32 = 16;
+    let bytes = |texels: &[[u8; 4]]| -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(texels.len() * 4);
+        for texel in texels {
+            rgba.extend_from_slice(texel);
+        }
+        rgba
+    };
+    let checker: Vec<[u8; 4]> = (0..SIDE * SIDE)
+        .map(|index| {
+            let (x, y) = (index % SIDE, index / SIDE);
+            if (x + y) % 2 == 0 {
+                CHECKER_A
+            } else {
+                CHECKER_B
+            }
+        })
+        .collect();
+    let reduced = vec![CHECKER_AVERAGE; ((SIDE / 2) * (SIDE / 2)) as usize];
+    let whole = AtlasSprite {
+        region: SpriteRect {
+            x: 0,
+            y: 0,
+            w: SIDE,
+            h: SIDE,
+        },
+        content: SpriteRect {
+            x: 0,
+            y: 0,
+            w: SIDE,
+            h: SIDE,
+        },
+    };
+    Atlas {
+        levels: vec![
+            AtlasLevel {
+                width: SIDE,
+                height: SIDE,
+                rgba: bytes(&checker),
+            },
+            AtlasLevel {
+                width: SIDE / 2,
+                height: SIDE / 2,
+                rgba: bytes(&reduced),
+            },
+        ],
+        width: SIDE,
+        height: SIDE,
+        level_count: 2,
+        sprites: BTreeMap::from([("test:checker".to_string(), whole)]),
+        animated: BTreeMap::new(),
+        missing: whole,
+    }
+}
+
+/// The hud draws one minified sprite twice — through the standing `Atlas` binding and
+/// through the icon binding — and the two readings differ: the standing binding blends the
+/// reduced level in, the icon binding samples the sprite's own level-0 texels.
+///
+/// The source: the block atlas's standing state is blur off with mipmaps on
+/// (`Minecraft.java:548-554`, `setBlurMipmapDirect(false, mipmapLevels > 0)`), the pair the
+/// terrain's mipped layers read it through; the GUI item draws switch it to
+/// `setBlurMipmap(false, false)` before their quads and restore after
+/// (`RenderItem.java`:318/:357 — the survey's §1.4), the nearest, level-0-only state
+/// [`HudTexture::AtlasIcon`] carries. A minified icon that sampled the standing binding
+/// would blend the reduced level in — the rig notes' minified-sprite mip class — where the
+/// source's icon draws stay crisp.
+///
+/// The stand-in atlas is hand-built here: a 16x16 two-colour checkerboard at level 0 and
+/// its 8x8 average at level 1. Each draw is a 4x4 GUI-pixel quad sampling the whole
+/// 16-texel sprite, so the sampling footprint is four texels per pixel and the level of
+/// detail reaches level 1. The resolution is 64x64 GUI units onto the 64x64 target, so one
+/// unit is one pixel and each quad lands at its own coordinate.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_atlasicon_binding_stays_crisp_where_the_atlas_binding_blends() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_atlas(&device, &queue, &checkerboard_atlas());
+    hud.set_atlas_icon(&device, &queue, &checkerboard_atlas());
+    let tint = [1.0, 1.0, 1.0, 1.0];
+    let whole = [0.0, 0.0, 1.0, 1.0];
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            // The standing binding: the minified quad through the mipped pair.
+            HudDraw::TexturedRect {
+                texture: HudTexture::Atlas,
+                x: 0.0,
+                y: 0.0,
+                width: 4.0,
+                height: 4.0,
+                uv: whole,
+                colour: tint,
+            },
+            // The icon binding: the same quad, crisp.
+            HudDraw::TexturedRect {
+                texture: HudTexture::AtlasIcon,
+                x: 0.0,
+                y: 4.0,
+                width: 4.0,
+                height: 4.0,
+                uv: whole,
+                colour: tint,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // The standing binding: every pixel the reduced level's own texel — the blend a
+    // minified sample reads in through the mipped pair.
+    for y in 0..4 {
+        for x in 0..4 {
+            expect_texel(
+                &pixels,
+                x,
+                y,
+                CHECKER_AVERAGE,
+                "the standing binding's pixel",
+            );
+        }
+    }
+    // The icon binding: every pixel one of the sprite's own two texels — level 0 alone,
+    // never the reduced level's blend.
+    for y in 4..8 {
+        for x in 0..4 {
+            let got = pixel_rgba(&pixels, x, y);
+            assert!(
+                got == CHECKER_A || got == CHECKER_B,
+                "the icon binding's pixel at ({x}, {y}) is one of the sprite's own texels: got {got:?}"
+            );
+        }
+    }
 }
 
 /// The hud draws the scoreboard sidebar's shape over the cleared frame: the title band,

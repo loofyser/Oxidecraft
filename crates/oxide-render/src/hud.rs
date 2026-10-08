@@ -230,6 +230,14 @@ pub enum HudTexture {
     Named(&'static str),
     /// The block atlas, through [`HudPass::set_atlas`].
     Atlas,
+    /// The block atlas bound with the icon draws' no-mipmap, no-blur sampler, through
+    /// [`HudPass::set_atlas_icon`]: the state the source's GUI item draws switch the
+    /// atlas to before their quads and restore after
+    /// (`RenderItem.renderItemIntoGUI`'s `setBlurMipmap(false, false)`,
+    /// `RenderItem.java`:318/:357 — survey §1.4), so a minified icon samples the
+    /// sprite's own texels where the standing binding would blend the reduced level
+    /// in. Every icon draw uses this binding.
+    AtlasIcon,
 }
 
 /// One item of a frame's hud draw list, in GUI-space units at the scaled resolution.
@@ -350,8 +358,10 @@ enum BatchTexture {
     Font,
     /// A named registered texture.
     Named(&'static str),
-    /// The block atlas.
+    /// The block atlas, under the standing (mipped) binding.
     Atlas,
+    /// The block atlas, under the icon draws' level-0 binding.
+    AtlasIcon,
     /// A registered skin texture, by id.
     Skin(SkinTexId),
 }
@@ -398,6 +408,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 match texture {
                     HudTexture::Named(name) => BatchTexture::Named(name),
                     HudTexture::Atlas => BatchTexture::Atlas,
+                    HudTexture::AtlasIcon => BatchTexture::AtlasIcon,
                 },
                 true,
             ),
@@ -600,8 +611,12 @@ pub struct HudPass {
     white_bind: wgpu::BindGroup,
     /// The font sheet, once [`HudPass::set_font`] has landed.
     font: Option<FontSheet>,
-    /// The block atlas' bind group, once [`HudPass::set_atlas`] has landed.
+    /// The block atlas' bind group, once [`HudPass::set_atlas`] has landed: the
+    /// standing binding, read with the atlas's mipped pair.
     atlas: Option<wgpu::BindGroup>,
+    /// The block atlas' level-0 bind group, once [`HudPass::set_atlas_icon`] has
+    /// landed: the icon draws' binding, read with the no-mipmap, no-blur pair.
+    atlas_icon: Option<wgpu::BindGroup>,
     /// The named textures [`HudPass::set_texture`] registered.
     textures: Vec<(&'static str, wgpu::BindGroup)>,
     /// The skin bind groups the stored list's head draws sample: one per distinct id,
@@ -758,6 +773,7 @@ impl HudPass {
             white_bind,
             font: None,
             atlas: None,
+            atlas_icon: None,
             textures: Vec::new(),
             skin_binds: Vec::new(),
             draws: Vec::new(),
@@ -920,24 +936,39 @@ impl HudPass {
     /// [`HudTexture::Atlas`].
     ///
     /// The upload is [`AtlasTexture`]'s, the same levels-and-mips shape the terrain
-    /// pass draws with; the plain sampler is the atlas' own nearest one.
+    /// pass draws with, and the binding is the atlas's standing pair — nearest within a
+    /// level, mipmaps live — the state the client leaves the block atlas in
+    /// (`Minecraft.java:548-554`: `setBlurMipmapDirect(false, mipmapLevels > 0)`, blur
+    /// off and mipmaps on) and the pair its mipped terrain layers read it through. The
+    /// icon draws' own level-0 binding is [`HudPass::set_atlas_icon`]'s.
     pub fn set_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) {
         let texture = AtlasTexture::upload(device, queue, atlas);
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("oxide hud atlas bind group"),
-            layout: &self.texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(texture.view()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(texture.plain_sampler()),
-                },
-            ],
-        });
-        self.atlas = Some(bind);
+        self.atlas = Some(atlas_bind(
+            device,
+            &self.texture_layout,
+            &texture,
+            texture.sampler(),
+            "oxide hud atlas bind group",
+        ));
+    }
+
+    /// Uploads `atlas` and binds its view for [`HudDraw::TexturedRect`]s that sample
+    /// [`HudTexture::AtlasIcon`]: the atlas read through the no-mipmap, no-blur pair —
+    /// `GL_NEAREST` on every filter, mip level 0 alone — the state the source's GUI
+    /// item draws switch the atlas to before their quads and restore after
+    /// (`RenderItem.renderItemIntoGUI`'s `setBlurMipmap(false, false)`,
+    /// `RenderItem.java`:318/:357 — survey §1.4). A minified icon therefore samples the
+    /// sprite's own level-0 texels where the standing binding blends the reduced level
+    /// in.
+    pub fn set_atlas_icon(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) {
+        let texture = AtlasTexture::upload(device, queue, atlas);
+        self.atlas_icon = Some(atlas_bind(
+            device,
+            &self.texture_layout,
+            &texture,
+            texture.plain_sampler(),
+            "oxide hud icon atlas bind group",
+        ));
     }
 
     /// Replaces the drawn list with `draws`.
@@ -1103,6 +1134,10 @@ impl HudPass {
                     Some(bind) => bind,
                     None => continue,
                 },
+                BatchTexture::AtlasIcon => match &self.atlas_icon {
+                    Some(bind) => bind,
+                    None => continue,
+                },
                 BatchTexture::Skin(id) => {
                     match self.skin_binds.iter().find(|(bound, _)| *bound == id) {
                         Some((_, bind)) => bind,
@@ -1114,6 +1149,31 @@ impl HudPass {
             pass.draw_indexed(batch.indices.clone(), 0, 0..1);
         }
     }
+}
+
+/// Builds one of the hud's atlas bind groups: the uploaded atlas's view with `sampler`
+/// under the hud's texture layout.
+fn atlas_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    texture: &AtlasTexture,
+    sampler: &wgpu::Sampler,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(texture.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 /// The one-texel white texture solid rects sample: opaque white, written at creation so
@@ -1620,6 +1680,16 @@ mod tests {
                 uv: [0.0, 0.0, 0.25, 0.25],
                 colour: [1.0; 4],
             },
+            // The icon binding is a different sampler on the same texture: its own run.
+            HudDraw::TexturedRect {
+                texture: HudTexture::AtlasIcon,
+                x: 0.0,
+                y: 0.0,
+                width: 16.0,
+                height: 16.0,
+                uv: [0.0, 0.0, 0.25, 0.25],
+                colour: [1.0; 4],
+            },
             HudDraw::TexturedRect {
                 texture: HudTexture::Named("gui/icons"),
                 x: 0.0,
@@ -1640,6 +1710,7 @@ mod tests {
             vec![
                 BatchTexture::White,
                 BatchTexture::Atlas,
+                BatchTexture::AtlasIcon,
                 BatchTexture::Named("gui/icons"),
             ]
         );

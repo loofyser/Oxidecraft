@@ -11,6 +11,7 @@
 //! fallback. Everything else the tree holds is read through the modules that own those rules:
 //! a malformed PNG, blockstate or model is their error, never a silent default.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,9 +19,10 @@ use oxide_assets::atlas::{Atlas, AtlasError, build_atlas};
 use oxide_assets::extract::Extractor;
 use oxide_assets::font::{Font, FontError};
 use oxide_assets::model::{BakedModel, BakedQuad, ModelError, ModelSource};
-use oxide_assets::resources::{ResourceError, TextureSet};
+use oxide_assets::resources::{GUI_SHEETS, ResourceError, TextureSet};
 use oxide_assets::store::{Store, StoreError};
 use oxide_assets::texture::Texture;
+use oxide_client::items::{self, ItemModel};
 use oxide_game::chat::LanguageTable;
 use oxide_game::mesher::{BlockModelSet, ModelChoice};
 use oxide_game::session::MeshAssets;
@@ -302,9 +304,32 @@ pub struct ClientAssets {
     /// The hud's icon sheet, under [`HUD_ICONS`]: the tab list's latency bars and
     /// heart glyphs sample it.
     pub hud_icons: Texture,
+    /// The GUI sheets, under their own store keys ([`GUI_SHEETS`]): the widgets
+    /// sheet, the container family, the two book sheets, the SGA glyph sheet and
+    /// the chest trio's icon sheets — the keys the screens and the chest item
+    /// model name them.
+    pub gui_sheets: Vec<(&'static str, Texture)>,
     /// The object draws' item mesh source: the baked block models, the sheets and the
     /// frame's wood.
     pub item_meshes: ClientItemMeshes,
+}
+
+/// The item registry's atlas sprite paths: every generated item's own layer sheets,
+/// deduplicated and sorted — the item set the atlas stitches beside the block model
+/// set (the survey's §1.4 decision: one atlas holds blocks and items).
+///
+/// The chest trio's icon sheets resolve through [`ItemModel::Builtin`] and are
+/// registered as their own textures ([`GUI_SHEETS`]), not stitched.
+fn item_sprite_paths() -> BTreeSet<String> {
+    items::registry()
+        .iter()
+        .filter_map(|entry| match entry.resolution {
+            ItemModel::Generated(layers) => Some(layers),
+            _ => None,
+        })
+        .flatten()
+        .map(|layer| (*layer).to_string())
+        .collect()
 }
 
 impl ClientAssets {
@@ -326,7 +351,15 @@ impl ClientAssets {
 
         let textures = TextureSet::load(&tree)?;
         let models = ModelSource::open(&tree)?;
-        let atlas = build_atlas(&textures, &models.texture_paths(), ATLAS_MIP_LEVELS)?;
+        // The item registry's sprite list, beside the block model set: one atlas
+        // holds the blocks and the items (the survey's §1.4 decision).
+        let item_sprites = item_sprite_paths();
+        let atlas = build_atlas(
+            &textures,
+            &models.texture_paths(),
+            &item_sprites,
+            ATLAS_MIP_LEVELS,
+        )?;
         let block_models = BlockModelSet::load(&models);
         let tint_maps = TintMaps {
             grass: colormap(&textures, GRASS_COLORMAP)?,
@@ -364,6 +397,13 @@ impl ClientAssets {
         // The hud's icon sheet: the tab list's latency bars and heart glyphs sample
         // it under the name every draw of it carries.
         let hud_icons = texture(&textures, HUD_ICONS)?.clone();
+        // The GUI sheets: the widgets, the container family, the book sheets, the
+        // SGA glyph sheet and the chest trio's icon sheets, under the keys the
+        // screens and the chest item model name them.
+        let mut gui_sheets = Vec::with_capacity(GUI_SHEETS.len());
+        for key in GUI_SHEETS {
+            gui_sheets.push((key, texture(&textures, key)?.clone()));
+        }
         // The blocks atlas's level-0 image, under the name the block-item meshes
         // sample; and the item frame's wood, baked from the tree's own model
         // (`RenderItemFrame.java`:37).
@@ -389,6 +429,8 @@ impl ClientAssets {
             atlas_height = mesh.atlas.height,
             atlas_levels = mesh.atlas.level_count,
             atlas_sprites = mesh.atlas.sprites.len(),
+            item_sprites = item_sprites.len(),
+            gui_sheets = gui_sheets.len(),
             sheet_width = sheet.width,
             sheet_height = sheet.height,
             "the client assets were loaded"
@@ -405,6 +447,7 @@ impl ClientAssets {
             skin_wide,
             skin_slim,
             hud_icons,
+            gui_sheets,
             item_meshes,
         })
     }
@@ -872,6 +915,110 @@ mod tests {
             models.blockstates(ITEM_FRAME_STATE.0).is_ok(),
             "the frame's blockstate file is in the store"
         );
+    }
+
+    /// The item sprite set is the registry's own generated layers: every generated
+    /// item's sheet paths, deduplicated and sorted — the `items/` sheets and the
+    /// block sheets the generated items sample (the torch, the rails, the plants)
+    /// — and nothing else: the block model set's own sheets stay out, and the
+    /// chest trio's icon sheets resolve through their own class and are registered
+    /// as textures, not stitched.
+    #[test]
+    fn the_item_sprite_set_is_the_registrys_generated_layers() {
+        let sprites = item_sprite_paths();
+        // A generated item's own top sheet is in it.
+        assert!(sprites.contains("items/apple"));
+        assert!(sprites.contains("items/diamond_sword"));
+        assert!(sprites.contains("items/potion_bottle_drinkable"));
+        // The block sheets the generated items sample travel in the set too: the
+        // torch, the rails and the plants are block textures.
+        assert!(sprites.contains("blocks/torch_on"));
+        assert!(sprites.contains("blocks/rail_golden"));
+        assert!(sprites.contains("blocks/flower_rose"));
+        // The block model set's own sheets are not the item set's, and the chest
+        // trio's icon sheets are not stitched.
+        assert!(!sprites.contains("blocks/stone"));
+        assert!(!sprites.contains("entity/chest/normal"));
+        // Every entry is a sheet of the tree, sorted by the set.
+        assert_eq!(sprites.len(), 214, "the registry's distinct layer sheets");
+        let mut sorted: Vec<&String> = sprites.iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, sprites.iter().collect::<Vec<_>>());
+    }
+
+    /// The item sprites and the GUI sheets load from the store's own tree: the
+    /// atlas carries the registry's sprites beside the block set, and every GUI
+    /// sheet loads under its own key — one real container sheet among them.
+    #[test]
+    #[ignore = "reads the asset store; set OXIDECRAFT_STORE and run with -- --ignored"]
+    fn the_item_sprites_and_gui_sheets_load_from_the_store() {
+        let root = std::env::var_os(STORE_VAR)
+            .filter(|root| !root.is_empty())
+            .expect("OXIDECRAFT_STORE must name the store root");
+        let assets =
+            ClientAssets::load(Some(PathBuf::from(&root))).expect("the client assets load");
+        let store = Store::open(PathBuf::from(&root)).expect("the store opens");
+        let tree = Extractor::new(&store, VERSION).root();
+        let models = ModelSource::open(&tree).expect("the block models load");
+        let requested = models.texture_paths();
+
+        // A real item sprite is stitched into the atlas beside the block set, at
+        // its own size; the item set shares the block sheets the generated items
+        // sample (the torch, the rails, the plants), so the count grows by the
+        // item set's own new sprites plus the fallback.
+        let item_sprites = item_sprite_paths();
+        let apple = assets
+            .mesh
+            .atlas
+            .sprites
+            .get("items/apple")
+            .expect("the apple's sheet is stitched");
+        assert_eq!(
+            (apple.content.w, apple.content.h),
+            (16, 16),
+            "the apple's own 16x16 pixels"
+        );
+        let shared = item_sprites
+            .iter()
+            .filter(|path| requested.contains(*path))
+            .count();
+        assert_eq!(
+            shared, 22,
+            "the generated items' block sheets are the block model set's own"
+        );
+        assert_eq!(
+            assets.mesh.atlas.sprites.len(),
+            requested.len() + item_sprites.len() - shared + 1,
+            "the block set, the item set's new sprites and the fallback"
+        );
+
+        // Every GUI sheet loads under its own key, in the list's own order: the
+        // widgets sheet, the container family, the two book sheets, the SGA glyph
+        // sheet and the chest trio's icon sheets.
+        assert_eq!(assets.gui_sheets.len(), GUI_SHEETS.len());
+        for ((key, texture), expected) in assets.gui_sheets.iter().zip(GUI_SHEETS) {
+            assert_eq!(*key, expected, "the sheets load in the list's own order");
+            assert!(
+                texture.width > 0 && texture.height > 0,
+                "{key} is loaded with its own pixels"
+            );
+        }
+        let generic = assets
+            .gui_sheets
+            .iter()
+            .find(|(key, _)| *key == "gui/container/generic_54")
+            .expect("the generic container frame is loaded");
+        assert_eq!(
+            (generic.1.width, generic.1.height),
+            (256, 256),
+            "the container frame's own canvas"
+        );
+        let widgets = assets
+            .gui_sheets
+            .iter()
+            .find(|(key, _)| *key == "gui/widgets")
+            .expect("the widgets sheet is loaded");
+        assert_eq!((widgets.1.width, widgets.1.height), (256, 256));
     }
 
     /// The live item mesh source: the baked block models, the generated item shapes,

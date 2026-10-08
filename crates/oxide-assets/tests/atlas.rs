@@ -43,6 +43,9 @@ const CLEAR_WHITE: [u8; 4] = [255, 255, 255, 0];
 const CLEAR: [u8; 4] = [0, 0, 0, 0];
 /// The green texel of the alpha-cutoff block, three quarters opaque.
 const FADED_GREEN: [u8; 4] = [0, 255, 0, 160];
+/// The item sheet's flat colour: the item sprite the item set stitches beside
+/// the block set.
+const AZURE: [u8; 4] = [0, 128, 255, 255];
 
 #[test]
 fn the_atlas_is_power_of_two_and_holds_every_requested_sprite() {
@@ -55,7 +58,7 @@ fn the_atlas_is_power_of_two_and_holds_every_requested_sprite() {
         "blocks/strip",
         "blocks/reversed",
     ]);
-    let atlas = build_atlas(&set, &requested, 4).expect("the requested set stitches");
+    let atlas = build_atlas(&set, &requested, &no_items(), 4).expect("the requested set stitches");
 
     // The atlas is a power of two on both axes, and every level halves each
     // axis, floored at one.
@@ -135,6 +138,47 @@ fn the_atlas_is_power_of_two_and_holds_every_requested_sprite() {
     );
 }
 
+/// The item set stitches beside the block set: a synthetic item sheet registers
+/// and samples like any other sprite, the sprite count grows by the item set's
+/// own size, and a path both sets name is one sprite.
+///
+/// The item sheet is `stitching_tree`'s own — `items/widget`, the flat
+/// [`AZURE`]. The client hands the registry's sprite list in beside the block
+/// model set so one atlas carries both (the survey's §1.4 decision).
+#[test]
+fn item_sprites_stitch_beside_the_block_set() {
+    let tree = stitching_tree();
+    let set = TextureSet::load(tree.root()).expect("the tree loads");
+    let blocks = paths(&["blocks/red", "blocks/slab"]);
+    let items = paths(&["items/widget"]);
+    let atlas = build_atlas(&set, &blocks, &items, 4).expect("the two sets stitch");
+
+    // The item sheet registers and samples: its own pixels at its place.
+    assert_content_is(&atlas, "items/widget", 16, &[AZURE; 16]);
+
+    // The block set's own sprites, the item set's, and the fallback.
+    assert_eq!(
+        atlas.sprites.len(),
+        blocks.len() + items.len() + 1,
+        "the block set, the item set and the fallback: {}",
+        atlas.sprites.len()
+    );
+    assert!(atlas.sprites.contains_key("missingno"));
+    assert_no_overlapping_regions(&atlas);
+
+    // A path both sets name stitches once: `blocks/red` is in the block set
+    // here as well, and the count does not double-count it.
+    let shared = build_atlas(&set, &blocks, &paths(&["items/widget", "blocks/red"]), 4)
+        .expect("the two sets stitch");
+    assert_content_is(&shared, "blocks/red", 16, &[RED; 16]);
+    assert_eq!(
+        shared.sprites.len(),
+        blocks.len() + 1 + 1,
+        "the shared path is one sprite: {}",
+        shared.sprites.len()
+    );
+}
+
 #[test]
 fn uv_and_level_rect_read_the_content_rect() {
     let tree = stitching_tree();
@@ -142,6 +186,7 @@ fn uv_and_level_rect_read_the_content_rect() {
     let atlas = build_atlas(
         &set,
         &paths(&["blocks/red", "blocks/slab", "blocks/strip"]),
+        &no_items(),
         4,
     )
     .expect("the requested set stitches");
@@ -194,7 +239,8 @@ fn the_default_mip_setting_keeps_five_levels_and_setting_zero_keeps_one() {
     let set = TextureSet::load(tree.root()).expect("the tree loads");
     let sixteen_only = paths(&["blocks/red", "blocks/blue"]);
 
-    let default = build_atlas(&set, &sixteen_only, 4).expect("the default setting stitches");
+    let default =
+        build_atlas(&set, &sixteen_only, &no_items(), 4).expect("the default setting stitches");
     assert_eq!(
         default.level_count, 5,
         "the default setting of 4 on an all-16x16 set builds the base image and 4 reductions"
@@ -205,11 +251,11 @@ fn the_default_mip_setting_keeps_five_levels_and_setting_zero_keeps_one() {
         "two 16x16 sprites and the fallback fill the first 32-texel atlas"
     );
 
-    let none = build_atlas(&set, &sixteen_only, 0).expect("setting 0 stitches");
+    let none = build_atlas(&set, &sixteen_only, &no_items(), 0).expect("setting 0 stitches");
     assert_eq!(none.level_count, 1, "setting 0 builds the base level only");
     assert_eq!(none.levels.len(), 1);
 
-    let one = build_atlas(&set, &sixteen_only, 1).expect("setting 1 stitches");
+    let one = build_atlas(&set, &sixteen_only, &no_items(), 1).expect("setting 1 stitches");
     assert_eq!(
         one.level_count, 2,
         "setting 1 keeps the base image and one reduction"
@@ -232,8 +278,8 @@ fn a_sprite_whose_size_clamps_the_level_count() {
         &solid_png(16, 24, GREEN),
     );
     let set = TextureSet::load(tree.root()).expect("the tree loads");
-    let atlas =
-        build_atlas(&set, &paths(&["blocks/red", "blocks/odd"]), 4).expect("the tree stitches");
+    let atlas = build_atlas(&set, &paths(&["blocks/red", "blocks/odd"]), &no_items(), 4)
+        .expect("the tree stitches");
 
     assert_eq!(
         atlas.level_count, 4,
@@ -278,6 +324,7 @@ fn the_mip_kernel_blends_in_gamma_space_like_the_client() {
     let atlas = build_atlas(
         &set,
         &paths(&["blocks/twotone", "blocks/cutout", "blocks/faded"]),
+        &no_items(),
         4,
     )
     .expect("the three sprites stitch");
@@ -348,6 +395,7 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
     let atlas = build_atlas(
         &set,
         &paths(&["blocks/red", "blocks/blue", "blocks/padded", "blocks/strip"]),
+        &no_items(),
         4,
     )
     .expect("the four sprites stitch");
@@ -459,8 +507,13 @@ fn no_pixel_of_a_reduced_level_bleeds_across_two_adjacent_sprites() {
 fn the_strip_frames_follow_the_playback_list_with_effective_times() {
     let tree = stitching_tree();
     let set = TextureSet::load(tree.root()).expect("the tree loads");
-    let atlas = build_atlas(&set, &paths(&["blocks/strip", "blocks/reversed"]), 4)
-        .expect("the strips stitch");
+    let atlas = build_atlas(
+        &set,
+        &paths(&["blocks/strip", "blocks/reversed"]),
+        &no_items(),
+        4,
+    )
+    .expect("the strips stitch");
 
     // The identity strip: no `frames` list, so the frames are the rows in
     // order, at the strip's width per frame, with the sidecar's frametime.
@@ -568,8 +621,13 @@ fn the_strip_frames_follow_the_playback_list_with_effective_times() {
 fn the_drawn_frame_of_a_strip_reduces_at_its_own_place() {
     let tree = stitching_tree();
     let set = TextureSet::load(tree.root()).expect("the tree loads");
-    let atlas = build_atlas(&set, &paths(&["blocks/strip", "blocks/reversed"]), 4)
-        .expect("the strips stitch");
+    let atlas = build_atlas(
+        &set,
+        &paths(&["blocks/strip", "blocks/reversed"]),
+        &no_items(),
+        4,
+    )
+    .expect("the strips stitch");
 
     // Each strip reduces the frame it draws — the first playback entry —
     // at the frame's own place: the clone generates every sprite's mipmaps
@@ -614,6 +672,7 @@ fn the_drawn_sprite_of_a_strip_is_its_first_frame() {
     let atlas = build_atlas(
         &set,
         &paths(&["blocks/red", "blocks/strip", "blocks/reversed"]),
+        &no_items(),
         4,
     )
     .expect("the tree stitches");
@@ -663,7 +722,8 @@ fn the_drawn_sprite_of_a_strip_is_its_first_frame() {
 fn the_missing_sprite_is_the_generated_checkerboard() {
     let tree = stitching_tree();
     let set = TextureSet::load(tree.root()).expect("the tree loads");
-    let atlas = build_atlas(&set, &paths(&["blocks/red"]), 4).expect("the tree stitches");
+    let atlas =
+        build_atlas(&set, &paths(&["blocks/red"]), &no_items(), 4).expect("the tree stitches");
 
     let missing = atlas.missing;
     assert_eq!(missing.region.w, 16);
@@ -704,8 +764,13 @@ fn a_path_the_set_does_not_hold_is_an_error_unless_it_is_the_fallback() {
     let tree = stitching_tree();
     let set = TextureSet::load(tree.root()).expect("the tree loads");
 
-    let error = build_atlas(&set, &paths(&["blocks/red", "blocks/ghost"]), 4)
-        .expect_err("a path the set does not hold cannot stitch");
+    let error = build_atlas(
+        &set,
+        &paths(&["blocks/red", "blocks/ghost"]),
+        &no_items(),
+        4,
+    )
+    .expect_err("a path the set does not hold cannot stitch");
     assert!(
         matches!(error, AtlasError::MissingTexture { .. }),
         "the error says the texture is missing: {error}"
@@ -716,7 +781,7 @@ fn a_path_the_set_does_not_hold_is_an_error_unless_it_is_the_fallback() {
     );
 
     // The fallback's own name is not an error: the atlas carries it itself.
-    let atlas = build_atlas(&set, &paths(&["blocks/red", "missingno"]), 4)
+    let atlas = build_atlas(&set, &paths(&["blocks/red", "missingno"]), &no_items(), 4)
         .expect("the fallback's name resolves");
     assert_eq!(atlas.sprites["missingno"], atlas.missing);
     assert_eq!(
@@ -740,7 +805,7 @@ fn a_frame_index_past_the_rows_is_an_error_naming_the_sprite() {
     );
     let set = TextureSet::load(tree.root()).expect("the tree loads");
 
-    let error = build_atlas(&set, &paths(&["blocks/badidx"]), 4)
+    let error = build_atlas(&set, &paths(&["blocks/badidx"]), &no_items(), 4)
         .expect_err("row 1 does not exist in a one-row sprite");
     assert!(
         matches!(error, AtlasError::FrameIndex { .. }),
@@ -765,7 +830,7 @@ fn a_strip_that_is_not_whole_rows_is_an_error_naming_the_sprite() {
     );
     let set = TextureSet::load(tree.root()).expect("the tree loads");
 
-    let error = build_atlas(&set, &paths(&["blocks/ragged"]), 4)
+    let error = build_atlas(&set, &paths(&["blocks/ragged"]), &no_items(), 4)
         .expect_err("24 texels are not a whole number of 16-texel rows");
     assert!(
         matches!(error, AtlasError::RaggedStrip { .. }),
@@ -792,8 +857,13 @@ fn a_sprite_that_cannot_fit_the_atlas_is_an_error() {
     );
     let set = TextureSet::load(tree.root()).expect("the tree loads");
 
-    let error = build_atlas(&set, &paths(&["blocks/wide_a", "blocks/wide_b"]), 4)
-        .expect_err("two 4096-texel cells cannot share the atlas");
+    let error = build_atlas(
+        &set,
+        &paths(&["blocks/wide_a", "blocks/wide_b"]),
+        &no_items(),
+        4,
+    )
+    .expect_err("two 4096-texel cells cannot share the atlas");
     assert!(
         matches!(error, AtlasError::TooLarge { .. }),
         "the error says the sprite is too large: {error}"
@@ -816,8 +886,8 @@ fn the_same_input_builds_the_same_bytes() {
         "blocks/reversed",
     ]);
 
-    let first = build_atlas(&set, &requested, 4).expect("the first build");
-    let second = build_atlas(&set, &requested, 4).expect("the second build");
+    let first = build_atlas(&set, &requested, &no_items(), 4).expect("the first build");
+    let second = build_atlas(&set, &requested, &no_items(), 4).expect("the second build");
 
     assert_eq!(
         layout_hash(&first),
@@ -887,18 +957,37 @@ fn the_real_extraction_tree_stitches() {
     let requested = source.texture_paths();
     assert_eq!(requested.len(), 376, "the survey's resolved path count");
 
-    let atlas = build_atlas(&set, &requested, 4).expect("the real tree stitches");
+    // The registry's sprite list, bounded here: this crate has no edge to the
+    // item registry, so the test names a real item set of the tree — a sword, a
+    // food and a plain sprite. The client hands the registry's own list in
+    // beside the block set; every entry here is a real sheet of the store.
+    let items = paths(&["items/diamond_sword", "items/apple", "items/stick"]);
+    for path in &items {
+        assert!(
+            !requested.contains(path),
+            "{path} is in both sets; the counts below would double-count it"
+        );
+    }
 
-    // Every resolved path is a sprite, plus the fallback under its own key.
+    let atlas = build_atlas(&set, &requested, &items, 4).expect("the real tree stitches");
+
+    // Every resolved path is a sprite, every item sprite is stitched beside it,
+    // plus the fallback under its own key.
     assert_eq!(
         atlas.sprites.len(),
-        requested.len() + 1,
-        "the resolved paths plus the fallback"
+        requested.len() + items.len() + 1,
+        "the resolved paths, the item sprites and the fallback"
     );
     for path in &requested {
         assert!(
             atlas.sprites.contains_key(path),
             "{path} is resolved but not in the atlas"
+        );
+    }
+    for path in &items {
+        assert!(
+            atlas.sprites.contains_key(path),
+            "{path} is an item sprite but not in the atlas"
         );
     }
     assert!(atlas.sprites.contains_key("missingno"));
@@ -988,7 +1077,7 @@ fn the_real_extraction_tree_stitches_the_destroy_stages() {
     let set = TextureSet::load(&root).expect("the real tree loads");
     let source = ModelSource::open(&root).expect("the real tree opens");
     let requested = source.texture_paths();
-    let atlas = build_atlas(&set, &requested, 4).expect("the real tree stitches");
+    let atlas = build_atlas(&set, &requested, &no_items(), 4).expect("the real tree stitches");
 
     for stage in 0..10 {
         let path = format!("blocks/destroy_stage_{stage}");
@@ -1027,9 +1116,10 @@ fn the_real_extraction_tree_stitches_the_destroy_stages() {
 /// Writes the shared synthetic tree the stitching tests build from.
 ///
 /// Two 16x16 sprites with distinct flat colours, one 32x32, an identity strip
-/// whose sidecar states frametime 2 and interpolation, and an out-of-order
+/// whose sidecar states frametime 2 and interpolation, an out-of-order
 /// strip whose sidecar lists its second row first and gives that frame its
-/// own time.
+/// own time, and one 16x16 item sheet — the sprite the item set stitches
+/// beside the block set.
 fn stitching_tree() -> Tree {
     let tree = Tree::new();
     tree.write(
@@ -1060,12 +1150,22 @@ fn stitching_tree() -> Tree {
         "assets/minecraft/textures/blocks/reversed.png.mcmeta",
         br#"{"animation":{"frametime":5,"frames":[{"index":1,"time":7},0]}}"#,
     );
+    tree.write(
+        "assets/minecraft/textures/items/widget.png",
+        &solid_png(16, 16, AZURE),
+    );
     tree
 }
 
 /// A path set from literal path names.
 fn paths(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| (*name).to_string()).collect()
+}
+
+/// The empty item set: the item-sprite input beside the block set that the
+/// cases not about items stitch with.
+fn no_items() -> BTreeSet<String> {
+    BTreeSet::new()
 }
 
 /// The row colours of a strip built from `(count, colour)` blocks, top block
