@@ -7,7 +7,10 @@ pub mod biome;
 pub mod chunk;
 pub mod collision;
 pub mod entity;
+pub mod inventory;
 pub mod light;
 pub mod noise;
 pub mod sky;
 pub mod world;
+
+pub use inventory::Inventory;
