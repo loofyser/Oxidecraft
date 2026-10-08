@@ -144,8 +144,8 @@ specification and continue without asking questions that are already answered he
   installed per run. The M0 caveat about the guard scripts being exercised only on the happy path is
   closed: both guards carry `--self-test` modes since `854ca85`, and CI runs each one before its
   normal check. **M4:** every checkpoint was CI-checked as it landed; the T22 chain's pushed head
-  `103549e` is green in run `37711182425` (all seven jobs), and the close-out commit (the commit
-  the `m4` tag marks) — its run id is recorded in the follow-up commit.
+  `103549e` is green in run `37711182425` (all seven jobs), and the close-out commit `a86f765`
+  (the commit the `m4` tag marks) is green in run `37713937089` (all seven jobs).
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding; the
   per-task reviews, the fix-round reviews and each milestone's final whole-branch review are in the
   milestone ledgers and round dirs (local, git-ignored: M2's in
