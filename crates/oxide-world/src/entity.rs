@@ -447,7 +447,7 @@ impl Entity {
             metadata: Metadata {
                 entries: Vec::new(),
             },
-            equipment: [None; 5],
+            equipment: [const { None }; 5],
             attachment: None,
             age: 0,
             limb_swing: 0.0,
@@ -882,6 +882,7 @@ mod tests {
             id,
             count: 1,
             damage: 0,
+            nbt: None,
         }
     }
 
@@ -1118,7 +1119,7 @@ mod tests {
 
         entities.set_equipment(1, 0, None);
         assert_eq!(
-            entities.get(1).map(|entity| entity.equipment[0]),
+            entities.get(1).map(|entity| entity.equipment[0].clone()),
             Some(None)
         );
 

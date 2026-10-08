@@ -653,22 +653,25 @@ fn extra(entity: &Entity) -> EntityExtra {
         // data, which the wire leaves empty (§6.3) — the air stack's zeroes.
         EntityKind::Item => {
             let stack = match last_value(entity, ITEM_STACK_INDEX) {
-                Some(MetadataValue::Item(Some(item))) => *item,
+                Some(MetadataValue::Item(Some(item))) => item.clone(),
                 Some(MetadataValue::Item(None)) => MetadataItem {
                     id: 0,
                     count: 0,
                     damage: 0,
+                    nbt: None,
                 },
                 _ => match &entity.data {
                     KindData::Item { id, count, damage } => MetadataItem {
                         id: *id,
                         count: *count,
                         damage: *damage,
+                        nbt: None,
                     },
                     _ => MetadataItem {
                         id: 0,
                         count: 0,
                         damage: 0,
+                        nbt: None,
                     },
                 },
             };
@@ -892,7 +895,7 @@ fn float_at(entity: &Entity, index: u8) -> Option<f32> {
 /// The stack a metadata index holds, when it holds a non-empty slot.
 fn item_at(entity: &Entity, index: u8) -> Option<MetadataItem> {
     match last_value(entity, index) {
-        Some(MetadataValue::Item(item)) => *item,
+        Some(MetadataValue::Item(item)) => item.clone(),
         _ => None,
     }
 }
@@ -1389,6 +1392,7 @@ mod tests {
                 id: 5,
                 count: 3,
                 damage: 1,
+                nbt: None,
             })),
         )]);
         assert_eq!(
@@ -1430,6 +1434,7 @@ mod tests {
                     id: 3,
                     count: 1,
                     damage: 7,
+                    nbt: None,
                 })),
             ),
             (9, MetadataValue::Byte(5)),
@@ -1440,7 +1445,8 @@ mod tests {
                 item: Some(MetadataItem {
                     id: 3,
                     count: 1,
-                    damage: 7
+                    damage: 7,
+                    nbt: None,
                 }),
                 rotation: 5
             }

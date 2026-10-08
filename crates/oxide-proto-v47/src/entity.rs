@@ -8,7 +8,7 @@
 //! `:410-411`, `:508`, `:536-537`, `:620-625`), kept here so a decoded field is
 //! already in the unit the rest of the client works in.
 
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 
 use oxide_proto::codec::{self, MAX_STRING_BYTES};
 use oxide_proto::varint::read_varint;
@@ -357,8 +357,9 @@ pub const MAX_METADATA_ENTRIES: usize = 64;
 
 /// The cap on the bytes of one slot's NBT tail.
 ///
-/// The tail is skipped, never read into a value tree; the cap keeps that skip
-/// bounded, and a slot whose tail would run past it is refused.
+/// The tail is captured verbatim, never read into a value tree here; the cap
+/// keeps that capture bounded, and a slot whose tail would run past it is
+/// refused.
 pub const MAX_SLOT_NBT_BYTES: usize = 65536;
 
 /// One entity's metadata block: the wire's `(index, value)` pairs in order.
@@ -412,11 +413,13 @@ pub enum MetadataValue {
     },
 }
 
-/// One slot's item data: the id, the stack count and the damage value.
+/// One slot's item data: the id, the stack count, the damage value and the
+/// raw NBT tail.
 ///
-/// The slot's NBT tail is skipped by the decoder rather than carried here:
-/// nothing downstream of the spawn codecs reads item NBT yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The tail is kept verbatim — the wire bytes after the damage, minus
+/// nothing — so the item can be re-emitted byte-exact ([`write_slot`]) and
+/// walked for display ([`crate::nbt::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataItem {
     /// The item id.
     pub id: i16,
@@ -424,6 +427,10 @@ pub struct MetadataItem {
     pub count: u8,
     /// The item's damage or metadata value.
     pub damage: i16,
+    /// The raw NBT tail: the root tag's id, name and payload
+    /// (`PacketBuffer.readNBTTagCompoundFromBuffer:213-227`), or `None` when
+    /// the tag byte was `0`.
+    pub nbt: Option<Vec<u8>>,
 }
 
 /// The metadata block's terminator (`DataWatcher.java:303-308`).
@@ -440,7 +447,7 @@ const METADATA_TAG_SHIFT: u32 = 5;
 ///
 /// Entries are kept in wire order; the decode is refused past
 /// [`MAX_METADATA_ENTRIES`] entries, and every payload rides the crate's own
-/// checks — the string rule, the slot shape, and the slot-NBT skip.
+/// checks — the string rule, the slot shape, and the slot-NBT capture.
 fn read_metadata(cursor: &mut Cursor<&[u8]>) -> Result<Metadata, PacketError> {
     let mut entries = Vec::new();
     loop {
@@ -502,20 +509,47 @@ fn unknown_metadata_tag(tag: u8) -> PacketError {
     )))
 }
 
-/// Decodes one slot: item id, stack count, damage, then the NBT tail.
+/// Decodes one slot: item id, stack count, damage, then the NBT tail
+/// (`PacketBuffer.readItemStackFromBuffer:257-271`).
 ///
-/// A negative id is the empty slot and closes the value
-/// (`PacketBuffer.readItemStackFromBuffer:257-271`); otherwise the tail is
-/// consumed by [`skip_slot_nbt`], which builds no value for it.
-fn read_slot(cursor: &mut Cursor<&[u8]>) -> Result<Option<MetadataItem>, PacketError> {
+/// A negative id is the empty slot and closes the value. Every other slot
+/// carries a tail: a zero tag byte keeps `nbt` at `None`, and any other byte
+/// starts a named tag whose bytes [`read_slot_nbt`] captures verbatim under
+/// [`MAX_SLOT_NBT_BYTES`]. No value tree is built here; [`crate::nbt::parse`]
+/// walks the captured bytes on demand.
+pub fn read_slot(cursor: &mut Cursor<&[u8]>) -> Result<Option<MetadataItem>, PacketError> {
     let id = codec::read_i16(&mut *cursor)?;
     if id < 0 {
         return Ok(None);
     }
     let count = codec::read_u8(&mut *cursor)?;
     let damage = codec::read_i16(&mut *cursor)?;
-    skip_slot_nbt(cursor)?;
-    Ok(Some(MetadataItem { id, count, damage }))
+    let nbt = read_slot_nbt(cursor)?;
+    Ok(Some(MetadataItem {
+        id,
+        count,
+        damage,
+        nbt,
+    }))
+}
+
+/// Writes one slot: the byte-exact inverse of [`read_slot`].
+///
+/// `None` is the empty slot and writes the negative id alone. A slot writes
+/// its id, count and damage, then the raw tail verbatim; an item whose `nbt`
+/// is `None` closes with the no-data byte, since every non-empty slot payload
+/// must end in a tag byte (the same byte closes a caller-built empty tail).
+pub fn write_slot(mut out: impl Write, item: Option<&MetadataItem>) -> io::Result<()> {
+    let Some(item) = item else {
+        return codec::write_i16(&mut out, -1);
+    };
+    codec::write_i16(&mut out, item.id)?;
+    codec::write_u8(&mut out, item.count)?;
+    codec::write_i16(&mut out, item.damage)?;
+    match item.nbt.as_deref() {
+        Some(raw) if !raw.is_empty() => out.write_all(raw),
+        _ => out.write_all(&[0x00]),
+    }
 }
 
 /// The depth past which the source's own NBT readers refuse to descend
@@ -541,20 +575,22 @@ enum NbtFrame {
     },
 }
 
-/// Skips one slot's NBT tail, if there is one.
+/// Reads one slot's NBT tail, keeping its bytes verbatim; `None` is the wire's
+/// zero tag byte.
 ///
 /// `PacketBuffer.readNBTTagCompoundFromBuffer:213-227` reads a zero byte as
 /// "no data"; any other byte starts a full named tag that closes the slot's
-/// payload. The tail is consumed as framing only — no value is ever built:
-/// tag ids drive a walk that keeps its own stack, every length is checked
-/// against the remaining body and [`MAX_SLOT_NBT_BYTES`] before a byte moves,
-/// and a tag id or shape that cannot be framed is refused rather than guessed
-/// at.
-fn skip_slot_nbt(cursor: &mut Cursor<&[u8]>) -> Result<(), PacketError> {
+/// payload. The bytes from the tag byte through the end of the tree are
+/// captured verbatim — no value is ever built here: tag ids drive a walk that
+/// keeps its own stack, every length is checked against the remaining body
+/// and [`MAX_SLOT_NBT_BYTES`] before a byte moves, and a tag id or shape that
+/// cannot be framed is refused rather than guessed at.
+fn read_slot_nbt(cursor: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>, PacketError> {
+    let start = cursor.position() as usize;
     let mut budget = MAX_SLOT_NBT_BYTES;
     let root = read_nbt_byte(cursor, &mut budget)?;
     if root == 0 {
-        return Ok(());
+        return Ok(None);
     }
     read_nbt_name(cursor, &mut budget)?;
     let mut stack: Vec<NbtFrame> = Vec::new();
@@ -565,7 +601,8 @@ fn skip_slot_nbt(cursor: &mut Cursor<&[u8]>) -> Result<(), PacketError> {
             continue;
         }
         let Some(top) = stack.last().copied() else {
-            return Ok(());
+            let end = cursor.position() as usize;
+            return Ok(Some(cursor.get_ref()[start..end].to_vec()));
         };
         match top {
             NbtFrame::Compound { depth } => {
@@ -1129,9 +1166,9 @@ const EQUIPMENT_SLOT_MAX: i16 = 4;
 /// short and the item. §2.1 rows the slots `0` held, `1` boots, `2` leggings,
 /// `3` chestplate and `4` helmet; a slot outside that range is refused. The
 /// item rides the metadata block's own slot reader, so a negative id is the
-/// empty slot and the NBT tail is skipped rather than converted a second
-/// time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// empty slot and the NBT tail is captured verbatim rather than converted a
+/// second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityEquipment {
     /// The entity whose equipment changed.
     pub entity_id: i32,
@@ -1729,6 +1766,7 @@ mod tests {
                         id: 276,
                         count: 1,
                         damage: 0,
+                        nbt: None,
                     })),
                 ),
                 (6, MetadataValue::Position { x: 1, y: -2, z: 3 },),
@@ -1832,6 +1870,7 @@ mod tests {
                         id: 276,
                         count: 2,
                         damage: 42,
+                        nbt: Some(vec![0x0a, 0x00, 0x00, 0x01, 0x00, 0x01, b'x', 0x7f, 0x00]),
                     })),
                 ),
             ]
@@ -1852,8 +1891,8 @@ mod tests {
     }
 
     #[test]
-    fn nbt_tails_are_skipped_without_recursion() {
-        // A slot whose NBT tail nests 500 lists deep must be skipped in
+    fn nbt_tails_are_captured_without_recursion() {
+        // A slot whose NBT tail nests 500 lists deep must be captured in
         // constant stack: the walk keeps its own frames.
         let mut payload = vec![0xa0, 0x01, 0x14, 0x01, 0x00, 0x00];
         payload.extend_from_slice(&[0x09, 0x00, 0x00]); // root: list, empty name
@@ -1862,7 +1901,7 @@ mod tests {
         }
         payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00]); // innermost: empty list
         payload.push(0x7f);
-        let metadata = decode_metadata(&payload).expect("deep nesting is skipped");
+        let metadata = decode_metadata(&payload).expect("deep nesting is captured");
         assert_eq!(
             metadata.entries,
             vec![(
@@ -1871,6 +1910,7 @@ mod tests {
                     id: 276,
                     count: 1,
                     damage: 0,
+                    nbt: Some(payload[6..payload.len() - 1].to_vec()),
                 })),
             )]
         );

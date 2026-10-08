@@ -616,6 +616,7 @@ fn metadata_item_carries_the_slot_shape() {
         id: 276,
         count: 2,
         damage: 42,
+        nbt: None,
     };
     assert_eq!(item.id, 276);
     assert_eq!(item.count, 2);
@@ -636,6 +637,7 @@ fn entity_equipment_decodes_both_slot_shapes() {
             id: 276,
             count: 1,
             damage: 0,
+            nbt: None,
         })
     );
 

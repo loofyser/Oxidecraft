@@ -4,9 +4,12 @@ pub mod clientbound;
 pub mod column;
 pub mod entity;
 pub mod handshake;
+pub mod nbt;
 pub mod serverbound;
 pub mod status;
 pub mod ui;
+
+pub use nbt::{NbtError, NbtValue, parse};
 
 use oxide_proto::codec::CodecError;
 
