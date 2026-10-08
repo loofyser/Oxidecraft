@@ -20,10 +20,12 @@
 //! Task 9's read sits beside them: [`sub_items`] answers each variant registration's
 //! damage stacks with the strings they compose, [`creative_tab_items`] answers every
 //! creative tab's ordered stacks (the search tab's list and [`search_matches`]'s
-//! filter rule included), [`CreativeTab`] carries each tab's own index, icon and
-//! sheet, and [`potion_name`] the potion registry's names. The data lives in the
-//! [`creative`] submodule, derived from the same reference tree and pinned by the
-//! same suite.
+//! filter rule included; the source's search method also appends one enchanted-book
+//! stack per typed enchantment, `GuiContainerCreative.java`:354-360 — those stacks
+//! carry enchantment NBT and [`TabEntry`] carries none, so they are not
+//! represented), [`CreativeTab`] carries each tab's own index, icon and sheet, and
+//! [`potion_name`] the potion registry's names. The data lives in the [`creative`]
+//! submodule, derived from the same reference tree and pinned by the same suite.
 
 use oxide_assets::model::{BuiltinItem, ItemModelSource};
 use oxide_game::container::{BASE_MAX_STACK_SIZE, StackCaps};
@@ -348,7 +350,7 @@ pub fn sub_items(id: i16) -> &'static [SubItem] {
 /// (`util/ObjectIntIdentityMap.java`:38-41), so the order ascends by id.
 ///
 /// [`CreativeTab::Search`] is the search tab's own list
-/// (`GuiContainerCreative.updateCreativeSearch`, `:341-386`): every tabbed
+/// (`GuiContainerCreative.updateCreativeSearch`, `:341-387`): every tabbed
 /// registration's stacks, in the same order. [`CreativeTab::Inventory`] holds the
 /// player's own items and is empty.
 pub fn creative_tab_items(tab: CreativeTab) -> &'static [TabEntry] {
@@ -384,7 +386,7 @@ pub fn stack_name(id: i16, damage: i16) -> Option<&'static str> {
 }
 
 /// The search tab's filter rule: the source's own comparison
-/// (`GuiContainerCreative.java`:363, `:374`) — both sides lower-cased, then
+/// (`GuiContainerCreative.java`:363, `:372`) — both sides lower-cased, then
 /// `contains`. The source filters over a stack's whole tooltip with formatting codes
 /// stripped; the names this table carries have no codes, so the display name is what
 /// this compares.

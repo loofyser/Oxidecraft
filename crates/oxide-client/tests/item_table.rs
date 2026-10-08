@@ -398,11 +398,11 @@ fn the_potion_damage_set_matches_the_sources_own_population() {
     }
     for (damage, name) in [
         (8194, "Potion of Swiftness"),
-        (8195, "Potion of Fire Resistance"),
+        (8227, "Potion of Fire Resistance"),
         (8196, "Potion of Poison"),
-        (8197, "Potion of Healing"),
+        (8261, "Potion of Healing"),
         (8201, "Potion of Strength"),
-        (8202, "Potion of Slowness"),
+        (8234, "Potion of Slowness"),
         (8225, "Potion of Regeneration"),
         (8257, "Potion of Regeneration"),
         (8265, "Potion of Strength"),
@@ -422,6 +422,63 @@ fn the_potion_damage_set_matches_the_sources_own_population() {
     assert_eq!(stack_name(373, 8193), stack_name(373, 8257));
     assert_eq!(stack_name(373, 8201), stack_name(373, 8233));
     assert_eq!(stack_name(373, 8201), stack_name(373, 8265));
+}
+
+#[test]
+fn a_duplicate_effect_list_emits_its_last_damage() {
+    // Sixteen pairs of damages share one effect list (l=0 against l=1/l=2 within
+    // one pattern and kind; `PotionEffect.equals` compares id, amplifier, duration,
+    // splash and ambient). The source's cache is a `LinkedHashMap`: a repeated key
+    // replaces the value in place, so each pair's later damage is the one the
+    // source emits.
+    for (earlier, later, name) in [
+        (8195, 8227, "Potion of Fire Resistance"),
+        (16387, 16419, "Splash Potion of Fire Resistance"),
+        (8197, 8261, "Potion of Healing"),
+        (16389, 16453, "Splash Potion of Healing"),
+        (8198, 8230, "Potion of Night Vision"),
+        (16390, 16422, "Splash Potion of Night Vision"),
+        (8200, 8232, "Potion of Weakness"),
+        (16392, 16424, "Splash Potion of Weakness"),
+        (8202, 8234, "Potion of Slowness"),
+        (16394, 16426, "Splash Potion of Slowness"),
+        (8204, 8268, "Potion of Harming"),
+        (16396, 16460, "Splash Potion of Harming"),
+        (8205, 8237, "Potion of Water Breathing"),
+        (16397, 16429, "Splash Potion of Water Breathing"),
+        (8206, 8238, "Potion of Invisibility"),
+        (16398, 16430, "Splash Potion of Invisibility"),
+    ] {
+        assert_eq!(
+            stack_name(373, later),
+            Some(name),
+            "the pair's later damage {later}"
+        );
+        assert_eq!(
+            stack_name(373, earlier),
+            None,
+            "the pair's earlier damage {earlier} is replaced"
+        );
+    }
+}
+
+#[test]
+fn the_new_log_and_leaf_carry_their_own_damages() {
+    // `BlockNewLeaf.getSubBlocks` adds damages 0 and 1; `BlockNewLog` adds the two
+    // planks enums' metadata minus 4 (ACACIA 4 -> 0, DARK_OAK 5 -> 1).
+    assert_eq!(
+        pairs(161),
+        vec![(0, "Acacia Leaves"), (1, "Dark Oak Leaves")],
+        "leaves2's own damages"
+    );
+    assert_eq!(
+        pairs(162),
+        vec![(0, "Acacia Wood"), (1, "Dark Oak Wood")],
+        "log2's own damages"
+    );
+    // The planks enum's metadata (4 and 5) is not a damage either class populates.
+    assert_eq!(stack_name(161, 4), None);
+    assert_eq!(stack_name(162, 5), None);
 }
 
 #[test]

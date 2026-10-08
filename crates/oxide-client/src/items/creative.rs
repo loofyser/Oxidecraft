@@ -6,7 +6,11 @@
 //! order from the registry's own id iteration (`Item.itemRegistry` iterates
 //! `ObjectIntIdentityMap`'s id list, `util/ObjectIntIdentityMap.java`:38-41, so
 //! ascending by id) filtered by each item's `getCreativeTab`, the search tab's
-//! list from `GuiContainerCreative.updateCreativeSearch` (`:341-386`), the potion
+//! list from `GuiContainerCreative.updateCreativeSearch` (`:341-387`; the method
+//! also appends one enchanted-book stack per typed enchantment
+//! (`GuiContainerCreative.java`:354-360) — those stacks carry enchantment NBT,
+//! which `TabEntry` does not, so the search list here is the tabbed stacks
+//! alone), the potion
 //! set from `ItemPotion.getSubItems` (`item/ItemPotion.java`:339-394) over the 1.8
 //! damage encoding (`potion/PotionHelper.java`:386-450), the tabs from
 //! `creativetab/CreativeTabs.java`, and the display strings from the en_US language
@@ -860,22 +864,22 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Decorations,
     },
     SubItem {
-        damage: 4,
+        damage: 0,
         name: "Acacia Leaves",
         tab: CreativeTab::Decorations,
     },
     SubItem {
-        damage: 5,
+        damage: 1,
         name: "Dark Oak Leaves",
         tab: CreativeTab::Decorations,
     },
     SubItem {
-        damage: 4,
+        damage: 0,
         name: "Acacia Wood",
         tab: CreativeTab::BuildingBlocks,
     },
     SubItem {
-        damage: 5,
+        damage: 1,
         name: "Dark Oak Wood",
         tab: CreativeTab::BuildingBlocks,
     },
@@ -1220,7 +1224,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8195,
+        damage: 8227,
         name: "Potion of Fire Resistance",
         tab: CreativeTab::Brewing,
     },
@@ -1230,7 +1234,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16387,
+        damage: 16419,
         name: "Splash Potion of Fire Resistance",
         tab: CreativeTab::Brewing,
     },
@@ -1270,7 +1274,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8197,
+        damage: 8261,
         name: "Potion of Healing",
         tab: CreativeTab::Brewing,
     },
@@ -1280,7 +1284,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16389,
+        damage: 16453,
         name: "Splash Potion of Healing",
         tab: CreativeTab::Brewing,
     },
@@ -1290,7 +1294,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8198,
+        damage: 8230,
         name: "Potion of Night Vision",
         tab: CreativeTab::Brewing,
     },
@@ -1300,7 +1304,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16390,
+        damage: 16422,
         name: "Splash Potion of Night Vision",
         tab: CreativeTab::Brewing,
     },
@@ -1310,7 +1314,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8200,
+        damage: 8232,
         name: "Potion of Weakness",
         tab: CreativeTab::Brewing,
     },
@@ -1320,7 +1324,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16392,
+        damage: 16424,
         name: "Splash Potion of Weakness",
         tab: CreativeTab::Brewing,
     },
@@ -1360,7 +1364,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8202,
+        damage: 8234,
         name: "Potion of Slowness",
         tab: CreativeTab::Brewing,
     },
@@ -1370,7 +1374,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16394,
+        damage: 16426,
         name: "Splash Potion of Slowness",
         tab: CreativeTab::Brewing,
     },
@@ -1410,7 +1414,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8204,
+        damage: 8268,
         name: "Potion of Harming",
         tab: CreativeTab::Brewing,
     },
@@ -1420,7 +1424,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16396,
+        damage: 16460,
         name: "Splash Potion of Harming",
         tab: CreativeTab::Brewing,
     },
@@ -1430,7 +1434,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8205,
+        damage: 8237,
         name: "Potion of Water Breathing",
         tab: CreativeTab::Brewing,
     },
@@ -1440,7 +1444,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16397,
+        damage: 16429,
         name: "Splash Potion of Water Breathing",
         tab: CreativeTab::Brewing,
     },
@@ -1450,7 +1454,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 8206,
+        damage: 8238,
         name: "Potion of Invisibility",
         tab: CreativeTab::Brewing,
     },
@@ -1460,7 +1464,7 @@ pub(super) static SUB_ITEMS: [SubItem; 314] = [
         tab: CreativeTab::Brewing,
     },
     SubItem {
-        damage: 16398,
+        damage: 16430,
         name: "Splash Potion of Invisibility",
         tab: CreativeTab::Brewing,
     },
@@ -1872,8 +1876,8 @@ pub(super) static BUILDING_BLOCKS_ITEMS: [TabEntry; 158] = [
         id: 159,
         damage: 15,
     },
-    TabEntry { id: 162, damage: 4 },
-    TabEntry { id: 162, damage: 5 },
+    TabEntry { id: 162, damage: 0 },
+    TabEntry { id: 162, damage: 1 },
     TabEntry { id: 163, damage: 0 },
     TabEntry { id: 164, damage: 0 },
     TabEntry { id: 168, damage: 0 },
@@ -1980,8 +1984,8 @@ pub(super) static DECORATIONS_ITEMS: [TabEntry; 126] = [
         id: 160,
         damage: 15,
     },
-    TabEntry { id: 161, damage: 4 },
-    TabEntry { id: 161, damage: 5 },
+    TabEntry { id: 161, damage: 0 },
+    TabEntry { id: 161, damage: 1 },
     TabEntry { id: 165, damage: 0 },
     TabEntry { id: 171, damage: 0 },
     TabEntry { id: 171, damage: 1 },
@@ -2587,10 +2591,10 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
         id: 160,
         damage: 15,
     },
-    TabEntry { id: 161, damage: 4 },
-    TabEntry { id: 161, damage: 5 },
-    TabEntry { id: 162, damage: 4 },
-    TabEntry { id: 162, damage: 5 },
+    TabEntry { id: 161, damage: 0 },
+    TabEntry { id: 161, damage: 1 },
+    TabEntry { id: 162, damage: 0 },
+    TabEntry { id: 162, damage: 1 },
     TabEntry { id: 163, damage: 0 },
     TabEntry { id: 164, damage: 0 },
     TabEntry { id: 165, damage: 0 },
@@ -2864,7 +2868,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8195,
+        damage: 8227,
     },
     TabEntry {
         id: 373,
@@ -2872,7 +2876,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16387,
+        damage: 16419,
     },
     TabEntry {
         id: 373,
@@ -2904,7 +2908,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8197,
+        damage: 8261,
     },
     TabEntry {
         id: 373,
@@ -2912,7 +2916,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16389,
+        damage: 16453,
     },
     TabEntry {
         id: 373,
@@ -2920,7 +2924,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8198,
+        damage: 8230,
     },
     TabEntry {
         id: 373,
@@ -2928,7 +2932,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16390,
+        damage: 16422,
     },
     TabEntry {
         id: 373,
@@ -2936,7 +2940,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8200,
+        damage: 8232,
     },
     TabEntry {
         id: 373,
@@ -2944,7 +2948,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16392,
+        damage: 16424,
     },
     TabEntry {
         id: 373,
@@ -2976,7 +2980,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8202,
+        damage: 8234,
     },
     TabEntry {
         id: 373,
@@ -2984,7 +2988,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16394,
+        damage: 16426,
     },
     TabEntry {
         id: 373,
@@ -3016,7 +3020,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8204,
+        damage: 8268,
     },
     TabEntry {
         id: 373,
@@ -3024,7 +3028,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16396,
+        damage: 16460,
     },
     TabEntry {
         id: 373,
@@ -3032,7 +3036,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8205,
+        damage: 8237,
     },
     TabEntry {
         id: 373,
@@ -3040,7 +3044,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16397,
+        damage: 16429,
     },
     TabEntry {
         id: 373,
@@ -3048,7 +3052,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 8206,
+        damage: 8238,
     },
     TabEntry {
         id: 373,
@@ -3056,7 +3060,7 @@ pub(super) static SEARCH_ITEMS: [TabEntry; 600] = [
     },
     TabEntry {
         id: 373,
-        damage: 16398,
+        damage: 16430,
     },
     TabEntry {
         id: 373,
@@ -3462,7 +3466,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8195,
+        damage: 8227,
     },
     TabEntry {
         id: 373,
@@ -3470,7 +3474,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16387,
+        damage: 16419,
     },
     TabEntry {
         id: 373,
@@ -3502,7 +3506,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8197,
+        damage: 8261,
     },
     TabEntry {
         id: 373,
@@ -3510,7 +3514,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16389,
+        damage: 16453,
     },
     TabEntry {
         id: 373,
@@ -3518,7 +3522,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8198,
+        damage: 8230,
     },
     TabEntry {
         id: 373,
@@ -3526,7 +3530,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16390,
+        damage: 16422,
     },
     TabEntry {
         id: 373,
@@ -3534,7 +3538,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8200,
+        damage: 8232,
     },
     TabEntry {
         id: 373,
@@ -3542,7 +3546,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16392,
+        damage: 16424,
     },
     TabEntry {
         id: 373,
@@ -3574,7 +3578,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8202,
+        damage: 8234,
     },
     TabEntry {
         id: 373,
@@ -3582,7 +3586,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16394,
+        damage: 16426,
     },
     TabEntry {
         id: 373,
@@ -3614,7 +3618,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8204,
+        damage: 8268,
     },
     TabEntry {
         id: 373,
@@ -3622,7 +3626,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16396,
+        damage: 16460,
     },
     TabEntry {
         id: 373,
@@ -3630,7 +3634,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8205,
+        damage: 8237,
     },
     TabEntry {
         id: 373,
@@ -3638,7 +3642,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16397,
+        damage: 16429,
     },
     TabEntry {
         id: 373,
@@ -3646,7 +3650,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 8206,
+        damage: 8238,
     },
     TabEntry {
         id: 373,
@@ -3654,7 +3658,7 @@ pub(super) static BREWING_ITEMS: [TabEntry; 73] = [
     },
     TabEntry {
         id: 373,
-        damage: 16398,
+        damage: 16430,
     },
     TabEntry {
         id: 373,
