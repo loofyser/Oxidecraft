@@ -16,6 +16,14 @@
 //! `resolve` — the object set's rendering path — reads the same rows: the former
 //! sprite slice (`SPRITES`) is subsumed by the table, and the ids it named resolve to
 //! the same sheets through their rows.
+//!
+//! Task 9's read sits beside them: [`sub_items`] answers each variant registration's
+//! damage stacks with the strings they compose, [`creative_tab_items`] answers every
+//! creative tab's ordered stacks (the search tab's list and [`search_matches`]'s
+//! filter rule included), [`CreativeTab`] carries each tab's own index, icon and
+//! sheet, and [`potion_name`] the potion registry's names. The data lives in the
+//! [`creative`] submodule, derived from the same reference tree and pinned by the
+//! same suite.
 
 use oxide_assets::model::{BuiltinItem, ItemModelSource};
 use oxide_game::container::{BASE_MAX_STACK_SIZE, StackCaps};
@@ -69,15 +77,16 @@ impl ItemModel {
 /// The tooltip attribute numbers one registration carries.
 ///
 /// The values derive per class from the source's own constructor blocks: the melee
-/// damage from `ItemSword`/`ItemTool` (`item/ItemSword.java`:138-146,
-/// `item/ItemTool.java`:100-108) and the armour value from `ItemArmor`
+/// damage from `ItemSword`/`ItemTool` (`item/ItemSword.java`:138-143,
+/// `item/ItemTool.java`:100-105) and the armour value from `ItemArmor`
 /// (`item/ItemArmor.java`:82). Those classes state the values on their modifiers; the
 /// armour value 1.8 carries on the item instead (`EntityLivingBase.getTotalArmorValue`
 /// reads it, `entity/EntityLivingBase.java`:1192-1200), and 1.8's attribute set is five
 /// attributes — attack damage is the only one a registration's item states
-/// (`entity/SharedMonsterAttributes.java`:16-22). The attack-speed, armour and
-/// toughness slots therefore stay `None` for every row, and
-/// [`ItemAttributes::tooltip_inputs`] composes the damage line alone.
+/// (`entity/SharedMonsterAttributes.java`:16-22). The attack-speed and armour-toughness
+/// slots therefore stay `None` for every row; the armour value is carried on the
+/// twenty armour rows and composes no attribute line (1.8's armour states no item
+/// modifier). [`ItemAttributes::tooltip_inputs`] composes the damage line alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ItemAttributes {
     /// The main-hand attack-damage modifier's amount: the class's base plus the
@@ -136,6 +145,7 @@ pub struct ItemEntry {
     pub variants: bool,
 }
 
+mod creative;
 mod table;
 
 /// The registry's row for a wire id, or `None` when the id is no registration's.
@@ -185,6 +195,210 @@ pub fn resolve(id: i16, damage: i16) -> ItemResolution {
         }
         _ => ItemResolution::Missing,
     }
+}
+
+/// One damage sub-item a registration's class populates: a stack the creative lists
+/// expand for a variant row (`Item.getSubItems`'s overrides and the block classes'
+/// `getSubBlocks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubItem {
+    /// The damage (metadata) value the stack carries.
+    pub damage: i16,
+    /// The en_US display string the stack composes at this damage.
+    pub name: &'static str,
+    /// The creative tab the owning registration sits in.
+    pub tab: CreativeTab,
+}
+
+/// One entry of a creative list: an item id at a damage value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabEntry {
+    /// The registration's id.
+    pub id: i16,
+    /// The damage (metadata) value the stack carries.
+    pub damage: i16,
+}
+
+/// One creative tab's own data, as `CreativeTabs`'s anonymous subclasses state it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabMeta {
+    /// The tab's slot in `creativeTabArray` (`CreativeTabs.getTabIndex`,
+    /// `creativetab/CreativeTabs.java`:123-126).
+    pub index: u8,
+    /// The tab's own label (`CreativeTabs.getTabLabel`, `:128-131`).
+    pub label: &'static str,
+    /// The tab's icon stack (`getTabIconItem` at `getIconItemDamage`, `:151-156`).
+    pub icon: TabEntry,
+    /// The sheet the tab draws from (`getBackgroundImageName`, `:158-161`).
+    pub sheet: &'static str,
+}
+
+/// One potion of the source's registry (`Potion.potionTypes`), ascending by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PotionName {
+    /// The potion's id (`Potion.getId`).
+    pub id: u8,
+    /// The registry's own name (`Potion.setPotionName`).
+    pub key: &'static str,
+    /// The en_US effect name the key carries.
+    pub name: &'static str,
+    /// The en_US postfix a stack's display name composes from this effect
+    /// (`ItemPotion.getItemStackDisplayName`, `item/ItemPotion.java`:211-240).
+    pub postfix: &'static str,
+}
+
+/// A creative tab: one variant per tab of the source's `creativeTabArray`, in its own
+/// `getTabIndex` order (`creativetab/CreativeTabs.java`:17-103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CreativeTab {
+    /// The building blocks tab (`tabBlock`, index 0).
+    BuildingBlocks,
+    /// The decorations tab (`tabDecorations`, index 1).
+    Decorations,
+    /// The redstone tab (`tabRedstone`, index 2).
+    Redstone,
+    /// The transportation tab (`tabTransport`, index 3).
+    Transportation,
+    /// The miscellaneous tab (`tabMisc`, index 4).
+    Misc,
+    /// The search tab (`tabAllSearch`, index 5).
+    Search,
+    /// The food tab (`tabFood`, index 6).
+    Food,
+    /// The tools tab (`tabTools`, index 7).
+    Tools,
+    /// The combat tab (`tabCombat`, index 8).
+    Combat,
+    /// The brewing tab (`tabBrewing`, index 9).
+    Brewing,
+    /// The materials tab (`tabMaterials`, index 10).
+    Materials,
+    /// The survival inventory tab (`tabInventory`, index 11).
+    Inventory,
+}
+
+impl CreativeTab {
+    /// Every tab, in `creativeTabArray` order.
+    pub const ALL: [CreativeTab; 12] = [
+        CreativeTab::BuildingBlocks,
+        CreativeTab::Decorations,
+        CreativeTab::Redstone,
+        CreativeTab::Transportation,
+        CreativeTab::Misc,
+        CreativeTab::Search,
+        CreativeTab::Food,
+        CreativeTab::Tools,
+        CreativeTab::Combat,
+        CreativeTab::Brewing,
+        CreativeTab::Materials,
+        CreativeTab::Inventory,
+    ];
+
+    /// The tab's slot in `creativeTabArray` (`CreativeTabs.getTabIndex`): the
+    /// constructor's first argument, which the variants are declared in.
+    pub const fn index(self) -> u8 {
+        self as u8
+    }
+
+    /// The tab's own label (`CreativeTabs.getTabLabel`).
+    pub fn label(self) -> &'static str {
+        self.meta().label
+    }
+
+    /// The tab's icon stack: `getTabIconItem`'s item at `getIconItemDamage`'s damage.
+    pub fn icon(self) -> TabEntry {
+        self.meta().icon
+    }
+
+    /// The sheet the tab draws from (`CreativeTabs.getBackgroundImageName`).
+    pub fn sheet(self) -> &'static str {
+        self.meta().sheet
+    }
+
+    /// The tab's row of the source's own data.
+    pub fn meta(self) -> &'static TabMeta {
+        &creative::TAB_META[self as usize]
+    }
+
+    /// The tab at a `creativeTabArray` index.
+    pub fn from_index(index: u8) -> Option<CreativeTab> {
+        CreativeTab::ALL
+            .into_iter()
+            .find(|tab| tab.index() == index)
+    }
+}
+
+/// The damage sub-items a registration's class populates, in its own populate order
+/// (`Item.getSubItems` and the block classes' `getSubBlocks`): the stacks the
+/// creative lists expand for the row. Empty for a row the class files as a single
+/// stack, and for an id outside the registry.
+pub fn sub_items(id: i16) -> &'static [SubItem] {
+    match creative::SUB_ITEM_RANGES.binary_search_by_key(&id, |&(row, _, _)| row) {
+        Ok(index) => {
+            let (_, start, count) = creative::SUB_ITEM_RANGES[index];
+            &creative::SUB_ITEMS[start..start + count]
+        }
+        Err(_) => &[],
+    }
+}
+
+/// The ordered list of a creative tab: the source's own creation order — the
+/// registration order of `Item.registerItems` filtered by the tab, each entry's
+/// sub-items in the class's populate order. `Item.itemRegistry` iterates its id list
+/// (`util/ObjectIntIdentityMap.java`:38-41), so the order ascends by id.
+///
+/// [`CreativeTab::Search`] is the search tab's own list
+/// (`GuiContainerCreative.updateCreativeSearch`, `:341-386`): every tabbed
+/// registration's stacks, in the same order. [`CreativeTab::Inventory`] holds the
+/// player's own items and is empty.
+pub fn creative_tab_items(tab: CreativeTab) -> &'static [TabEntry] {
+    match tab {
+        CreativeTab::BuildingBlocks => &creative::BUILDING_BLOCKS_ITEMS,
+        CreativeTab::Decorations => &creative::DECORATIONS_ITEMS,
+        CreativeTab::Redstone => &creative::REDSTONE_ITEMS,
+        CreativeTab::Transportation => &creative::TRANSPORTATION_ITEMS,
+        CreativeTab::Misc => &creative::MISC_ITEMS,
+        CreativeTab::Search => &creative::SEARCH_ITEMS,
+        CreativeTab::Food => &creative::FOOD_ITEMS,
+        CreativeTab::Tools => &creative::TOOLS_ITEMS,
+        CreativeTab::Combat => &creative::COMBAT_ITEMS,
+        CreativeTab::Brewing => &creative::BREWING_ITEMS,
+        CreativeTab::Materials => &creative::MATERIALS_ITEMS,
+        CreativeTab::Inventory => &creative::INVENTORY_ITEMS,
+    }
+}
+
+/// The display name a creative list entry carries: the sub-item's own composed name
+/// where the class populates one, else the registration's own name. `None` for an id
+/// outside the registry, and for a damage the class does not populate.
+pub fn stack_name(id: i16, damage: i16) -> Option<&'static str> {
+    let entry = item_entry(id)?;
+    let items = sub_items(id);
+    if items.is_empty() {
+        return Some(entry.name);
+    }
+    items
+        .iter()
+        .find(|item| item.damage == damage)
+        .map(|item| item.name)
+}
+
+/// The search tab's filter rule: the source's own comparison
+/// (`GuiContainerCreative.java`:363, `:374`) — both sides lower-cased, then
+/// `contains`. The source filters over a stack's whole tooltip with formatting codes
+/// stripped; the names this table carries have no codes, so the display name is what
+/// this compares.
+pub fn search_matches(name: &str, query: &str) -> bool {
+    name.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// The potion registry's row for a potion id (`Potion.potionTypes`), or `None` for an
+/// id outside it.
+pub fn potion_name(id: u8) -> Option<&'static PotionName> {
+    creative::POTION_NAMES
+        .binary_search_by_key(&id, |row| row.id)
+        .ok()
+        .map(|index| &creative::POTION_NAMES[index])
 }
 
 #[cfg(test)]
@@ -290,5 +504,47 @@ mod tests {
         assert_eq!(ItemTable.max_stack_size(&item(267)), 1);
         assert_eq!(ItemTable.max_stack_size(&item(260)), 64);
         assert_eq!(ItemTable.max_stack_size(&item(9_999)), BASE_MAX_STACK_SIZE);
+    }
+
+    #[test]
+    fn the_sub_item_and_tab_lookups_answer_the_sources_own_rows() {
+        assert_eq!(
+            sub_items(35).first().map(|item| (item.damage, item.name)),
+            Some((0, "Wool"))
+        );
+        assert_eq!(
+            sub_items(35).get(1).map(|item| (item.damage, item.name)),
+            Some((1, "Orange Wool"))
+        );
+        assert!(sub_items(260).is_empty());
+        assert_eq!(
+            sub_items(373).last().map(|item| (item.damage, item.name)),
+            Some((16462, "Splash Potion of Invisibility"))
+        );
+        assert_eq!(sub_items(383).len(), 27);
+        assert_eq!(stack_name(35, 1), Some("Orange Wool"));
+        assert_eq!(stack_name(260, 0), Some("Apple"));
+        assert_eq!(stack_name(35, 16), None);
+        assert_eq!(stack_name(9_999, 0), None);
+        assert_eq!(
+            potion_name(1).map(|row| row.postfix),
+            Some("Potion of Swiftness")
+        );
+        assert_eq!(potion_name(0), None);
+        assert!(search_matches("Potion of Regeneration", "REGEN"));
+        assert!(!search_matches("Potion of Regeneration", "Swift"));
+        assert_eq!(
+            creative_tab_items(CreativeTab::BuildingBlocks)
+                .first()
+                .map(|entry| (entry.id, entry.damage)),
+            Some((1, 0))
+        );
+        assert!(creative_tab_items(CreativeTab::Inventory).is_empty());
+        assert_eq!(CreativeTab::Brewing.index(), 9);
+        assert_eq!(CreativeTab::Brewing.icon().id, 373);
+        assert_eq!(CreativeTab::Brewing.sheet(), "items.png");
+        assert_eq!(CreativeTab::Search.sheet(), "item_search.png");
+        assert_eq!(CreativeTab::from_index(11), Some(CreativeTab::Inventory));
+        assert_eq!(CreativeTab::from_index(12), None);
     }
 }

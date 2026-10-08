@@ -5,7 +5,7 @@
 //! order and ids from `Item.registerItems` (`item/Item.java`:511-953), the block
 //! items' registry ids and unlocalized names from `Block.registerBlocks`
 //! (`block/Block.java`), the meta-0 model selection from
-//! `RenderItem.registerItems` (`client/renderer/entity/RenderItem.java`:522-1074)
+//! `RenderItem.registerItems` (`client/renderer/entity/RenderItem.java`:522-1068)
 //! and the `ItemMeshDefinition` registrations beside it, and the display strings
 //! from the en_US language file (which the repository never carries; only the
 //! strings it defines are committed). The per-class derivations are recorded in

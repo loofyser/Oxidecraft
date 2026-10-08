@@ -1,15 +1,25 @@
-//! The item registry table's completeness and pin suite.
+//! The item registry table's completeness and pin suite, and Task 9's sub-item and
+//! creative-list suites.
 //!
 //! The table's row count is the source's own registration count, derived by
 //! counting the registrations of `Item.registerItems` (`item/Item.java`:511-953)
 //! — 150 block items and 187 explicit registrations (the derivation and its log
 //! sit in `refs/m5-task-8/`). The pins are literal values from the source, so a
 //! shifted, drifted or partly dropped table fails loudly.
+//!
+//! The sub-item suite pins the damage stacks each class populates (wool's sixteen
+//! colours, the potion set's boundaries, the spawn eggs against the M4 roster) and
+//! the strings they compose; the tab suite pins every tab's own index, icon and
+//! sheet, two tabs' literal first ten entries, the search list and the search
+//! filter's rule (the derivation and its log sit in `refs/m5-task-9/`).
 
 use oxide_assets::model::{BuiltinItem, ItemModelSource};
-use oxide_client::items::{ItemAttributes, ItemEntry, ItemModel, ItemTable, item_entry, registry};
+use oxide_client::items::{
+    CreativeTab, ItemAttributes, ItemEntry, ItemModel, ItemTable, TabEntry, creative_tab_items,
+    item_entry, potion_name, registry, search_matches, stack_name, sub_items,
+};
 use oxide_game::container::{BASE_MAX_STACK_SIZE, BaseStackCaps, StackCaps, max_stack_size};
-use oxide_proto_v47::entity::MetadataItem;
+use oxide_proto_v47::entity::{MetadataItem, MobType};
 
 /// The derived registration count: 150 block items + 187 explicit items.
 const REGISTRATION_COUNT: usize = 337;
@@ -295,4 +305,580 @@ fn the_cap_bridge_reads_the_table() {
         BASE_MAX_STACK_SIZE
     );
     assert_eq!(ItemTable.max_stack_size(&stack(276)), 1);
+}
+
+// ------------------------------------------------------------- the sub-items
+
+/// The sub-items of a row, panicking when the row carries none.
+fn subs(id: i16) -> &'static [oxide_client::items::SubItem] {
+    let items = sub_items(id);
+    assert!(!items.is_empty(), "id {id} must populate sub-items");
+    items
+}
+
+/// The (damage, name) pairs of a row.
+fn pairs(id: i16) -> Vec<(i16, &'static str)> {
+    subs(id)
+        .iter()
+        .map(|item| (item.damage, item.name))
+        .collect()
+}
+
+#[test]
+fn wool_carries_its_sixteen_damage_names() {
+    assert_eq!(
+        pairs(35),
+        vec![
+            (0, "Wool"),
+            (1, "Orange Wool"),
+            (2, "Magenta Wool"),
+            (3, "Light Blue Wool"),
+            (4, "Yellow Wool"),
+            (5, "Lime Wool"),
+            (6, "Pink Wool"),
+            (7, "Gray Wool"),
+            (8, "Light Gray Wool"),
+            (9, "Cyan Wool"),
+            (10, "Purple Wool"),
+            (11, "Blue Wool"),
+            (12, "Brown Wool"),
+            (13, "Green Wool"),
+            (14, "Red Wool"),
+            (15, "Black Wool"),
+        ],
+        "wool's own sixteen damage names"
+    );
+    for item in subs(35) {
+        assert_eq!(item.tab, CreativeTab::BuildingBlocks, "wool's tab");
+    }
+}
+
+#[test]
+fn the_potion_damage_set_matches_the_sources_own_population() {
+    let items = subs(373);
+    assert_eq!(
+        items.len(),
+        63,
+        "the water bottle plus the source's 62 potions"
+    );
+    assert_eq!(
+        (items[0].damage, items[0].name),
+        (0, "Water Bottle"),
+        "the base stack the class files first"
+    );
+    assert_eq!(
+        (items[1].damage, items[1].name),
+        (8193, "Potion of Regeneration"),
+        "the set's first damage, by literal"
+    );
+    let last = items[items.len() - 1];
+    assert_eq!(
+        (last.damage, last.name),
+        (16462, "Splash Potion of Invisibility"),
+        "the set's last damage, by literal"
+    );
+
+    // The 1.8 damage encoding: bit 13 regular, bit 14 splash, bits 5/6 the
+    // extended and upgraded variants (`PotionHelper.java`:386-450). The water
+    // bottle carries neither bit.
+    let regular = items[1..]
+        .iter()
+        .filter(|item| item.damage & 16384 == 0)
+        .count();
+    let splash = items.iter().filter(|item| item.damage & 16384 != 0).count();
+    assert_eq!(regular, 31, "the regular half");
+    assert_eq!(splash, 31, "the splash half");
+    for item in &items[1..] {
+        assert!(
+            item.damage & 8192 != 0 || item.damage & 16384 != 0,
+            "every damage carries its potion bit: {}",
+            item.damage
+        );
+        assert_eq!(item.tab, CreativeTab::Brewing, "potions sit in brewing");
+    }
+    for (damage, name) in [
+        (8194, "Potion of Swiftness"),
+        (8195, "Potion of Fire Resistance"),
+        (8196, "Potion of Poison"),
+        (8197, "Potion of Healing"),
+        (8201, "Potion of Strength"),
+        (8202, "Potion of Slowness"),
+        (8225, "Potion of Regeneration"),
+        (8257, "Potion of Regeneration"),
+        (8265, "Potion of Strength"),
+        (16385, "Splash Potion of Regeneration"),
+        (16417, "Splash Potion of Regeneration"),
+        (16449, "Splash Potion of Regeneration"),
+    ] {
+        assert_eq!(
+            stack_name(373, damage),
+            Some(name),
+            "damage {damage}'s composed name"
+        );
+    }
+    // The upgraded and extended variants compose the same display name as the base
+    // one: the amplifier and the duration live in the tooltip, not the name.
+    assert_eq!(stack_name(373, 8193), stack_name(373, 8225));
+    assert_eq!(stack_name(373, 8193), stack_name(373, 8257));
+    assert_eq!(stack_name(373, 8201), stack_name(373, 8233));
+    assert_eq!(stack_name(373, 8201), stack_name(373, 8265));
+}
+
+#[test]
+fn spawn_eggs_count_against_the_m4_roster() {
+    let items = subs(383);
+    assert_eq!(items.len(), 27, "the source's own egg count");
+    let damages: Vec<i16> = items.iter().map(|item| item.damage).collect();
+    assert_eq!(
+        damages,
+        vec![
+            50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 65, 66, 67, 68, 90, 91, 92, 93, 94, 95,
+            96, 98, 100, 101, 120
+        ],
+        "the eggs' own damage order"
+    );
+    for item in items {
+        let mob = MobType::from_id(item.damage as u8);
+        assert!(mob.is_some(), "egg {} names a roster mob", item.damage);
+        assert_eq!(item.tab, CreativeTab::Misc, "eggs sit in misc");
+        assert!(
+            item.name.starts_with("Spawn "),
+            "egg {}'s name: {}",
+            item.damage,
+            item.name
+        );
+    }
+    for (damage, name) in [
+        (50, "Spawn Creeper"),
+        (57, "Spawn Zombie Pigman"),
+        (62, "Spawn Magma Cube"),
+        (98, "Spawn Ocelot"),
+        (100, "Spawn Horse"),
+        (120, "Spawn Villager"),
+    ] {
+        assert_eq!(stack_name(383, damage), Some(name), "egg {damage}");
+    }
+    // The roster's eggless five: spawnable, yet no egg carries them.
+    for id in [53u8, 63, 64, 97, 99] {
+        assert!(MobType::from_id(id).is_some(), "id {id} is in the roster");
+        assert!(
+            !items.iter().any(|item| item.damage == i16::from(id)),
+            "no egg carries roster id {id}"
+        );
+    }
+}
+
+#[test]
+fn a_damaged_entry_composes_its_own_name() {
+    for (id, damage, name) in [
+        (1, 6, "Polished Andesite"),
+        (5, 4, "Acacia Wood Planks"),
+        (6, 5, "Dark Oak Sapling"),
+        (24, 2, "Smooth Sandstone"),
+        (35, 1, "Orange Wool"),
+        (44, 7, "Quartz Slab"),
+        (95, 15, "Black Stained Glass"),
+        (155, 2, "Pillar Quartz Block"),
+        (263, 1, "Charcoal"),
+        (322, 1, "Golden Apple"),
+        (349, 3, "Pufferfish"),
+        (350, 1, "Cooked Salmon"),
+        (351, 15, "Bone Meal"),
+        (373, 8193, "Potion of Regeneration"),
+        (383, 50, "Spawn Creeper"),
+        (397, 3, "Head"),
+        (425, 15, "White Banner"),
+    ] {
+        assert_eq!(stack_name(id, damage), Some(name), "id {id} at {damage}");
+    }
+    // A row the class files as a single stack names the same string at any damage;
+    // a damage a variant class does not populate has no name.
+    assert_eq!(stack_name(260, 0), Some("Apple"));
+    assert_eq!(stack_name(260, 5), Some("Apple"));
+    assert_eq!(stack_name(35, 16), None);
+    assert_eq!(stack_name(9999, 0), None);
+    assert_eq!(stack_name(0, 0), None);
+}
+
+#[test]
+fn the_potion_registry_names_its_effects() {
+    let names: Vec<u8> = (0..=24)
+        .filter_map(|id| potion_name(id).map(|row| row.id))
+        .collect();
+    assert_eq!(
+        names,
+        (1..=23).collect::<Vec<u8>>(),
+        "the registry's own ids"
+    );
+    for (id, key, name, postfix) in [
+        (1, "potion.moveSpeed", "Speed", "Potion of Swiftness"),
+        (2, "potion.moveSlowdown", "Slowness", "Potion of Slowness"),
+        (
+            4,
+            "potion.digSlowDown",
+            "Mining Fatigue",
+            "Potion of Dullness",
+        ),
+        (6, "potion.heal", "Instant Health", "Potion of Healing"),
+        (7, "potion.harm", "Instant Damage", "Potion of Harming"),
+        (
+            10,
+            "potion.regeneration",
+            "Regeneration",
+            "Potion of Regeneration",
+        ),
+        (
+            11,
+            "potion.resistance",
+            "Resistance",
+            "Potion of Resistance",
+        ),
+        (19, "potion.poison", "Poison", "Potion of Poison"),
+        (20, "potion.wither", "Wither", "Potion of Decay"),
+        (
+            23,
+            "potion.saturation",
+            "Saturation",
+            "Potion of Saturation",
+        ),
+    ] {
+        let row = potion_name(id).unwrap_or_else(|| panic!("potion {id} must be in the table"));
+        assert_eq!(
+            (row.key, row.name, row.postfix),
+            (key, name, postfix),
+            "potion {id}"
+        );
+    }
+    assert_eq!(potion_name(0), None);
+    assert_eq!(potion_name(24), None);
+}
+
+#[test]
+fn every_variant_row_answers_its_own_sub_items() {
+    let mut populated = 0;
+    let mut flagged = 0;
+    for row in registry() {
+        let items = sub_items(row.id);
+        assert_eq!(
+            items.len() > 1,
+            row.variants,
+            "id {}'s variant flag marks a class that populates more than its base stack",
+            row.id
+        );
+        if row.variants {
+            flagged += 1;
+        }
+        if !items.is_empty() {
+            populated += 1;
+            let mut damages: Vec<i16> = items.iter().map(|item| item.damage).collect();
+            let count = damages.len();
+            damages.sort_unstable();
+            damages.dedup();
+            assert_eq!(damages.len(), count, "id {}'s damages are unique", row.id);
+            for item in items {
+                assert!(!item.name.is_empty(), "id {}'s name is present", row.id);
+                assert!(
+                    creative_tab_items(item.tab).contains(&TabEntry {
+                        id: row.id,
+                        damage: item.damage
+                    }),
+                    "id {} at {} is listed in its own tab",
+                    row.id,
+                    item.damage
+                );
+            }
+        }
+    }
+    assert_eq!(flagged, 37, "the rows the table flags as variants");
+    // Two classes populate exactly their base stack, so the table does not flag
+    // them: the dandelion (`BlockYellowFlower`) and the red sandstone slab.
+    assert_eq!(populated, 39, "the rows that answer a sub-item list");
+    for id in [37, 182] {
+        assert_eq!(sub_items(id).len(), 1, "id {id} populates its base stack");
+        assert!(!item_entry(id).expect("a row").variants);
+    }
+}
+
+// ----------------------------------------------------------------- the tabs
+
+#[test]
+fn every_tab_carries_its_index_label_icon_and_sheet() {
+    for (index, tab, label, icon, sheet) in [
+        (
+            0,
+            CreativeTab::BuildingBlocks,
+            "buildingBlocks",
+            (45, 0),
+            "items.png",
+        ),
+        (
+            1,
+            CreativeTab::Decorations,
+            "decorations",
+            (175, 5),
+            "items.png",
+        ),
+        (2, CreativeTab::Redstone, "redstone", (331, 0), "items.png"),
+        (
+            3,
+            CreativeTab::Transportation,
+            "transportation",
+            (27, 0),
+            "items.png",
+        ),
+        (4, CreativeTab::Misc, "misc", (327, 0), "items.png"),
+        (
+            5,
+            CreativeTab::Search,
+            "search",
+            (345, 0),
+            "item_search.png",
+        ),
+        (6, CreativeTab::Food, "food", (260, 0), "items.png"),
+        (7, CreativeTab::Tools, "tools", (258, 0), "items.png"),
+        (8, CreativeTab::Combat, "combat", (283, 0), "items.png"),
+        (9, CreativeTab::Brewing, "brewing", (373, 0), "items.png"),
+        (
+            10,
+            CreativeTab::Materials,
+            "materials",
+            (280, 0),
+            "items.png",
+        ),
+        (
+            11,
+            CreativeTab::Inventory,
+            "inventory",
+            (54, 0),
+            "inventory.png",
+        ),
+    ] {
+        assert_eq!(tab.index(), index, "the tab's own index");
+        assert_eq!(tab.meta().index, index, "the tab's own row");
+        assert_eq!(tab.label(), label, "tab {index}'s own label");
+        assert_eq!(
+            (tab.icon().id, tab.icon().damage),
+            icon,
+            "tab {index}'s icon"
+        );
+        assert_eq!(tab.sheet(), sheet, "tab {index}'s sheet");
+        assert_eq!(CreativeTab::from_index(index), Some(tab), "index {index}");
+        assert_eq!(CreativeTab::ALL[index as usize], tab, "the array's order");
+    }
+    assert_eq!(CreativeTab::ALL.len(), 12);
+    assert_eq!(CreativeTab::from_index(12), None);
+    assert_eq!(CreativeTab::from_index(200), None);
+}
+
+#[test]
+fn two_tabs_pin_their_first_ten_entries() {
+    let head = |tab, count: usize| -> Vec<(i16, i16)> {
+        creative_tab_items(tab)
+            .iter()
+            .take(count)
+            .map(|entry| (entry.id, entry.damage))
+            .collect()
+    };
+    assert_eq!(
+        head(CreativeTab::BuildingBlocks, 10),
+        vec![
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (1, 5),
+            (1, 6),
+            (2, 0),
+            (3, 0),
+            (3, 1)
+        ],
+        "the building blocks tab's first ten, by literal"
+    );
+    assert_eq!(
+        head(CreativeTab::Brewing, 10),
+        vec![
+            (370, 0),
+            (373, 0),
+            (373, 8193),
+            (373, 8225),
+            (373, 8257),
+            (373, 16385),
+            (373, 16417),
+            (373, 16449),
+            (373, 8194),
+            (373, 8226)
+        ],
+        "the brewing tab's first ten, by literal"
+    );
+}
+
+#[test]
+fn the_tab_lists_expand_variants_in_their_own_order() {
+    assert_eq!(
+        creative_tab_items(CreativeTab::Decorations)
+            .iter()
+            .take(8)
+            .map(|entry| (entry.id, entry.damage))
+            .collect::<Vec<_>>(),
+        vec![
+            (6, 0),
+            (6, 1),
+            (6, 2),
+            (6, 3),
+            (6, 4),
+            (6, 5),
+            (18, 0),
+            (18, 1)
+        ],
+        "decorations opens on the sapling run then the leaves"
+    );
+    assert_eq!(
+        creative_tab_items(CreativeTab::Food)
+            .iter()
+            .take(8)
+            .map(|entry| (entry.id, entry.damage))
+            .collect::<Vec<_>>(),
+        vec![
+            (260, 0),
+            (282, 0),
+            (297, 0),
+            (319, 0),
+            (320, 0),
+            (322, 0),
+            (322, 1),
+            (349, 0)
+        ],
+        "food's own order"
+    );
+    for tab in CreativeTab::ALL {
+        let entries = creative_tab_items(tab);
+        for pair in entries.windows(2) {
+            assert!(
+                pair[0].id <= pair[1].id,
+                "{:?} ascends by registration id: {:?} then {:?}",
+                tab,
+                pair[0],
+                pair[1]
+            );
+        }
+        for entry in entries {
+            let items = sub_items(entry.id);
+            if items.is_empty() {
+                assert_eq!(entry.damage, 0, "{:?}: {:?} is a single stack", tab, entry);
+            } else {
+                assert!(
+                    items.iter().any(|item| item.damage == entry.damage),
+                    "{:?}: {:?} is a populated damage",
+                    tab,
+                    entry
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_search_list_is_every_tabbed_stack_in_registration_order() {
+    let search = creative_tab_items(CreativeTab::Search);
+    assert_eq!(search.len(), 600, "the search list's own size");
+    assert_eq!(
+        search.iter().take(10).collect::<Vec<_>>(),
+        creative_tab_items(CreativeTab::BuildingBlocks)
+            .iter()
+            .take(10)
+            .collect::<Vec<_>>(),
+        "the search list opens on the registry's own first stacks"
+    );
+    for pair in search.windows(2) {
+        assert!(
+            pair[0].id <= pair[1].id,
+            "the search list ascends by id: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    let item_tabs = [
+        CreativeTab::BuildingBlocks,
+        CreativeTab::Decorations,
+        CreativeTab::Redstone,
+        CreativeTab::Transportation,
+        CreativeTab::Misc,
+        CreativeTab::Food,
+        CreativeTab::Tools,
+        CreativeTab::Combat,
+        CreativeTab::Brewing,
+        CreativeTab::Materials,
+    ];
+    let summed: usize = item_tabs
+        .iter()
+        .map(|tab| creative_tab_items(*tab).len())
+        .sum();
+    assert_eq!(
+        summed, 600,
+        "the search list is every tabbed stack exactly once"
+    );
+    assert!(creative_tab_items(CreativeTab::Inventory).is_empty());
+}
+
+#[test]
+fn the_search_filter_matches_case_insensitively() {
+    for (name, query, matches) in [
+        ("Stone", "stone", true),
+        ("Stone", "STONE", true),
+        ("Stone", "StOnE", true),
+        ("Stone", "ton", true),
+        ("Stone", "", true),
+        ("Orange Wool", "orange wool", true),
+        ("Orange Wool", "WOOL", true),
+        ("Orange Wool", "range woo", true),
+        ("Splash Potion of Regeneration", "potion of regen", true),
+        ("Stone", "stones", false),
+        ("Stone", "granite", false),
+        ("Orange Wool", "red", false),
+    ] {
+        assert_eq!(
+            search_matches(name, query),
+            matches,
+            "search_matches({name:?}, {query:?})"
+        );
+    }
+
+    // The rule over the search tab's own list: a fixture of the source's own names.
+    let filter = |query: &str| -> Vec<(i16, i16)> {
+        creative_tab_items(CreativeTab::Search)
+            .iter()
+            .filter(|entry| {
+                let name = stack_name(entry.id, entry.damage)
+                    .unwrap_or_else(|| panic!("{entry:?} must carry a name"));
+                search_matches(name, query)
+            })
+            .map(|entry| (entry.id, entry.damage))
+            .collect()
+    };
+    assert_eq!(
+        filter("potion of regeneration"),
+        vec![
+            (373, 8193),
+            (373, 8225),
+            (373, 8257),
+            (373, 16385),
+            (373, 16417),
+            (373, 16449)
+        ],
+        "the regular and splash regeneration potions"
+    );
+    assert_eq!(filter("wool").len(), 16, "wool's own sixteen stacks");
+    assert_eq!(
+        filter("wool").iter().map(|pair| pair.1).collect::<Vec<_>>(),
+        (0..16).collect::<Vec<_>>()
+    );
+    assert_eq!(filter("spawn").len(), 27, "every egg's stack");
+    assert_eq!(filter("sword").len(), 5, "the five swords");
+    assert_eq!(
+        filter("stone").len(),
+        46,
+        "the stone-family stacks and the names that carry the word"
+    );
+    assert!(filter("no such string").is_empty());
 }
