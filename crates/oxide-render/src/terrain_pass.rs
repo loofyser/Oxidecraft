@@ -890,6 +890,18 @@ pub(crate) fn depth_state(write: bool) -> wgpu::DepthStencilState {
     }
 }
 
+/// The depth state a draw carries when it does not test or write depth, in a pass that
+/// still attaches one: every fragment passes and nothing is written. The overlay's own
+/// layers (the dim, the hud's 2D draws and the debug text) draw under it once the hud
+/// pass offers the item draws a depth buffer to sort against.
+pub(crate) fn depth_state_off() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_write_enabled: false,
+        depth_compare: wgpu::CompareFunction::Always,
+        ..depth_state(false)
+    }
+}
+
 /// The colour target for one attachment in `format`: every channel written, blended when the
 /// layer asks for it.
 pub(crate) fn color_target(

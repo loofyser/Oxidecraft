@@ -29,11 +29,14 @@ use oxide_game::chat::{
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, PlayerListRecord};
 use oxide_game::scoreboard::{Objective, Scoreboard, format_entry};
 use oxide_game::session::ClientEvent;
+use oxide_proto_v47::entity::MetadataItem;
+use oxide_proto_v47::nbt::NbtValue;
 use oxide_render::entity_models::player::CapeMotion;
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
     DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, SkinLookup, SkinTexId, TextureRef,
 };
+use oxide_render::gui_item::ItemIcon;
 use oxide_render::hud::{HudDraw, HudTexture, ScaledResolution};
 use oxide_render::text::string_width;
 use oxide_world::entity::EntityKind;
@@ -1547,6 +1550,41 @@ fn line_top(resolution: ScaledResolution, index: usize) -> f32 {
 /// `Minecraft.java`:1010-1012 swaps both halves).
 pub fn reconcile_chat_open(chat: &mut ChatView, input: &ChatInput) {
     chat.set_open(input.open);
+}
+
+/// The icon one hud item draw carries: the wire's item stack as the pass's own minimal
+/// view, the enchant flag read from the stack's NBT.
+///
+/// The source's rule is `ItemStack.hasEffect` over `isItemEnchanted`: the stack's root
+/// compound carries an `ench` list (`ItemStack.isItemEnchanted`:902-905) — presence,
+/// not contents, so an empty list enchants too; the tag-less stack never is. No 1.8
+/// item overrides `hasEffect` (`ItemSimpleFoiled` has no subclasses in this tree), so
+/// the NBT rule is the whole of it.
+///
+/// The conversion is the draw-list seam: a slot's stack becomes this view when a frame
+/// builds its draws, and nothing else of the stack reaches the pass — the icon draw
+/// reads the id, the damage and the flag. The hotbar draws that call it are the next
+/// task's, so nothing calls it yet.
+#[allow(dead_code)]
+pub(crate) fn item_icon(stack: &MetadataItem) -> ItemIcon {
+    ItemIcon {
+        id: stack.id,
+        damage: stack.damage,
+        enchanted: stack.nbt.as_deref().is_some_and(root_has_ench),
+    }
+}
+
+/// Whether the raw NBT tail's root compound carries an `ench` list
+/// (`ItemStack.isItemEnchanted`:902-905's `hasKey("ench", 9)`); a tail that is not a
+/// compound, or does not parse, is not enchanted.
+fn root_has_ench(nbt: &[u8]) -> bool {
+    matches!(
+        oxide_proto_v47::nbt::parse(nbt),
+        Ok(NbtValue::Compound(children))
+            if children
+                .iter()
+                .any(|(name, value)| name == "ench" && matches!(value, NbtValue::List(_)))
+    )
 }
 
 /// One component's unformatted text: every element's own characters, `§` codes and
@@ -5426,6 +5464,7 @@ mod tests {
                 HudDraw::Rect { .. } | HudDraw::TexturedRect { .. } | HudDraw::SkinRect { .. } => {
                     None
                 }
+                HudDraw::Item { .. } => None,
             })
             .collect()
     }
@@ -5833,5 +5872,46 @@ mod tests {
         view.observe(vec![player_frame(8, UUID_SLIM)], t0);
         let draws = view.entity_draws(t0, &BTreeMap::new(), &board);
         assert_eq!(draws[0].below_name, None, "no record name, no line");
+    }
+
+    /// The stack conversion's enchant rule: the root compound's own `ench` list
+    /// (`ItemStack.isItemEnchanted`:902-905) — presence, not contents; a tag-less
+    /// stack, a compound without the key, a non-list `ench` and an unparseable tail
+    /// are all unenchanted, and the id and damage ride through untouched.
+    #[test]
+    fn the_item_icon_reads_the_enchant_rule() {
+        let stack = |nbt: Option<Vec<u8>>| MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 3,
+            nbt,
+        };
+        // The root compound with an `ench` list — empty here, and the source's rule
+        // counts it (`hasKey("ench", 9)` is presence).
+        let enchanted = [
+            0x0A, 0x00, 0x00, // the root: a compound, no name
+            0x09, 0x00, 0x04, b'e', b'n', b'c', b'h', // a list named `ench`
+            0x0A, 0x00, 0x00, 0x00, 0x00, // compounds, none of them
+            0x00, // the root ends
+        ];
+        assert_eq!(
+            item_icon(&stack(Some(enchanted.to_vec()))),
+            ItemIcon {
+                id: 276,
+                damage: 3,
+                enchanted: true,
+            }
+        );
+        assert!(!item_icon(&stack(None)).enchanted);
+        // An empty root compound, no `ench` at all.
+        let bare = [0x0A, 0x00, 0x00, 0x00];
+        assert!(!item_icon(&stack(Some(bare.to_vec()))).enchanted);
+        // An `ench` that is not a list (a string here): the type id must match, 9.
+        let string_ench = [
+            0x0A, 0x00, 0x00, 0x08, 0x00, 0x04, b'e', b'n', b'c', b'h', 0x00, 0x01, b'x', 0x00,
+        ];
+        assert!(!item_icon(&stack(Some(string_ench.to_vec()))).enchanted);
+        // A tail that does not parse is not enchanted either.
+        assert!(!item_icon(&stack(Some(vec![0x0A]))).enchanted);
     }
 }

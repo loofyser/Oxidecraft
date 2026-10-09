@@ -10,7 +10,9 @@
 //! Angles are degrees in the draw code and radians in the tables, as the source writes
 //! them; distances are in 1/16 model units unless a comment says blocks.
 
-use super::{Box, Model, Part, Vertices};
+use oxide_assets::model::CHEST_MODEL;
+
+use super::{Box, Model, Part, Vertices, build_vertices};
 
 /// One painting art of `EntityPainting.EnumArt`, in the table's own order — the ordinal
 /// is the index the art table is keyed by (`EntityPainting.java`:144-169).
@@ -982,6 +984,58 @@ pub fn missing_block() -> Vertices {
     out
 }
 
+/// The chest trio's icon model: `ModelChest`'s three renderers (`ModelChest.java`:6-31),
+/// their boxes taken from the item bake's own table ([`CHEST_MODEL`]) and their sheet
+/// cells from the renderers' own `new ModelRenderer(this, u, v)` arguments — the lid and
+/// the knob read (0, 0), the base (0, 19), all on a 64x64 sheet.
+///
+/// The parts are in `renderAll`'s own draw order (`ModelChest.java`:36-40). The lid's
+/// open angle is draw state and stays out: the icon draws the chest closed, its
+/// `rotateAngleX` zero while the lid angle is
+/// (`TileEntityChestRenderer.renderTileEntityAt`:172-175).
+pub static MODEL_CHEST: Model = Model {
+    parts: &[
+        part!(
+            CHEST_MODEL[0].origin,
+            [0.0, 0.0, 0.0],
+            CHEST_MODEL[0].from,
+            chest_box_size(0),
+            [0.0, 0.0],
+        ),
+        part!(
+            CHEST_MODEL[1].origin,
+            [0.0, 0.0, 0.0],
+            CHEST_MODEL[1].from,
+            chest_box_size(1),
+            [0.0, 0.0],
+        ),
+        part!(
+            CHEST_MODEL[2].origin,
+            [0.0, 0.0, 0.0],
+            CHEST_MODEL[2].from,
+            chest_box_size(2),
+            [0.0, 19.0],
+        ),
+    ],
+};
+
+/// The size of [`CHEST_MODEL`]'s `index`th box: its two corners' difference.
+const fn chest_box_size(index: usize) -> [f32; 3] {
+    let chest = CHEST_MODEL[index];
+    [
+        chest.to[0] - chest.from[0],
+        chest.to[1] - chest.from[1],
+        chest.to[2] - chest.from[2],
+    ]
+}
+
+/// The chest trio's icon mesh: [`MODEL_CHEST`]'s boxes through the entity box layout, on
+/// the trio's own 64x64 sheet — the 1/16-unit model the GUI draw's own scale places,
+/// playing `ModelChest.renderAll`'s `0.0625` argument.
+pub fn chest_item() -> Vertices {
+    build_vertices(&MODEL_CHEST, &MODEL_CHEST.rest(), [64.0, 64.0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1584,5 +1638,41 @@ mod tests {
         assert_eq!(vertices.uvs[0], [0.0, 0.0]);
         assert_eq!(vertices.uvs[2], [1.0, 1.0]);
         assert_eq!(vertices.normals[23], [1.0, 0.0, 0.0]);
+    }
+
+    /// The chest trio's icon model: `ModelChest`'s three renderers — their pivots, their
+    /// boxes and their sheet cells — and the mesh they build, in the 1/16-unit space the
+    /// GUI draw's own scale places.
+    #[test]
+    fn the_chest_model_is_the_trios_three_boxes() {
+        assert_eq!(MODEL_CHEST.parts.len(), 3, "the lid, the knob, the base");
+        // The lid: pivot (1, 7, 15), box (0, -5, -14) to (14, 0, 0), cell (0, 0).
+        let lid = MODEL_CHEST.parts[0];
+        assert_eq!(lid.point, [1.0, 7.0, 15.0]);
+        assert_eq!(lid.boxes[0].origin, [0.0, -5.0, -14.0]);
+        assert_eq!(lid.boxes[0].size, [14.0, 5.0, 14.0]);
+        assert_eq!(lid.boxes[0].uv, [0.0, 0.0]);
+        // The knob: pivot (8, 7, 15), box (-1, -2, -15) to (1, 2, -14), cell (0, 0).
+        assert_eq!(MODEL_CHEST.parts[1].point, [8.0, 7.0, 15.0]);
+        assert_eq!(MODEL_CHEST.parts[1].boxes[0].origin, [-1.0, -2.0, -15.0]);
+        assert_eq!(MODEL_CHEST.parts[1].boxes[0].size, [2.0, 4.0, 1.0]);
+        // The base: pivot (1, 6, 1), box (0, 0, 0) to (14, 10, 14), cell (0, 19).
+        assert_eq!(MODEL_CHEST.parts[2].point, [1.0, 6.0, 1.0]);
+        assert_eq!(MODEL_CHEST.parts[2].boxes[0].size, [14.0, 10.0, 14.0]);
+        assert_eq!(MODEL_CHEST.parts[2].boxes[0].uv, [0.0, 19.0]);
+
+        // The mesh: three boxes of six quads, the base's own corners placed by its
+        // pivot — (1, 6, 1) to (15, 16, 15) in 1/16 units.
+        let vertices = chest_item();
+        assert_eq!(vertices.positions.len(), 72, "three boxes of six quads");
+        assert!(vertices.positions.contains(&[1.0, 6.0, 1.0]));
+        assert!(vertices.positions.contains(&[15.0, 16.0, 15.0]));
+        assert!(
+            vertices
+                .uvs
+                .iter()
+                .all(|uv| (0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1])),
+            "the sheet's own 0..1 space"
+        );
     }
 }

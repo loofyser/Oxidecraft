@@ -1040,6 +1040,15 @@ fn void_y_factor(level_type: &str) -> f32 {
     if level_type == "flat" { 1.0 } else { 0.03125 }
 }
 
+/// The glint's clock, in milliseconds: the process's own monotonic elapsed time, the
+/// shape the source reads its own clock in (`Minecraft.getSystemTime`'s
+/// `Sys.getTime() * 1000 / Sys.getTimerResolution()` is milliseconds since the machine
+/// started), which the glint's scroll phases take modulo their periods.
+fn system_time_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 impl ClientApp {
     /// Builds the handler, reads the smoke-run frame limit, loads the assets when a session
     /// was asked for, and opens the session.
@@ -1445,6 +1454,9 @@ impl ClientApp {
                 ));
             }
         }
+        // The glint's own clock, before the list lands: an enchanted icon's glint
+        // passes scroll by the frame's system time.
+        renderer.set_hud_system_time(system_time_ms());
         renderer.set_hud(hud_draws);
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
@@ -2724,6 +2736,13 @@ impl ApplicationHandler for ClientApp {
                 renderer.set_hud_texture(key, texture);
             }
             renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
+            // The enchanted glint's sheet: the glint passes of an enchanted icon
+            // sample it under the glint sampler.
+            renderer.set_hud_glint(&assets.glint_sheet);
+            // The hud's item icon source: the pass resolves every item draw's icon
+            // through it (the item table and the bake), beside the object set's own
+            // mesh source.
+            renderer.set_hud_icon_source(Arc::new(assets.item_icons.clone()));
         }
         self.window = Some(window);
     }

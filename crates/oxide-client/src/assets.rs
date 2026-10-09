@@ -18,7 +18,7 @@ use std::sync::Arc;
 use oxide_assets::atlas::{Atlas, AtlasError, build_atlas};
 use oxide_assets::extract::Extractor;
 use oxide_assets::font::{Font, FontError};
-use oxide_assets::model::{BakedModel, BakedQuad, ModelError, ModelSource};
+use oxide_assets::model::{BakedModel, BakedQuad, ModelError, ModelSource, Transform};
 use oxide_assets::resources::{GUI_SHEETS, ResourceError, TextureSet};
 use oxide_assets::store::{Store, StoreError};
 use oxide_assets::texture::Texture;
@@ -28,6 +28,7 @@ use oxide_game::mesher::{BlockModelSet, ModelChoice};
 use oxide_game::session::MeshAssets;
 use oxide_render::entity_models::{Vertices, objects};
 use oxide_render::entity_pass::{ItemMesh, ItemMeshSource};
+use oxide_render::gui_item::{IconShape, ItemIconMesh, ItemIconSource};
 use oxide_render::sky::SkyTextures;
 use oxide_world::biome::{ColorMap, ColorMapError, TintMaps};
 
@@ -174,6 +175,11 @@ pub const DEFAULT_SKIN_SLIM: &str = "entity/alex.png";
 /// latency bars and heart glyphs sample it under the name every draw of it carries.
 pub const HUD_ICONS: &str = "gui/icons";
 
+/// The enchanted glint's sheet, the extraction tree's `misc/enchanted_item_glint.png`:
+/// the glint passes of an enchanted icon sample it, the source's own
+/// `RenderItem.RES_ITEM_GLINT` file (`RenderItem.java`:63).
+pub const GLINT_SHEET: &str = "misc/enchanted_item_glint";
+
 /// The item frame's own wood: the blockstate file and the variant key the frame's
 /// model resource names (`RenderItemFrame.java`:37's `("item_frame", "normal")`).
 const ITEM_FRAME_STATE: (&str, &str) = ("item_frame", "normal");
@@ -304,6 +310,9 @@ pub struct ClientAssets {
     /// The hud's icon sheet, under [`HUD_ICONS`]: the tab list's latency bars and
     /// heart glyphs sample it.
     pub hud_icons: Texture,
+    /// The enchanted glint's sheet, under [`GLINT_SHEET`]: the glint passes of an
+    /// enchanted icon sample it.
+    pub glint_sheet: Texture,
     /// The GUI sheets, under their own store keys ([`GUI_SHEETS`]): the widgets
     /// sheet, the container family, the two book sheets, the SGA glyph sheet and
     /// the chest trio's icon sheets — the keys the screens and the chest item
@@ -312,6 +321,8 @@ pub struct ClientAssets {
     /// The object draws' item mesh source: the baked block models, the sheets and the
     /// frame's wood.
     pub item_meshes: ClientItemMeshes,
+    /// The hud's item icon source: every item row's baked icon.
+    pub item_icons: ClientItemIcons,
 }
 
 /// The item registry's atlas sprite paths: every generated item's own layer sheets,
@@ -397,6 +408,9 @@ impl ClientAssets {
         // The hud's icon sheet: the tab list's latency bars and heart glyphs sample
         // it under the name every draw of it carries.
         let hud_icons = texture(&textures, HUD_ICONS)?.clone();
+        // The enchanted glint's sheet: the glint passes of an enchanted icon sample
+        // it, under the name the hud's glint registration carries.
+        let glint_sheet = texture(&textures, GLINT_SHEET)?.clone();
         // The GUI sheets: the widgets, the container family, the book sheets, the
         // SGA glyph sheet and the chest trio's icon sheets, under the keys the
         // screens and the chest item model name them.
@@ -423,6 +437,9 @@ impl ClientAssets {
             sheets: object_textures.clone(),
             frame,
         };
+        // The hud's item icons: every item row's icon, baked once against the same
+        // models and atlas the object set reads.
+        let item_icons = ClientItemIcons::load(&models, &mesh);
 
         tracing::info!(
             atlas_width = mesh.atlas.width,
@@ -447,8 +464,10 @@ impl ClientAssets {
             skin_wide,
             skin_slim,
             hud_icons,
+            glint_sheet,
             gui_sheets,
             item_meshes,
+            item_icons,
         })
     }
 }
@@ -538,6 +557,150 @@ impl ItemMeshSource for ClientItemMeshes {
     }
 }
 
+/// The hud's item icon source: every item row's icon, baked once at load, behind the
+/// pass's own [`ItemIconSource`].
+///
+/// Mirrors [`ClientItemMeshes`]'s shape: the pass asks for an id and a damage and this
+/// resolves them against the item table (Task 8) and the item bake (Task 7) — a block
+/// row's chain through [`ModelSource::bake_item`], a generated row's layer through the
+/// atlas's stitched sprite, a folded chest trio row through [`objects::chest_item`].
+/// The meshes are the entity pass's own 1/16-unit shapes, so the icon draw samples the
+/// atlas the world draws sample; a row nothing resolves for answers `None` and the
+/// draw falls back to [`ItemIconSource::missing_icon`].
+#[derive(Debug, Clone)]
+pub struct ClientItemIcons {
+    /// One icon per item id, `None` for a row nothing resolves for.
+    icons: Vec<Option<ItemIconMesh>>,
+    /// The missing icon every unresolved stack draws: the missing model's own cube
+    /// (`ModelBakery`'s `builtin/missing` elements, every face the whole sprite,
+    /// `ModelBakery.java`:716) under the 3D branch — the missing model's own `gui3d`.
+    missing: Option<ItemIconMesh>,
+}
+
+impl ClientItemIcons {
+    /// Bakes every item row's icon against the loaded tree.
+    ///
+    /// The atlas and the item table are the two inputs; nothing here reads the store,
+    /// so the build is pure over the loaded assets and fails soft: a row the bake
+    /// refuses answers the missing icon rather than failing the client's load.
+    fn load(models: &ModelSource, mesh: &Arc<MeshAssets>) -> ClientItemIcons {
+        let max_id = items::registry()
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .unwrap_or(0);
+        let mut icons = vec![None; max_id as usize + 1];
+        for entry in items::registry() {
+            icons[entry.id as usize] = match entry.resolution {
+                ItemModel::Block(name) => {
+                    // The item's own chain: the source's bake starts at the item
+                    // file (`models/item/<name>.json`, `ModelBakery.getItemLocation`)
+                    // and walks down into the block model, and the display slots
+                    // live on the item file — the chain's transform lookup walks up
+                    // from the item's own model (`ModelBlock.getTransform`:177-179).
+                    // The table carries the chain's block member, so the bake starts
+                    // at the item file above it; a member no item file parents
+                    // bakes as the block model itself.
+                    let item_file = models.item_model_above(name);
+                    let baked = item_file
+                        .as_deref()
+                        .and_then(|resource| models.bake_item(resource).ok())
+                        .or_else(|| models.bake_item(name).ok());
+                    baked.map(|baked| ItemIconMesh {
+                        mesh: ItemMesh {
+                            vertices: Arc::new(quad_vertices(&baked.quads, &mesh.atlas)),
+                            texture: BLOCKS_ATLAS_TEXTURE,
+                        },
+                        transform: baked.display.gui,
+                        shape: IconShape::Gui3d,
+                    })
+                }
+                ItemModel::Generated(layers) => layers.last().and_then(|layer| {
+                    generated_icon_vertices(layer, &mesh.atlas).map(|vertices| ItemIconMesh {
+                        mesh: ItemMesh {
+                            vertices: Arc::new(vertices),
+                            texture: BLOCKS_ATLAS_TEXTURE,
+                        },
+                        // No generated item model in the tree states a gui slot — the
+                        // 26 that state one are block items or builtin/entity ids — so
+                        // the chain's completed gui slot is the source's default (the
+                        // store pass pins the representative chains).
+                        transform: Transform::DEFAULT,
+                        shape: IconShape::Flat,
+                    })
+                }),
+                ItemModel::Builtin(item) => {
+                    models
+                        .bake_item(item.model_name())
+                        .ok()
+                        .map(|baked| ItemIconMesh {
+                            mesh: ItemMesh {
+                                vertices: Arc::new(objects::chest_item()),
+                                texture: item.icon_sheet(),
+                            },
+                            transform: baked.display.gui,
+                            shape: IconShape::Builtin,
+                        })
+                }
+                ItemModel::Missing => None,
+            };
+        }
+        let missing = Some(ItemIconMesh {
+            mesh: ItemMesh {
+                vertices: Arc::new(missing_cube(&mesh.atlas)),
+                texture: BLOCKS_ATLAS_TEXTURE,
+            },
+            transform: Transform::DEFAULT,
+            shape: IconShape::Gui3d,
+        });
+        ClientItemIcons { icons, missing }
+    }
+}
+
+impl ItemIconSource for ClientItemIcons {
+    /// The icon the row resolves.
+    ///
+    /// The damage is not consulted: the table's rows are per id, and the source's
+    /// per-subtype model registrations (`RenderItem.registerItems`) are not folded
+    /// (recorded, matching the entity pass's own `items::resolve`).
+    fn icon(&self, id: i16, _damage: i16) -> Option<ItemIconMesh> {
+        let index = usize::try_from(id).ok()?;
+        self.icons.get(index).and_then(|icon| icon.clone())
+    }
+
+    /// The atlas's own missing sprite as the missing model draws it: the cube the
+    /// fallback bakes, under the 3D branch.
+    fn missing_icon(&self) -> Option<ItemIconMesh> {
+        self.missing.clone()
+    }
+}
+
+/// The generated item shape over one atlas sprite: the sprite's own pixels through the
+/// item model generator's scan, its uvs mapped into the sprite's atlas rect — the icon
+/// draw samples the atlas, so the shape lives in atlas space.
+///
+/// The sprite is the path the item table's layer names; a path the atlas never stitched
+/// draws the missing sprite, the source's own fallback
+/// (`TextureMap.getAtlasSprite`'s `missingno`).
+fn generated_icon_vertices(key: &str, atlas: &Atlas) -> Option<Vertices> {
+    let sprite = atlas.drawn(key);
+    let rect = sprite.content;
+    let (width, height) = (rect.w as usize, rect.h as usize);
+    let stride = atlas.levels[0].width as usize * 4;
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let start = (rect.y as usize + row) * stride + rect.x as usize * 4;
+        rgba.extend_from_slice(atlas.levels[0].rgba.get(start..start + width * 4)?);
+    }
+    let mut mesh = objects::generated_item(rect.w, rect.h, &rgba)?;
+    let [min, max] = atlas.uv(sprite);
+    for uv in &mut mesh.uvs {
+        uv[0] = min[0] + uv[0] * (max[0] - min[0]);
+        uv[1] = min[1] + uv[1] * (max[1] - min[1]);
+    }
+    Some(mesh)
+}
+
 /// The mesher's own fallback for a state the model set did not resolve: the missing
 /// sprite's cube (`objects::missing_block`), its uvs mapped onto the atlas's missing
 /// sprite.
@@ -554,8 +717,13 @@ fn missing_cube(atlas: &Atlas) -> Vertices {
 /// A baked model's quads as one entity vertex set: positions in 1/16 units, uvs mapped
 /// into the atlas's drawn rects, each quad's own normal.
 fn model_vertices(model: &BakedModel, atlas: &Atlas) -> Vertices {
+    quad_vertices(&model.quads, atlas)
+}
+
+/// A quad list as one entity vertex set, the same mapping [`model_vertices`] applies.
+fn quad_vertices(quads: &[BakedQuad], atlas: &Atlas) -> Vertices {
     let mut out = Vertices::default();
-    for quad in &model.quads {
+    for quad in quads {
         push_model_quad(&mut out, quad, atlas);
     }
     out
@@ -1019,6 +1187,123 @@ mod tests {
             .find(|(key, _)| *key == "gui/widgets")
             .expect("the widgets sheet is loaded");
         assert_eq!((widgets.1.width, widgets.1.height), (256, 256));
+
+        // The enchanted glint's sheet loads with its own pixels: the source's own
+        // 64x64 `misc/enchanted_item_glint.png` (`RenderItem.java`:63).
+        assert_eq!(
+            (assets.glint_sheet.width, assets.glint_sheet.height),
+            (64, 64),
+            "the glint sheet's own canvas"
+        );
+    }
+
+    /// The two atlas names the icon path couples: the resolver marks an atlas-mapped
+    /// mesh with the client's registry name ([`BLOCKS_ATLAS_TEXTURE`]) and the hud
+    /// pass's batch split compares it against its own
+    /// [`oxide_render::gui_item::ATLAS_TEXTURE`] — the same registry entry
+    /// (`TextureMap.java`:30); if the two ever diverge, an icon's quads batch under a
+    /// named texture nothing registered instead of the atlas binding.
+    #[test]
+    fn the_atlas_names_are_one_key() {
+        assert_eq!(BLOCKS_ATLAS_TEXTURE, oxide_render::gui_item::ATLAS_TEXTURE);
+    }
+
+    /// The live item icons: every class's icon builds from the store's own tree — the
+    /// block bake, the generated scan over the atlas's stitched sprite, the chest
+    /// trio's boxes — and the rows nothing resolves for stay `None`.
+    #[test]
+    #[ignore = "reads the asset store; set OXIDECRAFT_STORE and run with -- --ignored"]
+    fn the_item_icons_build_from_the_store() {
+        let root = std::env::var_os(STORE_VAR)
+            .filter(|root| !root.is_empty())
+            .expect("OXIDECRAFT_STORE must name the store root");
+        let assets =
+            ClientAssets::load(Some(PathBuf::from(&root))).expect("the client assets load");
+        let icons = &assets.item_icons;
+
+        // A block item's icon: the chain's baked quads sampling the atlas, the GUI slot
+        // the file states (item/stone.json states third-person only, so the source's
+        // default applies), the 3D shape.
+        let stone = icons.icon(1, 0).expect("stone's icon builds");
+        assert_eq!(stone.mesh.texture, BLOCKS_ATLAS_TEXTURE);
+        assert_eq!(stone.shape, IconShape::Gui3d);
+        assert_eq!(stone.transform, Transform::DEFAULT);
+        assert!(!stone.mesh.vertices.positions.is_empty());
+
+        // A stated GUI slot rides through the chain: item/oak_stairs.json states
+        // rotation (0, 180, 0) in its gui slot.
+        let stairs = icons.icon(53, 0).expect("the stairs' icon builds");
+        assert_eq!(stairs.shape, IconShape::Gui3d);
+        assert_eq!(stairs.transform.rotation, [0.0, 180.0, 0.0]);
+
+        // A generated item: the atlas sprite's own scan, the flat shape, the source's
+        // default GUI slot (no generated item model states one). The shape is the same
+        // scan the entity pass's own generated draw bakes — the same sprite pixels.
+        let apple = icons.icon(260, 0).expect("the apple's icon builds");
+        assert_eq!(apple.shape, IconShape::Flat);
+        assert_eq!(apple.transform, Transform::DEFAULT);
+        assert_eq!(apple.mesh.texture, BLOCKS_ATLAS_TEXTURE);
+        let world = assets
+            .item_meshes
+            .generated("items/apple")
+            .expect("the world's apple bakes");
+        assert_eq!(
+            apple.mesh.vertices.positions, world.vertices.positions,
+            "the icon and the world's generated shape scan the same pixels"
+        );
+
+        // The chest trio: the chest model's boxes on the trio's own sheet, under the
+        // builtin shape (the 3D branch plus the block-entity tail).
+        let chest = icons.icon(54, 0).expect("the chest's icon builds");
+        assert_eq!(chest.shape, IconShape::Builtin);
+        assert_eq!(chest.mesh.texture, "entity/chest/normal");
+        assert_eq!(
+            chest.mesh.vertices.positions.len(),
+            72,
+            "three boxes, six faces each"
+        );
+        assert_eq!(chest.transform, Transform::DEFAULT);
+
+        // The missing icon: the missing model's cube under the 3D branch, sampling the
+        // atlas's own missing sprite.
+        let missing = icons.missing_icon().expect("the missing icon builds");
+        assert_eq!(missing.shape, IconShape::Gui3d);
+        assert_eq!(missing.mesh.texture, BLOCKS_ATLAS_TEXTURE);
+        assert_eq!(
+            missing.mesh.vertices.positions.len(),
+            24,
+            "the cube's six faces"
+        );
+
+        // An id nothing resolves for answers `None`: below the item range and the
+        // missing marker's own rows.
+        assert!(icons.icon(0, 0).is_none());
+        let skull = items::registry()
+            .iter()
+            .find(|entry| matches!(entry.resolution, ItemModel::Missing))
+            .map(|entry| entry.id)
+            .expect("a missing row is in the table");
+        assert!(icons.icon(skull, 0).is_none());
+
+        // The representative chains the generated and builtin defaults rest on: none
+        // states a gui slot, so the source's default is the completed one.
+        let store = Store::open(PathBuf::from(&root)).expect("the store opens");
+        let tree = Extractor::new(&store, VERSION).root();
+        let models = ModelSource::open(&tree).expect("the block models load");
+        for name in [
+            "apple",
+            "diamond_sword",
+            "item/chest",
+            "item/trapped_chest",
+            "item/ender_chest",
+        ] {
+            let baked = models.bake_item(name).expect("the model bakes");
+            assert_eq!(
+                baked.display.gui,
+                Transform::DEFAULT,
+                "{name} states no gui slot"
+            );
+        }
     }
 
     /// The live item mesh source: the baked block models, the generated item shapes,

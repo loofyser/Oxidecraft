@@ -118,7 +118,7 @@ impl DimPass {
                 cull_mode: None,
                 ..wgpu::PrimitiveState::default()
             },
-            depth_stencil: None,
+            depth_stencil: Some(crate::terrain_pass::depth_state_off()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,

@@ -51,10 +51,12 @@
 //! round.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
+use oxide_assets::model::Transform;
 use oxide_assets::texture::Texture;
 use oxide_render::camera::{
     Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
@@ -65,6 +67,7 @@ use oxide_render::entity_pass::{
     SkinLookup, TextureRef, TextureRegistry,
 };
 use oxide_render::fog::{FogParams, fog_colour};
+use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
@@ -206,7 +209,9 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
     with_terrain_pass(&mut encoder, &target.view, &depth, |pass| {
         terrain.draw(pass)
     });
-    with_overlay_pass(&mut encoder, &target.view, |pass| overlay.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        overlay.draw(pass)
+    });
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -266,11 +271,14 @@ fn the_overlay_pass_discards_the_below_threshold_texels() {
         .expect("the synthetic sheet is a 16x16 grid");
     overlay.upload_text(&device, &queue, &["|".to_string()]);
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide pipeline headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| overlay.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        overlay.draw(pass)
+    });
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -1662,11 +1670,13 @@ fn with_terrain_pass(
     draw(&mut pass);
 }
 
-/// Runs the overlay pass over the target: the colour the terrain pass left, loaded, and no
-/// depth attachment at all, because the overlay's pipeline has no depth state.
+/// Runs the overlay pass over the target: the colour the terrain pass left, loaded, and the
+/// depth buffer cleared and attached, the state the hud's item pipelines state their depth
+/// against.
 fn with_overlay_pass(
     encoder: &mut wgpu::CommandEncoder,
     target: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
     draw: impl FnOnce(&mut wgpu::RenderPass<'_>),
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1680,7 +1690,14 @@ fn with_overlay_pass(
                 store: wgpu::StoreOp::Store,
             },
         })],
-        depth_stencil_attachment: None,
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
         timestamp_writes: None,
         occlusion_query_set: None,
     });
@@ -5278,11 +5295,12 @@ fn the_hud_pass_draws_a_chat_line() {
         &skins,
     );
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -5362,11 +5380,12 @@ fn the_hud_pass_draws_the_fade_series_at_four_alphas() {
     let skins = TextureRegistry::new(&device, &queue);
     hud.set_draws(&device, &queue, &draws, &skins);
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -5446,11 +5465,12 @@ fn the_hud_pass_draws_the_input_line_and_cursor() {
         &skins,
     );
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -5561,11 +5581,12 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
         &[bar(27.0), text("||", 28.0), bar(18.0), text("|", 19.0)],
         &skins,
     );
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -5625,7 +5646,7 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -5843,11 +5864,12 @@ fn the_hud_pass_draws_the_tab_list() {
         &skins,
     );
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -6055,11 +6077,12 @@ fn the_atlasicon_binding_stays_crisp_where_the_atlas_binding_blends() {
         &TextureRegistry::new(&device, &queue),
     );
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -6169,11 +6192,12 @@ fn the_hud_pass_draws_the_scoreboard_sidebar() {
         &skins,
     );
 
+    let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
@@ -6316,11 +6340,14 @@ fn boss_bar_frame(
     target: &Target,
     hud: &HudPass,
 ) -> Vec<u8> {
+    let depth = create_depth(device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide hud headless encoder"),
     });
     with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
-    with_overlay_pass(&mut encoder, &target.view, |pass| hud.draw_boss_bar(pass));
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        hud.draw_boss_bar(pass)
+    });
     queue.submit(Some(encoder.finish()));
     read_pixels(device, queue, target)
 }
@@ -6451,4 +6478,599 @@ fn the_hud_pass_hides_the_spent_boss_bar() {
     hud.set_boss_bar(&device, &queue, None, &scaled);
     let pixels = boss_bar_frame(&device, &queue, &target, &hud);
     assert_eq!(non_sky(&pixels), 0, "the spent frame draws nothing");
+}
+
+// ---------------------------------------------------------------------------------------
+// The GUI item draws: the fixtures' own atlas and glint sheet, the synthetic icon source
+// the four cases resolve through, and the cases themselves.
+// ---------------------------------------------------------------------------------------
+
+/// The item fixtures' top face sprite: solid red.
+const ITEM_TOP_TEXEL: [u8; 4] = [255, 0, 0, 255];
+/// The item fixtures' side sprite: solid blue.
+const ITEM_SIDE_TEXEL: [u8; 4] = [0, 0, 255, 255];
+/// The generated fixture's checkerboard, light texel.
+const ITEM_FLAT_A: [u8; 4] = [255, 255, 255, 255];
+/// The generated fixture's checkerboard, dark texel.
+const ITEM_FLAT_B: [u8; 4] = [0, 0, 0, 255];
+/// The second icon's sprite: solid green.
+const ITEM_GREEN_TEXEL: [u8; 4] = [0, 255, 0, 255];
+/// The glint fixture's lit texel, and the one the pattern leaves dark.
+const GLINT_LIT: [u8; 4] = [255, 255, 255, 255];
+const GLINT_DARK: [u8; 4] = [0, 0, 0, 255];
+
+/// The item fixtures' own atlas: a 16x16 level 0 holding four flat 8x8 sprites — the block
+/// icon's top (red) and side (blue) faces, the generated icon's one-texel checkerboard, and
+/// the second icon's solid green — with the whole image as the missing sprite.
+///
+/// The texels are generated here; no asset store is read and no Mojang pixel is embedded.
+fn item_atlas() -> Atlas {
+    const SIDE: u32 = 16;
+    let mut texels = vec![[0u8, 0, 0, 255]; (SIDE * SIDE) as usize];
+    paint_rect(&mut texels, SIDE, 0, 0, 8, 8, ITEM_TOP_TEXEL);
+    paint_rect(&mut texels, SIDE, 8, 0, 8, 8, ITEM_SIDE_TEXEL);
+    paint_rect(&mut texels, SIDE, 8, 8, 8, 8, ITEM_GREEN_TEXEL);
+    for ty in 0..8 {
+        for tx in 0..8 {
+            let colour = if (tx + ty) % 2 == 0 {
+                ITEM_FLAT_A
+            } else {
+                ITEM_FLAT_B
+            };
+            paint_rect(&mut texels, SIDE, tx, 8 + ty, 1, 1, colour);
+        }
+    }
+    let sprite = |x: u32, y: u32| AtlasSprite {
+        region: SpriteRect { x, y, w: 8, h: 8 },
+        content: SpriteRect { x, y, w: 8, h: 8 },
+    };
+    let whole = AtlasSprite {
+        region: SpriteRect {
+            x: 0,
+            y: 0,
+            w: SIDE,
+            h: SIDE,
+        },
+        content: SpriteRect {
+            x: 0,
+            y: 0,
+            w: SIDE,
+            h: SIDE,
+        },
+    };
+    let mut rgba = Vec::with_capacity(texels.len() * 4);
+    for texel in &texels {
+        rgba.extend_from_slice(texel);
+    }
+    Atlas {
+        levels: vec![AtlasLevel {
+            width: SIDE,
+            height: SIDE,
+            rgba,
+        }],
+        width: SIDE,
+        height: SIDE,
+        level_count: 1,
+        sprites: BTreeMap::from([
+            ("fixture:top".to_string(), sprite(0, 0)),
+            ("fixture:side".to_string(), sprite(8, 0)),
+            ("fixture:flat".to_string(), sprite(0, 8)),
+            ("fixture:green".to_string(), sprite(8, 8)),
+        ]),
+        animated: BTreeMap::new(),
+        missing: whole,
+    }
+}
+
+/// Fills one rectangle of a row-major texel image, the fixture builder's own brush.
+fn paint_rect(texels: &mut [[u8; 4]], side: u32, x: u32, y: u32, w: u32, h: u32, colour: [u8; 4]) {
+    for ty in y..y + h {
+        for tx in x..x + w {
+            texels[(ty * side + tx) as usize] = colour;
+        }
+    }
+}
+
+/// The glint fixture's sheet: 16x16 at alpha 255, one-texel white and black columns, so the
+/// glint's own sampling shows in the pixels it adds over an icon — and its eightfold uv
+/// scale wraps through the glint sampler rather than clamping at the sheet's edge.
+///
+/// The texels are generated here; no asset store is read and no Mojang pixel is embedded.
+fn glint_sheet() -> Texture {
+    const SIDE: u32 = 16;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let colour = if x % 2 == 0 { GLINT_LIT } else { GLINT_DARK };
+            let at = ((y * SIDE + x) * 4) as usize;
+            rgba[at..at + 4].copy_from_slice(&colour);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The synthetic icon source the item cases resolve through: id 1 the block cube (its top
+/// face on the fixtures' red sprite, its other faces on the blue one), id 2 the generated
+/// quad on the checkerboard sprite and id 3 the generated quad on the green sprite — every
+/// mesh built from [`item_atlas`]'s own sprite rects, never from a store.
+struct TestIcons {
+    /// The fixtures' atlas, whose sprite rects the meshes' uvs map into.
+    atlas: Atlas,
+}
+
+impl TestIcons {
+    /// The block cube: the six faces of the 0..16 box, the top face on `top`'s sprite and
+    /// the rest on `side`'s, every vertex carrying its own face's normal.
+    fn cube(&self, top: &str, side: &str) -> ItemMesh {
+        let mut vertices = Vertices {
+            positions: Vec::new(),
+            uvs: Vec::new(),
+            normals: Vec::new(),
+        };
+        // One cube face: its four corners, its normal and the sprite its uvs map.
+        type CubeFace<'a> = ([[f32; 3]; 4], [f32; 3], &'a str);
+        let faces: [CubeFace<'_>; 6] = [
+            (
+                [
+                    [0.0, 16.0, 16.0],
+                    [16.0, 16.0, 16.0],
+                    [16.0, 16.0, 0.0],
+                    [0.0, 16.0, 0.0],
+                ],
+                [0.0, 1.0, 0.0],
+                top,
+            ),
+            (
+                [
+                    [0.0, 0.0, 0.0],
+                    [16.0, 0.0, 0.0],
+                    [16.0, 0.0, 16.0],
+                    [0.0, 0.0, 16.0],
+                ],
+                [0.0, -1.0, 0.0],
+                side,
+            ),
+            (
+                [
+                    [0.0, 16.0, 0.0],
+                    [16.0, 16.0, 0.0],
+                    [16.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                [0.0, 0.0, -1.0],
+                side,
+            ),
+            (
+                [
+                    [0.0, 0.0, 16.0],
+                    [16.0, 0.0, 16.0],
+                    [16.0, 16.0, 16.0],
+                    [0.0, 16.0, 16.0],
+                ],
+                [0.0, 0.0, 1.0],
+                side,
+            ),
+            (
+                [
+                    [0.0, 16.0, 0.0],
+                    [0.0, 16.0, 16.0],
+                    [0.0, 0.0, 16.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                [-1.0, 0.0, 0.0],
+                side,
+            ),
+            (
+                [
+                    [16.0, 16.0, 16.0],
+                    [16.0, 16.0, 0.0],
+                    [16.0, 0.0, 0.0],
+                    [16.0, 0.0, 16.0],
+                ],
+                [1.0, 0.0, 0.0],
+                side,
+            ),
+        ];
+        for (corners, normal, sprite) in faces {
+            self.push_face(&mut vertices, corners, normal, sprite);
+        }
+        ItemMesh {
+            vertices: Arc::new(vertices),
+            texture: ATLAS_TEXTURE,
+        }
+    }
+
+    /// The generated item's quad: the 0..16 plane at the model's own z 8, the sprite's
+    /// rect its four corners.
+    fn flat(&self, sprite: &str) -> ItemMesh {
+        let mut vertices = Vertices {
+            positions: Vec::new(),
+            uvs: Vec::new(),
+            normals: Vec::new(),
+        };
+        let corners = [
+            [0.0, 0.0, 8.0],
+            [16.0, 0.0, 8.0],
+            [16.0, 16.0, 8.0],
+            [0.0, 16.0, 8.0],
+        ];
+        self.push_face(&mut vertices, corners, [0.0, 0.0, 1.0], sprite);
+        ItemMesh {
+            vertices: Arc::new(vertices),
+            texture: ATLAS_TEXTURE,
+        }
+    }
+
+    /// Appends one quad: the corners in order, the normal on every corner, and the sprite's
+    /// own four uv corners.
+    fn push_face(
+        &self,
+        vertices: &mut Vertices,
+        corners: [[f32; 3]; 4],
+        normal: [f32; 3],
+        sprite: &str,
+    ) {
+        let [[u0, v0], [u1, v1]] = self.atlas.uv(self.atlas.drawn(sprite));
+        for (corner, uv) in corners
+            .into_iter()
+            .zip([[u0, v0], [u0, v1], [u1, v1], [u1, v0]])
+        {
+            vertices.positions.push(corner);
+            vertices.uvs.push(uv);
+            vertices.normals.push(normal);
+        }
+    }
+}
+
+impl ItemIconSource for TestIcons {
+    fn icon(&self, id: i16, _damage: i16) -> Option<ItemIconMesh> {
+        match id {
+            1 => Some(ItemIconMesh {
+                mesh: self.cube("fixture:top", "fixture:side"),
+                transform: Transform::DEFAULT,
+                shape: IconShape::Gui3d,
+            }),
+            2 => Some(ItemIconMesh {
+                mesh: self.flat("fixture:flat"),
+                transform: Transform::DEFAULT,
+                shape: IconShape::Flat,
+            }),
+            3 => Some(ItemIconMesh {
+                mesh: self.flat("fixture:green"),
+                transform: Transform::DEFAULT,
+                shape: IconShape::Flat,
+            }),
+            _ => None,
+        }
+    }
+
+    fn missing_icon(&self) -> Option<ItemIconMesh> {
+        Some(ItemIconMesh {
+            mesh: self.flat("fixture:top"),
+            transform: Transform::DEFAULT,
+            shape: IconShape::Flat,
+        })
+    }
+}
+
+/// Renders one item-draw frame over the cleared target: the depth buffer cleared and
+/// attached, the hud's list set, and the pixels read back.
+fn item_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    hud: &HudPass,
+) -> Vec<u8> {
+    let depth = create_depth(device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hud headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+    read_pixels(device, queue, target)
+}
+
+/// The hud draws a block item's icon: the block cube's three visible faces at their own
+/// lit colours, its own silhouette inside the draw's 16x16 cell and the sky around it.
+///
+/// The chain is the source's own (`RenderItem.renderItemIntoGUI`:353-397): the 3D branch's
+/// 40x scale and its 210-about-x, -135-about-y turns (`:385-387`), the default display
+/// transform (a 1.8 block item's own model chain carries no `display.gui` entry — the
+/// assets' `block/cube.json` and `item/stone.json` state only a third-person one — so
+/// `ItemCameraTransforms.DEFAULT` applies) and the render path's 0.5 scale and -0.5
+/// translate (`:145`, `:157`). The z is the ladder's first rung: `100 + 50`
+/// (`setupGuiTransform`:378, `renderItemAndEffectIntoGUI`:402).
+///
+/// The pinning run measured the bytes: the top face [255, 0, 0] (its light 1.320266
+/// clamped to 1 by the fixed-function colour clamp), the left face [0, 0, 162] (the east
+/// face's 0.636575), the right face [0, 0, 111] (the north face's 0.434702) — the two
+/// side faces the source's own lights leave distinct.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_a_block_items_icon() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_atlas_icon(&device, &queue, &item_atlas());
+    hud.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::Item {
+            stack: Some(ItemIcon {
+                id: 1,
+                damage: 0,
+                enchanted: false,
+            }),
+            x: 24.0,
+            y: 24.0,
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let pixels = item_frame(&device, &queue, &target, &hud);
+    expect_pixel(&pixels, 32, 27, [255, 0, 0], "the icon's top face");
+    expect_pixel(&pixels, 28, 34, [0, 0, 162], "the icon's left face");
+    expect_pixel(&pixels, 35, 34, [0, 0, 111], "the icon's right face");
+    // The silhouette: the cube's own extent stops short of its cell's corners, and the
+    // sky above and beside it is untouched.
+    expect_pixel(&pixels, 32, 22, SKY, "the sky above the icon");
+    expect_pixel(&pixels, 23, 32, SKY, "the sky beside the icon");
+    expect_pixel(&pixels, 40, 40, SKY, "the sky past the icon's cell");
+    // The pinning run measured the icon's own 176 pixels — the cube's silhouette under
+    // the case's rasterization (the 384 of the first draft was the geometric
+    // prediction); the floor keeps a margin under the measurement.
+    let own = non_sky(&pixels);
+    assert!(
+        own > 140,
+        "the icon's own pixel count: the cube's silhouette, got {own}"
+    );
+}
+
+/// The hud draws a generated item's sprite crisp: the checkerboard sprite's own two texels
+/// alone across the icon's 16x16 cell, never a blend of them.
+///
+/// The draw is the flat branch (`RenderItem.setupGuiTransform`:390-394): the 64x scale and
+/// the 180-about-x turn, lighting off, and the sprite filling the cell at the ladder's
+/// first rung. The quad samples the icon binding — the atlas through the no-mipmap,
+/// no-blur pair — where the standing atlas binding's linear filter would blend the two
+/// texels at every pixel (the Task 10 discrimination, re-used at the real draw: each
+/// texel covers two pixels, so the linear sample sits a quarter into the neighbouring
+/// texel and reads 3:1 of its colour).
+///
+/// The pinning run measured the bytes: every pixel of the cell exactly one of
+/// [255, 255, 255] and [0, 0, 0] — 128 of each — and nothing else inside it.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_a_generated_items_sprite_crisp_edges() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_atlas_icon(&device, &queue, &item_atlas());
+    hud.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::Item {
+            stack: Some(ItemIcon {
+                id: 2,
+                damage: 0,
+                enchanted: false,
+            }),
+            x: 24.0,
+            y: 24.0,
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let pixels = item_frame(&device, &queue, &target, &hud);
+    let mut light = 0;
+    let mut dark = 0;
+    for y in 24..40 {
+        for x in 24..40 {
+            let got = pixel_rgba(&pixels, x, y);
+            match got {
+                [255, 255, 255, 255] => light += 1,
+                [0, 0, 0, 255] => dark += 1,
+                other => {
+                    panic!("the sprite's own texels at ({x}, {y}), never a blend: got {other:?}")
+                }
+            }
+        }
+    }
+    assert_eq!(light, 128, "the checkerboard's light texels");
+    assert_eq!(dark, 128, "the checkerboard's dark texels");
+    expect_pixel(&pixels, 23, 32, SKY, "the sky beside the cell");
+    assert_eq!(non_sky(&pixels), 256, "the sprite's own 16x16 pixel count");
+}
+
+/// The hud draws the glint over an enchanted icon: the two passes' own additions over the
+/// icon's pixels and the icon alone where both passes land on the pattern's dark texels.
+///
+/// The glint is `RenderItem.renderEffect`: the texture matrix scales the model's uvs
+/// eightfold, turns them -50 degrees about z on the first pass and +10 on the second, and
+/// scrolls them by `(time % 3000) / 3000 / 8` and `(time % 4873) / 4873 / 8` (`:181-192`);
+/// the colour is `0xFF8040CC` (`:185`), the blend `src_alpha`/`one` (`:172-173`) and the
+/// depth pair `GL_EQUAL` with writes off (`:171-172`), so both passes land exactly on the
+/// icon's own fragments. At time zero both scrolls are zero, so the two passes' difference
+/// is their own z turns.
+///
+/// The pinning run measured the bytes: over the red top face [255, 0, 0] the icon alone,
+/// [255, 64, 204] where one pass adds and [255, 128, 255] where both do — the glint's own
+/// (128, 64, 204) added once or twice and clamped, over the icon's pixels, never outside
+/// them. The same run counted the classes: 12 pixels left at the icon's own colour, 25
+/// with one pass's addition and 37 with both, of the icon's own 176.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_glint_over_an_enchanted_icon() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_atlas_icon(&device, &queue, &item_atlas());
+    hud.set_glint(&device, &queue, &glint_sheet());
+    hud.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    hud.set_system_time(&device, &queue, 0);
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::Item {
+            stack: Some(ItemIcon {
+                id: 1,
+                damage: 0,
+                enchanted: true,
+            }),
+            x: 24.0,
+            y: 24.0,
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let pixels = item_frame(&device, &queue, &target, &hud);
+    // The glint draws the icon's own geometry again: the silhouette is the same, so the
+    // sky around it is untouched and the icon's own pixel count stands — the pinning
+    // run measured 176 under the case's rasterization (the first draft's 384 was the
+    // geometric prediction), and the floor keeps a margin under it.
+    expect_pixel(&pixels, 32, 22, SKY, "the sky above the icon");
+    let own = non_sky(&pixels);
+    assert!(
+        own > 140,
+        "the glint adds over the icon's own pixels alone, got {own}"
+    );
+    // The two passes over the icon's pixels: the pattern's own texels leave the icon's
+    // colour where both are dark and add the glint's colour once or twice where they are
+    // lit.
+    let mut plain = 0;
+    let mut once = 0;
+    let mut twice = 0;
+    for y in 24..40 {
+        for x in 24..40 {
+            let got = pixel_rgba(&pixels, x, y);
+            match got {
+                [255, 0, 0, 255] => plain += 1,
+                [255, 64, 204, 255] => once += 1,
+                [255, 128, 255, 255] => twice += 1,
+                _ => {}
+            }
+        }
+    }
+    // The three classes over the icon's pixels: the pattern's own texels leave the icon's
+    // colour where both passes are dark and add the glint's colour once or twice where
+    // they are lit — the pinning run's counts, and never a pixel outside the icon.
+    assert_eq!(plain, 12, "pixels the pattern leaves dark");
+    assert_eq!(once, 25, "pixels one pass adds over");
+    assert_eq!(twice, 37, "pixels both passes add over");
+    assert!(
+        plain + once + twice <= own,
+        "the glint lands over the icon's own pixels alone"
+    );
+}
+
+/// The hud draws the later icon over the earlier one: the list's own order is the source's
+/// z ladder (`renderItemAndEffectIntoGUI`:402 — each icon's `zLevel` is the rung
+/// `50 * (index + 1)`), so a second draw's geometry sits nearer and wins where the two
+/// overlap, while the first icon's own pixels outside it stand.
+///
+/// The first icon is the block cube at its first rung, the second the generated quad one
+/// rung deeper. Without the ladder both would share a z, and the cube's own front faces —
+/// half a block, five pixels, in front of its centre — would win the overlap against a
+/// later draw.
+///
+/// The pinning run measured the bytes: the overlap's pixel the second icon's own [0, 255,
+/// 0], the first icon's pixel outside it its right face's [0, 0, 111], and the second
+/// icon's own [0, 255, 0] where it stands alone.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_later_icon_over_the_earlier_one() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_atlas_icon(&device, &queue, &item_atlas());
+    hud.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 1,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 24.0,
+                y: 24.0,
+            },
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 3,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 20.0,
+                y: 20.0,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let pixels = item_frame(&device, &queue, &target, &hud);
+    // The overlap: the later draw's own quad, one rung nearer.
+    expect_pixel(
+        &pixels,
+        32,
+        27,
+        [0, 255, 0],
+        "the later icon over the earlier one's face",
+    );
+    // The earlier icon's own pixel outside the later draw's cell.
+    expect_pixel(
+        &pixels,
+        38,
+        32,
+        [0, 0, 111],
+        "the earlier icon's right face",
+    );
+    // The later icon where it stands alone, and the sky past its own cell.
+    expect_pixel(&pixels, 21, 21, [0, 255, 0], "the later icon's own cell");
+    expect_pixel(&pixels, 19, 19, SKY, "the sky past the later icon's cell");
 }

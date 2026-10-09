@@ -14,6 +14,7 @@ use crate::camera::Camera;
 use crate::dim_pass::DimPass;
 use crate::entity_pass::{BossStatus, EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
+use crate::gui_item::ItemIconSource;
 use crate::hud::{HudDraw, HudPass, ScaledResolution, scaled_resolution};
 use crate::overlay::OverlayPass;
 use crate::sky::{
@@ -607,6 +608,29 @@ impl Renderer {
             .set_texture(&self.device, &self.queue, name, texture);
     }
 
+    /// Uploads the glint sheet the hud's enchanted icons' glint passes sample.
+    ///
+    /// The client owns the store's `misc/enchanted_item_glint` sheet; until this is
+    /// called, an enchanted icon's glint batches are skipped and only the icon draws.
+    pub fn set_hud_glint(&mut self, texture: &Texture) {
+        self.hud.set_glint(&self.device, &self.queue, texture);
+    }
+
+    /// Sets the source the hud's item icons build their meshes and display transforms
+    /// from.
+    ///
+    /// The client owns the bake and the item table; until this is called, the hud's
+    /// [`HudDraw::Item`] draws contribute nothing.
+    pub fn set_hud_icon_source(&mut self, source: Arc<dyn ItemIconSource>) {
+        self.hud.set_icon_source(&self.device, &self.queue, source);
+    }
+
+    /// Hands the hud pass the frame's system time, in milliseconds, which the glint
+    /// draws' scroll phases read (`Minecraft.getSystemTime`'s own clock).
+    pub fn set_hud_system_time(&mut self, time_ms: u64) {
+        self.hud.set_system_time(&self.device, &self.queue, time_ms);
+    }
+
     /// Sets the full-frame tint the next frames draw over the scene, or clears it.
     ///
     /// The interim death view's backdrop: a colour here dims the whole frame
@@ -634,9 +658,12 @@ impl Renderer {
     /// the cloud layer once — through the source's under-layer arm before the terrain while the
     /// entity eye is under the layer, or through its at-or-above arm after the terrain once the
     /// eye is at or above it (`EntityRenderer.java:1364-1367`, `:1474-1478`; [`scene_draws`]).
-    /// The overlay pass then draws the frame's GUI over the result, in a pass without a depth
-    /// attachment, so no terrain can hide it: the dim quad first, then the boss bar, then the
-    /// hud's draw list, then the debug lines text.
+    /// The overlay pass then draws the frame's GUI over the result, with the depth buffer
+    /// cleared and offered to the item draws alone — the source clears depth before the GUI
+    /// (`EntityRenderer.setupOverlayRendering`:1752) and its icons test it while its 2D draws
+    /// pass over it — so no terrain can hide the GUI: the dim quad first, then the boss bar,
+    /// then the hud's draw list (its 2D batches and its depth-tested item icons), then the
+    /// debug lines text.
     ///
     /// The boss bar's status cell advances once per frame on this call: a wither's or a
     /// dragon's raise from the entity pass overwrites it, an untouched status spends one of
@@ -736,7 +763,17 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        // The source clears depth before the GUI's own pass
+                        // (`EntityRenderer.setupOverlayRendering`:1752) and nothing
+                        // reads it after the frame's GUI is drawn.
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });

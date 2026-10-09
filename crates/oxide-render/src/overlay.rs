@@ -260,8 +260,9 @@ impl OverlayPass {
                 buffers: &[vertex_layout()],
             },
             primitive: primitive_state(),
-            // No depth state: the overlay is drawn in a pass with no depth attachment.
-            depth_stencil: None,
+            // The hud pass attaches depth for the item draws, so the overlay states its
+            // own: always passing and never writing.
+            depth_stencil: Some(crate::terrain_pass::depth_state_off()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,

@@ -93,6 +93,29 @@ const CUBE_ITEM_BLOCK: &[u8] = br##"{
   "textures": { "all": "blocks/cube_item" }
 }"##;
 
+/// `models/block/above_block.json`: a second block model two item files parent.
+const ABOVE_BLOCK: &[u8] = br##"{
+  "parent": "block/cube_all",
+  "textures": { "all": "blocks/above_block" }
+}"##;
+
+/// `models/item/above_block.json`: the item file above [`ABOVE_BLOCK`], with a
+/// gui slot of its own — the shape the real tree's stairs and fences carry.
+const ABOVE_ITEM: &[u8] = br##"{
+  "parent": "block/above_block",
+  "display": {
+    "gui": {
+      "rotation": [ 0, 180, 0 ]
+    }
+  }
+}"##;
+
+/// `models/item/above_block_egg.json`: a second file parented to the same block
+/// model, namespaced and longer — the tie the lookup resolves past.
+const ABOVE_ITEM_EGG: &[u8] = br##"{
+  "parent": "minecraft:block/above_block"
+}"##;
+
 /// `models/block/cube.json`: one element, six faces, every face culled.
 const CUBE: &[u8] = br##"{
   "elements": [
@@ -261,6 +284,48 @@ fn a_block_item_resolves_to_its_block_model() {
             scale: [0.4, 0.4, 0.4],
         },
         "the item model's own third-person transform applies"
+    );
+}
+
+#[test]
+fn the_item_file_above_a_block_member_is_found_and_carries_the_slots() {
+    let tree = sphere();
+    let source = ModelSource::open(tree.root()).expect("the synthetic tree opens");
+
+    // The tie: two item files parent `block/above_block`, one namespaced; the
+    // shortest path wins, so the item's own file is found.
+    assert_eq!(
+        source.item_model_above("block/above_block").as_deref(),
+        Some("item/above_block"),
+        "the shortest item file parented to the member"
+    );
+    let baked = source
+        .bake_item("item/above_block")
+        .expect("the item file's chain bakes");
+    assert_eq!(
+        baked.quads.len(),
+        6,
+        "the block model's cube, through the item file"
+    );
+    assert_eq!(
+        baked.display.get(TransformType::Gui),
+        Transform {
+            rotation: [0.0, 180.0, 0.0],
+            translation: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        },
+        "the item file's own gui slot"
+    );
+
+    assert_eq!(
+        source.item_model_above("block/cube_item").as_deref(),
+        Some("item/cube_item"),
+        "the block item's own file"
+    );
+    assert_eq!(
+        source.item_model_above("block/cube"),
+        None,
+        "no item file parents the helper"
     );
 }
 
@@ -519,6 +584,15 @@ fn sphere() -> Tree {
     tree.write(
         "assets/minecraft/models/block/cube_item.json",
         CUBE_ITEM_BLOCK,
+    );
+    tree.write(
+        "assets/minecraft/models/block/above_block.json",
+        ABOVE_BLOCK,
+    );
+    tree.write("assets/minecraft/models/item/above_block.json", ABOVE_ITEM);
+    tree.write(
+        "assets/minecraft/models/item/above_block_egg.json",
+        ABOVE_ITEM_EGG,
     );
     tree.write("assets/minecraft/models/block/cube.json", CUBE);
     tree.write("assets/minecraft/models/block/cube_all.json", CUBE_ALL);

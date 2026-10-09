@@ -24,6 +24,8 @@
 //! by its id ([`SkinTexId`]), resolved through [`SkinTextures`] against the registry's
 //! current uploads whenever a draw list lands.
 
+use std::sync::Arc;
+
 use glam::Mat4;
 use oxide_assets::atlas::Atlas;
 use oxide_assets::font::{Font, FontError};
@@ -31,6 +33,9 @@ use oxide_assets::texture::Texture;
 
 use crate::atlas_texture::AtlasTexture;
 use crate::entity_pass::{BossStatus, SkinTexId};
+use crate::gui_item::{
+    ATLAS_TEXTURE, GuiItemDraw, ItemIcon, ItemIconSource, icon_matrix, icon_z_level,
+};
 use crate::text::{TextBuilder, TextVertex, string_width};
 
 /// The hud shader: map scaled GUI pixels to clip space through the orthographic
@@ -322,6 +327,26 @@ pub enum HudDraw {
         /// (`GuiNewChat.java`:84).
         blend: bool,
     },
+    /// One item icon: the stack's own minimal view and the top-left corner of the
+    /// source's 16x16 GUI cell (`RenderItem.renderItemAndEffectIntoGUI`'s `(x, y)`,
+    /// `RenderItem.java`:399-405).
+    ///
+    /// The pass lays the icon out through the resolver the frame handed over
+    /// ([`HudPass::set_icon_source`]): the model's mesh and its own `display.gui`
+    /// transform, composed by [`icon_matrix`] with the draw's own rung of the z-level
+    /// ladder, so the list's order survives the item pipeline's depth test. A stack
+    /// the resolver cannot place draws its missing-sprite fallback
+    /// ([`ItemIconSource::missing_icon`]); `None` draws nothing — an empty cell. An
+    /// enchanted stack ([`ItemIcon::enchanted`]) draws its two glint passes after the
+    /// icon, before the next draw of the list.
+    Item {
+        /// The stack's own minimal view, or `None` for a cell that paints nothing.
+        stack: Option<ItemIcon>,
+        /// The cell's left edge.
+        x: f32,
+        /// The cell's top edge.
+        y: f32,
+    },
 }
 
 /// The skin textures a frame's head draws name by id.
@@ -362,18 +387,36 @@ enum BatchTexture {
     Atlas,
     /// The block atlas, under the icon draws' level-0 binding.
     AtlasIcon,
+    /// The glint sheet, bound under its own repeating sampler
+    /// ([`HudPass::set_glint`]).
+    Glint,
     /// A registered skin texture, by id.
     Skin(SkinTexId),
 }
 
-/// One consecutive run of draws that samples the same texture.
+/// The pipeline state one batch draws through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchState {
+    /// The blended 2D pipeline.
+    Blended,
+    /// The unblended 2D pipeline (the source's blend-off glyph runs).
+    Unblended,
+    /// The item pipeline: the icon's own vertices through the depth test.
+    Item,
+    /// The glint pipeline: the icon's vertices again, equal-depth and write-less,
+    /// blended `src_alpha` over `one`.
+    Glint,
+}
+
+/// One consecutive run of draws that samples the same texture in the same pipeline
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Batch {
     /// The texture the run samples.
     texture: BatchTexture,
-    /// Whether the run draws through the blended pipeline; the key's second half, so a
-    /// run that changes blend state opens its own batch.
-    blend: bool,
+    /// The pipeline state the run draws through; the key's second half, so a run that
+    /// changes state opens its own batch.
+    state: BatchState,
     /// The run's index range into the shared index buffer.
     indices: std::ops::Range<u32>,
 }
@@ -393,27 +436,64 @@ struct BuiltGeometry {
 /// Lays `draws` out as triangles.
 ///
 /// `font` is the measured font and sheet size the text draws lay out against; a text
-/// draw without one contributes nothing, like the overlay before its sheet. Consecutive
-/// draws that sample the same texture in the same blend state share one batch, and the
-/// batches stay in draw order, so the painter's order survives the batching.
-fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry {
+/// draw without one contributes nothing, like the overlay before its sheet. `icons` is
+/// the item icons' resolver; an item draw without one contributes nothing, like a text
+/// draw before the font. `time_ms` is the frame's system time, which the glint draws'
+/// scroll phases read. Consecutive draws that sample the same texture in the same
+/// pipeline state share one batch, and the batches stay in draw order, so the painter's
+/// order survives the batching.
+fn build(
+    draws: &[HudDraw],
+    font: Option<(&Font, (u32, u32))>,
+    icons: Option<&dyn ItemIconSource>,
+    time_ms: u64,
+) -> BuiltGeometry {
     let mut built = BuiltGeometry::default();
+    // The rung of the z-level ladder the next icon draw takes: the list's own item
+    // draws count, the 2D draws in between do not.
+    let mut item_index = 0;
     for draw in draws {
-        // The batch key: the texture the run samples and its blend state. Every
+        if let HudDraw::Item { stack, x, y } = draw {
+            let Some(stack) = stack else { continue };
+            let Some(source) = icons else { continue };
+            let Some(resolved) = source
+                .icon(stack.id, stack.damage)
+                .or_else(|| source.missing_icon())
+            else {
+                continue;
+            };
+            let icon = GuiItemDraw::from_icon(&resolved);
+            let matrix = icon_matrix(*x, *y, icon_z_level(item_index), icon.shape, icon.transform);
+            item_index += 1;
+            push_item(&mut built, &icon, matrix, time_ms, stack.enchanted);
+            continue;
+        }
+        // The batch key: the texture the run samples and its pipeline state. Every
         // primitive but the text draws blends (`drawRect` and its siblings enable it for
         // their own fill); a text draw carries the state its source path left in force.
-        let (texture, blend) = match draw {
-            HudDraw::Rect { .. } => (BatchTexture::White, true),
+        let (texture, state) = match draw {
+            HudDraw::Rect { .. } => (BatchTexture::White, BatchState::Blended),
             HudDraw::TexturedRect { texture, .. } => (
                 match texture {
                     HudTexture::Named(name) => BatchTexture::Named(name),
                     HudTexture::Atlas => BatchTexture::Atlas,
                     HudTexture::AtlasIcon => BatchTexture::AtlasIcon,
                 },
-                true,
+                BatchState::Blended,
             ),
-            HudDraw::SkinRect { texture, .. } => (BatchTexture::Skin(*texture), true),
-            HudDraw::Text { blend, .. } => (BatchTexture::Font, *blend),
+            HudDraw::SkinRect { texture, .. } => {
+                (BatchTexture::Skin(*texture), BatchState::Blended)
+            }
+            HudDraw::Text { blend, .. } => (
+                BatchTexture::Font,
+                if *blend {
+                    BatchState::Blended
+                } else {
+                    BatchState::Unblended
+                },
+            ),
+            // The item draws carry their own batches and never reach this key.
+            HudDraw::Item { .. } => continue,
         };
         match draw {
             HudDraw::Rect {
@@ -423,7 +503,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 height,
                 colour,
             } => {
-                open_batch(&mut built, texture, blend);
+                open_batch(&mut built, texture, state);
                 push_quad(&mut built, (*x, *y), (*width, *height), WHITE_UV, *colour);
             }
             HudDraw::TexturedRect {
@@ -435,7 +515,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 colour,
                 ..
             } => {
-                open_batch(&mut built, texture, blend);
+                open_batch(&mut built, texture, state);
                 push_quad(&mut built, (*x, *y), (*width, *height), *uv, *colour);
             }
             HudDraw::SkinRect {
@@ -447,7 +527,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 colour,
                 ..
             } => {
-                open_batch(&mut built, texture, blend);
+                open_batch(&mut built, texture, state);
                 push_quad(&mut built, (*x, *y), (*width, *height), *uv, *colour);
             }
             HudDraw::Text {
@@ -462,7 +542,7 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                 let Some((font, sheet)) = font else {
                     continue;
                 };
-                open_batch(&mut built, texture, blend);
+                open_batch(&mut built, texture, state);
                 let mut builder = TextBuilder::new();
                 builder.push(text, [*x, *y, 0.0], *scale, *colour, *shadow);
                 let (vertices, indices) = builder.geometry(font, sheet);
@@ -473,24 +553,86 @@ fn build(draws: &[HudDraw], font: Option<(&Font, (u32, u32))>) -> BuiltGeometry 
                     .extend(indices.iter().map(|index| index + base));
                 close_batch(&mut built);
             }
+            HudDraw::Item { .. } => {}
         }
     }
     built
 }
 
-/// Opens the batch `texture` and `blend`'s next draws belong to: the last one when it
-/// samples the same texture in the same blend state, a new one otherwise, and returns
-/// its position.
-fn open_batch(built: &mut BuiltGeometry, texture: BatchTexture, blend: bool) -> usize {
+/// Appends one icon's geometry: the item pipeline's own vertices and, for an enchanted
+/// stack, the two glint passes after them (`RenderItem.renderEffect`:170-198), each
+/// under its own batch so the painter's order is the list's.
+fn push_item(
+    built: &mut BuiltGeometry,
+    icon: &GuiItemDraw,
+    matrix: Mat4,
+    time_ms: u64,
+    enchanted: bool,
+) {
+    // The atlas-mapped meshes draw through the icon binding; a model whose mesh names
+    // its own texture (the folded chest trio's sheet) draws through that registration.
+    let texture = if icon.mesh.texture == ATLAS_TEXTURE {
+        BatchTexture::AtlasIcon
+    } else {
+        BatchTexture::Named(icon.mesh.texture)
+    };
+    push_triangles(built, &icon.vertices(matrix), texture, BatchState::Item);
+    if enchanted {
+        for pass in 0..2 {
+            push_triangles(
+                built,
+                &icon.glint_vertices(matrix, pass, time_ms),
+                BatchTexture::Glint,
+                BatchState::Glint,
+            );
+        }
+    }
+}
+
+/// Appends one vertex run as quads, in order, under its own batch.
+///
+/// The run is the mesh's own vertices, four to a quad — the same winding [`push_quad`]
+/// uses. A trailing partial quad is dropped rather than guessed at.
+fn push_triangles(
+    built: &mut BuiltGeometry,
+    vertices: &[TextVertex],
+    texture: BatchTexture,
+    state: BatchState,
+) {
+    let quads = vertices.len() / 4;
+    if quads == 0 {
+        return;
+    }
+    open_batch(built, texture, state);
+    let base = built.vertices.len() as u32;
+    built.vertices.extend_from_slice(vertices);
+    for quad in 0..quads {
+        let first = base + (quad as u32) * 4;
+        built.indices.extend_from_slice(&[
+            first,
+            first + 1,
+            first + 2,
+            first,
+            first + 2,
+            first + 3,
+        ]);
+    }
+    close_batch(built);
+}
+
+/// Opens the batch `texture` and `state`'s next draws belong to: the last one when it
+/// samples the same texture in the same pipeline state, a new one otherwise, and
+/// returns its position.
+fn open_batch(built: &mut BuiltGeometry, texture: BatchTexture, state: BatchState) -> usize {
     if built
         .batches
         .last()
-        .map(|batch| (batch.texture, batch.blend))
-        != Some((texture, blend))
+        .map(|batch| (batch.texture, batch.state))
+        != Some((texture, state))
     {
         built.batches.push(Batch {
             texture,
-            blend,
+            state,
             indices: built.indices.len() as u32..0,
         });
     }
@@ -598,15 +740,29 @@ pub struct HudPass {
     /// The unblended pipeline: the same vertex stage with `fs_main_opaque` and no blend
     /// state, for the glyph runs the source draws with blend off.
     opaque_pipeline: wgpu::RenderPipeline,
+    /// The item draws' pipeline: the same vertices and the alpha test, with the depth
+    /// test and write the icons' own order needs.
+    item_pipeline: wgpu::RenderPipeline,
+    /// The glint passes' pipeline: the icon's vertices again, equal-depth, write-less,
+    /// blended `src_alpha` over `one`.
+    glint_pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the scaled-resolution orthographic projection.
     ortho_buffer: wgpu::Buffer,
     /// The bind group the pipeline reads the projection through.
     ortho_bind_group: wgpu::BindGroup,
+    /// The uniform buffer holding the item draws' own GUI projection, whose z carries
+    /// the source's `100 + zLevel` ladder into the depth test.
+    item_buffer: wgpu::Buffer,
+    /// The bind group the item and glint pipelines read that projection through.
+    item_bind_group: wgpu::BindGroup,
     /// The layout every drawn texture is bound through: built once, so the pipeline,
     /// the white texel, the font sheet and every registered texture agree.
     texture_layout: wgpu::BindGroupLayout,
     /// The sampler every hud texture is read through: nearest and clamp-to-edge.
     sampler: wgpu::Sampler,
+    /// The sampler the glint sheet alone is read through: nearest and repeating, the
+    /// source's own wrap for a texture whose uvs are scaled eightfold.
+    glint_sampler: wgpu::Sampler,
     /// The one-texel white texture solid rects sample.
     white_bind: wgpu::BindGroup,
     /// The font sheet, once [`HudPass::set_font`] has landed.
@@ -617,11 +773,19 @@ pub struct HudPass {
     /// The block atlas' level-0 bind group, once [`HudPass::set_atlas_icon`] has
     /// landed: the icon draws' binding, read with the no-mipmap, no-blur pair.
     atlas_icon: Option<wgpu::BindGroup>,
+    /// The glint sheet's bind group, once [`HudPass::set_glint`] has landed: the
+    /// enchanted icons' glint passes read it through the glint sampler.
+    glint_bind: Option<wgpu::BindGroup>,
     /// The named textures [`HudPass::set_texture`] registered.
     textures: Vec<(&'static str, wgpu::BindGroup)>,
     /// The skin bind groups the stored list's head draws sample: one per distinct id,
     /// rebuilt whenever a draw list lands.
     skin_binds: Vec<(SkinTexId, wgpu::BindGroup)>,
+    /// The item icons' resolver, once [`HudPass::set_icon_source`] has landed.
+    icons: Option<Arc<dyn ItemIconSource>>,
+    /// The frame's system time in milliseconds, as the glint draws' scroll phases read
+    /// it ([`HudPass::set_system_time`]).
+    system_time: u64,
     /// The last draw list the frame handed over, kept so a late font still lays out.
     draws: Vec<HudDraw>,
     /// The uploaded geometry of that list.
@@ -699,6 +863,23 @@ impl HudPass {
                 resource: ortho_buffer.as_entire_binding(),
             }],
         });
+        // The item draws' own projection: the same uniform layout, its own buffer, so a
+        // draw's GUI-space z (the source's `100 + zLevel`) reaches the depth test while
+        // the 2D draws keep the flat projection.
+        let item_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oxide hud item ortho"),
+            size: UNIFORM_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let item_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oxide hud item ortho bind group"),
+            layout: &ortho_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: item_buffer.as_entire_binding(),
+            }],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("oxide hud pipeline layout"),
             bind_group_layouts: &[&ortho_layout, &texture_layout],
@@ -714,8 +895,10 @@ impl HudPass {
                 buffers: &[vertex_layout()],
             },
             primitive: primitive_state(),
-            // No depth state: the hud draws in a pass with no depth attachment.
-            depth_stencil: None,
+            // The pass attaches depth for the item draws, so every 2D pipeline states
+            // its own: always passing and never writing, the state the source's 2D GUI
+            // draws leave the depth buffer in.
+            depth_stencil: Some(crate::terrain_pass::depth_state_off()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -736,8 +919,7 @@ impl HudPass {
                 buffers: &[vertex_layout()],
             },
             primitive: primitive_state(),
-            // No depth state: the hud draws in a pass with no depth attachment.
-            depth_stencil: None,
+            depth_stencil: Some(crate::terrain_pass::depth_state_off()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -748,7 +930,69 @@ impl HudPass {
             multiview: None,
             cache: None,
         });
+        let item_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("oxide hud item pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[vertex_layout()],
+            },
+            primitive: primitive_state(),
+            // The item draws test and write depth, under the client's standing
+            // comparison (`Minecraft.java`:540's `depthFunc(515)`, `GL_LEQUAL`), so a
+            // later icon's geometry sorts in front of an earlier one's and each icon's
+            // own faces resolve against each other.
+            depth_stencil: Some(item_depth_state()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main_opaque"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[color_target(format, Some(src_alpha_blend()))],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let glint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("oxide hud glint pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[vertex_layout()],
+            },
+            primitive: primitive_state(),
+            // `renderEffect`'s own depth pair: `depthFunc(514)` (`GL_EQUAL`) with
+            // `depthMask(false)` (`RenderItem.java`:171-172), so a glint pass lands
+            // exactly on the icon's own fragments and writes nothing.
+            depth_stencil: Some(glint_depth_state()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main_opaque"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[color_target(format, Some(glint_blend()))],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let sampler = device.create_sampler(&texture_sampler_descriptor());
+        // The glint sheet's own sampler: the source loads every texture with
+        // `GL_REPEAT` (`TextureUtil.setTextureClamped(false)`:250-251, reached through
+        // `SimpleTexture.loadTexture`'s `uploadTextureImageAllocate(..., false, false)`
+        // at `SimpleTexture.java`:41 and `TextureUtil.uploadTextureImageSubImpl`:228),
+        // and the glint's uvs are scaled eightfold, so the sheet tiles where the hud's
+        // clamped sampler would smear its edge texels.
+        let glint_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("oxide hud glint sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            ..texture_sampler_descriptor()
+        });
         let white_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("oxide hud white bind group"),
             layout: &texture_layout,
@@ -766,16 +1010,24 @@ impl HudPass {
         Self {
             pipeline,
             opaque_pipeline,
+            item_pipeline,
+            glint_pipeline,
             ortho_buffer,
             ortho_bind_group,
+            item_buffer,
+            item_bind_group,
             texture_layout,
             sampler,
+            glint_sampler,
             white_bind,
             font: None,
             atlas: None,
             atlas_icon: None,
+            glint_bind: None,
             textures: Vec::new(),
             skin_binds: Vec::new(),
+            icons: None,
+            system_time: 0,
             draws: Vec::new(),
             geometry: Geometry::default(),
             boss_bar: None,
@@ -792,6 +1044,11 @@ impl HudPass {
     /// leave a stale projection behind while the draws stay the same.
     pub fn set_resolution(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
         queue.write_buffer(&self.ortho_buffer, 0, &matrix_bytes(ortho(width, height)));
+        queue.write_buffer(
+            &self.item_buffer,
+            0,
+            &matrix_bytes(crate::gui_item::gui_projection(width, height)),
+        );
     }
 
     /// Uploads `sheet` and measures it as the font every following text draws with.
@@ -971,6 +1228,99 @@ impl HudPass {
         ));
     }
 
+    /// Uploads `sheet` as the glint texture the enchanted icons' glint passes sample
+    /// ([`crate::gui_item::GLINT_TEXTURE`] — the source's own `RES_ITEM_GLINT`, `RenderItem.java`:63).
+    ///
+    /// The sheet is bound under the glint sampler: the source loads every texture with
+    /// `GL_REPEAT` (`TextureUtil.setTextureClamped(false)`:250-251 through
+    /// `SimpleTexture`'s own load), and the glint's uvs are scaled eightfold, so the
+    /// sheet tiles where the hud's clamped sampler would smear its edge texels. Until a
+    /// sheet lands, an enchanted icon's glint batches are skipped like any other
+    /// unbound texture.
+    pub fn set_glint(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sheet: &Texture) {
+        let gpu_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("oxide hud glint sheet"),
+            size: wgpu::Extent3d {
+                width: sheet.width,
+                height: sheet.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &gpu_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &sheet.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(sheet.width * 4),
+                rows_per_image: Some(sheet.height),
+            },
+            wgpu::Extent3d {
+                width: sheet.width,
+                height: sheet.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = gpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.glint_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oxide hud glint bind group"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.glint_sampler),
+                },
+            ],
+        }));
+    }
+
+    /// Hands the pass the item icons' resolver: the models the [`HudDraw::Item`] draws
+    /// lay out through, and the missing-sprite fallback an unresolvable stack draws.
+    ///
+    /// The stored list is laid out again with the new source, so a resolver that lands
+    /// after the first draw list still fills its icons in.
+    pub fn set_icon_source(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: Arc<dyn ItemIconSource>,
+    ) {
+        self.icons = Some(source);
+        self.rebuild(device, queue);
+    }
+
+    /// Hands the pass the frame's system time in milliseconds, which the glint draws'
+    /// scroll phases read (`RenderItem.renderEffect`:183 and :191 —
+    /// `Minecraft.getSystemTime`'s millisecond clock).
+    ///
+    /// A list that carries an enchanted icon is laid out again whenever the time
+    /// changes: the scroll's phase is part of the glint's geometry and moves every
+    /// frame. A list without one is left alone — its geometry cannot move with the
+    /// clock.
+    pub fn set_system_time(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, time_ms: u64) {
+        if self.system_time == time_ms {
+            return;
+        }
+        self.system_time = time_ms;
+        if self.draws.iter().any(enchanted_item) {
+            self.rebuild(device, queue);
+        }
+    }
+
     /// Replaces the drawn list with `draws`.
     ///
     /// Calling this again with an equal list does nothing: the geometry and the
@@ -1032,17 +1382,19 @@ impl HudPass {
         }
     }
 
-    /// Lays the stored draw list out again, with the current font.
+    /// Lays the stored draw list out again, with the current font, icon source and
+    /// system time.
     fn rebuild(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let font = self.font.as_ref().map(|sheet| (&sheet.font, sheet.sheet));
-        let built = build(&self.draws, font);
+        let built = build(&self.draws, font, self.icons.as_deref(), self.system_time);
         self.geometry.store(device, queue, built);
     }
 
     /// Draws the stored list, or nothing when it is empty.
     ///
-    /// The pass must attach the colour target the dim pass has just drawn into and no
-    /// depth attachment; the draws blend over what is under them. A batch whose
+    /// The pass must attach the colour target the dim pass has just drawn into and the
+    /// depth attachment the item draws test against; the 2D draws blend over what is
+    /// under them, and the item draws carry their own depth states. A batch whose
     /// texture was never set is skipped.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         self.draw_geometry(pass, &self.geometry);
@@ -1088,7 +1440,12 @@ impl HudPass {
         }
         self.boss_draws = draws;
         let font = self.font.as_ref().map(|sheet| (&sheet.font, sheet.sheet));
-        let built = build(&self.boss_draws, font);
+        let built = build(
+            &self.boss_draws,
+            font,
+            self.icons.as_deref(),
+            self.system_time,
+        );
         self.boss_geometry.store(device, queue, built);
     }
 
@@ -1104,19 +1461,20 @@ impl HudPass {
         if geometry.index_count == 0 {
             return;
         }
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.ortho_bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        let mut blended = true;
+        let mut state = None;
         for batch in &geometry.batches {
-            if batch.blend != blended {
-                pass.set_pipeline(if batch.blend {
-                    &self.pipeline
-                } else {
-                    &self.opaque_pipeline
-                });
-                blended = batch.blend;
+            if state != Some(batch.state) {
+                let (pipeline, group0) = match batch.state {
+                    BatchState::Blended => (&self.pipeline, &self.ortho_bind_group),
+                    BatchState::Unblended => (&self.opaque_pipeline, &self.ortho_bind_group),
+                    BatchState::Item => (&self.item_pipeline, &self.item_bind_group),
+                    BatchState::Glint => (&self.glint_pipeline, &self.item_bind_group),
+                };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, group0, &[]);
+                state = Some(batch.state);
             }
             let bind = match batch.texture {
                 BatchTexture::White => &self.white_bind,
@@ -1135,6 +1493,10 @@ impl HudPass {
                     None => continue,
                 },
                 BatchTexture::AtlasIcon => match &self.atlas_icon {
+                    Some(bind) => bind,
+                    None => continue,
+                },
+                BatchTexture::Glint => match &self.glint_bind {
                     Some(bind) => bind,
                     None => continue,
                 },
@@ -1260,6 +1622,57 @@ fn src_alpha_blend() -> wgpu::BlendState {
     }
 }
 
+/// The glint's own blend pair: `src_alpha` over `one` (`RenderItem.renderEffect`:172-173's
+/// `blendFunc(768, 1)`, `GL_SRC_ALPHA`/`GL_ONE`), so the glint adds over the icon the
+/// draw before it left.
+fn glint_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
+/// The item draws' own depth state: the client's standing comparison
+/// (`Minecraft.java`:540's `depthFunc(515)`, `GL_LEQUAL`) with writes on, so an icon's
+/// faces resolve against each other and a later icon's geometry sorts in front of an
+/// earlier one's — [`crate::terrain_pass::depth_state`]'s own shape.
+fn item_depth_state() -> wgpu::DepthStencilState {
+    crate::terrain_pass::depth_state(true)
+}
+
+/// The glint passes' depth state: `renderEffect`'s own pair — `depthFunc(514)`
+/// (`GL_EQUAL`) with `depthMask(false)` (`RenderItem.java`:171-172) — so a glint pass
+/// lands exactly on the icon's own fragments and writes nothing.
+fn glint_depth_state() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_compare: wgpu::CompareFunction::Equal,
+        ..crate::terrain_pass::depth_state(false)
+    }
+}
+
+/// Whether one draw is an enchanted icon draw: the draws whose glint geometry reads the
+/// frame's clock.
+fn enchanted_item(draw: &HudDraw) -> bool {
+    matches!(
+        draw,
+        HudDraw::Item {
+            stack: Some(ItemIcon {
+                enchanted: true,
+                ..
+            }),
+            ..
+        }
+    )
+}
+
 /// The colour target for one attachment in `format`: the fragment's alpha blends over
 /// the frame with the client's own `src_alpha / one_minus_src_alpha` pair when `blend`
 /// is set, and writes straight through when it is not (the unblended glyph runs).
@@ -1333,9 +1746,9 @@ mod tests {
     //! The scale rule and the geometry's arithmetic, without a GPU.
 
     use super::{
-        Batch, BatchTexture, BuiltGeometry, HudDraw, HudTexture, ICONS_TEXTURE, MIN_HEIGHT,
-        MIN_WIDTH, SkinTexId, VERTEX_BYTES, WHITE_UV, boss_bar_draws, build, scaled_resolution,
-        vertex_layout,
+        Batch, BatchState, BatchTexture, BuiltGeometry, HudDraw, HudTexture, ICONS_TEXTURE,
+        MIN_HEIGHT, MIN_WIDTH, SkinTexId, VERTEX_BYTES, WHITE_UV, boss_bar_draws, build,
+        scaled_resolution, vertex_layout,
     };
     use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
     use crate::text::string_width;
@@ -1545,7 +1958,7 @@ mod tests {
                 blend: true,
             },
         ];
-        let built = build(&draws, Some((&font, (128, 128))));
+        let built = build(&draws, Some((&font, (128, 128))), None, 0);
         // The bar's quad and the text's two copies of the one glyph, shadow first.
         assert_eq!(built.vertices.len(), 4 + 8);
         assert_eq!(built.indices.len(), 6 + 12);
@@ -1555,12 +1968,12 @@ mod tests {
             vec![
                 Batch {
                     texture: BatchTexture::White,
-                    blend: true,
+                    state: BatchState::Blended,
                     indices: 0..6,
                 },
                 Batch {
                     texture: BatchTexture::Font,
-                    blend: true,
+                    state: BatchState::Blended,
                     indices: 6..18,
                 },
             ]
@@ -1617,18 +2030,18 @@ mod tests {
                 blend: false,
             },
         ];
-        let built = build(&draws, Some((&font, (128, 128))));
+        let built = build(&draws, Some((&font, (128, 128))), None, 0);
         assert_eq!(
             built.batches,
             vec![
                 Batch {
                     texture: BatchTexture::Font,
-                    blend: true,
+                    state: BatchState::Blended,
                     indices: 0..6,
                 },
                 Batch {
                     texture: BatchTexture::Font,
-                    blend: false,
+                    state: BatchState::Unblended,
                     indices: 6..12,
                 },
             ],
@@ -1656,7 +2069,7 @@ mod tests {
                 blend: true,
             },
         ];
-        let built = build(&draws, None);
+        let built = build(&draws, None, None, 0);
         assert_eq!(built.vertices.len(), 4, "the bar keeps its quad");
         assert_eq!(built.batches.len(), 1);
     }
@@ -1700,7 +2113,7 @@ mod tests {
                 colour: [1.0; 4],
             },
         ];
-        let built: BuiltGeometry = build(&draws, None);
+        let built: BuiltGeometry = build(&draws, None, None, 0);
         assert_eq!(
             built
                 .batches
@@ -1746,7 +2159,7 @@ mod tests {
                 colour: [1.0; 4],
             },
         ];
-        let built = build(&draws, None);
+        let built = build(&draws, None, None, 0);
         assert_eq!(
             built
                 .batches

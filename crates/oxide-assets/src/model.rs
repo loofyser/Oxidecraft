@@ -567,6 +567,17 @@ impl BuiltinItem {
         }
     }
 
+    /// The model resource the trio member registers under, as
+    /// `models/item/<name>.json` writes it — the name [`ModelSource::bake_item`]
+    /// resolves the member's chain by.
+    pub fn model_name(self) -> &'static str {
+        match self {
+            BuiltinItem::Chest => CHEST_ITEM_MODEL,
+            BuiltinItem::TrappedChest => TRAPPED_CHEST_ITEM_MODEL,
+            BuiltinItem::EnderChest => ENDER_CHEST_ITEM_MODEL,
+        }
+    }
+
     /// The icon sheet the trio's draw binds, as the texture tree keys it.
     ///
     /// The names are the TESRs' own `ResourceLocation`s with the `.png` the
@@ -958,6 +969,34 @@ impl ModelSource {
             .filter(|source| matches!(source, ItemModelSource::Missing))
             .count();
         ItemModelSet { sources, missing }
+    }
+
+    /// The item file whose chain's first `block/` hop is `member`.
+    ///
+    /// The source's item bake starts at `models/item/<name>.json`
+    /// (`ModelBakery.getItemLocation`:350-353) and walks down into the block
+    /// model, and a block item's display slots live on that item file — the
+    /// chain's transform lookup walks up from the item's own model
+    /// (`ModelBlock.getTransform`:177-179). [`ItemModelSource::Block`] carries
+    /// the block member alone, so this answers the file above it: the shortest
+    /// `item/` path whose own parent resolves to `member`, lexicographically
+    /// first on a tie. A tie means several items parent one block model
+    /// (`block/stone`'s monster-egg file beside the item's own); the shipping
+    /// tree's tied files state the same display slots.
+    pub fn item_model_above(&self, member: &str) -> Option<String> {
+        self.models
+            .iter()
+            .filter(|(path, model)| {
+                path.starts_with(ITEM_MODEL_PREFIX)
+                    && model
+                        .parent
+                        .as_deref()
+                        .and_then(|parent| path_of(parent).ok())
+                        == Some(member)
+            })
+            .map(|(path, _)| path)
+            .min_by_key(|path| (path.len(), path.as_str()))
+            .cloned()
     }
 
     /// Bakes one item model by name.
