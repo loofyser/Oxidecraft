@@ -109,7 +109,7 @@ pub enum PoseExtra {
     #[default]
     None,
     /// The player model's own: the cape layer's motion term.
-    Player(player::CapeMotion),
+    Player(player::PlayerExtra),
     /// The skeleton's own: whether the class is the wither type, whose living-animation rule
     /// turns on the aim pose (`ModelSkeleton.setLivingAnimations`:43).
     Skeleton {
@@ -312,6 +312,21 @@ fn rest_of(part: &Part, out: &mut Vec<Rot>) {
 /// texture size, which is why a layer drawn through a sheet of its own (the cape's 64x32)
 /// builds separately from the model it belongs to.
 pub fn build_vertices(model: &Model, transforms: &[Rot], texture: [f32; 2]) -> Vertices {
+    build_vertices_inflated(model, transforms, texture, 0.0)
+}
+
+/// [`build_vertices`] with every box's inflation shifted by `inflate`.
+///
+/// The armour models and the auras are the entity's own table at a construction inflation
+/// the source bakes into the boxes (`ModelBiped(modelSize)`'s `addBox(..., modelSize)`,
+/// `ModelCreeper(2.0F)`, `ModelWither(0.5F)`); the port's tables carry the plain inflation,
+/// so the delta rides the build. Zero is [`build_vertices`] itself.
+pub fn build_vertices_inflated(
+    model: &Model,
+    transforms: &[Rot],
+    texture: [f32; 2],
+    inflate: f32,
+) -> Vertices {
     let mut out = Vertices::default();
     let mut cursor = 0;
     for part in model.parts {
@@ -321,6 +336,7 @@ pub fn build_vertices(model: &Model, transforms: &[Rot], texture: [f32; 2]) -> V
             transforms,
             &mut cursor,
             texture,
+            inflate,
             &mut out,
         );
     }
@@ -334,6 +350,7 @@ fn walk(
     transforms: &[Rot],
     cursor: &mut usize,
     texture: [f32; 2],
+    inflate: f32,
     out: &mut Vertices,
 ) {
     let Some(rot) = transforms.get(*cursor) else {
@@ -353,10 +370,10 @@ fn walk(
         * Mat4::from_rotation_x(rot.angles[0]);
     let world = parent * local;
     for b in part.boxes {
-        push_box(b, world, texture, out);
+        push_box(b, world, texture, inflate, out);
     }
     for child in part.children {
-        walk(child, world, transforms, cursor, texture, out);
+        walk(child, world, transforms, cursor, texture, inflate, out);
     }
 }
 
@@ -368,18 +385,19 @@ fn walk(
 /// two steps `ModelBox.addBox` takes, in its order, so the UVs stay with the corners as they
 /// were assigned. Each face's normal is the source's `(v1 - v2) x (v1 - v0)`, computed from
 /// the corners as emitted and turned by the part's own transform.
-fn push_box(b: &Box, world: Mat4, texture: [f32; 2], out: &mut Vertices) {
+fn push_box(b: &Box, world: Mat4, texture: [f32; 2], inflate: f32, out: &mut Vertices) {
     let (w, h, d) = (b.size[0], b.size[1], b.size[2]);
     if w <= 0.0 || h <= 0.0 || d <= 0.0 {
         return;
     }
     let (u, v) = (b.uv[0], b.uv[1]);
-    let mut x1 = b.origin[0] - b.inflate;
-    let mut x2 = b.origin[0] + w + b.inflate;
-    let y1 = b.origin[1] - b.inflate;
-    let y2 = b.origin[1] + h + b.inflate;
-    let z1 = b.origin[2] - b.inflate;
-    let z2 = b.origin[2] + d + b.inflate;
+    let inflate = b.inflate + inflate;
+    let mut x1 = b.origin[0] - inflate;
+    let mut x2 = b.origin[0] + w + inflate;
+    let y1 = b.origin[1] - inflate;
+    let y2 = b.origin[1] + h + inflate;
+    let z1 = b.origin[2] - inflate;
+    let z2 = b.origin[2] + d + inflate;
     if b.mirror {
         core::mem::swap(&mut x1, &mut x2);
     }

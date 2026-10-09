@@ -323,9 +323,18 @@ pub enum DrawExtra {
         /// Whether the draw is saddled.
         saddle: bool,
     },
-    /// A creeper: the kind's own marker — the charge flag lives on the entity and only
-    /// the deferred aura layer will read it (`LayerCreeperCharge`).
-    Creeper,
+    /// A creeper: the charge flag the aura layer reads (`LayerCreeperCharge`'s
+    /// `getPowered`).
+    Creeper {
+        /// Whether the creeper is charged (`EntityCreeper.getPowered`).
+        powered: bool,
+    },
+    /// A wither: the armour flag the aura layer reads (`LayerWitherAura`'s `isArmored`).
+    Wither {
+        /// Whether the wither's health sits at or below half
+        /// (`EntityWither.isArmored`:653-656).
+        armored: bool,
+    },
     /// A chicken: the child fold rides the model table (`ModelChicken.render`:54-72).
     Chicken {
         /// Whether the draw is a child.
@@ -489,6 +498,33 @@ impl BlockItemCache {
     }
 }
 
+/// One equipment slot's stack as a draw carries it: the stack's own fields reduced to what
+/// the item and armour layers read — the item-icon seam's rule, nothing else of the stack
+/// crosses the crate edge.
+///
+/// The armour classification (material, slot) is the render side's own table
+/// ([`entity_models::layers::armour_piece`]) over `id`; the dye rides as the raw
+/// `display.color` int the client's NBT reader found, so `ItemArmor.getColor`'s material
+/// fold stays beside the armour rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquipmentDraw {
+    /// The item's id.
+    pub id: i16,
+    /// The stack's damage or metadata value.
+    pub damage: i16,
+    /// Whether the stack carries the effect flag (`ItemStack.isItemEnchanted`): the glint
+    /// gates of both the armour (`LayerArmorBase.java`:78) and the held item
+    /// (`RenderItem.java`:160).
+    pub enchanted: bool,
+    /// The raw `display.color` int of the stack's NBT tail, when the tag carries one —
+    /// the leather dye read (`ItemArmor.getColor`:135-157).
+    pub colour: Option<i32>,
+    /// Whether the stack is the cross-rendered block family: the held-item layer's own
+    /// branch (`LayerHeldItem.java`:52-59's `ItemBlock` render-type-2 test, folded by the
+    /// client's behaviour table).
+    pub cross: bool,
+}
+
 /// One entity's draw for a frame, as the window assembles it.
 ///
 /// The positions and angles are already interpolated for the frame's fraction; `light` is the
@@ -497,6 +533,9 @@ impl BlockItemCache {
 /// boss kinds' pair, for the status the pass will raise.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityDraw {
+    /// The entity's id, the store's own: the cart's jitter seed (`RenderMinecart.java`:34-39)
+    /// and the dropped stack's phase (`RenderEntityItem`'s `hoverStart`).
+    pub id: i32,
     /// The box model the draw renders.
     pub model: ModelRef,
     /// The interpolated position, in blocks.
@@ -523,12 +562,19 @@ pub struct EntityDraw {
     pub health: Option<(f32, f32)>,
     /// The composed nametag the draw may show, when the session resolved one.
     pub nametag: Option<NametagDraw>,
+    /// The entity's own name, when the session resolved one — the player's account name.
+    /// The deadmau5 ears' gate reads it (`LayerDeadmau5Head.java`:24's
+    /// `getName().equals("deadmau5")`); the composed nametag above is the display text.
+    pub name: Option<Arc<str>>,
     /// The composed slot-2 label the draw may show, when the session resolved
     /// one: the player's points in the below-name objective and its display
     /// name (`RenderPlayer.renderOffsetLivingLabel:139-155`). The pass draws it
     /// as a second world-space line under the nametag, ahead of the tag and at
     /// the plain anchor; the nametag above it takes the source's raise.
     pub below_name: Option<String>,
+    /// The five equipment slots' stacks, in the store's own order (held `0`, feet `1`,
+    /// legs `2`, chest `3`, head `4`) — the held-item and armour layers' input.
+    pub equipment: [Option<EquipmentDraw>; 5],
     /// The kind's own extras.
     pub extra: DrawExtra,
 }
@@ -1321,6 +1367,11 @@ pub struct EntityPass {
     /// The gel pipeline: the model fragment with the source's straight-alpha pair
     /// (`LayerSlimeGel.java`:26).
     gel_pipeline: wgpu::RenderPipeline,
+    /// The glint pipeline: the unlit sprite fragment with the source's equal-depth,
+    /// write-less additive pair (`LayerArmorBase.renderGlint`:106-114,
+    /// `RenderItem.renderEffect`:172-175) — the HUD's own glint shape
+    /// (`hud.rs`:407-410).
+    glint_pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the frame's matrix, eye, fog and lights.
     frame_buffer: wgpu::Buffer,
     /// The bind group the frame uniforms are read through.
@@ -1335,6 +1386,10 @@ pub struct EntityPass {
     camera_set: bool,
     /// The object draws' mesh source: the client's atlas and model baker, once set.
     item_source: Option<Arc<dyn ItemMeshSource>>,
+    /// The equipment layers' icon source: the same client resolver the HUD's item draws
+    /// read through ([`crate::gui_item::ItemIconSource`]). Until the client hands one
+    /// over, the held item draws nothing.
+    icon_source: Option<Arc<dyn crate::gui_item::ItemIconSource>>,
     /// The block-item meshes: one cached vertex set per distinct block state.
     block_cache: BlockItemCache,
     /// The camera's yaw in degrees, the source's `playerViewY` (`RenderManager.java`:260-261).
@@ -1344,6 +1399,11 @@ pub struct EntityPass {
     /// The camera's feet position, the render-view entity's origin for the nametag's
     /// distance rule.
     view_position: [f64; 3],
+    /// The frame's system clock in milliseconds — `Minecraft.getSystemTime`, the held
+    /// item's glint scroll (`RenderItem.renderEffect`:172's `(float)(getSystemTime() % …)`).
+    /// Zero until [`EntityPass::set_system_time`] gives one; the armour's own glint
+    /// scrolls with the entity's age and reads none of it.
+    system_time: u64,
     /// The nametag font: its measured metrics and uploaded sheet, once [`EntityPass::set_font`]
     /// gave one.
     nametag_font: Option<NametagFont>,
@@ -1484,6 +1544,20 @@ impl EntityPass {
             },
             None,
         );
+        // The glint passes: the source's equal-depth, write-less pair
+        // (`LayerArmorBase.renderGlint`:106-114's `depthFunc(514)`/`depthMask(false)`,
+        // `RenderItem.renderEffect`:172-175), the unlit sprite fragment and the HUD's own
+        // blend reading (`hud.rs`:407-410).
+        let glint_pipeline = pipeline(
+            "oxide entity glint pipeline",
+            FRAGMENT_SHADOW,
+            PipelinePlan {
+                blend: Some(glint_blend()),
+                depth_write: false,
+                compare: wgpu::CompareFunction::LessEqual,
+            },
+            None,
+        );
         // The label's four pipelines: `Render.renderLivingLabel` disables the depth test
         // and masks the writes for the box and the faint pass (`Render.java`:348-349) and
         // re-enables both before the solid pass (`Render.java`:371-372); the sneaking
@@ -1548,6 +1622,7 @@ impl EntityPass {
             shadow_pipeline,
             eyes_pipeline,
             gel_pipeline,
+            glint_pipeline,
             frame_buffer,
             frame_bind_group,
             vertex_buffer,
@@ -1555,10 +1630,12 @@ impl EntityPass {
             frame: FrameUniform::default(),
             camera_set: false,
             item_source: None,
+            icon_source: None,
             block_cache: BlockItemCache::new(),
             view_yaw: 0.0,
             view_pitch: 0.0,
             view_position: [0.0; 3],
+            system_time: 0,
             nametag_font: None,
             nametag_pipelines,
             texture_layout: texture_layout.clone(),
@@ -1592,6 +1669,20 @@ impl EntityPass {
     /// model tables, reached through [`ItemMeshSource`] so this crate names neither.
     pub fn set_item_source(&mut self, source: Arc<dyn ItemMeshSource>) {
         self.item_source = Some(source);
+    }
+
+    /// Gives the pass the icon resolver its equipment layers read: the same
+    /// [`crate::gui_item::ItemIconSource`] the HUD's item draws take, so the held item
+    /// and the HUD resolve a stack through one seam.
+    pub fn set_icon_source(&mut self, source: Arc<dyn crate::gui_item::ItemIconSource>) {
+        self.icon_source = Some(source);
+    }
+
+    /// Sets the frame's system clock in milliseconds: the held item's glint scroll reads
+    /// it (`Minecraft.getSystemTime`), and zero — the initial value — pins the scroll's
+    /// phase for the tests.
+    pub fn set_system_time(&mut self, time_ms: u64) {
+        self.system_time = time_ms;
     }
 
     /// Gives the pass the font its nametags measure and sample: the same sheet the text
@@ -1689,6 +1780,27 @@ impl EntityPass {
                 pass.set_bind_group(1, &texture.bind_group, &[]);
                 pass.draw(range.clone(), 0..1);
             }
+            // The equipment pieces draw next, in the source's own order, each through
+            // its sheet and its blend's pipeline: the armour's opaque pass, the leather
+            // overlay's, the held item's straight-alpha pass, the ears', the aura's
+            // additive pass and each enchanted piece's write-less glint
+            // (`LayerArmorBase.renderLayer`:57-79, `LayerHeldItem`:66 through
+            // `RenderItem.renderItemModelTransform`:316-341, `LayerCreeperCharge`:32-38).
+            for (range, sheet, blend) in &geometry.equipment {
+                let texture = match sheet {
+                    EquipmentSheet::Named(key) => textures.texture_for(&TextureRef::Named(key)),
+                    EquipmentSheet::Own => textures.texture_for(&draw.texture),
+                };
+                let pipeline = match blend {
+                    EquipmentBlend::Opaque => &self.model_pipeline,
+                    EquipmentBlend::Alpha => &self.gel_pipeline,
+                    EquipmentBlend::Additive => &self.eyes_pipeline,
+                    EquipmentBlend::Glint => &self.glint_pipeline,
+                };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(1, &texture.bind_group, &[]);
+                pass.draw(range.clone(), 0..1);
+            }
             if let Some(range) = &geometry.cape {
                 if let TextureRef::Skin { uuid, .. } = &draw.texture {
                     if let Some(cape_texture) = textures.cape(uuid) {
@@ -1753,6 +1865,7 @@ impl EntityPass {
             cape: None,
             nametag: Vec::new(),
             hurt: draw.hurt > 0.0 || draw.death > 0.0,
+            equipment: Vec::new(),
         };
 
         // The shadow first in the buffer (drawn after the model, in the source's order).
@@ -1819,6 +1932,12 @@ impl EntityPass {
                 .push((start..vertices.len() as u32, layer.texture, layer.blend));
         }
 
+        // The equipment draws after the model and its own layers, in the kind's
+        // registered list order (`RendererLivingEntity.renderLayers`:459-470 over each
+        // renderer's own `addLayer` sites — the armour walk, the held item, the ears,
+        // the charge aura).
+        self.build_equipment(draw, vertices, &mut built);
+
         // The cape: the layer's own box, wave and chain.
         if let ModelRef::Player { parts, .. } = draw.model {
             if parts & player::PART_CAPE != 0 {
@@ -1848,6 +1967,266 @@ impl EntityPass {
         self.build_nametag(draw, vertices, &mut built);
 
         built
+    }
+
+    /// Builds one draw's equipment into `vertices`: the layers the kind's renderer
+    /// registers, in its own list order ([`entity_models::layers::layer_order`]) — the
+    /// armour walk, the held item, the deadmau5 ears and the charge aura, each behind the
+    /// model and its own layers as the source walks them
+    /// (`RendererLivingEntity.renderLayers`:459-470).
+    fn build_equipment(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+    ) {
+        for layer in entity_models::layers::layer_order(draw.model) {
+            match layer {
+                entity_models::layers::RenderLayer::Armour => {
+                    self.build_armour(draw, vertices, built);
+                }
+                entity_models::layers::RenderLayer::HeldItem => {
+                    self.build_held_item(draw, vertices, built);
+                }
+                entity_models::layers::RenderLayer::Ears => {
+                    self.build_ears(draw, vertices, built);
+                }
+                entity_models::layers::RenderLayer::Aura => {
+                    self.build_aura(draw, vertices, built);
+                }
+            }
+        }
+    }
+
+    /// Builds the held item: the layer's mount over the draw's own right arm, the stack's
+    /// mesh through the item-icon seam at its third-person display transform, and the
+    /// enchanted stack's two glint passes behind it (`LayerHeldItem.doRenderLayer`:31-64
+    /// through `RenderItem.renderItemModelForEntity` and `RenderItem.renderEffect`).
+    /// Nothing draws without a layer for the kind, a filled slot, a source, or a mesh —
+    /// the seam's missing icon stands in for an id nothing resolves.
+    fn build_held_item(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+    ) {
+        let Some(held) = entity_models::layers::draw_held_item(
+            draw.model,
+            &draw.pose,
+            draw.equipment[0].as_ref(),
+        ) else {
+            return;
+        };
+        let Some(source) = self.icon_source.as_deref() else {
+            return;
+        };
+        let Some(icon) = source
+            .icon(held.stack.id, held.stack.damage)
+            .or_else(|| source.missing_icon())
+        else {
+            return;
+        };
+        let builtin = icon.shape == crate::gui_item::IconShape::Builtin;
+        let chain = item_frame(draw)
+            * held.mount
+            * entity_models::layers::held_item_tail(icon.third_person, builtin);
+        let colour = [draw.light, draw.light, draw.light, 1.0];
+        let start = vertices.len() as u32;
+        push_vertices(vertices, &icon.mesh.vertices, chain, colour);
+        built.equipment.push((
+            start..vertices.len() as u32,
+            EquipmentSheet::Named(icon.mesh.texture),
+            EquipmentBlend::Alpha,
+        ));
+        // The glint: the enchanted stack's two passes after the item's own draw
+        // (`RenderItem.renderItem`:160-163), the builtin shape exempt (`:147-154`).
+        if held.stack.enchanted && !builtin {
+            for pass in 0..2 {
+                push_glint(
+                    vertices,
+                    built,
+                    &icon.mesh.vertices,
+                    chain,
+                    |uv| crate::gui_item::glint_uv(pass, self.system_time, uv),
+                    crate::gui_item::GLINT_COLOUR,
+                );
+            }
+        }
+    }
+
+    /// Builds the four armour slots: each filled slot's piece through the armour model at
+    /// the slot's construction inflation, its tier sheet under the dye tint, the leather
+    /// overlay behind it and the enchanted piece's glint after it
+    /// (`LayerArmorBase.doRenderLayer`:34-37's walk through `renderLayer`:45-79 and
+    /// `renderGlint`).
+    fn build_armour(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+    ) {
+        let held = matches!(draw.pose.extra, entity_models::PoseExtra::Player(extra) if extra.held);
+        let chain = body_chain(draw);
+        let model = entity_models::layers::armour_model(draw.model);
+        for slot in entity_models::layers::ArmourSlot::walk() {
+            let Some(stack) = draw.equipment[slot.store_index()].as_ref() else {
+                continue;
+            };
+            let Some((material, piece)) = entity_models::layers::armour_piece(stack.id) else {
+                continue;
+            };
+            // The slot's piece: the id's own slot must be the walk's
+            // (`ItemArmor`'s registrations — a helmet in the feet slot draws nothing).
+            if piece != slot {
+                continue;
+            }
+            let mut rots = model.rest();
+            entity_models::bipeds::armour_pose(draw.model, &draw.pose, held, &mut rots);
+            for (rot, shown) in rots
+                .iter_mut()
+                .zip(entity_models::layers::armour_visible(slot))
+            {
+                rot.visible = shown;
+            }
+            let mesh = entity_models::build_vertices_inflated(
+                model,
+                &rots,
+                entity_models::layers::ARMOUR_TEXTURE,
+                entity_models::layers::armour_inflation(slot),
+            );
+            let tint = entity_models::layers::armour_tint(
+                material,
+                entity_models::layers::armour_colour(material, stack.colour),
+            );
+            let colour = [
+                draw.light * tint[0],
+                draw.light * tint[1],
+                draw.light * tint[2],
+                1.0,
+            ];
+            let start = vertices.len() as u32;
+            push_vertices(vertices, &mesh, chain, colour);
+            built.equipment.push((
+                start..vertices.len() as u32,
+                EquipmentSheet::Named(entity_models::layers::armour_sheet(material, slot)),
+                EquipmentBlend::Opaque,
+            ));
+            if material == entity_models::layers::ArmourMaterial::Leather {
+                // The overlay: the same geometry, the overlay sheet, white
+                // (`renderLayer`:68's fall-through bind and reset colour).
+                let start = vertices.len() as u32;
+                push_vertices(
+                    vertices,
+                    &mesh,
+                    chain,
+                    [draw.light, draw.light, draw.light, 1.0],
+                );
+                built.equipment.push((
+                    start..vertices.len() as u32,
+                    EquipmentSheet::Named(entity_models::layers::armour_overlay(slot)),
+                    EquipmentBlend::Opaque,
+                ));
+            }
+            if stack.enchanted {
+                // The glint: the armour model again on the glint sheet, two passes at
+                // the entity's own age (`renderGlint`:115-124).
+                let glint = entity_models::layers::GLINT_COLOUR;
+                let colour = [glint[0], glint[1], glint[2], 1.0];
+                for pass in 0..2 {
+                    push_glint(
+                        vertices,
+                        built,
+                        &mesh,
+                        chain,
+                        |uv| entity_models::layers::glint_uv(pass, draw.pose.age, uv),
+                        colour,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Builds the deadmau5 ears: the name-gated layer redrawing the draw's own skin sheet
+    /// with the ear's box, once per side (`LayerDeadmau5Head.doRenderLayer`:16-38).
+    fn build_ears(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+    ) {
+        if !entity_models::layers::deadmau5_ears(draw.name.as_deref()) {
+            return;
+        }
+        let chain = layer_frame(draw);
+        let rot = entity_models::layers::ear_rot(&draw.pose);
+        let mesh = entity_models::build_vertices(
+            &entity_models::layers::MODEL_DEADMAU5_EAR,
+            std::slice::from_ref(&rot),
+            entity_models::texture_size(draw.model),
+        );
+        let colour = [draw.light, draw.light, draw.light, 1.0];
+        for side in [-1.0_f32, 1.0] {
+            let ear = chain
+                * entity_models::layers::ear_chain(draw.pose.head_yaw, draw.pose.head_pitch, side);
+            let start = vertices.len() as u32;
+            push_vertices(vertices, &mesh, ear, colour);
+            built.equipment.push((
+                start..vertices.len() as u32,
+                EquipmentSheet::Own,
+                EquipmentBlend::Opaque,
+            ));
+        }
+    }
+
+    /// Builds the charge aura: the entity's own model redrawn at the aura's construction
+    /// inflation on its sheet, flat half-grey, additive (`LayerCreeperCharge`:20-46,
+    /// `LayerWitherAura`:21-47) — the source's own gate inside
+    /// [`entity_models::layers::draw_charge_aura`].
+    fn build_aura(
+        &self,
+        draw: &EntityDraw,
+        vertices: &mut Vec<EntityVertex>,
+        built: &mut BuiltDraw,
+    ) {
+        let Some(aura) =
+            entity_models::layers::draw_charge_aura(draw.model, &draw.extra, &draw.pose)
+        else {
+            return;
+        };
+        let model = entity_models::model_for(draw.model);
+        let mut rots = model.rest();
+        entity_models::pose(draw.model, &draw.pose, &mut rots);
+        let mut mesh = entity_models::build_vertices_inflated(
+            model,
+            &rots,
+            entity_models::texture_size(draw.model),
+            aura.inflate,
+        );
+        // The texture matrix's offset: every uv shifted (`LayerCreeperCharge`:29-30's
+        // `translate`, `LayerWitherAura`:33-34's wave).
+        for uv in &mut mesh.uvs {
+            uv[0] += aura.uv_offset[0];
+            uv[1] += aura.uv_offset[1];
+        }
+        let light = if aura.full_bright { 1.0 } else { draw.light };
+        let colour = [
+            light * aura.tint[0],
+            light * aura.tint[1],
+            light * aura.tint[2],
+            1.0,
+        ];
+        let start = vertices.len() as u32;
+        push_vertices(vertices, &mesh, layer_frame(draw), colour);
+        let blend = match aura.blend {
+            entity_models::layers::Blend::Opaque => EquipmentBlend::Opaque,
+            entity_models::layers::Blend::Alpha => EquipmentBlend::Alpha,
+            entity_models::layers::Blend::Additive => EquipmentBlend::Additive,
+        };
+        built.equipment.push((
+            start..vertices.len() as u32,
+            EquipmentSheet::Named(aura.texture),
+            blend,
+        ));
     }
 
     /// Builds one draw's tag runs into `vertices`: the below-name line, then the nametag,
@@ -1890,8 +2269,14 @@ fn item_tail(gui3d: bool) -> Mat4 {
 /// `0.046875` z-step (`RenderEntityItem.java`:51-57, :138-139), and the 3D stacks' own
 /// loop scale (`:125`). The 3D copies all sit at one spot — the source gives them neither
 /// the centring nor the step; its `j > 0` random jitter stays unmodelled.
-fn dropped_stack_chain(position: Vec3, gui3d: bool, age: f32, copies: u8, copy: u8) -> Mat4 {
-    let hover = 0.0_f32;
+fn dropped_stack_chain(
+    position: Vec3,
+    gui3d: bool,
+    age: f32,
+    hover: f32,
+    copies: u8,
+    copy: u8,
+) -> Mat4 {
     let bob =
         entity_models::objects::item_bob(age, hover) + entity_models::objects::ITEM_GROUND_LIFT;
     let spin = entity_models::objects::item_spin_degrees(age, hover);
@@ -1934,9 +2319,9 @@ fn item_fields(model: ModelRef, extra: &DrawExtra, pose: &entity_models::Pose) -
 
 /// The boat's and the minecart's shared prefix: the world position plus the jitter
 /// argument, the lift, the `180 - yaw` turn and the pitch about z
-/// (`RenderBoat.doRender`:29-30, `RenderMinecart.doRender`:34-39, :75-77). The cart's id
-/// jitter stays at zero: the draw carries no entity id (`RenderMinecart.doRender`:34-39),
-/// so `minecart_jitter` stays for a draw that carries one.
+/// (`RenderBoat.doRender`:29-30, `RenderMinecart.doRender`:34-39, :75-77). The cart passes
+/// its id jitter (`RenderMinecart.doRender`:34-39 through `minecart_jitter`); the boat
+/// passes none — its renderer has no such term.
 fn vehicle_prefix(position: Vec3, body_yaw: f32, pitch: f32, lift: f32, jitter: [f32; 3]) -> Mat4 {
     Mat4::from_translation(Vec3::new(
         position.x + jitter[0],
@@ -2038,8 +2423,13 @@ impl EntityPass {
             (ModelRef::Minecart { body }, _) => {
                 let model = &entity_models::objects::MODEL_MINECART;
                 let mesh = build_vertices(model, &model.rest(), [64.0, 64.0]);
-                let prefix =
-                    vehicle_prefix(position, draw.body_yaw, draw.head_pitch, 0.375, [0.0; 3]);
+                let prefix = vehicle_prefix(
+                    position,
+                    draw.body_yaw,
+                    draw.head_pitch,
+                    0.375,
+                    entity_models::objects::minecart_jitter(draw.id),
+                );
                 let flip = prefix
                     * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
                     * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
@@ -2164,9 +2554,10 @@ impl EntityPass {
                 _ => {
                     let (gui3d, age, count) = item_fields(draw.model, extra, &draw.pose);
                     let copies = entity_models::objects::item_copies(count);
+                    let phase = entity_models::objects::item_phase(draw.id);
                     let mesh = source.generated(key);
                     for copy in 0..copies.max(1) {
-                        let chain = dropped_stack_chain(position, gui3d, age, copies, copy);
+                        let chain = dropped_stack_chain(position, gui3d, age, phase, copies, copy);
                         push_source_group(vertices, built, mesh.clone(), chain, colour);
                     }
                 }
@@ -2203,8 +2594,10 @@ impl EntityPass {
                     _ => {
                         let (gui3d, age, count) = item_fields(draw.model, extra, &draw.pose);
                         let copies = entity_models::objects::item_copies(count);
+                        let phase = entity_models::objects::item_phase(draw.id);
                         for copy in 0..copies.max(1) {
-                            let chain = dropped_stack_chain(position, gui3d, age, copies, copy);
+                            let chain =
+                                dropped_stack_chain(position, gui3d, age, phase, copies, copy);
                             push_source_group(vertices, built, mesh.clone(), chain, colour);
                         }
                     }
@@ -2263,6 +2656,33 @@ impl EntityPass {
 /// pre-render callback, `RendererLivingEntity.doRender`).
 fn body_chain(draw: &EntityDraw) -> Mat4 {
     let [_, lift] = entity_models::sneak_terms(draw.model);
+    let lift = if draw.pose.sneak { lift } else { 0.0 };
+    frame_chain(draw, lift)
+}
+
+/// The entity frame the renderers' layers draw in: the body's chain without the model's own
+/// sneak lift — the lift lives inside the model's `render` (`ModelBiped.render`:82-84), which
+/// pops before the layer walk (`RendererLivingEntity.doRender`:167's model render,
+/// `:178`'s layer walk). The ears take no lift at all (`LayerDeadmau5Head`) and the armour
+/// model's own render re-applies it (`LayerArmorBase`'s `ModelBiped`), so the armour
+/// walks the body's chain and the ears and the aura this one. The held item walks
+/// [`item_frame`] — this frame with the model's own 1/16 fold cancelled, because the
+/// layer's own mount is in blocks.
+fn layer_frame(draw: &EntityDraw) -> Mat4 {
+    frame_chain(draw, 0.0)
+}
+
+/// The entity frame the held item draws in: [`layer_frame`] with the model's own 1/16 fold
+/// cancelled (`* scale(16)`). The layer's mount (`held_item_mount`) carries the arm's end in
+/// block units and the item's own tail re-folds its mesh's 1/16 (`held_item_tail`), so the
+/// model's fold left in place would shrink the whole item away. The held item's own sneak
+/// branch stands in for the model's lift (`LayerHeldItem.java`:63).
+fn item_frame(draw: &EntityDraw) -> Mat4 {
+    frame_chain(draw, 0.0) * Mat4::from_scale(Vec3::splat(16.0))
+}
+
+/// The entity's own frame with the model's sneak lift as the one variable term.
+fn frame_chain(draw: &EntityDraw, lift: f32) -> Mat4 {
     let position = Vec3::new(
         draw.position[0] as f32,
         draw.position[1] as f32 - sneak_drop(draw),
@@ -2271,7 +2691,6 @@ fn body_chain(draw: &EntityDraw) -> Mat4 {
     let tilt = draw.death * entity_models::death_rotation(draw.model)
         + entity_models::corpse_roll(draw.model, &draw.pose);
     let shift = entity_models::corpse_shift(draw.model, &draw.pose);
-    let lift = if draw.pose.sneak { lift } else { 0.0 };
     let scale = match entity_models::cube_scale(draw.model, squish_of(draw)) {
         Some([x, y, z]) => Vec3::new(x, y, z),
         None => Vec3::splat(entity_models::render_scale(draw.model)),
@@ -2377,6 +2796,40 @@ struct BuiltDraw {
     nametag: Vec<(Range<u32>, TagPass)>,
     /// Whether the hurt combine draws over the body.
     hurt: bool,
+    /// The equipment pieces the draw loop renders after the body and its layers, in the
+    /// source's own draw order: the kind's registered layers' geometry — the armour walk
+    /// with its leather overlays, the held item, the deadmau5 ears, the charge aura — and
+    /// every enchanted piece's glint passes behind it — each piece with the sheet it
+    /// samples and the pass its blend names.
+    equipment: Vec<(Range<u32>, EquipmentSheet, EquipmentBlend)>,
+}
+
+/// The sheet an equipment piece samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EquipmentSheet {
+    /// A named registry key: the armour sheets, the held item's mesh texture, the glint
+    /// sheet, the aura sheets.
+    Named(&'static str),
+    /// The draw's own texture: the deadmau5 ears redraw the player's skin
+    /// (`LayerDeadmau5Head.doRenderLayer`:35's `getEntityTexture`).
+    Own,
+}
+
+/// The blend an equipment piece draws through: the source's own pair per pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EquipmentBlend {
+    /// The opaque pass: the armour, the leather overlay and the ears
+    /// (`LayerArmorBase.renderLayer`:57's default state, `LayerDeadmau5Head`'s).
+    Opaque,
+    /// The straight-alpha pass: the held item's model draw
+    /// (`RenderItem.renderItemModelTransform`:323-324's `770`/`771` pair).
+    Alpha,
+    /// The additive pass: the charge aura (`LayerCreeperCharge`:36's `blendFunc(1, 1)`,
+    /// `LayerWitherAura`:42's).
+    Additive,
+    /// The glint pass: the unlit sprite fragment, write-less and equal-depth
+    /// (`LayerArmorBase.renderGlint`:106-114, `RenderItem.renderEffect`:172-175).
+    Glint,
 }
 
 /// The shadow quad's geometry: its four corners, their uvs and the vertex alpha.
@@ -2463,6 +2916,42 @@ fn push_vertices(
             out.push(corner(index));
         }
     }
+}
+
+/// Pushes one glint pass of a mesh through `chain`: the mesh's own corners at the
+/// pass's uv transform and the glint's colour, landing in the draw's equipment list on
+/// the glint sheet, write-less and equal-depth (`LayerArmorBase.renderGlint`:106-124).
+fn push_glint(
+    vertices: &mut Vec<EntityVertex>,
+    built: &mut BuiltDraw,
+    mesh: &entity_models::Vertices,
+    chain: Mat4,
+    uv: impl Fn([f32; 2]) -> [f32; 2],
+    colour: [f32; 4],
+) {
+    let start = vertices.len() as u32;
+    let corner = |index: usize| EntityVertex {
+        position: chain
+            .transform_point3(Vec3::from(mesh.positions[index]))
+            .into(),
+        uv: uv(mesh.uvs[index]),
+        normal: chain
+            .transform_vector3(Vec3::from(mesh.normals[index]))
+            .normalize_or_zero()
+            .into(),
+        colour,
+    };
+    let quads = mesh.positions.len() & !3;
+    for quad in (0..quads).step_by(4) {
+        for index in [quad, quad + 1, quad + 2, quad, quad + 2, quad + 3] {
+            vertices.push(corner(index));
+        }
+    }
+    built.equipment.push((
+        start..vertices.len() as u32,
+        EquipmentSheet::Named(entity_models::layers::GLINT_SHEET),
+        EquipmentBlend::Glint,
+    ));
 }
 
 /// One vertex the entity pipelines take.
@@ -2634,6 +3123,24 @@ fn alpha_blend() -> wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::SrcAlpha,
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
+/// The glint passes' blend: the source's `blendFunc(768, 1)` in the port's landed reading —
+/// the HUD's own glint pair, source alpha over one (`hud.rs`:407-410; GL's own `768` is
+/// `GL_SRC_COLOR`, recorded in the task's deviations).
+fn glint_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         },
         alpha: wgpu::BlendComponent {
@@ -2884,6 +3391,7 @@ mod tests {
     /// A player draw standing at the origin, lit at half brightness.
     fn player_draw() -> EntityDraw {
         EntityDraw {
+            id: 0,
             model: ModelRef::Player {
                 slim: false,
                 parts: entity_models::player::PARTS_ALL,
@@ -2899,7 +3407,9 @@ mod tests {
             death: 0.0,
             health: None,
             nametag: None,
+            name: None,
             below_name: None,
+            equipment: [None; 5],
             extra: DrawExtra::None,
         }
     }
@@ -3421,8 +3931,11 @@ mod tests {
     #[test]
     fn the_dropped_stack_composes_the_sources_scale_and_arrangement() {
         let block_draw = EntityDraw {
+            id: 0,
             nametag: None,
+            name: None,
             below_name: None,
+            equipment: [None; 5],
             model: ModelRef::BlockItem { block: 1 },
             position: [0.0, 0.0, 0.0],
             body_yaw: 0.0,
@@ -3447,7 +3960,7 @@ mod tests {
         let origin = Vec3::new(0.0, 0.0, 0.0);
         // One copy's composed span for the mesh's 16 units: the net draw scale in blocks —
         // the loop's own 0.5 (3D only) times `renderItem`'s 0.5, so 0.25 for the block form.
-        let span = dropped_stack_chain(origin, gui3d, age, copies, 0)
+        let span = dropped_stack_chain(origin, gui3d, age, 0.0, copies, 0)
             .transform_vector3(Vec3::new(16.0, 0.0, 0.0))
             .length();
         assert_eq!(span, 0.25);
@@ -3462,7 +3975,7 @@ mod tests {
             item_fields(sprite_draw.model, &sprite_draw.extra, &sprite_draw.pose);
         assert!(!flat, "a sprite item draws as the flat model");
         let flat_copies = entity_models::objects::item_copies(flat_count);
-        let flat_span = dropped_stack_chain(origin, flat, flat_age, flat_copies, 0)
+        let flat_span = dropped_stack_chain(origin, flat, flat_age, 0.0, flat_copies, 0)
             .transform_vector3(Vec3::new(16.0, 0.0, 0.0))
             .length();
         // The flat form takes no loop scale and no pre-transform: `renderItem`'s 0.5
@@ -3471,13 +3984,14 @@ mod tests {
         assert_eq!(flat_span, entity_models::objects::dropped_item_scale(false));
         // The 3D copies stack at one spot; the flat copies keep the source's z-step.
         let at = |copies: u8, copy: u8| {
-            dropped_stack_chain(origin, true, age, copies, copy).transform_point3(Vec3::ZERO)
+            dropped_stack_chain(origin, true, age, 0.0, copies, copy).transform_point3(Vec3::ZERO)
         };
         assert_eq!(at(3, 0), at(3, 1));
         // The 3D copies take no centring: the copy count leaves the chain where it is.
         assert_eq!(at(1, 0), at(3, 0));
-        let flat_step = dropped_stack_chain(origin, false, age, 2, 1).transform_point3(Vec3::ZERO)
-            - dropped_stack_chain(origin, false, age, 2, 0).transform_point3(Vec3::ZERO);
+        let flat_step = dropped_stack_chain(origin, false, age, 0.0, 2, 1)
+            .transform_point3(Vec3::ZERO)
+            - dropped_stack_chain(origin, false, age, 0.0, 2, 0).transform_point3(Vec3::ZERO);
         assert!(
             (flat_step - Vec3::new(0.0, 0.0, entity_models::objects::ITEM_COPY_STEP)).length()
                 < 1.0e-6,

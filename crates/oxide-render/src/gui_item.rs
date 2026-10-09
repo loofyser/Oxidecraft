@@ -186,6 +186,11 @@ pub struct ItemIconMesh {
     /// source's default, which `applyTransform` no-ops (`ItemCameraTransforms.java`
     /// :59).
     pub first_person: Transform,
+    /// The model's own third-person display transform (`display.thirdperson`), as the
+    /// file states it — the slot the entity held item's layer applies
+    /// (`LayerHeldItem.java`:66's `TransformType.THIRD_PERSON`). An absent key is the
+    /// source's default, which `applyTransform` no-ops (`ItemCameraTransforms.java`:59).
+    pub third_person: Transform,
     /// The shape the model draws with.
     pub shape: IconShape,
 }

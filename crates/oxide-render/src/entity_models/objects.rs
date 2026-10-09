@@ -597,6 +597,18 @@ pub fn minecart_jitter(id: i32) -> [f32; 3] {
     out
 }
 
+/// The item entity's bob/spin phase, in radians: the source seeds `hoverStart` from
+/// `Math.random() * 2.0 * PI` per entity (`EntityItem.java`:42's constructor, `:70`'s
+/// respawn), a per-client value nothing on the wire carries — so the port pins a
+/// deterministic per-entity phase from the id, the same stand-in shape as the cart's own
+/// jitter (`RenderEntityItem.java`:37's `hoverStart` feeding the bob at :47 and the spin
+/// at :48). The Weyl fold spreads consecutive ids around the circle.
+pub fn item_phase(id: i32) -> f32 {
+    let bits = (id as u32).wrapping_mul(0x9E37_79B9);
+    let spread = ((bits >> 16) & 0xFFFF) as f32 / 65_536.0;
+    spread * std::f32::consts::TAU
+}
+
 /// The orb's texture key (`RenderXPOrb.java`:14).
 pub const ORB_TEXTURE: &str = "entity/experience_orb.png";
 
@@ -1366,6 +1378,19 @@ mod tests {
             let expected = ((((i >> shift) & 7) as f32 + 0.5) / 8.0 - 0.5) * 0.004;
             assert_eq!(jitter[axis], expected, "axis {axis}");
         }
+    }
+
+    /// The item phase is a deterministic per-entity fold (`EntityItem.java`:42 — the wire
+    /// carries no phase): id zero pins the circle's home, consecutive ids spread and stay
+    /// in the turn.
+    #[test]
+    fn the_item_phase_is_a_deterministic_spread() {
+        assert_eq!(item_phase(0), 0.0);
+        let first = item_phase(1);
+        let second = item_phase(2);
+        assert!(first > 0.0 && first < std::f32::consts::TAU, "{first}");
+        assert!(second > 0.0 && second < std::f32::consts::TAU, "{second}");
+        assert_ne!(first, second);
     }
 
     /// The orb's icon table, both ends and one boundary each way

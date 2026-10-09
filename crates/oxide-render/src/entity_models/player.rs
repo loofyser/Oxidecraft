@@ -20,7 +20,7 @@
 
 use std::f32::consts::PI;
 
-use super::{Box, Model, Part, Pose, Rot};
+use super::{Box, Model, Part, Pose, PoseExtra, Rot};
 
 /// The parts byte with every model part worn, the client's own default until the settings
 /// screen can clear a bit (`EnumPlayerModelParts`' seven bits; the options file's default is
@@ -58,14 +58,20 @@ pub const PLAYER_TEXTURE_SIZE: [f32; 2] = [64.0, 64.0];
 /// constructor).
 pub const CAPE_TEXTURE_SIZE: [f32; 2] = [64.0, 32.0];
 
-/// The player model's own pose input: the cape layer's motion term.
+/// The player model's own pose input: the cape layer's motion term and the held-item gate.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct CapeMotion {
+pub struct PlayerExtra {
     /// The entity's displacement over the tick pair the frame spans, in blocks — the
     /// frame's stand-in for the chasing-position delta the source reads; the window
     /// carries neither the smoothed chaser nor the camera-yaw sensor the source derives
     /// it from, so the wave reads this motion and the sneak lift alone.
     pub motion: [f32; 3],
+    /// Whether the draw holds a stack: `heldItemRight` at one
+    /// (`RenderPlayer.setModelVisibilities`:93-105), the term that halves the right arm's
+    /// walk sway and drops it by a tenth of pi before the swing block
+    /// (`ModelBiped.setRotationAngles`:160-174). The armour model copies it through
+    /// `setModelAttributes` (`LayerArmorBase.renderLayer`:52-53).
+    pub held: bool,
 }
 
 /// The head's box: 8x8x8 at the pivot's back-top corner (`ModelBiped.java:55-57`).
@@ -453,6 +459,7 @@ pub fn pose(pose: &Pose, parts: u8, out: &mut [Rot]) {
     if out.len() < PART_COUNT {
         return;
     }
+    let held = matches!(pose.extra, PoseExtra::Player(extra) if extra.held);
     let head_yaw = pose.head_yaw.to_radians();
     let head_pitch = pose.head_pitch.to_radians();
     out[0].angles = [head_pitch, head_yaw, 0.0];
@@ -465,6 +472,12 @@ pub fn pose(pose: &Pose, parts: u8, out: &mut [Rot]) {
     out[3].angles = [phase.cos() * 2.0 * amount * 0.5, 0.0, 0.0];
     out[4].angles = [phase.cos() * 1.4 * amount, 0.0, 0.0];
     out[5].angles = [(phase + PI).cos() * 1.4 * amount, 0.0, 0.0];
+
+    // The held-item term (`ModelBiped.setRotationAngles`:160-174, `heldItemRight` at one):
+    // the walk sway halves and drops by a tenth of pi, before the swing block adds its own.
+    if held {
+        out[2].angles[0] = out[2].angles[0] * 0.5 - PI / 10.0;
+    }
 
     // The arm swing about the body, over the swing progress.
     let swing = pose.swing_progress;
@@ -552,7 +565,7 @@ mod tests {
     /// A pose with every field at rest: no swing, no walk, no age, facing forward.
     fn rest_pose() -> Pose {
         Pose {
-            extra: PoseExtra::Player(CapeMotion::default()),
+            extra: PoseExtra::Player(PlayerExtra::default()),
             ..Pose::default()
         }
     }
@@ -713,7 +726,7 @@ mod tests {
         let mut rots = MODEL_PLAYER_WIDE.rest();
         let pose = Pose {
             swing_progress: 1.0 / 6.0,
-            extra: PoseExtra::Player(CapeMotion::default()),
+            extra: PoseExtra::Player(PlayerExtra::default()),
             ..Pose::default()
         };
         super::pose(&pose, PARTS_ALL, &mut rots);
@@ -741,7 +754,7 @@ mod tests {
             limb_swing: 1.0,
             limb_swing_amount: 1.0,
             age: 20.0,
-            extra: PoseExtra::Player(CapeMotion::default()),
+            extra: PoseExtra::Player(PlayerExtra::default()),
             ..Pose::default()
         };
         super::pose(&pose, PARTS_ALL, &mut rots);
@@ -767,7 +780,7 @@ mod tests {
         let pose = Pose {
             head_yaw: 90.0,
             head_pitch: 45.0,
-            extra: PoseExtra::Player(CapeMotion::default()),
+            extra: PoseExtra::Player(PlayerExtra::default()),
             ..Pose::default()
         };
         super::pose(&pose, PARTS_ALL, &mut rots);
@@ -783,7 +796,7 @@ mod tests {
             sneak: true,
             limb_swing: 1.0,
             limb_swing_amount: 1.0,
-            extra: PoseExtra::Player(CapeMotion::default()),
+            extra: PoseExtra::Player(PlayerExtra::default()),
             ..Pose::default()
         };
         super::pose(&pose, PARTS_ALL, &mut rots);

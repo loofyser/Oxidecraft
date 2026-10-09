@@ -34,6 +34,7 @@
 //! input carries; both are recorded limits of this milestone.
 
 use super::{Box, Model, Part, Pose, PoseExtra, Rot};
+use crate::entity_pass::ModelRef;
 
 /// The biped table's head: `ModelBiped.java`:55-57, model size zero.
 static HEAD: Part = Part {
@@ -680,6 +681,47 @@ pub static MODEL_ZOMBIE_VILLAGER: Model = Model {
     parts: &ZOMBIE_VILLAGER_PARTS,
 };
 
+/// The zombie villager armour head's one box: the `p_i1165_3_` branch's plain eight-cube
+/// head, uv (0,0), no nose (`ModelZombieVillager.java`:17-23).
+static ARMOUR_VILLAGER_HEAD: Part = Part {
+    point: [0.0, 0.0, 0.0],
+    rest: [0.0, 0.0, 0.0],
+    boxes: &[Box {
+        origin: [-4.0, -10.0, -4.0],
+        size: [8.0, 8.0, 8.0],
+        uv: [0.0, 0.0],
+        inflate: 0.0,
+        mirror: false,
+    }],
+    children: &[],
+};
+
+/// The zombie villager's armour parts: the one-box head over the thick biped.
+static ARMOUR_VILLAGER_PARTS: [Part; 7] = [
+    ARMOUR_VILLAGER_HEAD,
+    BODY,
+    RIGHT_ARM,
+    LEFT_ARM,
+    RIGHT_LEG,
+    LEFT_LEG,
+    HEADWEAR,
+];
+
+/// The armour models' plain table: the thick biped every armour model carries
+/// (`LayerBipedArmor.initArmor`:13-17's `ModelBiped` pair; `ModelSkeleton(_, true)` and
+/// `ModelZombie(_, true)` pass the flag that skips the thin-limb swap and keeps the thick
+/// limbs). The construction inflation rides the draw's own build, so the table itself is
+/// the plain one.
+pub static MODEL_ARMOUR_BIPED: Model = Model {
+    parts: &ZOMBIE_PARTS,
+};
+
+/// The zombie villager's armour model: `ModelZombieVillager(_, 0.0F, true)`'s own head
+/// (`LayerVillagerArmor.initArmor`:14-18).
+pub static MODEL_ARMOUR_VILLAGER: Model = Model {
+    parts: &ARMOUR_VILLAGER_PARTS,
+};
+
 /// The villager's model: `ModelVillager`'s table, texture `64` by `64`.
 pub static MODEL_VILLAGER: Model = Model {
     parts: &VILLAGER_PARTS,
@@ -754,7 +796,7 @@ use slot::*;
 /// false). The term is the same one the player model's pose carries for its own table; the
 /// two stand beside each other because the source shares them by inheritance and the tables
 /// differ.
-fn pose_biped_base(pose: &Pose, aimed_bow: bool, out: &mut [Rot]) {
+fn pose_biped_base(pose: &Pose, aimed_bow: bool, held: bool, out: &mut [Rot]) {
     let yaw = pose.head_yaw.to_radians();
     let pitch = pose.head_pitch.to_radians();
     out[P_HEAD].angles = [pitch, yaw, 0.0];
@@ -776,6 +818,14 @@ fn pose_biped_base(pose: &Pose, aimed_bow: bool, out: &mut [Rot]) {
     out[P_RIGHT_ARM].angles[2] = 0.0;
     out[P_LEFT_ARM].angles[1] = 0.0;
     out[P_LEFT_ARM].angles[2] = 0.0;
+
+    // The held-item term (`ModelBiped.setRotationAngles`:160-174, `heldItemRight` at one):
+    // the walk sway halves and drops by a tenth of pi, before the swing block adds its own.
+    // Only the player's renderer ever writes the flag (`RenderPlayer.setModelVisibilities`),
+    // so the mobs' poses pass zero.
+    if held {
+        out[P_RIGHT_ARM].angles[0] = out[P_RIGHT_ARM].angles[0] * 0.5 - std::f32::consts::PI / 10.0;
+    }
 
     // The swing block: the body opens with the punch and the arms follow it
     // (`ModelBiped.setRotationAngles`:178-198). `swingProgress` is the frame's own fraction,
@@ -868,7 +918,7 @@ fn pose_zombie_arms(pose: &Pose, out: &mut [Rot]) {
 /// The zombie's pose: the base terms with the raised arms over them — the arms held out at
 /// the source's constant quarter-turn back.
 pub fn pose_zombie(pose: &Pose, out: &mut [Rot]) {
-    pose_biped_base(pose, false, out);
+    pose_biped_base(pose, false, false, out);
     pose_zombie_arms(pose, out);
 }
 
@@ -881,8 +931,35 @@ pub fn pose_zombie(pose: &Pose, out: &mut [Rot]) {
 /// the composition holds the source's own order, and its pin finds them equal.
 pub fn pose_skeleton(pose: &Pose, out: &mut [Rot]) {
     let aimed_bow = matches!(pose.extra, PoseExtra::Skeleton { aimed_bow: true });
-    pose_biped_base(pose, aimed_bow, out);
+    pose_biped_base(pose, aimed_bow, false, out);
     pose_zombie_arms(pose, out);
+}
+
+/// The armour model's pose for a kind: the kind's own class terms over the armour table
+/// (`LayerArmorBase.renderLayer`:52-53's `setModelAttributes` copies the main model's own
+/// flags, so the armour model runs its own class's `setRotationAngles` — the player's plain
+/// biped base with the held-item term the copied `heldItemRight` carries, the zombie
+/// family's and the skeleton's raised arms).
+pub fn armour_pose(model: ModelRef, pose: &Pose, held: bool, out: &mut [Rot]) {
+    match model {
+        ModelRef::Zombie | ModelRef::Giant | ModelRef::ZombieVillager => {
+            pose_biped_base(pose, false, held, out);
+            pose_zombie_arms(pose, out);
+        }
+        ModelRef::Skeleton => {
+            let aimed_bow = matches!(pose.extra, PoseExtra::Skeleton { aimed_bow: true });
+            pose_biped_base(pose, aimed_bow, held, out);
+            pose_zombie_arms(pose, out);
+        }
+        _ => pose_biped_base(pose, false, held, out),
+    }
+}
+
+/// The armour models' texture size: 64 by 32 for every kind — `ModelBiped(modelSize)`'s own
+/// pair, `ModelSkeleton(_, true)`'s, `ModelZombie(_, true)`'s (the flag's 32) and
+/// `ModelZombieVillager(_, _, true)`'s.
+pub fn armour_texture_size() -> [f32; 2] {
+    [64.0, 32.0]
 }
 
 /// The villager's pose (`ModelVillager.setRotationAngles`:76-84): the head on the frame's

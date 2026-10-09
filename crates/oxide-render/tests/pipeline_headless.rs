@@ -63,8 +63,8 @@ use oxide_render::camera::{
 };
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
-    BOSS_STATUS_TIME, BossStatus, DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw,
-    SkinLookup, TextureRef, TextureRegistry,
+    BOSS_STATUS_TIME, BossStatus, DrawExtra, EntityDraw, EntityPass, EquipmentDraw, ModelRef,
+    NametagDraw, SkinLookup, TextureRef, TextureRegistry,
 };
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
@@ -2203,6 +2203,7 @@ fn entity_camera() -> Camera {
 /// brightness, nothing hurting or dying.
 fn player_at_origin(texture: TextureRef) -> EntityDraw {
     EntityDraw {
+        id: 0,
         model: ModelRef::Player {
             slim: false,
             parts: 0x7F,
@@ -2218,7 +2219,9 @@ fn player_at_origin(texture: TextureRef) -> EntityDraw {
         death: 0.0,
         health: Some((20.0, 20.0)),
         nametag: None,
+        name: None,
         below_name: None,
+        equipment: [None; 5],
         extra: DrawExtra::None,
     }
 }
@@ -2963,6 +2966,7 @@ fn the_entities_draw_between_the_terrain_layers() {
 /// One mob draw at the origin with the given model, sheet and extras.
 fn mob_at_origin(model: ModelRef, sheet: &'static str, extra: DrawExtra) -> EntityDraw {
     EntityDraw {
+        id: 0,
         model,
         position: [0.0; 3],
         body_yaw: 0.0,
@@ -2975,7 +2979,9 @@ fn mob_at_origin(model: ModelRef, sheet: &'static str, extra: DrawExtra) -> Enti
         death: 0.0,
         health: None,
         nametag: None,
+        name: None,
         below_name: None,
+        equipment: [None; 5],
         extra,
     }
 }
@@ -3517,7 +3523,7 @@ fn the_crawler_family_draws_its_own_silhouettes() {
             mob_at_origin(
                 ModelRef::Creeper,
                 "entity/creeper/creeper.png",
-                DrawExtra::Creeper,
+                DrawExtra::Creeper { powered: false },
             ),
         ),
         (
@@ -4713,6 +4719,437 @@ fn the_wither_draws_its_second_sheet() {
     );
 }
 
+// ---------------------------------------------------------------- the equipment layers
+
+/// The item fixtures' atlas as a registry texture: its level 0, under the meshes' own
+/// [`ATLAS_TEXTURE`] key, so the entity pass resolves the held item's quad the way the
+/// client's registry does.
+fn atlas_sheet(atlas: &Atlas) -> Texture {
+    let level = &atlas.levels[0];
+    Texture {
+        width: level.width,
+        height: level.height,
+        rgba: level.rgba.clone(),
+    }
+}
+
+/// The equipment cases' registry: the zombie's and the creeper's sheets in the test hue,
+/// the leather tier sheet white so the dye tint reads alone, the leather overlay fully
+/// transparent (the cutout drops it, as the real overlay's spare texels are), the iron
+/// sheet a mid grey, the creeper's aura sheet white, the glint sheet white, and the item
+/// fixtures' atlas under its own key.
+fn equipment_registry(device: &wgpu::Device, queue: &wgpu::Queue) -> TextureRegistry {
+    let mut registry = mob_registry(
+        device,
+        queue,
+        &[
+            ("entity/zombie/zombie.png", [200, 90, 40, 255]),
+            ("entity/creeper/creeper.png", [200, 90, 40, 255]),
+            ("models/armor/leather_layer_1.png", [255, 255, 255, 255]),
+            (
+                "models/armor/leather_layer_1_overlay.png",
+                [255, 255, 255, 0],
+            ),
+            ("models/armor/iron_layer_1.png", [120, 120, 120, 255]),
+            ("entity/creeper/creeper_armor.png", [255, 255, 255, 255]),
+            ("misc/enchanted_item_glint.png", [255, 255, 255, 255]),
+        ],
+    );
+    registry.set_named(device, queue, ATLAS_TEXTURE, &atlas_sheet(&item_atlas()));
+    registry
+}
+
+/// One zombie at the origin wearing `equipment`.
+fn zombie_wearing(equipment: [Option<EquipmentDraw>; 5]) -> EntityDraw {
+    let mut draw = mob_at_origin(
+        ModelRef::Zombie,
+        "entity/zombie/zombie.png",
+        DrawExtra::None,
+    );
+    draw.equipment = equipment;
+    draw
+}
+
+/// The equipment pass: the fixture icon source set, the camera driven.
+fn equipment_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    registry: &TextureRegistry,
+) -> EntityPass {
+    let mut entities = EntityPass::new(
+        device,
+        queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        registry.layout(),
+    );
+    entities.set_camera(entity_camera(), 1.0);
+    entities.set_icon_source(Arc::new(TestIcons {
+        atlas: item_atlas(),
+    }));
+    entities
+}
+
+/// The bounding box of the pixels carrying the item fixture's green.
+fn green_silhouette(pixels: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let [r, g, b] = pixel(pixels, x, y);
+            if g as i32 > r as i32 + 40 && g as i32 > b as i32 + 40 {
+                bounds = Some(match bounds {
+                    None => (x, y, x, y),
+                    Some((min_x, min_y, max_x, max_y)) => {
+                        (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                    }
+                });
+            }
+        }
+    }
+    bounds
+}
+
+/// The count of pixels that read as a grey: the channels within six of each other and
+/// clear of the shadow's faint wash.
+fn grey_pixels(pixels: &[u8]) -> usize {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b] = pixel(pixels, x, y);
+            let [r, g, b] = [r as i32, g as i32, b as i32];
+            (r - g).abs() <= 6 && (g - b).abs() <= 6 && r > 40
+        })
+        .count()
+}
+
+/// The pixel whose channels moved most between the two frames, with both frames' readings
+/// there.
+fn biggest_change(before: &[u8], after: &[u8]) -> (u32, u32, [u8; 3], [u8; 3]) {
+    let mut best = (0, 0, [0; 3], [0; 3], -1i32);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let old = pixel(before, x, y);
+            let new = pixel(after, x, y);
+            let moved: i32 = old
+                .iter()
+                .zip(new.iter())
+                .map(|(a, b)| (*a as i32 - *b as i32).abs())
+                .sum();
+            if moved > best.4 {
+                best = (x, y, old, new, moved);
+            }
+        }
+    }
+    (best.0, best.1, best.2, best.3)
+}
+
+/// The held item draws on the zombie's arm: the sword fixture's quad, mounted through the
+/// layer's chain at its third-person display transform, stands beside the body — its green
+/// sprite's pixels land on the side the sword's own `display.thirdperson` turn puts them
+/// (`LayerHeldItem.java`:41-42, :66; the item model's rotation) — and the empty hand draws
+/// none of them.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_equipment_held_sword_draws_on_the_zombies_arm() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = equipment_registry(&device, &queue);
+    let mut entities = equipment_pass(&device, &queue, &registry);
+
+    let bare = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        zombie_wearing([None; 5]),
+    );
+    let mut held = [None; 5];
+    held[0] = Some(EquipmentDraw {
+        id: 4,
+        damage: 0,
+        enchanted: false,
+        colour: None,
+        cross: false,
+    });
+    let armed = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        zombie_wearing(held),
+    );
+
+    assert_eq!(
+        green_pixels(&bare),
+        0,
+        "the empty hand draws no item pixels"
+    );
+    let item = green_pixels(&armed);
+    assert!(item >= 8, "the sword draws: {item} item pixels");
+    // The orientation pin: the quad's silhouette, measured on the fixed frame (x 24..=26,
+    // y 4..=28 at 22 green pixels), is a narrow strip beside the body's screen-left edge —
+    // the zombie's right arm, mirrored by the `180 - body_yaw` turn — reaching above the
+    // head's top (the head's own rows start near 14) down past the chest. The x pin
+    // catches a mirrored mount (the strip would land near 37..40); the y pin catches a
+    // collapsed or sideways display transform.
+    let (min_x, min_y, max_x, max_y) =
+        green_silhouette(&armed).expect("the item's pixels stand in the frame");
+    assert!(
+        min_x >= 20 && max_x <= 30,
+        "the sword hangs beside the body, not across it: x span {min_x}..={max_x}"
+    );
+    assert!(
+        min_y <= 8 && (20..=34).contains(&max_y),
+        "the blade reaches from above the head down past the chest: y span {min_y}..={max_y}"
+    );
+}
+
+/// The leather armour takes the stack's dye: the same chestplate with no `display.color`
+/// reads the default brown, and the red dye turns its texels red — the tint multiplies the
+/// white sheet, so the dyed pixels' green and blue collapse (`ItemArmor.getColor`:135-157
+/// through the armour layer's tint term).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_equipment_leather_armour_takes_the_dye() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = equipment_registry(&device, &queue);
+    let mut entities = equipment_pass(&device, &queue, &registry);
+
+    let chest = |colour: Option<i32>| {
+        let mut equipment = [None; 5];
+        equipment[3] = Some(EquipmentDraw {
+            id: 299,
+            damage: 0,
+            enchanted: false,
+            colour,
+            cross: false,
+        });
+        zombie_wearing(equipment)
+    };
+    let plain = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        chest(None),
+    );
+    let dyed = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        chest(Some(0xFF0000)),
+    );
+
+    // The dyed armour's pixels: pure red under the shading — no green or blue survives the
+    // tint, which the zombie's own hue (its green high) and the sky never match.
+    let red = |pixels: &[u8]| {
+        (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let [r, g, b] = pixel(pixels, x, y);
+                r as i32 > 80 && (g as i32) < 24 && (b as i32) < 24
+            })
+            .count()
+    };
+    let red_pixels = red(&dyed);
+    assert_eq!(
+        red(&plain),
+        0,
+        "the default brown keeps its green: no pure-red pixels"
+    );
+    assert!(
+        red_pixels >= 40,
+        "the red dye reads on the armour: {red_pixels} pixels"
+    );
+    assert!(
+        changed_pixels(&plain, &dyed) >= 40,
+        "the dye redraws the armour: {} pixels changed",
+        changed_pixels(&plain, &dyed)
+    );
+    let (x, y, before, after) = biggest_change(&plain, &dyed);
+    assert!(
+        after[0] as i32 > before[0] as i32 && (after[1] as i32) < before[1] as i32,
+        "the dye raises red and drops green at ({x}, {y}): {before:?} -> {after:?}"
+    );
+}
+
+/// The iron tier sheet draws its own grey: the chestplate's texels come from the iron
+/// sheet, not the zombie's hue — the frame's grey count climbs by the armour's coverage,
+/// and the change's centre pixel reads grey.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_equipment_iron_armour_draws_its_sheet() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = equipment_registry(&device, &queue);
+    let mut entities = equipment_pass(&device, &queue, &registry);
+
+    let bare = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        zombie_wearing([None; 5]),
+    );
+    let mut equipment = [None; 5];
+    equipment[3] = Some(EquipmentDraw {
+        id: 307,
+        damage: 0,
+        enchanted: false,
+        colour: None,
+        cross: false,
+    });
+    let armoured = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        zombie_wearing(equipment),
+    );
+
+    let greys = grey_pixels(&armoured) as i64 - grey_pixels(&bare) as i64;
+    assert!(
+        greys >= 40,
+        "the iron sheet's grey covers the torso: {greys} pixels of grey added"
+    );
+    let (x, y, before, after) = biggest_change(&bare, &armoured);
+    let [r, g, b] = after;
+    assert!(
+        (r as i32 - g as i32).abs() <= 12 && (g as i32 - b as i32).abs() <= 12 && r > 40,
+        "the armour's own texel reads at the change's centre ({x}, {y}): {before:?} -> {after:?}"
+    );
+}
+
+/// The enchanted chestplate glints: the effect flag runs the two glint passes over the
+/// armour (`LayerArmorBase.java`:78 through the glint pipeline), and the clock set, the
+/// blended overlay shifts the armour's pixels toward the glint colour — a plain chestplate
+/// with the same clock does not.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_equipment_enchanted_chestplate_glints() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = equipment_registry(&device, &queue);
+    let mut entities = equipment_pass(&device, &queue, &registry);
+    entities.set_system_time(500);
+
+    let chest = |enchanted: bool| {
+        let mut equipment = [None; 5];
+        equipment[3] = Some(EquipmentDraw {
+            id: 307,
+            damage: 0,
+            enchanted,
+            colour: None,
+            cross: false,
+        });
+        zombie_wearing(equipment)
+    };
+    let plain = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        chest(false),
+    );
+    let glinting = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        chest(true),
+    );
+
+    let changed = changed_pixels(&plain, &glinting);
+    assert!(
+        changed >= 40,
+        "the glint pass shifts the armour's pixels: {changed} pixels changed"
+    );
+    let (x, y, before, after) = biggest_change(&plain, &glinting);
+    assert!(
+        after[2] as i32 > before[2] as i32 + 20,
+        "the glint adds its blue at ({x}, {y}): {before:?} -> {after:?}"
+    );
+}
+
+/// The creeper's charge draws its aura: the powered flag runs the inflated second pass in
+/// the additive blend (`LayerCreeperCharge.java`:28-31), lifting the creeper's own pixels
+/// and adding a rim over the sky — an unpowered creeper draws neither.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_equipment_creeper_charge_overlay_answers_the_flag() {
+    let (device, queue) = headless_device();
+    let target = create_target(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let depth = create_depth(&device);
+    let registry = equipment_registry(&device, &queue);
+    let mut entities = equipment_pass(&device, &queue, &registry);
+
+    let creeper = |powered: bool| {
+        mob_at_origin(
+            ModelRef::Creeper,
+            "entity/creeper/creeper.png",
+            DrawExtra::Creeper { powered },
+        )
+    };
+    let plain = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        creeper(false),
+    );
+    let charged = render_mob(
+        &device,
+        &queue,
+        &target,
+        &depth,
+        &mut entities,
+        &registry,
+        creeper(true),
+    );
+
+    let changed = changed_pixels(&plain, &charged);
+    assert!(
+        changed >= 40,
+        "the aura redraws the creeper: {changed} pixels changed"
+    );
+    assert!(
+        model_pixels(&charged) > model_pixels(&plain),
+        "the inflated pass adds a rim: {} -> {} non-sky pixels",
+        model_pixels(&plain),
+        model_pixels(&charged)
+    );
+    let (x, y, before, after) = biggest_change(&plain, &charged);
+    assert!(
+        after[0] as i32 >= before[0] as i32
+            && after[1] as i32 >= before[1] as i32
+            && after[2] as i32 >= before[2] as i32,
+        "the additive pass only lifts at ({x}, {y}): {before:?} -> {after:?}"
+    );
+}
+
 /// Blocks the calling thread until `future` resolves; the test has no async runtime.
 ///
 /// The test target cannot reach the private `block_on` in `renderer.rs`, so this is a copy of
@@ -4827,6 +5264,7 @@ impl ItemMeshSource for StubSource {
 /// One object draw at the origin, facing the entity camera, full brightness.
 fn object_draw(model: ModelRef, extra: DrawExtra) -> EntityDraw {
     EntityDraw {
+        id: 0,
         model,
         position: [0.0; 3],
         body_yaw: 0.0,
@@ -4839,7 +5277,9 @@ fn object_draw(model: ModelRef, extra: DrawExtra) -> EntityDraw {
         death: 0.0,
         health: None,
         nametag: None,
+        name: None,
         below_name: None,
+        equipment: [None; 5],
         extra,
     }
 }
@@ -6734,18 +7174,21 @@ impl ItemIconSource for TestIcons {
                 mesh: self.cube("fixture:top", "fixture:side"),
                 transform: Transform::DEFAULT,
                 first_person: Transform::DEFAULT,
+                third_person: Transform::DEFAULT,
                 shape: IconShape::Gui3d,
             }),
             2 => Some(ItemIconMesh {
                 mesh: self.flat("fixture:flat"),
                 transform: Transform::DEFAULT,
                 first_person: Transform::DEFAULT,
+                third_person: Transform::DEFAULT,
                 shape: IconShape::Flat,
             }),
             3 => Some(ItemIconMesh {
                 mesh: self.flat("fixture:green"),
                 transform: Transform::DEFAULT,
                 first_person: Transform::DEFAULT,
+                third_person: Transform::DEFAULT,
                 shape: IconShape::Flat,
             }),
             // The sword-shaped fixture: the flat quad with the real diamond sword's
@@ -6754,6 +7197,7 @@ impl ItemIconSource for TestIcons {
                 mesh: self.flat("fixture:green"),
                 transform: Transform::DEFAULT,
                 first_person: sword_transform(),
+                third_person: sword_third_transform(),
                 shape: IconShape::Flat,
             }),
             // The chest-shaped fixture: the folded trio's own mesh on a synthetic
@@ -6766,6 +7210,7 @@ impl ItemIconSource for TestIcons {
                 },
                 transform: Transform::DEFAULT,
                 first_person: Transform::DEFAULT,
+                third_person: Transform::DEFAULT,
                 shape: IconShape::Builtin,
             }),
             _ => None,
@@ -6777,6 +7222,7 @@ impl ItemIconSource for TestIcons {
             mesh: self.flat("fixture:top"),
             transform: Transform::DEFAULT,
             first_person: Transform::DEFAULT,
+            third_person: Transform::DEFAULT,
             shape: IconShape::Flat,
         })
     }
@@ -6789,6 +7235,17 @@ fn sword_transform() -> Transform {
         rotation: [0.0, -135.0, 25.0],
         translation: [0.0, 4.0, 2.0],
         scale: [1.7, 1.7, 1.7],
+    }
+}
+
+/// The diamond sword's third-person display transform, exactly as its model JSON states
+/// it (`models/item/diamond_sword.json`'s `display.thirdperson`) — the slot the entity
+/// held item's layer applies (`LayerHeldItem.java`:66).
+fn sword_third_transform() -> Transform {
+    Transform {
+        rotation: [0.0, 90.0, -35.0],
+        translation: [0.0, 1.25, -3.5],
+        scale: [0.85, 0.85, 0.85],
     }
 }
 

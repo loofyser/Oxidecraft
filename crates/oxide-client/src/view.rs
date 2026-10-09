@@ -31,15 +31,17 @@ use oxide_game::scoreboard::{Objective, Scoreboard, format_entry};
 use oxide_game::session::ClientEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::nbt::NbtValue;
-use oxide_render::entity_models::player::CapeMotion;
+use oxide_render::entity_models::player::PlayerExtra;
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
-    DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, SkinLookup, SkinTexId, TextureRef,
+    DrawExtra, EntityDraw, EquipmentDraw, FrameContent, ModelRef, NametagDraw, SkinLookup,
+    SkinTexId, TextureRef,
 };
 use oxide_render::gui_item::ItemIcon;
 use oxide_render::held_item::{ArmSway, Equip, HeldItemFrame, Swing};
 use oxide_render::hud::{HudDraw, HudTexture, ScaledResolution};
 use oxide_render::text::string_width;
+use oxide_world::behaviour::{self, RenderKind};
 use oxide_world::entity::EntityKind;
 
 use crate::CHAT_TEXT_CAP;
@@ -342,7 +344,7 @@ fn projectile_sprite(kind: EntityKind) -> Option<&'static str> {
 /// (`DefaultPlayerSkin.isSlimSkin`, `DefaultPlayerSkin.java:41-44`); the renderer's
 /// resolver falls back the same way when the update carries no texture. The cape layer's
 /// wave reads the frame pair's displacement between its ticks — the window's stand-in for
-/// the smoothed chaser and camera-yaw terms its state cannot produce ([`CapeMotion`]). An
+/// the smoothed chaser and camera-yaw terms its state cannot produce ([`PlayerExtra`]). An
 /// invisible entity yields no draw, model and shadow alike: the source skips both for one
 /// (`RendererLivingEntity.java:248-249`, `Render.java:303`), and the window's shadow rides
 /// the same draw.
@@ -404,7 +406,7 @@ fn draw_for(
             };
             // The cape layer's wave reads the frame pair's own displacement — the window's
             // stand-in for the smoothed chaser and camera-yaw terms its state cannot
-            // produce (`CapeMotion`).
+            // produce (`PlayerExtra`).
             (
                 ModelRef::Player {
                     slim,
@@ -412,12 +414,15 @@ fn draw_for(
                 },
                 TextureRef::Skin { uuid, slim },
                 DrawExtra::None,
-                PoseExtra::Player(CapeMotion {
+                PoseExtra::Player(PlayerExtra {
                     motion: [
                         (frame.pos[0] - frame.prev[0]) as f32,
                         (frame.pos[1] - frame.prev[1]) as f32,
                         (frame.pos[2] - frame.prev[2]) as f32,
                     ],
+                    // The held-item pose gate: a non-null held stack
+                    // (`RenderPlayer.setModelVisibilities`:93-97).
+                    held: frame.equipment[0].is_some(),
                 }),
                 false,
             )
@@ -608,6 +613,7 @@ fn draw_for(
     };
 
     Some(EntityDraw {
+        id: frame.id,
         model,
         position,
         body_yaw,
@@ -622,9 +628,13 @@ fn draw_for(
         // The frame carries the composed text the session resolved; a frame without a name
         // leaves the field empty and the pass writes nothing.
         nametag: frame.nametag.clone().map(|text| NametagDraw { text }),
+        // The entity's own name: the deadmau5 ears' gate (`LayerDeadmau5Head.java`:24).
+        name: frame.name.clone(),
         // The below-name label is the frame's slot-2 composition; the caller fills it once
         // the draw is built ([`below_name_for`]).
         below_name: None,
+        // The five slots' stacks, converted through the item-icon seam's rule.
+        equipment: equipment_draw(&frame.equipment),
         extra: draw_extra,
     })
 }
@@ -758,10 +768,10 @@ fn mob_draw(
             PoseExtra::None,
             false,
         ),
-        (EntityKind::Creeper, _) => (
+        (EntityKind::Creeper, MobExtra::Creeper { powered }) => (
             ModelRef::Creeper,
             TextureRef::Named("entity/creeper/creeper.png"),
-            DrawExtra::Creeper,
+            DrawExtra::Creeper { powered: *powered },
             PoseExtra::None,
             false,
         ),
@@ -984,7 +994,13 @@ fn mob_draw(
             PoseExtra::Dragon { anim_time: 0.0 },
             false,
         ),
-        (EntityKind::WitherBoss, MobExtra::Wither { invul_time }) => (
+        (
+            EntityKind::WitherBoss,
+            MobExtra::Wither {
+                invul_time,
+                armored,
+            },
+        ) => (
             ModelRef::Wither {
                 invul_time: *invul_time,
             },
@@ -998,7 +1014,7 @@ fn mob_draw(
                     "entity/wither/wither.png"
                 },
             ),
-            DrawExtra::None,
+            DrawExtra::Wither { armored: *armored },
             PoseExtra::None,
             false,
         ),
@@ -1749,6 +1765,53 @@ pub(crate) fn item_icon(stack: &MetadataItem) -> ItemIcon {
         damage: stack.damage,
         enchanted: stack_has_effect(stack),
     }
+}
+
+/// The five equipment slots a frame's stacks convert to: each slot through the same
+/// item-icon seam rule — a slot's stack becomes the draw's reduced view, and nothing else
+/// of the stack crosses the crate edge.
+fn equipment_draw(equipment: &[Option<MetadataItem>; 5]) -> [Option<EquipmentDraw>; 5] {
+    std::array::from_fn(|slot| equipment[slot].as_ref().map(equipment_stack))
+}
+
+/// One stack's conversion: the id, damage and effect flag the icon seam reads, the raw
+/// `display.color` int the leather dye reads and the cross flag the held item's block
+/// branch reads (`LayerHeldItem.java`:52-59's `getRenderType() == 2` test, folded by the
+/// behaviour table's own cross kind).
+fn equipment_stack(stack: &MetadataItem) -> EquipmentDraw {
+    EquipmentDraw {
+        id: stack.id,
+        damage: stack.damage,
+        enchanted: stack_has_effect(stack),
+        colour: display_colour(stack),
+        cross: matches!(
+            items::resolve(stack.id, stack.damage),
+            items::ItemResolution::Block(block)
+                if behaviour::behaviour(block).is_some_and(|entry| entry.render == RenderKind::Cross)
+        ),
+    }
+}
+
+/// The raw `display.color` int of a stack's NBT tail, when the tag carries one
+/// (`ItemArmor.hasColor`:127-130's `hasKey("display", 10)` fold through
+/// `getColor`:135-157): the root compound's `display` child's `color` int. A tail that
+/// is not a compound, or does not parse, carries none.
+fn display_colour(stack: &MetadataItem) -> Option<i32> {
+    let nbt = stack.nbt.as_deref()?;
+    let Ok(NbtValue::Compound(children)) = oxide_proto_v47::nbt::parse(nbt) else {
+        return None;
+    };
+    let Some((_, NbtValue::Compound(display))) =
+        children.iter().find(|(name, _)| name == "display")
+    else {
+        return None;
+    };
+    display
+        .iter()
+        .find_map(|(name, value)| match (name.as_str(), value) {
+            ("color", NbtValue::Int(colour)) => Some(*colour),
+            _ => None,
+        })
 }
 
 /// The source's `hasEffect` rule for one stack (`Item.hasEffect`:416-419 and its six
@@ -2707,7 +2770,7 @@ mod tests {
     use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, display_name};
     use oxide_proto_v47::entity::MetadataItem;
     use oxide_render::entity_models::PoseExtra;
-    use oxide_render::entity_models::player::{CapeMotion, cape_rotation};
+    use oxide_render::entity_models::player::{PlayerExtra, cape_rotation};
     use oxide_render::entity_pass::{FrameContent, ModelRef, NametagDraw, TextureRef};
     use oxide_render::hud::scaled_resolution;
     use oxide_world::entity::EntityKind;
@@ -2731,6 +2794,7 @@ mod tests {
             kind: EntityKind::Player,
             uuid: Some(uuid.to_owned()),
             name: None,
+            equipment: std::array::from_fn(|_| None),
             prev: [0.0, 0.0, 0.0],
             pos: [2.0, 0.0, 0.0],
             prev_yaw: 0.0,
@@ -2892,8 +2956,9 @@ mod tests {
         let draw = &draws_at(&view, t0, Duration::ZERO)[0];
         assert_eq!(
             draw.pose.extra,
-            PoseExtra::Player(CapeMotion {
-                motion: [2.0, 0.0, 0.0]
+            PoseExtra::Player(PlayerExtra {
+                motion: [2.0, 0.0, 0.0],
+                held: false,
             }),
             "the cape's motion term is the frame pair's displacement"
         );
@@ -2909,8 +2974,9 @@ mod tests {
         view.observe(vec![still], t0);
         assert_eq!(
             draws_at(&view, t0, Duration::ZERO)[0].pose.extra,
-            PoseExtra::Player(CapeMotion {
-                motion: [0.0, 0.0, 0.0]
+            PoseExtra::Player(PlayerExtra {
+                motion: [0.0, 0.0, 0.0],
+                held: false,
             })
         );
     }
@@ -3071,7 +3137,11 @@ mod tests {
         let t0 = Instant::now();
         view.observe(
             vec![
-                mob_frame(1, EntityKind::Creeper, EntityExtra::Mob(MobExtra::Creeper)),
+                mob_frame(
+                    1,
+                    EntityKind::Creeper,
+                    EntityExtra::Mob(MobExtra::Creeper { powered: false }),
+                ),
                 mob_frame(2, EntityKind::Spider, EntityExtra::Mob(MobExtra::Other)),
                 mob_frame(3, EntityKind::CaveSpider, EntityExtra::Mob(MobExtra::Other)),
                 mob_frame(
@@ -3130,7 +3200,7 @@ mod tests {
         // The pinned extras ride the draws: the creeper's marker, the bat's hang on
         // both terms, the cubes' sizes with their squash pairs at rest, and the
         // client-side-only states held off.
-        assert_eq!(draws[0].extra, DrawExtra::Creeper);
+        assert_eq!(draws[0].extra, DrawExtra::Creeper { powered: false });
         assert_eq!(
             draws[3].pose.extra,
             PoseExtra::Enderman { attacking: false }
@@ -3539,22 +3609,34 @@ mod tests {
                 mob_frame(
                     26,
                     EntityKind::WitherBoss,
-                    EntityExtra::Mob(MobExtra::Wither { invul_time: 0 }),
+                    EntityExtra::Mob(MobExtra::Wither {
+                        invul_time: 0,
+                        armored: false,
+                    }),
                 ),
                 mob_frame(
                     27,
                     EntityKind::WitherBoss,
-                    EntityExtra::Mob(MobExtra::Wither { invul_time: 100 }),
+                    EntityExtra::Mob(MobExtra::Wither {
+                        invul_time: 100,
+                        armored: false,
+                    }),
                 ),
                 mob_frame(
                     28,
                     EntityKind::WitherBoss,
-                    EntityExtra::Mob(MobExtra::Wither { invul_time: 5 }),
+                    EntityExtra::Mob(MobExtra::Wither {
+                        invul_time: 5,
+                        armored: false,
+                    }),
                 ),
                 mob_frame(
                     29,
                     EntityKind::WitherBoss,
-                    EntityExtra::Mob(MobExtra::Wither { invul_time: 10 }),
+                    EntityExtra::Mob(MobExtra::Wither {
+                        invul_time: 10,
+                        armored: false,
+                    }),
                 ),
             ],
             t0,
@@ -3880,7 +3962,7 @@ mod tests {
     fn every_roster_mob_maps_to_a_draw() {
         let cases: &[(EntityKind, MobExtra)] = &[
             // 50..=68.
-            (EntityKind::Creeper, MobExtra::Creeper),
+            (EntityKind::Creeper, MobExtra::Creeper { powered: false }),
             (EntityKind::Skeleton, MobExtra::Other),
             (EntityKind::Spider, MobExtra::Other),
             (EntityKind::Giant, MobExtra::Other),
@@ -3894,7 +3976,13 @@ mod tests {
             (EntityKind::Blaze, MobExtra::Other),
             (EntityKind::LavaSlime, MobExtra::Slime { size: 1 }),
             (EntityKind::EnderDragon, MobExtra::Other),
-            (EntityKind::WitherBoss, MobExtra::Wither { invul_time: 0 }),
+            (
+                EntityKind::WitherBoss,
+                MobExtra::Wither {
+                    invul_time: 0,
+                    armored: false,
+                },
+            ),
             (EntityKind::Bat, MobExtra::Bat { hanging: false }),
             (EntityKind::Witch, MobExtra::Other),
             (EntityKind::Endermite, MobExtra::Other),
@@ -6203,6 +6291,164 @@ mod tests {
         // builtin shape never glints) is the pass's own.
         let chest = item_icon(&stack(54, 0, Some(ench.to_vec())));
         assert!(chest.enchanted, "the chest's tag sets the flag: {chest:?}");
+    }
+
+    /// The equipment conversion: each slot's stack becomes the draw's reduced view
+    /// through the same seam the icon takes — the id and damage, the enchant flag, the
+    /// raw `display.color` int the leather dye reads (`ItemArmor.hasColor`:127-130's
+    /// compound fold) and the cross flag the held item's block branch reads
+    /// (`LayerHeldItem.java`:52's render-type-2 test through the behaviour table's own
+    /// cross kind). Empty slots convert to nothing; a tail that is not a compound, or
+    /// carries no `display`, carries no colour.
+    #[test]
+    fn the_equipment_converts_through_the_item_icon_seam() {
+        // A leather chestplate (299) with a red dye: the root compound's `display`
+        // child's `color` int, 0xFF0000.
+        let dyed = [
+            0x0A, 0x00, 0x00, // the root: a compound, no name
+            0x0A, 0x00, 0x07, b'd', b'i', b's', b'p', b'l', b'a',
+            b'y', // a compound `display`
+            0x03, 0x00, 0x05, b'c', b'o', b'l', b'o', b'r', // an int `color`
+            0x00, 0xFF, 0x00, 0x00, // 0xFF0000
+            0x00, // the display ends
+            0x00, // the root ends
+        ];
+        let slots: [Option<MetadataItem>; 5] = std::array::from_fn(|slot| {
+            (slot == 3).then(|| MetadataItem {
+                id: 299,
+                count: 1,
+                damage: 0,
+                nbt: Some(dyed.to_vec()),
+            })
+        });
+        let converted = equipment_draw(&slots);
+        assert_eq!(
+            converted[3],
+            Some(EquipmentDraw {
+                id: 299,
+                damage: 0,
+                enchanted: false,
+                colour: Some(0xFF0000),
+                cross: false,
+            })
+        );
+        assert!(
+            converted[..3].iter().all(Option::is_none) && converted[4].is_none(),
+            "empty slots convert to nothing"
+        );
+        // A `display` without a `color`, and a root that is not a compound: no colour.
+        let bare_display = [
+            0x0A, 0x00, 0x00, 0x0A, 0x00, 0x07, b'd', b'i', b's', b'p', b'l', b'a', b'y', 0x00,
+            0x00,
+        ];
+        let stack = MetadataItem {
+            id: 299,
+            count: 1,
+            damage: 0,
+            nbt: Some(bare_display.to_vec()),
+        };
+        assert_eq!(equipment_stack(&stack).colour, None);
+        let not_compound = MetadataItem {
+            id: 299,
+            count: 1,
+            damage: 0,
+            nbt: Some(vec![0x03, 0x00, 0x01, b'x', 0x00, 0x00, 0x00, 0x05]),
+        };
+        assert_eq!(equipment_stack(&not_compound).colour, None);
+
+        // The cross flag: tall grass (31) is the cross family, stone (1) is not, and a
+        // non-block item never is (`ItemBlock`'s own gate).
+        let grass = MetadataItem {
+            id: 31,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        };
+        assert!(
+            equipment_stack(&grass).cross,
+            "tall grass is the cross family"
+        );
+        let stone = MetadataItem {
+            id: 1,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        };
+        assert!(!equipment_stack(&stone).cross);
+        let sword = MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        };
+        assert!(!equipment_stack(&sword).cross);
+    }
+
+    /// The equipment and the extras ride the draw: a held stack lifts the player's
+    /// `held` pose flag (`RenderPlayer.setModelVisibilities`:93-97's non-null gate), the
+    /// creeper's charge (byte 17) and the wither's armour flag ride the draw's extra,
+    /// and the five slots convert onto the draw's own array.
+    #[test]
+    fn the_equipment_and_extras_ride_the_draw() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        let mut frame = player_frame(1, UUID_WIDE);
+        frame.equipment[0] = Some(MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        view.observe(vec![frame.clone()], t0);
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        let draw = &draws[0];
+        assert_eq!(draw.id, 1, "the draw carries the frame's id");
+        assert!(
+            matches!(
+                draw.pose.extra,
+                PoseExtra::Player(PlayerExtra { held: true, .. })
+            ),
+            "a held stack lifts the flag: {:?}",
+            draw.pose.extra
+        );
+        assert_eq!(
+            draw.equipment[0].map(|stack| stack.id),
+            Some(276),
+            "the held slot converts onto the draw"
+        );
+        // An empty hand leaves the flag off.
+        frame.equipment[0] = None;
+        view.observe(vec![frame], t0);
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert!(matches!(
+            draws[0].pose.extra,
+            PoseExtra::Player(PlayerExtra { held: false, .. })
+        ));
+
+        // The creeper's charge and the wither's armour ride the draw's extra.
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(
+            vec![
+                mob_frame(
+                    1,
+                    EntityKind::Creeper,
+                    EntityExtra::Mob(MobExtra::Creeper { powered: true }),
+                ),
+                mob_frame(
+                    2,
+                    EntityKind::WitherBoss,
+                    EntityExtra::Mob(MobExtra::Wither {
+                        invul_time: 0,
+                        armored: true,
+                    }),
+                ),
+            ],
+            t0,
+        );
+        let draws = draws_at(&view, t0, Duration::ZERO);
+        assert_eq!(draws[0].extra, DrawExtra::Creeper { powered: true });
+        assert_eq!(draws[1].extra, DrawExtra::Wither { armored: true });
     }
 
     /// The potion arm's own decode: `ItemPotion.hasEffect`:330-334 is its effect list

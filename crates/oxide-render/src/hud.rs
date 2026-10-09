@@ -2260,6 +2260,7 @@ mod tests {
                 },
                 transform: oxide_assets::model::Transform::DEFAULT,
                 first_person: oxide_assets::model::Transform::DEFAULT,
+                third_person: oxide_assets::model::Transform::DEFAULT,
                 shape,
             })
         }

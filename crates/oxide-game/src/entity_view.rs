@@ -136,6 +136,9 @@ pub struct EntityFrame {
     pub health: Option<(f32, f32)>,
     /// The composed nametag text, when the name may show.
     pub nametag: Option<Arc<str>>,
+    /// The five equipment slots' stacks, in the store's own order (held `0`, feet `1`,
+    /// legs `2`, chest `3`, head `4`) — the held-item and armour layers' input.
+    pub equipment: [Option<MetadataItem>; 5],
     /// The kind-specific extras the renderer reads.
     pub extra: EntityExtra,
 }
@@ -305,10 +308,13 @@ pub enum MobExtra {
         elder: bool,
     },
     /// A wither's spawn invulnerability timer (int 20 — `EntityWither.getInvulTime`),
-    /// which the sheet flickers by.
+    /// which the sheet flickers by, and the armour flag the aura layer reads — the
+    /// health fold, `isArmored` at or below half (`EntityWither.isArmored:653-656`).
     Wither {
         /// The timer in ticks; zero once the spawn shield drops.
         invul_time: u16,
+        /// Whether the wither's health sits at or below half.
+        armored: bool,
     },
     /// A zombie's villager flag (byte index 13 —
     /// `EntityZombie.isVillager:197`).
@@ -316,8 +322,12 @@ pub enum MobExtra {
         /// Whether the zombie is a villager zombie.
         villager: bool,
     },
-    /// A creeper; its fuse and powered state are not read this milestone.
-    Creeper,
+    /// A creeper: byte index 17 the charged flag (`EntityCreeper.getPowered:213-216`
+    /// answers `== 1`).
+    Creeper {
+        /// Whether the creeper is charged.
+        powered: bool,
+    },
     /// An enderman; its carried block and screaming are not read this
     /// milestone.
     Enderman,
@@ -522,6 +532,7 @@ fn frame_of(
         brightness: brightness(world, entity.position),
         health: health(entity),
         nametag: nametag(entity, player_list, board, ridden),
+        equipment: entity.equipment.clone(),
         extra: extra(entity),
     }
 }
@@ -841,16 +852,25 @@ fn mob_extra(kind: EntityKind, entity: &Entity) -> MobExtra {
         },
         // A wither: int 20 the spawn invulnerability's timer
         // (`EntityWither.getInvulTime`); negatives and values past the wire's short
-        // clamp to it.
-        EntityKind::WitherBoss => MobExtra::Wither {
-            invul_time: int_at(entity, 20).unwrap_or(0).clamp(0, 65_535) as u16,
-        },
+        // clamp to it. The armour flag is the health fold (`isArmored`:653-656).
+        EntityKind::WitherBoss => {
+            let (current, maximum) =
+                health(entity).unwrap_or((WITHER_MAX_HEALTH, WITHER_MAX_HEALTH));
+            MobExtra::Wither {
+                invul_time: int_at(entity, 20).unwrap_or(0).clamp(0, 65_535) as u16,
+                armored: current <= maximum / 2.0,
+            }
+        }
         // A zombie: byte 13 the villager flag
         // (`EntityZombie.isVillager:195-198` answers `== 1`).
         EntityKind::Zombie => MobExtra::Zombie {
             villager: byte_at(entity, 13).unwrap_or(0) == 1,
         },
-        EntityKind::Creeper => MobExtra::Creeper,
+        // A creeper: byte 17 the charged flag (`EntityCreeper.getPowered` answers
+        // `== 1`).
+        EntityKind::Creeper => MobExtra::Creeper {
+            powered: byte_at(entity, 17).unwrap_or(0) == 1,
+        },
         EntityKind::Enderman => MobExtra::Enderman,
         _ => MobExtra::Other,
     }
@@ -1371,7 +1391,7 @@ mod tests {
     fn the_mobless_mobs_are_their_own_extras() {
         assert_eq!(
             extra_for(&Entity::new(1, EntityKind::Creeper)),
-            EntityExtra::Mob(MobExtra::Creeper)
+            EntityExtra::Mob(MobExtra::Creeper { powered: false })
         );
         assert_eq!(
             extra_for(&Entity::new(1, EntityKind::Enderman)),

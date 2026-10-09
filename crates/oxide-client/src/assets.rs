@@ -75,7 +75,7 @@ const CLOUDS: &str = "environment/clouds";
 /// layers bind sheets of their own, `textures/entity/spider_eyes.png` and
 /// `textures/entity/enderman/enderman_eyes.png` (`LayerSpiderEyes.java`:11,
 /// `LayerEndermanEyes.java`:11).
-pub const ENTITY_TEXTURES: [&str; 77] = [
+pub const ENTITY_TEXTURES: [&str; 92] = [
     "misc/shadow.png",
     "entity/steve.png",
     "entity/alex.png",
@@ -99,6 +99,7 @@ pub const ENTITY_TEXTURES: [&str; 77] = [
     "entity/sheep/sheep.png",
     "entity/sheep/sheep_fur.png",
     "entity/creeper/creeper.png",
+    "entity/creeper/creeper_armor.png",
     "entity/spider/spider.png",
     "entity/spider_eyes.png",
     "entity/spider/cave_spider.png",
@@ -163,6 +164,25 @@ pub const ENTITY_TEXTURES: [&str; 77] = [
     "entity/enderdragon/dragon.png",
     "entity/wither/wither.png",
     "entity/wither/wither_invulnerable.png",
+    "entity/wither/wither_armor.png",
+    // The equipment sheets the held-item and armour layers read: the ten tier sheets and
+    // the two leather overlays (`getArmorResource`:136-153's
+    // `textures/models/armor/<material>_layer_<n>.png`, the overlays' third argument at
+    // `LayerArmorBase`:68) and the one enchant glint
+    // (`LayerArmorBase.java`:15's `ENCHANTED_ITEM_GLINT_RES`).
+    "models/armor/leather_layer_1.png",
+    "models/armor/leather_layer_2.png",
+    "models/armor/leather_layer_1_overlay.png",
+    "models/armor/leather_layer_2_overlay.png",
+    "models/armor/chainmail_layer_1.png",
+    "models/armor/chainmail_layer_2.png",
+    "models/armor/iron_layer_1.png",
+    "models/armor/iron_layer_2.png",
+    "models/armor/diamond_layer_1.png",
+    "models/armor/diamond_layer_2.png",
+    "models/armor/gold_layer_1.png",
+    "models/armor/gold_layer_2.png",
+    "misc/enchanted_item_glint.png",
 ];
 
 /// The wide default skin's key, an entry of [`ENTITY_TEXTURES`].
@@ -616,6 +636,9 @@ impl ClientItemIcons {
                         // (`item/torch.json`'s own `display.firstperson`), the chain's
                         // completed lookup.
                         first_person: baked.display.first_person,
+                        // The third-person slot is the same chain's own
+                        // (`LayerHeldItem.java`:66's `TransformType.THIRD_PERSON`).
+                        third_person: baked.display.third_person,
                         shape: IconShape::Gui3d,
                     })
                 }
@@ -647,6 +670,13 @@ impl ClientItemIcons {
                             .and_then(|file| models.bake_item(&file).ok())
                             .map(|baked| baked.display.first_person)
                             .unwrap_or(Transform::DEFAULT),
+                        // The third-person slot is the same lookup's own
+                        // (`LayerHeldItem.java`:66).
+                        third_person: models
+                            .generated_item_file(layers)
+                            .and_then(|file| models.bake_item(&file).ok())
+                            .map(|baked| baked.display.third_person)
+                            .unwrap_or(Transform::DEFAULT),
                         shape: IconShape::Flat,
                     })
                 }),
@@ -664,6 +694,7 @@ impl ClientItemIcons {
                             // `item/chest.json` files carry none), so the slot is the
                             // source's default.
                             first_person: baked.display.first_person,
+                            third_person: baked.display.third_person,
                             shape: IconShape::Builtin,
                         })
                 }
@@ -677,6 +708,7 @@ impl ClientItemIcons {
             },
             transform: Transform::DEFAULT,
             first_person: Transform::DEFAULT,
+            third_person: Transform::DEFAULT,
             shape: IconShape::Gui3d,
         });
         ClientItemIcons { icons, missing }
@@ -867,6 +899,7 @@ mod tests {
                 "entity/sheep/sheep.png",
                 "entity/sheep/sheep_fur.png",
                 "entity/creeper/creeper.png",
+                "entity/creeper/creeper_armor.png",
                 "entity/spider/spider.png",
                 "entity/spider_eyes.png",
                 "entity/spider/cave_spider.png",
@@ -879,6 +912,16 @@ mod tests {
                 "entity/bat.png",
                 "entity/silverfish.png",
                 "entity/endermite.png",
+                // The exotic families: the horse's type, colour, marking and armour tables
+                // (`RenderHorse.getEntityTexture`:51-78, `EntityHorse.java`:53-58), the wolf's
+                // states and the collar sheet (`RenderWolf.getEntityTexture`:46-49,
+                // `LayerWolfCollar.java`:12), the cat coats (`RenderOcelot.getEntityTexture`:23-40),
+                // the rabbit coats with the toast and killer entries
+                // (`RenderRabbit.getEntityTexture`:27-62), the ghast's shooting sheet
+                // (`RenderGhast.getEntityTexture`:21-24), the blaze's, the guardian pair
+                // (`RenderGuardian.getEntityTexture`:177-180), the dragon's
+                // (`RenderDragon.getEntityTexture`:150-153) and the wither's spawn-shield pair
+                // (`RenderWither.getEntityTexture`:33-37).
                 "entity/horse/horse_white.png",
                 "entity/horse/horse_creamy.png",
                 "entity/horse/horse_chestnut.png",
@@ -921,6 +964,25 @@ mod tests {
                 "entity/enderdragon/dragon.png",
                 "entity/wither/wither.png",
                 "entity/wither/wither_invulnerable.png",
+                "entity/wither/wither_armor.png",
+                // The equipment sheets the held-item and armour layers read: the ten tier sheets and
+                // the two leather overlays (`getArmorResource`:136-153's
+                // `textures/models/armor/<material>_layer_<n>.png`, the overlays' third argument at
+                // `LayerArmorBase`:68) and the one enchant glint
+                // (`LayerArmorBase.java`:15's `ENCHANTED_ITEM_GLINT_RES`).
+                "models/armor/leather_layer_1.png",
+                "models/armor/leather_layer_2.png",
+                "models/armor/leather_layer_1_overlay.png",
+                "models/armor/leather_layer_2_overlay.png",
+                "models/armor/chainmail_layer_1.png",
+                "models/armor/chainmail_layer_2.png",
+                "models/armor/iron_layer_1.png",
+                "models/armor/iron_layer_2.png",
+                "models/armor/diamond_layer_1.png",
+                "models/armor/diamond_layer_2.png",
+                "models/armor/gold_layer_1.png",
+                "models/armor/gold_layer_2.png",
+                "misc/enchanted_item_glint.png",
             ]
         );
         assert!(ENTITY_TEXTURES.contains(&DEFAULT_SKIN_WIDE));

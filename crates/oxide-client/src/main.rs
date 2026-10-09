@@ -1496,6 +1496,8 @@ impl ClientApp {
         // The glint's own clock, before the list lands: an enchanted icon's glint
         // passes scroll by the frame's system time.
         renderer.set_hud_system_time(system_time_ms());
+        // The entity pass's own clock, for the held item's glint scroll.
+        renderer.set_entity_system_time(system_time_ms());
         renderer.set_hud(hud_draws);
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
@@ -2781,6 +2783,10 @@ impl ApplicationHandler for ClientApp {
                 renderer.set_hud_texture(key, texture);
             }
             renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
+            // The entity pass's icon source: the same resolver the hud's item draws
+            // read, so the held item's mesh and its third-person transform resolve
+            // through one seam.
+            renderer.set_entity_icon_source(Arc::new(assets.item_icons.clone()));
             // The enchanted glint's sheet: the glint passes of an enchanted icon
             // sample it under the glint sampler.
             renderer.set_hud_glint(&assets.glint_sheet);
@@ -3964,6 +3970,7 @@ mod tests {
             kind: EntityKind::Pig,
             uuid: None,
             name: None,
+            equipment: std::array::from_fn(|_| None),
             prev: pos,
             pos,
             prev_yaw: 0.0,

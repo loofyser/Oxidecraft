@@ -497,6 +497,20 @@ impl Renderer {
         self.entity_pass.set_item_source(source);
     }
 
+    /// Sets the icon source the entity pass's equipment layers resolve their stacks
+    /// through: the same resolver the hud's item draws take, so a held item and a GUI
+    /// icon read one seam. Until this is called, the held item draws nothing.
+    pub fn set_entity_icon_source(&mut self, source: Arc<dyn ItemIconSource>) {
+        self.entity_pass.set_icon_source(source);
+    }
+
+    /// Hands the entity pass the frame's system time, in milliseconds: the held item's
+    /// glint scroll reads it (`Minecraft.getSystemTime`); the armour's own glint scrolls
+    /// with the entity's age and reads none of it.
+    pub fn set_entity_system_time(&mut self, time_ms: u64) {
+        self.entity_pass.set_system_time(time_ms);
+    }
+
     /// Uploads one profile's skin and cape, replacing the profile's entry whole.
     ///
     /// A re-upload replaces both textures; a missing cape clears one. A profile with no skin
