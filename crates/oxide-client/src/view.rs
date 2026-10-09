@@ -1017,11 +1017,10 @@ impl View {
     /// the source declares it false and never sets it (`:638`, read at
     /// `:793-811`).
     ///
-    /// Two test-pinned readings differ from the letter of the source, both
-    /// recorded: the container's blink follows the pending counter rather than
-    /// the phased flag (so the raise's own render already blinks), and the
-    /// one-second settle parks the counter on the tick (so the flash ends with
-    /// the memory).
+    /// The container's blink follows the source's phased flag rather than the
+    /// pending counter (`k3 = flag ? 1 : 0`, `:700-705` — the raise's own
+    /// render keeps the normal container), and the one-second settle leaves
+    /// the counter untouched (`:628-636` never resets it).
     pub fn stat_rows_draws(&mut self, input: &RowsInput<'_>) -> Vec<HudDraw> {
         if !input.survival || !hud_visible(input.hide_gui, input.screen_open) {
             return Vec::new();
@@ -1048,7 +1047,6 @@ impl View {
             rows.player_health = i;
             rows.last_player_health = i;
             rows.last_system_time = input.now_ms;
-            rows.health_update_counter = rows.tick as i64;
         }
         rows.player_health = i;
         let j = rows.last_player_health;
@@ -1090,7 +1088,7 @@ impl View {
             } else {
                 0
             };
-        let k3 = if blink { 1 } else { 0 };
+        let k3 = if flag { 1 } else { 0 };
         let cells = ceil_float_int((max_health + absorption) / 2.0);
         let mut f2 = absorption;
         for i6 in (0..cells).rev() {
@@ -8325,8 +8323,10 @@ mod tests {
     /// and the one-second settle — with the raises gated by the hurt window.
     #[test]
     fn the_rows_blink_state_follows_the_counter_and_clock() {
-        // A hurt loss raises by twenty: drawing three ticks on the flag reads
-        // true and the flash pair draws against the remembered twenty.
+        // A hurt loss raises by twenty: the raise's own frame (diff 20) is
+        // phase-false so the container stays normal; a later phase-true
+        // frame (diff 17) blinks and the flash pair draws against the
+        // remembered twenty.
         let mut view = View::new();
         let font = chat_font();
         let _ = rows_draws(
@@ -8363,8 +8363,8 @@ mod tests {
         );
         let slices = rows_slices(&draws);
         assert!(
-            slices.contains(&(122.0, 201.0, [25.0 / 256.0, 0.0, 34.0 / 256.0, 9.0 / 256.0])),
-            "the blink recolours the container while the flag runs: {slices:?}"
+            slices.contains(&(122.0, 201.0, [16.0 / 256.0, 0.0, 25.0 / 256.0, 9.0 / 256.0])),
+            "the raise's own frame keeps the normal container: {slices:?}"
         );
         let draws = rows_draws(
             &mut view,
@@ -8392,7 +8392,9 @@ mod tests {
             "the current half heart over its flash: {slices:?}"
         );
         // Past the second the settle lands: the remembered health becomes the
-        // current one and the flash leaves.
+        // current one, but the counter still runs ahead phase-true — so the
+        // source keeps that frame's flash (`:628-636` never resets the
+        // counter). The flash ends with the counter instead.
         let draws = rows_draws(
             &mut view,
             Some(&font),
@@ -8411,10 +8413,32 @@ mod tests {
         );
         let slices = rows_slices(&draws);
         assert!(
+            slices.contains(&(186.0, 201.0, [79.0 / 256.0, 0.0, 88.0 / 256.0, 9.0 / 256.0])),
+            "the settle keeps that frame's flash: {slices:?}"
+        );
+        // At the counter the blink ends: plain containers, no flash.
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            6_001,
+            120,
+            false,
+            0,
+            16.5,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
             !slices
                 .iter()
                 .any(|(_, _, uv)| uv[0] == 70.0 / 256.0 || uv[0] == 79.0 / 256.0),
-            "no flash slice survives the settle: {slices:?}"
+            "no flash slice survives the counter: {slices:?}"
         );
         // A loss outside the hurt window raises nothing: plain containers.
         let mut view = View::new();

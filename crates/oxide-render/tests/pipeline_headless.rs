@@ -8826,7 +8826,7 @@ fn the_hud_pass_draws_the_poisoned_hearts() {
         draws.push(rows_slice(122.0 + cell as f32 * 8.0, 201.0, 16, 0));
     }
     for cell in 0..9 {
-        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 201.0, 52, 0));
+        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 201.0, 88, 0));
     }
     draws.push(rows_slice(194.0, 201.0, 97, 0));
     hud.set_draws(
@@ -8942,8 +8942,9 @@ fn the_hud_pass_draws_the_mixed_armour() {
     );
 }
 
-/// The hud draws the draining air row at its true coordinates: seven air submerged —
-/// three full bubbles and the fading pair on the fourth, nothing past it.
+/// The hud draws the draining air row at its true coordinates: ninety-one air
+/// submerged — three full bubbles and the fading pair on the fourth, nothing
+/// past it.
 ///
 /// The pins: the first bubble's cyan, the fourth's popping blue, the sky where the
 /// fifth would sit, and the sky above the row.
@@ -9008,7 +9009,7 @@ fn the_hud_pass_draws_the_experience_bar() {
     for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
         draws.push(HudDraw::Text {
             text: "12".to_string(),
-            x: 211.0 + dx,
+            x: 212.0 + dx,
             y: 205.0 + dy,
             scale: 1.0,
             colour: black,
@@ -9018,7 +9019,7 @@ fn the_hud_pass_draws_the_experience_bar() {
     }
     draws.push(HudDraw::Text {
         text: "12".to_string(),
-        x: 211.0,
+        x: 212.0,
         y: 205.0,
         scale: 1.0,
         colour: green,
@@ -9048,8 +9049,8 @@ fn the_hud_pass_draws_the_experience_bar() {
         [0, 0, 139],
         "the background's right edge",
     );
-    expect_rows(&pixels, 211, 208, [128, 255, 32], "the main one's green");
-    expect_rows(&pixels, 213, 208, [128, 255, 32], "the main two's green");
-    expect_rows(&pixels, 212, 205, [0, 0, 0], "the outline beside the pen");
-    expect_rows(&pixels, 211, 204, [0, 0, 0], "the outline above the pen");
+    expect_rows(&pixels, 212, 208, [128, 255, 32], "the main one's green");
+    expect_rows(&pixels, 214, 208, [128, 255, 32], "the main two's green");
+    expect_rows(&pixels, 213, 205, [0, 0, 0], "the outline beside the pen");
+    expect_rows(&pixels, 212, 204, [0, 0, 0], "the outline above the pen");
 }
