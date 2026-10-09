@@ -53,6 +53,9 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_assets::font::Font;
 use oxide_assets::skins::SkinCache;
 use oxide_assets::store::Store;
+use oxide_client::items::ItemTable;
+use oxide_client::screens::Screens;
+use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -731,6 +734,17 @@ struct ClientApp {
     skin_updates: Option<Receiver<SkinUpdate>>,
     /// The pointer-capture rules.
     capture: Capture,
+    /// The open screen, when the server has a window up: the container screens
+    /// Task 16 wires. While one is open the pointer is free and the screen
+    /// holds every event — the M4 rule — with its own routing below.
+    screens: Screens,
+    /// Whether either shift key is held: the container screen's shift-click
+    /// reads it (`Keyboard.isKeyDown(42) || isKeyDown(54)` at
+    /// `GuiContainer.java`:413), and the window owns no other modifier state.
+    shift: bool,
+    /// Whether either control key is held: the drop key's whole-stack arm
+    /// reads it (`isCtrlKeyDown` at `GuiContainer.java`:707).
+    ctrl: bool,
     /// The free pointer's position in the frame's GUI units while the chat is
     /// open: the hover and the box's hit-test read it, and nothing about it
     /// reaches the session (`GuiChat.drawScreen`:305-310 reads the free mouse;
@@ -1188,6 +1202,9 @@ impl ClientApp {
             overlay_visible,
             dead: false,
             capture: Capture::default(),
+            screens: Screens::default(),
+            shift: false,
+            ctrl: false,
             cursor: None,
             opener: Box::new(spawn_url_opener),
             script,
@@ -1240,6 +1257,17 @@ impl ClientApp {
         let mut script_click = false;
         for event in events {
             self.view.apply(&event);
+            // The screens fold the window's own events — a free function, so
+            // the fold runs while the renderer below stays borrowed.
+            Self::apply_screen_event(
+                &mut self.screens,
+                &mut self.tab,
+                &mut self.cursor,
+                &mut self.capture,
+                self.window.as_ref(),
+                self.session.as_ref(),
+                &event,
+            );
             // The tab list folds its own events in — the player-list entries
             // and the header and footer pair — and a scoreboard report
             // becomes the frame's mirror, the board the assembly reads.
@@ -1473,6 +1501,21 @@ impl ClientApp {
             tooltip_point(self.chat_input.open, self.chat.confirm_open(), self.cursor),
             scaled,
         );
+        // The screen's frame: the panel centres in the scaled size and the free
+        // pointer feeds the hover, so the draws the group assembles below read
+        // the frame's own state.
+        let screen_open = self.screens.is_open();
+        if let Some(screen) = self.screens.container_mut() {
+            screen.set_screen_size(scaled.width as i32, scaled.height as i32);
+        }
+        // Inline — not the method — so the feed runs while the renderer
+        // stays borrowed: the fields are disjoint.
+        if let Some(cursor) = self.cursor {
+            if let Some(screen) = self.screens.container_mut() {
+                let (ox, oy) = screen.origin();
+                screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32, &ItemTable);
+            }
+        }
         // The hud list runs in the source's own overlay order: the hotbar frame
         // first — the background and highlight slices, the slot items, the
         // crosshair fifth and the popup eleventh (`GuiIngame.java`:136-362) —
@@ -1481,9 +1524,10 @@ impl ClientApp {
         // with the measured font; the list draws only while its key is held.
         // The survival rows land between the hotbar and the sidebar, in the
         // overlay's own order (`renderPlayerStats` then `renderExpBar`).
-        // The window carries no F1 key, no open screen and no spectator/debug
-        // state yet, so the hotbar's gates rest at their playing defaults and
-        // the mode at survival (recorded; later tasks feed them).
+        // The window carries no F1 key and no spectator/debug state yet, so the
+        // hotbar's gates rest at their playing defaults and the mode at
+        // survival (recorded; later tasks feed them) — but the open screen
+        // rides the frame's own state now.
         let mut hud_draws = self.view.hotbar_draws(
             Instant::now(),
             &view::HotbarInput {
@@ -1491,7 +1535,7 @@ impl ClientApp {
                 scaled,
                 show_crosshair: true,
                 hide_gui: false,
-                screen_open: false,
+                screen_open,
                 survival: true,
             },
         );
@@ -1500,7 +1544,7 @@ impl ClientApp {
             scaled,
             survival: true,
             hide_gui: false,
-            screen_open: false,
+            screen_open,
             now_ms: system_time_ms(),
         }));
         hud_draws.extend(match self.font.as_ref() {
@@ -1524,6 +1568,18 @@ impl ClientApp {
         // The entity pass's own clock, for the held item's glint scroll.
         renderer.set_entity_system_time(system_time_ms());
         renderer.set_hud(hud_draws);
+        // The screen group draws above the whole HUD/overlay group: the
+        // source's `currentScreen.drawScreen` after the depth clear
+        // (`EntityRenderer.java`:1185-1191) — the port's own screen pass, fed
+        // from the frame's state every frame.
+        renderer.set_screen(view::screen_draws(
+            &self.screens,
+            &view::ScreenDrawInput {
+                font: self.font.as_ref(),
+                scaled,
+                mouse: self.cursor,
+            },
+        ));
         // The death view replaces the debug overlay while the player is dead:
         // the dim quad over the scene and the two lines where the overlay's
         // text goes. Both are cleared when the respawn arrives.
@@ -1603,10 +1659,12 @@ impl ClientApp {
             match escape_route(
                 self.chat_input.open,
                 self.chat.confirm_open(),
+                self.screens.is_open(),
                 &mut self.capture,
             ) {
                 EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
                 EscapeRoute::CloseChat => self.close_chat(event_loop),
+                EscapeRoute::CloseScreen => self.close_screen(event_loop),
                 EscapeRoute::Capture(step) => self.apply_capture(event_loop, step),
             }
             return;
@@ -1620,6 +1678,13 @@ impl ClientApp {
         }
         if self.chat_input.open {
             self.on_chat_key(event_loop, event);
+            return;
+        }
+        // The open screen holds every other key: the container's own E, 1-9
+        // and Q routing runs here, above the gameplay keys — an open screen
+        // takes user input only for the inventory kind (`allowUserInput`),
+        // but every screen swallows the rest.
+        if self.on_screen_key(event_loop, &event) {
             return;
         }
         // The held player list: a Tab edge while no screen consumes the keys
@@ -1718,6 +1783,221 @@ impl ClientApp {
         self.apply_capture(event_loop, step);
     }
 
+    /// Folds one window event into the screens from the frame loop: an open
+    /// stands the screen, drops the held list and frees the pointer with the
+    /// held keys' clearing send — the source's `displayGuiScreen` through
+    /// `setIngameNotInFocus` (`Minecraft.java`:1010-1012, `:1470-1478`). A
+    /// server close of the live window clears with no send
+    /// (`handleCloseWindow`:1311-1315 reaches `closeScreenAndDropStack` only)
+    /// and recaptures, and every snapshot refreshes the view's slot and
+    /// cursor copies. Other events are not the screens'.
+    /// An associated function without `self` — not a method — so the frame
+    /// loop can fold events through disjoint fields while the renderer stays
+    /// borrowed.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_screen_event(
+        screens: &mut Screens,
+        tab: &mut view::TabState,
+        cursor: &mut Option<(f32, f32)>,
+        capture: &mut Capture,
+        window: Option<&Arc<Window>>,
+        session: Option<&SessionLink>,
+        event: &ClientEvent,
+    ) {
+        /// Runs one capture step's window half: the grab or the release, with
+        /// the step's own input send. The exit arm never reaches this fold.
+        fn apply_step(
+            window: Option<&Arc<Window>>,
+            session: Option<&SessionLink>,
+            capture: &mut Capture,
+            step: CaptureStep,
+        ) {
+            match step {
+                CaptureStep::Consumed => {}
+                CaptureStep::Grab => {
+                    let Some(window) = window else { return };
+                    let grab = window
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                    match grab {
+                        Ok(()) => {
+                            window.set_cursor_visible(false);
+                            tracing::info!("the pointer was grabbed");
+                        }
+                        Err(error) => {
+                            *capture = Capture::default();
+                            tracing::warn!(%error, "the pointer could not be grabbed");
+                        }
+                    }
+                }
+                CaptureStep::Release => {
+                    if let Some(window) = window {
+                        if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                            tracing::warn!(%error, "the pointer could not be released");
+                        }
+                        window.set_cursor_visible(true);
+                    }
+                    if let Some(input) = step.input() {
+                        if let Some(session) = session {
+                            if session.input_tx.send(input).is_err() {
+                                tracing::warn!("the session's input channel is closed");
+                            }
+                        }
+                    }
+                    tracing::info!("the pointer was released and the held keys were cleared");
+                }
+                CaptureStep::Exit => {}
+            }
+        }
+        match event {
+            ClientEvent::WindowOpened {
+                window_id,
+                kind,
+                title,
+            } => {
+                screens.on_window_opened(*window_id, *kind, title.clone());
+                tab.open = false;
+                // The pointer was grabbed until this open: there is no free
+                // position yet, so no hover or hit-test point until the mouse
+                // moves.
+                *cursor = None;
+                let step = capture.chat_open();
+                apply_step(window, session, capture, step);
+            }
+            ClientEvent::WindowClosed { window_id } => {
+                if screens.on_server_close(*window_id) {
+                    *cursor = None;
+                    let step = capture.chat_close();
+                    apply_step(window, session, capture, step);
+                }
+            }
+            ClientEvent::WindowSnapshot {
+                window_id,
+                slots,
+                cursor: snapshot_cursor,
+                ..
+            } => {
+                screens.apply_snapshot(*window_id, slots.clone(), snapshot_cursor.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// Closes the open screen from the window's own key: one `CloseWindow`
+    /// carrying the screen's window id leaves — window 0 included — the
+    /// view's cursor copy drops with it, and the pointer recaptures
+    /// (`GuiContainer.keyTyped`:692-696 through `EntityPlayerSP.closeScreen`
+    /// :330-341). With no screen there is nothing to close and the pointer
+    /// stays as it was.
+    fn close_screen(&mut self, event_loop: &ActiveEventLoop) {
+        let mut dropped = None;
+        let Some(event) = self.screens.close(&mut dropped) else {
+            return;
+        };
+        self.send_input(event);
+        self.cursor = None;
+        let step = self.capture.chat_close();
+        self.apply_capture(event_loop, step);
+    }
+
+    /// Routes one key press to the open screen: the inventory key closes every
+    /// container screen, the number keys swap with mode 2 and the drop key
+    /// drops — `GuiContainer.keyTyped`:692-712 with `checkHotbarKeys`:718-733.
+    /// Releases never reach the screen, and while one is open every other key
+    /// is the screen's to swallow — the M4 rule — so the caller's gameplay
+    /// path must not run after a `true`.
+    fn on_screen_key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) -> bool {
+        if !self.screens.is_open() {
+            return false;
+        }
+        if event.state != ElementState::Pressed {
+            return true;
+        }
+        // The debug key stays live over the screens that take user input —
+        // the runTick keyboard loop runs for `allowUserInput` screens
+        // (`Minecraft.java`:1834) — while containers swallow it.
+        if self.screens.allow_user_input() && is_f3_press(event.state, &event.logical_key) {
+            return false;
+        }
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return true;
+        };
+        if code == KeyCode::KeyE {
+            self.close_screen(event_loop);
+            return true;
+        }
+        // Copied out before the screen borrows: the key sends read it while
+        // the screen stays mutably borrowed.
+        let ctrl = self.ctrl;
+        if let Some(index) = number_key_index(code) {
+            let events = self
+                .screens
+                .container_mut()
+                .map(|screen| screen.screen_key(ScreenKey::Number(index), ctrl))
+                .unwrap_or_default();
+            for event in events {
+                self.send_input(event);
+            }
+            return true;
+        }
+        if code == KeyCode::KeyQ {
+            let events = self
+                .screens
+                .container_mut()
+                .map(|screen| screen.screen_key(ScreenKey::Drop, ctrl))
+                .unwrap_or_default();
+            for event in events {
+                self.send_input(event);
+            }
+            return true;
+        }
+        true
+    }
+
+    /// Routes one mouse button event to the open screen: the press and the
+    /// release both run the container's derivation — `mouseClicked`:359-460
+    /// and `mouseReleased`:515-652 — with the free pointer fed first, and
+    /// every produced click leaves for the session. The middle button is the
+    /// pick-block binding's own (`keyBindPickBlock.getKeyCode() + 100`,
+    /// :362/:410/:448). While a screen is open the click can neither grab
+    /// nor steer, so the caller's paths must not run after a `true`.
+    fn on_screen_button(&mut self, state: ElementState, button: WinitMouseButton) -> bool {
+        if !self.screens.is_open() {
+            return false;
+        }
+        let Some(button) = screen_click_button(button) else {
+            return true;
+        };
+        self.feed_screen_mouse();
+        let shift = self.shift;
+        let Some(screen) = self.screens.container_mut() else {
+            return true;
+        };
+        let now = system_time_ms();
+        let events = match state {
+            ElementState::Pressed => screen.press(button, shift, now),
+            ElementState::Released => screen.release(button, shift, now),
+        };
+        for event in events {
+            self.send_input(event);
+        }
+        true
+    }
+
+    /// Feeds the free pointer into the open container's hover and drag: the
+    /// cursor's screen units minus the panel's origin are the panel-local
+    /// units the hit test reads.
+    fn feed_screen_mouse(&mut self) {
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        let Some(screen) = self.screens.container_mut() else {
+            return;
+        };
+        let (ox, oy) = screen.origin();
+        screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32, &ItemTable);
+    }
+
     /// Routes one key event to the confirm overlay — the only keys it has.
     ///
     /// Enter opens the link: the overlay's URL goes through the opener exactly
@@ -1790,6 +2070,11 @@ impl ClientApp {
         state: ElementState,
         button: WinitMouseButton,
     ) {
+        // The open screen holds the click: the container's own press and
+        // release run here, above the grabbing click and the gameplay button.
+        if self.on_screen_button(state, button) {
+            return;
+        }
         if self.chat_input.open {
             // The screen holds the click. A press with the confirm overlay up
             // belongs to the overlay, whose own keys are the keyboard's in this
@@ -2320,9 +2605,9 @@ fn apply_session_event(
             tracing::debug!(id, "keepalive answered");
             false
         }
-        // The M5 window and inventory events: the screens and the HUD that
-        // read them arrive with later tasks, so nothing consumes them yet and
-        // the session stays up.
+        // The window's own three ride here unconsumed: the screens fold above
+        // owns them (open, server close, snapshot), and the HUD reads the
+        // rest.
         ClientEvent::WindowOpened { .. }
         | ClientEvent::WindowClosed { .. }
         | ClientEvent::WindowSnapshot { .. }
@@ -2681,11 +2966,18 @@ fn tooltip_point(
 /// screen on top, and its cancel re-displays the chat
 /// (`GuiScreen.confirmClicked`:713-725) — then an open chat closes and nothing
 /// else; a closed chat leaves the M3 capture rules exactly as they were.
-fn escape_route(chat_open: bool, confirm_open: bool, capture: &mut Capture) -> EscapeRoute {
+fn escape_route(
+    chat_open: bool,
+    confirm_open: bool,
+    screens_open: bool,
+    capture: &mut Capture,
+) -> EscapeRoute {
     if confirm_open {
         EscapeRoute::CancelConfirm
     } else if chat_open {
         EscapeRoute::CloseChat
+    } else if screens_open {
+        EscapeRoute::CloseScreen
     } else {
         EscapeRoute::Capture(capture.escape())
     }
@@ -2694,13 +2986,18 @@ fn escape_route(chat_open: bool, confirm_open: bool, capture: &mut Capture) -> E
 /// The three destinations of an Escape press. The chat's own close is what
 /// makes an Escape while the chat is open close only — capture neither
 /// releases nor exits — and the overlay's cancel sits above both: cancel is
-/// the topmost screen's, the M3 capture rules only the free pointer's.
+/// the topmost screen's, the M3 capture rules only the free pointer's. A
+/// container screen sits between the chat and the capture: its Escape closes
+/// the screen through `closeScreen` (`GuiContainer.keyTyped`:692-696), which
+/// sends C0D — the chat above it answers first and never reaches here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeRoute {
     /// The confirm overlay is cancelled; the chat below it stays open.
     CancelConfirm,
     /// The open chat closes and nothing else moves.
     CloseChat,
+    /// The open screen closes and C0D leaves for its window.
+    CloseScreen,
     /// The capture rules run, exactly M3's.
     Capture(CaptureStep),
 }
@@ -2731,6 +3028,37 @@ fn bound_mouse_button(button: WinitMouseButton) -> Option<MouseButton> {
     match button {
         WinitMouseButton::Left => Some(MouseButton::Left),
         WinitMouseButton::Right => Some(MouseButton::Right),
+        _ => None,
+    }
+}
+
+/// The container click a window button maps to, or `None` when unbound: left
+/// and right are the source's buttons 0 and 1, and the middle button is the
+/// pick-block binding's default (`keyBindPickBlock.getKeyCode() + 100` at
+/// `GuiContainer.java`:362/:410/:448 — LWJGL button 2 encodes as 102).
+fn screen_click_button(button: WinitMouseButton) -> Option<ClickButton> {
+    match button {
+        WinitMouseButton::Left => Some(ClickButton::Left),
+        WinitMouseButton::Right => Some(ClickButton::Right),
+        WinitMouseButton::Middle => Some(ClickButton::Pick),
+        _ => None,
+    }
+}
+
+/// The hotbar index a number key maps to, or `None` for any other key: the
+/// top-row digits and the numpad both swap (`checkHotbarKeys`:718-733 reads
+/// the hotbar bindings 0..8, sent as mode 2's button).
+fn number_key_index(code: KeyCode) -> Option<u8> {
+    match code {
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some(0),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some(1),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some(2),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some(3),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some(4),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some(5),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some(6),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some(7),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some(8),
         _ => None,
     }
 }
@@ -2852,18 +3180,27 @@ impl ApplicationHandler for ClientApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // The free pointer's position, in the frame's GUI units, while
-                // the chat is open: the hover and the box's clicks read it,
-                // and nothing about it reaches the session
+                // the chat or a container screen is open: the hover and the
+                // hit-tests read it, and nothing about it reaches the session
                 // (`GuiChat.drawScreen`:305-310 reads the live mouse;
                 // `GuiNewChat.getChatComponent`:256-257 divides it by the
                 // scale factor).
-                if self.chat_input.open {
+                if self.chat_input.open || self.screens.is_open() {
                     let scale = self
                         .renderer
                         .as_ref()
                         .map_or(1, |renderer| renderer.scaled_resolution().scale_factor);
                     self.cursor = Some(scaled_cursor(position, scale));
+                    self.feed_screen_mouse();
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // The screen's shift-click and Ctrl+Q arms read the live
+                // modifier state — the window owns it, the session never sees
+                // it.
+                let state = modifiers.state();
+                self.shift = state.shift_key();
+                self.ctrl = state.control_key();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // The wheel is the chat log's while the chat is open
@@ -2906,10 +3243,11 @@ impl ApplicationHandler for ClientApp {
         // The look is raw device motion (`MouseHelper.mouseXYChange`,
         // `MouseHelper.java:33-37`) and flows only while the pointer is
         // grabbed: a free cursor's motion never turns the player. While the
-        // chat is open the motion belongs to the window's own cursor — the
-        // screen freed it — so the session is not told either.
+        // chat or a container screen is open the motion belongs to the
+        // window's own cursor — the screen freed it — so the session is not
+        // told either.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.capture.grabbed() && !self.chat_input.open {
+            if self.capture.grabbed() && !self.chat_input.open && !self.screens.is_open() {
                 self.send_input(InputEvent::MouseDelta { dx, dy });
             }
         }
@@ -3178,15 +3516,16 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClientApp,
-        DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute, Key,
-        MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate, SkyValues,
-        UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline, apply_overlay_event,
-        bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines, clear_break_stage,
-        command_text, cracks_in_view, escape_route, frame_params, gameplay_key, interpolate_pose,
-        is_enter_press, is_escape_press, is_f3_press, parse_script, parse_server_address,
-        scaled_cursor, scripted_chat_click, skin_requests, store_aim, store_break_stage,
-        store_skins, tab_held, tooltip_point, void_y_factor,
+        Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClickButton,
+        ClientApp, DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute,
+        Key, MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate,
+        SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
+        apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
+        clear_break_stage, command_text, cracks_in_view, escape_route, frame_params, gameplay_key,
+        interpolate_pose, is_enter_press, is_escape_press, is_f3_press, number_key_index,
+        parse_script, parse_server_address, scaled_cursor, screen_click_button,
+        scripted_chat_click, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
+        tooltip_point, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -3545,7 +3884,7 @@ mod tests {
         );
         assert!(!capture.grabbed());
         assert_eq!(
-            escape_route(true, false, &mut capture),
+            escape_route(true, false, false, &mut capture),
             EscapeRoute::CloseChat
         );
         assert!(!capture.grabbed(), "the escape itself touches nothing");
@@ -3564,12 +3903,12 @@ mod tests {
         let mut capture = Capture::default();
         capture.click();
         assert_eq!(
-            escape_route(false, false, &mut capture),
+            escape_route(false, false, false, &mut capture),
             EscapeRoute::Capture(CaptureStep::Release),
             "escape while grabbed releases"
         );
         assert_eq!(
-            escape_route(false, false, &mut capture),
+            escape_route(false, false, false, &mut capture),
             EscapeRoute::Capture(CaptureStep::Exit),
             "the second escape exits"
         );
@@ -3584,21 +3923,81 @@ mod tests {
         let mut capture = Capture::default();
         capture.click();
         assert_eq!(
-            escape_route(true, true, &mut capture),
+            escape_route(true, true, false, &mut capture),
             EscapeRoute::CancelConfirm,
             "the overlay's cancel comes before the chat's close"
         );
         assert!(capture.grabbed(), "the escape itself touches nothing");
         assert_eq!(
-            escape_route(true, false, &mut capture),
+            escape_route(true, false, false, &mut capture),
             EscapeRoute::CloseChat,
             "with the overlay down the same press closes the chat"
         );
         assert_eq!(
-            escape_route(false, false, &mut Capture::default()),
+            escape_route(false, false, false, &mut Capture::default()),
             EscapeRoute::Capture(CaptureStep::Exit),
             "a closed chat keeps the M3 rules: the untouched capture's own exit"
         );
+    }
+
+    #[test]
+    fn escape_with_a_screen_open_closes_the_screen_after_the_chat() {
+        // The route's third tier: below the confirm overlay and the chat, an
+        // open container screen's Escape closes the screen — C0D leaves
+        // through `closeScreen` (`GuiContainer.keyTyped`:692-696) — and with
+        // no screen the M3 capture rules stand.
+        let mut capture = Capture::default();
+        capture.click();
+        assert_eq!(
+            escape_route(false, false, true, &mut capture),
+            EscapeRoute::CloseScreen,
+            "an open screen's escape closes the screen"
+        );
+        assert_eq!(
+            escape_route(true, false, true, &mut capture),
+            EscapeRoute::CloseChat,
+            "the chat above the screen answers first"
+        );
+        assert_eq!(
+            escape_route(false, true, true, &mut capture),
+            EscapeRoute::CancelConfirm,
+            "the overlay above both cancels first"
+        );
+        assert!(capture.grabbed(), "the route itself touches nothing");
+    }
+
+    #[test]
+    fn the_screen_buttons_follow_the_source_binding() {
+        // Left and right are the source's buttons 0 and 1; the middle button
+        // is the pick-block binding's default (`keyBindPickBlock.getKeyCode()
+        // + 100` at `GuiContainer.java`:362/:410/:448) — any further button
+        // is unbound.
+        use winit::event::MouseButton as WinitMouseButton;
+        assert_eq!(
+            screen_click_button(WinitMouseButton::Left),
+            Some(ClickButton::Left)
+        );
+        assert_eq!(
+            screen_click_button(WinitMouseButton::Right),
+            Some(ClickButton::Right)
+        );
+        assert_eq!(
+            screen_click_button(WinitMouseButton::Middle),
+            Some(ClickButton::Pick)
+        );
+        assert_eq!(screen_click_button(WinitMouseButton::Back), None);
+    }
+
+    #[test]
+    fn the_number_keys_index_the_hotbar() {
+        // The top-row digits and the numpad both swap: 1-9 read hotbar
+        // indices 0-8 (`checkHotbarKeys`:718-733 sends mode 2's button) —
+        // anything else is no number key at all.
+        assert_eq!(number_key_index(KeyCode::Digit1), Some(0));
+        assert_eq!(number_key_index(KeyCode::Digit9), Some(8));
+        assert_eq!(number_key_index(KeyCode::Numpad5), Some(4));
+        assert_eq!(number_key_index(KeyCode::KeyE), None);
+        assert_eq!(number_key_index(KeyCode::KeyQ), None);
     }
 
     #[test]
@@ -5482,7 +5881,7 @@ mod tests {
         app.chat.open_confirm("https://b.example");
         let mut capture = Capture::default();
         assert_eq!(
-            escape_route(true, true, &mut capture),
+            escape_route(true, true, false, &mut capture),
             EscapeRoute::CancelConfirm
         );
         assert!(!capture.grabbed(), "the escape itself touches nothing");

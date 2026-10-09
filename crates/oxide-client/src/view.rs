@@ -48,6 +48,8 @@ use crate::CHAT_TEXT_CAP;
 use crate::ChatInput;
 use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
+use oxide_client::screens::container::{HOVER_COLOUR, TITLE_COLOUR};
+use oxide_client::screens::{ScreenState, Screens};
 
 /// The all-on parts byte every player draws with this milestone.
 ///
@@ -292,6 +294,248 @@ pub struct HotbarInput<'a> {
 /// condition (`GuiIngame.java`:128-363). No per-entry screen suppression exists.
 pub(crate) fn hud_visible(hide_gui: bool, screen_open: bool) -> bool {
     !hide_gui || screen_open
+}
+
+/// The screen frame's inputs beside the screens' own state: the font the
+/// titles and the counts measure with, the GUI-space size, and the free
+/// pointer's scaled position the cursor draw reads.
+pub struct ScreenDrawInput<'a> {
+    /// The measured font; without one the titles and the counts stay out
+    /// while the sheet, items and bars still draw.
+    pub font: Option<&'a Font>,
+    /// The GUI-space size the frame lays out in.
+    pub scaled: ScaledResolution,
+    /// The free pointer's scaled position, or `None` before the first move.
+    pub mouse: Option<(f32, f32)>,
+}
+
+/// The screen group's own draws: the source's `currentScreen.drawScreen`
+/// after the depth clear (`EntityRenderer.java`:1185-1191), over the whole
+/// HUD/overlay group. The window hands this list to the screen pass — never
+/// into the hud list — so the order survives.
+///
+/// A container screen draws the default background's gradient
+/// (`GuiScreen.drawWorldBackground`:668-683 — the world-present arm), its
+/// sheet blit, every slot's item, the hover highlight (the 0x80FFFFFF rect at
+/// `GuiContainer.java`:134), the title lines, the carried stack at the
+/// pointer minus 8 (`:149, :169`) with the drag's remnant preview, and —
+/// while a multi-slot drag runs — each covered slot's preview count with its
+/// own white rect (`drawSlot`:243-303). A covered slot of a lone-slot drag
+/// draws nothing (`:245-248`). The tooltip is Task 17's seam: the base leaves
+/// the slot under the pointer readable.
+///
+/// The declared-but-unimplemented variants (inventory, sign, book, creative)
+/// and the unknown kinds draw the generic frame — the background and the
+/// title alone — until their tasks land their tables (recorded).
+pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDraw> {
+    let Some(screen) = screens.current() else {
+        return Vec::new();
+    };
+    let mut draws = Vec::new();
+    // The default background: the world-present gradient, one rect per half
+    // (`GuiScreen.java`:668-683 paints top −1072689136 over bottom
+    // −804253680 — 0xC0101010 over 0xD0101010).
+    let width = input.scaled.width as f32;
+    let height = input.scaled.height as f32;
+    draws.push(HudDraw::Rect {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height: height / 2.0,
+        colour: [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 192.0 / 255.0],
+    });
+    draws.push(HudDraw::Rect {
+        x: 0.0,
+        y: height / 2.0,
+        width,
+        height: height - height / 2.0,
+        colour: [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 208.0 / 255.0],
+    });
+    let ScreenState::Container(container) = screen else {
+        return draws;
+    };
+    let layout = container.layout();
+    let (gx, gy) = container.origin();
+    let (gx, gy) = (gx as f32, gy as f32);
+    // The sheet blit at the panel's top-left (the generic frame's single
+    // blit; the chest's split pair is Task 18's).
+    draws.push(HudDraw::TexturedRect {
+        texture: HudTexture::Named(layout.sheet),
+        x: gx,
+        y: gy,
+        width: layout.x_size as f32,
+        height: layout.y_size as f32,
+        uv: [
+            0.0,
+            0.0,
+            layout.x_size as f32 / 256.0,
+            layout.y_size as f32 / 256.0,
+        ],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    });
+    // The slots in slot order, each cell's item through the icon seam. A
+    // covered slot draws its preview count with the white rect; a lone
+    // covered slot draws nothing at all (`drawSlot`:243-303).
+    let drag_len = container.drag_slots().len();
+    for pos in layout.slots {
+        let x = gx + pos.x as f32;
+        let y = gy + pos.y as f32;
+        if let Some(preview) = container
+            .preview()
+            .iter()
+            .find(|(index, _)| *index == pos.index)
+        {
+            if drag_len == 1 {
+                continue;
+            }
+            draws.push(HudDraw::Rect {
+                x,
+                y,
+                width: 16.0,
+                height: 16.0,
+                colour: HOVER_COLOUR,
+            });
+            let template = container.cursor().cloned().unwrap_or(MetadataItem {
+                id: 0,
+                count: 0,
+                damage: 0,
+                nbt: None,
+            });
+            let stack = MetadataItem {
+                count: preview.1.clamp(0, 255) as u8,
+                ..template
+            };
+            draws.push(HudDraw::Item {
+                stack: Some(item_icon(&stack)),
+                x,
+                y,
+                pop: 0.0,
+            });
+            push_stack_overlay(&mut draws, &stack, None, input.font, x, y);
+            continue;
+        }
+        let stack = container.slot_stack(pos.index).cloned().flatten();
+        draws.push(HudDraw::Item {
+            stack: stack.as_ref().map(item_icon),
+            x,
+            y,
+            pop: 0.0,
+        });
+        if let Some(stack) = stack.as_ref() {
+            push_stack_overlay(&mut draws, stack, None, input.font, x, y);
+        }
+    }
+    // The hover highlight: the draw loop's last match with the
+    // semi-transparent white rect (`GuiContainer.java`:126-138).
+    if let Some(hovered) = container.hovered() {
+        if let Some(pos) = layout.slots.iter().find(|pos| pos.index == hovered) {
+            draws.push(HudDraw::Rect {
+                x: gx + pos.x as f32,
+                y: gy + pos.y as f32,
+                width: 16.0,
+                height: 16.0,
+                colour: HOVER_COLOUR,
+            });
+        }
+    }
+    // The title lines over the panel (`drawGuiContainerForegroundLayer` —
+    // the chest's pair, the inventory's label, the generic title). Without
+    // a font the titles stay out while the sheet and items still draw.
+    if input.font.is_some() {
+        for line in container.title_lines() {
+            let text = plain_text(&chat::parse_json(&line.text));
+            if !text.is_empty() {
+                draws.push(HudDraw::Text {
+                    text,
+                    x: gx + line.x as f32,
+                    y: gy + line.y as f32,
+                    scale: 1.0,
+                    colour: TITLE_COLOUR,
+                    shadow: false,
+                    blend: false,
+                });
+            }
+        }
+    }
+    // The carried stack at the pointer minus 8, with the drag's remnant
+    // preview and the yellow zero (`drawScreen`:144-170).
+    if let Some(mouse) = input.mouse {
+        if let Some(cursor) = container.cursor_draw(mouse) {
+            draws.push(HudDraw::Item {
+                stack: Some(item_icon(&cursor.stack)),
+                x: cursor.x,
+                y: cursor.y,
+                pop: 0.0,
+            });
+            push_stack_overlay(
+                &mut draws,
+                &cursor.stack,
+                cursor.alt_text.as_deref(),
+                input.font,
+                cursor.x,
+                cursor.y,
+            );
+        }
+    }
+    draws
+}
+
+/// One stack's count and durability overlay at the cell (`x`, `y`)
+/// (`RenderItem.renderItemOverlayIntoGUI`:455-494): the count at
+/// `(x + 19 − 2 − width, y + 6 + 3)` — hidden at exactly one, red below one,
+/// or the given alt text verbatim (the drag's yellow zero) — unblended with
+/// shadow, then the durability bar's black bed, underlay and ramp at
+/// `(x + 2, y + 13)`.
+fn push_stack_overlay(
+    draws: &mut Vec<HudDraw>,
+    stack: &MetadataItem,
+    alt_text: Option<&str>,
+    font: Option<&Font>,
+    x: f32,
+    y: f32,
+) {
+    let text = match alt_text {
+        Some(text) => Some(text.to_string()),
+        None => count_text(stack),
+    };
+    if let (Some(text), Some(font)) = (text, font) {
+        let width = string_width(font, &text) as f32;
+        draws.push(HudDraw::Text {
+            text,
+            x: x + 17.0 - width,
+            y: y + 9.0,
+            scale: 1.0,
+            colour: [1.0, 1.0, 1.0, 1.0],
+            shadow: true,
+            blend: false,
+        });
+    }
+    if stack_damaged(stack) {
+        if let Some(entry) = items::item_entry(stack.id) {
+            let (fill, ramp) = durability_terms(stack.damage, entry.max_damage);
+            draws.push(HudDraw::Rect {
+                x: x + 2.0,
+                y: y + 13.0,
+                width: 13.0,
+                height: 2.0,
+                colour: [0.0, 0.0, 0.0, 1.0],
+            });
+            draws.push(HudDraw::Rect {
+                x: x + 2.0,
+                y: y + 13.0,
+                width: 12.0,
+                height: 1.0,
+                colour: [((255 - ramp) / 4) as f32 / 255.0, 64.0 / 255.0, 0.0, 1.0],
+            });
+            draws.push(HudDraw::Rect {
+                x: x + 2.0,
+                y: y + 13.0,
+                width: fill as f32,
+                height: 1.0,
+                colour: [(255 - ramp) as f32 / 255.0, ramp as f32 / 255.0, 0.0, 1.0],
+            });
+        }
+    }
 }
 
 /// The popup text's alpha byte: `k = (int)(ticks × 256/10)`, clamped to 255
@@ -9289,6 +9533,135 @@ mod tests {
             (frame.sway_yaw - 5.0).abs() < 1e-6,
             "the third tick's yaw argument: {}",
             frame.sway_yaw
+        );
+    }
+
+    // ---- the screen group ----
+
+    /// The screen group's own frame: no screen draws nothing, a declared
+    /// variant draws the generic frame's background alone, and a container
+    /// draws the background, the centred sheet, the title and the carried
+    /// stack at the pointer minus 8 (`EntityRenderer.java`:1185-1191;
+    /// `GuiContainer.java`:149/:169).
+    #[test]
+    fn no_screen_draws_nothing() {
+        let font = chat_font();
+        let screens = Screens::default();
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: Some((100.0, 50.0)),
+            },
+        );
+        assert!(draws.is_empty(), "no screen owns no draws");
+    }
+
+    #[test]
+    fn a_declared_variant_draws_the_generic_frame() {
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_inventory();
+        let scaled = chat_resolution();
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled,
+                mouse: Some((100.0, 50.0)),
+            },
+        );
+        // The world-present gradient alone: top 0xC0101010 over bottom
+        // 0xD0101010 (`GuiScreen.java`:668-683), no sheet and no title until
+        // the variant's task lands it (recorded).
+        assert_eq!(draws.len(), 2, "the background halves alone: {draws:?}");
+        for draw in &draws {
+            assert!(
+                matches!(draw, HudDraw::Rect { .. }),
+                "no textured or text draw: {draw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_container_frame_centres_sheet_title_and_cursor() {
+        use oxide_proto_v47::window::WindowKind;
+
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_container(3, WindowKind::Chest, String::from("{\"text\":\"Chest\"}"));
+        screens
+            .container_mut()
+            .expect("the open is a container")
+            .set_screen_size(427, 240);
+        screens.apply_snapshot(
+            3,
+            Vec::new(),
+            Some(MetadataItem {
+                id: 1,
+                count: 4,
+                damage: 0,
+                nbt: None,
+            }),
+        );
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: Some((100.0, 50.0)),
+            },
+        );
+        // The 427x240 frame centres the 176x166 panel at (125, 37); the
+        // generic layout carries no slots, so the background pair, the sheet,
+        // the title and the carried stack with its count is the whole list.
+        assert_eq!(
+            draws.len(),
+            6,
+            "background, sheet, title, item, count: {draws:?}"
+        );
+        assert!(
+            matches!(
+                draws[2],
+                HudDraw::TexturedRect {
+                    x: 125.0,
+                    y: 37.0,
+                    width: 176.0,
+                    height: 166.0,
+                    ..
+                }
+            ),
+            "the sheet blits at the centred origin: {:?}",
+            draws[2]
+        );
+        assert!(
+            matches!(
+                &draws[3],
+                HudDraw::Text { text, x: 133.0, y: 43.0, .. } if text == "Chest"
+            ),
+            "the generic title at (8, 6) over the panel: {:?}",
+            draws[3]
+        );
+        assert!(
+            matches!(
+                draws[4],
+                HudDraw::Item {
+                    x: 92.0,
+                    y: 42.0,
+                    ..
+                }
+            ),
+            "the carried stack at the pointer minus 8: {:?}",
+            draws[4]
+        );
+        assert!(
+            matches!(
+                &draws[5],
+                HudDraw::Text { text, y: 51.0, .. } if text == "4"
+            ),
+            "the count overlay under the carried stack: {:?}",
+            draws[5]
         );
     }
 }

@@ -9054,3 +9054,345 @@ fn the_hud_pass_draws_the_experience_bar() {
     expect_rows(&pixels, 213, 205, [0, 0, 0], "the outline beside the pen");
     expect_rows(&pixels, 212, 204, [0, 0, 0], "the outline above the pen");
 }
+
+/// The container sheet in miniature: the `t16/container` fixture for the screen
+/// group's own cases — the sampled 176x166 window green left of panel x 88 and
+/// blue right of it, a white strip along the bottom (`y >= 160`) and a yellow
+/// strip along the right (`x >= 170`, over the white where they meet), so the
+/// sheet's pins discriminate the blit's colour halves and both uv scales.
+///
+/// Generated here; no asset store is read and no sheet pixel is copied.
+fn t16_container_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let at = ((y * SIDE + x) * 4) as usize;
+            let texel = if x >= 170 {
+                [255, 255, 0, 255]
+            } else if y >= 160 {
+                [255, 255, 255, 255]
+            } else if x < 88 {
+                [0, 255, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            rgba[at..at + 4].copy_from_slice(&texel);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The screen group paints over the whole HUD group: a 176x166 container frame
+/// at the 427x240 origin (125, 37) over an opaque red hud rect, with slot 0's
+/// checker item, the hover highlight over empty slot 1 and the carried stack at
+/// the (100, 50) pointer.
+///
+/// The geometry mirrors `view.rs`'s screen draws for the task's local two-slot
+/// fixture — slots at panel (8, 18) and (26, 18) — which the render crate
+/// cannot import: the sheet blit at the centred origin, slot cells 16x16, the
+/// semi-white hover rect over the hovered cell, the carried stack at the
+/// pointer minus 8. The background gradient and the title stay out of the
+/// mirror — the client-side assembly pins own them — and the clear colour
+/// stands in for the gradient.
+///
+/// The pins: the sheet's green/blue halves, its white bottom and yellow right
+/// strips, the sheet's corner over the hud's red (the order proof — red shows
+/// nowhere), the checker item's white and black cells over the sheet, the
+/// hover's blend over the sheet's green, the carried flat-green stack over the
+/// sky with the sky on two sides, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t16_screen_frame_paints_over_the_hud() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::Rect {
+            x: 125.0,
+            y: 37.0,
+            width: 176.0,
+            height: 166.0,
+            colour: [1.0, 0.0, 0.0, 1.0],
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    screen.set_texture(&device, &queue, "t16/container", &t16_container_sheet());
+    screen
+        .set_font(&device, &queue, &hotbar_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    screen.set_atlas_icon(&device, &queue, &item_atlas());
+    screen.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    screen.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("t16/container"),
+                x: 125.0,
+                y: 37.0,
+                width: 176.0,
+                height: 166.0,
+                uv: [0.0, 0.0, 176.0 / 256.0, 166.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 2,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 133.0,
+                y: 55.0,
+                pop: 0.0,
+            },
+            HudDraw::Rect {
+                x: 151.0,
+                y: 55.0,
+                width: 16.0,
+                height: 16.0,
+                colour: [1.0, 1.0, 1.0, 128.0 / 255.0],
+            },
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 3,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 92.0,
+                y: 42.0,
+                pop: 0.0,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let depth = rows_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t16 screen headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    // The source's own order (`EntityRenderer.java`:1166-1170, then
+    // `:1185-1191`): the hud group first, the screen group over it.
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        hud.draw(pass);
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_rows_pixels(&device, &queue, &target);
+    // The sheet's halves and strips, through the 1:1 blit.
+    expect_rows(&pixels, 135, 137, [0, 255, 0], "the sheet's green half");
+    expect_rows(&pixels, 225, 137, [0, 0, 255], "the sheet's blue half");
+    expect_rows(
+        &pixels,
+        135,
+        199,
+        [255, 255, 255],
+        "the sheet's white strip",
+    );
+    expect_rows(&pixels, 295, 100, [255, 255, 0], "the sheet's yellow strip");
+    // The order proof: the sheet's corner over the hud's red, and red shows
+    // nowhere the sheet reaches.
+    expect_rows(
+        &pixels,
+        125,
+        37,
+        [0, 255, 0],
+        "the sheet over the hud's red",
+    );
+    expect_rows(
+        &pixels,
+        300,
+        202,
+        [255, 255, 0],
+        "the yellow strip, no red past the edge",
+    );
+    // Slot 0's checker item over the sheet: the mesh's v-flip puts the
+    // checker's bottom row on top, so the top-left cell is black, its right
+    // neighbour white and the cell below it white.
+    expect_rows(&pixels, 133, 55, [0, 0, 0], "the checker's black cell");
+    expect_rows(
+        &pixels,
+        135,
+        55,
+        [255, 255, 255],
+        "the checker's white cell",
+    );
+    expect_rows(
+        &pixels,
+        133,
+        57,
+        [255, 255, 255],
+        "the checker's flipped row",
+    );
+    // The hover over empty slot 1: the semi-white blend over the sheet's
+    // green.
+    expect_rows(&pixels, 159, 63, [128, 255, 128], "the hover's blend");
+    // The carried stack at the pointer minus 8 over the sky.
+    expect_rows(&pixels, 92, 42, [0, 255, 0], "the carried stack's top-left");
+    expect_rows(
+        &pixels,
+        107,
+        57,
+        [0, 255, 0],
+        "the carried stack's bottom-right",
+    );
+    expect_rows(&pixels, 91, 42, SKY, "the sky left of the carried stack");
+    expect_rows(&pixels, 92, 41, SKY, "the sky above the carried stack");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// A right-drag's view side on the pixels: two covered slots drawing the
+/// preview count of 1 with the white rect, and the carried stack drawing the
+/// remnant count of 16 (18 carried minus the two placed).
+///
+/// The geometry mirrors the same fixture mid-drag: covered slots 0 and 1 draw
+/// the semi-white rect, the cursor's own item and the preview count, while the
+/// cursor draws the remnant. The pins: the preview one's ink and shadow over
+/// both covered slots and the remnant sixteen's ink and shadow over the sky.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t16_screen_drag_preview_counts_the_remnant() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    screen.set_texture(&device, &queue, "t16/container", &t16_container_sheet());
+    screen
+        .set_font(&device, &queue, &hotbar_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    screen.set_atlas_icon(&device, &queue, &item_atlas());
+    screen.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    let carried = ItemIcon {
+        id: 3,
+        damage: 0,
+        enchanted: false,
+    };
+    screen.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("t16/container"),
+                x: 125.0,
+                y: 37.0,
+                width: 176.0,
+                height: 166.0,
+                uv: [0.0, 0.0, 176.0 / 256.0, 166.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            HudDraw::Rect {
+                x: 133.0,
+                y: 55.0,
+                width: 16.0,
+                height: 16.0,
+                colour: [1.0, 1.0, 1.0, 128.0 / 255.0],
+            },
+            HudDraw::Item {
+                stack: Some(carried),
+                x: 133.0,
+                y: 55.0,
+                pop: 0.0,
+            },
+            HudDraw::Text {
+                text: "1".to_string(),
+                x: 148.0,
+                y: 64.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Rect {
+                x: 151.0,
+                y: 55.0,
+                width: 16.0,
+                height: 16.0,
+                colour: [1.0, 1.0, 1.0, 128.0 / 255.0],
+            },
+            HudDraw::Item {
+                stack: Some(carried),
+                x: 151.0,
+                y: 55.0,
+                pop: 0.0,
+            },
+            HudDraw::Text {
+                text: "1".to_string(),
+                x: 166.0,
+                y: 64.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Item {
+                stack: Some(carried),
+                x: 92.0,
+                y: 42.0,
+                pop: 0.0,
+            },
+            HudDraw::Text {
+                text: "16".to_string(),
+                x: 105.0,
+                y: 51.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let depth = rows_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t16 drag headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_rows_pixels(&device, &queue, &target);
+    // The covered slots' preview ones: white ink and quarter shadow over the
+    // carried item's green.
+    expect_rows(&pixels, 148, 64, TEXT, "slot 0's preview one");
+    expect_rows(&pixels, 149, 65, SHADOW, "slot 0's preview shadow");
+    expect_rows(&pixels, 166, 64, TEXT, "slot 1's preview one");
+    expect_rows(&pixels, 167, 65, SHADOW, "slot 1's preview shadow");
+    // The remnant sixteen at the carried stack: both digits' ink and shadow
+    // over the sky.
+    expect_rows(&pixels, 105, 51, TEXT, "the remnant one's ink");
+    expect_rows(&pixels, 107, 51, TEXT, "the remnant six's ink");
+    expect_rows(&pixels, 106, 52, SHADOW, "the remnant one's shadow");
+    expect_rows(&pixels, 108, 52, SHADOW, "the remnant six's shadow");
+    expect_rows(&pixels, 91, 51, SKY, "the sky left of the carried stack");
+}

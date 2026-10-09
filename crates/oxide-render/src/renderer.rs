@@ -179,6 +179,12 @@ pub struct Renderer {
     /// The hud pass, drawing the frame's GUI-space draw list between the dim and the
     /// debug overlay text.
     hud: HudPass,
+    /// The screen pass, drawing the open screen's GUI-space draw list after the
+    /// whole HUD/overlay group: the source draws the HUD overlay first
+    /// (`EntityRenderer.java`:1166-1170), then `currentScreen.drawScreen`
+    /// after a depth clear (`:1185-1191`). The port's `hud` list sits inside
+    /// the overlay group, so the screen needs its own group above it.
+    screen: HudPass,
     /// The first-person held item pass, drawing the frame's selected stack in camera
     /// space between the scene pass and the overlay pass — the source's own order: the
     /// hand draws inside the world pass after the terrain and the entities
@@ -315,6 +321,8 @@ impl Renderer {
         let mut hud = HudPass::new(&device, &queue, format);
         let scaled = scaled_resolution(config.width, config.height, 0);
         hud.set_resolution(&queue, scaled.width as f32, scaled.height as f32);
+        let mut screen = HudPass::new(&device, &queue, format);
+        screen.set_resolution(&queue, scaled.width as f32, scaled.height as f32);
         let held_item = HeldItemPass::new(&device, format);
         let depth = DepthTarget::new(&device, config.width, config.height);
         let entity_textures = TextureRegistry::new(&device, &queue);
@@ -334,6 +342,7 @@ impl Renderer {
             overlay,
             dim,
             hud,
+            screen,
             held_item,
             gui_scale: 0,
             entity_pass,
@@ -382,6 +391,8 @@ impl Renderer {
             let scaled = self.scaled_resolution();
             self.hud
                 .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
+            self.screen
+                .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
         }
     }
 
@@ -426,6 +437,7 @@ impl Renderer {
         self.entity_pass
             .set_font(&self.device, &self.queue, sheet)?;
         self.hud.set_font(&self.device, &self.queue, sheet)?;
+        self.screen.set_font(&self.device, &self.queue, sheet)?;
         self.overlay.set_font(&self.device, &self.queue, sheet)
     }
 
@@ -438,6 +450,8 @@ impl Renderer {
         self.gui_scale = gui_scale;
         let scaled = self.scaled_resolution();
         self.hud
+            .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
+        self.screen
             .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
     }
 
@@ -622,11 +636,28 @@ impl Renderer {
             .set_draws(&self.device, &self.queue, &draws, &self.entity_textures);
     }
 
+    /// Sets the screen draw list drawn this frame; empty draws nothing.
+    ///
+    /// The list draws after the whole HUD/overlay group — the source's own
+    /// order (`EntityRenderer.java`:1166-1170, then `:1185-1191`) — so an
+    /// open screen paints over the overlay, the debug lines included.
+    pub fn set_screen(&mut self, draws: Vec<HudDraw>) {
+        self.screen
+            .set_draws(&self.device, &self.queue, &draws, &self.entity_textures);
+    }
+
     /// Registers a hud texture under `name`, for the hud draws that sample a named
     /// texture; a later call under the same name replaces it, and a draw whose name
     /// never landed is skipped.
     pub fn set_hud_texture(&mut self, name: &'static str, texture: &Texture) {
         self.hud
+            .set_texture(&self.device, &self.queue, name, texture);
+    }
+
+    /// Registers a screen texture under `name`, for the screen draws' sheets;
+    /// the screen pass keeps its own registry beside the hud's.
+    pub fn set_screen_texture(&mut self, name: &'static str, texture: &Texture) {
+        self.screen
             .set_texture(&self.device, &self.queue, name, texture);
     }
 
@@ -636,6 +667,7 @@ impl Renderer {
     /// called, an enchanted icon's glint batches are skipped and only the icon draws.
     pub fn set_hud_glint(&mut self, texture: &Texture) {
         self.hud.set_glint(&self.device, &self.queue, texture);
+        self.screen.set_glint(&self.device, &self.queue, texture);
     }
 
     /// Sets the source the hud's item icons build their meshes and display transforms
@@ -644,13 +676,18 @@ impl Renderer {
     /// The client owns the bake and the item table; until this is called, the hud's
     /// [`HudDraw::Item`] draws contribute nothing.
     pub fn set_hud_icon_source(&mut self, source: Arc<dyn ItemIconSource>) {
-        self.hud.set_icon_source(&self.device, &self.queue, source);
+        self.hud
+            .set_icon_source(&self.device, &self.queue, source.clone());
+        self.screen
+            .set_icon_source(&self.device, &self.queue, source);
     }
 
     /// Hands the hud pass the frame's system time, in milliseconds, which the glint
     /// draws' scroll phases read (`Minecraft.getSystemTime`'s own clock).
     pub fn set_hud_system_time(&mut self, time_ms: u64) {
         self.hud.set_system_time(&self.device, &self.queue, time_ms);
+        self.screen
+            .set_system_time(&self.device, &self.queue, time_ms);
     }
 
     /// Sets the first-person held item frame the next draws show, or clears it with a
@@ -870,6 +907,7 @@ impl Renderer {
             self.hud.draw_boss_bar(&mut overlay_pass);
             self.hud.draw(&mut overlay_pass);
             self.overlay.draw(&mut overlay_pass);
+            self.screen.draw(&mut overlay_pass);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
