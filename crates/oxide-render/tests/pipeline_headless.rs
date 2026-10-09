@@ -8504,3 +8504,552 @@ fn the_hud_pass_draws_the_hotbar_frame() {
     expect_wide(&pixels, 121, 25, SKY, "the transparent corner stays sky");
     expect_wide(&pixels, 136, 40, SKY, "the opposite corner stays sky");
 }
+
+/// The rows probe's own size: a 448x240 target, so the rows' true coordinates at
+/// `ScaledResolution { width: 427, height: 240 }` land one GUI unit per pixel —
+/// hearts/food at `y = 240 − 39 = 201`, armour/air at `191`, the bar at `211`,
+/// the level at `205`, the food row reaching `x = 304` (`view.rs`'s rows draws —
+/// the render crate cannot import the client).
+const ROWS_WIDE: u32 = 448;
+/// The probe target's height in texels; the readback row stride (448 × 4) stays
+/// a multiple of 256 bytes.
+const ROWS_TALL: u32 = 240;
+
+/// The offscreen colour target at the rows probe's size.
+fn rows_target(device: &wgpu::Device, format: wgpu::TextureFormat) -> Target {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("oxide rows headless target"),
+        size: wgpu::Extent3d {
+            width: ROWS_WIDE,
+            height: ROWS_TALL,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Target { texture, view }
+}
+
+/// The depth texture at the rows probe's size.
+fn rows_depth(device: &wgpu::Device) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("oxide rows headless depth"),
+        size: wgpu::Extent3d {
+            width: ROWS_WIDE,
+            height: ROWS_TALL,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Reads the rows probe's target back: one 1792-byte row per line, 240 lines.
+fn read_rows_pixels(device: &wgpu::Device, queue: &wgpu::Queue, target: &Target) -> Vec<u8> {
+    const ROW: u32 = ROWS_WIDE * 4;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oxide rows headless readback"),
+        size: u64::from(ROW) * u64::from(ROWS_TALL),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide rows headless readback encoder"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ROW),
+                rows_per_image: Some(ROWS_TALL),
+            },
+        },
+        wgpu::Extent3d {
+            width: ROWS_WIDE,
+            height: ROWS_TALL,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::Wait).expect("the device polls");
+    receiver
+        .recv()
+        .expect("the map callback runs")
+        .expect("the buffer maps");
+    let pixels = slice.get_mapped_range().to_vec();
+    buffer.unmap();
+    pixels
+}
+
+/// Asserts one rows probe pixel's RGB bytes exactly, naming it in the failure message.
+fn expect_rows(pixels: &[u8], x: u32, y: u32, want: [u8; 3], what: &str) {
+    let offset = (y * ROWS_WIDE * 4 + x * 4) as usize;
+    let got = [pixels[offset], pixels[offset + 1], pixels[offset + 2]];
+    assert_eq!(got, want, "{what} at ({x}, {y})");
+}
+
+/// Counts the rows probe's non-sky pixels: the RGB triple differs from [`SKY`].
+///
+/// Ten opaque 9-wide cells at spacing eight share nine columns, so ten fully
+/// covered cells count 10 × 81 − 9 × 9 = 729.
+fn rows_lit(pixels: &[u8]) -> usize {
+    rows_lit_band(pixels, 0, 0, ROWS_WIDE, ROWS_TALL)
+}
+
+/// Counts the non-sky pixels inside the `(x, y, w, h)` band.
+fn rows_lit_band(pixels: &[u8], x: u32, y: u32, w: u32, h: u32) -> usize {
+    let mut lit = 0;
+    for row in y..y + h {
+        for col in x..x + w {
+            let offset = (row * ROWS_WIDE * 4 + col * 4) as usize;
+            if [pixels[offset], pixels[offset + 1], pixels[offset + 2]] != SKY {
+                lit += 1;
+            }
+        }
+    }
+    lit
+}
+
+/// The synthetic rows sheet: `gui/icons` in miniature — one opaque band per slice
+/// window the rows sample, each a colour no other window uses, over a transparent
+/// sheet. The half windows (`61`, `79`, `97` and the armour `25`) ink only their
+/// left five columns, mimicking the source sheet's transparent right halves, so a
+/// half slice shows the draw beneath on its right.
+///
+/// Generated here; no asset store is read and no sheet pixel is copied.
+fn rows_icon_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    let rect = |rgba: &mut [u8], x0: u32, x1: u32, y0: u32, y1: u32, colour: [u8; 4]| {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let at = ((y * SIDE + x) * 4) as usize;
+                rgba[at..at + 4].copy_from_slice(&colour);
+            }
+        }
+    };
+    // Hearts row windows: the container, the blink container, the full, the half,
+    // the flash pair and the poison pair.
+    rect(&mut rgba, 16, 25, 0, 9, [128, 128, 128, 255]);
+    rect(&mut rgba, 25, 34, 0, 9, [255, 255, 255, 255]);
+    rect(&mut rgba, 52, 61, 0, 9, [255, 0, 0, 255]);
+    rect(&mut rgba, 61, 66, 0, 9, [255, 0, 0, 255]);
+    rect(&mut rgba, 70, 79, 0, 9, [255, 0, 255, 255]);
+    rect(&mut rgba, 79, 84, 0, 9, [255, 0, 255, 255]);
+    rect(&mut rgba, 88, 97, 0, 9, [0, 255, 0, 255]);
+    rect(&mut rgba, 97, 102, 0, 9, [0, 255, 0, 255]);
+    // Armour windows: the empty, the half and the full.
+    rect(&mut rgba, 16, 25, 9, 18, [64, 64, 64, 255]);
+    rect(&mut rgba, 25, 30, 9, 18, [70, 130, 180, 255]);
+    rect(&mut rgba, 34, 43, 9, 18, [70, 130, 180, 255]);
+    // Air windows: the full bubble and the popping one.
+    rect(&mut rgba, 16, 25, 18, 27, [0, 255, 255, 255]);
+    rect(&mut rgba, 25, 34, 18, 27, [0, 0, 255, 255]);
+    // Food windows: the background, the full haunch and the half.
+    rect(&mut rgba, 16, 25, 27, 36, [150, 75, 0, 255]);
+    rect(&mut rgba, 52, 61, 27, 36, [255, 165, 0, 255]);
+    rect(&mut rgba, 61, 66, 27, 36, [255, 165, 0, 255]);
+    // Experience windows: the background slice and the fill.
+    rect(&mut rgba, 0, 182, 64, 69, [0, 0, 139, 255]);
+    rect(&mut rgba, 0, 183, 69, 74, [255, 255, 0, 255]);
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The synthetic rows font sheet: a 128x128 grid whose `1` and `2` cells ink only
+/// their first column, so the level digits land on known pixels at advance two.
+///
+/// Generated here; no asset store is read and no Mojang pixel is embedded.
+fn rows_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for code in ['1' as u32, '2' as u32] {
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// A hud pass ready for the rows' cases: the 448x240 target, the synthetic font and
+/// rows sheet, and the 448x240 resolution so one GUI unit is one pixel.
+fn rows_scene() -> (wgpu::Device, wgpu::Queue, Target, HudPass) {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    hud.set_font(&device, &queue, &rows_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_texture(&device, &queue, "gui/icons", &rows_icon_sheet());
+    (device, queue, target, hud)
+}
+
+/// Renders the rows' draws over a cleared frame and reads the pixels back.
+fn rows_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    hud: &HudPass,
+) -> Vec<u8> {
+    let depth = rows_depth(device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide rows headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+    read_rows_pixels(device, queue, target)
+}
+
+/// One 9x9 rows slice draw at `(x, y)` sampling the `(u, v)` icons window.
+fn rows_slice(x: f32, y: f32, u: i32, v: i32) -> HudDraw {
+    HudDraw::TexturedRect {
+        texture: HudTexture::Named("gui/icons"),
+        x,
+        y,
+        width: 9.0,
+        height: 9.0,
+        uv: [
+            u as f32 / 256.0,
+            v as f32 / 256.0,
+            (u + 9) as f32 / 256.0,
+            (v + 9) as f32 / 256.0,
+        ],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    }
+}
+
+/// The hud draws the hurt hearts at their true coordinates: 17.5 health against the
+/// remembered nineteen with the blink running — the blink containers, the flash pair
+/// (fulls over cells 0–8, the half over cell 9) and the current fulls over cells 0–8.
+///
+/// The geometry mirrors `view.rs`'s rows draws: the containers at `(122 + 8c, 201)`
+/// with `u = 25`, the flash fulls at `u = 70`, the flash half at `(194, 201)`, the
+/// current fulls at `u = 52`.
+///
+/// The pins: the current full's red over cell 0, the flash half's magenta on cell 9's
+/// left, the blink container's white showing through its transparent right, the sky
+/// above the row, and the 729 non-sky pixels of ten overlapping cells.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_hurt_hearts() {
+    let (device, queue, target, mut hud) = rows_scene();
+    let mut draws = Vec::new();
+    for cell in 0..10 {
+        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 201.0, 25, 0));
+    }
+    for cell in 0..9 {
+        let x = 122.0 + cell as f32 * 8.0;
+        draws.push(rows_slice(x, 201.0, 70, 0));
+        draws.push(rows_slice(x, 201.0, 52, 0));
+    }
+    draws.push(rows_slice(194.0, 201.0, 79, 0));
+    hud.set_draws(
+        &device,
+        &queue,
+        &draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_rows(
+        &pixels,
+        126,
+        205,
+        [255, 0, 0],
+        "the current full over cell 0",
+    );
+    expect_rows(
+        &pixels,
+        196,
+        205,
+        [255, 0, 255],
+        "the flash half on cell 9's left",
+    );
+    expect_rows(
+        &pixels,
+        201,
+        205,
+        [255, 255, 255],
+        "the blink container through its transparent right",
+    );
+    expect_rows(&pixels, 126, 200, SKY, "the sky above the row");
+    assert_eq!(rows_lit(&pixels), 729, "ten overlapping cells");
+}
+
+/// The hud draws the poisoned hearts at their true coordinates: nineteen health under
+/// the poison effect — the containers, the green fulls over cells 0–8 and the green
+/// half over cell 9, whose transparent right shows the container.
+///
+/// The pins: the green full over cell 0, the green half on cell 9's left, the grey
+/// container through its right, and the 729 non-sky pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_poisoned_hearts() {
+    let (device, queue, target, mut hud) = rows_scene();
+    let mut draws = Vec::new();
+    for cell in 0..10 {
+        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 201.0, 16, 0));
+    }
+    for cell in 0..9 {
+        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 201.0, 52, 0));
+    }
+    draws.push(rows_slice(194.0, 201.0, 97, 0));
+    hud.set_draws(
+        &device,
+        &queue,
+        &draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_rows(
+        &pixels,
+        126,
+        205,
+        [0, 255, 0],
+        "the poisoned full over cell 0",
+    );
+    expect_rows(
+        &pixels,
+        196,
+        205,
+        [0, 255, 0],
+        "the poisoned half on cell 9's left",
+    );
+    expect_rows(
+        &pixels,
+        201,
+        205,
+        [128, 128, 128],
+        "the container through its transparent right",
+    );
+    assert_eq!(rows_lit(&pixels), 729, "ten overlapping cells");
+}
+
+/// The hud draws the jittered food row at its true coordinates: six food at zero
+/// saturation on the qualifying tick — cells 0–1 straight, cell 2 one pixel lower,
+/// every cell's background under its haunch.
+///
+/// The pins: cell 0's orange mid and top row (unjittered), cell 2's orange mid one
+/// lower, the sky above the shifted cell, and cell 3's bare saddle background.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_jittered_food() {
+    let (device, queue, target, mut hud) = rows_scene();
+    let mut draws = Vec::new();
+    for cell in 0..10 {
+        // Cell 2 jitters one lower: its background and its haunch both sit at 202.
+        let y = if cell == 2 { 202.0 } else { 201.0 };
+        draws.push(rows_slice(295.0 - cell as f32 * 8.0, y, 16, 27));
+    }
+    draws.push(rows_slice(295.0, 201.0, 52, 27));
+    draws.push(rows_slice(287.0, 201.0, 52, 27));
+    draws.push(rows_slice(279.0, 202.0, 52, 27));
+    hud.set_draws(
+        &device,
+        &queue,
+        &draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_rows(&pixels, 299, 205, [255, 165, 0], "cell 0's full haunch");
+    expect_rows(
+        &pixels,
+        299,
+        201,
+        [255, 165, 0],
+        "cell 0's unshifted top row",
+    );
+    expect_rows(&pixels, 283, 206, [255, 165, 0], "cell 2's shifted haunch");
+    expect_rows(&pixels, 283, 201, SKY, "the sky above the shifted cell");
+    expect_rows(&pixels, 275, 205, [150, 75, 0], "cell 3's bare background");
+}
+
+/// The hud draws the mixed armour row at its true coordinates: thirteen points — six
+/// full icons, the seventh halved (its transparent right over the sky) and the rest
+/// empty.
+///
+/// The pins: the first full's steel, the halved icon's steel left, the sky through
+/// its right, and the next icon's empty slate.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_mixed_armour() {
+    let (device, queue, target, mut hud) = rows_scene();
+    let mut draws = Vec::new();
+    for cell in 0..6 {
+        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 191.0, 34, 9));
+    }
+    draws.push(rows_slice(170.0, 191.0, 25, 9));
+    for cell in 7..10 {
+        draws.push(rows_slice(122.0 + cell as f32 * 8.0, 191.0, 16, 9));
+    }
+    hud.set_draws(
+        &device,
+        &queue,
+        &draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_rows(&pixels, 126, 195, [70, 130, 180], "the first full icon");
+    expect_rows(&pixels, 174, 195, [70, 130, 180], "the halved icon's left");
+    expect_rows(
+        &pixels,
+        177,
+        195,
+        SKY,
+        "the sky through its transparent right",
+    );
+    expect_rows(
+        &pixels,
+        182,
+        195,
+        [64, 64, 64],
+        "the next icon's empty slate",
+    );
+}
+
+/// The hud draws the draining air row at its true coordinates: seven air submerged —
+/// three full bubbles and the fading pair on the fourth, nothing past it.
+///
+/// The pins: the first bubble's cyan, the fourth's popping blue, the sky where the
+/// fifth would sit, and the sky above the row.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_draining_air() {
+    let (device, queue, target, mut hud) = rows_scene();
+    let draws = [
+        rows_slice(295.0, 191.0, 16, 18),
+        rows_slice(287.0, 191.0, 16, 18),
+        rows_slice(279.0, 191.0, 16, 18),
+        rows_slice(271.0, 191.0, 25, 18),
+    ];
+    hud.set_draws(
+        &device,
+        &queue,
+        &draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_rows(&pixels, 299, 195, [0, 255, 255], "the first full bubble");
+    expect_rows(&pixels, 275, 195, [0, 0, 255], "the fading fourth bubble");
+    expect_rows(&pixels, 267, 195, SKY, "no fifth bubble");
+    expect_rows(&pixels, 295, 190, SKY, "the sky above the row");
+}
+
+/// The hud draws the experience bar and level at their true coordinates: the 182-wide
+/// background, the 76-wide fill at 0.42, and the green `12` with its black outline.
+///
+/// The pins: the fill's yellow mid-row, the background's blue past the fill and at
+/// its right edge, the main line's green under both digits, and the outline's black
+/// beside and above the pen.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_experience_bar() {
+    let (device, queue, target, mut hud) = rows_scene();
+    let tint = [1.0, 1.0, 1.0, 1.0];
+    let green = [128.0 / 255.0, 1.0, 32.0 / 255.0, 1.0];
+    let black = [0.0, 0.0, 0.0, 1.0];
+    // The truncated fill at 0.42: `(int)(0.42 * 183) = 76`.
+    let fill = 76.0;
+    let mut draws = vec![
+        HudDraw::TexturedRect {
+            texture: HudTexture::Named("gui/icons"),
+            x: 122.0,
+            y: 211.0,
+            width: 182.0,
+            height: 5.0,
+            uv: [0.0, 64.0 / 256.0, 182.0 / 256.0, 69.0 / 256.0],
+            colour: tint,
+        },
+        HudDraw::TexturedRect {
+            texture: HudTexture::Named("gui/icons"),
+            x: 122.0,
+            y: 211.0,
+            width: fill,
+            height: 5.0,
+            uv: [0.0, 69.0 / 256.0, fill / 256.0, 74.0 / 256.0],
+            colour: tint,
+        },
+    ];
+    for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        draws.push(HudDraw::Text {
+            text: "12".to_string(),
+            x: 211.0 + dx,
+            y: 205.0 + dy,
+            scale: 1.0,
+            colour: black,
+            shadow: false,
+            blend: false,
+        });
+    }
+    draws.push(HudDraw::Text {
+        text: "12".to_string(),
+        x: 211.0,
+        y: 205.0,
+        scale: 1.0,
+        colour: green,
+        shadow: false,
+        blend: false,
+    });
+    hud.set_draws(
+        &device,
+        &queue,
+        &draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_rows(&pixels, 150, 213, [255, 255, 0], "the fill's yellow");
+    expect_rows(&pixels, 180, 213, [255, 255, 0], "the fill's mid yellow");
+    expect_rows(
+        &pixels,
+        200,
+        213,
+        [0, 0, 139],
+        "the background past the fill",
+    );
+    expect_rows(
+        &pixels,
+        303,
+        213,
+        [0, 0, 139],
+        "the background's right edge",
+    );
+    expect_rows(&pixels, 211, 208, [128, 255, 32], "the main one's green");
+    expect_rows(&pixels, 213, 208, [128, 255, 32], "the main two's green");
+    expect_rows(&pixels, 212, 205, [0, 0, 0], "the outline beside the pen");
+    expect_rows(&pixels, 211, 204, [0, 0, 0], "the outline above the pen");
+}

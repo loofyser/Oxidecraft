@@ -1479,6 +1479,8 @@ impl ClientApp {
         // then the scoreboard sidebar (`:336`), the chat's draws (`:343-346`)
         // and the held player list (`:348-358`). The sidebar and the list draw
         // with the measured font; the list draws only while its key is held.
+        // The survival rows land between the hotbar and the sidebar, in the
+        // overlay's own order (`renderPlayerStats` then `renderExpBar`).
         // The window carries no F1 key, no open screen and no spectator/debug
         // state yet, so the hotbar's gates rest at their playing defaults and
         // the mode at survival (recorded; later tasks feed them).
@@ -1493,6 +1495,14 @@ impl ClientApp {
                 survival: true,
             },
         );
+        hud_draws.extend(self.view.stat_rows_draws(&view::RowsInput {
+            font: self.font.as_ref(),
+            scaled,
+            survival: true,
+            hide_gui: false,
+            screen_open: false,
+            now_ms: system_time_ms(),
+        }));
         hud_draws.extend(match self.font.as_ref() {
             Some(font) => view::sidebar_draws(&self.board, &self.own_name, font, scaled),
             None => Vec::new(),
@@ -2318,6 +2328,7 @@ fn apply_session_event(
         | ClientEvent::WindowSnapshot { .. }
         | ClientEvent::HeldItemSlot { .. }
         | ClientEvent::Experience { .. }
+        | ClientEvent::Absorption { .. }
         | ClientEvent::Air { .. }
         | ClientEvent::Effects { .. }
         | ClientEvent::SignEditorOpen { .. }

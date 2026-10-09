@@ -126,6 +126,10 @@ const HELD_ITEM_CHANGE_ID: i32 = 0x09;
 /// (`Entity.java:286-287`: index 1 of the own block, a short).
 const AIR_METADATA_INDEX: u8 = 1;
 
+/// The own player's metadata index the absorption rides
+/// (`EntityPlayer.java:200, :2350-2356`: index 17 of the own block, a float).
+const ABSORPTION_METADATA_INDEX: u8 = 17;
+
 /// The brand payload, as the capture records the vanilla client sending it: a
 /// length-prefixed `vanilla`.
 const BRAND_PAYLOAD: &[u8] = b"\x07vanilla";
@@ -626,6 +630,16 @@ pub enum ClientEvent {
     Air {
         /// The air in ticks; 300 is a full breath.
         air: i16,
+    },
+    /// The own player's absorption, from clientbound 0x1C's metadata index 17.
+    ///
+    /// The absorption rides the own player's metadata block as a float
+    /// (`EntityPlayer.getAbsorptionAmount` reads DataWatcher 17,
+    /// `EntityPlayer.java:2353-2356`, registered in `entityInit` at :200) and
+    /// feeds the hearts row's yellow overlay directly.
+    Absorption {
+        /// The absorption in half-hearts, as the server sent it.
+        amount: f32,
     },
     /// The own player's live effects, after an addition or a removal
     /// (clientbound 0x1D and 0x1E).
@@ -1690,6 +1704,14 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     if *index == AIR_METADATA_INDEX {
                                         if let MetadataValue::Short(air) = value {
                                             report(events, ClientEvent::Air { air: *air });
+                                        }
+                                    }
+                                    if *index == ABSORPTION_METADATA_INDEX {
+                                        if let MetadataValue::Float(amount) = value {
+                                            report(
+                                                events,
+                                                ClientEvent::Absorption { amount: *amount },
+                                            );
                                         }
                                     }
                                 }

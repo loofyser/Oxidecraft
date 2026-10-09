@@ -28,7 +28,7 @@ use oxide_game::chat::{
 };
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, PlayerListRecord};
 use oxide_game::scoreboard::{Objective, Scoreboard, format_entry};
-use oxide_game::session::ClientEvent;
+use oxide_game::session::{ClientEvent, StatusEffect};
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::nbt::NbtValue;
 use oxide_render::entity_models::player::PlayerExtra;
@@ -81,6 +81,8 @@ pub struct View {
     own: Option<i32>,
     /// The held item's own state: the stack, the ease and the swing.
     held: HeldItem,
+    /// The survival rows' own state: the feeds `stat_rows_draws` reads.
+    rows: StatRows,
 }
 
 /// The window's held-item state: the source's own `ItemRenderer` fields the hand draws
@@ -433,6 +435,7 @@ impl View {
             arrival: None,
             own: None,
             held: HeldItem::new(),
+            rows: StatRows::new(),
         }
     }
 
@@ -457,6 +460,14 @@ impl View {
                 // port's own windows.rs holds the same band at 36–44).
                 self.held.hotbar = slots.iter().skip(HOTBAR_START).take(9).cloned().collect();
                 self.held.pop = *hotbar_pop;
+                // The armour band at 5–8 feeds the rows' armour sum
+                // (`ContainerPlayer.java`:36-54; `GuiIngame.java`:660-685 reads the
+                // worn total through `getTotalArmorValue`).
+                if let Some(band) = slots.get(5..9) {
+                    for (cell, stack) in band.iter().enumerate() {
+                        self.rows.armour[cell] = stack.clone();
+                    }
+                }
             }
             ClientEvent::HeldItemSlot { slot } => {
                 if let Ok(slot) = usize::try_from(*slot) {
@@ -465,7 +476,41 @@ impl View {
                     }
                 }
             }
-            ClientEvent::PlayerTick { yaw, pitch, .. } => self.held.tick(*pitch, *yaw),
+            ClientEvent::PlayerTick {
+                yaw,
+                pitch,
+                tick,
+                in_water,
+                hurt_time,
+                ..
+            } => {
+                self.held.tick(*pitch, *yaw);
+                self.rows.tick = *tick;
+                self.rows.in_water = *in_water;
+                self.rows.hurt_time = *hurt_time;
+            }
+            ClientEvent::Health {
+                health,
+                food,
+                saturation,
+            } => {
+                self.rows.health = *health;
+                self.rows.food = *food;
+                self.rows.saturation = *saturation;
+            }
+            ClientEvent::Effects { effects } => {
+                self.rows.effects.clone_from(effects);
+            }
+            ClientEvent::Air { air } => {
+                self.rows.air = *air;
+            }
+            ClientEvent::Absorption { amount } => {
+                self.rows.absorption = *amount;
+            }
+            ClientEvent::Experience { bar, level, .. } => {
+                self.rows.bar = *bar;
+                self.rows.level = *level;
+            }
             _ => {}
         }
     }
@@ -688,6 +733,485 @@ impl View {
                         blend: true,
                     });
                 }
+            }
+        }
+        draws
+    }
+}
+
+/// The stat rows' draw inputs: the font the level needs, the layout's size, the
+/// mode and F1 gates, and the wall clock in milliseconds — the blink's settle
+/// rule reads the same millisecond clock the source's `Minecraft.getSystemTime`
+/// returns (`GuiIngame.java`:630-634).
+pub struct RowsInput<'a> {
+    /// The measured font; without one the level stays out while the slices
+    /// still draw.
+    pub font: Option<&'a Font>,
+    /// The GUI-space size the frame lays out in.
+    pub scaled: ScaledResolution,
+    /// Whether survival or adventure is in force (`gameIsSurvivalOrAdventure`,
+    /// the rows' and the bar's own gate, `GuiIngame.java`:187-189/:218-222).
+    pub survival: bool,
+    /// The F1 state (`EntityRenderer.java`:1166).
+    pub hide_gui: bool,
+    /// Whether a screen is open (`EntityRenderer.java`:1166).
+    pub screen_open: bool,
+    /// The wall clock in milliseconds.
+    pub now_ms: u64,
+}
+
+/// The rows' shared jitter literal: `rand.setSeed(updateCounter × 312871)`, set
+/// once per render before the hearts loop (`GuiIngame.java`:637) and consumed by
+/// the hearts (`:711-714`) and the food (`:788-791`) loops.
+const ROWS_SEED_FACTOR: i64 = 312871;
+
+/// The max health the rows lay out against: the `maxHealth` attribute's own
+/// default. No 1.7-protocol packet carries the attribute, so the port reads the
+/// default the source spawns with (recorded; the regen cell and the row count
+/// both key off it, `:646`/:657).
+const ROWS_MAX_HEALTH: f32 = 20.0;
+
+/// The potion ids the rows read (`Potion.java`: the own player's active map,
+/// `EntityPlayer.isPotionActive` at each row's call site).
+const EFFECT_REGENERATION: u8 = 10;
+const EFFECT_HUNGER: u8 = 17;
+const EFFECT_POISON: u8 = 19;
+const EFFECT_WITHER: u8 = 20;
+
+/// The ceil of a float health term: the source's own truncating cast plus one
+/// when fractional (`MathHelper.ceiling_float_int`, `MathHelper.java`:106-110).
+fn ceil_float_int(value: f32) -> i32 {
+    let truncated = value as i32;
+    if value > truncated as f32 {
+        truncated + 1
+    } else {
+        truncated
+    }
+}
+
+/// The ceil of a double air term: the same cast one level up
+/// (`MathHelper.ceiling_double_int`, `MathHelper.java`:112-116).
+fn ceil_double_int(value: f64) -> i32 {
+    let truncated = value as i32;
+    if value > truncated as f64 {
+        truncated + 1
+    } else {
+        truncated
+    }
+}
+
+/// The rows' shared seed for one tick: the source's own `updateCounter * 312871`
+/// int arithmetic (`GuiIngame.java`:637), Java's 32-bit wrap included.
+fn row_seed(tick: u64) -> i64 {
+    (tick as i32).wrapping_mul(ROWS_SEED_FACTOR as i32) as i64
+}
+
+/// The source's `java.util.Random` (`Random.java`): the 48-bit linear
+/// congruential stream the hearts and food jitter draw from. The port carries
+/// the exact recurrence — the multiplier, the addend and the mask — because the
+/// tests pin the JVM's own `nextInt(2)`/`nextInt(3)` sequences.
+struct JvmRand {
+    seed: u64,
+}
+
+impl JvmRand {
+    /// The LCG's multiplier (`Random.java`:28).
+    const MULTIPLIER: u64 = 0x5DEECE66D;
+    /// The LCG's addend (`Random.java`:29).
+    const ADDEND: u64 = 0xB;
+    /// The 48-bit mask (`Random.java`:30).
+    const MASK: u64 = (1 << 48) - 1;
+
+    /// The stream for one seed: `setSeed`'s own xor-and-mask (`Random.java`:113).
+    fn new(seed: i64) -> Self {
+        Self {
+            seed: (seed as u64 ^ Self::MULTIPLIER) & Self::MASK,
+        }
+    }
+
+    /// The next `bits` of the stream (`Random.next`, `Random.java`:186-190).
+    fn next(&mut self, bits: u32) -> i32 {
+        self.seed = (self
+            .seed
+            .wrapping_mul(Self::MULTIPLIER)
+            .wrapping_add(Self::ADDEND))
+            & Self::MASK;
+        (self.seed >> (48 - bits)) as i32
+    }
+
+    /// The bounded draw (`Random.nextInt(int)`, `Random.java`:206-240): the
+    /// power-of-two fast path and the rejection loop, in the source's own
+    /// wrapping int arithmetic. A non-positive bound answers zero — the source
+    /// throws, but the rows only ever pass 2 and 3 (recorded).
+    fn next_int(&mut self, bound: i32) -> i32 {
+        if bound <= 0 {
+            return 0;
+        }
+        if (bound & bound.wrapping_neg()) == bound {
+            return ((bound as i64 * i64::from(self.next(31))) >> 31) as i32;
+        }
+        loop {
+            let bits = self.next(31);
+            let value = bits % bound;
+            if bits.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
+                return value;
+            }
+        }
+    }
+}
+
+/// One armour icon's sheet window: full `(34, 9)` while the pair sits under the
+/// value, half `(25, 9)` on it, empty `(16, 9)` past it (`GuiIngame.java`:664-682).
+fn armour_slice(points: i32, cell: i32) -> (i32, i32) {
+    if cell * 2 + 1 < points {
+        (34, 9)
+    } else if cell * 2 + 1 == points {
+        (25, 9)
+    } else {
+        (16, 9)
+    }
+}
+
+/// The air split: the full bubbles and the one fading bubble
+/// (`GuiIngame.java`:878-879 — `k7` full, `i8` popping).
+fn air_split(air: i16) -> (i32, i32) {
+    let full = ceil_double_int((f64::from(air) - 2.0) * 10.0 / 300.0);
+    let total = ceil_double_int(f64::from(air) * 10.0 / 300.0);
+    (full, total - full)
+}
+
+/// The experience fill's width: the truncated `bar × 183`
+/// (`GuiIngame.java`:422 — `(int)(experience * (j + 1))`, `j = 182`).
+fn exp_fill_width(bar: f32) -> i32 {
+    (bar * 183.0) as i32
+}
+
+/// The bar's gate: the level's own cap (`EntityPlayer.xpBarCap`:2059-2062).
+fn xp_bar_cap(level: i32) -> i32 {
+    if level >= 30 {
+        112 + (level - 30) * 9
+    } else if level >= 15 {
+        37 + (level - 15) * 5
+    } else {
+        7 + level * 2
+    }
+}
+
+/// The survival rows' own state: every feed `stat_rows_draws` reads, folded in
+/// by [`View::apply`].
+#[derive(Debug, Clone)]
+struct StatRows {
+    /// The session's tick: the rows' `updateCounter` (`GuiIngame.java`:637).
+    tick: u64,
+    /// Whether the player is in water: the air row's submersion gate
+    /// (`isInsideOfMaterial(Material.water)`, `:875`).
+    in_water: bool,
+    /// Ticks left of the hurt flash: the blink raises' own gate
+    /// (`hurtResistantTime > 0`, `:619`/:624).
+    hurt_time: u32,
+    /// The health, food and saturation the 0x06 carried.
+    health: f32,
+    /// The food level the 0x06 carried.
+    food: i32,
+    /// The saturation the 0x06 carried.
+    saturation: f32,
+    /// The own player's live effects.
+    effects: Vec<StatusEffect>,
+    /// The air in ticks; 300 is a full breath.
+    air: i16,
+    /// The absorption in half-hearts, from the own metadata's index 17.
+    absorption: f32,
+    /// The experience bar's fill, 0 through 1.
+    bar: f32,
+    /// The player's level.
+    level: i32,
+    /// The armour band: window 0's slots 5–8.
+    armour: [Option<MetadataItem>; 4],
+    /// The current ceil'd health (`playerHealth`, `:634`).
+    player_health: i32,
+    /// The remembered ceil'd health the flash draws against (`lastPlayerHealth`).
+    last_player_health: i32,
+    /// The blink's deadline tick (`healthUpdateCounter`, `:615`/:622/:627).
+    health_update_counter: i64,
+    /// The last raise or settle's clock (`lastSystemTime`, `:620`/:625/:633).
+    last_system_time: u64,
+}
+
+impl StatRows {
+    /// The resting state: full health and food, full air, nothing worn, no
+    /// effects — the frame a fresh spawn draws.
+    fn new() -> Self {
+        Self {
+            tick: 0,
+            in_water: false,
+            hurt_time: 0,
+            health: ROWS_MAX_HEALTH,
+            food: 20,
+            saturation: 5.0,
+            effects: Vec::new(),
+            air: 300,
+            absorption: 0.0,
+            bar: 0.0,
+            level: 0,
+            armour: [None, None, None, None],
+            player_health: ROWS_MAX_HEALTH as i32,
+            last_player_health: ROWS_MAX_HEALTH as i32,
+            health_update_counter: 0,
+            last_system_time: 0,
+        }
+    }
+
+    /// Whether the named effect is active (`isPotionActive` at each row's site).
+    fn effect_active(&self, id: u8) -> bool {
+        self.effects.iter().any(|effect| effect.effect_id == id)
+    }
+
+    /// The worn armour's total, capped at twenty: window-0 slots 5–8 through
+    /// Task 8's `armour_points` (`getTotalArmorValue`'s own walk, capped where
+    /// the display caps).
+    fn armour_points(&self) -> i32 {
+        let total: f32 = self
+            .armour
+            .iter()
+            .flatten()
+            .map(|stack| {
+                items::item_entry(stack.id)
+                    .and_then(|entry| entry.attributes.armour_points)
+                    .unwrap_or(0.0)
+            })
+            .sum();
+        total.min(20.0) as i32
+    }
+}
+
+/// One nine-by-nine `gui/icons` slice at `(x, y)` sampling `(u, v)`.
+fn rows_icons_slice(x: f32, y: f32, u: i32, v: i32) -> HudDraw {
+    HudDraw::TexturedRect {
+        texture: HudTexture::Named(TAB_ICONS),
+        x,
+        y,
+        width: 9.0,
+        height: 9.0,
+        uv: [
+            u as f32 / 256.0,
+            v as f32 / 256.0,
+            (u + 9) as f32 / 256.0,
+            (v + 9) as f32 / 256.0,
+        ],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    }
+}
+
+impl View {
+    /// The survival rows' draws: the armour, hearts (with the absorption
+    /// overlay), food, air and experience rows (`renderPlayerStats`:609-900 and
+    /// `renderExpBar`:414-450).
+    ///
+    /// The list runs in the source's own section order — armour, health, food,
+    /// air, then the bar and the level. The whole list obeys the call site's
+    /// gates: nothing draws outside survival and adventure, and F1 with no
+    /// screen open draws nothing (`gameIsSurvivalOrAdventure` at `:218-222`,
+    /// `EntityRenderer.java`:1166-1169). The mount-health arm is omitted — the
+    /// port tracks no ridden entity (recorded) — and the hardcore row offset
+    /// stays zero for the same reason. The food's `flag1` flash never draws:
+    /// the source declares it false and never sets it (`:638`, read at
+    /// `:793-811`).
+    ///
+    /// Two test-pinned readings differ from the letter of the source, both
+    /// recorded: the container's blink follows the pending counter rather than
+    /// the phased flag (so the raise's own render already blinks), and the
+    /// one-second settle parks the counter on the tick (so the flash ends with
+    /// the memory).
+    pub fn stat_rows_draws(&mut self, input: &RowsInput<'_>) -> Vec<HudDraw> {
+        if !input.survival || !hud_visible(input.hide_gui, input.screen_open) {
+            return Vec::new();
+        }
+        // The source's own integer halves (`sr.getScaledWidth() / 2`).
+        let half_w = (input.scaled.width / 2) as f32;
+        let height = input.scaled.height as f32;
+        let i1 = half_w - 91.0;
+        let j1 = half_w + 91.0;
+        let k1 = height - 39.0;
+        let rows = &mut self.rows;
+        // The blink's bookkeeping (`GuiIngame.java`:615-636): the 20-tick raise
+        // on a hurt loss and the 10-tick raise on a hurt gain, then the
+        // one-second settle of the remembered health.
+        let i = ceil_float_int(rows.health);
+        if i < rows.player_health && rows.hurt_time > 0 {
+            rows.last_system_time = input.now_ms;
+            rows.health_update_counter = rows.tick as i64 + 20;
+        } else if i > rows.player_health && rows.hurt_time > 0 {
+            rows.last_system_time = input.now_ms;
+            rows.health_update_counter = rows.tick as i64 + 10;
+        }
+        if input.now_ms.saturating_sub(rows.last_system_time) > 1000 {
+            rows.player_health = i;
+            rows.last_player_health = i;
+            rows.last_system_time = input.now_ms;
+            rows.health_update_counter = rows.tick as i64;
+        }
+        rows.player_health = i;
+        let j = rows.last_player_health;
+        let tick = rows.tick as i64;
+        let blink = rows.health_update_counter > tick;
+        let flag = blink && (rows.health_update_counter - tick) / 3 % 2 == 1;
+        let mut rand = JvmRand::new(row_seed(rows.tick));
+        let mut draws = Vec::new();
+        let max_health = ROWS_MAX_HEALTH;
+        let absorption = rows.absorption;
+        // The row count and the armour/air height (`:644-650`).
+        let l1 = ceil_float_int((max_health + absorption) / 2.0 / 10.0);
+        let i2 = (10 - (l1 - 2)).max(3);
+        let j2 = k1 - (l1 - 1) as f32 * i2 as f32 - 10.0;
+        // The regeneration cell (`:657`): `updateCounter % ceil(maxHealth + 5)` —
+        // the max-health attribute, absorption excluded.
+        let l2 = if rows.effect_active(EFFECT_REGENERATION) {
+            (rows.tick % u64::from(ceil_float_int(max_health + 5.0) as u32)) as i32
+        } else {
+            -1
+        };
+        // The armour row (`:660-685`): each point pair draws full, half or
+        // empty from the row's left edge — hidden entirely at zero.
+        let armour = rows.armour_points();
+        if armour > 0 {
+            for cell in 0..10 {
+                let (u, v) = armour_slice(armour, cell);
+                draws.push(rows_icons_slice(i1 + cell as f32 * 8.0, j2, u, v));
+            }
+        }
+        // The hearts row (`:687-774`).
+        let poisoned = rows.effect_active(EFFECT_POISON);
+        let withered = rows.effect_active(EFFECT_WITHER);
+        let j6 = 16
+            + if poisoned {
+                36
+            } else if withered {
+                72
+            } else {
+                0
+            };
+        let k3 = if blink { 1 } else { 0 };
+        let cells = ceil_float_int((max_health + absorption) / 2.0);
+        let mut f2 = absorption;
+        for i6 in (0..cells).rev() {
+            let l3 = ceil_float_int((i6 + 1) as f32 / 10.0) - 1;
+            let x = i1 + (i6 % 10) as f32 * 8.0;
+            let mut y = k1 - l3 as f32 * i2 as f32;
+            if i <= 4 {
+                y += rand.next_int(2) as f32;
+            }
+            if i6 == l2 {
+                y -= 2.0;
+            }
+            draws.push(rows_icons_slice(x, y, 16 + k3 * 9, 0));
+            if flag {
+                if i6 * 2 + 1 < j {
+                    draws.push(rows_icons_slice(x, y, j6 + 54, 0));
+                }
+                if i6 * 2 + 1 == j {
+                    draws.push(rows_icons_slice(x, y, j6 + 63, 0));
+                }
+            }
+            if f2 > 0.0 {
+                if f2 == absorption && absorption % 2.0 == 1.0 {
+                    draws.push(rows_icons_slice(x, y, j6 + 153, 0));
+                } else {
+                    draws.push(rows_icons_slice(x, y, j6 + 144, 0));
+                }
+                f2 -= 2.0;
+            } else {
+                if i6 * 2 + 1 < i {
+                    draws.push(rows_icons_slice(x, y, j6 + 36, 0));
+                }
+                if i6 * 2 + 1 == i {
+                    draws.push(rows_icons_slice(x, y, j6 + 45, 0));
+                }
+            }
+        }
+        // The food row (`:776-823`): the half rule, the hunger-effect variant
+        // and the saturation-gated jitter off the shared seed.
+        let hungered = rows.effect_active(EFFECT_HUNGER);
+        let l7 = if hungered { 52 } else { 16 };
+        let j8 = if hungered { 13 } else { 0 };
+        for k6 in 0..10 {
+            let mut y = k1;
+            if rows.saturation <= 0.0
+                && rows.tick % (u64::from(rows.food.max(0) as u32) * 3 + 1) == 0
+            {
+                y += (rand.next_int(3) - 1) as f32;
+            }
+            let x = j1 - k6 as f32 * 8.0 - 9.0;
+            draws.push(rows_icons_slice(x, y, 16 + j8 * 9, 27));
+            if k6 * 2 + 1 < rows.food {
+                draws.push(rows_icons_slice(x, y, l7 + 36, 27));
+            }
+            if k6 * 2 + 1 == rows.food {
+                draws.push(rows_icons_slice(x, y, l7 + 45, 27));
+            }
+        }
+        // The air row (`:873-891`): the 300/10 split into full and popping
+        // bubbles, right-to-left at the armour's height, gated by submersion.
+        if rows.in_water {
+            let (full, popping) = air_split(rows.air);
+            for l8 in 0..full + popping {
+                let u = if l8 < full { 16 } else { 25 };
+                draws.push(rows_icons_slice(j1 - l8 as f32 * 8.0 - 9.0, j2, u, 18));
+            }
+        }
+        // The experience bar (`renderExpBar`:414-432): the background and the
+        // truncated fill at `scaledH − 29`, behind the bar's own cap gate.
+        if xp_bar_cap(rows.level) > 0 {
+            let y = height - 29.0;
+            draws.push(HudDraw::TexturedRect {
+                texture: HudTexture::Named(TAB_ICONS),
+                x: i1,
+                y,
+                width: 182.0,
+                height: 5.0,
+                uv: [0.0, 64.0 / 256.0, 182.0 / 256.0, 69.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            });
+            let k = exp_fill_width(rows.bar);
+            if k > 0 {
+                draws.push(HudDraw::TexturedRect {
+                    texture: HudTexture::Named(TAB_ICONS),
+                    x: i1,
+                    y,
+                    width: k as f32,
+                    height: 5.0,
+                    uv: [0.0, 69.0 / 256.0, k as f32 / 256.0, 74.0 / 256.0],
+                    colour: [1.0, 1.0, 1.0, 1.0],
+                });
+            }
+        }
+        // The level (`:434-450`): the number centred in `0x80FF20` with the
+        // four-offset black outline at `scaledH − 35` — past level zero only.
+        if rows.level > 0 {
+            if let Some(font) = input.font {
+                let text = rows.level.to_string();
+                let width = string_width(font, &text);
+                let x = ((input.scaled.width as i32 - width) / 2) as f32;
+                let y = height - 35.0;
+                for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                    draws.push(HudDraw::Text {
+                        text: text.clone(),
+                        x: x + dx,
+                        y: y + dy,
+                        scale: 1.0,
+                        colour: [0.0, 0.0, 0.0, 1.0],
+                        shadow: false,
+                        blend: false,
+                    });
+                }
+                draws.push(HudDraw::Text {
+                    text,
+                    x,
+                    y,
+                    scale: 1.0,
+                    colour: [128.0 / 255.0, 1.0, 32.0 / 255.0, 1.0],
+                    shadow: false,
+                    blend: false,
+                });
             }
         }
         draws
@@ -7424,6 +7948,1188 @@ mod tests {
                 .iter()
                 .any(|draw| matches!(draw, HudDraw::InvertRect { .. })),
             "no crosshair while the gate says hide"
+        );
+    }
+
+    // ---- the stat rows (Task 15) ----
+
+    /// One window-0 snapshot carrying the armour band: slots 5-8 hold the
+    /// pieces, everything else stays empty (`ContainerPlayer.java`:36-54).
+    fn rows_snapshot(ids: [Option<i16>; 4]) -> ClientEvent {
+        let mut slots: Vec<Option<MetadataItem>> = vec![None; 45];
+        for (band, id) in ids.iter().enumerate() {
+            slots[5 + band] = id.map(|id| MetadataItem {
+                id,
+                count: 1,
+                damage: 0,
+                nbt: None,
+            });
+        }
+        ClientEvent::WindowSnapshot {
+            window_id: 0,
+            slots,
+            cursor: None,
+            properties: Vec::new(),
+            hotbar_pop: [0; 9],
+        }
+    }
+
+    /// One player tick naming the rows' clock, water and hurt state.
+    fn rows_tick(tick: u64, in_water: bool, hurt_time: u32) -> ClientEvent {
+        ClientEvent::PlayerTick {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            on_ground: true,
+            sprinting: false,
+            sneaking: false,
+            flying: false,
+            in_water,
+            tick,
+            snapped: false,
+            hurt_time,
+            attacked_at_yaw: 0.0,
+        }
+    }
+
+    /// The health feed: the packet's own triple (`Health`, clientbound 0x06).
+    fn rows_health(health: f32, food: i32, saturation: f32) -> ClientEvent {
+        ClientEvent::Health {
+            health,
+            food,
+            saturation,
+        }
+    }
+
+    /// The effects feed holding exactly the named ids.
+    fn rows_effects(ids: &[u8]) -> ClientEvent {
+        ClientEvent::Effects {
+            effects: ids
+                .iter()
+                .map(|id| oxide_game::session::StatusEffect {
+                    effect_id: *id,
+                    amplifier: 0,
+                    duration: 200,
+                })
+                .collect(),
+        }
+    }
+
+    /// The rows' inputs at the chat suite's resolution, the font optional, the
+    /// wall clock explicit so the blink's settle rule stays deterministic.
+    fn rows_input(font: Option<&Font>, now_ms: u64) -> RowsInput<'_> {
+        RowsInput {
+            font,
+            scaled: chat_resolution(),
+            survival: true,
+            hide_gui: false,
+            screen_open: false,
+            now_ms,
+        }
+    }
+
+    /// The rows' draws for a view fed exactly as the arguments say: the tick
+    /// first (the clock, water and hurt), then health, effects, air,
+    /// absorption and experience.
+    #[allow(clippy::too_many_arguments)]
+    fn rows_draws(
+        view: &mut View,
+        font: Option<&Font>,
+        now_ms: u64,
+        tick: u64,
+        in_water: bool,
+        hurt_time: u32,
+        health: f32,
+        food: i32,
+        saturation: f32,
+        effect_ids: &[u8],
+        air: i16,
+        absorption: f32,
+        bar: f32,
+        level: i32,
+    ) -> Vec<HudDraw> {
+        view.apply(&rows_tick(tick, in_water, hurt_time));
+        view.apply(&rows_health(health, food, saturation));
+        view.apply(&rows_effects(effect_ids));
+        view.apply(&ClientEvent::Air { air });
+        view.apply(&ClientEvent::Absorption { amount: absorption });
+        view.apply(&ClientEvent::Experience {
+            bar,
+            level,
+            total: 0,
+        });
+        view.stat_rows_draws(&rows_input(font, now_ms))
+    }
+
+    /// A healthy, dry, unhurt frame's rows: health and food full, no effects,
+    /// full air, no absorption, no experience.
+    fn rows_healthy(view: &mut View, font: Option<&Font>, now_ms: u64) -> Vec<HudDraw> {
+        rows_draws(
+            view,
+            font,
+            now_ms,
+            0,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        )
+    }
+
+    /// The `(x, y, uv)` of every icons-slice draw, in list order.
+    fn rows_slices(draws: &[HudDraw]) -> Vec<(f32, f32, [f32; 4])> {
+        draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::TexturedRect { x, y, uv, .. } => Some((*x, *y, *uv)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `(text, x, y, colour, shadow)` of every text draw, in list order.
+    fn rows_texts(draws: &[HudDraw]) -> Vec<(String, f32, f32, [f32; 4], bool)> {
+        draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Text {
+                    text,
+                    x,
+                    y,
+                    colour,
+                    shadow,
+                    ..
+                } => Some((text.clone(), *x, *y, *colour, *shadow)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The ceil pair is the source's own truncating cast plus one when
+    /// fractional (`MathHelper.ceiling_float_int`/`ceiling_double_int`,
+    /// `MathHelper.java`:106-116).
+    #[test]
+    fn the_rows_ceil_rules_follow_the_sources_casts() {
+        assert_eq!(ceil_float_int(20.0), 20);
+        assert_eq!(ceil_float_int(17.5), 18);
+        assert_eq!(ceil_float_int(0.1), 1);
+        assert_eq!(ceil_float_int(0.0), 0);
+        assert_eq!(ceil_double_int(10.0), 10);
+        assert_eq!(ceil_double_int(9.0667), 10);
+        assert_eq!(ceil_double_int(0.0334), 1);
+        assert_eq!(
+            ceil_double_int(-0.0334),
+            0,
+            "a negative fraction ceils to zero"
+        );
+        assert_eq!(ceil_double_int(0.0), 0);
+    }
+
+    /// The rows' geometry at the chat suite's 427x240 resolution: the hearts
+    /// row at `scaledW/2 − 91` (`GuiIngame.java`:643), hearts and hunger at
+    /// `scaledH − 39` (:645), armour and air ten above (:650), the bar at
+    /// `scaledH − 29` (:425) and the level at `scaledH − 35` (:441).
+    #[test]
+    fn the_rows_geometry_pins_the_sources_rows() {
+        let mut view = View::new();
+        view.apply(&rows_snapshot([None, None, None, None]));
+        let font = chat_font();
+        let draws = rows_healthy(&mut view, Some(&font), 5_000);
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(122.0, 201.0, [16.0 / 256.0, 0.0, 25.0 / 256.0, 9.0 / 256.0])),
+            "the first heart's container at (122, 201): {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                295.0,
+                201.0,
+                [16.0 / 256.0, 27.0 / 256.0, 25.0 / 256.0, 36.0 / 256.0]
+            )),
+            "the first food cell at j1 − 9 = 295, same row: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                122.0,
+                211.0,
+                [0.0, 64.0 / 256.0, 182.0 / 256.0, 69.0 / 256.0]
+            )),
+            "the experience background at (122, 211): {slices:?}"
+        );
+    }
+
+    /// The heart variant picker (`GuiIngame.java`:689-698, :756-767): the
+    /// ceil'd health picks full (`j6 + 36`) below and half (`j6 + 45) at the
+    /// boundary over the always-drawn container, with the base at 16, 52
+    /// under poison and 88 under wither — poison winning over wither.
+    #[test]
+    fn the_rows_heart_variants_pin_the_slice_windows() {
+        let font = chat_font();
+        // Full health: ten containers each carrying a full heart.
+        let mut view = View::new();
+        let draws = rows_healthy(&mut view, Some(&font), 5_000);
+        let hearts: Vec<(f32, f32, [f32; 4])> = rows_slices(&draws)
+            .into_iter()
+            .filter(|(_, y, _)| *y == 201.0)
+            .filter(|(x, _, _)| *x < 200.0)
+            .collect();
+        assert_eq!(
+            hearts.len(),
+            20,
+            "ten containers plus ten full hearts: {hearts:?}"
+        );
+        for cell in 0..10 {
+            let x = 122.0 + cell as f32 * 8.0;
+            assert!(
+                hearts.contains(&(x, 201.0, [16.0 / 256.0, 0.0, 25.0 / 256.0, 9.0 / 256.0])),
+                "cell {cell}'s container: {hearts:?}"
+            );
+            assert!(
+                hearts.contains(&(x, 201.0, [52.0 / 256.0, 0.0, 61.0 / 256.0, 9.0 / 256.0])),
+                "cell {cell}'s full heart: {hearts:?}"
+            );
+        }
+        // Nineteen health: nine full, the last cell a half.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            false,
+            0,
+            19.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let hearts: Vec<(f32, f32, [f32; 4])> = rows_slices(&draws)
+            .into_iter()
+            .filter(|(_, y, _)| *y == 201.0)
+            .filter(|(x, _, _)| *x < 200.0)
+            .collect();
+        assert_eq!(
+            hearts.len(),
+            20,
+            "ten containers, nine full, one half: {hearts:?}"
+        );
+        assert!(
+            hearts.contains(&(194.0, 201.0, [61.0 / 256.0, 0.0, 70.0 / 256.0, 9.0 / 256.0])),
+            "the last cell's half heart: {hearts:?}"
+        );
+        // Two health: one full heart over the first container, nine bare ones.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            0,
+            false,
+            0,
+            2.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let fulls = rows_slices(&draws)
+            .into_iter()
+            .filter(|(_, _, uv)| *uv == [52.0 / 256.0, 0.0, 61.0 / 256.0, 9.0 / 256.0])
+            .count();
+        assert_eq!(fulls, 1, "a single full heart at two health: {draws:?}");
+        // Zero health: ten bare containers, no heart slice at all.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            0,
+            false,
+            0,
+            0.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        assert!(
+            rows_slices(&draws)
+                .iter()
+                .filter(|(x, _, _)| *x >= 122.0 && *x <= 194.0)
+                .all(|(_, _, uv)| uv[0] < 50.0 / 256.0),
+            "no full or half slice draws at zero health: {draws:?}"
+        );
+        // Poison shifts the pair to 88/97, wither to 124/133, poison winning.
+        for (effects, full, half, what) in [
+            (&[19u8][..], 88.0, 97.0, "poison"),
+            (&[20u8][..], 124.0, 133.0, "wither"),
+            (&[19u8, 20u8][..], 88.0, 97.0, "poison over wither"),
+        ] {
+            let mut view = View::new();
+            let draws = rows_draws(
+                &mut view,
+                Some(&font),
+                5_000,
+                0,
+                false,
+                0,
+                19.0,
+                20,
+                5.0,
+                effects,
+                300,
+                0.0,
+                0.0,
+                0,
+            );
+            let slices = rows_slices(&draws);
+            assert!(
+                slices.contains(&(
+                    122.0,
+                    201.0,
+                    [full / 256.0, 0.0, (full + 9.0) / 256.0, 9.0 / 256.0]
+                )),
+                "{what}'s full heart: {slices:?}"
+            );
+            assert!(
+                slices.contains(&(
+                    194.0,
+                    201.0,
+                    [half / 256.0, 0.0, (half + 9.0) / 256.0, 9.0 / 256.0]
+                )),
+                "{what}'s half heart: {slices:?}"
+            );
+        }
+    }
+
+    /// The blink state machine (`GuiIngame.java`:615-636): the 20-tick raise
+    /// on a hurt loss and the 10-tick raise on a hurt gain, the 3-tick flip
+    /// and the one-second settle — with the raises gated by the hurt window.
+    #[test]
+    fn the_rows_blink_state_follows_the_counter_and_clock() {
+        // A hurt loss raises by twenty: drawing three ticks on the flag reads
+        // true and the flash pair draws against the remembered twenty.
+        let mut view = View::new();
+        let font = chat_font();
+        let _ = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            100,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            100,
+            false,
+            5,
+            16.5,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(122.0, 201.0, [25.0 / 256.0, 0.0, 34.0 / 256.0, 9.0 / 256.0])),
+            "the blink recolours the container while the flag runs: {slices:?}"
+        );
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            103,
+            false,
+            5,
+            16.5,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(194.0, 201.0, [70.0 / 256.0, 0.0, 79.0 / 256.0, 9.0 / 256.0])),
+            "the flash full pair against the remembered twenty: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(186.0, 201.0, [61.0 / 256.0, 0.0, 70.0 / 256.0, 9.0 / 256.0])),
+            "the current half heart over its flash: {slices:?}"
+        );
+        // Past the second the settle lands: the remembered health becomes the
+        // current one and the flash leaves.
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            6_001,
+            103,
+            false,
+            0,
+            16.5,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            !slices
+                .iter()
+                .any(|(_, _, uv)| uv[0] == 70.0 / 256.0 || uv[0] == 79.0 / 256.0),
+            "no flash slice survives the settle: {slices:?}"
+        );
+        // A loss outside the hurt window raises nothing: plain containers.
+        let mut view = View::new();
+        let _ = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            100,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            103,
+            false,
+            0,
+            16.5,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            !slices.iter().any(|(_, _, uv)| uv[0] == 25.0 / 256.0),
+            "no blink container without the hurt window: {slices:?}"
+        );
+        // A hurt gain raises by ten instead: the flag still runs.
+        let mut view = View::new();
+        let _ = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            100,
+            false,
+            0,
+            10.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            100,
+            false,
+            5,
+            16.5,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.iter().any(|(_, _, uv)| uv[0] == 25.0 / 256.0),
+            "the hurt gain's raise recolours the container: {slices:?}"
+        );
+    }
+
+    /// The absorption overlay (`GuiIngame.java`:743-755): the cell count grows
+    /// by the absorption, the overlay fills from the rightmost cell, and an
+    /// odd total shows the half slice (`j6 + 153`) on the first cell only.
+    #[test]
+    fn the_rows_absorption_overlay_fills_from_the_right() {
+        let font = chat_font();
+        // Four absorption: twelve cells, the two rightmost overlaid full.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            4.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                130.0,
+                191.0,
+                [160.0 / 256.0, 0.0, 169.0 / 256.0, 9.0 / 256.0]
+            )),
+            "the rightmost cell's full overlay, one row up: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                122.0,
+                191.0,
+                [160.0 / 256.0, 0.0, 169.0 / 256.0, 9.0 / 256.0]
+            )),
+            "the second cell's full overlay: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(122.0, 201.0, [52.0 / 256.0, 0.0, 61.0 / 256.0, 9.0 / 256.0])),
+            "the leftmost cell stays a normal full heart: {slices:?}"
+        );
+        // Three absorption: the first overlaid cell shows the odd half slice.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            3.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                130.0,
+                191.0,
+                [169.0 / 256.0, 0.0, 178.0 / 256.0, 9.0 / 256.0]
+            )),
+            "the odd total's half overlay on the first cell only: {slices:?}"
+        );
+        assert!(
+            !slices
+                .iter()
+                .any(|(x, y, uv)| (*x, *y) != (130.0, 191.0) && uv[0] == 169.0 / 256.0),
+            "no other cell carries the half slice: {slices:?}"
+        );
+    }
+
+    /// The regeneration bob (`GuiIngame.java`:653-658): the cell matching
+    /// `updateCounter % ceil(maxHealth + 5)` sits two higher — max health, so
+    /// absorption never moves it.
+    #[test]
+    fn the_rows_regen_bob_reads_max_health() {
+        let font = chat_font();
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            8,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[10],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.iter().any(|(x, y, _)| *x == 186.0 && *y == 199.0),
+            "cell eight bobs at tick eight of twenty-five: {slices:?}"
+        );
+        assert!(
+            slices
+                .iter()
+                .filter(|(x, y, _)| *x == 122.0 && *y == 201.0)
+                .all(|(_, y, _)| *y == 201.0),
+            "cell zero stays on the row: {slices:?}"
+        );
+        // Absorption excluded: twenty-six ticks still pick cell one.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            26,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[10],
+            300,
+            4.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices
+                .iter()
+                .any(|(x, y, _)| *x == 130.0 && (*y == 199.0 || *y == 189.0)),
+            "cell one bobs with absorption held: {slices:?}"
+        );
+    }
+
+    /// The shared seed and the low-health jitter (`GuiIngame.java`:637,
+    /// :711-714): the seed is set once per render from `updateCounter ×
+    /// 312871`, and each cell draws `nextInt(2)` while the ceil'd health is
+    /// four or below — the JVM's own sequence.
+    #[test]
+    fn the_rows_shared_seed_feeds_the_low_health_jitter() {
+        assert_eq!(ROWS_SEED_FACTOR, 312871);
+        assert_eq!(row_seed(0), 0);
+        assert_eq!(row_seed(1), 312871);
+        // Health two at tick zero: the first ten `nextInt(2)` draws of seed
+        // zero read 1,1,0,1,1,0,1,0,1,1 from the highest cell down.
+        let font = chat_font();
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            0,
+            false,
+            0,
+            2.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let jittered: Vec<(f32, f32)> = rows_slices(&draws)
+            .into_iter()
+            .filter(|(x, _, _)| *x >= 122.0 && *x <= 194.0)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        for (cell, want) in [(9u32, 202.0), (8, 202.0), (7, 201.0), (0, 202.0)] {
+            let x = 122.0 + cell as f32 * 8.0;
+            assert!(
+                jittered.iter().any(|(hx, hy)| *hx == x && *hy == want),
+                "cell {cell} sits at {want}: {jittered:?}"
+            );
+        }
+        // Full health draws no jitter at all: every heart cell sits on 201.
+        let mut view = View::new();
+        let draws = rows_healthy(&mut view, Some(&font), 60_000);
+        assert!(
+            rows_slices(&draws)
+                .iter()
+                .filter(|(x, y, _)| *x < 200.0 && (*y == 201.0 || *y == 202.0))
+                .all(|(_, y, _)| *y == 201.0),
+            "no jitter above four health: {draws:?}"
+        );
+    }
+
+    /// The food row (`GuiIngame.java`:776-823): the half rule, the
+    /// hunger-effect variant, and the saturation-gated jitter with the shared
+    /// seed — the JVM's own `nextInt(3)` sequences at the qualifying ticks.
+    #[test]
+    fn the_rows_food_pins_the_half_and_the_jitter() {
+        let font = chat_font();
+        // Six food at tick thirty-eight: 38 % 19 == 0, and seed 38 × 312871
+        // opens 1,1,2 — offsets 0,0,+1 across the first three cells.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            38,
+            false,
+            0,
+            20.0,
+            6,
+            0.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                295.0,
+                201.0,
+                [52.0 / 256.0, 27.0 / 256.0, 61.0 / 256.0, 36.0 / 256.0]
+            )),
+            "cell zero's full haunch, unshifted: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                279.0,
+                202.0,
+                [52.0 / 256.0, 27.0 / 256.0, 61.0 / 256.0, 36.0 / 256.0]
+            )),
+            "cell two's full haunch shifted one lower: {slices:?}"
+        );
+        assert!(
+            !slices
+                .iter()
+                .any(|(x, _, uv)| *x == 271.0 && uv[0] == 52.0 / 256.0),
+            "cell three stays empty at six food: {slices:?}"
+        );
+        // Seven food: the fourth cell carries the half haunch.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            1,
+            false,
+            0,
+            20.0,
+            7,
+            0.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                271.0,
+                201.0,
+                [61.0 / 256.0, 27.0 / 256.0, 70.0 / 256.0, 36.0 / 256.0]
+            )),
+            "cell three's half haunch: {slices:?}"
+        );
+        // Saturation above zero suppresses the jitter even on a qualifying tick.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            38,
+            false,
+            0,
+            20.0,
+            6,
+            1.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        assert!(
+            rows_slices(&draws)
+                .iter()
+                .filter(|(x, _, _)| *x >= 223.0)
+                .all(|(_, y, _)| *y == 201.0),
+            "no jitter while saturation lasts: {draws:?}"
+        );
+        // A non-qualifying tick draws the row straight at zero saturation.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            39,
+            false,
+            0,
+            20.0,
+            6,
+            0.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        assert!(
+            rows_slices(&draws)
+                .iter()
+                .filter(|(x, _, _)| *x >= 223.0)
+                .all(|(_, y, _)| *y == 201.0),
+            "no jitter off the modulo: {draws:?}"
+        );
+        // The hunger effect shifts the background to 133 and the pair to 88/97.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            60_000,
+            1,
+            false,
+            0,
+            20.0,
+            6,
+            0.0,
+            &[17],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                295.0,
+                201.0,
+                [133.0 / 256.0, 27.0 / 256.0, 142.0 / 256.0, 36.0 / 256.0]
+            )),
+            "the hungered background: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                295.0,
+                201.0,
+                [88.0 / 256.0, 27.0 / 256.0, 97.0 / 256.0, 36.0 / 256.0]
+            )),
+            "the hungered full haunch: {slices:?}"
+        );
+    }
+
+    /// The armour row (`GuiIngame.java`:660-685): the value sums window-0
+    /// slots 5–8 through Task 8's `armour_points`, and each point pair draws
+    /// full (34, 9), half (25, 9) or empty (16, 9) from the row's left edge —
+    /// hidden entirely at zero.
+    #[test]
+    fn the_rows_armour_sums_slots_five_to_eight() {
+        let font = chat_font();
+        // Iron helm 2, chain chest 5, iron legs 5, leather boots 1: thirteen.
+        let mut view = View::new();
+        view.apply(&rows_snapshot([Some(306), Some(303), Some(308), Some(301)]));
+        let draws = rows_healthy(&mut view, Some(&font), 5_000);
+        let slices = rows_slices(&draws);
+        for cell in 0..6 {
+            assert!(
+                slices.contains(&(
+                    122.0 + cell as f32 * 8.0,
+                    191.0,
+                    [34.0 / 256.0, 9.0 / 256.0, 43.0 / 256.0, 18.0 / 256.0]
+                )),
+                "icon {cell} full at thirteen armour: {slices:?}"
+            );
+        }
+        assert!(
+            slices.contains(&(
+                170.0,
+                191.0,
+                [25.0 / 256.0, 9.0 / 256.0, 34.0 / 256.0, 18.0 / 256.0]
+            )),
+            "the thirteenth point halves icon six: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                178.0,
+                191.0,
+                [16.0 / 256.0, 9.0 / 256.0, 25.0 / 256.0, 18.0 / 256.0]
+            )),
+            "icon seven stays empty: {slices:?}"
+        );
+        // An unknown id contributes nothing: a lone leather cap reads one.
+        let mut view = View::new();
+        view.apply(&rows_snapshot([Some(9999), None, None, Some(298)]));
+        let draws = rows_healthy(&mut view, Some(&font), 5_000);
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                122.0,
+                191.0,
+                [25.0 / 256.0, 9.0 / 256.0, 34.0 / 256.0, 18.0 / 256.0]
+            )),
+            "one point halves the first icon: {slices:?}"
+        );
+        // Bare: no armour slice draws anywhere.
+        let mut view = View::new();
+        view.apply(&rows_snapshot([None, None, None, None]));
+        let draws = rows_healthy(&mut view, Some(&font), 5_000);
+        assert!(
+            !rows_slices(&draws)
+                .iter()
+                .any(|(_, y, uv)| *y == 191.0 && (uv[1] - 9.0 / 256.0).abs() < 1e-9),
+            "the row hides at zero armour: {draws:?}"
+        );
+        // The display caps at ten full icons past twenty points.
+        assert_eq!(armour_slice(25, 9), (34, 9));
+        assert_eq!(armour_slice(20, 9), (34, 9));
+        assert_eq!(armour_slice(13, 6), (25, 9));
+    }
+
+    /// The air row (`GuiIngame.java`:873-891): the 300/10 split into full and
+    /// popping bubbles, right-to-left at the armour's height, gated by
+    /// submersion — ten full bubbles at full air, none dry.
+    #[test]
+    fn the_rows_air_segmentation_pins_the_split() {
+        assert_eq!(air_split(300), (10, 0));
+        assert_eq!(air_split(299), (10, 0));
+        assert_eq!(air_split(272), (9, 1));
+        assert_eq!(air_split(270), (9, 0));
+        assert_eq!(air_split(31), (1, 1));
+        assert_eq!(air_split(30), (1, 0));
+        assert_eq!(air_split(1), (0, 1));
+        assert_eq!(air_split(0), (0, 0));
+        // Submerged at 182: six full bubbles and the fading pair.
+        let font = chat_font();
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            true,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            182,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        for cell in 0..6 {
+            assert!(
+                slices.contains(&(
+                    295.0 - cell as f32 * 8.0,
+                    191.0,
+                    [16.0 / 256.0, 18.0 / 256.0, 25.0 / 256.0, 27.0 / 256.0]
+                )),
+                "bubble {cell} full: {slices:?}"
+            );
+        }
+        assert!(
+            slices.contains(&(
+                247.0,
+                191.0,
+                [25.0 / 256.0, 18.0 / 256.0, 34.0 / 256.0, 27.0 / 256.0]
+            )),
+            "the leftmost bubble pops: {slices:?}"
+        );
+        // Dry: no bubble draws whatever the air reads.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            182,
+            0.0,
+            0.0,
+            0,
+        );
+        assert!(
+            !rows_slices(&draws)
+                .iter()
+                .any(|(_, _, uv)| (uv[1] - 18.0 / 256.0).abs() < 1e-9),
+            "no bubbles out of water: {draws:?}"
+        );
+    }
+
+    /// The experience bar (`GuiIngame.java`:414-450): the background
+    /// `(0, 64, 182, 5)` and the truncated fill `(0, 69, k, 5)` with `k =
+    /// (int)(bar × 183)` at `scaledH − 29`, and above it the level in
+    /// `0x80FF20` with the four-offset black outline at `scaledH − 35` —
+    /// drawn only past level zero.
+    #[test]
+    fn the_rows_exp_fill_and_level_pin_the_bar() {
+        assert_eq!(exp_fill_width(0.0), 0);
+        assert_eq!(exp_fill_width(0.5), 91);
+        assert_eq!(exp_fill_width(0.42), 76);
+        assert_eq!(exp_fill_width(1.0), 183);
+        let font = chat_font();
+        // 0.42 full at level twelve: the background, the 76-wide fill and the
+        // five level draws.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.42,
+            12,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            slices.contains(&(
+                122.0,
+                211.0,
+                [0.0, 64.0 / 256.0, 182.0 / 256.0, 69.0 / 256.0]
+            )),
+            "the bar background: {slices:?}"
+        );
+        assert!(
+            slices.contains(&(
+                122.0,
+                211.0,
+                [0.0, 69.0 / 256.0, 76.0 / 256.0, 74.0 / 256.0]
+            )),
+            "the truncated fill: {slices:?}"
+        );
+        let texts = rows_texts(&draws);
+        assert_eq!(
+            texts.len(),
+            5,
+            "the outline four plus the main line: {texts:?}"
+        );
+        let green = [128.0 / 255.0, 1.0, 32.0 / 255.0, 1.0];
+        assert!(
+            texts.contains(&("12".to_owned(), 212.0, 205.0, green, false)),
+            "the level centred in 0x80FF20: {texts:?}"
+        );
+        for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            assert!(
+                texts.contains(&(
+                    "12".to_owned(),
+                    212.0 + dx,
+                    205.0 + dy,
+                    [0.0, 0.0, 0.0, 1.0],
+                    false
+                )),
+                "the outline at ({dx}, {dy}): {texts:?}"
+            );
+        }
+        // An empty bar draws no fill; level zero draws no text.
+        let mut view = View::new();
+        let draws = rows_draws(
+            &mut view,
+            Some(&font),
+            5_000,
+            0,
+            false,
+            0,
+            20.0,
+            20,
+            5.0,
+            &[],
+            300,
+            0.0,
+            0.0,
+            0,
+        );
+        let slices = rows_slices(&draws);
+        assert!(
+            !slices
+                .iter()
+                .any(|(_, _, uv)| (uv[1] - 69.0 / 256.0).abs() < 1e-9),
+            "no fill slice at zero: {slices:?}"
+        );
+        assert!(
+            rows_texts(&draws).is_empty(),
+            "no level text at zero: {draws:?}"
+        );
+    }
+
+    /// The rows' gates: outside survival and adventure nothing draws, and the
+    /// call site's F1 rule hides the rows with the rest of the overlay.
+    #[test]
+    fn the_rows_gates_follow_the_overlay_rules() {
+        let mut view = View::new();
+        view.apply(&rows_snapshot([Some(306), Some(303), Some(308), Some(301)]));
+        let font = chat_font();
+        let creative = RowsInput {
+            survival: false,
+            ..rows_input(Some(&font), 5_000)
+        };
+        assert!(
+            view.stat_rows_draws(&creative).is_empty(),
+            "no rows outside survival and adventure"
+        );
+        let hidden = RowsInput {
+            hide_gui: true,
+            ..rows_input(Some(&font), 5_000)
+        };
+        assert!(
+            view.stat_rows_draws(&hidden).is_empty(),
+            "F1 alone hides the rows"
+        );
+        let screened = RowsInput {
+            hide_gui: true,
+            screen_open: true,
+            ..rows_input(Some(&font), 5_000)
+        };
+        assert!(
+            !view.stat_rows_draws(&screened).is_empty(),
+            "a screen keeps the rows"
         );
     }
 

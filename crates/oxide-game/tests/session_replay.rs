@@ -6880,6 +6880,27 @@ fn an_own_metadata_air_change_publishes_the_air_supply() {
 }
 
 #[test]
+fn an_own_metadata_absorption_change_publishes_the_absorption() {
+    let head = feed_head(&[
+        entity_metadata_frame(20, &[(17, 3, meta_float(4.0))]),
+        entity_metadata_frame(21, &[(17, 3, meta_float(4.0))]),
+        entity_metadata_frame(20, &[(0, 0, meta_byte(0))]),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let absorption: Vec<f32> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Absorption { amount } => Some(*amount),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        absorption,
+        vec![4.0],
+        "the own id's index 17 lands; another entity's and an own block without one report nothing: {events:?}"
+    );
+}
+#[test]
 fn a_merchant_trade_list_publishes_its_offers() {
     let mut body = Vec::new();
     body.extend_from_slice(&1i32.to_be_bytes());
