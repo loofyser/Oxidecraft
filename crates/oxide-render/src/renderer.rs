@@ -787,10 +787,11 @@ impl Renderer {
         }
         // The held item draws between the scene and the overlay, in its own pass: the
         // source's hand draws inside the world pass after the terrain and the entities
-        // and before the GUI's own pass (`EntityRenderer.java`:864-876). The pass
-        // clears depth, because the scene pass discards its own — nothing stores it —
-        // so the hand tests against itself alone and no terrain hides it (recorded:
-        // the source's hand tests against the world's depth).
+        // and before the GUI's own pass (`EntityRenderer.java`:864-876), the depth
+        // buffer cleared immediately before it (`:1484`'s `clear(256)`). This pass
+        // clears its own depth for the same shape, because the scene pass discards its
+        // own — nothing stores it — so the hand tests against itself alone and no
+        // terrain hides it, matching the source's own clear.
         if self.camera.is_some() {
             let mut held_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("oxide-render held item pass"),

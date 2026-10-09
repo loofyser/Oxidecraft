@@ -999,6 +999,37 @@ impl ModelSource {
             .cloned()
     }
 
+    /// The item file a generated row's own layer list regenerates.
+    ///
+    /// The row's layers are the `layer0…4` paths its chain resolves — the
+    /// same list [`ItemModelSource::Generated`] carries — and the file that
+    /// regenerates exactly that list is the row's model file: the generator
+    /// writes the item's file from the item's own sprites
+    /// (`ItemModelGenerator`'s naming rule pairs the sprite `items/<name>`
+    /// with the file `item/<name>`), so the full layer list — not one
+    /// sprite's basename — names the file. The shortest `item/` path wins a
+    /// tie, lexicographically first, matching [`ModelSource::item_model_above`];
+    /// a tie means two files regenerate one list (the shipping tree's ties
+    /// state the same display slots).
+    pub fn generated_item_file(&self, layers: &[&str]) -> Option<String> {
+        self.models
+            .iter()
+            .filter(|(path, _)| path.starts_with(ITEM_MODEL_PREFIX))
+            .filter(|(path, _)| {
+                self.chain_for_resource(path)
+                    .map(|chain| {
+                        chain_layers(&chain)
+                            .iter()
+                            .map(String::as_str)
+                            .eq(layers.iter().copied())
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(path, _)| path)
+            .min_by_key(|path| (path.len(), path.as_str()))
+            .cloned()
+    }
+
     /// Bakes one item model by name.
     ///
     /// The classes bake the way the source's item pass bakes them

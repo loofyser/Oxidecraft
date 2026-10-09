@@ -61,7 +61,7 @@ use oxide_assets::texture::Texture;
 use oxide_render::camera::{
     Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
 };
-use oxide_render::entity_models::{Pose, PoseExtra};
+use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
     BOSS_STATUS_TIME, BossStatus, DrawExtra, EntityDraw, EntityPass, ModelRef, NametagDraw,
     SkinLookup, TextureRef, TextureRegistry,
@@ -6756,6 +6756,18 @@ impl ItemIconSource for TestIcons {
                 first_person: sword_transform(),
                 shape: IconShape::Flat,
             }),
+            // The chest-shaped fixture: the folded trio's own mesh on a synthetic
+            // 64x64 sheet under the trio's texture name, for the builtin class's own
+            // held case.
+            5 => Some(ItemIconMesh {
+                mesh: ItemMesh {
+                    vertices: Arc::new(objects::chest_item()),
+                    texture: "entity/chest/normal",
+                },
+                transform: Transform::DEFAULT,
+                first_person: Transform::DEFAULT,
+                shape: IconShape::Builtin,
+            }),
             _ => None,
         }
     }
@@ -6900,8 +6912,59 @@ fn held_frame(equip: f32, equip_prev: f32, sleeping: bool) -> HeldItemFrame {
         equip_prev,
         swing: 0.0,
         swing_prev: 0.0,
+        sway_pitch: 0.0,
+        sway_yaw: 0.0,
         brightness: 1.0,
         sleeping,
+    }
+}
+
+/// The held chest case's frame: the chest fixture (`TestIcons` id 5) at rest, full
+/// bright and awake.
+fn held_chest_frame() -> HeldItemFrame {
+    HeldItemFrame {
+        stack: Some(ItemIcon {
+            id: 5,
+            damage: 0,
+            enchanted: false,
+        }),
+        equip: 0.0,
+        equip_prev: 0.0,
+        swing: 0.0,
+        swing_prev: 0.0,
+        sway_pitch: 0.0,
+        sway_yaw: 0.0,
+        brightness: 1.0,
+        sleeping: false,
+    }
+}
+
+/// The held chest case's sheet: the chest model's own two uv cells — the lid and the
+/// knob sample rows 0..19 (their `v = 0` cell), the base rows 19..44 (its `v = 19`
+/// cell). The lid cell is banded along u (the box's own face columns: west 0..14,
+/// down/north 14..28, up/east 28..42, south 42..56), so the builtin class's
+/// `rotate(180, Y)` — which swaps the model's north and south faces — changes the
+/// pixels; the base cell is one colour, the classifier's own "base".
+fn chest_sheet() -> Texture {
+    let lid = |u: usize| match u {
+        0..=13 => [220, 60, 40, 255],
+        14..=27 => [80, 200, 60, 255],
+        28..=41 => [240, 240, 240, 255],
+        42..=55 => [250, 200, 40, 255],
+        _ => [140, 80, 200, 255],
+    };
+    const BASE: [u8; 4] = [60, 120, 220, 255];
+    let mut rgba = Vec::with_capacity(64 * 64 * 4);
+    for row in 0..64 {
+        for column in 0..64 {
+            let colour = if row < 19 { lid(column) } else { BASE };
+            rgba.extend_from_slice(&colour);
+        }
+    }
+    Texture {
+        width: 64,
+        height: 64,
+        rgba,
     }
 }
 
@@ -7140,6 +7203,74 @@ fn the_held_item_draws_nothing_while_the_player_sleeps() {
     let pixels = held_item_frame(&device, &queue, &target, &held);
     assert_eq!(non_sky(&pixels), 0, "the sleeping frame draws nothing");
     expect_pixel(&pixels, 57, 55, SKY, "the blade's own pixel stays sky");
+}
+
+/// The builtin class's own tail (`RenderItem.renderItem`:147-154's `rotate(180, Y)`
+/// and `TileEntityChestRenderer.renderTileEntityAt`:125-127's lift and y/z flip): a
+/// held chest carries what the flat class doesn't — the lid's own texels (the
+/// sheet's rows 0..19) sit above the base's (rows 19..44), told apart by their
+/// dominant channel. The lid cell is banded along u (the box's own face columns:
+/// west 0..14, down/north 14..28, up/east 28..42, south 42..56), so the class's own
+/// turn is pinned by which band its side face reads: east (u 28..42) with the turn,
+/// west (u 0..14) without. Without the tail the lid never appears at all: the whole
+/// ink is the base's own colour.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_held_chest_carries_the_builtin_tail() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let mut held = held_pass(&device, &queue);
+    held.set_texture(&device, &queue, "entity/chest/normal", &chest_sheet());
+    held.set_frame(&device, &queue, &held_chest_frame());
+    let pixels = held_item_frame(&device, &queue, &target, &held);
+    let (mut lid_n, mut lid_y, mut base_n, mut base_y) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let p = pixel(&pixels, x, y);
+            if p == SKY {
+                continue;
+            }
+            if p[0] > p[2] {
+                lid_n += 1.0;
+                lid_y += y as f32;
+            } else if p[2] > p[0] {
+                base_n += 1.0;
+                base_y += y as f32;
+            }
+        }
+    }
+    assert!(
+        lid_n >= 100.0,
+        "the lid's own texels under the builtin tail: {lid_n} pixels"
+    );
+    assert!(
+        lid_y / lid_n < base_y / base_n.max(1.0),
+        "the lid sits above the base: lid {:.2} vs base {:.2}",
+        lid_y / lid_n,
+        base_y / base_n.max(1.0)
+    );
+    expect_pixel(
+        &pixels,
+        50,
+        55,
+        [80, 200, 60],
+        "the lid's own down-face texel, the flip's own shade",
+    );
+    expect_pixel(
+        &pixels,
+        45,
+        58,
+        [170, 170, 170],
+        "the lid's own side face, the turn's own band",
+    );
+    expect_pixel(
+        &pixels,
+        43,
+        63,
+        [43, 85, 156],
+        "the base's own shaded texel",
+    );
 }
 
 /// The hud draws a generated item's sprite crisp: the checkerboard sprite's own two texels

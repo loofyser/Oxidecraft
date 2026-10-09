@@ -633,15 +633,18 @@ impl ClientItemIcons {
                         // The first-person slot is a different story: the generated
                         // items' own files state one (`item/diamond_sword.json`'s
                         // `display.firstperson`, the 45-degree item pose), and it is
-                        // read the generator's way — the item's model file
-                        // (`item/<name>`) sits above its base layer's sprite
-                        // (`items/<name>`), so the file's name comes from the layer.
-                        // A name that does not resolve leaves the source's default,
-                        // which `applyTransform` no-ops (`ItemCameraTransforms.java`
-                        // :59).
-                        first_person: layers
-                            .first()
-                            .and_then(|base| models.bake_item(&generated_model_name(base)).ok())
+                        // read the generator's way — the item's file sits over the
+                        // sprites the row's layer list names (`item/wooden_sword`
+                        // over `items/wood_sword`), so the file is resolved by
+                        // matching that full layer list against the store's `item/`
+                        // tree (`ModelSource::generated_item_file`; the layer0
+                        // basename alone misses 86 of the 208 rows — 85 resolve no
+                        // file at all). A row that resolves no file leaves the
+                        // source's default, which `applyTransform` no-ops
+                        // (`ItemCameraTransforms.java`:59).
+                        first_person: models
+                            .generated_item_file(layers)
+                            .and_then(|file| models.bake_item(&file).ok())
                             .map(|baked| baked.display.first_person)
                             .unwrap_or(Transform::DEFAULT),
                         shape: IconShape::Flat,
@@ -678,14 +681,6 @@ impl ClientItemIcons {
         });
         ClientItemIcons { icons, missing }
     }
-}
-
-/// The item model file a generated item's base sprite names: `items/<name>` sits under
-/// `item/<name>` (`ItemModelGenerator`'s own naming rule — the generated model keeps the
-/// item's name and its texture is the item's own sprite).
-fn generated_model_name(sprite: &str) -> String {
-    let name = sprite.rsplit('/').next().unwrap_or(sprite);
-    format!("item/{name}")
 }
 
 impl ItemIconSource for ClientItemIcons {
@@ -1375,6 +1370,61 @@ mod tests {
                 .first_person,
             Transform::DEFAULT,
             "the chest's icon carries the default"
+        );
+
+        // The wooden sword (`268`): its layer0 is `items/wood_sword` while its file
+        // is `item/wooden_sword`, so a layer0-basename rule misses it — the row read
+        // the default before the full-list rule.
+        assert_eq!(
+            icons
+                .icon(268, 0)
+                .expect("the wooden sword's icon builds")
+                .first_person,
+            pose,
+            "the wooden sword carries its file's stated pose"
+        );
+        // The potion overlay (`373`): its layer0 alone ties the drinkable and splash
+        // files; the full layer list names the drinkable one, whose pose the icon
+        // carries.
+        assert_eq!(
+            icons
+                .icon(373, 0)
+                .expect("the potion's icon builds")
+                .first_person,
+            pose,
+            "the potion overlay carries the drinkable file's stated pose"
+        );
+        assert_eq!(
+            models
+                .generated_item_file(&["items/potion_overlay", "items/potion_bottle_drinkable"])
+                .as_deref(),
+            Some("item/bottle_drinkable"),
+            "the full layer list disambiguates the potion overlay's tie"
+        );
+        // The generated rows' own first-person slots, resolved by the full layer
+        // list: the sweep pins the whole class — every one of the table's 208
+        // generated rows carries its file's stated pose.
+        let mut rows = 0;
+        let mut resolved = 0;
+        let mut misses: Vec<(i16, &'static str)> = Vec::new();
+        for entry in items::registry() {
+            if let ItemModel::Generated(_) = entry.resolution {
+                rows += 1;
+                if icons
+                    .icon(entry.id, 0)
+                    .expect("a generated row's icon builds")
+                    .first_person
+                    != Transform::DEFAULT
+                {
+                    resolved += 1;
+                } else {
+                    misses.push((entry.id, entry.name));
+                }
+            }
+        }
+        assert_eq!(
+            resolved, rows,
+            "every generated row resolves its stated pose; misses: {misses:?}"
         );
     }
 

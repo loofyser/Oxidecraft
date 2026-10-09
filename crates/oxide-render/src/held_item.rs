@@ -3,16 +3,23 @@
 //!
 //! One frame's matrix composes exactly as the source's chain does, in call order
 //! (first-called leftmost, the point seeing rightmost first):
-//! `doItemUsedTransformations` (`ItemRenderer.java`:261-267), then
-//! `transformFirstPersonItem` (`:296-307`), then the wrapper's 3D scale
-//! (`ItemRenderer.renderItem`:67) or the generated class's `preTransform` scale
-//! (`RenderItem.java`:254-257, run at `:320`), then the display transform
-//! (`RenderItem.java`:327), then the render path's tail — `scale(0.5)` (`:145`) and
-//! `translate(-0.5,-0.5,-0.5)` (`:157`) — over the 1/16-unit mesh:
+//! `rotateWithPlayerRotations` (`ItemRenderer.java`:364, body `:122-128`), then
+//! `doItemUsedTransformations` (`:261-267`), then `transformFirstPersonItem`
+//! (`:296-307`), then the wrapper's 3D scale (`ItemRenderer.renderItem`:67) or the
+//! generated class's `preTransform` scale (`RenderItem.java`:254-257, run at
+//! `:320`), then the display transform (`RenderItem.java`:327), then the render
+//! path's tail — `scale(0.5)` (`:145`) and `translate(-0.5,-0.5,-0.5)` (`:157`),
+//! with the builtin class's `rotate(180, Y)` (`:147-150`) between them and the
+//! block-entity tail (`TileEntityChestRenderer.renderTileEntityAt`:125-127) after
+//! — over the 1/16-unit mesh:
 //!
 //! ```text
-//! M = doItemUsed(s) . TFPI(equip, s) . S(2) . display(firstperson) . S(0.5) . T(-0.5) . S(1/16)
+//! M = R_x(0.1·(pitch − f)) . R_y(0.1·(yaw − f1)) . doItemUsed(s) . TFPI(equip, s) . S(2) . display(firstperson) . S(0.5) . R_y(180°) . T(-0.5) . T(0,1,1) . S(1,-1,-1) . S(1/16)
 //! ```
+//!
+//! `f` and `f1` are the arm pair at the frame's fraction ([`ArmSway`]); the two
+//! leading terms are its own, and the builtin class alone adds the marked
+//! `R_y(180°)` and `T(0,1,1) . S(1,-1,-1)`.
 //!
 //! The carried derivation notes' "CORRECTION 1" reversed the `display` and
 //! `S(0.5)·T(-0.5)` segment; the source order above says the original chain was
@@ -37,7 +44,9 @@ use oxide_assets::model::Transform;
 
 use crate::camera::Camera;
 use crate::entity_pass::ItemMesh;
-use crate::gui_item::{ATLAS_TEXTURE, ItemIcon, ItemIconMesh, ItemIconSource, display_matrix};
+use crate::gui_item::{
+    ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource, display_matrix,
+};
 use crate::terrain_pass::depth_state;
 use crate::text::TextVertex;
 
@@ -82,6 +91,19 @@ const RENDER_SCALE: f32 = 0.5;
 
 /// The render path's centring translate (`RenderItem.renderItem`:157).
 const RENDER_CENTRE: f32 = -0.5;
+
+/// The builtin class's own turn about y in degrees (`RenderItem.renderItem`:150's
+/// `rotate(180, Y)`; the GUI chain's own `BUILTIN_TURN`, `gui_item.rs`:93).
+const BUILTIN_TURN: f32 = 180.0;
+
+/// The block-entity tail's lift, both y and z (`TileEntityChestRenderer
+/// .renderTileEntityAt`:125's `translate(x, y + 1, z + 1)` with the fake chest's
+/// zero position; the GUI chain's `BUILTIN_OFFSET`, `gui_item.rs`:90).
+const BUILTIN_OFFSET: f32 = 1.0;
+
+/// The arm sway's own tenth (`ItemRenderer.rotateWithPlayerRotations`:127-128's
+/// `0.1F`).
+const ARM_SWAY: f32 = 0.1;
 
 /// The model units: a mesh's coordinates are sixteenths of a block
 /// (`FaceBakery`'s 0..16 element space divided by 16).
@@ -260,6 +282,84 @@ impl Equip {
     }
 }
 
+/// The arm's own rotation pair, the source's `EntityPlayerSP` fields
+/// `renderArmYaw`/`renderArmPitch` (`:115-117`) and their previous-tick latches
+/// (`prevRenderArmYaw`/`prevRenderArmPitch`, `:118-119`).
+///
+/// The client owns the pair the way the source's own player does: it chases the
+/// camera's rotation at half each tick (`updateEntityActionState`:699-702), and
+/// the frame renders the latches' interpolation
+/// (`ItemRenderer.rotateWithPlayerRotations`:124-125).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArmSway {
+    /// `renderArmPitch`.
+    pitch: f32,
+    /// `prevRenderArmPitch`.
+    prev_pitch: f32,
+    /// `renderArmYaw`.
+    yaw: f32,
+    /// `prevRenderArmYaw`.
+    prev_yaw: f32,
+}
+
+impl Default for ArmSway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArmSway {
+    /// The resting pair: both values zero — a fresh `EntityPlayerSP`'s own fields.
+    pub fn new() -> Self {
+        Self {
+            pitch: 0.0,
+            prev_pitch: 0.0,
+            yaw: 0.0,
+            prev_yaw: 0.0,
+        }
+    }
+
+    /// One tick of the chase (`EntityPlayerSP.updateEntityActionState`:699-702):
+    /// the latches slide to the current pair, then each value moves half the way
+    /// toward the camera's rotation.
+    pub fn tick(&mut self, pitch: f32, yaw: f32) {
+        self.prev_pitch = self.pitch;
+        self.prev_yaw = self.yaw;
+        self.pitch += (pitch - self.pitch) * 0.5;
+        self.yaw += (yaw - self.yaw) * 0.5;
+    }
+
+    /// The rendered pair `f`, `f1` at `partial`
+    /// (`ItemRenderer.rotateWithPlayerRotations`:124-125): the latches
+    /// interpolated, pitch first.
+    pub fn render(&self, partial: f32) -> (f32, f32) {
+        (
+            self.prev_pitch + (self.pitch - self.prev_pitch) * partial,
+            self.prev_yaw + (self.yaw - self.prev_yaw) * partial,
+        )
+    }
+
+    /// The current tick's pitch (`renderArmPitch`).
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+
+    /// The previous tick's pitch (`prevRenderArmPitch`).
+    pub fn prev_pitch(&self) -> f32 {
+        self.prev_pitch
+    }
+
+    /// The current tick's yaw (`renderArmYaw`).
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    /// The previous tick's yaw (`prevRenderArmYaw`).
+    pub fn prev_yaw(&self) -> f32 {
+        self.prev_yaw
+    }
+}
+
 /// `doItemUsedTransformations` (`ItemRenderer.java`:261-267): the swing's own
 /// translate, applied before the first-person item chain.
 pub fn do_item_used(swing: f32) -> Mat4 {
@@ -287,21 +387,44 @@ pub fn transform_first_person(equip: f32, swing: f32) -> Mat4 {
 }
 
 /// The full first-person item matrix for a display transform, at `equip` and
-/// `swing`:
+/// `swing`, under the arm sway's own `sway_pitch`/`sway_yaw` pair and the icon's
+/// `shape`:
 ///
 /// ```text
-/// doItemUsed(s) . TFPI(equip, s) . S(2) . display(firstperson) . S(0.5) . T(-0.5) . S(1/16)
+/// R_x(0.1·sway_pitch) . R_y(0.1·sway_yaw) . doItemUsed(s) . TFPI(equip, s) . S(2) . display(firstperson) . S(0.5) . [R_y(180°)] . T(-0.5) . [T(0,1,1) . S(1,-1,-1)] . S(1/16)
 /// ```
 ///
-/// exactly one `S(2)` applies per class — the 3D class at `ItemRenderer`:67, the
-/// generated class at `RenderItem`:256 — so one constant covers both.
-pub fn held_matrix(equip: f32, swing: f32, transform: Transform) -> Mat4 {
-    let mut matrix = do_item_used(swing);
+/// The pair is the source's own arguments — the raw current rotation minus the
+/// lerped arm pair (`ItemRenderer.rotateWithPlayerRotations`:127-128) — applied
+/// outermost, ahead of the item's own chain (`:364` calls it before `:402`'s
+/// `doItemUsedTransformations`). Exactly one `S(2)` applies per class — the 3D
+/// class at `ItemRenderer`:67, the generated class at `RenderItem`:256 — so one
+/// constant covers both, and the bracketed terms are the builtin class's alone
+/// (`RenderItem.renderItem`:147-150; `TileEntityChestRenderer.renderTileEntityAt`
+/// :125-127).
+pub fn held_matrix(
+    equip: f32,
+    swing: f32,
+    transform: Transform,
+    sway_pitch: f32,
+    sway_yaw: f32,
+    shape: IconShape,
+) -> Mat4 {
+    let mut matrix = Mat4::from_rotation_x((sway_pitch * ARM_SWAY).to_radians());
+    matrix *= Mat4::from_rotation_y((sway_yaw * ARM_SWAY).to_radians());
+    matrix *= do_item_used(swing);
     matrix *= transform_first_person(equip, swing);
     matrix *= Mat4::from_scale(Vec3::splat(CLASS_SCALE));
     matrix *= display_matrix(transform);
     matrix *= Mat4::from_scale(Vec3::splat(RENDER_SCALE));
+    if shape == IconShape::Builtin {
+        matrix *= Mat4::from_rotation_y(BUILTIN_TURN.to_radians());
+    }
     matrix *= Mat4::from_translation(Vec3::splat(RENDER_CENTRE));
+    if shape == IconShape::Builtin {
+        matrix *= Mat4::from_translation(Vec3::new(0.0, BUILTIN_OFFSET, BUILTIN_OFFSET));
+        matrix *= Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0));
+    }
     matrix *= Mat4::from_scale(Vec3::splat(MESH_SCALE));
     matrix
 }
@@ -349,13 +472,14 @@ fn normal_matrix(matrix: Mat4) -> Mat3 {
 }
 
 /// One frame's held-item state: the stack the ease's swap rule shows, the rendered
-/// ease and swing arguments, and the draw's own gates.
+/// ease and swing arguments, the arm sway's own pair, and the draw's own gates.
 ///
 /// The client fills it each frame from the session's window and tick events: the
 /// rendered values are resolved at the view seam (the source's own
-/// `f = 1 - lerp(prev, cur, partial)` at `:357` and `getSwingProgress(pt)` at
-/// `:359`), while `equip_prev`/`swing_prev` carry the source's raw previous-tick
-/// latches (`prevEquippedProgress` `:42`, `prevSwingProgress` `:85`) for the record.
+/// `f = 1 - lerp(prev, cur, partial)` at `:357`, `getSwingProgress(pt)` at
+/// `:359` and the arm pair's interpolation at `:124-125`), while
+/// `equip_prev`/`swing_prev` carry the source's raw previous-tick latches
+/// (`prevEquippedProgress` `:42`, `prevSwingProgress` `:85`) for the record.
 /// `brightness` is the lightmap's factor — the source enables the lightmap before
 /// the hand (`EntityRenderer.java`:865) — and `sleeping` is the source's own skip
 /// (`:861-863`), which the port has no state for yet: the pass honours it and the
@@ -372,6 +496,12 @@ pub struct HeldItemFrame {
     pub swing: f32,
     /// The raw `prevSwingProgress`.
     pub swing_prev: f32,
+    /// The arm sway's pitch argument: the raw current `rotationPitch` minus the
+    /// lerped `renderArmPitch` (`ItemRenderer.rotateWithPlayerRotations`:127).
+    pub sway_pitch: f32,
+    /// The arm sway's yaw argument: the raw current `rotationYaw` minus the
+    /// lerped `renderArmYaw` (`:128`).
+    pub sway_yaw: f32,
     /// The lightmap's brightness factor, `0..1`: 1 is the full-bright equivalent.
     pub brightness: f32,
     /// Whether the player sleeps, the source's own skip.
@@ -631,7 +761,14 @@ impl HeldItemPass {
     /// The frame's vertices: the mesh through [`held_matrix`], each corner's colour
     /// the source's flat lighting times the frame's brightness.
     fn frame_vertices(&self, frame: &HeldItemFrame, icon: &ItemIconMesh) -> Vec<TextVertex> {
-        let matrix = held_matrix(frame.equip, frame.swing, icon.first_person);
+        let matrix = held_matrix(
+            frame.equip,
+            frame.swing,
+            icon.first_person,
+            frame.sway_pitch,
+            frame.sway_yaw,
+            icon.shape,
+        );
         let normals = normal_matrix(matrix);
         let mesh: &ItemMesh = &icon.mesh;
         let mut out = Vec::with_capacity(mesh.vertices.positions.len() / 4 * 6);
@@ -1013,6 +1150,48 @@ mod tests {
         );
     }
 
+    /// The arm sway's own chase (`EntityPlayerSP.updateEntityActionState`:699-702):
+    /// each value latches and moves half the way toward the camera's rotation, and
+    /// the rendered pair interpolates the latches
+    /// (`ItemRenderer.rotateWithPlayerRotations`:124-125).
+    #[test]
+    fn the_arm_sway_chases_the_camera_halfway_each_tick() {
+        let mut arm = ArmSway::new();
+        assert_eq!(arm.render(0.5), (0.0, 0.0), "the pair rests at zero");
+        arm.tick(20.0, 40.0);
+        // The first tick: the latches slide to zero and each value lands halfway.
+        assert!((arm.pitch() - 10.0).abs() < 1e-6, "the first pitch");
+        assert!((arm.yaw() - 20.0).abs() < 1e-6, "the first yaw");
+        assert_eq!(arm.prev_pitch(), 0.0);
+        assert_eq!(arm.prev_yaw(), 0.0);
+        assert!(
+            (arm.render(0.0).0 - 0.0).abs() < 1e-6,
+            "the pair's start: {}",
+            arm.render(0.0).0
+        );
+        assert!(
+            (arm.render(0.5).0 - 5.0).abs() < 1e-6,
+            "the pair's midpoint: {}",
+            arm.render(0.5).0
+        );
+        assert!(
+            (arm.render(1.0).0 - 10.0).abs() < 1e-6,
+            "the pair's end: {}",
+            arm.render(1.0).0
+        );
+        assert!(
+            (arm.render(0.5).1 - 10.0).abs() < 1e-6,
+            "the yaw's midpoint: {}",
+            arm.render(0.5).1
+        );
+        arm.tick(20.0, 40.0);
+        // The second tick: three quarters of the way — 15 and 30 — with the
+        // first tick's values as the latches.
+        assert!((arm.pitch() - 15.0).abs() < 1e-6, "the second pitch");
+        assert!((arm.yaw() - 30.0).abs() < 1e-6, "the second yaw");
+        assert!((arm.prev_pitch() - 10.0).abs() < 1e-6, "the second latch");
+    }
+
     /// The sword's full first-person chain by literal: the source's constants
     /// through `doItemUsedTransformations`, `transformFirstPersonItem`, the class
     /// scale, the display transform and the render path's tail, at rest.
@@ -1023,7 +1202,7 @@ mod tests {
     /// to `(-1, 0, 0)` — the quad's own plane, seen from the lower right.
     #[test]
     fn the_sword_first_person_chain_composes_to_the_pinned_matrix() {
-        let matrix = held_matrix(0.0, 0.0, sword());
+        let matrix = held_matrix(0.0, 0.0, sword(), 0.0, 0.0, IconShape::Flat);
         let expected: [f32; 16] = [
             0.0,
             0.017_961_3,
@@ -1058,6 +1237,56 @@ mod tests {
             "the display sits outside the render tail: {}",
             matrix.w_axis.z
         );
+    }
+
+    /// The arm sway's rotation (`ItemRenderer.rotateWithPlayerRotations`:127-128):
+    /// `R_x(0.1·sway_pitch) · R_y(0.1·sway_yaw)` sits outermost, ahead of the item's
+    /// own chain — a camera turned to pitch 20 and yaw 40 with the arm still at rest
+    /// turns the whole item by 2 and 4 degrees about the eye.
+    #[test]
+    fn the_arm_sway_terms_follow_the_sources_own_constants() {
+        let matrix = held_matrix(0.0, 0.0, sword(), 20.0, 40.0, IconShape::Flat);
+        let expected: [f32; 16] = [
+            0.002_686_885_5,
+            0.016_609_347,
+            0.039_027_685,
+            0.0,
+            -0.001_252_915_3,
+            0.039_119_93,
+            -0.016_562_347,
+            0.0,
+            -0.042_396_47,
+            -0.000_103_464_8,
+            0.002_962_844,
+            0.0,
+            0.911_582_2,
+            -0.740_671_4,
+            -0.905_875_7,
+            1.0,
+        ];
+        for (index, (value, want)) in matrix.to_cols_array().iter().zip(expected).enumerate() {
+            assert!(
+                (value - want).abs() < 1e-6,
+                "the sway sample's element {index}: {value} != {want}"
+            );
+        }
+        // The placement: the pair is outermost — the same matrix composes from the
+        // two raw glam rotations ahead of the resting chain (a reversed pair, or one
+        // applied inside, would land on other numbers).
+        let outer = Mat4::from_rotation_x((20.0 * ARM_SWAY).to_radians())
+            * Mat4::from_rotation_y((40.0 * ARM_SWAY).to_radians())
+            * held_matrix(0.0, 0.0, sword(), 0.0, 0.0, IconShape::Flat);
+        for (index, (got, want)) in matrix
+            .to_cols_array()
+            .iter()
+            .zip(outer.to_cols_array())
+            .enumerate()
+        {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "the outermost composition's element {index}: {got} != {want}"
+            );
+        }
     }
 
     /// The swing's own translate (`doItemUsedTransformations`:261-267) and the
@@ -1097,7 +1326,7 @@ mod tests {
         // factors are full: `f = sin(s^2 * pi)` turns the y axis and
         // `f1 = sin(sqrt(s) * pi)` the z and x ones (`:301-305`). The peak's
         // angles are all zero, so only an interior sample pins them.
-        let swung = held_matrix(0.0, 0.25, sword());
+        let swung = held_matrix(0.0, 0.25, sword(), 0.0, 0.0, IconShape::Flat);
         let expected: [f32; 16] = [
             -0.020_088_47,
             0.037_451_26,
@@ -1155,7 +1384,7 @@ mod tests {
         // The flat quad's own shade at rest: the normal (0, 0, 1) through the
         // chain's normal matrix is (-1, 0, 0), so only the second light's own x
         // term contributes: 0.4 + 0.6 * 0.2/sqrt(0.2^2 + 1^2 + 0.7^2).
-        let matrix = held_matrix(0.0, 0.0, sword());
+        let matrix = held_matrix(0.0, 0.0, sword(), 0.0, 0.0, IconShape::Flat);
         let colour = lit_colour([0.0, 0.0, 1.0], normal_matrix(matrix), &level, 1.0);
         let expected = 0.4 + 0.6 * (0.2f32 / (0.2f32 * 0.2 + 1.0 + 0.7 * 0.7).sqrt());
         assert!(

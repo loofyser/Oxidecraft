@@ -37,7 +37,7 @@ use oxide_render::entity_pass::{
     DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, SkinLookup, SkinTexId, TextureRef,
 };
 use oxide_render::gui_item::ItemIcon;
-use oxide_render::held_item::{Equip, HeldItemFrame, Swing};
+use oxide_render::held_item::{ArmSway, Equip, HeldItemFrame, Swing};
 use oxide_render::hud::{HudDraw, HudTexture, ScaledResolution};
 use oxide_render::text::string_width;
 use oxide_world::entity::EntityKind;
@@ -106,6 +106,12 @@ struct HeldItem {
     equip: Equip,
     /// The swing counters.
     swing: Swing,
+    /// The arm's own rotation pair (`renderArmYaw`/`renderArmPitch` and their
+    /// latches on the source's own player, `EntityPlayerSP.java`:115-119).
+    arm: ArmSway,
+    /// The tick's own rotation, the sway's raw pair (`rotationPitch`/`rotationYaw`).
+    rotation_pitch: f32,
+    rotation_yaw: f32,
 }
 
 impl HeldItem {
@@ -117,6 +123,9 @@ impl HeldItem {
             stack: None,
             equip: Equip::new(),
             swing: Swing::new(),
+            arm: ArmSway::new(),
+            rotation_pitch: 0.0,
+            rotation_yaw: 0.0,
         }
     }
 
@@ -125,14 +134,17 @@ impl HeldItem {
         self.hotbar.get(self.selected).and_then(Clone::clone)
     }
 
-    /// One tick of the source's own two updaters: `updateEquippedItem`
-    /// (`ItemRenderer.java`:581-611) and `updateArmSwingProgress`
-    /// (`EntityLivingBase.java`:1402-1422).
+    /// One tick of the source's own three updaters: `updateEquippedItem`
+    /// (`ItemRenderer.java`:581-611), `updateArmSwingProgress`
+    /// (`EntityLivingBase.java`:1402-1422) and the arm pair's own chase toward the
+    /// tick's rotation (`EntityPlayerSP.updateEntityActionState`:699-702).
     ///
     /// The ease's target follows whether the selected stack differs from the one in
-    /// hand (`flag`), the swap lands while the ease is below its threshold, and the
-    /// swing's counter advances its own tick.
-    fn tick(&mut self) {
+    /// hand (`flag`), the swap lands while the ease is below its threshold, the
+    /// swing's counter advances its own tick, and the arm's pair latches and moves
+    /// half the way to `pitch`/`yaw` — which the frame's sway also reads as its raw
+    /// pair (`rotationPitch`/`rotationYaw`).
+    fn tick(&mut self, pitch: f32, yaw: f32) {
         let current = self.current();
         let differ = self.stack != current;
         self.equip.tick(differ);
@@ -140,6 +152,9 @@ impl HeldItem {
             self.stack = current;
         }
         self.swing.tick();
+        self.arm.tick(pitch, yaw);
+        self.rotation_pitch = pitch;
+        self.rotation_yaw = yaw;
     }
 
     /// Starts a swing (`swingItem`:1342-1354) — the window's own input path.
@@ -152,12 +167,15 @@ impl HeldItem {
     ///
     /// The ease renders the source's own `f = 1 - (prev + (cur - prev) * partial)`
     /// (`ItemRenderer.renderItemInFirstPerson`:357) and the swing `getSwingProgress`
-    /// (`EntityLivingBase`:2188-2198); the raw previous-tick latches ride along for the
-    /// record. The brightness stands at the full-bright equivalent and the sleep state
-    /// at false: the port has no own-player light channel (the session's feed carries a
-    /// brightness per tracked entity, and the window's own player is not one) and no
-    /// sleep state (recorded; the pass honours both).
+    /// (`EntityLivingBase`:2188-2198); the arm pair renders its own interpolation
+    /// (`ItemRenderer.rotateWithPlayerRotations`:124-125) and the sway's arguments
+    /// are the raw current rotation minus it. The raw previous-tick latches ride
+    /// along for the record. The brightness stands at the full-bright equivalent and
+    /// the sleep state at false: the port has no own-player light channel (the
+    /// session's feed carries a brightness per tracked entity, and the window's own
+    /// player is not one) and no sleep state (recorded; the pass honours both).
     fn frame(&self, partial: f32) -> HeldItemFrame {
+        let (arm_pitch, arm_yaw) = self.arm.render(partial);
         HeldItemFrame {
             // The stack's own icon conversion, the draw-list seam's helper: the id,
             // the damage and the glint flag the source's own rule gives it (the pass
@@ -167,6 +185,10 @@ impl HeldItem {
             equip_prev: self.equip.prev(),
             swing: self.swing.render(partial),
             swing_prev: self.swing.prev(),
+            // The sway's own pair: the tick's rotation minus the arm pair at this
+            // fraction (`rotateWithPlayerRotations`:127-128).
+            sway_pitch: self.rotation_pitch - arm_pitch,
+            sway_yaw: self.rotation_yaw - arm_yaw,
             brightness: 1.0,
             sleeping: false,
         }
@@ -211,13 +233,17 @@ impl View {
                     }
                 }
             }
-            ClientEvent::PlayerTick { .. } => self.held.tick(),
+            ClientEvent::PlayerTick { yaw, pitch, .. } => self.held.tick(*pitch, *yaw),
             _ => {}
         }
     }
 
     /// Starts the held item's swing — the window's own input path (the source's
-    /// `swingItem` from `clickMouse` and `rightClickMouse`).
+    /// `swingItem` from `clickMouse` and `rightClickMouse`). The source's own gates
+    /// stay with the session and are not carried here: `clickMouse` swings only while
+    /// `leftClickCounter <= 0` (`Minecraft.java`:1524; the miss cooldown, set to 10 at
+    /// `:1534`/`:1558` and ticked down at `:1897-1899`), and the per-tick digging
+    /// swing also needs `!isUsingItem` (`:1503`).
     pub fn swing_held(&mut self) {
         self.held.swing();
     }
@@ -6220,12 +6246,17 @@ mod tests {
     /// A tick event for the held item's own state machine: only the tick's own number
     /// reaches it.
     fn held_tick(tick: u64) -> ClientEvent {
+        held_tick_at(tick, 0.0, 0.0)
+    }
+
+    /// A tick whose camera has turned: the same event with the given pitch and yaw.
+    fn held_tick_at(tick: u64, pitch: f32, yaw: f32) -> ClientEvent {
         ClientEvent::PlayerTick {
             x: 0.0,
             y: 0.0,
             z: 0.0,
-            yaw: 0.0,
-            pitch: 0.0,
+            yaw,
+            pitch,
             on_ground: true,
             sprinting: false,
             sneaking: false,
@@ -6329,6 +6360,61 @@ mod tests {
             frame.swing_prev.abs() < 1e-6,
             "the pair's own previous latch: {}",
             frame.swing_prev
+        );
+    }
+
+    /// The arm sway's own chase and the frame's rendered pair: the source's
+    /// `renderArmPitch`/`renderArmYaw` move half the way toward the camera's
+    /// rotation each tick (`EntityPlayerSP.updateEntityActionState`:699-702), and
+    /// the frame's pair is the raw rotation minus the arm's own at the frame's
+    /// fraction (`ItemRenderer.rotateWithPlayerRotations`:124-128).
+    #[test]
+    fn the_held_frame_lags_the_camera_by_the_arm_sway() {
+        let mut view = View::new();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        // The camera turns to pitch 20 and yaw 40 and two ticks chase it: the arm
+        // pair reaches (10, 20) then (15, 30) — half the way each tick.
+        view.apply(&held_tick_at(1, 20.0, 40.0));
+        view.apply(&held_tick_at(2, 20.0, 40.0));
+        // At the tick's own start (a partial of zero) the pair's previous latch
+        // renders: the sway's arguments are the camera minus (10, 20).
+        let frame = view.held_frame(t0);
+        assert!(
+            (frame.sway_pitch - 10.0).abs() < 1e-6,
+            "the sway's pitch argument: {}",
+            frame.sway_pitch
+        );
+        assert!(
+            (frame.sway_yaw - 20.0).abs() < 1e-6,
+            "the sway's yaw argument: {}",
+            frame.sway_yaw
+        );
+        // At the tick's end the current pair renders: the camera minus (15, 30).
+        let frame = view.held_frame(t0 + Duration::from_millis(50));
+        assert!(
+            (frame.sway_pitch - 5.0).abs() < 1e-6,
+            "the rendered current pair: {}",
+            frame.sway_pitch
+        );
+        assert!(
+            (frame.sway_yaw - 10.0).abs() < 1e-6,
+            "the rendered current yaw pair: {}",
+            frame.sway_yaw
+        );
+        // A third tick boundary: the arm moves to (17.5, 35), halving the yaw term
+        // again — the chase keeps closing on the camera.
+        view.apply(&held_tick_at(3, 20.0, 40.0));
+        let frame = view.held_frame(t0 + Duration::from_millis(50));
+        assert!(
+            (frame.sway_pitch - 2.5).abs() < 1e-6,
+            "the third tick's pitch argument: {}",
+            frame.sway_pitch
+        );
+        assert!(
+            (frame.sway_yaw - 5.0).abs() < 1e-6,
+            "the third tick's yaw argument: {}",
+            frame.sway_yaw
         );
     }
 }
