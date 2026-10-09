@@ -451,10 +451,9 @@ hurt cam (EntityRenderer.hurtCameraEffect:585-609):
 hand swing (ItemRenderer.renderItemInFirstPerson / transformFirstPersonItem:296-320):
   equipProgress: lerp(prevEquippedProgress, equippedProgress, partialTicks)
   translate(0, equipProgress * -0.6, 0)
-  f  = sin(swingProgress² * π)
-  f1 = sin(sqrt(swingProgress) * π)
-  translate(-f1 * 0.4,  f * 0.2,  -f1 * 0.2)
-  rotate(-f1 * 70°, Y); rotate( f * 70°,  Z); rotate(-f * 70°, X)
+  use swing (doItemUsedTransformations:261-267): f = -0.4·sin(√s·π), f1 = 0.2·sin(√s·2π), f2 = -0.2·sin(s·π); translate(f, f1, f2)
+  hand (transformFirstPersonItem:296-307): translate(0.56, -0.52, -0.72); rotate(45°, Y)
+  f = sin(s²·π), f1 = sin(√s·π): rotate(f·-20°, Y); rotate(f1·-20°, Z); rotate(f1·-80°, X)
   scale(0.4)
   (block-in-hand path uses 0.4 scale + item-specific transforms; damage/attack swing total 6 ticks)
 ```
@@ -535,7 +534,7 @@ Sources: <https://minecraft.wiki/w/Sound>, <https://minecraft.wiki/w/Sounds.json
 22. Achievement popup slides in top-right using `achievement_background.png`; **no** 1.9+/1.12 toast or advancement popups appear anywhere.
 23. Block selection outline is black 0.4-alpha 2-px-wide lines inflated by 0.002, drawn with depth writes disabled.
 24. Block-break progress uses the 10 `destroy_stage_*` sprites with additive-ish blending and no mipmaps; the overlay is removed 400 ticks after the last update.
-25. Held item in first person uses the model's `display.firstperson` values (sword/ingot/block differ); the swing animation matches the `±0.4/0.2/0.2` translate + 70° rotations over 6 ticks.
+25. Held item in first person uses the model's `display.firstperson` values (sword/ingot/block differ); the swing animation matches the sin-warped use-swing translate (`-0.4·sin(√s·π)`, `0.2·sin(√s·2π)`, `-0.2·sin(s·π)`) and hand rotations (`sin(s²π)·-20° Y`, `sin(√s·π)·-20° Z`, `sin(√s·π)·-80° X`) over 6 ticks.
 26. Block-in-hand overlay (suffocation) draws the opaque block texture with `0.1,0.1,0.1,0.5` tint when the camera is inside an opaque block.
 27. View bobbing matches the `sin/cos(distanceWalked)` translate+rotate triple and scales with the `viewBobbing` option.
 28. Vignette appears only on Fancy graphics with alpha `1 − brightness`; it darkens in the Nether/at low light and while inside a world border.
