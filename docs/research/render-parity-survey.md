@@ -238,7 +238,7 @@ Screen classes verified present in the 1.8.9 sources (`client/gui/**`), i.e. **t
 | Chat | bottom-left, above hotbar; `chatScale` (0.5–1.0), `chatWidth`, `chatHeightFocused`/`chatHeightUnfocused`, `chatOpacity`; 20 lines retained in the scroll view; fade-out of 10 s (200 t) after 10 s hold | `GuiNewChat`, `GameSettings:105-109` |
 | Scoreboard sidebar | right edge, max 15 lines, `(0,0,0)` semi-transparent bg, title centred, red numbers when `redNumbers`… | `GuiIngame.renderScoreboard:551-605`; title at `height/2 + lines/3` anchor; x = `width − font.getStringWidth(longest) − 3` |
 | Boss health bar | centred, `(0,74,182,5)` background (drawn twice, identically — a no-op) + `(0,79,182,5)` progress, name text 10 px above; one static status — a second boss's set overwrites (last drawn wins) (corrected 2026-10-06, Task 18's pre-flight) | `GuiIngame.renderBossHealth:901-926` |
-| Item tooltips | white title, gray "…", rarity colours: common white `0xFFFFFF`, uncommon yellow, rare aqua `0x55FFFF`, epic light purple `0xA000FF`? — 1.8 uses `EnumRarity` colours; background `0x10001000` with `0xF0100010` border gradient, 3-px padding | `GuiScreen.renderTooltip`, `ItemStack.getTooltip` |
+| Item tooltips | white title, gray "…", rarity colours: common white `0xFFFFFF`, uncommon yellow, rare aqua `0x55FFFF`, epic light purple `0xA000FF`? — 1.8 uses `EnumRarity` colours; fill `0xF0100010` with the `0x505000FF`→`0x5028007F` border gradient, 3-px padding | `GuiScreen.renderTooltip`, `ItemStack.getTooltip` |
 | Hurt flash | no screen flash exists in 1.8; the camera *rolls* (`hurtCameraEffect`, see §5.3) and the entity tints red (`RendererLivingEntity`:328-334); `hurtResistantTime` is read by no overlay | `EntityRenderer.hurtCameraEffect:585-609` |
 | Attack/damage direction indicator | **1.8: the camera *rolls* away from the attacker** (`hurtCameraEffect`, see §5.3) — there is no separate 2D "direction arrow" (that arrives in 1.15+) | `EntityRenderer.java:585-609` |
 | Block outline | black `RGBA(0,0,0,0.4)`, `glLineWidth(2.0)`, inflated by `0.002` (`RenderGlobal.drawSelectionBox:1875-1890`) | `RenderGlobal.java:1879-1885` |
@@ -523,7 +523,7 @@ Sources: <https://minecraft.wiki/w/Sound>, <https://minecraft.wiki/w/Sounds.json
 11. Chat renders with the configured scale/width/opacity, 20-line scrollback, fade-out, and §-colour codes + shadow.
 12. Scoreboard sidebar sits flush right, ≤15 lines, translucent black background, red scores when configured.
 13. Boss health bar uses `gui/icons.png` 182×5 at y offsets 74/79 with the white, shadowed name text 10 px above (one static status; overwrites, no stacking) (corrected 2026-10-06, Task 18's pre-flight).
-14. Item tooltips use `0x10001000` background with the purple gradient border, stacked lines 10 px apart, rarity colours, and shift-info (F3+H).
+14. Item tooltips use the `0xF0100010` fill with the `0x505000FF`→`0x5028007F` border gradient, stacked lines 10 px apart, rarity colours, and shift-info (F3+H).
 15. Container interactions match §3.4: right-click = half / single place, left-drag = even distribution with remnant, shift-click transfer, hotbar swap, double-click collect, Q drop.
 16. Inventory screen shows the 3D player model (rotating with drag), 2×2 crafting grid, 4 armour slots and no offhand slot.
 17. Every container opens the 1.8 texture from `gui/container/*` at the correct size (anvil, beacon, brewing stand, dispenser, enchantment, furnace, generic_54, hopper, horse, inventory, villager, crafting_table).
