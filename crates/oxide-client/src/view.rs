@@ -37,6 +37,7 @@ use oxide_render::entity_pass::{
     DrawExtra, EntityDraw, FrameContent, ModelRef, NametagDraw, SkinLookup, SkinTexId, TextureRef,
 };
 use oxide_render::gui_item::ItemIcon;
+use oxide_render::held_item::{Equip, HeldItemFrame, Swing};
 use oxide_render::hud::{HudDraw, HudTexture, ScaledResolution};
 use oxide_render::text::string_width;
 use oxide_world::entity::EntityKind;
@@ -57,6 +58,12 @@ pub const ALL_PARTS: u8 = 0x7F;
 /// The tick's step, in seconds: the fraction's divisor (the camera's own 50 ms rule).
 const TICK_SECONDS: f32 = 0.05;
 
+/// The hotbar band's own start in window 0's layout: the crafting band, the armour
+/// band at 5–8 and the main twenty-seven at 9–35 ahead of it
+/// (`ContainerPlayer.java`:36-67; the port's own windows.rs holds the same band at
+/// 36–44).
+const HOTBAR_START: usize = 36;
+
 /// The tick-to-tick step past which the draw's position snaps instead of sliding: the
 /// same four-block rule the camera's pose interpolation pins (`Render.doRender`'s
 /// teleport class).
@@ -70,6 +77,100 @@ pub struct View {
     arrival: Option<Instant>,
     /// The window's own entity id, from [`ClientEvent::Joined`]; skipped when drawing.
     own: Option<i32>,
+    /// The held item's own state: the stack, the ease and the swing.
+    held: HeldItem,
+}
+
+/// The window's held-item state: the source's own `ItemRenderer` fields the hand draws
+/// from.
+///
+/// The stack is the source's `itemToRender`, the ease its two counters
+/// (`equippedProgress`/`prevEquippedProgress`, `ItemRenderer.java`:42-43) and the swing
+/// the own player's (`EntityLivingBase.java`:66-86) — all three are client-local: the
+/// own player's stack rides the window 0 snapshot, its selection the held-slot event,
+/// and the swing is set by the window's own input (the source's `swingItem` calls from
+/// `clickMouse`:1519 and `rightClickMouse`:1613). The swap rule is the source's own:
+/// `itemToRender` lands when `equippedProgress < 0.1` (`updateEquippedItem`:609-613),
+/// and the comparison is the stack's identity — the source's `getIsItemStackEqual`
+/// compares item, damage, size and NBT; the port compares the whole
+/// [`MetadataItem`], the wire's own shape (recorded).
+#[derive(Debug, Clone)]
+struct HeldItem {
+    /// The window's selected hotbar slot, 0..8 (`InventoryPlayer.currentItem`).
+    selected: usize,
+    /// The window 0 snapshot's nine hotbar stacks, in slot order.
+    hotbar: Vec<Option<MetadataItem>>,
+    /// The stack `itemToRender` holds, through the ease's swap rule.
+    stack: Option<MetadataItem>,
+    /// The equip ease's counters.
+    equip: Equip,
+    /// The swing counters.
+    swing: Swing,
+}
+
+impl HeldItem {
+    /// The resting state: no snapshot, the first slot selected, nothing in hand.
+    fn new() -> Self {
+        Self {
+            selected: 0,
+            hotbar: Vec::new(),
+            stack: None,
+            equip: Equip::new(),
+            swing: Swing::new(),
+        }
+    }
+
+    /// The selected slot's stack, as the snapshot holds it (`InventoryPlayer.getCurrentItem`).
+    fn current(&self) -> Option<MetadataItem> {
+        self.hotbar.get(self.selected).and_then(Clone::clone)
+    }
+
+    /// One tick of the source's own two updaters: `updateEquippedItem`
+    /// (`ItemRenderer.java`:581-611) and `updateArmSwingProgress`
+    /// (`EntityLivingBase.java`:1402-1422).
+    ///
+    /// The ease's target follows whether the selected stack differs from the one in
+    /// hand (`flag`), the swap lands while the ease is below its threshold, and the
+    /// swing's counter advances its own tick.
+    fn tick(&mut self) {
+        let current = self.current();
+        let differ = self.stack != current;
+        self.equip.tick(differ);
+        if self.equip.swap_lands() {
+            self.stack = current;
+        }
+        self.swing.tick();
+    }
+
+    /// Starts a swing (`swingItem`:1342-1354) — the window's own input path.
+    fn swing(&mut self) {
+        self.swing.swing();
+    }
+
+    /// The frame at the given fraction: the stack through the swap rule and the two
+    /// rendered arguments, resolved at this seam.
+    ///
+    /// The ease renders the source's own `f = 1 - (prev + (cur - prev) * partial)`
+    /// (`ItemRenderer.renderItemInFirstPerson`:357) and the swing `getSwingProgress`
+    /// (`EntityLivingBase`:2188-2198); the raw previous-tick latches ride along for the
+    /// record. The brightness stands at the full-bright equivalent and the sleep state
+    /// at false: the port has no own-player light channel (the session's feed carries a
+    /// brightness per tracked entity, and the window's own player is not one) and no
+    /// sleep state (recorded; the pass honours both).
+    fn frame(&self, partial: f32) -> HeldItemFrame {
+        HeldItemFrame {
+            // The stack's own icon conversion, the draw-list seam's helper: the id,
+            // the damage and the glint flag the source's own rule gives it (the pass
+            // does not draw the held item's glint — recorded).
+            stack: self.stack.as_ref().map(item_icon),
+            equip: self.equip.render(partial),
+            equip_prev: self.equip.prev(),
+            swing: self.swing.render(partial),
+            swing_prev: self.swing.prev(),
+            brightness: 1.0,
+            sleeping: false,
+        }
+    }
 }
 
 impl View {
@@ -79,18 +180,61 @@ impl View {
             frames: Vec::new(),
             arrival: None,
             own: None,
+            held: HeldItem::new(),
         }
     }
 
     /// Folds one session event in: the join records the window's own entity, the tick
-    /// feed stores the frames and stamps their arrival.
+    /// feed stores the frames and stamps their arrival, the window 0 snapshot carries
+    /// the hotbar, the held-slot event the selection, and the tick advances the held
+    /// item's own two updaters.
     pub fn apply(&mut self, event: &ClientEvent) {
         match event {
             ClientEvent::Joined { entity_id, .. } => self.own = Some(*entity_id),
             ClientEvent::EntitiesTick { entities } => {
                 self.observe(entities.clone(), Instant::now());
             }
+            ClientEvent::WindowSnapshot {
+                window_id: 0,
+                slots,
+                ..
+            } => {
+                // The hotbar band of window 0's layout: the armour band at 5–8 and the
+                // main slots at 9–35 sit ahead of it (`ContainerPlayer.java`:36-67; the
+                // port's own windows.rs holds the same band at 36–44).
+                self.held.hotbar = slots.iter().skip(HOTBAR_START).take(9).cloned().collect();
+            }
+            ClientEvent::HeldItemSlot { slot } => {
+                if let Ok(slot) = usize::try_from(*slot) {
+                    if slot < 9 {
+                        self.held.selected = slot;
+                    }
+                }
+            }
+            ClientEvent::PlayerTick { .. } => self.held.tick(),
             _ => {}
+        }
+    }
+
+    /// Starts the held item's swing — the window's own input path (the source's
+    /// `swingItem` from `clickMouse` and `rightClickMouse`).
+    pub fn swing_held(&mut self) {
+        self.held.swing();
+    }
+
+    /// The held item's frame at `now`: the stack through the swap rule and the rendered
+    /// arguments at the frame's own fraction.
+    pub fn held_frame(&self, now: Instant) -> HeldItemFrame {
+        self.held.frame(self.partial(now))
+    }
+
+    /// The frame fraction: the elapsed time since the feed's arrival over the
+    /// fifty-millisecond tick, clamped to one; zero before any feed.
+    fn partial(&self, now: Instant) -> f32 {
+        match self.arrival {
+            Some(arrival) => (now.saturating_duration_since(arrival).as_secs_f32() / TICK_SECONDS)
+                .clamp(0.0, 1.0),
+            None => 0.0,
         }
     }
 
@@ -125,11 +269,10 @@ impl View {
         skins: &BTreeMap<String, SkinUpdate>,
         board: &Scoreboard,
     ) -> Vec<EntityDraw> {
-        let Some(arrival) = self.arrival else {
+        if self.arrival.is_none() {
             return Vec::new();
-        };
-        let partial =
-            (now.saturating_duration_since(arrival).as_secs_f32() / TICK_SECONDS).clamp(0.0, 1.0);
+        }
+        let partial = self.partial(now);
         let mut draws = Vec::new();
         for frame in &self.frames {
             if Some(frame.id) == self.own {
@@ -1572,8 +1715,8 @@ pub fn reconcile_chat_open(chat: &mut ChatView, input: &ChatInput) {
 /// builds its draws, and nothing else of the stack reaches the pass — the icon draw
 /// reads the id, the damage and the flag, and the pass gates the glint the way the
 /// source's draw does (a builtin shape never glints, `RenderItem.renderItem`:154-165).
-/// The hotbar draws that call it are the next task's, so nothing calls it yet.
-#[allow(dead_code)]
+/// The held item's own frame calls it; the hotbar draws that call it are the next
+/// task's.
 pub(crate) fn item_icon(stack: &MetadataItem) -> ItemIcon {
     ItemIcon {
         id: stack.id,
@@ -6072,5 +6215,120 @@ mod tests {
                 "damage {damage} matches none of the source's requirements: {icon:?}"
             );
         }
+    }
+
+    /// A tick event for the held item's own state machine: only the tick's own number
+    /// reaches it.
+    fn held_tick(tick: u64) -> ClientEvent {
+        ClientEvent::PlayerTick {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            on_ground: true,
+            sprinting: false,
+            sneaking: false,
+            flying: false,
+            in_water: false,
+            tick,
+            snapped: false,
+            hurt_time: 0,
+            attacked_at_yaw: 0.0,
+        }
+    }
+
+    /// A window 0 snapshot whose hotbar carries the given stacks: the band at 36–44 of
+    /// the forty-five-slot layout.
+    fn held_snapshot(stacks: [Option<MetadataItem>; 9]) -> ClientEvent {
+        let mut slots = vec![None; 36];
+        slots.extend(stacks);
+        ClientEvent::WindowSnapshot {
+            window_id: 0,
+            slots,
+            cursor: None,
+            properties: Vec::new(),
+            hotbar_pop: [0; 9],
+        }
+    }
+
+    /// The held item's swap rule: the ease runs down while the selection differs and
+    /// the stack in hand lands only under its tenth (`updateEquippedItem`:581-613).
+    #[test]
+    fn the_held_item_swaps_under_the_eases_threshold() {
+        let sword = MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        };
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = Some(sword.clone());
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        // The ease runs up to one over four ticks with nothing changing (a step of two
+        // fifths): the first tick's swap lands the stack at a zero progress.
+        for tick in 1..=6 {
+            view.apply(&held_tick(tick));
+        }
+        assert_eq!(view.held.equip.progress(), 1.0);
+        assert_eq!(view.held.stack, Some(sword.clone()));
+        // The selection moves to an empty slot: the ease runs down, but the stack
+        // stays in hand until the progress passes under a tenth.
+        view.apply(&ClientEvent::HeldItemSlot { slot: 1 });
+        view.apply(&held_tick(7));
+        assert_eq!(view.held.equip.progress(), 0.6, "the first step down");
+        assert_eq!(view.held.stack, Some(sword), "still in hand");
+        for tick in 8..=9 {
+            view.apply(&held_tick(tick));
+        }
+        assert_eq!(view.held.equip.progress(), 0.0, "two more steps down");
+        assert_eq!(view.held.stack, None, "the swap lands at zero");
+        // The frame at a partial of zero renders `1 - prev`: the pair's lower end.
+        let frame = view.held_frame(Instant::now());
+        assert!(
+            (frame.equip - 0.8).abs() < 1e-6,
+            "the frame's rendered ease: {}",
+            frame.equip
+        );
+        assert_eq!(frame.stack, None, "the frame carries the swapped stack");
+    }
+
+    /// The swing's setter path: a press starts the counter, the ticks advance it, and
+    /// the frame's rendered value follows `getSwingProgress`
+    /// (`EntityLivingBase`:2188-2198).
+    #[test]
+    fn the_held_swing_advances_with_the_ticks() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = Some(MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        view.apply(&held_tick(1));
+        view.swing_held();
+        view.apply(&held_tick(2));
+        view.apply(&held_tick(3));
+        // At the tick's own start (a partial of zero) the rendered swing reads the
+        // pair's previous latch, and at its end the current value: the swing's second
+        // tick covers zero to a sixth (the first lands on zero of six).
+        let frame = view.held_frame(t0);
+        assert_eq!(frame.swing, 0.0, "the swing starts at zero");
+        let frame = view.held_frame(t0 + Duration::from_millis(50));
+        assert!(
+            (frame.swing - 1.0 / 6.0).abs() < 1e-6,
+            "the swing's second tick renders a sixth: {}",
+            frame.swing
+        );
+        assert!(
+            frame.swing_prev.abs() < 1e-6,
+            "the pair's own previous latch: {}",
+            frame.swing_prev
+        );
     }
 }

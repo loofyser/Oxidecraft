@@ -180,6 +180,12 @@ pub struct ItemIconMesh {
     pub mesh: ItemMesh,
     /// The model's own GUI display transform, as the file states it.
     pub transform: Transform,
+    /// The model's own first-person display transform (`display.firstperson`), as
+    /// the file states it — the slot the held-item pass applies
+    /// (`ItemCameraTransforms.TransformType.FIRST_PERSON`). An absent key is the
+    /// source's default, which `applyTransform` no-ops (`ItemCameraTransforms.java`
+    /// :59).
+    pub first_person: Transform,
     /// The shape the model draws with.
     pub shape: IconShape,
 }

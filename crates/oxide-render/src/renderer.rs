@@ -15,6 +15,7 @@ use crate::dim_pass::DimPass;
 use crate::entity_pass::{BossStatus, EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
 use crate::gui_item::ItemIconSource;
+use crate::held_item::{HeldItemFrame, HeldItemPass};
 use crate::hud::{HudDraw, HudPass, ScaledResolution, scaled_resolution};
 use crate::overlay::OverlayPass;
 use crate::sky::{
@@ -178,6 +179,11 @@ pub struct Renderer {
     /// The hud pass, drawing the frame's GUI-space draw list between the dim and the
     /// debug overlay text.
     hud: HudPass,
+    /// The first-person held item pass, drawing the frame's selected stack in camera
+    /// space between the scene pass and the overlay pass — the source's own order: the
+    /// hand draws inside the world pass after the terrain and the entities
+    /// (`EntityRenderer.java`:864-876), before the GUI's own pass clears depth.
+    held_item: HeldItemPass,
     /// The gui-scale setting the hud's scaled resolution reads: zero is the source's
     /// auto scale (`ScaledResolution.java`:22-25). The settings screen that owns the
     /// option is a later milestone's, so the default stands.
@@ -309,6 +315,7 @@ impl Renderer {
         let mut hud = HudPass::new(&device, &queue, format);
         let scaled = scaled_resolution(config.width, config.height, 0);
         hud.set_resolution(&queue, scaled.width as f32, scaled.height as f32);
+        let held_item = HeldItemPass::new(&device, format);
         let depth = DepthTarget::new(&device, config.width, config.height);
         let entity_textures = TextureRegistry::new(&device, &queue);
         let entity_pass = EntityPass::new(&device, &queue, format, entity_textures.layout());
@@ -327,6 +334,7 @@ impl Renderer {
             overlay,
             dim,
             hud,
+            held_item,
             gui_scale: 0,
             entity_pass,
             entity_textures,
@@ -631,6 +639,35 @@ impl Renderer {
         self.hud.set_system_time(&self.device, &self.queue, time_ms);
     }
 
+    /// Sets the first-person held item frame the next draws show, or clears it with a
+    /// frame whose stack is `None`.
+    ///
+    /// The client owns the frame: the stack through the ease's swap rule and the
+    /// rendered equip and swing arguments. Until this is called, the hand draws
+    /// nothing.
+    pub fn set_held_item(&mut self, frame: &HeldItemFrame) {
+        self.held_item.set_frame(&self.device, &self.queue, frame);
+    }
+
+    /// Uploads the blocks atlas the held item's meshes sample, under the source's own
+    /// item sampler (`RenderItem.java`:319).
+    pub fn set_held_item_atlas_icon(&mut self, atlas: &Atlas) {
+        self.held_item
+            .set_atlas_icon(&self.device, &self.queue, atlas);
+    }
+
+    /// Registers a named sheet a held item's mesh may name (the folded chest trio).
+    pub fn set_held_item_texture(&mut self, name: &'static str, texture: &Texture) {
+        self.held_item
+            .set_texture(&self.device, &self.queue, name, texture);
+    }
+
+    /// Sets the source the held item's stack resolves its mesh and first-person display
+    /// transform through — the same source the hud's icons use.
+    pub fn set_held_item_icon_source(&mut self, source: Arc<dyn ItemIconSource>) {
+        self.held_item.set_icon_source(source);
+    }
+
     /// Sets the full-frame tint the next frames draw over the scene, or clears it.
     ///
     /// The interim death view's backdrop: a colour here dims the whole frame
@@ -681,6 +718,10 @@ impl Renderer {
             self.sky.set_camera(&self.queue, camera, aspect);
             self.cloud.set_camera(&self.queue, camera, aspect);
             self.entity_pass.set_camera(camera, aspect);
+            // The held item's own camera: the hand's projection (`far * 2`, the view
+            // effect alone) and the lights turned by the pose.
+            self.held_item
+                .set_camera(&self.device, &self.queue, &camera, aspect);
             // The overlay's frame: the outline's pixel width and the crack's projection both
             // follow the surface size, so the frame is built from the same configuration the
             // render pass is.
@@ -743,6 +784,39 @@ impl Renderer {
                     }
                 }
             }
+        }
+        // The held item draws between the scene and the overlay, in its own pass: the
+        // source's hand draws inside the world pass after the terrain and the entities
+        // and before the GUI's own pass (`EntityRenderer.java`:864-876). The pass
+        // clears depth, because the scene pass discards its own — nothing stores it —
+        // so the hand tests against itself alone and no terrain hides it (recorded:
+        // the source's hand tests against the world's depth).
+        if self.camera.is_some() {
+            let mut held_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxide-render held item pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        // The overlay pass clears depth at its own load, so nothing
+                        // reads the held item's depth after it.
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.held_item.draw(&mut held_pass);
         }
         // The status step runs after the scene pass: a raise overwrites the cell whole and
         // a frame without one spends a frame of the hold, hiding the bar at zero

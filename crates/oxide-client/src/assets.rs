@@ -612,6 +612,10 @@ impl ClientItemIcons {
                             texture: BLOCKS_ATLAS_TEXTURE,
                         },
                         transform: baked.display.gui,
+                        // The block item's own file states its first-person slot
+                        // (`item/torch.json`'s own `display.firstperson`), the chain's
+                        // completed lookup.
+                        first_person: baked.display.first_person,
                         shape: IconShape::Gui3d,
                     })
                 }
@@ -626,6 +630,20 @@ impl ClientItemIcons {
                         // the chain's completed gui slot is the source's default (the
                         // store pass pins the representative chains).
                         transform: Transform::DEFAULT,
+                        // The first-person slot is a different story: the generated
+                        // items' own files state one (`item/diamond_sword.json`'s
+                        // `display.firstperson`, the 45-degree item pose), and it is
+                        // read the generator's way — the item's model file
+                        // (`item/<name>`) sits above its base layer's sprite
+                        // (`items/<name>`), so the file's name comes from the layer.
+                        // A name that does not resolve leaves the source's default,
+                        // which `applyTransform` no-ops (`ItemCameraTransforms.java`
+                        // :59).
+                        first_person: layers
+                            .first()
+                            .and_then(|base| models.bake_item(&generated_model_name(base)).ok())
+                            .map(|baked| baked.display.first_person)
+                            .unwrap_or(Transform::DEFAULT),
                         shape: IconShape::Flat,
                     })
                 }),
@@ -639,6 +657,10 @@ impl ClientItemIcons {
                                 texture: item.icon_sheet(),
                             },
                             transform: baked.display.gui,
+                            // The folded chest trio states no display at all (its
+                            // `item/chest.json` files carry none), so the slot is the
+                            // source's default.
+                            first_person: baked.display.first_person,
                             shape: IconShape::Builtin,
                         })
                 }
@@ -651,10 +673,19 @@ impl ClientItemIcons {
                 texture: BLOCKS_ATLAS_TEXTURE,
             },
             transform: Transform::DEFAULT,
+            first_person: Transform::DEFAULT,
             shape: IconShape::Gui3d,
         });
         ClientItemIcons { icons, missing }
     }
+}
+
+/// The item model file a generated item's base sprite names: `items/<name>` sits under
+/// `item/<name>` (`ItemModelGenerator`'s own naming rule — the generated model keeps the
+/// item's name and its texture is the item's own sprite).
+fn generated_model_name(sprite: &str) -> String {
+    let name = sprite.rsplit('/').next().unwrap_or(sprite);
+    format!("item/{name}")
 }
 
 impl ItemIconSource for ClientItemIcons {
@@ -1304,6 +1335,47 @@ mod tests {
                 "{name} states no gui slot"
             );
         }
+        // The first-person slots are the other half of the story: the item files state
+        // one — the 45-degree item pose — while the chest trio states none.
+        let pose = Transform {
+            rotation: [0.0, -135.0, 25.0],
+            translation: [0.0, 4.0, 2.0],
+            scale: [1.7, 1.7, 1.7],
+        };
+        for name in ["apple", "diamond_sword"] {
+            let baked = models.bake_item(name).expect("the model bakes");
+            assert_eq!(
+                baked.display.first_person, pose,
+                "{name} states the item first-person pose"
+            );
+        }
+        for name in ["item/chest", "item/trapped_chest", "item/ender_chest"] {
+            let baked = models.bake_item(name).expect("the model bakes");
+            assert_eq!(
+                baked.display.first_person,
+                Transform::DEFAULT,
+                "{name} states no first-person slot"
+            );
+        }
+        // The icon the running client builds carries the slot through: the diamond
+        // sword's own icon (`276`, the table's own id) holds the stated pose, and the
+        // chest's holds the default.
+        assert_eq!(
+            icons
+                .icon(276, 0)
+                .expect("the sword's icon builds")
+                .first_person,
+            pose,
+            "the sword's icon carries its first-person slot"
+        );
+        assert_eq!(
+            icons
+                .icon(54, 0)
+                .expect("the chest's icon builds")
+                .first_person,
+            Transform::DEFAULT,
+            "the chest's icon carries the default"
+        );
     }
 
     /// The live item mesh source: the baked block models, the generated item shapes,

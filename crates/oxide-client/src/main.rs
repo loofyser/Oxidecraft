@@ -197,6 +197,8 @@ enum DirectiveAction {
 /// frame's GUI units) and a `mouse` press is the chat screen's own click,
 /// run by the field's owner ([`ClientApp::chat_click`]) on the tick's own
 /// frame; the pointer's recapture is the window's and a script run has none.
+/// A gameplay press (the field shut) starts the held item's swing, the
+/// window's own `on_mouse_button` rule, and flows to the session.
 ///
 /// Every tick the session reports is written to `<script path>.log` as one
 /// CSV line, `tick,x,y,z,yaw,pitch,on_ground`; the tick's entity section
@@ -217,6 +219,9 @@ struct ScriptDriver {
     /// Whether a scripted chat-screen press is waiting for the field's owner
     /// to run the screen's own click.
     pending_chat_click: bool,
+    /// Whether a scripted gameplay press is waiting for the frame's owner to
+    /// start the held item's swing.
+    pending_swing: bool,
     /// The tick log, one line per tick.
     log: File,
 }
@@ -247,6 +252,7 @@ impl ScriptDriver {
             applied: 0,
             last_tick: None,
             pending_chat_click: false,
+            pending_swing: false,
             log,
         })
     }
@@ -340,6 +346,19 @@ impl ScriptDriver {
                             // field's owner runs it — the window's own click
                             // (`ClientApp::chat_click`).
                             self.pending_chat_click = true;
+                        }
+                        InputEvent::MouseButton { pressed: true, .. } => {
+                            // The gameplay press starts the held item's swing
+                            // exactly as the window's own `on_mouse_button`
+                            // does: the frame's owner runs it once the frame's
+                            // events are in, and the press still flows to the
+                            // session.
+                            self.pending_swing = true;
+                            if self.input_tx.send(event.clone()).is_err() {
+                                tracing::warn!(
+                                    "the session's input channel is closed; the script stopped"
+                                );
+                            }
                         }
                         InputEvent::MouseDelta { dx, dy } if chat.open => {
                             // The source's screen rule: while the field is
@@ -451,6 +470,13 @@ impl ScriptDriver {
     /// free pointer as it stands ([`ClientApp::chat_click`]).
     fn take_chat_click(&mut self) -> bool {
         std::mem::take(&mut self.pending_chat_click)
+    }
+
+    /// Takes the queued gameplay press, when the last observed tick carried
+    /// one: the frame's owner starts the held item's swing — the window's
+    /// own path ([`ClientApp::on_mouse_button`]).
+    fn take_swing(&mut self) -> bool {
+        std::mem::take(&mut self.pending_swing)
     }
 }
 
@@ -1278,6 +1304,15 @@ impl ClientApp {
                     // the free pointer as it stands.
                     script_click = true;
                 }
+                if self
+                    .script
+                    .as_mut()
+                    .is_some_and(|script| script.take_swing())
+                {
+                    // The gameplay press: queued here, run once the frame's
+                    // events are in — the window's own swing start.
+                    self.view.swing_held();
+                }
                 // The chat field's blink steps on the session's tick — the
                 // source runs its counter from `GuiChat.updateScreen`
                 // (`:78-81`).
@@ -1420,6 +1455,10 @@ impl ClientApp {
                 self.view
                     .entity_draws(Instant::now(), &self.skins, &self.board),
             );
+            // The held item's frame: the stack through the ease's swap rule and the
+            // rendered arguments at this frame's fraction, drawn between the scene
+            // and the overlay.
+            renderer.set_held_item(&self.view.held_frame(Instant::now()));
         }
         // The chat: the mirror ages to the session's tick, and the frame's draws —
         // bars, text and the record line at the scaled resolution — land in the hud
@@ -1743,10 +1782,16 @@ impl ClientApp {
             return;
         }
         if let Some(button) = bound_mouse_button(button) {
-            self.send_input(InputEvent::MouseButton {
-                button,
-                pressed: state == ElementState::Pressed,
-            });
+            let pressed = state == ElementState::Pressed;
+            // The own player's swing: the source's `clickMouse`:1519 swings on the
+            // attack press and `rightClickMouse`:1613 on a successful use — the
+            // port's session owns the dig and the place, so the swing fires on the
+            // press for both, and the use's success gate and the per-tick digging
+            // swing (`sendClickBlockToController`:1494-1516) are absent (recorded).
+            if pressed {
+                self.view.swing_held();
+            }
+            self.send_input(InputEvent::MouseButton { button, pressed });
         }
     }
 
@@ -2743,6 +2788,17 @@ impl ApplicationHandler for ClientApp {
             // through it (the item table and the bake), beside the object set's own
             // mesh source.
             renderer.set_hud_icon_source(Arc::new(assets.item_icons.clone()));
+            // The held item's own pass: the same icon source, the blocks atlas under
+            // the source's item sampler, and the chest trio's sheets for the builtin
+            // meshes — the held item's pass keeps its own bindings, beside the hud's
+            // named registrations.
+            renderer.set_held_item_atlas_icon(&assets.mesh.atlas);
+            renderer.set_held_item_icon_source(Arc::new(assets.item_icons.clone()));
+            for (key, texture) in &assets.gui_sheets {
+                if key.starts_with("entity/chest/") {
+                    renderer.set_held_item_texture(key, texture);
+                }
+            }
         }
         self.window = Some(window);
     }
@@ -5269,6 +5325,75 @@ mod tests {
             )
             .expect("the log line writes");
         assert!(!driver.take_chat_click(), "the release is no click");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scripted_gameplay_press_starts_the_swing() {
+        // While the field is shut a mouse press is the gameplay button: the
+        // driver queues the swing the frame's owner runs — the window's own
+        // path (`on_mouse_button`) — and the press itself still flows to the
+        // session.
+        let dir = std::env::temp_dir().join(format!("oxide-client-swing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("swing.script");
+        std::fs::write(&script_path, "3 mouse Left down\n4 mouse Left up\n")
+            .expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor: Option<(f32, f32)> = None;
+        driver
+            .observe(
+                3,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                1,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(driver.take_swing(), "the press queued the swing");
+        assert!(!driver.take_swing(), "the swing is taken once");
+        assert_eq!(
+            input_rx.try_recv().expect("the press flowed"),
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true
+            },
+        );
+        driver
+            .observe(
+                4,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                1,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert!(!driver.take_swing(), "the release is no swing");
+        assert_eq!(
+            input_rx.try_recv().expect("the release flowed"),
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false
+            },
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

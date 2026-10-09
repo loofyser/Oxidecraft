@@ -68,6 +68,7 @@ use oxide_render::entity_pass::{
 };
 use oxide_render::fog::{FogParams, fog_colour};
 use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
+use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
@@ -6732,16 +6733,27 @@ impl ItemIconSource for TestIcons {
             1 => Some(ItemIconMesh {
                 mesh: self.cube("fixture:top", "fixture:side"),
                 transform: Transform::DEFAULT,
+                first_person: Transform::DEFAULT,
                 shape: IconShape::Gui3d,
             }),
             2 => Some(ItemIconMesh {
                 mesh: self.flat("fixture:flat"),
                 transform: Transform::DEFAULT,
+                first_person: Transform::DEFAULT,
                 shape: IconShape::Flat,
             }),
             3 => Some(ItemIconMesh {
                 mesh: self.flat("fixture:green"),
                 transform: Transform::DEFAULT,
+                first_person: Transform::DEFAULT,
+                shape: IconShape::Flat,
+            }),
+            // The sword-shaped fixture: the flat quad with the real diamond sword's
+            // first-person display transform, for the held item's own cases.
+            4 => Some(ItemIconMesh {
+                mesh: self.flat("fixture:green"),
+                transform: Transform::DEFAULT,
+                first_person: sword_transform(),
                 shape: IconShape::Flat,
             }),
             _ => None,
@@ -6752,8 +6764,19 @@ impl ItemIconSource for TestIcons {
         Some(ItemIconMesh {
             mesh: self.flat("fixture:top"),
             transform: Transform::DEFAULT,
+            first_person: Transform::DEFAULT,
             shape: IconShape::Flat,
         })
+    }
+}
+
+/// The diamond sword's first-person display transform, exactly as its model JSON
+/// states it (`models/item/diamond_sword.json`'s `display.firstperson`).
+fn sword_transform() -> Transform {
+    Transform {
+        rotation: [0.0, -135.0, 25.0],
+        translation: [0.0, 4.0, 2.0],
+        scale: [1.7, 1.7, 1.7],
     }
 }
 
@@ -6839,6 +6862,284 @@ fn the_hud_pass_draws_a_block_items_icon() {
         own > 140,
         "the icon's own pixel count: the cube's silhouette, got {own}"
     );
+}
+
+/// The held item's cases' projection aspect: the client's own 16:9 window. The probe
+/// target is square, so the cases drive the pass with the aspect the client's frames
+/// carry — the chain's geometry is the frame's, and the probe only rasterizes it.
+const HELD_ASPECT: f32 = 16.0 / 9.0;
+
+/// The camera the held item's cases draw with: at the origin, level (the lights unturned),
+/// the default fov, the near plane and one chunk's far plane — the pass doubles the far
+/// for the hand (`EntityRenderer.renderHand`:844).
+fn held_camera() -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            sneak: false,
+        },
+        fov_degrees: DEFAULT_FOV,
+        near: NEAR_PLANE,
+        far_chunks: 1.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
+}
+
+/// The held item's cases' frame: the sword fixture (`TestIcons` id 4) with the given
+/// rendered arguments, at the full-bright equivalent and awake.
+fn held_frame(equip: f32, equip_prev: f32, sleeping: bool) -> HeldItemFrame {
+    HeldItemFrame {
+        stack: Some(ItemIcon {
+            id: 4,
+            damage: 0,
+            enchanted: false,
+        }),
+        equip,
+        equip_prev,
+        swing: 0.0,
+        swing_prev: 0.0,
+        brightness: 1.0,
+        sleeping,
+    }
+}
+
+/// Builds the held item's cases' pass: the atlas bound under the item sampler and the
+/// fixture source set, the camera already driven.
+fn held_pass(device: &wgpu::Device, queue: &wgpu::Queue) -> HeldItemPass {
+    let mut held = HeldItemPass::new(device, wgpu::TextureFormat::Rgba8Unorm);
+    held.set_atlas_icon(device, queue, &item_atlas());
+    held.set_icon_source(Arc::new(TestIcons {
+        atlas: item_atlas(),
+    }));
+    held.set_camera(device, queue, &held_camera(), HELD_ASPECT);
+    held
+}
+
+/// Renders one held item frame over the cleared target: the colour cleared to the sky,
+/// the pass's own draw in the overlay-shaped pass (colour loaded, depth cleared) and the
+/// pixels read back.
+fn held_item_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    held: &HeldItemPass,
+) -> Vec<u8> {
+    let depth = create_depth(device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide held item headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| held.draw(pass));
+    queue.submit(Some(encoder.finish()));
+    read_pixels(device, queue, target)
+}
+
+/// The frame's ink: the pixels that are not the sky, with their bounds and centroid.
+struct Ink {
+    /// How many pixels the item landed over.
+    count: usize,
+    /// The ink's bounds.
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    /// The ink's centroid.
+    centroid_x: f32,
+    centroid_y: f32,
+}
+
+/// Measures one frame's ink, or nothing when the frame stayed sky.
+fn ink(pixels: &[u8]) -> Option<Ink> {
+    let mut ink = Ink {
+        count: 0,
+        min_x: SIZE as f32,
+        min_y: SIZE as f32,
+        max_x: 0.0,
+        max_y: 0.0,
+        centroid_x: 0.0,
+        centroid_y: 0.0,
+    };
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            if pixel(pixels, x, y) == SKY {
+                continue;
+            }
+            ink.count += 1;
+            let (x, y) = (x as f32, y as f32);
+            ink.min_x = ink.min_x.min(x);
+            ink.min_y = ink.min_y.min(y);
+            ink.max_x = ink.max_x.max(x);
+            ink.max_y = ink.max_y.max(y);
+            sum_x += x;
+            sum_y += y;
+        }
+    }
+    if ink.count == 0 {
+        return None;
+    }
+    ink.centroid_x = sum_x / ink.count as f32;
+    ink.centroid_y = sum_y / ink.count as f32;
+    Some(ink)
+}
+
+/// The held item's rest frame: the sword fixture's quad through the first-person chain —
+/// `doItemUsed(0) . TFPI(0, 0) . S(2) . display(firstperson) . S(0.5) . T(-0.5) . S(1/16)`
+/// with the model's own `[0, -135, 25]` rotation, `[0, 4, 2]` translation and 1.7 scale.
+///
+/// The predictions come from `refs/m5-task-12/derive.py` (its `derive.log` is the
+/// receipt), sampled densely and clipped to the frame at this case's own 16:9 aspect:
+/// the ink spans `(46.7, 21.5)..(64, 64)`, its centroid sits at `(54.05, 46.23)` — left
+/// of the bounds' own centre-x `55.36` by 1.31 pixels — the mesh's centre projects to
+/// `(56.97, 54.52)` and the quad's shade is `0.497014`. The pins below carry a few
+/// pixels' slack around those predictions; the run that first pinned them is recorded in
+/// the task report.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_held_sword_draws_its_blade_in_the_frames_lower_right() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let mut held = held_pass(&device, &queue);
+    held.set_frame(&device, &queue, &held_frame(0.0, 0.0, false));
+
+    let pixels = held_item_frame(&device, &queue, &target, &held);
+    let ink = ink(&pixels).expect("the blade's ink");
+    // The blade fills the right half from the frame's bottom edge to just above its
+    // middle: the bounds' own prediction, with slack.
+    assert!(
+        (ink.min_x - 46.7).abs() < 4.0,
+        "the blade's left bound: {} (predicted 46.7)",
+        ink.min_x
+    );
+    assert!(
+        (ink.min_y - 21.5).abs() < 4.0,
+        "the blade's top bound: {} (predicted 21.5)",
+        ink.min_y
+    );
+    assert!(
+        ink.max_x > 61.0 && ink.max_y > 61.0,
+        "the blade reaches the frame's corner: {} x {}",
+        ink.max_x,
+        ink.max_y
+    );
+    assert!(
+        ink.centroid_x > 40.0 && ink.centroid_y > 40.0,
+        "the blade's own mass sits lower-right: ({}, {})",
+        ink.centroid_x,
+        ink.centroid_y
+    );
+    // The colour pin: the green fixture sprite's texel times the quad's own shade
+    // (255 * 0.497014 = 127), sampled at a pixel well inside the silhouette.
+    expect_pixel(&pixels, 57, 55, [0, 127, 0], "the blade's lit texel");
+    assert!(
+        ink.count > 400,
+        "the blade's own pixel count: got {}",
+        ink.count
+    );
+}
+
+/// The held sword's orientation-sensitive assertion: the blade is seen edge-on, and the
+/// reversed 45-degree turn sweeps it across the frame.
+///
+/// The carried notes predicted the ink's centroid to sit left of its bounds' centre at
+/// rest and to flip under the mutation. The pinning run measured otherwise: the centroid
+/// sits right of the bounds' centre at BOTH turns (margin -1.29 at rest, -1.44 under the
+/// reversed turn — the notes' dense sample over-weighted the quad's near part), so this
+/// case asserts the signals the run found to move: the silhouette's own width (16 px
+/// edge-on at rest, 29 px under the reversed turn), its left edge (47 vs 34, crossing the
+/// frame's centre), the recorded side and margin, and the shade the case-1 pin reads
+/// ([0, 127, 0] at rest — the edge-on face's own normal — against the reversed turn's
+/// [0, 189, 0]). The mutation run in `refs/m5-task-12/mutations.sh` proves every one of
+/// them fails under the reversed turn.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_held_sword_blade_is_seen_edge_on() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let mut held = held_pass(&device, &queue);
+    held.set_frame(&device, &queue, &held_frame(0.0, 0.0, false));
+
+    let pixels = held_item_frame(&device, &queue, &target, &held);
+    let ink = ink(&pixels).expect("the blade's ink");
+    let width = ink.max_x - ink.min_x;
+    assert!(
+        width <= 20.0,
+        "the blade's edge-on width: {width} px (the reversed turn shows its face, 29 px)"
+    );
+    assert!(
+        ink.min_x >= 44.0,
+        "the blade's own left edge: {} (the reversed turn sweeps it to 34, past the \
+         frame's centre)",
+        ink.min_x
+    );
+    // The notes' own signal, recorded as measured: the mass sits right of the bounds'
+    // centre by 1.29 px at rest.
+    let centre_x = (ink.min_x + ink.max_x) / 2.0;
+    let margin = centre_x - ink.centroid_x;
+    assert!(
+        (-3.0..=-0.5).contains(&margin),
+        "the blade's mass sits right of its bounds' centre by {margin:.2} px \
+         (centroid_x {:.2}, bounds' centre-x {centre_x:.2})",
+        ink.centroid_x
+    );
+    expect_pixel(
+        &pixels,
+        57,
+        55,
+        [0, 127, 0],
+        "the blade's lit texel: the edge-on face's own shade (the reversed turn reads 189)",
+    );
+}
+
+/// The held item at the equip ease's midpoint: `f = 0.5` drops it by `0.5 * -0.6` model
+/// units (`ItemRenderer.java`:299's `equipProgress * -0.6F`), so its ink slides down the
+/// frame and its top bound sits well below the rest frame's — the item is drawn, lower.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_held_item_draws_dropped_at_the_eases_midpoint() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let mut held = held_pass(&device, &queue);
+    held.set_frame(&device, &queue, &held_frame(0.5, 0.0, false));
+
+    let pixels = held_item_frame(&device, &queue, &target, &held);
+    let ink = ink(&pixels).expect("the dropped item's ink");
+    assert!(
+        ink.min_y > 44.0,
+        "the item has dropped below the rest position: top bound {} (rest's 22)",
+        ink.min_y
+    );
+    assert!(
+        ink.count > 150,
+        "the dropped item's own pixel count: got {}",
+        ink.count
+    );
+    // The pin: the item's own green texel times the shade, at a pixel inside the
+    // dropped silhouette (the pinning run measured bounds (47, 48)..(63, 63)).
+    expect_pixel(&pixels, 57, 57, [0, 127, 0], "the dropped item's lit texel");
+}
+
+/// The held item draws nothing while the player sleeps: the source's own skip
+/// (`EntityRenderer.java`:861-863) — the hand is skipped while `thePlayer.isPlayerSleeping()`.
+/// The frame stays sky, pixel for pixel.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_held_item_draws_nothing_while_the_player_sleeps() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let mut held = held_pass(&device, &queue);
+    held.set_frame(&device, &queue, &held_frame(0.0, 0.0, true));
+
+    let pixels = held_item_frame(&device, &queue, &target, &held);
+    assert_eq!(non_sky(&pixels), 0, "the sleeping frame draws nothing");
+    expect_pixel(&pixels, 57, 55, SKY, "the blade's own pixel stays sky");
 }
 
 /// The hud draws a generated item's sprite crisp: the checkerboard sprite's own two texels

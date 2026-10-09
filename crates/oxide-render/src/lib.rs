@@ -10,6 +10,7 @@ pub mod fog;
 pub mod fps;
 pub mod frustum;
 pub mod gui_item;
+pub mod held_item;
 pub mod hud;
 pub mod lightmap;
 pub mod overlay;

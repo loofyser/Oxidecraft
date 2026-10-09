@@ -2259,6 +2259,7 @@ mod tests {
                     texture: "fixtures/items",
                 },
                 transform: oxide_assets::model::Transform::DEFAULT,
+                first_person: oxide_assets::model::Transform::DEFAULT,
                 shape,
             })
         }
