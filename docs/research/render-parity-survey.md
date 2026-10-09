@@ -227,19 +227,19 @@ Screen classes verified present in the 1.8.9 sources (`client/gui/**`), i.e. **t
 | Hotbar | drawn at `x = width/2 − 91`, `y = height − 22`; texture `gui/widgets.png` region `(0,0,182,22)` | `GuiIngame.java:375` |
 | Selected slot highlight | `(0,22,24,22)` shifted by `currentItem * 20`, offset `(−1,−1)` | `GuiIngame.java:376` |
 | Held-item name popup | above hotbar, fades out over ~2 s (`heldItemTooltips` option); text centred, `-1` colour white | `GuiIngame` |
-| Hearts | 10 hearts at `width/2 − 91`, `height − 22 − 21` (row above hotbar); rows wrap upward when > 10 hearts; half hearts; blinking on low health | `:643-700` |
-| Absorption hearts | extra row above, yellow outline | `:700-740` |
-| Hunger | right-aligned from `width/2 + 91 − 20*…`, `height − 22 − 21`; shank icons `(16..,[9,18,27])`; "hunger effect" jitter when `foodSaturationLevel == 0` | `:740-790` |
-| Armour | `x = width/2 + 91 − 8*… − …`, `y = height − 22 − 21 − 10`; chestplate icons | `GuiIngame:885-895` |
-| Air bubbles | right side above hunger, 10 bubbles, blink when ≤ 3 | `:856-870` |
-| XP bar | `(0,64,182,5)` background + `(0,69,182,5)` clipped by progress, at `width/2 − 91`, `height − 22 − 7`… (line 404-408: 182×5 at y-offset) | `:401-412` |
+| Hearts | 10 hearts at `width/2 − 91`, `height − 39` (row above hotbar); rows wrap upward when > 10 hearts; half hearts; blinking on low health | `:643-700` |
+| Absorption hearts | extra row above, yellow outline | `:743-755` |
+| Hunger | right-aligned from `width/2 + 91 − 20*…`, `height − 39`; shank icons `(16..,[9,18,27])`; "hunger effect" jitter when `foodSaturationLevel == 0` | `:740-790` |
+| Armour | `x = width/2 + 91 − 8*… − …`, `y = height − 49`; chestplate icons | `GuiIngame:660-683` |
+| Air bubbles | right side above hunger, ten bubbles at full air; the popping/fading split from `getAir` (`:878-879`) | `:873-891` |
+| XP bar | `(0,64,182,5)` background + `(0,69,182,5)` clipped by progress, at `width/2 − 91`, `height − 22 − 7` (the draws at :423-431; lines 404-408 are the horse jump bar's) | `renderExpBar:414-449` |
 | XP level text | centred, bright green `0x80FF20` with black outline (wiki: drawn 4× offset black + green on top) | wiki Font |
 | Crosshair | two 1-px-wide quads (inverted blend) at exact screen centre `width/2 − 1`, `height/2 − 1`, with `GL_ONE_MINUS_DST_COLOR`-equivalent blend (`tryBlendFuncSeparate(775, 769, 1, 0)`) | `GuiIngame:179` |
 | Chat | bottom-left, above hotbar; `chatScale` (0.5–1.0), `chatWidth`, `chatHeightFocused`/`chatHeightUnfocused`, `chatOpacity`; 20 lines retained in the scroll view; fade-out of 10 s (200 t) after 10 s hold | `GuiNewChat`, `GameSettings:105-109` |
 | Scoreboard sidebar | right edge, max 15 lines, `(0,0,0)` semi-transparent bg, title centred, red numbers when `redNumbers`… | `GuiIngame.renderScoreboard:551-605`; title at `height/2 + lines/3` anchor; x = `width − font.getStringWidth(longest) − 3` |
 | Boss health bar | centred, `(0,74,182,5)` background (drawn twice, identically — a no-op) + `(0,79,182,5)` progress, name text 10 px above; one static status — a second boss's set overwrites (last drawn wins) (corrected 2026-10-06, Task 18's pre-flight) | `GuiIngame.renderBossHealth:901-926` |
 | Item tooltips | white title, gray "…", rarity colours: common white `0xFFFFFF`, uncommon yellow, rare aqua `0x55FFFF`, epic light purple `0xA000FF`? — 1.8 uses `EnumRarity` colours; background `0x10001000` with `0xF0100010` border gradient, 3-px padding | `GuiScreen.renderTooltip`, `ItemStack.getTooltip` |
-| Hurt flash | screen red tint driven by `hurtTime` (see §5.3), plus a red screen edge overlay in 1.8 (`entityplayer.hurtResistantTime`) | `EntityRenderer.hurtCameraEffect` |
+| Hurt flash | no screen flash exists in 1.8; the camera *rolls* (`hurtCameraEffect`, see §5.3) and the entity tints red (`RendererLivingEntity`:328-334); `hurtResistantTime` is read by no overlay | `EntityRenderer.hurtCameraEffect:585-609` |
 | Attack/damage direction indicator | **1.8: the camera *rolls* away from the attacker** (`hurtCameraEffect`, see §5.3) — there is no separate 2D "direction arrow" (that arrives in 1.15+) | `EntityRenderer.java:585-609` |
 | Block outline | black `RGBA(0,0,0,0.4)`, `glLineWidth(2.0)`, inflated by `0.002` (`RenderGlobal.drawSelectionBox:1875-1890`) | `RenderGlobal.java:1879-1885` |
 | Block-break crack | atlas sprites `blocks/destroy_stage_0…9.png` (16×16, exactly 10 stages present in the jar), selected by `progress = 0..9`, drawn with additive-ish blend `(770,1,1,0)`, depth-masked, and with the atlas' blur/mipmap temporarily disabled | `RenderGlobal.sendBlockBreakProgress:2362-2380`; `EntityRenderer:1431-1437` |
