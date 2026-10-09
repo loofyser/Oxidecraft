@@ -304,7 +304,7 @@ Sources: `client/gui/GuiOverlayDebug.java` (MCP-919), <https://minecraft.wiki/w/
 | Double-click | collect all matching stacks to the cursor (up to the max stack size) |
 | Drop | `Q` drops one, `Ctrl+Q`/`Q` outside GUI drops whole stack |
 | Creative | middle-click copy; `1–9` while hovering gives a stack; scroll wheel switches hotbar; delete-key slot erases |
-| Cursor stack render | drawn at `zLevel 200` in the GUI pass; the "returning stack" animation (100 ms) uses `Minecraft.getSystemTime()` and eases position |
+| Cursor stack render | drawn at `zLevel 200` in the GUI pass; the "returning stack" easing (100 ms, `Minecraft.getSystemTime()`) is the TOUCHSCREEN drag-return only (`GuiContainer`:172-187, set :583-608) — a close carrying a cursor DROPS the stack (`Container.onContainerClosed`:516-525) |
 | Durability bar | 13×2 px at slot bottom, green→red interpolation, shown when damaged |
 | Stack count | bottom-right, 1-px shadow, yellow "0" while splitting |
 Handled in `GuiContainer` (drag state fields :66-71, remnant logic :156-165) and `Minecraft.clickMouse`.
