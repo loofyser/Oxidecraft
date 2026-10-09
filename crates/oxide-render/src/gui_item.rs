@@ -144,10 +144,13 @@ pub struct ItemIcon {
     pub id: i16,
     /// The item's damage or metadata value.
     pub damage: i16,
-    /// Whether the stack carries the enchant flag: the source's own `hasEffect` rule
-    /// (`ItemStack.hasEffect`:859-861 over `isItemEnchanted`:902-905 — a root compound
-    /// with an `ench` list, or a class whose `hasEffect` is always true,
-    /// `ItemSimpleFoiled`:5-8).
+    /// Whether the stack carries the enchant flag, from the source's own `hasEffect`
+    /// rule (`ItemStack.hasEffect`:859-861 → the item's `hasEffect`, `Item.hasEffect`
+    /// :416-419): the NBT default — a root compound's `ench` list
+    /// (`isItemEnchanted`:902-905) — or one of the five class overrides (the enchanted
+    /// book, the written book, the bottle o' enchanting, the golden apple's metadata and
+    /// the potion's effect list). The draw applies the source's own second gate on top:
+    /// a builtin shape never glints (`RenderItem.renderItem`:154-165).
     pub enchanted: bool,
 }
 
@@ -340,12 +343,13 @@ pub fn icon_matrix(x: f32, y: f32, z_level: f32, shape: IconShape, transform: Tr
 
 /// The z-level one icon draw carries, from its own place among the list's item draws.
 ///
-/// The source raises the level by 50 for every `renderItemAndEffectIntoGUI` call
-/// (`:402`), so the first icon of a frame sits at 50 and every later one 50 nearer —
-/// the same ladder the source's own hotbar loop walks, and the reason a later icon's
-/// geometry sorts strictly in front of an earlier one's (recorded: the source's
-/// per-call ladder, with the container contexts' bases folded into the list's own
-/// order).
+/// The source raises the level by 50 before each `renderItemAndEffectIntoGUI` call
+/// (`RenderItem`:402) and lowers it by 50 once the call returns (`:443`), so its own
+/// hotbar loop is balanced — every call walks the same 50 (`GuiPlayerTabOverlay`'s pair
+/// does the same with its own 100, `:269`/`:271`). The ladder here is the plan's
+/// recorded generalization: the container contexts' own bases folded into the list's
+/// order, with the first icon of a frame at 50 and every later one 50 nearer — the
+/// reason a later icon's geometry sorts strictly in front of an earlier one's.
 pub fn icon_z_level(index: usize) -> f32 {
     Z_LEVEL_STEP * (index as f32 + 1.0)
 }

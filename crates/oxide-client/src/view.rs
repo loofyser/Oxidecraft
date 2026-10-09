@@ -1553,25 +1553,71 @@ pub fn reconcile_chat_open(chat: &mut ChatView, input: &ChatInput) {
 }
 
 /// The icon one hud item draw carries: the wire's item stack as the pass's own minimal
-/// view, the enchant flag read from the stack's NBT.
+/// view, the enchant flag read from the stack's own rule.
 ///
-/// The source's rule is `ItemStack.hasEffect` over `isItemEnchanted`: the stack's root
-/// compound carries an `ench` list (`ItemStack.isItemEnchanted`:902-905) — presence,
-/// not contents, so an empty list enchants too; the tag-less stack never is. No 1.8
-/// item overrides `hasEffect` (`ItemSimpleFoiled` has no subclasses in this tree), so
-/// the NBT rule is the whole of it.
+/// The source's gate is `stack.hasEffect()` (`RenderItem.renderItem`:160-163 →
+/// `ItemStack.hasEffect`:859-861), the item's own `hasEffect(stack)` (`Item.hasEffect`
+/// :416-419): the NBT default — a root compound with an `ench` list
+/// (`isItemEnchanted`:902-905, presence not contents) — with six class overrides, each
+/// replacing it: the always-true `ItemEnchantedBook`:16-19 (the enchanted book, 403),
+/// `ItemEditableBook`:146-149 (the written book, 387), `ItemExpBottle`:16-19 (the bottle
+/// o' enchanting, 384) and `ItemSimpleFoiled`:5-8 (the nether star, 399 — the class's
+/// own registration at `Item.java`:909); the golden apple's `stack.getMetadata() > 0`
+/// (`ItemAppleGold`:18-21, 322) and the potion's effect list non-empty
+/// (`ItemPotion`:330-334, 373 — [`potion_has_effects`]'s damage decode; the stack's own
+/// `CustomPotionEffects` tag is not read here). The ids are the registrations' own
+/// (`Item.registerItems`:831, :883, :894, :897, :909, :913).
 ///
 /// The conversion is the draw-list seam: a slot's stack becomes this view when a frame
 /// builds its draws, and nothing else of the stack reaches the pass — the icon draw
-/// reads the id, the damage and the flag. The hotbar draws that call it are the next
-/// task's, so nothing calls it yet.
+/// reads the id, the damage and the flag, and the pass gates the glint the way the
+/// source's draw does (a builtin shape never glints, `RenderItem.renderItem`:154-165).
+/// The hotbar draws that call it are the next task's, so nothing calls it yet.
 #[allow(dead_code)]
 pub(crate) fn item_icon(stack: &MetadataItem) -> ItemIcon {
     ItemIcon {
         id: stack.id,
         damage: stack.damage,
-        enchanted: stack.nbt.as_deref().is_some_and(root_has_ench),
+        enchanted: stack_has_effect(stack),
     }
+}
+
+/// The source's `hasEffect` rule for one stack (`Item.hasEffect`:416-419 and its six
+/// overrides), by registration id: each override replaces the default rather than
+/// extending it.
+fn stack_has_effect(stack: &MetadataItem) -> bool {
+    match stack.id {
+        // The always-true registrations: the enchanted book, the written book, the
+        // bottle o' enchanting and the nether star.
+        403 | 387 | 384 | 399 => true,
+        // The enchanted golden apple: any metadata above the plain apple's 0.
+        322 => stack.damage > 0,
+        // Potions: the effect list non-empty.
+        373 => potion_has_effects(stack.damage),
+        // Everything else: the NBT default.
+        _ => stack.nbt.as_deref().is_some_and(root_has_ench),
+    }
+}
+
+/// The union of the source's thirteen potion requirement patterns over a damage's low
+/// four bits (`PotionHelper.potionRequirements`:581-593, read through
+/// `parsePotionEffects`:220-341): bit `n` set means a damage whose low nibble is `n`
+/// answers at least one requirement, i.e. its effect list is non-empty. The holes are
+/// 0 (water), 7 and 15.
+const POTION_EFFECT_FLAGS: u16 = 0x7F7E;
+
+/// The potion arm's damage decode: whether `ItemPotion.getEffects`:40-70's damage path
+/// — `PotionHelper.getPotionEffects(meta, false)`:386-449 — answers with at least one
+/// effect, which is what `ItemPotion.hasEffect`:330-334 tests. Each requirement string
+/// spells flag terms over the damage's low four bits (the parser's `&`/`!`/`+` terms:
+/// a required bit set, its negated neighbours clear; the trailing `+6` terms only add
+/// to a count the required bit already carries), so the thirteen strings reduce to
+/// [`POTION_EFFECT_FLAGS`]'s patterns. The splash bit (16384) and the tier bits (32,
+/// 64) sit above the nibble and never change the answer. The metadata is the source's
+/// own non-negative domain (`ItemStack.setItemDamage`:278-284 clamps).
+fn potion_has_effects(damage: i16) -> bool {
+    let flags = damage.max(0) as u16 & 0xF;
+    (POTION_EFFECT_FLAGS >> flags) & 1 == 1
 }
 
 /// Whether the raw NBT tail's root compound carries an `ench` list
@@ -5874,10 +5920,11 @@ mod tests {
         assert_eq!(draws[0].below_name, None, "no record name, no line");
     }
 
-    /// The stack conversion's enchant rule: the root compound's own `ench` list
-    /// (`ItemStack.isItemEnchanted`:902-905) — presence, not contents; a tag-less
-    /// stack, a compound without the key, a non-list `ench` and an unparseable tail
-    /// are all unenchanted, and the id and damage ride through untouched.
+    /// The stack conversion's NBT default: the root compound's own `ench` list
+    /// (`Item.hasEffect`:416-419 over `ItemStack.isItemEnchanted`:902-905) — presence,
+    /// not contents; a tag-less stack, a compound without the key, a non-list `ench`
+    /// and an unparseable tail are all unenchanted, and the id and damage ride through
+    /// untouched.
     #[test]
     fn the_item_icon_reads_the_enchant_rule() {
         let stack = |nbt: Option<Vec<u8>>| MetadataItem {
@@ -5913,5 +5960,117 @@ mod tests {
         assert!(!item_icon(&stack(Some(string_ench.to_vec()))).enchanted);
         // A tail that does not parse is not enchanted either.
         assert!(!item_icon(&stack(Some(vec![0x0A]))).enchanted);
+    }
+
+    /// The class arms of `hasEffect`, which replace the NBT default rather than
+    /// extending it: the always-true registrations — the enchanted book 403
+    /// (`ItemEnchantedBook`:16-19), the written book 387 (`ItemEditableBook`:146-149),
+    /// the bottle o' enchanting 384 (`ItemExpBottle`:16-19) and the nether star 399
+    /// (`ItemSimpleFoiled`:5-8, the class's own registration at `Item.java`:909) —
+    /// glint with no NBT at all, the golden apple 322 is `stack.getMetadata() > 0`
+    /// (`ItemAppleGold`:18-21) and the potion 373 is its effect list non-empty
+    /// (`ItemPotion`:330-334). The ids are `Item.registerItems`' own literals
+    /// (`Item.java`:831, :883, :894, :897, :909, :913).
+    #[test]
+    fn the_item_icon_reads_the_class_arms() {
+        let stack = |id: i16, damage: i16, nbt: Option<Vec<u8>>| MetadataItem {
+            id,
+            count: 1,
+            damage,
+            nbt,
+        };
+        for id in [403, 387, 384, 399] {
+            let icon = item_icon(&stack(id, 0, None));
+            assert!(
+                icon.enchanted,
+                "the always-foiled registration {id} glints without NBT: {icon:?}"
+            );
+        }
+        // The golden apple: metadata 0 the plain apple, anything above it the enchanted
+        // one — the arm is `> 0`, not the sub-item pair's membership.
+        let plain = item_icon(&stack(322, 0, None));
+        assert!(
+            !plain.enchanted,
+            "the plain golden apple does not glint: {plain:?}"
+        );
+        let golden = item_icon(&stack(322, 1, None));
+        assert!(
+            golden.enchanted,
+            "the enchanted golden apple glints: {golden:?}"
+        );
+        let golden = item_icon(&stack(322, 2, None));
+        assert!(
+            golden.enchanted,
+            "the arm is `metadata > 0`, so damage 2 glints too: {golden:?}"
+        );
+        // An override replaces the default: the enchanted book glints with or without
+        // the tag, while a water potion and a plain golden apple carrying `ench` do not.
+        let ench = [
+            0x0A, 0x00, 0x00, 0x09, 0x00, 0x04, b'e', b'n', b'c', b'h', 0x0A, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let book = item_icon(&stack(403, 0, Some(ench.to_vec())));
+        assert!(
+            book.enchanted,
+            "the enchanted book glints with or without the tag: {book:?}"
+        );
+        let water = item_icon(&stack(373, 0, Some(ench.to_vec())));
+        assert!(
+            !water.enchanted,
+            "the water potion's tag does not survive its arm: {water:?}"
+        );
+        let plain = item_icon(&stack(322, 0, Some(ench.to_vec())));
+        assert!(
+            !plain.enchanted,
+            "the plain golden apple's tag does not survive its arm: {plain:?}"
+        );
+        // The default arm for any other id: the NBT rule still answers.
+        let other = item_icon(&stack(276, 0, Some(ench.to_vec())));
+        assert!(other.enchanted, "the default arm reads the tag: {other:?}");
+        let other = item_icon(&stack(276, 0, None));
+        assert!(!other.enchanted, "the tag-less default does not: {other:?}");
+        // A builtin-shaped stack's flag comes from this rule too — the chest's own block
+        // item has no override, so its `ench` tag sets the flag; the draw-side gate (a
+        // builtin shape never glints) is the pass's own.
+        let chest = item_icon(&stack(54, 0, Some(ench.to_vec())));
+        assert!(chest.enchanted, "the chest's tag sets the flag: {chest:?}");
+    }
+
+    /// The potion arm's own decode: `ItemPotion.hasEffect`:330-334 is its effect list
+    /// non-empty (`getEffects`:40-70), which for a stack without a
+    /// `CustomPotionEffects` tag is the damage's `PotionHelper.getPotionEffects`
+    /// answer (`:386-449` over the thirteen `potionRequirements` strings, `:581-593`).
+    /// The T9 sub-item data carries the source's own population: the water bottle at
+    /// damage 0 and the 62 effect-carrying damages, every one of which glints; the
+    /// patterns 0, 7 and 15, and the splash bit alone, match no requirement.
+    #[test]
+    fn the_item_icon_decodes_the_potion_damages() {
+        let stack = |damage: i16| MetadataItem {
+            id: 373,
+            count: 1,
+            damage,
+            nbt: None,
+        };
+        let items = oxide_client::items::sub_items(373);
+        assert_eq!(items.len(), 63, "the water bottle plus the 62 potions");
+        for item in items {
+            let icon = item_icon(&stack(item.damage));
+            if item.damage == 0 {
+                assert!(!icon.enchanted, "the water bottle does not glint: {icon:?}");
+            } else {
+                assert!(
+                    icon.enchanted,
+                    "{} at damage {} carries effects and glints: {icon:?}",
+                    item.name, item.damage
+                );
+            }
+        }
+        for damage in [0, 7, 15, 16384] {
+            let icon = item_icon(&stack(damage));
+            assert!(
+                !icon.enchanted,
+                "damage {damage} matches none of the source's requirements: {icon:?}"
+            );
+        }
     }
 }

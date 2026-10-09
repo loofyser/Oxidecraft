@@ -6846,11 +6846,12 @@ fn the_hud_pass_draws_a_block_items_icon() {
 ///
 /// The draw is the flat branch (`RenderItem.setupGuiTransform`:390-394): the 64x scale and
 /// the 180-about-x turn, lighting off, and the sprite filling the cell at the ladder's
-/// first rung. The quad samples the icon binding — the atlas through the no-mipmap,
-/// no-blur pair — where the standing atlas binding's linear filter would blend the two
-/// texels at every pixel (the Task 10 discrimination, re-used at the real draw: each
-/// texel covers two pixels, so the linear sample sits a quarter into the neighbouring
-/// texel and reads 3:1 of its colour).
+/// first rung. The cell magnifies the sprite 2:1 — each texel covers two pixels — and at
+/// that ratio the icon binding's level-0 pair reads the same exact texels the standing
+/// atlas binding would (both pairs' mag filter is nearest), so the case pins the icon
+/// draw's own crispness, not the sampler choice: the pair discrimination belongs to
+/// [`the_atlasicon_binding_stays_crisp_where_the_atlas_binding_blends`], the minified
+/// case.
 ///
 /// The pinning run measured the bytes: every pixel of the cell exactly one of
 /// [255, 255, 255] and [0, 0, 0] — 128 of each — and nothing else inside it.
@@ -6918,11 +6919,17 @@ fn the_hud_pass_draws_a_generated_items_sprite_crisp_edges() {
 /// icon's own fragments. At time zero both scrolls are zero, so the two passes' difference
 /// is their own z turns.
 ///
-/// The pinning run measured the bytes: over the red top face [255, 0, 0] the icon alone,
-/// [255, 64, 204] where one pass adds and [255, 128, 255] where both do — the glint's own
-/// (128, 64, 204) added once or twice and clamped, over the icon's pixels, never outside
-/// them. The same run counted the classes: 12 pixels left at the icon's own colour, 25
-/// with one pass's addition and 37 with both, of the icon's own 176.
+/// The glint's own sampler is the source's pair for the sheet: both filters `GL_LINEAR`
+/// (`TextureUtil.setTextureBlurMipmap(true, false)`:260-274, from the sheet's
+/// `{"texture": {"blur": true}}` metadata read at `SimpleTexture.loadTexture`:44) and
+/// `GL_REPEAT` (`setTextureClamped(false)`:250-251). The eightfold uv scale minifies the
+/// sheet over the icon, so every covered pixel's sample is a bilinear mix of the
+/// fixture's lit and dark columns: the additions form a spread of blends — under the
+/// nearest sampler this case pinned three classes (12 pixels at the icon's own colour,
+/// 25 with one pass's addition and 37 with both, the top face reading [255, 64, 204] and
+/// [255, 128, 255]) — and under the linear one no pixel keeps the icon's own colour, so
+/// the pinning run's bytes below pin the spread, one pixel per face and phase, and the
+/// count of untouched pixels is the assertion that the blend reached every one of them.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn the_hud_pass_draws_the_glint_over_an_enchanted_icon() {
@@ -6971,30 +6978,41 @@ fn the_hud_pass_draws_the_glint_over_an_enchanted_icon() {
     // The two passes over the icon's pixels: the pattern's own texels leave the icon's
     // colour where both are dark and add the glint's colour once or twice where they are
     // lit.
-    let mut plain = 0;
-    let mut once = 0;
-    let mut twice = 0;
+    // Under the linear sampler every covered pixel's bilinear sample mixes the sheet's
+    // lit and dark columns: no pixel keeps the icon's own colour (the nearest sampler
+    // left 12), the additions form a spread of blends, and the pinning run's bytes below
+    // pin one pixel per face and phase.
+    let mut untouched = 0;
     for y in 24..40 {
         for x in 24..40 {
             let got = pixel_rgba(&pixels, x, y);
-            match got {
-                [255, 0, 0, 255] => plain += 1,
-                [255, 64, 204, 255] => once += 1,
-                [255, 128, 255, 255] => twice += 1,
-                _ => {}
+            if got == [255, 0, 0, 255] || got == [0, 0, 111, 255] || got == [0, 0, 162, 255] {
+                untouched += 1;
             }
         }
     }
-    // The three classes over the icon's pixels: the pattern's own texels leave the icon's
-    // colour where both passes are dark and add the glint's colour once or twice where
-    // they are lit — the pinning run's counts, and never a pixel outside the icon.
-    assert_eq!(plain, 12, "pixels the pattern leaves dark");
-    assert_eq!(once, 25, "pixels one pass adds over");
-    assert_eq!(twice, 37, "pixels both passes add over");
-    assert!(
-        plain + once + twice <= own,
-        "the glint lands over the icon's own pixels alone"
+    assert_eq!(
+        untouched, 0,
+        "every covered pixel carries the linear blend's addition"
     );
+    expect_pixel(&pixels, 27, 26, [255, 69, 221], "the top face's blend");
+    expect_pixel(
+        &pixels,
+        25,
+        27,
+        [255, 115, 255],
+        "the top face's edge blend",
+    );
+    expect_pixel(
+        &pixels,
+        32,
+        27,
+        [255, 66, 209],
+        "the top face's centre blend",
+    );
+    expect_pixel(&pixels, 25, 28, [102, 51, 255], "the left face's blend");
+    expect_pixel(&pixels, 33, 33, [210, 105, 255], "the right face's blend");
+    expect_pixel(&pixels, 27, 37, [48, 24, 239], "the lower face's blend");
 }
 
 /// The hud draws the later icon over the earlier one: the list's own order is the source's
@@ -7073,4 +7091,113 @@ fn the_hud_pass_draws_the_later_icon_over_the_earlier_one() {
     // The later icon where it stands alone, and the sky past its own cell.
     expect_pixel(&pixels, 21, 21, [0, 255, 0], "the later icon's own cell");
     expect_pixel(&pixels, 19, 19, SKY, "the sky past the later icon's cell");
+}
+
+/// The hud draws the count text over the icon: the icon's own draw, then the 2D text's
+/// ink and shadow over it — the batch resume path, a 2D primitive after an `Item` in one
+/// list.
+///
+/// The source draws the stack's count after the icon, inside the slot's bottom-right
+/// corner: `RenderItem.renderItemOverlayIntoGUI`:455-473 disables depth and blend, then
+/// `drawStringWithShadow(s, x + 19 - 2 - width, y + 6 + 3, 16777215)` at :471 draws the
+/// count string over the icon (`FontRenderer.drawStringWithShadow`:325, its shadow the
+/// own `(colour & 16579836) >> 2`:589). The fixture font's `|` inks one column of its
+/// cell, so the case draws the same shape at the icon's lower right and pins the resume:
+/// the ink and its shadow column over the icon's own faces, the icon through the glyph's
+/// transparent cells, and the icon's own pixels outside the text's cell untouched. The
+/// order is what makes the ink visible — the item's geometry sits nearer than the 2D
+/// draws, so a text batch ahead of the item's would be overwritten.
+///
+/// The pinning run measured the bytes: the ink column [255, 255, 255] and the shadow
+/// [63, 63, 63] (`0xFF3F3F3F`, the source's own quarter), both over the icon's faces,
+/// with the faces' own [0, 0, 162] and [0, 0, 111] standing under the glyph's
+/// transparent cells.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_count_text_over_the_icon() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, SIZE as f32, SIZE as f32);
+    hud.set_atlas_icon(&device, &queue, &item_atlas());
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 1,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 24.0,
+                y: 24.0,
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 32.0,
+                y: 30.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: true,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let pixels = item_frame(&device, &queue, &target, &hud);
+    // The ink column over the icon's own faces: the text's batches after the item's.
+    expect_pixel(
+        &pixels,
+        32,
+        30,
+        [255, 255, 255],
+        "the ink over the icon's top face",
+    );
+    expect_pixel(
+        &pixels,
+        32,
+        34,
+        [255, 255, 255],
+        "the ink over the icon's side face",
+    );
+    // The shadow column one pixel along, the source's own quarter.
+    expect_pixel(&pixels, 33, 31, [63, 63, 63], "the shadow over the icon");
+    // The glyph's transparent cells leave the icon's own faces standing.
+    expect_pixel(
+        &pixels,
+        36,
+        32,
+        [0, 0, 111],
+        "the icon through the transparent cells",
+    );
+    // The icon's own pixels outside the text's cell are untouched.
+    expect_pixel(
+        &pixels,
+        32,
+        27,
+        [255, 0, 0],
+        "the icon's top face above the text",
+    );
+    expect_pixel(
+        &pixels,
+        28,
+        34,
+        [0, 0, 162],
+        "the icon's left face beside the text",
+    );
+    expect_pixel(&pixels, 23, 32, SKY, "the sky beside the icon");
+    expect_pixel(&pixels, 40, 40, SKY, "the sky past the icon's cell");
 }

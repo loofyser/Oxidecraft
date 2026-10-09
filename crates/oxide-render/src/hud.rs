@@ -34,7 +34,7 @@ use oxide_assets::texture::Texture;
 use crate::atlas_texture::AtlasTexture;
 use crate::entity_pass::{BossStatus, SkinTexId};
 use crate::gui_item::{
-    ATLAS_TEXTURE, GuiItemDraw, ItemIcon, ItemIconSource, icon_matrix, icon_z_level,
+    ATLAS_TEXTURE, GuiItemDraw, IconShape, ItemIcon, ItemIconSource, icon_matrix, icon_z_level,
 };
 use crate::text::{TextBuilder, TextVertex, string_width};
 
@@ -338,7 +338,8 @@ pub enum HudDraw {
     /// the resolver cannot place draws its missing-sprite fallback
     /// ([`ItemIconSource::missing_icon`]); `None` draws nothing — an empty cell. An
     /// enchanted stack ([`ItemIcon::enchanted`]) draws its two glint passes after the
-    /// icon, before the next draw of the list.
+    /// icon, before the next draw of the list — unless its shape is builtin, which the
+    /// source's draw never glints (`RenderItem.renderItem`:154-165).
     Item {
         /// The stack's own minimal view, or `None` for a cell that paints nothing.
         stack: Option<ItemIcon>,
@@ -387,7 +388,7 @@ enum BatchTexture {
     Atlas,
     /// The block atlas, under the icon draws' level-0 binding.
     AtlasIcon,
-    /// The glint sheet, bound under its own repeating sampler
+    /// The glint sheet, bound under its own linear, repeating sampler
     /// ([`HudPass::set_glint`]).
     Glint,
     /// A registered skin texture, by id.
@@ -560,8 +561,12 @@ fn build(
 }
 
 /// Appends one icon's geometry: the item pipeline's own vertices and, for an enchanted
-/// stack, the two glint passes after them (`RenderItem.renderEffect`:170-198), each
-/// under its own batch so the painter's order is the list's.
+/// non-builtin icon, the two glint passes after them (`RenderItem.renderEffect`:170-198),
+/// each under its own batch so the painter's order is the list's.
+///
+/// The glint's own gate is the source's: it sits in `renderItem`'s non-builtin
+/// else-branch (`RenderItem.renderItem`:154-165), so a builtin model — which takes the
+/// `TileEntityItemStackRenderer` branch — never glints however enchanted its stack is.
 fn push_item(
     built: &mut BuiltGeometry,
     icon: &GuiItemDraw,
@@ -577,7 +582,8 @@ fn push_item(
         BatchTexture::Named(icon.mesh.texture)
     };
     push_triangles(built, &icon.vertices(matrix), texture, BatchState::Item);
-    if enchanted {
+    let glints = enchanted && icon.shape != IconShape::Builtin;
+    if glints {
         for pass in 0..2 {
             push_triangles(
                 built,
@@ -760,8 +766,9 @@ pub struct HudPass {
     texture_layout: wgpu::BindGroupLayout,
     /// The sampler every hud texture is read through: nearest and clamp-to-edge.
     sampler: wgpu::Sampler,
-    /// The sampler the glint sheet alone is read through: nearest and repeating, the
-    /// source's own wrap for a texture whose uvs are scaled eightfold.
+    /// The sampler the glint sheet alone is read through: linear and repeating, the
+    /// source's own pair for a sheet whose metadata asks for the blur and whose uvs are
+    /// scaled eightfold ([`HudPass::set_glint`]'s chain).
     glint_sampler: wgpu::Sampler,
     /// The one-texel white texture solid rects sample.
     white_bind: wgpu::BindGroup,
@@ -980,17 +987,25 @@ impl HudPass {
             cache: None,
         });
         let sampler = device.create_sampler(&texture_sampler_descriptor());
-        // The glint sheet's own sampler: the source loads every texture with
-        // `GL_REPEAT` (`TextureUtil.setTextureClamped(false)`:250-251, reached through
-        // `SimpleTexture.loadTexture`'s `uploadTextureImageAllocate(..., false, false)`
-        // at `SimpleTexture.java`:41 and `TextureUtil.uploadTextureImageSubImpl`:228),
-        // and the glint's uvs are scaled eightfold, so the sheet tiles where the hud's
-        // clamped sampler would smear its edge texels.
+        // The glint sheet's own sampler: `GL_LINEAR` on both filters, no mipmaps, and
+        // `GL_REPEAT`. The source's own load path reads the sheet's metadata
+        // (`{"texture": {"blur": true}}`) in `SimpleTexture.loadTexture`:36-54 — `flag`
+        // from `getTextureBlur()` at :44, `flag1` from `getTextureClamp()` at :45 — and
+        // calls `uploadTextureImageAllocate(..., flag, flag1)` at :54;
+        // `TextureUtil.uploadTextureImageSubImpl`:227 then hands the blur to
+        // `setTextureBlurred`:255-258 → `setTextureBlurMipmap(true, false)`:260-274,
+        // which sets min `GL_LINEAR` (no mipmaps generated) and mag `GL_LINEAR`, and
+        // `setTextureClamped(false)`:250-251 sets the wrap to `GL_REPEAT`. The uvs are
+        // scaled eightfold and minified over the icon, so the sheet tiles and blends
+        // where the hud's clamped, nearest sampler would smear its edge texels.
         let glint_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("oxide hud glint sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            lod_max_clamp: 0.0,
             ..texture_sampler_descriptor()
         });
         let white_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1231,11 +1246,15 @@ impl HudPass {
     /// Uploads `sheet` as the glint texture the enchanted icons' glint passes sample
     /// ([`crate::gui_item::GLINT_TEXTURE`] — the source's own `RES_ITEM_GLINT`, `RenderItem.java`:63).
     ///
-    /// The sheet is bound under the glint sampler: the source loads every texture with
-    /// `GL_REPEAT` (`TextureUtil.setTextureClamped(false)`:250-251 through
-    /// `SimpleTexture`'s own load), and the glint's uvs are scaled eightfold, so the
-    /// sheet tiles where the hud's clamped sampler would smear its edge texels. Until a
-    /// sheet lands, an enchanted icon's glint batches are skipped like any other
+    /// The sheet is bound under the glint sampler, which is the source's own pair for
+    /// this texture: both filters `GL_LINEAR` — the sheet's metadata
+    /// (`{"texture": {"blur": true}}`) reaches `SimpleTexture.loadTexture`:36-54's
+    /// `flag`, and `TextureUtil.setTextureBlurMipmap(true, false)`:260-274 (via
+    /// `setTextureBlurred`:255-258 and `uploadTextureImageSubImpl`:227) sets min and mag
+    /// `GL_LINEAR` with no mipmaps — and the wrap `GL_REPEAT`
+    /// (`setTextureClamped(false)`:250-251, the metadata setting no clamp). The glint's
+    /// uvs are scaled eightfold, so the sheet tiles and minifies through the filters.
+    /// Until a sheet lands, an enchanted icon's glint batches are skipped like any other
     /// unbound texture.
     pub fn set_glint(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sheet: &Texture) {
         let gpu_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1747,7 +1766,7 @@ mod tests {
 
     use super::{
         Batch, BatchState, BatchTexture, BuiltGeometry, HudDraw, HudTexture, ICONS_TEXTURE,
-        MIN_HEIGHT, MIN_WIDTH, SkinTexId, VERTEX_BYTES, WHITE_UV, boss_bar_draws, build,
+        ItemIcon, MIN_HEIGHT, MIN_WIDTH, SkinTexId, VERTEX_BYTES, WHITE_UV, boss_bar_draws, build,
         scaled_resolution, vertex_layout,
     };
     use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
@@ -2207,5 +2226,95 @@ mod tests {
     #[test]
     fn the_scale_minimums_are_the_sources_own() {
         assert_eq!((MIN_WIDTH, MIN_HEIGHT), (320, 240));
+    }
+
+    /// A resolver for the glint gate's test: id 1 a builtin-shaped icon, id 2 the 3D
+    /// shape, both one quad over a named fixture texture.
+    struct GateIcons;
+
+    /// One quad in the mesh's 1/16 units, the gate test's minimal icon.
+    fn gate_quad() -> crate::entity_models::Vertices {
+        crate::entity_models::Vertices {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [16.0, 0.0, 0.0],
+                [16.0, 16.0, 0.0],
+                [0.0, 16.0, 0.0],
+            ],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+        }
+    }
+
+    impl crate::gui_item::ItemIconSource for GateIcons {
+        fn icon(&self, id: i16, _damage: i16) -> Option<crate::gui_item::ItemIconMesh> {
+            let shape = match id {
+                1 => crate::gui_item::IconShape::Builtin,
+                2 => crate::gui_item::IconShape::Gui3d,
+                _ => return None,
+            };
+            Some(crate::gui_item::ItemIconMesh {
+                mesh: crate::entity_pass::ItemMesh {
+                    vertices: std::sync::Arc::new(gate_quad()),
+                    texture: "fixtures/items",
+                },
+                transform: oxide_assets::model::Transform::DEFAULT,
+                shape,
+            })
+        }
+
+        fn missing_icon(&self) -> Option<crate::gui_item::ItemIconMesh> {
+            None
+        }
+    }
+
+    /// The item draws' glint gate: the source's glint sits in `renderItem`'s non-builtin
+    /// else-branch (`RenderItem.renderItem`:154-165) — a builtin-shaped model takes the
+    /// `TileEntityItemStackRenderer` branch and never glints, however enchanted the
+    /// stack, while every other shape's enchanted draw carries the two passes' glint
+    /// run (one batch: both passes sample one texture in one state).
+    #[test]
+    fn the_glint_skips_a_builtin_shaped_stack() {
+        let draw = |id: i16, enchanted: bool| HudDraw::Item {
+            stack: Some(ItemIcon {
+                id,
+                damage: 0,
+                enchanted,
+            }),
+            x: 0.0,
+            y: 0.0,
+        };
+        // The builtin shape: the icon's own run alone, no glint after it.
+        let built = build(&[draw(1, true)], None, Some(&GateIcons), 0);
+        assert_eq!(
+            built
+                .batches
+                .iter()
+                .map(|batch| (batch.texture, batch.state))
+                .collect::<Vec<_>>(),
+            vec![(BatchTexture::Named("fixtures/items"), BatchState::Item)],
+            "a builtin-shaped enchanted stack draws no glint"
+        );
+        // The 3D shape: the icon's run, then the two passes' own.
+        let built = build(&[draw(2, true)], None, Some(&GateIcons), 0);
+        assert_eq!(
+            built
+                .batches
+                .iter()
+                .map(|batch| (batch.texture, batch.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (BatchTexture::Named("fixtures/items"), BatchState::Item),
+                (BatchTexture::Glint, BatchState::Glint),
+            ],
+            "the 3D shape's enchanted draw glints"
+        );
+        // The flag still answers for both shapes: an unenchanted draw never glints.
+        let built = build(&[draw(2, false)], None, Some(&GateIcons), 0);
+        assert_eq!(
+            built.batches.len(),
+            1,
+            "an unenchanted 3D draw does not glint"
+        );
     }
 }
