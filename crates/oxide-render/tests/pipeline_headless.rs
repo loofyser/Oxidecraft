@@ -7310,6 +7310,7 @@ fn the_hud_pass_draws_a_block_items_icon() {
             }),
             x: 24.0,
             y: 24.0,
+            pop: 0.0,
         }],
         &TextureRegistry::new(&device, &queue),
     );
@@ -7772,6 +7773,7 @@ fn the_hud_pass_draws_a_generated_items_sprite_crisp_edges() {
             }),
             x: 24.0,
             y: 24.0,
+            pop: 0.0,
         }],
         &TextureRegistry::new(&device, &queue),
     );
@@ -7849,6 +7851,7 @@ fn the_hud_pass_draws_the_glint_over_an_enchanted_icon() {
             }),
             x: 24.0,
             y: 24.0,
+            pop: 0.0,
         }],
         &TextureRegistry::new(&device, &queue),
     );
@@ -7946,6 +7949,7 @@ fn the_hud_pass_draws_the_later_icon_over_the_earlier_one() {
                 }),
                 x: 24.0,
                 y: 24.0,
+                pop: 0.0,
             },
             HudDraw::Item {
                 stack: Some(ItemIcon {
@@ -7955,6 +7959,7 @@ fn the_hud_pass_draws_the_later_icon_over_the_earlier_one() {
                 }),
                 x: 20.0,
                 y: 20.0,
+                pop: 0.0,
             },
         ],
         &TextureRegistry::new(&device, &queue),
@@ -8032,6 +8037,7 @@ fn the_hud_pass_draws_the_count_text_over_the_icon() {
                 }),
                 x: 24.0,
                 y: 24.0,
+                pop: 0.0,
             },
             HudDraw::Text {
                 text: "|".to_string(),
@@ -8089,4 +8095,412 @@ fn the_hud_pass_draws_the_count_text_over_the_icon() {
     );
     expect_pixel(&pixels, 23, 32, SKY, "the sky beside the icon");
     expect_pixel(&pixels, 40, 40, SKY, "the sky past the icon's cell");
+}
+
+/// The hotbar frame's own probe size: a 256x64 target, so the assembly's true
+/// 182-wide background and its true coordinates land one GUI unit per pixel —
+/// the frame `view.rs` composes at `ScaledResolution { width: 256, height: 64 }`
+/// (`bg = (128 − 91, 64 − 22)`, slot 4's highlight at `128 − 92 + 4 × 20`,
+/// slot cells at `128 − 88 + 20j`, the popup at `64 − 59`, the crosshair at
+/// `(128 − 7, 32 − 7)`).
+const HOTBAR_WIDE: u32 = 256;
+/// The probe target's height in texels; the readback row stride (256 × 4) stays
+/// a multiple of 256 bytes.
+const HOTBAR_TALL: u32 = 64;
+
+/// The offscreen colour target at the hotbar probe's size.
+fn wide_target(device: &wgpu::Device, format: wgpu::TextureFormat) -> Target {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("oxide hotbar headless target"),
+        size: wgpu::Extent3d {
+            width: HOTBAR_WIDE,
+            height: HOTBAR_TALL,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Target { texture, view }
+}
+
+/// The depth texture at the hotbar probe's size.
+fn wide_depth(device: &wgpu::Device) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("oxide hotbar headless depth"),
+        size: wgpu::Extent3d {
+            width: HOTBAR_WIDE,
+            height: HOTBAR_TALL,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Reads the hotbar probe's target back: one 1024-byte row per line, 64 lines.
+fn read_wide_pixels(device: &wgpu::Device, queue: &wgpu::Queue, target: &Target) -> Vec<u8> {
+    const ROW: u32 = HOTBAR_WIDE * 4;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oxide hotbar headless readback"),
+        size: u64::from(ROW) * u64::from(HOTBAR_TALL),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hotbar headless readback encoder"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ROW),
+                rows_per_image: Some(HOTBAR_TALL),
+            },
+        },
+        wgpu::Extent3d {
+            width: HOTBAR_WIDE,
+            height: HOTBAR_TALL,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::Wait).expect("the device polls");
+    receiver
+        .recv()
+        .expect("the map callback runs")
+        .expect("the buffer maps");
+    let pixels = slice.get_mapped_range().to_vec();
+    buffer.unmap();
+    pixels
+}
+
+/// Asserts one probe pixel's RGB bytes exactly, naming it in the failure message.
+fn expect_wide(pixels: &[u8], x: u32, y: u32, want: [u8; 3], what: &str) {
+    let offset = (y * HOTBAR_WIDE * 4 + x * 4) as usize;
+    let got = [pixels[offset], pixels[offset + 1], pixels[offset + 2]];
+    assert_eq!(got, want, "{what} at ({x}, {y})");
+}
+
+/// The synthetic widgets sheet: `gui/widgets` in miniature — the background
+/// window `(0, 0, 182, 22)` split green left and blue right so the slice's span
+/// reads in the pixels, the highlight window `(0, 22, 24, 22)` solid yellow —
+/// over a transparent sheet.
+///
+/// Generated here; no asset store is read and no sheet pixel is copied.
+fn hotbar_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 0..22 {
+        for x in 0..182 {
+            let colour = if x < 91 {
+                [0u8, 255, 0, 255]
+            } else {
+                [0u8, 0, 255, 255]
+            };
+            let at = ((y * SIDE + x) * 4) as usize;
+            rgba[at..at + 4].copy_from_slice(&colour);
+        }
+    }
+    for y in 22..44 {
+        for x in 0..24 {
+            let at = ((y * SIDE + x) * 4) as usize;
+            rgba[at..at + 4].copy_from_slice(&[255, 255, 0, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The synthetic hotbar font sheet: a 128x128 grid whose `1`, `6` and `|`
+/// cells ink only their first column, so the count digits and the popup's
+/// placeholder glyph land on known pixels at advance two.
+///
+/// Generated here; no asset store is read and no Mojang pixel is embedded.
+fn hotbar_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for code in ['1' as u32, '6' as u32, '|' as u32] {
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The synthetic crosshair sheet: `gui/icons` in miniature — the 16x16
+/// crosshair window `(0, 0, 16, 16)` carrying the source's own 17 opaque white
+/// texels (the vertical arm `x = 7, y = 3..11` and the horizontal arm `y = 7,
+/// x = 3..11`, `GuiIngame.java`:179 over the extracted `icons.png`) over a
+/// transparent sheet.
+///
+/// Generated here; no asset store is read and no sheet pixel is copied.
+fn crosshair_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 3..12 {
+        let at = ((y * SIDE + 7) * 4) as usize;
+        rgba[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    for x in 3..12 {
+        let at = ((7 * SIDE + x) * 4) as usize;
+        rgba[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// The hud draws one hotbar frame at its true coordinates: the 182x22
+/// background slice and the slot-4 highlight from the widgets sheet, slot 0's
+/// damaged sword (its icon, its count suppressed at one, its durability ramp),
+/// slot 1's 16-stack (its icon, its count, no ramp), the held sword's popup at
+/// forty ticks, and the crosshair inverting the sky.
+///
+/// The geometry is the assembly's own at `ScaledResolution { width: 256,
+/// height: 64 }`, mirrored here (`view.rs`'s hotbar draws — the render crate
+/// cannot import the client): the background at `(128 − 91, 64 − 22)`, the
+/// highlight at `(128 − 92 + 4 × 20, 64 − 23)`, slot cells at `(128 − 88 +
+/// 20j, 64 − 19)`, the count at `(x + 17 − width, y + 9)`, the ramp at `(x +
+/// 2, y + 13)` for damage 780 of 1561 (`j = 7`, fill `(127, 128, 0)`), the
+/// popup at `(64 − 59)` fully opaque, and the crosshair at `(128 − 7, 32 − 7)`.
+///
+/// The pins: the background's green/blue span and its four sky neighbours, the
+/// highlight's yellow over the background's green, the sword icon's cell, the
+/// ramp's three colours and the icon beside and above them, the count's white
+/// ink and quarter shadow over the dirt cube, the popup's ink and shadow over
+/// the sky, and the crosshair's inverted centre and arm against its untouched
+/// transparent corner.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_draws_the_hotbar_frame() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = wide_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, HOTBAR_WIDE as f32, HOTBAR_TALL as f32);
+    hud.set_texture(&device, &queue, "gui/widgets", &hotbar_sheet());
+    hud.set_texture(&device, &queue, "gui/icons", &crosshair_sheet());
+    hud.set_font(&device, &queue, &hotbar_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    hud.set_atlas_icon(&device, &queue, &item_atlas());
+    hud.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    let tint = [1.0, 1.0, 1.0, 1.0];
+    hud.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/widgets"),
+                x: 37.0,
+                y: 42.0,
+                width: 182.0,
+                height: 22.0,
+                uv: [0.0, 0.0, 182.0 / 256.0, 22.0 / 256.0],
+                colour: tint,
+            },
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/widgets"),
+                x: 116.0,
+                y: 41.0,
+                width: 24.0,
+                height: 22.0,
+                uv: [0.0, 22.0 / 256.0, 24.0 / 256.0, 44.0 / 256.0],
+                colour: tint,
+            },
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 4,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 40.0,
+                y: 45.0,
+                pop: 0.0,
+            },
+            HudDraw::Rect {
+                x: 42.0,
+                y: 58.0,
+                width: 13.0,
+                height: 2.0,
+                colour: [0.0, 0.0, 0.0, 1.0],
+            },
+            HudDraw::Rect {
+                x: 42.0,
+                y: 58.0,
+                width: 12.0,
+                height: 1.0,
+                colour: [31.0 / 255.0, 64.0 / 255.0, 0.0, 1.0],
+            },
+            HudDraw::Rect {
+                x: 42.0,
+                y: 58.0,
+                width: 7.0,
+                height: 1.0,
+                colour: [127.0 / 255.0, 128.0 / 255.0, 0.0, 1.0],
+            },
+            HudDraw::Item {
+                stack: Some(ItemIcon {
+                    id: 1,
+                    damage: 0,
+                    enchanted: false,
+                }),
+                x: 60.0,
+                y: 45.0,
+                pop: 0.0,
+            },
+            HudDraw::Text {
+                text: "16".to_string(),
+                x: 73.0,
+                y: 54.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Text {
+                text: "|".to_string(),
+                x: 127.0,
+                y: 5.0,
+                scale: 1.0,
+                colour: tint,
+                shadow: true,
+                blend: true,
+            },
+            HudDraw::InvertRect {
+                x: 121.0,
+                y: 25.0,
+                w: 16.0,
+                h: 16.0,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+
+    let depth = wide_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide hotbar headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_wide_pixels(&device, &queue, &target);
+    // The background slice: its green/blue span and the sky on all four sides.
+    expect_wide(
+        &pixels,
+        37,
+        42,
+        [0, 255, 0],
+        "the background's top-left texel",
+    );
+    expect_wide(&pixels, 100, 50, [0, 255, 0], "the background's green half");
+    expect_wide(&pixels, 200, 50, [0, 0, 255], "the background's blue half");
+    expect_wide(
+        &pixels,
+        218,
+        63,
+        [0, 0, 255],
+        "the background's bottom-right texel",
+    );
+    expect_wide(&pixels, 36, 42, SKY, "the sky left of the background");
+    expect_wide(&pixels, 37, 41, SKY, "the sky above the background");
+    expect_wide(&pixels, 219, 42, SKY, "the sky right of the background");
+    // The highlight at slot 4's offset: yellow over the background's green.
+    expect_wide(&pixels, 116, 41, [255, 255, 0], "the highlight's top-left");
+    expect_wide(
+        &pixels,
+        139,
+        62,
+        [255, 255, 0],
+        "the highlight's bottom-right",
+    );
+    expect_wide(&pixels, 115, 41, SKY, "the sky left of the highlight");
+    expect_wide(&pixels, 116, 40, SKY, "the sky above the highlight");
+    expect_wide(
+        &pixels,
+        120,
+        50,
+        [255, 255, 0],
+        "the highlight over the background",
+    );
+    // Slot 0's sword icon: the green cell and its edges against the background.
+    expect_wide(&pixels, 40, 45, [0, 255, 0], "the icon's top-left");
+    expect_wide(&pixels, 55, 57, [0, 255, 0], "the icon's bottom-right");
+    expect_wide(&pixels, 56, 50, [0, 255, 0], "the background past the icon");
+    // The durability ramp: the fill, the underlay, the black bed's overhang,
+    // and the icon standing beside and above the bar.
+    expect_wide(&pixels, 43, 58, [127, 128, 0], "the ramp's fill");
+    expect_wide(&pixels, 48, 58, [127, 128, 0], "the fill's last column");
+    expect_wide(&pixels, 49, 58, [31, 64, 0], "the underlay past the fill");
+    expect_wide(&pixels, 53, 58, [31, 64, 0], "the underlay's last column");
+    expect_wide(
+        &pixels,
+        54,
+        58,
+        [0, 0, 0],
+        "the black bed past the underlay",
+    );
+    expect_wide(&pixels, 42, 59, [0, 0, 0], "the black bed's second row");
+    expect_wide(&pixels, 41, 58, [0, 255, 0], "the icon left of the bar");
+    expect_wide(&pixels, 42, 57, [0, 255, 0], "the icon above the bar");
+    // The count of 16 over slot 1: the digits' white ink and their quarter
+    // shadows, drawn unblended.
+    expect_wide(&pixels, 73, 54, TEXT, "the one's ink");
+    expect_wide(&pixels, 75, 54, TEXT, "the six's ink");
+    expect_wide(&pixels, 74, 55, SHADOW, "the one's shadow");
+    expect_wide(&pixels, 76, 55, SHADOW, "the six's shadow");
+    // The popup at forty ticks: opaque white ink and shadow over the sky.
+    expect_wide(&pixels, 127, 5, TEXT, "the popup's ink");
+    expect_wide(&pixels, 128, 6, SHADOW, "the popup's shadow");
+    expect_wide(&pixels, 126, 5, SKY, "the sky left of the popup");
+    // The crosshair: the sky inverted under the sprite's opaque texels, untouched
+    // where the sheet is transparent.
+    expect_wide(&pixels, 128, 32, [97, 61, 5], "the inverted centre");
+    expect_wide(&pixels, 128, 28, [97, 61, 5], "the inverted vertical arm");
+    expect_wide(&pixels, 124, 32, [97, 61, 5], "the inverted horizontal arm");
+    expect_wide(&pixels, 121, 25, SKY, "the transparent corner stays sky");
+    expect_wide(&pixels, 136, 40, SKY, "the opposite corner stays sky");
 }

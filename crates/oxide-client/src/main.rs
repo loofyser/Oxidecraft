@@ -1473,15 +1473,30 @@ impl ClientApp {
             tooltip_point(self.chat_input.open, self.chat.confirm_open(), self.cursor),
             scaled,
         );
-        // The hud list runs in the source's own overlay order: the scoreboard
-        // sidebar first (`GuiIngame.java`:336), then the chat's draws
-        // (`GuiIngame.java`:343-346), then the held player list
-        // (`GuiIngame.java`:348-358). The sidebar and the list draw with the
-        // measured font; the list draws only while its key is held.
-        let mut hud_draws = match self.font.as_ref() {
+        // The hud list runs in the source's own overlay order: the hotbar frame
+        // first — the background and highlight slices, the slot items, the
+        // crosshair fifth and the popup eleventh (`GuiIngame.java`:136-362) —
+        // then the scoreboard sidebar (`:336`), the chat's draws (`:343-346`)
+        // and the held player list (`:348-358`). The sidebar and the list draw
+        // with the measured font; the list draws only while its key is held.
+        // The window carries no F1 key, no open screen and no spectator/debug
+        // state yet, so the hotbar's gates rest at their playing defaults and
+        // the mode at survival (recorded; later tasks feed them).
+        let mut hud_draws = self.view.hotbar_draws(
+            Instant::now(),
+            &view::HotbarInput {
+                font: self.font.as_ref(),
+                scaled,
+                show_crosshair: true,
+                hide_gui: false,
+                screen_open: false,
+                survival: true,
+            },
+        );
+        hud_draws.extend(match self.font.as_ref() {
             Some(font) => view::sidebar_draws(&self.board, &self.own_name, font, scaled),
             None => Vec::new(),
-        };
+        });
         hud_draws.extend(self.chat.draws(scaled, &self.chat_input));
         if self.tab.open {
             if let Some(font) = self.font.as_ref() {

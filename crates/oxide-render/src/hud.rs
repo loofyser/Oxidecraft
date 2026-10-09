@@ -91,6 +91,15 @@ fn fs_main_opaque(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     return texel;
 }
+
+@fragment
+fn fs_main_invert(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(hud_texture, hud_sampler, input.uv) * input.color;
+    if (texel.a <= 0.1) {
+        discard;
+    }
+    return vec4<f32>(texel.rgb, 1.0);
+}
 "#;
 
 /// The GUI-space minimum the auto scale keeps on both axes (`ScaledResolution.java`:27).
@@ -169,6 +178,10 @@ fn ceiling_div(value: u32, divisor: u32) -> u32 {
 /// The icon sheet the boss bar's slices sample: `gui/icons.png` (`Gui.java`:14's `icons`),
 /// under the key the client registers it by.
 const ICONS_TEXTURE: &str = "gui/icons";
+
+/// The icon sheet's texel size: the legacy sheet is 256×256, and
+/// `Gui.drawTexturedModalRect` divides texel windows by it (`Gui.java`:140-141).
+const ICONS_SHEET: f32 = 256.0;
 
 /// The boss bar's draws for a status at a scaled resolution (`GuiIngame.renderBossHealth`:901-926).
 ///
@@ -347,6 +360,30 @@ pub enum HudDraw {
         x: f32,
         /// The cell's top edge.
         y: f32,
+        /// The pop's `f = animationsToGo − partialTicks`
+        /// (`GuiIngame.renderHotbarItem`:1043), floored at zero by the frame: a
+        /// positive value scales the icon about the pivot `(x + 8, y + 12)` by
+        /// `(1/f1, (f1 + 1)/2)` with `f1 = 1 + f/5` (`:1047-1051`); zero draws
+        /// unscaled.
+        pop: f32,
+    },
+    /// The crosshair's inverting quad: the source's own 16x16 `gui/icons` draw at
+    /// `(scaledW/2 − 7, scaledH/2 − 7)` under the `(775, 769, 1, 0)` blend
+    /// (`GuiIngame.java`:175-180) — `GL_ONE_MINUS_DST_COLOR /
+    /// GL_ONE_MINUS_SRC_COLOR`, so a white sprite texel leaves `1 − dst` behind,
+    /// a per-channel inversion — with the pass-wide alpha test discarding the
+    /// sprite's transparent texels (`EntityRenderer.java`:1168).
+    InvertRect {
+        /// The left edge.
+        x: f32,
+        /// The top edge.
+        y: f32,
+        /// The width, in GUI pixels and in sheet texels from the icons sheet's
+        /// origin.
+        w: f32,
+        /// The height, in GUI pixels and in sheet texels from the icons sheet's
+        /// origin.
+        h: f32,
     },
 }
 
@@ -407,6 +444,9 @@ enum BatchState {
     /// The glint pipeline: the icon's vertices again, equal-depth and write-less,
     /// blended `src_alpha` over `one`.
     Glint,
+    /// The crosshair pipeline: the icons sheet's sprite through the source's own
+    /// inverting blend (`GuiIngame.java`:177).
+    Invert,
 }
 
 /// One consecutive run of draws that samples the same texture in the same pipeline
@@ -454,7 +494,7 @@ fn build(
     // draws count, the 2D draws in between do not.
     let mut item_index = 0;
     for draw in draws {
-        if let HudDraw::Item { stack, x, y } = draw {
+        if let HudDraw::Item { stack, x, y, pop } = draw {
             let Some(stack) = stack else { continue };
             let Some(source) = icons else { continue };
             let Some(resolved) = source
@@ -465,6 +505,16 @@ fn build(
             };
             let icon = GuiItemDraw::from_icon(&resolved);
             let matrix = icon_matrix(*x, *y, icon_z_level(item_index), icon.shape, icon.transform);
+            // The pop scales about the pivot while `f > 0`, in GUI space around
+            // the icon's own matrix — the source's push/scale/translate sequence
+            // (`GuiIngame.renderHotbarItem`:1045-1052), which wraps the item draw
+            // but not the overlay.
+            let matrix = if *pop > 0.0 {
+                let f1 = 1.0 + *pop / 5.0;
+                pop_matrix(*x, *y, f1) * matrix
+            } else {
+                matrix
+            };
             item_index += 1;
             push_item(&mut built, &icon, matrix, time_ms, stack.enchanted);
             continue;
@@ -495,6 +545,8 @@ fn build(
             ),
             // The item draws carry their own batches and never reach this key.
             HudDraw::Item { .. } => continue,
+            // The crosshair samples the icons sheet through the inverting pipeline.
+            HudDraw::InvertRect { .. } => (BatchTexture::Named(ICONS_TEXTURE), BatchState::Invert),
         };
         match draw {
             HudDraw::Rect {
@@ -555,9 +607,28 @@ fn build(
                 close_batch(&mut built);
             }
             HudDraw::Item { .. } => {}
+            HudDraw::InvertRect { x, y, w, h } => {
+                open_batch(&mut built, texture, state);
+                push_quad(
+                    &mut built,
+                    (*x, *y),
+                    (*w, *h),
+                    [0.0, 0.0, *w / ICONS_SHEET, *h / ICONS_SHEET],
+                    [1.0, 1.0, 1.0, 1.0],
+                );
+            }
         }
     }
     built
+}
+
+/// The pop's GUI-space matrix: the translate/scale/translate sequence about the
+/// pivot `(x + 8, y + 12)` (`GuiIngame.renderHotbarItem`:1047-1051), left-multiplied
+/// around the icon's own matrix.
+fn pop_matrix(x: f32, y: f32, f1: f32) -> Mat4 {
+    Mat4::from_translation(glam::Vec3::new(x + 8.0, y + 12.0, 0.0))
+        * Mat4::from_scale(glam::Vec3::new(1.0 / f1, (f1 + 1.0) / 2.0, 1.0))
+        * Mat4::from_translation(glam::Vec3::new(-(x + 8.0), -(y + 12.0), 0.0))
 }
 
 /// Appends one icon's geometry: the item pipeline's own vertices and, for an enchanted
@@ -752,6 +823,10 @@ pub struct HudPass {
     /// The glint passes' pipeline: the icon's vertices again, equal-depth, write-less,
     /// blended `src_alpha` over `one`.
     glint_pipeline: wgpu::RenderPipeline,
+    /// The crosshair's pipeline: the icons sprite's texels through the source's own
+    /// inverting blend, with the alpha test's discard for the sprite's transparent
+    /// texels.
+    invert_pipeline: wgpu::RenderPipeline,
     /// The uniform buffer holding the scaled-resolution orthographic projection.
     ortho_buffer: wgpu::Buffer,
     /// The bind group the pipeline reads the projection through.
@@ -986,6 +1061,27 @@ impl HudPass {
             multiview: None,
             cache: None,
         });
+        let invert_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("oxide hud invert pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[vertex_layout()],
+            },
+            primitive: primitive_state(),
+            depth_stencil: Some(crate::terrain_pass::depth_state_off()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main_invert"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[color_target(format, Some(invert_blend()))],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let sampler = device.create_sampler(&texture_sampler_descriptor());
         // The glint sheet's own sampler: `GL_LINEAR` on both filters, no mipmaps, and
         // `GL_REPEAT`. The source's own load path reads the sheet's metadata
@@ -1027,6 +1123,7 @@ impl HudPass {
             opaque_pipeline,
             item_pipeline,
             glint_pipeline,
+            invert_pipeline,
             ortho_buffer,
             ortho_bind_group,
             item_buffer,
@@ -1490,6 +1587,7 @@ impl HudPass {
                     BatchState::Unblended => (&self.opaque_pipeline, &self.ortho_bind_group),
                     BatchState::Item => (&self.item_pipeline, &self.item_bind_group),
                     BatchState::Glint => (&self.glint_pipeline, &self.item_bind_group),
+                    BatchState::Invert => (&self.invert_pipeline, &self.ortho_bind_group),
                 };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, group0, &[]);
@@ -1654,6 +1752,26 @@ fn glint_blend() -> wgpu::BlendState {
         alpha: wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::SrcAlpha,
             dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
+/// The crosshair's own blend pair: `one_minus_dst_color` over
+/// `one_minus_src_color` with alpha `one` over `zero`
+/// (`GuiIngame.java`:177's `tryBlendFuncSeparate(775, 769, 1, 0)`), so a white
+/// sprite texel leaves `1 − dst` behind — a per-channel inversion — and the
+/// alpha lands at the sprite's own.
+fn invert_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::OneMinusDst,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
             operation: wgpu::BlendOperation::Add,
         },
     }
@@ -2285,6 +2403,7 @@ mod tests {
             }),
             x: 0.0,
             y: 0.0,
+            pop: 0.0,
         };
         // The builtin shape: the icon's own run alone, no glint after it.
         let built = build(&[draw(1, true)], None, Some(&GateIcons), 0);

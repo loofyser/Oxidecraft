@@ -102,6 +102,14 @@ struct HeldItem {
     selected: usize,
     /// The window 0 snapshot's nine hotbar stacks, in slot order.
     hotbar: Vec<Option<MetadataItem>>,
+    /// The pop counters the window 0 snapshot carries per hotbar slot: the
+    /// source's `animationsToGo` (`GuiIngame.renderHotbarItem`:1043), ticked by
+    /// the session, read here minus the frame's fraction.
+    pop: [u8; 9],
+    /// The popup's remaining clock (`GuiIngame.remainingHighlightTicks`).
+    popup_ticks: u8,
+    /// The stack the popup names (`GuiIngame.highlightingItemStack`).
+    popup_stack: Option<MetadataItem>,
     /// The stack `itemToRender` holds, through the ease's swap rule.
     stack: Option<MetadataItem>,
     /// The equip ease's counters.
@@ -122,6 +130,9 @@ impl HeldItem {
         Self {
             selected: 0,
             hotbar: Vec::new(),
+            pop: [0; 9],
+            popup_ticks: 0,
+            popup_stack: None,
             stack: None,
             equip: Equip::new(),
             swing: Swing::new(),
@@ -151,7 +162,30 @@ impl HeldItem {
         let differ = self.stack != current;
         self.equip.tick(differ);
         if self.equip.swap_lands() {
-            self.stack = current;
+            self.stack = current.clone();
+        }
+        // The popup's own clock (`GuiIngame.updateTick`:1089-1109): an empty
+        // hand clears it, the same stack counts it down while positive, and any
+        // other swap resets it to forty — then the stack is stored either way.
+        match current {
+            None => {
+                self.popup_ticks = 0;
+                self.popup_stack = None;
+            }
+            Some(stack) => {
+                let same = self
+                    .popup_stack
+                    .as_ref()
+                    .is_some_and(|previous| same_popup_stack(&stack, previous));
+                if same {
+                    if self.popup_ticks > 0 {
+                        self.popup_ticks -= 1;
+                    }
+                } else {
+                    self.popup_ticks = POPUP_TICKS;
+                }
+                self.popup_stack = Some(stack);
+            }
         }
         self.swing.tick();
         self.arm.tick(pitch, yaw);
@@ -197,6 +231,200 @@ impl HeldItem {
     }
 }
 
+/// The widgets sheet's key, the extraction tree's `gui/widgets.png`: the hotbar's
+/// background and highlight slices sample it under the name their draws carry
+/// (`GuiIngame.java`:48, bound at `:370`).
+const HOTBAR_WIDGETS: &str = "gui/widgets";
+
+/// The popup clock's full count: a swapped stack resets `remainingHighlightTicks`
+/// to forty (`GuiIngame.updateTick`:1104).
+const POPUP_TICKS: u8 = 40;
+
+/// The popup alpha's span: `k = ticks × 256 / 10` (`GuiIngame.java`:473).
+const POPUP_ALPHA_SPAN: f32 = 10.0;
+
+/// The pop curve's divisor: `f1 = 1 + f/5` (`GuiIngame.renderHotbarItem`:1048).
+/// The live matrix reads it in the render pass; this names it for the suite that
+/// pins the curve, so no frame code cites the literal.
+#[allow(dead_code)]
+const POP_DIVISOR: f32 = 5.0;
+
+/// The popup's row above the screen's bottom (`GuiIngame.java`:467).
+const POPUP_ABOVE: i32 = 59;
+
+/// How much lower the popup sits outside survival and adventure
+/// (`GuiIngame.java`:468-471 — `!shouldDrawHUD()`, creative and spectator).
+const POPUP_CREATIVE_SHIFT: i32 = 14;
+
+/// The durability bar's full width, in GUI pixels (`RenderItem.java`:478).
+const DURABILITY_WIDTH: f64 = 13.0;
+
+/// The durability ramp's full scale (`RenderItem.java`:479).
+const DURABILITY_RAMP: f64 = 255.0;
+
+/// The hotbar frame's inputs beside the view's own state: the font the count and
+/// the popup measure with, the scaled resolution, and the frame's three gates —
+/// the crosshair's `showCrosshair`, the call site's `hideGUI`/`currentScreen`
+/// pair, and `shouldDrawHUD`'s survival-and-adventure arm.
+pub struct HotbarInput<'a> {
+    /// The measured font; without one the count and the popup (which need the
+    /// string width) stay out while the slices, icons and bars still draw.
+    pub font: Option<&'a Font>,
+    /// The GUI-space size the frame lays out in.
+    pub scaled: ScaledResolution,
+    /// Whether the crosshair draws (`GuiIngame.showCrosshair`:513-544).
+    pub show_crosshair: bool,
+    /// The F1 state (`EntityRenderer.java`:1166).
+    pub hide_gui: bool,
+    /// Whether a screen is open (`EntityRenderer.java`:1166).
+    pub screen_open: bool,
+    /// Whether survival or adventure is in force (`shouldDrawHUD`,
+    /// `PlayerControllerMP.java`:115-117).
+    pub survival: bool,
+}
+
+/// Whether the HUD draws at all: the call site's own gate, not the overlay's —
+/// `!hideGUI || currentScreen != null` (`EntityRenderer.java`:1166-1169). With
+/// a screen open the whole overlay still draws (the screen paints over it after
+/// the depth clear, `:1185-1191`); `renderGameOverlay` itself carries no screen
+/// condition (`GuiIngame.java`:128-363). No per-entry screen suppression exists.
+pub(crate) fn hud_visible(hide_gui: bool, screen_open: bool) -> bool {
+    !hide_gui || screen_open
+}
+
+/// The popup text's alpha byte: `k = (int)(ticks × 256/10)`, clamped to 255
+/// (`GuiIngame.java`:473-477). Forty ticks give 1024 and ten give 256 — both
+/// clamp — nine gives 230, two 51 and one 25; the truncating float-to-int cast
+/// is the source's own.
+pub(crate) fn popup_alpha(ticks: u8) -> u8 {
+    let k = (f32::from(ticks) * 256.0 / POPUP_ALPHA_SPAN) as u32;
+    k.min(255) as u8
+}
+
+/// The pop's scale pair for `f = animationsToGo − partialTicks`
+/// (`GuiIngame.renderHotbarItem`:1043-1051): `f1 = 1 + f/5` scales `(1/f1,
+/// (f1+1)/2)` about the pivot — five ticks give (0.5, 1.5), two and a half
+/// (0.6667, 1.25) — and a spent pop (`f ≤ 0`) draws unscaled. The render pass
+/// carries the live matrix; this states the curve the suite pins.
+#[allow(dead_code)]
+pub(crate) fn pop_factors(f: f32) -> Option<(f32, f32)> {
+    if f <= 0.0 {
+        return None;
+    }
+    let f1 = 1.0 + f / POP_DIVISOR;
+    Some((1.0 / f1, (f1 + 1.0) / 2.0))
+}
+
+/// The root compound of a stack's NBT tail, when the tail parses as one; an
+/// unparseable tail carries no compound (the port reads the wire bytes the
+/// session parsed, and a tail that is not a compound answers no key).
+fn root_compound(nbt: &[u8]) -> Option<Vec<(String, NbtValue)>> {
+    match oxide_proto_v47::nbt::parse(nbt) {
+        Ok(NbtValue::Compound(children)) => Some(children),
+        _ => None,
+    }
+}
+
+/// Whether the stack's tail marks it `Unbreakable`
+/// (`ItemStack.isItemStackDamageable`:252 — `getBoolean("Unbreakable")`).
+fn stack_unbreakable(stack: &MetadataItem) -> bool {
+    let Some(nbt) = stack.nbt.as_deref() else {
+        return false;
+    };
+    let Some(children) = root_compound(nbt) else {
+        return false;
+    };
+    children.iter().any(|(name, value)| {
+        name == "Unbreakable" && matches!(value, NbtValue::Byte(flag) if *flag != 0)
+    })
+}
+
+/// Whether the stack is damageable: a positive `maxDamage` and no `Unbreakable`
+/// tag (`ItemStack.isItemStackDamageable`:252). An id outside the registry is
+/// not damageable — the source's null-item arm.
+fn stack_damageable(stack: &MetadataItem) -> bool {
+    items::item_entry(stack.id).is_some_and(|entry| entry.max_damage > 0)
+        && !stack_unbreakable(stack)
+}
+
+/// The popup's same-stack comparison (`GuiIngame.updateTick`:1097): the item,
+/// the exact NBT tags (`ItemStack.areItemStackTagsEqual`:426-429 — the wire
+/// bytes' own equality, which implies the compounds') and — for non-damageable
+/// stacks only — the metadata. A damageable stack's damage short-circuits true,
+/// so wearing a tool never resets the popup.
+fn same_popup_stack(current: &MetadataItem, previous: &MetadataItem) -> bool {
+    current.id == previous.id
+        && current.nbt == previous.nbt
+        && (stack_damageable(current) || current.damage == previous.damage)
+}
+
+/// The stack's NBT display name, when its tail names one (`ItemStack.getDisplayName`
+/// :578-590 over `hasDisplayName`:639-642 — the `display.Name` string).
+fn nbt_display_name(stack: &MetadataItem) -> Option<String> {
+    let nbt = stack.nbt.as_deref()?;
+    let children = root_compound(nbt)?;
+    let (_, NbtValue::Compound(display)) = children.iter().find(|(name, _)| name == "display")?
+    else {
+        return None;
+    };
+    display
+        .iter()
+        .find_map(|(name, value)| match (name.as_str(), value) {
+            ("Name", NbtValue::String(name)) => Some(name.clone()),
+            _ => None,
+        })
+}
+
+/// The name the popup draws for one stack: the NBT name when the stack has one
+/// (italicised, `EnumChatFormatting.ITALIC + s`, `GuiIngame.java`:460-463), else
+/// the damage variant's own name (the wool colours, the potions — the registry's
+/// sub-item rows), else the registration's name. An id the registry does not
+/// know has no name, and the popup stays out for it.
+fn popup_text(stack: &MetadataItem) -> Option<String> {
+    if let Some(name) = nbt_display_name(stack) {
+        return Some(format!("§o{name}"));
+    }
+    if let Some(variant) = items::sub_items(stack.id)
+        .iter()
+        .find(|item| item.damage == stack.damage)
+    {
+        return Some(variant.name.to_string());
+    }
+    items::item_entry(stack.id).map(|entry| entry.name.to_string())
+}
+
+/// The count the overlay draws for one stack, or nothing at a lone stack
+/// (`RenderItem.renderItemOverlayIntoGUI`:459-466 — the hotbar passes no text,
+/// so the count hides at exactly one; below one it draws red).
+fn count_text(stack: &MetadataItem) -> Option<String> {
+    if stack.count == 1 {
+        return None;
+    }
+    if stack.count < 1 {
+        Some(format!("§c{}", stack.count))
+    } else {
+        Some(stack.count.to_string())
+    }
+}
+
+/// Whether the stack draws the durability bar: damageable and damaged
+/// (`RenderItem.java`:476 over `ItemStack.isItemDamaged`:263-266).
+fn stack_damaged(stack: &MetadataItem) -> bool {
+    stack_damageable(stack) && stack.damage > 0
+}
+
+/// The durability bar's fill width and ramp value for a damaged stack
+/// (`RenderItem.java`:478-479): `j = round(13 − damage·13/maxDamage)`,
+/// `i = round(255 − damage·255/maxDamage)` — damage 780 of 1561 gives `j = 7`,
+/// `i = 128`.
+fn durability_terms(damage: i16, max_damage: i16) -> (i32, i32) {
+    let damage = f64::from(damage);
+    let max = f64::from(max_damage);
+    let width = (DURABILITY_WIDTH - damage * DURABILITY_WIDTH / max).round() as i32;
+    let ramp = (DURABILITY_RAMP - damage * DURABILITY_RAMP / max).round() as i32;
+    (width, ramp)
+}
+
 impl View {
     /// A view with no feed.
     pub fn new() -> Self {
@@ -221,12 +449,14 @@ impl View {
             ClientEvent::WindowSnapshot {
                 window_id: 0,
                 slots,
+                hotbar_pop,
                 ..
             } => {
                 // The hotbar band of window 0's layout: the armour band at 5–8 and the
                 // main slots at 9–35 sit ahead of it (`ContainerPlayer.java`:36-67; the
                 // port's own windows.rs holds the same band at 36–44).
                 self.held.hotbar = slots.iter().skip(HOTBAR_START).take(9).cloned().collect();
+                self.held.pop = *hotbar_pop;
             }
             ClientEvent::HeldItemSlot { slot } => {
                 if let Ok(slot) = usize::try_from(*slot) {
@@ -311,6 +541,154 @@ impl View {
             };
             draw.below_name = below_name_for(frame, board);
             draws.push(draw);
+        }
+        draws
+    }
+
+    /// The hotbar frame's draws at `now`: the widgets background and highlight
+    /// slices, the nine slot items carrying the session's pop counters minus the
+    /// frame's fraction, each slot's count and durability overlay, the held-item
+    /// popup and the crosshair (`GuiIngame.renderTooltip`:365-394,
+    /// `renderHotbarItem`:1037-1063, `renderSelectedItem`:452-492, the crosshair
+    /// block `:175-180`).
+    ///
+    /// The list runs in the source's own overlay order — the hotbar fourth, the
+    /// crosshair fifth, the popup eleventh (`GuiIngame.java`:136-362; the values
+    /// file's order table). The whole list obeys the call site's gate, not the
+    /// overlay's: F1 with no screen open draws nothing, a screen keeps every
+    /// entry (`EntityRenderer.java`:1166-1169). The hotbar itself is not gated by
+    /// `shouldDrawHUD` — it draws in creative too — while the popup sits fourteen
+    /// lower outside survival and adventure (`GuiIngame.java`:468-471). A slot
+    /// with no stack draws nothing: no item, no pop, no overlay (`:1039-1041`).
+    /// The overlay draws outside the pop matrix, unscaled (`:1054-1061`).
+    pub fn hotbar_draws(&self, now: Instant, input: &HotbarInput<'_>) -> Vec<HudDraw> {
+        if !hud_visible(input.hide_gui, input.screen_open) {
+            return Vec::new();
+        }
+        // The source's own integer halves (`sr.getScaledWidth() / 2`).
+        let half_w = (input.scaled.width / 2) as f32;
+        let half_h = (input.scaled.height / 2) as f32;
+        let height = input.scaled.height as f32;
+        let mut draws = Vec::new();
+        // The 182x22 background slice `(0, 0, 182, 22)` at `(scaledW/2 − 91,
+        // scaledH − 22)` (`GuiIngame.java`:375).
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(HOTBAR_WIDGETS),
+            x: half_w - 91.0,
+            y: height - 22.0,
+            width: 182.0,
+            height: 22.0,
+            uv: [0.0, 0.0, 182.0 / 256.0, 22.0 / 256.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+        // The 24x22 highlight slice `(0, 22, 24, 22)` at `(scaledW/2 − 92 +
+        // selected·20, scaledH − 23)` (`:376`).
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(HOTBAR_WIDGETS),
+            x: half_w - 92.0 + self.held.selected as f32 * 20.0,
+            y: height - 23.0,
+            width: 24.0,
+            height: 22.0,
+            uv: [0.0, 22.0 / 256.0, 24.0 / 256.0, 44.0 / 256.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+        let partial = self.partial(now);
+        for (slot, stack) in self.held.hotbar.iter().take(9).enumerate() {
+            let Some(stack) = stack else {
+                continue;
+            };
+            // The cell's top-left (`scaledW/2 − 88 + 20j, scaledH − 19`, `:383-387`).
+            let x = half_w - 88.0 + slot as f32 * 20.0;
+            let y = height - 19.0;
+            // The pop's `f = animationsToGo − partialTicks`, floored at zero
+            // (`:1043`); the draw scales only while positive (`:1047-1051`).
+            let pop = (f32::from(self.held.pop[slot]) - partial).max(0.0);
+            draws.push(HudDraw::Item {
+                stack: Some(item_icon(stack)),
+                x,
+                y,
+                pop,
+            });
+            // The count (`RenderItem.java`:459-473): hidden at exactly one, red
+            // below one, unblended with shadow at `(x + 17 − width, y + 9)`.
+            if let Some(text) = count_text(stack) {
+                if let Some(font) = input.font {
+                    let width = string_width(font, &text) as f32;
+                    draws.push(HudDraw::Text {
+                        text,
+                        x: x + 17.0 - width,
+                        y: y + 9.0,
+                        scale: 1.0,
+                        colour: [1.0, 1.0, 1.0, 1.0],
+                        shadow: true,
+                        blend: false,
+                    });
+                }
+            }
+            // The durability bar (`RenderItem.java`:476-494): the black bed, the
+            // underlay and the ramp fill at `(x + 2, y + 13)`, plain colour quads.
+            if stack_damaged(stack) {
+                if let Some(entry) = items::item_entry(stack.id) {
+                    let (fill, ramp) = durability_terms(stack.damage, entry.max_damage);
+                    draws.push(HudDraw::Rect {
+                        x: x + 2.0,
+                        y: y + 13.0,
+                        width: 13.0,
+                        height: 2.0,
+                        colour: [0.0, 0.0, 0.0, 1.0],
+                    });
+                    draws.push(HudDraw::Rect {
+                        x: x + 2.0,
+                        y: y + 13.0,
+                        width: 12.0,
+                        height: 1.0,
+                        colour: [((255 - ramp) / 4) as f32 / 255.0, 64.0 / 255.0, 0.0, 1.0],
+                    });
+                    draws.push(HudDraw::Rect {
+                        x: x + 2.0,
+                        y: y + 13.0,
+                        width: fill as f32,
+                        height: 1.0,
+                        colour: [(255 - ramp) as f32 / 255.0, ramp as f32 / 255.0, 0.0, 1.0],
+                    });
+                }
+            }
+        }
+        // The crosshair (`GuiIngame.java`:175-180): one 16x16 `gui/icons` quad at
+        // `(scaledW/2 − 7, scaledH/2 − 7)`, exactly while `showCrosshair` says so —
+        // the overlay's fifth entry, ahead of the popup's eleventh.
+        if input.show_crosshair {
+            draws.push(HudDraw::InvertRect {
+                x: half_w - 7.0,
+                y: half_h - 7.0,
+                w: 16.0,
+                h: 16.0,
+            });
+        }
+        // The popup (`GuiIngame.java`:452-492): the named stack centred at
+        // `scaledH − 59` — fourteen lower outside survival — while its clock runs,
+        // blended, at the clock's own alpha.
+        if self.held.popup_ticks > 0 {
+            if let (Some(font), Some(stack)) = (input.font, self.held.popup_stack.as_ref()) {
+                if let Some(name) = popup_text(stack) {
+                    let width = string_width(font, &name) as f32;
+                    let alpha = f32::from(popup_alpha(self.held.popup_ticks)) / 255.0;
+                    draws.push(HudDraw::Text {
+                        text: name,
+                        x: (input.scaled.width as f32 - width) / 2.0,
+                        y: height - (POPUP_ABOVE as f32)
+                            + if input.survival {
+                                0.0
+                            } else {
+                                POPUP_CREATIVE_SHIFT as f32
+                            },
+                        scale: 1.0,
+                        colour: [1.0, 1.0, 1.0, alpha],
+                        shadow: true,
+                        blend: true,
+                    });
+                }
+            }
         }
         draws
     }
@@ -5767,7 +6145,7 @@ mod tests {
                 HudDraw::Rect { .. } | HudDraw::TexturedRect { .. } | HudDraw::SkinRect { .. } => {
                     None
                 }
-                HudDraw::Item { .. } => None,
+                HudDraw::Item { .. } | HudDraw::InvertRect { .. } => None,
             })
             .collect()
     }
@@ -6518,6 +6896,12 @@ mod tests {
     /// A window 0 snapshot whose hotbar carries the given stacks: the band at 36–44 of
     /// the forty-five-slot layout.
     fn held_snapshot(stacks: [Option<MetadataItem>; 9]) -> ClientEvent {
+        held_snapshot_pop(stacks, [0; 9])
+    }
+
+    /// The Task 14 hotbar assembly's own snapshot: the nine stacks plus the
+    /// session's per-slot pop counters (`animationsToGo`, `GuiIngame.java`:1043).
+    fn held_snapshot_pop(stacks: [Option<MetadataItem>; 9], pop: [u8; 9]) -> ClientEvent {
         let mut slots = vec![None; 36];
         slots.extend(stacks);
         ClientEvent::WindowSnapshot {
@@ -6525,8 +6909,522 @@ mod tests {
             slots,
             cursor: None,
             properties: Vec::new(),
-            hotbar_pop: [0; 9],
+            hotbar_pop: pop,
         }
+    }
+
+    /// The Task 14 assembly's inputs at the chat suite's resolution, the font
+    /// optional so the no-font row reads.
+    fn hotbar_input(font: Option<&Font>) -> HotbarInput<'_> {
+        HotbarInput {
+            font,
+            scaled: chat_resolution(),
+            show_crosshair: true,
+            hide_gui: false,
+            screen_open: false,
+            survival: true,
+        }
+    }
+
+    /// The hotbar draws at `elapsed` past the observed arrival, against the
+    /// Task 14 inputs.
+    fn hotbar_at(
+        view: &View,
+        arrival: Instant,
+        elapsed: Duration,
+        font: Option<&Font>,
+    ) -> Vec<HudDraw> {
+        view.hotbar_draws(arrival + elapsed, &hotbar_input(font))
+    }
+
+    /// One hotbar stack: the id, the count and the damage the overlay reads.
+    fn hotbar_stack(id: i16, count: u8, damage: i16) -> Option<MetadataItem> {
+        Some(MetadataItem {
+            id,
+            count,
+            damage,
+            nbt: None,
+        })
+    }
+
+    /// The popup's swap rule (`GuiIngame.updateTick`:1089-1109): a changed stack
+    /// resets to 40, an identical one counts down, and an empty hand clears.
+    #[test]
+    fn the_popup_resets_to_forty_on_a_stack_swap() {
+        let sword = MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        };
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = Some(sword.clone());
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        assert_eq!(view.held.popup_ticks, 0, "nothing selected yet");
+        view.apply(&held_tick(1));
+        assert_eq!(view.held.popup_ticks, 40, "the swap resets the clock");
+        view.apply(&held_tick(2));
+        assert_eq!(
+            view.held.popup_ticks, 39,
+            "the identical stack counts down, not resets"
+        );
+        // A different id swaps again.
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = Some(MetadataItem {
+            id: 3,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(3));
+        assert_eq!(view.held.popup_ticks, 40, "a new id resets the clock");
+        // An empty hand clears it outright (`itemstack == null` → 0).
+        let empty: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        view.apply(&held_snapshot(empty));
+        view.apply(&held_tick(4));
+        assert_eq!(view.held.popup_ticks, 0, "no stack, no popup");
+        assert_eq!(view.held.popup_stack, None);
+    }
+
+    /// The damageable short-circuit (`GuiIngame.java`:1097): a damageable
+    /// stack's damage is not compared, so a damaged sword counts down; a
+    /// non-damageable stack's metadata is, so a recoloured wool resets.
+    #[test]
+    fn the_popup_ignores_damage_on_damageable_stacks_only() {
+        let mut view = View::new();
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(276, 1, 0);
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(1));
+        assert_eq!(view.held.popup_ticks, 40);
+        // The same sword, damaged: no reset.
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(276, 1, 5);
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(2));
+        assert_eq!(
+            view.held.popup_ticks, 39,
+            "a damageable stack's damage change does not reset"
+        );
+        // Wool is not damageable: the same id at another metadata resets.
+        let mut view = View::new();
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(35, 1, 0);
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(1));
+        assert_eq!(view.held.popup_ticks, 40);
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(35, 1, 1);
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(2));
+        assert_eq!(
+            view.held.popup_ticks, 40,
+            "a non-damageable stack's metadata change resets"
+        );
+        // The same wool, untouched, counts down.
+        view.apply(&held_tick(3));
+        assert_eq!(view.held.popup_ticks, 39);
+    }
+
+    /// The tag arm of the swap comparison (`ItemStack.areItemStackTagsEqual`,
+    /// `ItemStack.java`:426-429): a tag change resets even when the id and the
+    /// damage match, and an `Unbreakable` tag makes a sword non-damageable so
+    /// its damage compares again.
+    #[test]
+    fn the_popup_compares_the_nbt_tags() {
+        let bare = [0x0Au8, 0x00, 0x00, 0x00];
+        let named = [
+            0x0Au8, 0x00, 0x00, // the root, no name
+            0x0A, 0x00, 0x07, b'd', b'i', b's', b'p', b'l', b'a', b'y', // `display`
+            0x08, 0x00, 0x04, b'N', b'a', b'm', b'e', 0x00, 0x05, b'S', b'w', b'o', b'r',
+            b'd', // `Name` = "Sword"
+            0x00, // the display compound ends
+            0x00, // the root ends
+        ];
+        let mut view = View::new();
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = Some(MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: Some(bare.to_vec()),
+        });
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(1));
+        assert_eq!(view.held.popup_ticks, 40);
+        // The same sword with a name tag: the tags differ, so it resets.
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = Some(MetadataItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+            nbt: Some(named.to_vec()),
+        });
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(2));
+        assert_eq!(
+            view.held.popup_ticks, 40,
+            "a tag change resets like any other swap"
+        );
+        // The named stack draws under its NBT name, italicised
+        // (`hasDisplayName` → `ITALIC + s`, `GuiIngame.java`:460-463).
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        let popup = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the popup draws");
+        assert_eq!(popup, "§oSword", "the NBT name, italicised");
+    }
+
+    /// The 40-tick countdown: the reset lands on 40 and same-stack ticks walk
+    /// it to zero, where it stays (`updateTick`:1095-1099).
+    #[test]
+    fn the_popup_counts_down_forty_ticks() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(276, 1, 0);
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(1));
+        for tick in 2..=41 {
+            view.apply(&held_tick(tick));
+        }
+        assert_eq!(view.held.popup_ticks, 0, "forty ticks run the clock out");
+        view.apply(&held_tick(42));
+        assert_eq!(view.held.popup_ticks, 0, "zero holds while the stack stays");
+    }
+
+    /// The popup's alpha curve (`GuiIngame.java`:473-485): `k = ticks × 256 /
+    /// 10`, clamped to 255 — 40 and 10 both saturate, 9, 2 and 1 do not.
+    #[test]
+    fn the_popup_alpha_follows_the_sources_curve() {
+        assert_eq!(popup_alpha(40), 255, "1024 clamps to 255");
+        assert_eq!(popup_alpha(10), 255, "256 clamps to 255");
+        assert_eq!(popup_alpha(9), 230);
+        assert_eq!(popup_alpha(2), 51);
+        assert_eq!(popup_alpha(1), 25);
+        assert_eq!(popup_alpha(0), 0);
+    }
+
+    /// The pop's fraction (`GuiIngame.renderHotbarItem`:1043-1051): `f =
+    /// animationsToGo − partial`, and while positive `f1 = 1 + f/5` scales
+    /// `(1/f1, (f1+1)/2)`; at zero or below the item draws unscaled.
+    #[test]
+    fn the_pop_fraction_follows_the_sources_curve() {
+        let (sx, sy) = pop_factors(5.0).expect("a live pop scales");
+        assert!((sx - 0.5).abs() < 1e-6, "1/2 at five ticks: {sx}");
+        assert!((sy - 1.5).abs() < 1e-6, "(2+1)/2 at five ticks: {sy}");
+        let (sx, sy) = pop_factors(2.5).expect("a mid pop scales");
+        assert!((sx - 2.0 / 3.0).abs() < 1e-6, "1/1.5: {sx}");
+        assert!((sy - 1.25).abs() < 1e-6, "2.5/2: {sy}");
+        assert_eq!(pop_factors(0.0), None, "spent pops draw unscaled");
+        assert_eq!(pop_factors(-0.25), None, "overrun partials draw unscaled");
+    }
+
+    /// The pop the slot item carries: the snapshot's counter minus the frame's
+    /// fraction, floored at zero — the draw at a zero fraction carries the
+    /// whole counter, mid-frame it carries the remainder.
+    #[test]
+    fn the_slot_item_carries_the_pop_minus_the_partial() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(3, 1, 0);
+        let mut view = View::new();
+        view.apply(&held_snapshot_pop(slots, [5, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        let item = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Item { x, y, pop, .. } => Some((*x, *y, *pop)),
+                _ => None,
+            })
+            .expect("slot 0 draws its item");
+        assert_eq!(item, (125.0, 221.0, 5.0), "the cell and the whole counter");
+        let draws = hotbar_at(&view, t0, Duration::from_millis(25), Some(&font));
+        let pop = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Item { pop, .. } => Some(*pop),
+                _ => None,
+            })
+            .expect("slot 0 draws its item");
+        assert!(
+            (pop - 4.5).abs() < 1e-6,
+            "the counter minus the half-tick fraction: {pop}"
+        );
+    }
+
+    /// The HUD-visibility rule is the call site's gate
+    /// (`EntityRenderer.java`:1166-1169): the overlay draws unless F1 hides it
+    /// with no screen open — a screen never suppresses an entry.
+    #[test]
+    fn the_hud_visibility_rule_is_the_call_sites_gate() {
+        assert!(hud_visible(false, false), "plain play draws");
+        assert!(
+            hud_visible(false, true),
+            "a screen draws over the HUD, not instead of it"
+        );
+        assert!(hud_visible(true, true), "F1 with a screen open still draws");
+        assert!(!hud_visible(true, false), "F1 alone hides the overlay");
+        // The assembly obeys it: nothing draws under F1 alone, everything does
+        // with a screen open.
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(3, 1, 0);
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let hidden = HotbarInput {
+            hide_gui: true,
+            ..hotbar_input(Some(&font))
+        };
+        assert!(
+            view.hotbar_draws(t0, &hidden).is_empty(),
+            "F1 alone draws no hotbar entry"
+        );
+        let screened = HotbarInput {
+            hide_gui: true,
+            screen_open: true,
+            ..hotbar_input(Some(&font))
+        };
+        assert!(
+            !view.hotbar_draws(t0, &screened).is_empty(),
+            "a screen keeps every entry"
+        );
+    }
+
+    /// The hotbar's geometry at the chat suite's 427x240 resolution
+    /// (`GuiIngame.renderTooltip`:372-387): the 182x22 background slice
+    /// `(0, 0, 182, 22)` at `(213 − 91, 240 − 22)`, and with slot 4 selected
+    /// the 24x22 highlight `(0, 22, 24, 22)` at `(213 − 92 + 4 × 20, 240 − 23)`.
+    #[test]
+    fn the_hotbar_geometry_pins_the_sources_slices() {
+        let mut view = View::new();
+        view.apply(&held_snapshot(std::array::from_fn(|_| None)));
+        view.apply(&ClientEvent::HeldItemSlot { slot: 4 });
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        assert_eq!(
+            draws[0],
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/widgets"),
+                x: 122.0,
+                y: 218.0,
+                width: 182.0,
+                height: 22.0,
+                uv: [0.0, 0.0, 182.0 / 256.0, 22.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            "the background slice"
+        );
+        assert_eq!(
+            draws[1],
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/widgets"),
+                x: 201.0,
+                y: 217.0,
+                width: 24.0,
+                height: 22.0,
+                uv: [0.0, 22.0 / 256.0, 24.0 / 256.0, 44.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            "the highlight shifted to slot 4"
+        );
+    }
+
+    /// The slot overlay (`RenderItem.renderItemOverlayIntoGUI`:455-497): a
+    /// 16-stack counts (`stackSize != 1`, right-aligned at `x + 17 − width`,
+    /// `y + 9`, unblended with shadow), and a damaged sword bars
+    /// (`isItemDamaged`, `j = round(13 − 780 × 13/1561) = 7`, `i =
+    /// round(255 − 780 × 255/1561) = 128`): black 13x2, `(31, 64, 0)` 12x1 and
+    /// `(127, 128, 0)` 7x1 at `(x + 2, y + 13)` — while a lone sword counts
+    /// nothing.
+    #[test]
+    fn the_slot_overlay_pins_the_count_and_the_ramp() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(3, 16, 0);
+        slots[1] = hotbar_stack(276, 1, 780);
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        // Slot 0's cell: the item at (125, 221), the count right-aligned at
+        // (125 + 17 − width("16"), 221 + 9), unblended and shadowed.
+        let width = string_width(&font, "16") as f32;
+        let count = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text { text, x, y, .. } if text == "16" => Some((*x, *y)),
+                _ => None,
+            })
+            .expect("the 16-stack counts");
+        assert_eq!(count, (125.0 + 17.0 - width, 230.0));
+        let count_draw = draws
+            .iter()
+            .find(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "16"))
+            .expect("the 16-stack counts");
+        match count_draw {
+            HudDraw::Text {
+                colour,
+                shadow,
+                blend,
+                ..
+            } => {
+                assert_eq!(*colour, [1.0, 1.0, 1.0, 1.0], "opaque white");
+                assert!(*shadow, "the count draws with shadow");
+                assert!(!*blend, "the count draws unblended");
+            }
+            other => panic!("a text draw: {other:?}"),
+        }
+        // Slot 1's cell at x = 145: the three durability rects at (147, 234).
+        let rects: Vec<(f32, f32, f32, f32, [f32; 4])> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    colour,
+                } if *x >= 147.0 && *x < 160.0 => Some((*x, *y, *width, *height, *colour)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rects,
+            vec![
+                (147.0, 234.0, 13.0, 2.0, [0.0, 0.0, 0.0, 1.0]),
+                (
+                    147.0,
+                    234.0,
+                    12.0,
+                    1.0,
+                    [31.0 / 255.0, 64.0 / 255.0, 0.0, 1.0]
+                ),
+                (
+                    147.0,
+                    234.0,
+                    7.0,
+                    1.0,
+                    [127.0 / 255.0, 128.0 / 255.0, 0.0, 1.0]
+                ),
+            ],
+            "the black bed, the underlay and the ramp fill"
+        );
+        // The lone sword counts nothing: no other count text draws.
+        let counts = draws
+            .iter()
+            .filter(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "1"))
+            .count();
+        assert_eq!(counts, 0, "a lone stack draws no count");
+    }
+
+    /// The popup's draw (`GuiIngame.renderSelectedItem`:452-492): the
+    /// selected sword's name centred at `y = scaledH − 59` (one tick after the
+    /// swap, alpha 255), fading to 230 after thirty-one ticks, and sitting
+    /// fourteen lower outside survival (`:468-471`).
+    #[test]
+    fn the_popup_text_pins_position_and_alpha() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(276, 1, 0);
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(1));
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        let width = string_width(&font, "Diamond Sword") as f32;
+        let popup = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text {
+                    text, x, y, colour, ..
+                } if text == "Diamond Sword" => Some((*x, *y, *colour)),
+                _ => None,
+            })
+            .expect("the popup names the held sword");
+        assert_eq!(
+            popup,
+            ((427.0 - width) / 2.0, 181.0, [1.0, 1.0, 1.0, 1.0]),
+            "centred, above the hotbar, fully opaque at forty ticks"
+        );
+        // Thirty-one ticks on: nine remain, alpha 230.
+        for tick in 2..=32 {
+            view.apply(&held_tick(tick));
+        }
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        let alpha = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text { text, colour, .. } if text == "Diamond Sword" => Some(colour[3]),
+                _ => None,
+            })
+            .expect("the popup still draws at nine ticks");
+        assert!(
+            (alpha - 230.0 / 255.0).abs() < 1e-6,
+            "the faded alpha: {alpha}"
+        );
+        // Outside survival the line sits fourteen lower.
+        let creative = HotbarInput {
+            survival: false,
+            ..hotbar_input(Some(&font))
+        };
+        let draws = view.hotbar_draws(t0, &creative);
+        let y = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text { text, y, .. } if text == "Diamond Sword" => Some(*y),
+                _ => None,
+            })
+            .expect("the popup draws outside survival");
+        assert_eq!(y, 195.0, "scaledH − 59 + 14");
+    }
+
+    /// The crosshair (`GuiIngame.java`:175-180): one 16x16 `gui/icons` quad at
+    /// `(213 − 7, 120 − 7)`, drawn exactly while `showCrosshair` says so.
+    #[test]
+    fn the_crosshair_pins_the_sources_quad() {
+        let mut view = View::new();
+        view.apply(&held_snapshot(std::array::from_fn(|_| None)));
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let draws = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        assert!(
+            draws.contains(&HudDraw::InvertRect {
+                x: 206.0,
+                y: 113.0,
+                w: 16.0,
+                h: 16.0,
+            }),
+            "the inverting quad at the centre: {draws:?}"
+        );
+        let hidden = HotbarInput {
+            show_crosshair: false,
+            ..hotbar_input(Some(&font))
+        };
+        assert!(
+            !view
+                .hotbar_draws(t0, &hidden)
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::InvertRect { .. })),
+            "no crosshair while the gate says hide"
+        );
     }
 
     /// The held item's swap rule: the ease runs down while the selection differs and
