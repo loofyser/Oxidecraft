@@ -899,16 +899,16 @@ chore: sweep the carried citations and extend the extractor
 **Goal:** The three copies of the PNG test helpers become one, and the 16-bit/tRNS strip path gets its fixture.
 
 **Files:**
-- Modify: `crates/oxide-assets/src/atlas.rs`, `crates/oxide-assets/src/texture.rs`, `crates/oxide-assets/src/resources.rs` — the helper consolidation (the three test-module copies the M4 close recorded).
-- Create/Modify: the shared test-support module for `oxide-assets` (per the crate's own test-support pattern — derive where the sibling crates keep theirs and follow it).
-- Test: the new synthetic fixture: a 16-bit PNG with a `tRNS` chunk (built programmatically — no binary committed) exercising the loader's strip path.
+- Modify: `crates/oxide-assets/tests/atlas.rs`, `crates/oxide-assets/tests/resources.rs`, `crates/oxide-assets/tests/texture.rs` — the helper consolidation (the three integration-suite copies the M4 close recorded — 19/19/24 lines; the `src/` files hold no writers).
+- Create/Modify: the shared test-support module for `oxide-assets` — the workspace's FIRST such module (no precedent exists; verified) — lead: `tests/common.rs` + `mod common;` per suite (the standard Cargo integration-test pattern).
+- Test: the new synthetic fixture: a 16-bit PNG with a `tRNS` chunk (built programmatically — no binary committed) exercising the loader's strip path (lead: a 16-bit GREYSCALE + tRNS PNG exercises both sub-paths — transparency expansion and high-byte strip — in one fixture).
 
 **Interfaces:**
-- Produces: one helper set (encode/decode round-trips used by the three modules); the fixture test asserting the stripped path's bytes (the loader's own contract: the pixel kept per the M4 record; pin the expected bytes).
+- Produces: one ENCODE-side helper set (the PNG writers; decode is the code under test) used by the three suites; the fixture test asserting the stripped path's bytes (the loader's own contract: 16-bit samples strip to their high byte, decoder-side — `src/texture.rs`:53-58 + `png`'s `STRIP_16` semantics; NO M4 record states it — pin the expected bytes from those).
 - Consumes: nothing.
 
 - [ ] **Step 1: Consolidate (green-to-green refactor).** All three modules' tests pass before and after; the diff removes the copies. Run: `cargo test -p oxide-assets` — green both sides.
-- [ ] **Step 2: The fixture (RED).** A synthetic 16-bit + tRNS PNG hits the strip path; the expected pixel bytes pin the contract; red first if the path mishandles it (record whatever it does — the M4 record says the second half was never verified; this task either confirms or files it).
+- [ ] **Step 2: The fixture (RED).** A synthetic 16-bit + tRNS PNG hits the strip path; the expected pixel bytes pin the contract; red first if the path mishandles it (record whatever it does — the records say the WHOLE 16-bit/greyscale-tRNS strip is fixtureless; this task either confirms or files it).
 - [ ] **Step 3: Settle the finding and gate.** If the path is wrong, the fix is scoped inside this task (loader fix + the test); the gate runs either way.
 - [ ] **Step 4: Commit.** Commit:
 
