@@ -50,7 +50,9 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///   (`GuiMerchant.java`:29), `horse`
 ///   (`GuiScreenHorseInventory.java`:12) and `inventory`
 ///   (`GuiInventory.java`:85-89 binds `inventoryBackground`), all under
-///   `gui/container/`.
+///   `gui/container/`, plus the creative strip `creative_inventory/tabs`
+///   (`GuiContainerCreative.java`:38) and the twelve per-tab panels
+///   `creative_inventory/tab_<name>` (`:692-693`).
 /// - `gui/book` — the written book's frame (`GuiScreenBook.java`:33).
 /// - `entity/enchanting_table_book` — the enchanting table's book render
 ///   (`GuiEnchantment.java`:33, `TileEntityEnchantmentTableRenderer.java`:13).
@@ -63,7 +65,7 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///
 /// The hud's icon sheet, `gui/icons`, already travels under its own
 /// client-side name and is not repeated here.
-pub const GUI_SHEETS: [&str; 19] = [
+pub const GUI_SHEETS: [&str; 32] = [
     "gui/widgets",
     "gui/container/generic_54",
     "gui/container/dispenser",
@@ -77,6 +79,19 @@ pub const GUI_SHEETS: [&str; 19] = [
     "gui/container/villager",
     "gui/container/horse",
     "gui/container/inventory",
+    "gui/container/creative_inventory/tabs",
+    "gui/container/creative_inventory/tab_buildingBlocks",
+    "gui/container/creative_inventory/tab_decorations",
+    "gui/container/creative_inventory/tab_redstone",
+    "gui/container/creative_inventory/tab_transportation",
+    "gui/container/creative_inventory/tab_misc",
+    "gui/container/creative_inventory/tab_search",
+    "gui/container/creative_inventory/tab_food",
+    "gui/container/creative_inventory/tab_tools",
+    "gui/container/creative_inventory/tab_combat",
+    "gui/container/creative_inventory/tab_brewing",
+    "gui/container/creative_inventory/tab_materials",
+    "gui/container/creative_inventory/tab_inventory",
     "gui/book",
     "entity/enchanting_table_book",
     "font/ascii_sga",
@@ -362,6 +377,19 @@ mod tests {
                 "gui/container/villager",
                 "gui/container/horse",
                 "gui/container/inventory",
+                "gui/container/creative_inventory/tabs",
+                "gui/container/creative_inventory/tab_buildingBlocks",
+                "gui/container/creative_inventory/tab_decorations",
+                "gui/container/creative_inventory/tab_redstone",
+                "gui/container/creative_inventory/tab_transportation",
+                "gui/container/creative_inventory/tab_misc",
+                "gui/container/creative_inventory/tab_search",
+                "gui/container/creative_inventory/tab_food",
+                "gui/container/creative_inventory/tab_tools",
+                "gui/container/creative_inventory/tab_combat",
+                "gui/container/creative_inventory/tab_brewing",
+                "gui/container/creative_inventory/tab_materials",
+                "gui/container/creative_inventory/tab_inventory",
                 "gui/book",
                 "entity/enchanting_table_book",
                 "font/ascii_sga",

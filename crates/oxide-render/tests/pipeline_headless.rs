@@ -10437,3 +10437,143 @@ fn t20_inventory_draws_sheet_item_preview_and_effects() {
     expect_rows(&pixels, 100, 86, [127, 127, 127], "the 1:00 ink");
     expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
 }
+
+/// Task 21's frame runner: one screen pass over the sky clear with the panel
+/// and strip sheets, the lettered font and the given draws, through the item
+/// icon seam. The runner owns both sheet names — the panel and the strip —
+/// so the case reads the strip, the panel, an item, the thumb, the search
+/// ink and the delete cell; the mutation probe shifts the runner's panel
+/// rect.
+fn t21_creative_pixels(
+    panel_name: &'static str,
+    panel: &Texture,
+    strip_name: &'static str,
+    strip: &Texture,
+    draws: &[HudDraw],
+) -> Vec<u8> {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    screen.set_texture(&device, &queue, panel_name, panel);
+    screen.set_texture(&device, &queue, strip_name, strip);
+    screen
+        .set_font(&device, &queue, &t20_font_sheet())
+        .expect("the lettered sheet is a 16x16 grid");
+    screen.set_atlas_icon(&device, &queue, &item_atlas());
+    screen.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    screen.set_draws(
+        &device,
+        &queue,
+        draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let depth = rows_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t21 creative headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+    read_rows_pixels(&device, &queue, &target)
+}
+
+/// The creative frame on the search tab: the eleven unselected strip tabs,
+/// the 195x136 panel, the selected tab last, the twelve tab icons, the 45
+/// page cells with the hotbar row, the enabled thumb, the search text and
+/// the delete cell's panel pixel.
+///
+/// The geometry mirrors `view.rs`'s creative draws at the centred origin
+/// (126, 52) with the search tab selected, which the render crate cannot
+/// import. The pins: an unselected tab's red, the selected tab's yellow past
+/// its icon, the panel's green/blue, a grid item's black cell, the thumb's
+/// white, the search ink, the delete cell's magenta and the sky past the
+/// frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t21_creative_draws_strip_grid_thumb_search_and_bin() {
+    const PANEL: &str = "t21/tab_search";
+    const STRIP: &str = "t21/tabs";
+    const GX: f32 = 126.0;
+    const GY: f32 = 52.0;
+    const SEARCH: i32 = 5;
+    let panel = t18_family_sheet(&[(173, 112, 16, 16, [255, 0, 255, 255])]);
+    let strip = t18_family_sheet(&[
+        (0, 0, 168, 32, [255, 0, 0, 255]),
+        (0, 32, 168, 32, [255, 255, 0, 255]),
+        (232, 0, 12, 15, [255, 255, 255, 255]),
+    ]);
+    let mut draws = Vec::new();
+    // The strip: every unselected tab first — the top row at y -32, the
+    // bottom at +136, the sheet column 28 wide with the odd row at v 32 —
+    // mirroring `tab_sprite`/`tab_uv`.
+    for index in 0..12 {
+        if index == SEARCH {
+            continue;
+        }
+        let col = (index % 6) * 28;
+        let (dy, v) = if index < 6 {
+            (-32, (index % 2) * 32)
+        } else {
+            (136, (index % 2) * 32)
+        };
+        draws.push(t18_blit(STRIP, GX, GY, [col, dy, 28, 32, col, v]));
+    }
+    // The panel second, the selected tab last.
+    draws.push(t18_blit(PANEL, GX, GY, [0, 0, 195, 136, 0, 0]));
+    draws.push(t18_blit(STRIP, GX, GY, [140, -32, 28, 32, 140, 32]));
+    // The twelve tab icons over the strip, then the page cells with the
+    // hotbar row — checker items throughout.
+    for index in 0..12 {
+        let iy = if index < 6 { -23 } else { 145 };
+        draws.push(t18_slot_item(
+            GX + ((index % 6) * 28 + 5) as f32,
+            GY + iy as f32,
+        ));
+    }
+    for cell in 0..45 {
+        draws.push(t18_slot_item(
+            GX + (9 + (cell % 9) * 18) as f32,
+            GY + (18 + (cell / 9) * 18) as f32,
+        ));
+    }
+    for hotbar in 0..9 {
+        draws.push(t18_slot_item(GX + (9 + hotbar * 18) as f32, GY + 112.0));
+    }
+    // The enabled thumb and the search text.
+    draws.push(t18_blit(STRIP, GX, GY, [175, 18, 12, 15, 232, 0]));
+    draws.push(HudDraw::Text {
+        text: "Speed".to_string(),
+        x: GX + 82.0,
+        y: GY + 6.0,
+        scale: 1.0,
+        colour: [1.0, 1.0, 1.0, 1.0],
+        shadow: false,
+        blend: false,
+    });
+    let pixels = t21_creative_pixels(PANEL, &panel, STRIP, &strip, &draws);
+    expect_rows(&pixels, 150, 36, [255, 0, 0], "unselected tab 0's red");
+    expect_rows(&pixels, 290, 36, [255, 255, 0], "the selected tab's yellow");
+    expect_rows(&pixels, 150, 150, [0, 255, 0], "the panel's green");
+    expect_rows(&pixels, 300, 150, [0, 0, 255], "the panel's blue");
+    expect_rows(&pixels, 135, 70, [0, 0, 0], "grid cell 0's item");
+    expect_rows(&pixels, 307, 77, [255, 255, 255], "the thumb's white");
+    expect_rows(&pixels, 208, 58, [255, 255, 255], "the search ink");
+    expect_rows(
+        &pixels,
+        307,
+        172,
+        [255, 0, 255],
+        "the delete cell's magenta",
+    );
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}

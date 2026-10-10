@@ -8,9 +8,9 @@
 //!
 //! [`Screens`] holds the current screen. Five variants are declared here;
 //! Task 16 wires only the [`ScreenState::Container`] kind's `WindowOpened`
-//! path — the opens for Inventory, Sign, Book and Creative land in Tasks
-//! 20-23, and an open for a declared-but-unimplemented variant draws the
-//! generic frame (recorded).
+//! path — the inventory open landed in Task 20, the creative open in Task
+//! 21; the opens for Sign and Book land in Tasks 22-23, and an open for a
+//! declared-but-unimplemented variant draws the generic frame (recorded).
 //!
 //! The close rule: every close sends
 //! [`InputEvent::CloseWindow`](oxide_game::input::InputEvent::CloseWindow)
@@ -34,8 +34,10 @@ use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
 use container::{ContainerLayout, ContainerScreen};
+use creative::CreativeScreen;
 
 pub mod container;
+pub mod creative;
 pub mod family_a;
 pub mod family_b;
 pub mod inventory;
@@ -63,26 +65,32 @@ pub enum ScreenState {
         /// The book stack being read.
         stack: MetadataItem,
     },
-    /// The creative screen (Task 21 owns it).
-    Creative,
+    /// The creative screen: the tab strip, the paged grid and the search
+    /// field over the player's own inventory window (boxed like the
+    /// container kinds).
+    Creative(Box<CreativeScreen>),
 }
 
 impl ScreenState {
     /// The window the screen stands on: the container's id, window 0 for
-    /// the inventory, none for the windowless screens.
+    /// the inventory and the creative screen alike — the creative screen
+    /// stands on the player's own inventory window (`GuiContainerCreative`
+    /// closes through the same `closeScreen`, so its close carries C0D id
+    /// 0) — none for the windowless screens.
     pub fn window_id(&self) -> Option<u8> {
         match self {
             ScreenState::Container(screen) | ScreenState::Inventory(screen) => {
                 Some(screen.window_id())
             }
-            ScreenState::Sign { .. } | ScreenState::Book { .. } | ScreenState::Creative => None,
+            ScreenState::Creative(_) => Some(0),
+            ScreenState::Sign { .. } | ScreenState::Book { .. } => None,
         }
     }
 
     /// The input ownership (`allowUserInput`, `GuiScreen`:68): the inventory
     /// and creative screens take user input; containers inherit false.
     pub fn allow_user_input(&self) -> bool {
-        matches!(self, ScreenState::Inventory(_) | ScreenState::Creative)
+        matches!(self, ScreenState::Inventory(_) | ScreenState::Creative(_))
     }
 }
 
@@ -97,6 +105,11 @@ pub struct Screens {
     current: Option<ScreenState>,
     /// The screen the chat covered, dropped when the chat closes.
     covered: Option<ScreenState>,
+    /// The creative screen's remembered tab: the session-scoped UI state
+    /// (`selectedTabIndex`, `GuiContainerCreative`:42, default 0).
+    /// `open_creative` stands the screen on it, `close` saves it back —
+    /// reopening keeps the last tab within the session.
+    creative_tab: u8,
 }
 
 impl Screens {
@@ -143,6 +156,16 @@ impl Screens {
         self.current
             .as_ref()
             .is_some_and(ScreenState::allow_user_input)
+    }
+
+    /// The open creative screen, when the current screen is one: the
+    /// frame's feed, the pointer and the creative keys drive this; the
+    /// container-only routing above never answers it.
+    pub fn creative_mut(&mut self) -> Option<&mut CreativeScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Creative(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
     }
 
     /// Folds one `WindowOpened` into the screens: Task 16 wires the
@@ -228,16 +251,41 @@ impl Screens {
         self.current = Some(ScreenState::Book { stack });
     }
 
-    /// Opens the creative screen. It lands in Task 21; the variant draws the
-    /// generic frame until then (recorded).
-    pub fn open_creative(&mut self) {
-        self.current = Some(ScreenState::Creative);
+    /// Opens the creative screen on the remembered tab: one
+    /// [`InputEvent::OpenInventory`] — the C16 client status 2 still sends
+    /// first (`Minecraft.java`:2100 sends before the display at :2101,
+    /// whatever the display becomes) — beside the fresh creative screen.
+    /// No guard exists: two opens send two C16s. The tab is the
+    /// session-scoped UI state (`selectedTabIndex`, `GuiContainerCreative`
+    /// :42, default building-blocks 0): reopening keeps the last tab, and
+    /// only a client-session reset returns it to 0.
+    pub fn open_creative(&mut self) -> Option<InputEvent> {
+        self.current = Some(ScreenState::Creative(Box::new(CreativeScreen::new(
+            self.creative_tab,
+        ))));
+        Some(InputEvent::OpenInventory)
+    }
+
+    /// Swaps the open survival inventory for the creative screen: the
+    /// port's `GuiInventory.updateScreen`:34-42, which re-displays as
+    /// `GuiContainerCreative` every tick while creative. Anything but the
+    /// inventory open stays put.
+    pub fn swap_to_creative(&mut self) {
+        if matches!(self.current, Some(ScreenState::Inventory(_))) {
+            self.current = Some(ScreenState::Creative(Box::new(CreativeScreen::new(
+                self.creative_tab,
+            ))));
+        }
     }
 
     /// Closes the open screen: one `CloseWindow` carrying the screen's own
     /// window id — window 0 included — and the view's cursor copy dropped
     /// with it. A screen on no window, and no screen at all, send nothing.
+    /// Closing the creative screen remembers its tab for the next open.
     pub fn close(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
+        if let Some(ScreenState::Creative(screen)) = self.current.as_ref() {
+            self.creative_tab = screen.selected_tab();
+        }
         let screen = self.current.take()?;
         *cursor = None;
         screen
@@ -283,7 +331,9 @@ impl Screens {
         // Window 0's snapshots feed the inventory screen; any other window's
         // the open container standing on it. The inventory answers no send —
         // the beacon reseed and the anvil re-fire below are the container
-        // kinds' alone.
+        // kinds' alone. The creative screen folds window 0 into its player
+        // copies through its own S2F guard (hotbar always, the rest on the
+        // inventory tab only) and likewise answers no send.
         let screen = match self.current.as_mut() {
             Some(ScreenState::Container(screen)) if screen.window_id() == window_id => {
                 screen.as_mut()
@@ -291,6 +341,10 @@ impl Screens {
             Some(ScreenState::Inventory(screen)) if window_id == 0 => {
                 let screen = screen.as_mut();
                 screen.apply_snapshot(slots, cursor, properties);
+                return None;
+            }
+            Some(ScreenState::Creative(screen)) if window_id == 0 => {
+                screen.apply_snapshot(slots);
                 return None;
             }
             _ => return None,
@@ -410,5 +464,95 @@ mod tests {
             Some(InputEvent::CloseWindow { window_id: 0 })
         );
         assert_eq!(cursor, None, "the close drops the cursor copy");
+    }
+
+    #[test]
+    fn the_creative_open_sends_one_c16_beside_the_screen() {
+        // The C16 still sends first in creative mode (`Minecraft.java`:2100
+        // sends before the display at :2101, whatever the display becomes).
+        let mut screens = Screens::default();
+        assert_eq!(screens.open_creative(), Some(InputEvent::OpenInventory));
+        assert!(matches!(screens.current(), Some(ScreenState::Creative(_))));
+        assert_eq!(screens.current_window_id(), Some(0));
+    }
+
+    #[test]
+    fn the_creative_open_remembers_its_tab_within_the_session() {
+        // The static `selectedTabIndex` (`GuiContainerCreative`:42, default
+        // 0): reopening keeps the last tab; only a session reset returns it.
+        let mut screens = Screens::default();
+        screens.open_creative();
+        screens
+            .creative_mut()
+            .expect("the creative stands")
+            .set_tab(5);
+        let mut cursor = None;
+        screens.close(&mut cursor);
+        screens.open_creative();
+        assert_eq!(
+            screens
+                .creative_mut()
+                .expect("the creative stands")
+                .selected_tab(),
+            5
+        );
+    }
+
+    #[test]
+    fn window_zero_snapshots_feed_the_creative_hotbar_only_off_the_inventory_tab() {
+        // The S2F guard (`handleSetSlot`:1135-1165): slots 36–44 always
+        // land; the rest are suppressed off the inventory tab.
+        let mut screens = Screens::default();
+        screens.open_creative();
+        let mut slots = vec![None; 46];
+        slots[9] = stack(264);
+        slots[36] = stack(265);
+        assert_eq!(
+            screens.apply_snapshot(0, slots, None, Vec::new()),
+            None,
+            "a window-0 snapshot answers no send"
+        );
+        let screen = screens.creative_mut().expect("the creative stands");
+        assert_eq!(screen.player_slot(9), Some(&None));
+        assert_eq!(screen.player_slot(36), Some(&stack(265)));
+        screen.set_tab(11);
+        let mut slots = vec![None; 46];
+        slots[9] = stack(264);
+        assert_eq!(screens.apply_snapshot(0, slots, None, Vec::new()), None);
+        assert_eq!(
+            screens
+                .creative_mut()
+                .expect("the creative stands")
+                .player_slot(9),
+            Some(&stack(264))
+        );
+    }
+
+    #[test]
+    fn the_creative_close_carries_window_zero() {
+        // The creative screen stands on the player's own inventory window,
+        // so its close carries C0D id 0 like every other close.
+        let mut screens = Screens::default();
+        screens.open_creative();
+        let mut cursor = stack(264);
+        assert_eq!(
+            screens.close(&mut cursor),
+            Some(InputEvent::CloseWindow { window_id: 0 })
+        );
+        assert_eq!(cursor, None, "the close drops the cursor copy");
+    }
+
+    #[test]
+    fn the_update_screen_swap_replaces_only_the_inventory() {
+        // `GuiInventory.updateScreen`:34-42 re-displays as creative while
+        // creative; any other open stays put.
+        let mut screens = Screens::default();
+        screens.open_inventory();
+        screens.swap_to_creative();
+        assert!(matches!(screens.current(), Some(ScreenState::Creative(_))));
+        let mut screens = Screens::default();
+        screens.open_sign(1, 2, 3);
+        screens.swap_to_creative();
+        assert!(matches!(screens.current(), Some(ScreenState::Sign { .. })));
     }
 }

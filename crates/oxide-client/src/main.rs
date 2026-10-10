@@ -58,7 +58,7 @@ use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
-use oxide_client::screens::{ScreenState, inventory};
+use oxide_client::screens::{ScreenState, creative, inventory};
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -750,6 +750,13 @@ struct ClientApp {
     /// Task 16 wires. While one is open the pointer is free and the screen
     /// holds every event — the M4 rule — with its own routing below.
     screens: Screens,
+    /// Whether the Join/Respawn gamemode reads creative: the E-key redirect
+    /// and the survival screen's next-tick swap both read it
+    /// (`GuiInventory.updateScreen`:34-42). Set from the session's Join and
+    /// Respawn events; the mid-session `ChangeGameState` reports no client
+    /// event, so a `/gamemode` switch re-routes on the next login
+    /// (recorded).
+    creative: bool,
     /// Whether either shift key is held: the container screen's shift-click
     /// reads it (`Keyboard.isKeyDown(42) || isKeyDown(54)` at
     /// `GuiContainer.java`:413), and the window owns no other modifier state.
@@ -1217,6 +1224,7 @@ impl ClientApp {
             dead: false,
             capture: Capture::default(),
             screens: Screens::default(),
+            creative: false,
             shift: false,
             ctrl: false,
             cursor: None,
@@ -1271,6 +1279,19 @@ impl ClientApp {
         let mut script_click = false;
         for event in events {
             self.view.apply(&event);
+            // The Join/Respawn gamemode folds into the creative flag: the
+            // E-key redirect and the survival screen's next-tick swap both
+            // read it (`GuiInventory.updateScreen`:34-42). The fold sits
+            // beside the screens' own, before any draw reads the flag.
+            match &event {
+                ClientEvent::Joined { gamemode, .. } | ClientEvent::Respawned { gamemode, .. } => {
+                    self.creative = oxide_game::interaction::creative(*gamemode);
+                    if self.creative {
+                        self.screens.swap_to_creative();
+                    }
+                }
+                _ => {}
+            }
             // The screens fold the window's own events — a free function, so
             // the fold runs while the renderer below stays borrowed. The
             // fold's answer (the anvil's slot-0 re-fire) leaves for the
@@ -1548,12 +1569,20 @@ impl ClientApp {
                 );
             }
         }
+        if let Some(screen) = self.screens.creative_mut() {
+            screen.set_screen_size(scaled.width as i32, scaled.height as i32);
+        }
         // Inline — not the method — so the feed runs while the renderer
         // stays borrowed: the fields are disjoint.
         if let Some(cursor) = self.cursor {
             if let Some(screen) = self.screens.container_mut() {
                 let (ox, oy) = screen.origin();
                 screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32, &ItemTable);
+            } else if let Some(screen) = self.screens.creative_mut() {
+                // The creative pointer feeds panel-local too: its origin
+                // centers the wider 195-pixel frame like every container.
+                let (ox, oy) = screen.origin();
+                screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32);
             }
         }
         // The hud list runs in the source's own overlay order: the hotbar frame
@@ -2013,12 +2042,15 @@ impl ClientApp {
     /// carrying action 2 leaves — the source's `OPEN_INVENTORY_ACHIEVEMENT`
     /// (`Minecraft.java`:2090-2103, send at :2100) — and the window-0 screen
     /// stands beside it (:2101). No guard exists, so every open sends one.
+    /// In creative mode the creative screen stands instead: the C16 still
+    /// sends first, and the survival screen's `updateScreen` would swap it
+    /// next tick anyway (`GuiInventory.updateScreen`:34-42).
     /// The pointer frees like any other window open, with no hover until the
     /// mouse moves. (The riding branch is out of scope, recorded; the
-    /// creative swap lands with Task 21; the keymap binding itself is Task
-    /// 24's — this is the router seam.)
+    /// keymap binding itself is Task 24's — this is the router seam.)
     fn open_inventory(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(event) = self.screens.open_inventory() {
+        let event = self.inventory_open_event();
+        if let Some(event) = event {
             self.send_input(event);
         }
         self.tab.open = false;
@@ -2027,9 +2059,22 @@ impl ClientApp {
         self.apply_capture(event_loop, step);
     }
 
+    /// The E-key open's own send: one C16 beside the window-0 screen — the
+    /// creative screen in creative mode, the survival screen otherwise. The
+    /// caller frees the pointer and recaptures around it.
+    fn inventory_open_event(&mut self) -> Option<InputEvent> {
+        if self.creative {
+            self.screens.open_creative()
+        } else {
+            self.screens.open_inventory()
+        }
+    }
+
     /// Routes one key press to the open screen: the inventory key closes every
     /// container screen, the number keys swap with mode 2 and the drop key
-    /// drops — `GuiContainer.keyTyped`:692-712 with `checkHotbarKeys`:718-733.
+    /// drops — `GuiContainer.keyTyped`:692-712 with `checkHotbarKeys`:718-733 —
+    /// and the creative screen's own chart before the container's:
+    /// `GuiContainerCreative.keyTyped`:306-339 with `checkHotbarKeys`:718-733.
     /// Releases never reach the screen, and while one is open every other key
     /// is the screen's to swallow — the M4 rule — so the caller's gameplay
     /// path must not run after a `true`.
@@ -2083,6 +2128,68 @@ impl ClientApp {
         // Copied out before the screen borrows: the key sends read it while
         // the screen stays mutably borrowed.
         let ctrl = self.ctrl;
+        // The creative screen's own keys before the container path: the
+        // chat key jumps to the search tab off it (`keyTyped`:308-313),
+        // number keys swap before text (`checkHotbarKeys`:718-733), Q drops
+        // (`:692-696`), editing keys edit and characters type (`:306-339`).
+        // The branch returns for every key — the M4 rule holds the screen's
+        // events — with the number-key fall-through landing in the text
+        // path instead of the container one.
+        if self.screens.creative_mut().is_some() {
+            if self
+                .screens
+                .creative_mut()
+                .is_some_and(|screen| screen.selected_tab() != creative::SEARCH_TAB)
+                && chat_opener(event.state, event.repeat, event.physical_key).is_some()
+            {
+                self.screens
+                    .creative_mut()
+                    .expect("the creative screen is open")
+                    .chat_key();
+                return true;
+            }
+            if let Some(index) = number_key_index(code) {
+                if let Some(events) = self
+                    .screens
+                    .creative_mut()
+                    .expect("the creative screen is open")
+                    .number_key(index, &ItemTable)
+                {
+                    for event in events {
+                        self.send_input(event);
+                    }
+                    return true;
+                }
+            }
+            if code == KeyCode::KeyQ {
+                for event in self
+                    .screens
+                    .creative_mut()
+                    .expect("the creative screen is open")
+                    .screen_key(ScreenKey::Drop, ctrl)
+                {
+                    self.send_input(event);
+                }
+                return true;
+            }
+            if let Some(key) = keymap::translate(code) {
+                if self
+                    .screens
+                    .creative_mut()
+                    .expect("the creative screen is open")
+                    .field_key(key)
+                {
+                    return true;
+                }
+            }
+            if let Some(text) = event.text.as_deref() {
+                self.screens
+                    .creative_mut()
+                    .expect("the creative screen is open")
+                    .type_text(text);
+            }
+            return true;
+        }
         if let Some(index) = number_key_index(code) {
             let events = self
                 .screens
@@ -2113,7 +2220,9 @@ impl ClientApp {
     /// and `mouseReleased`:515-652 — with the free pointer fed first, and
     /// every produced click leaves for the session. The middle button is the
     /// pick-block binding's own (`keyBindPickBlock.getKeyCode() + 100`,
-    /// :362/:410/:448). While a screen is open the click can neither grab
+    /// :362/:410/:448). The creative screen runs its own press and release
+    /// instead — `GuiContainerCreative.mouseClicked`:493-575 and
+    /// `mouseReleased`:578-655. While a screen is open the click can neither grab
     /// nor steer, so the caller's paths must not run after a `true`.
     fn on_screen_button(&mut self, state: ElementState, button: WinitMouseButton) -> bool {
         if !self.screens.is_open() {
@@ -2125,6 +2234,17 @@ impl ClientApp {
         self.feed_screen_mouse();
         let shift = self.shift;
         let level = self.view.level();
+        if let Some(screen) = self.screens.creative_mut() {
+            let now = system_time_ms();
+            let events = match state {
+                ElementState::Pressed => screen.press(button, shift, &ItemTable, now),
+                ElementState::Released => screen.release(button, shift, &ItemTable, now),
+            };
+            for event in events {
+                self.send_input(event);
+            }
+            return true;
+        }
         let Some(screen) = self.screens.container_mut() else {
             return true;
         };
@@ -2147,18 +2267,21 @@ impl ClientApp {
         true
     }
 
-    /// Feeds the free pointer into the open container's hover and drag: the
+    /// Feeds the free pointer into the open screen's hover and drag: the
     /// cursor's screen units minus the panel's origin are the panel-local
-    /// units the hit test reads.
+    /// units the hit test reads — the container's and the creative screen's
+    /// alike.
     fn feed_screen_mouse(&mut self) {
         let Some(cursor) = self.cursor else {
             return;
         };
-        let Some(screen) = self.screens.container_mut() else {
-            return;
-        };
-        let (ox, oy) = screen.origin();
-        screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32, &ItemTable);
+        if let Some(screen) = self.screens.container_mut() {
+            let (ox, oy) = screen.origin();
+            screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32, &ItemTable);
+        } else if let Some(screen) = self.screens.creative_mut() {
+            let (ox, oy) = screen.origin();
+            screen.mouse_moved(cursor.0 - ox as f32, cursor.1 - oy as f32);
+        }
     }
 
     /// Routes one key event to the confirm overlay — the only keys it has.
@@ -3197,6 +3320,24 @@ fn chat_wheel_lines(delta: MouseScrollDelta) -> i32 {
     notch * 7
 }
 
+/// One wheel event's notch for the creative list: the event's delta clamps
+/// to ±1 — a pixel delta's magnitude is not a notch count — and the screen
+/// divides it by the world-height rule itself
+/// (`handleMouseInput`:546-569).
+fn creative_wheel_notch(delta: MouseScrollDelta) -> f32 {
+    let notches = match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(position) => position.y as f32,
+    };
+    if notches > 0.0 {
+        1.0
+    } else if notches < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// The bound mouse button a window button maps to, or `None` when unbound.
 fn bound_mouse_button(button: WinitMouseButton) -> Option<MouseButton> {
     match button {
@@ -3378,13 +3519,17 @@ impl ApplicationHandler for ClientApp {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // The wheel is the chat log's while the chat is open
-                // (`GuiChat.handleMouseInput`:143-167); a closed chat has no
-                // wheel surface yet — the hotbar's is a later task's.
+                // (`GuiChat.handleMouseInput`:143-167); over the creative
+                // screen it scrolls the list (`handleMouseInput`:546-569) —
+                // a closed chat has no other wheel surface yet — the hotbar's
+                // is a later task's.
                 if self.chat_input.open {
                     let lines = chat_wheel_lines(delta);
                     if lines != 0 {
                         self.chat.scroll(lines);
                     }
+                } else if let Some(screen) = self.screens.creative_mut() {
+                    screen.wheel(creative_wheel_notch(delta));
                 }
             }
             WindowEvent::Focused(false) => {
@@ -3727,11 +3872,12 @@ mod tests {
         Key, MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate,
         SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
         apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
-        clear_break_stage, command_text, cracks_in_view, escape_route, f3_hold_step, frame_params,
-        gameplay_key, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
-        is_f3_press, is_h_press, number_key_index, parse_script, parse_server_address,
-        scaled_cursor, screen_click_button, scripted_chat_click, skin_requests, store_aim,
-        store_break_stage, store_skins, tab_held, tooltip_point, void_y_factor,
+        clear_break_stage, command_text, cracks_in_view, creative_wheel_notch, escape_route,
+        f3_hold_step, frame_params, gameplay_key, interpolate_pose, inventory_opener,
+        is_enter_press, is_escape_press, is_f3_press, is_h_press, number_key_index, parse_script,
+        parse_server_address, scaled_cursor, screen_click_button, scripted_chat_click,
+        skin_requests, store_aim, store_break_stage, store_skins, tab_held, tooltip_point,
+        void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -5519,6 +5665,71 @@ mod tests {
             false,
             PhysicalKey::Code(KeyCode::KeyW)
         ));
+    }
+
+    #[test]
+    fn the_e_open_stands_the_creative_screen_in_creative_mode() {
+        // The T20 redirect: the flag the Join/Respawn gamemode folds in
+        // picks the screen, and the C16 still sends first
+        // (`Minecraft.java`:2100-2101).
+        let mut app = test_app();
+        app.creative = true;
+        assert_eq!(app.inventory_open_event(), Some(InputEvent::OpenInventory));
+        assert!(
+            app.screens.creative_mut().is_some(),
+            "E stands the creative screen"
+        );
+        let mut app = test_app();
+        assert_eq!(app.inventory_open_event(), Some(InputEvent::OpenInventory));
+        assert!(
+            app.screens.creative_mut().is_none(),
+            "survival still stands the survival screen"
+        );
+    }
+
+    #[test]
+    fn middle_click_on_the_creative_grid_picks_with_no_packet() {
+        // The button router feeds the creative press: a middle click over a
+        // grid cell lifts the max-size copy into the cursor
+        // (`mouseClicked`:533-540) and sends nothing — the pick applies
+        // locally, with no session attached here.
+        let mut app = test_app();
+        app.creative = true;
+        app.screens.open_creative();
+        app.cursor = Some((17.0, 26.0));
+        assert!(app.on_screen_button(ElementState::Pressed, WinitMouseButton::Middle));
+        assert!(
+            app.screens
+                .creative_mut()
+                .expect("the screen stays open")
+                .cursor()
+                .is_some(),
+            "the pick lifted the cell's stack"
+        );
+    }
+
+    #[test]
+    fn the_creative_wheel_clamps_every_event_to_one_notch() {
+        // `handleMouseInput`:546-569: the event's delta clamps to ±1 — a
+        // pixel delta's magnitude is not a notch count — and the screen
+        // divides the notch itself.
+        assert_eq!(
+            creative_wheel_notch(MouseScrollDelta::LineDelta(0.0, 1.0)),
+            1.0
+        );
+        assert_eq!(
+            creative_wheel_notch(MouseScrollDelta::LineDelta(0.0, 5.0)),
+            1.0,
+            "a five-notch event still clamps to one notch"
+        );
+        assert_eq!(
+            creative_wheel_notch(MouseScrollDelta::LineDelta(0.0, -1.0)),
+            -1.0
+        );
+        assert_eq!(
+            creative_wheel_notch(MouseScrollDelta::LineDelta(0.0, 0.0)),
+            0.0
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ use crate::ChatInput;
 use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
 use oxide_client::screens::container::{ContainerScreen, HOVER_COLOUR, title_rgba};
+use oxide_client::screens::creative::CreativeScreen;
 use oxide_client::screens::family_a;
 use oxide_client::screens::family_b;
 use oxide_client::screens::inventory;
@@ -341,9 +342,10 @@ pub struct ScreenDrawInput<'a> {
 /// `:245-248`, and a capped one counts yellow), and last the hovered slot's
 /// tooltip over the cursor.
 ///
-/// The declared-but-unimplemented variants (inventory, sign, book, creative)
-/// and the unknown kinds draw the generic frame — the background and the
-/// title alone — until their tasks land their tables (recorded).
+/// The declared-but-unimplemented variants (sign, book) and the unknown
+/// kinds draw the generic frame — the background and the title alone —
+/// until their tasks land their tables (recorded). The inventory screen
+/// landed in Task 20, the creative screen in Task 21.
 pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDraw> {
     let Some(screen) = screens.current() else {
         return Vec::new();
@@ -370,7 +372,10 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     });
     let container = match screen {
         ScreenState::Container(container) | ScreenState::Inventory(container) => container.as_ref(),
-        ScreenState::Sign { .. } | ScreenState::Book { .. } | ScreenState::Creative => {
+        ScreenState::Creative(creative) => {
+            return push_creative_draws(draws, creative, input, width, height);
+        }
+        ScreenState::Sign { .. } | ScreenState::Book { .. } => {
             return draws;
         }
     };
@@ -574,6 +579,274 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         push_inventory_effects(&mut draws, container, input, gx, gy);
     }
     draws
+}
+
+/// The creative screen's draws (`GuiContainerCreative.drawScreen` and
+/// `drawGuiContainerBackgroundLayer`): the unselected tabs first, the panel
+/// sheet second, the selected tab last (`:682-706`), the twelve tab icons
+/// over the strip (`:817-828`), the title line (`:392-400`), the slots —
+/// the 9×5 page plus the hotbar row, or the survival layout with the delete
+/// cell on the inventory tab — the hover highlight, the scrollbar thumb
+/// (`:696-704`), the search field's text, the carried stack at the pointer
+/// and last the hovered tooltip.
+fn push_creative_draws(
+    mut draws: Vec<HudDraw>,
+    screen: &CreativeScreen,
+    input: &ScreenDrawInput<'_>,
+    width: f32,
+    height: f32,
+) -> Vec<HudDraw> {
+    use oxide_client::screens::creative as cr;
+    let selected = screen.selected_tab();
+    let tab =
+        items::CreativeTab::from_index(selected).unwrap_or(items::CreativeTab::BuildingBlocks);
+    let (gx, gy) = screen.origin();
+    let (gx, gy) = (gx as f32, gy as f32);
+    // The strip: every unselected tab, then the panel, then the selected
+    // tab (`func_147051_a`'s order, `:682-706`) — one sheet blit each, in
+    // the 256-wide sheet space the container path reads.
+    for index in 0..cr::TAB_COUNT {
+        if index == selected {
+            continue;
+        }
+        let (sx, sy) = cr::tab_sprite(index);
+        let (u, v) = cr::tab_uv(index, false);
+        sheet_blit(
+            &mut draws,
+            cr::TABS_SHEET,
+            gx,
+            gy,
+            sx,
+            sy,
+            cr::TAB_W,
+            cr::TAB_H,
+            u,
+            v,
+        );
+    }
+    sheet_blit(
+        &mut draws,
+        cr::panel_sheet(tab),
+        gx,
+        gy,
+        0,
+        0,
+        cr::FRAME_W,
+        cr::FRAME_H,
+        0,
+        0,
+    );
+    {
+        let (sx, sy) = cr::tab_sprite(selected);
+        let (u, v) = cr::tab_uv(selected, true);
+        sheet_blit(
+            &mut draws,
+            cr::TABS_SHEET,
+            gx,
+            gy,
+            sx,
+            sy,
+            cr::TAB_W,
+            cr::TAB_H,
+            u,
+            v,
+        );
+    }
+    // The twelve tab icons over the strip (`:817-828`).
+    for index in 0..cr::TAB_COUNT {
+        let icon_tab =
+            items::CreativeTab::from_index(index).unwrap_or(items::CreativeTab::BuildingBlocks);
+        let icon = cr::entry_stack(icon_tab.icon());
+        let (ix, iy) = cr::tab_icon_pos(index);
+        draws.push(HudDraw::Item {
+            stack: Some(item_icon(&icon)),
+            x: gx + ix as f32,
+            y: gy + iy as f32,
+            pop: 0.0,
+        });
+    }
+    // The title line over the panel (`:392-400`) — none on the inventory
+    // tab — untranslated: key resolution is a locale-table concern the
+    // port does not carry.
+    if input.font.is_some() {
+        if let Some(title) = cr::tab_title(selected) {
+            draws.push(HudDraw::Text {
+                text: title,
+                x: gx + 8.0,
+                y: gy + 6.0,
+                scale: 1.0,
+                colour: title_rgba(4210752),
+                shadow: false,
+                blend: false,
+            });
+        }
+    }
+    // The slots: the page plus the hotbar row, or the survival layout with
+    // the delete cell (`:512` — the bin shows the display's tmp index 0,
+    // the page's first cell).
+    if selected == cr::INVENTORY_TAB {
+        for slot in 5..45_i16 {
+            let stack = screen.player_slot(slot).cloned().flatten();
+            let (sx, sy) = cr::inventory_slot_pos(slot);
+            push_creative_cell(
+                &mut draws,
+                input.font,
+                gx + sx as f32,
+                gy + sy as f32,
+                &stack,
+            );
+        }
+        push_creative_cell(
+            &mut draws,
+            input.font,
+            gx + cr::BIN_DX as f32,
+            gy + cr::BIN_DY as f32,
+            &screen.grid()[0],
+        );
+    } else {
+        for (cell, stack) in screen.grid().iter().enumerate() {
+            let x = gx
+                + cr::GRID_LEFT as f32
+                + (cell % cr::GRID_COLS as usize) as f32 * cr::CELL_STEP as f32;
+            let y = gy
+                + cr::GRID_TOP as f32
+                + (cell / cr::GRID_COLS as usize) as f32 * cr::CELL_STEP as f32;
+            push_creative_cell(&mut draws, input.font, x, y, stack);
+        }
+        for (k, stack) in screen.hotbar().iter().enumerate() {
+            let x = gx + cr::GRID_LEFT as f32 + k as f32 * cr::CELL_STEP as f32;
+            push_creative_cell(&mut draws, input.font, x, y_hotbar(gy), stack);
+        }
+    }
+    // The hover highlight over the hovered cell (`GuiContainer.java`
+    // :126-138's rect, read through the creative hit test).
+    if let Some(mouse) = input.mouse {
+        let rect = match screen.hover_at(mouse.0 - gx, mouse.1 - gy) {
+            cr::Hover::Grid(cell) => {
+                let col = (cell % cr::GRID_COLS as usize) as i32;
+                let row = (cell / cr::GRID_COLS as usize) as i32;
+                Some((
+                    cr::GRID_LEFT + col * cr::CELL_STEP,
+                    cr::GRID_TOP + row * cr::CELL_STEP,
+                ))
+            }
+            cr::Hover::Hotbar(k) => {
+                Some((cr::GRID_LEFT + k as i32 * cr::CELL_STEP, cr::HOTBAR_TOP))
+            }
+            cr::Hover::Player(slot) => {
+                let (x, y) = cr::inventory_slot_pos(slot);
+                Some((x, y))
+            }
+            cr::Hover::Bin => Some((cr::BIN_DX, cr::BIN_DY)),
+            cr::Hover::Tab(_) | cr::Hover::Track | cr::Hover::Panel | cr::Hover::None => None,
+        };
+        if let Some((x, y)) = rect {
+            draws.push(HudDraw::Rect {
+                x: gx + x as f32,
+                y: gy + y as f32,
+                width: 16.0,
+                height: 16.0,
+                colour: HOVER_COLOUR,
+            });
+        }
+    }
+    // The scrollbar thumb over the panel (`:696-704`), on every tab but
+    // the inventory one — the 232 slice while the list scrolls, 244 while
+    // it fits.
+    if let Some((tx, ty)) = cr::thumb_rect(screen.scroll(), selected) {
+        sheet_blit(
+            &mut draws,
+            cr::TABS_SHEET,
+            gx,
+            gy,
+            tx,
+            ty,
+            cr::THUMB_W,
+            cr::THUMB_H,
+            cr::thumb_sheet_x(screen.list_len(), selected),
+            0,
+        );
+    }
+    // The search field's text: the borderless white line at the field's
+    // own origin (`initGui`:263-280).
+    if screen.search_visible() && input.font.is_some() {
+        draws.push(HudDraw::Text {
+            text: screen.search_text().to_string(),
+            x: gx + cr::SEARCH_DX as f32,
+            y: gy + cr::SEARCH_DY as f32,
+            scale: 1.0,
+            colour: [1.0, 1.0, 1.0, 1.0],
+            shadow: false,
+            blend: false,
+        });
+    }
+    // The carried stack at the pointer minus 8 (`drawScreen`:144-170).
+    if let Some(mouse) = input.mouse {
+        if let Some(cursor) = screen.cursor_draw(mouse) {
+            draws.push(HudDraw::Item {
+                stack: Some(item_icon(&cursor.0)),
+                x: cursor.1,
+                y: cursor.2,
+                pop: 0.0,
+            });
+            push_stack_overlay(&mut draws, &cursor.0, None, input.font, cursor.1, cursor.2);
+        }
+    }
+    // The hovered cell's tooltip, last over everything the screen drew —
+    // the delete slot's own line on the inventory tab (`:613-616`), else
+    // the hovered stack's lines — and only with empty hands, so the
+    // tooltip and the carried stack never co-draw.
+    if let (Some(mouse), Some(font)) = (input.mouse, input.font) {
+        if screen.cursor().is_none() {
+            let hover = screen.hover_at(mouse.0 - gx, mouse.1 - gy);
+            if hover == cr::Hover::Bin {
+                draws.extend(tooltip::tooltip_draws(
+                    &tooltip::plain_tooltip_lines(vec![String::from("inventory.binSlot")]),
+                    font,
+                    mouse,
+                    (width, height),
+                ));
+            } else {
+                let stack = match hover {
+                    cr::Hover::Grid(cell) => screen.grid().get(cell).cloned().flatten(),
+                    cr::Hover::Hotbar(k) => screen.hotbar().get(k).cloned().flatten(),
+                    cr::Hover::Player(slot) => screen.player_slot(slot).cloned().flatten(),
+                    _ => None,
+                };
+                if let Some(stack) = stack {
+                    let lines = tooltip::tooltip_lines(&stack, input.advanced);
+                    draws.extend(tooltip::tooltip_draws(&lines, font, mouse, (width, height)));
+                }
+            }
+        }
+    }
+    draws
+}
+
+/// The hotbar row's top in frame units: the row rides with the frame.
+fn y_hotbar(gy: f32) -> f32 {
+    use oxide_client::screens::creative as cr;
+    gy + cr::HOTBAR_TOP as f32
+}
+
+/// One creative cell's item with its count/durability overlay, mirroring
+/// the container path's slot draws.
+fn push_creative_cell(
+    draws: &mut Vec<HudDraw>,
+    font: Option<&Font>,
+    x: f32,
+    y: f32,
+    stack: &Option<MetadataItem>,
+) {
+    draws.push(HudDraw::Item {
+        stack: stack.as_ref().map(item_icon),
+        x,
+        y,
+        pop: 0.0,
+    });
+    if let Some(stack) = stack.as_ref() {
+        push_stack_overlay(draws, stack, None, font, x, y);
+    }
 }
 
 /// The inventory's player preview: the skin-face silhouette centred on the
