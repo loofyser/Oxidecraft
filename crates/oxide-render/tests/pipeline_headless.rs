@@ -9396,3 +9396,137 @@ fn t16_screen_drag_preview_counts_the_remnant() {
     expect_rows(&pixels, 108, 52, SHADOW, "the remnant six's shadow");
     expect_rows(&pixels, 91, 51, SKY, "the sky left of the carried stack");
 }
+
+/// The blend of one RGBA rect colour over a backdrop: the pipeline's
+/// `src_alpha` over `one_minus_src_alpha` pair, per channel.
+fn blend_over(rgb: [f32; 3], alpha: f32, backdrop: [u8; 3]) -> [u8; 3] {
+    [
+        (rgb[0] * alpha + f32::from(backdrop[0]) * (1.0 - alpha)).round() as u8,
+        (rgb[1] * alpha + f32::from(backdrop[1]) * (1.0 - alpha)).round() as u8,
+        (rgb[2] * alpha + f32::from(backdrop[2]) * (1.0 - alpha)).round() as u8,
+    ]
+}
+
+/// The tooltip's two-line box over the sky, then flipped past the right
+/// edge: a two-line `||` tooltip at the (10, 20) cursor on the 448x240
+/// screen, then the same box at the (440, 20) cursor.
+///
+/// The draws mirror `oxide-client/src/tooltip.rs`'s assembly draw for draw —
+/// the render crate cannot import the client crate — for the lines `||`
+/// (white name row) and `||` (grey `§7` second row): the `|` glyph inks its
+/// first column only at two font pixels' advance, so each row is four font
+/// pixels wide and the box is (22, 8, 4, 20).
+///
+/// The pins: the `0xF0100010` fill's blend inside the box, the `0x505000FF`
+/// top edge's blend and the `0x5028007F` bottom edge's blend, the name row's
+/// white ink, the second row's grey ink, the sky right of the box — then the
+/// flipped frame's fill blend inside the moved box, its name ink, and the sky
+/// where the unflipped box would have run off the screen.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t17_tooltip_paints_fill_border_lines_and_flip() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+
+    let mut hud = HudPass::new(&device, &queue, format);
+    hud.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    hud.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+
+    // The assembly's literals as floats — the source's ARGB ints `0xF0100010`,
+    // `0x505000FF`, `0x5028007F`.
+    let fill = [16.0 / 255.0, 0.0, 16.0 / 255.0, 240.0 / 255.0];
+    let top = [80.0 / 255.0, 0.0, 1.0, 80.0 / 255.0];
+    let bottom = [40.0 / 255.0, 0.0, 127.0 / 255.0, 80.0 / 255.0];
+    let grey = [170.0 / 255.0, 170.0 / 255.0, 170.0 / 255.0, 1.0];
+    let white = [1.0, 1.0, 1.0, 1.0];
+    let rect = |x: f32, y: f32, width: f32, height: f32, colour: [f32; 4]| HudDraw::Rect {
+        x,
+        y,
+        width,
+        height,
+        colour,
+    };
+    let line = |body: &str, x: f32, y: f32, colour: [f32; 4]| HudDraw::Text {
+        text: body.to_string(),
+        x,
+        y,
+        scale: 1.0,
+        colour,
+        shadow: true,
+        blend: false,
+    };
+    // One two-line box at (box_x, 8): the five fills, the six border steps
+    // (the top edge in the top colour, the bottom edge in the bottom colour,
+    // each side split halfway), then the white name row and the grey second
+    // row — the draws the assembly emits, last over the screen.
+    let box_draws = |box_x: f32| {
+        vec![
+            rect(box_x - 3.0, 4.0, 10.0, 1.0, fill),
+            rect(box_x - 3.0, 31.0, 10.0, 1.0, fill),
+            rect(box_x - 3.0, 5.0, 10.0, 26.0, fill),
+            rect(box_x - 4.0, 5.0, 1.0, 26.0, fill),
+            rect(box_x + 7.0, 5.0, 1.0, 26.0, fill),
+            rect(box_x - 3.0, 6.0, 1.0, 12.0, top),
+            rect(box_x - 3.0, 18.0, 1.0, 12.0, bottom),
+            rect(box_x + 6.0, 6.0, 1.0, 12.0, top),
+            rect(box_x + 6.0, 18.0, 1.0, 12.0, bottom),
+            rect(box_x - 3.0, 5.0, 10.0, 1.0, top),
+            rect(box_x - 3.0, 30.0, 10.0, 1.0, bottom),
+            line("||", box_x, 8.0, white),
+            line("||", box_x, 18.0, grey),
+        ]
+    };
+
+    let skins = TextureRegistry::new(&device, &queue);
+    let depth = rows_depth(&device);
+
+    // Frame one: the cursor at (10, 20) puts the box at x = 22, y = 8.
+    hud.set_draws(&device, &queue, &box_draws(22.0), &skins);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t17 tooltip headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_rows_pixels(&device, &queue, &target);
+    // The border draws over the fill, so its rows blend twice: the fill over
+    // the sky, then the edge over the fill.
+    let fill_sky = blend_over([16.0, 0.0, 16.0], 240.0 / 255.0, SKY);
+    let top_fill = blend_over([80.0, 0.0, 255.0], 80.0 / 255.0, fill_sky);
+    let bottom_fill = blend_over([40.0, 0.0, 127.0], 80.0 / 255.0, fill_sky);
+    expect_rows(&pixels, 20, 7, fill_sky, "the fill inside the box");
+    expect_rows(&pixels, 24, 5, top_fill, "the top edge's row");
+    expect_rows(&pixels, 24, 30, bottom_fill, "the bottom edge's row");
+    expect_rows(&pixels, 22, 8, TEXT, "the name row's ink");
+    expect_rows(
+        &pixels,
+        22,
+        18,
+        [170, 170, 170],
+        "the second row's grey ink",
+    );
+    expect_rows(&pixels, 30, 10, SKY, "the sky right of the box");
+
+    // Frame two: the cursor at (440, 20) flips the box to x = 400, y = 8.
+    hud.set_draws(&device, &queue, &box_draws(400.0), &skins);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t17 tooltip flip headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_rows_pixels(&device, &queue, &target);
+    expect_rows(&pixels, 398, 7, fill_sky, "the flipped fill inside the box");
+    expect_rows(&pixels, 400, 8, TEXT, "the flipped name row's ink");
+    expect_rows(
+        &pixels,
+        446,
+        7,
+        SKY,
+        "the sky where the unflipped box would run off",
+    );
+}

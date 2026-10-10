@@ -50,6 +50,7 @@ use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
 use oxide_client::screens::container::{HOVER_COLOUR, TITLE_COLOUR};
 use oxide_client::screens::{ScreenState, Screens};
+use oxide_client::tooltip;
 
 /// The all-on parts byte every player draws with this milestone.
 ///
@@ -307,6 +308,9 @@ pub struct ScreenDrawInput<'a> {
     pub scaled: ScaledResolution,
     /// The free pointer's scaled position, or `None` before the first move.
     pub mouse: Option<(f32, f32)>,
+    /// Whether F3+H has the advanced tooltips showing (`ItemStack.getTooltip`'s
+    /// flag at `GuiScreen.java`:160 — the appendix Task 17 reads).
+    pub advanced: bool,
 }
 
 /// The screen group's own draws: the source's `currentScreen.drawScreen`
@@ -318,11 +322,11 @@ pub struct ScreenDrawInput<'a> {
 /// (`GuiScreen.drawWorldBackground`:668-683 — the world-present arm), its
 /// sheet blit, every slot's item, the hover highlight (the 0x80FFFFFF rect at
 /// `GuiContainer.java`:134), the title lines, the carried stack at the
-/// pointer minus 8 (`:149, :169`) with the drag's remnant preview, and —
-/// while a multi-slot drag runs — each covered slot's preview count with its
-/// own white rect (`drawSlot`:243-303). A covered slot of a lone-slot drag
-/// draws nothing (`:245-248`). The tooltip is Task 17's seam: the base leaves
-/// the slot under the pointer readable.
+/// pointer minus 8 (`:149, :169`) with the drag's remnant preview, each
+/// covered slot's preview count with its own white rect while a multi-slot
+/// drag runs (`drawSlot`:243-303 — a lone covered slot draws nothing,
+/// `:245-248`, and a capped one counts yellow), and last the hovered slot's
+/// tooltip over the cursor.
 ///
 /// The declared-but-unimplemented variants (inventory, sign, book, creative)
 /// and the unknown kinds draw the generic frame — the background and the
@@ -383,7 +387,7 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         if let Some(preview) = container
             .preview()
             .iter()
-            .find(|(index, _)| *index == pos.index)
+            .find(|entry| entry.index == pos.index)
         {
             if drag_len == 1 {
                 continue;
@@ -402,7 +406,7 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
                 nbt: None,
             });
             let stack = MetadataItem {
-                count: preview.1.clamp(0, 255) as u8,
+                count: preview.count.clamp(0, 255) as u8,
                 ..template
             };
             draws.push(HudDraw::Item {
@@ -411,7 +415,14 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
                 y,
                 pop: 0.0,
             });
-            push_stack_overlay(&mut draws, &stack, None, input.font, x, y);
+            push_stack_overlay(
+                &mut draws,
+                &stack,
+                preview_alt(stack.count, preview.capped).as_deref(),
+                input.font,
+                x,
+                y,
+            );
             continue;
         }
         let stack = container.slot_stack(pos.index).cloned().flatten();
@@ -477,7 +488,28 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             );
         }
     }
+    // The hovered slot's tooltip, last over everything the screen drew: the
+    // builder's lines through the draw assembly at the pointer
+    // (`GuiContainer.drawScreen` renders the hovered stack's tooltip after
+    // the cursor). Without a font there is no width to place, so the box
+    // stays out while the rest still draws.
+    if let (Some(mouse), Some(font)) = (input.mouse, input.font) {
+        if let Some(hovered) = container.hovered() {
+            if let Some(stack) = container.slot_stack(hovered).cloned().flatten() {
+                let lines = tooltip::tooltip_lines(&stack, input.advanced);
+                draws.extend(tooltip::tooltip_draws(&lines, font, mouse, (width, height)));
+            }
+        }
+    }
     draws
+}
+
+/// A covered slot's overlay text: past the cap the count draws as the yellow
+/// cap (`drawSlot`'s capped branch at `GuiContainer.java`:253-264 states `s`
+/// as `YELLOW + cap`); inside the cap the count draws through the usual
+/// white path, so there is no alt text.
+fn preview_alt(count: u8, capped: bool) -> Option<String> {
+    capped.then(|| format!("§e{count}"))
 }
 
 /// One stack's count and durability overlay at the cell (`x`, `y`)
@@ -9538,6 +9570,20 @@ mod tests {
 
     // ---- the screen group ----
 
+    #[test]
+    fn the_capped_preview_draws_the_yellow_cap() {
+        assert_eq!(
+            preview_alt(1, true),
+            Some(String::from("§e1")),
+            "past the cap the count draws yellow"
+        );
+        assert_eq!(
+            preview_alt(32, false),
+            None,
+            "inside the cap the white count path draws"
+        );
+    }
+
     /// The screen group's own frame: no screen draws nothing, a declared
     /// variant draws the generic frame's background alone, and a container
     /// draws the background, the centred sheet, the title and the carried
@@ -9553,6 +9599,7 @@ mod tests {
                 font: Some(&font),
                 scaled: chat_resolution(),
                 mouse: Some((100.0, 50.0)),
+                advanced: false,
             },
         );
         assert!(draws.is_empty(), "no screen owns no draws");
@@ -9570,6 +9617,7 @@ mod tests {
                 font: Some(&font),
                 scaled,
                 mouse: Some((100.0, 50.0)),
+                advanced: false,
             },
         );
         // The world-present gradient alone: top 0xC0101010 over bottom
@@ -9611,6 +9659,7 @@ mod tests {
                 font: Some(&font),
                 scaled: chat_resolution(),
                 mouse: Some((100.0, 50.0)),
+                advanced: false,
             },
         );
         // The 427x240 frame centres the 176x166 panel at (125, 37); the

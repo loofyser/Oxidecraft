@@ -683,6 +683,14 @@ struct ClientApp {
     camera: CameraState,
     /// Whether F3 has the overlay showing.
     overlay_visible: bool,
+    /// Whether F3 is held: the H chord's own read (`Keyboard.isKeyDown(61)`
+    /// at `Minecraft.java`:2000-2004 — an edge either way lands here).
+    f3_held: bool,
+    /// Whether F3+H has the advanced tooltips showing
+    /// (`gameSettings.advancedItemTooltips`, toggled at :2000-2004): the
+    /// flag the screen frame hands the tooltip builder. Session-only, like
+    /// the overlay — the port keeps no options file.
+    advanced_tooltips: bool,
     /// Whether the session last reported the player dead.
     ///
     /// While it holds, the frame draws the interim death view — the dim quad
@@ -1200,6 +1208,8 @@ impl ClientApp {
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
             overlay_visible,
+            f3_held: false,
+            advanced_tooltips: false,
             dead: false,
             capture: Capture::default(),
             screens: Screens::default(),
@@ -1578,6 +1588,7 @@ impl ClientApp {
                 font: self.font.as_ref(),
                 scaled,
                 mouse: self.cursor,
+                advanced: self.advanced_tooltips,
             },
         ));
         // The death view replaces the debug overlay while the player is dead:
@@ -1678,6 +1689,21 @@ impl ClientApp {
         }
         if self.chat_input.open {
             self.on_chat_key(event_loop, event);
+            return;
+        }
+        // The F3 hold tracks every edge — the level read behind the chord.
+        self.f3_held = f3_hold_step(self.f3_held, event.state, &event.logical_key);
+        // The H chord shares the F3 toggle's gate: the runTick keyboard loop
+        // runs with no screen or an `allowUserInput` one (`Minecraft.java`
+        // :1834, and the M4 seam above lets F3 through only there) — over a
+        // container the screen swallows the keys and the chord never fires.
+        // An H press edge while F3 is held flips the advanced tooltips
+        // (`Minecraft.java`:2000-2004); a held H's repeat never re-toggles.
+        if f3_chord_live(self.screens.is_open(), self.screens.allow_user_input())
+            && is_h_press(event.state, event.repeat, event.physical_key)
+            && self.f3_held
+        {
+            self.advanced_tooltips = !self.advanced_tooltips;
             return;
         }
         // The open screen holds every other key: the container's own E, 1-9
@@ -3274,11 +3300,43 @@ fn is_escape_press(state: ElementState, repeat: bool, key: &WinitKey) -> bool {
     state == ElementState::Pressed && !repeat && *key == WinitKey::Named(NamedKey::Escape)
 }
 
+/// Whether the F3+H chord is live: no screen, or one that takes user input
+/// (the runTick keyboard loop's gate at `Minecraft.java`:1834 — containers
+/// swallow the keys).
+///
+/// Kept out of the event match so the gate's truth table can be pinned
+/// without an event loop.
+fn f3_chord_live(screen_open: bool, allow_user_input: bool) -> bool {
+    !screen_open || allow_user_input
+}
+
 /// Whether a key event is a press of F3.
 ///
 /// Kept out of the event match so the overlay toggle can be pinned without an event loop.
 fn is_f3_press(state: ElementState, key: &WinitKey) -> bool {
     state == ElementState::Pressed && *key == WinitKey::Named(NamedKey::F3)
+}
+
+/// The F3 hold's next read: a press edge holds, a release edge drops, and
+/// every other key leaves it — the port's own `Keyboard.isKeyDown(61)` for
+/// the H chord (`Minecraft.java`:2000-2004).
+///
+/// Kept out of the event match so the chord can be pinned without an event loop.
+fn f3_hold_step(held: bool, state: ElementState, key: &WinitKey) -> bool {
+    if *key == WinitKey::Named(NamedKey::F3) {
+        state == ElementState::Pressed
+    } else {
+        held
+    }
+}
+
+/// Whether a key event is a fresh H press: the chord's own edge (`k == 35`
+/// at :2000-2004, under the press-edge gate at :1933). The physical key is
+/// the source's scancode read; a held key's auto-repeat never re-toggles.
+///
+/// Kept out of the event match so the chord can be pinned without an event loop.
+fn is_h_press(state: ElementState, repeat: bool, key: PhysicalKey) -> bool {
+    state == ElementState::Pressed && !repeat && key == PhysicalKey::Code(KeyCode::KeyH)
 }
 
 /// The chat field's character cap: `GuiChat.initGui`'s own
@@ -3521,9 +3579,9 @@ mod tests {
         Key, MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate,
         SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
         apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
-        clear_break_stage, command_text, cracks_in_view, escape_route, frame_params, gameplay_key,
-        interpolate_pose, is_enter_press, is_escape_press, is_f3_press, number_key_index,
-        parse_script, parse_server_address, scaled_cursor, screen_click_button,
+        clear_break_stage, command_text, cracks_in_view, escape_route, f3_hold_step, frame_params,
+        gameplay_key, interpolate_pose, is_enter_press, is_escape_press, is_f3_press, is_h_press,
+        number_key_index, parse_script, parse_server_address, scaled_cursor, screen_click_button,
         scripted_chat_click, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
         tooltip_point, void_y_factor,
     };
@@ -3596,6 +3654,28 @@ mod tests {
             ElementState::Pressed,
             &WinitKey::Character("f3".into())
         ));
+    }
+
+    #[test]
+    fn the_f3_hold_tracks_its_edges() {
+        let f3 = &WinitKey::Named(NamedKey::F3);
+        let other = &WinitKey::Character("h".into());
+        assert!(f3_hold_step(false, ElementState::Pressed, f3));
+        assert!(!f3_hold_step(true, ElementState::Released, f3));
+        assert!(f3_hold_step(true, ElementState::Pressed, other));
+        assert!(!f3_hold_step(false, ElementState::Released, other));
+    }
+
+    #[test]
+    fn only_a_fresh_h_press_chords() {
+        let h = PhysicalKey::Code(KeyCode::KeyH);
+        let g = PhysicalKey::Code(KeyCode::KeyG);
+        assert!(is_h_press(ElementState::Pressed, false, h));
+        // A held H's auto-repeat is not a second chord edge: it must not
+        // re-toggle the flag.
+        assert!(!is_h_press(ElementState::Pressed, true, h));
+        assert!(!is_h_press(ElementState::Released, false, h));
+        assert!(!is_h_press(ElementState::Pressed, false, g));
     }
 
     #[test]

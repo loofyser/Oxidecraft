@@ -321,6 +321,20 @@ struct LastClick {
     time: u64,
 }
 
+/// One covered slot's preview: the wire index, the drawn count, and whether
+/// the draw caps it — past the cap the count draws yellow (`drawSlot`'s
+/// capped branch at `GuiContainer.java`:253-264, which states `s` as the
+/// yellow cap while clamping the stack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewSlot {
+    /// The covered wire index, in cover order.
+    pub index: i16,
+    /// The drawn count, clamped to the cap.
+    pub count: i32,
+    /// Whether the raw split ran past the cap: the yellow text's own read.
+    pub capped: bool,
+}
+
 /// The drag's view side: Task 6's [`DragState`] (mode, packed button, covered
 /// slots, remnant cursor) plus the raw pressed button the release compares
 /// (`dragSplittingButton` at :558-564) and the per-slot preview counts
@@ -333,8 +347,26 @@ struct DragRun {
     state: DragState,
     /// The raw pressed button, for the release's cancel compare.
     press: ClickButton,
-    /// The preview count per covered wire index, in cover order.
-    preview: Vec<(i16, i32)>,
+    /// The drag's preview: the wire index, the drawn count and the capped
+    /// read, in cover order.
+    preview: Vec<PreviewSlot>,
+}
+
+/// The drag mode's own base share before any cap: the even split over the
+/// set's size, one item, or the dragged item's own cap (`Container.java`'s
+/// `computeStackSize` arms at :740-752, without the item cap that call folds
+/// in after). The capped read needs the pre-cap base, so it reads these arms
+/// directly rather than reusing that call.
+fn drag_base(mode: i32, cursor: &MetadataItem, set_len: usize, caps: &impl StackCaps) -> i32 {
+    match mode {
+        0 => match i32::try_from(set_len) {
+            Ok(0) | Err(_) => 0,
+            Ok(len) => i32::from(cursor.count) / len,
+        },
+        1 => 1,
+        2 => max_stack_size(cursor, caps),
+        _ => i32::from(cursor.count),
+    }
 }
 
 /// One open container screen: the window it stands on, the view's copies of
@@ -521,9 +553,9 @@ impl ContainerScreen {
             .map(|stack| stack.count)
     }
 
-    /// The drag's per-slot preview counts: the wire index and the drawn
-    /// count, in cover order.
-    pub fn preview(&self) -> &[(i16, i32)] {
+    /// The drag's per-slot preview: the wire index, the drawn count and the
+    /// capped read, in cover order.
+    pub fn preview(&self) -> &[PreviewSlot] {
         self.drag
             .as_ref()
             .map_or(&[], |drag| drag.preview.as_slice())
@@ -557,13 +589,20 @@ impl ContainerScreen {
         let mut preview = Vec::with_capacity(slots.len());
         for slot in &slots {
             let held = stack_of(*slot).map_or(0, |stack| i32::from(stack.count));
-            let mut size =
-                compute_stack_size(mode, &cursor, stack_of(*slot).as_ref(), &others, caps);
-            size = size
-                .min(max_stack_size(&cursor, caps))
-                .min(BASE_MAX_STACK_SIZE);
+            let raw = compute_stack_size(mode, &cursor, stack_of(*slot).as_ref(), &others, caps);
+            let cap = max_stack_size(&cursor, caps).min(BASE_MAX_STACK_SIZE);
+            let size = raw.min(cap);
             remnant -= size - held;
-            preview.push((*slot, size));
+            preview.push(PreviewSlot {
+                index: *slot,
+                count: size,
+                // The capped read compares the mode's own base plus the
+                // held count against the caps (`drawSlot`:253-264 states
+                // the yellow cap past either one). `compute_stack_size`
+                // already folds the item cap in, so the base is re-read
+                // from the mode's own arms here.
+                capped: drag_base(mode, &cursor, others.len(), caps) + held > cap,
+            });
         }
         let mut remnant_stack = cursor;
         remnant_stack.count = remnant.clamp(0, 255) as u8;
@@ -944,6 +983,44 @@ mod unit {
         let draw = screen.cursor_draw((100.0, 50.0)).expect("a cursor draws");
         assert_eq!(draw.stack.count, 0);
         assert_eq!(draw.alt_text, Some(String::from("§e0")));
+    }
+
+    #[test]
+    fn the_capped_preview_marks_its_slots() {
+        static CAPPED_TWO: &[SlotPos] = &[
+            SlotPos {
+                index: 0,
+                x: 8,
+                y: 18,
+            },
+            SlotPos {
+                index: 1,
+                x: 26,
+                y: 18,
+            },
+        ];
+        static CAPPED_LAYOUT: ContainerLayout = ContainerLayout {
+            x_size: 176,
+            y_size: 166,
+            sheet: "unit/capped",
+            slots: CAPPED_TWO,
+            title: TitleKind::Generic,
+        };
+        // Sixty-four shovels (cap 1) split evenly over two slots: the raw
+        // thirty-two runs past the cap, so each preview draws capped at one
+        // (`drawSlot`:253-264 states the yellow cap while clamping).
+        let mut screen = ContainerScreen::new(1, WindowKind::Chest, String::new(), &CAPPED_LAYOUT);
+        screen.apply_snapshot(vec![None, None], Some(stack(256, 64)));
+        screen.mouse_moved(16.0, 26.0, &crate::items::ItemTable);
+        screen.press(ClickButton::Left, false, 1_000);
+        screen.mouse_moved(16.0, 26.0, &crate::items::ItemTable);
+        screen.mouse_moved(34.0, 26.0, &crate::items::ItemTable);
+        let preview = screen.preview();
+        assert_eq!(preview.len(), 2, "both covered slots preview");
+        for entry in preview {
+            assert_eq!(entry.count, 1, "the split clamps to the cap");
+            assert!(entry.capped, "thirty-two past a cap of one caps");
+        }
     }
 
     #[test]
