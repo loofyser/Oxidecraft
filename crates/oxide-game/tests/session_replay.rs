@@ -6949,7 +6949,15 @@ fn a_sign_update_and_editor_open_publish_the_position() {
         })
         .collect();
     assert_eq!(signs.len(), 2, "both packets report: {events:?}");
-    let ClientEvent::SignTextChanged { x, y, z, lines } = signs[0] else {
+    let ClientEvent::SignTextChanged {
+        x,
+        y,
+        z,
+        lines,
+        block_id,
+        metadata,
+    } = signs[0]
+    else {
         panic!("the update publishes first: {:?}", signs[0]);
     };
     assert_eq!(
@@ -6966,6 +6974,11 @@ fn a_sign_update_and_editor_open_publish_the_position() {
             ]
         ),
         "the packed position round-trips, negative z and all"
+    );
+    assert_eq!(
+        (*block_id, *metadata),
+        (0, 0),
+        "no chunk holds the position, so the block rides as air"
     );
     let ClientEvent::SignEditorOpen { x, y, z } = signs[1] else {
         panic!("the editor open publishes behind it: {:?}", signs[1]);

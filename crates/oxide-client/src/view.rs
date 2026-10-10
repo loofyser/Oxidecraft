@@ -342,10 +342,11 @@ pub struct ScreenDrawInput<'a> {
 /// `:245-248`, and a capped one counts yellow), and last the hovered slot's
 /// tooltip over the cursor.
 ///
-/// The declared-but-unimplemented variants (sign, book) and the unknown
+/// The declared-but-unimplemented variant (book) and the unknown
 /// kinds draw the generic frame — the background and the title alone —
 /// until their tasks land their tables (recorded). The inventory screen
-/// landed in Task 20, the creative screen in Task 21.
+/// landed in Task 20, the creative screen in Task 21, the sign editor in
+/// Task 22.
 pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDraw> {
     let Some(screen) = screens.current() else {
         return Vec::new();
@@ -375,7 +376,16 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         ScreenState::Creative(creative) => {
             return push_creative_draws(draws, creative, input, width, height);
         }
-        ScreenState::Sign { .. } | ScreenState::Book { .. } => {
+        // The sign editor draws its own title, lines and Done button over
+        // the background (Task 22); without a measured font the background
+        // alone stands, like the titles that stay out.
+        ScreenState::Sign(editor) => {
+            if let Some(font) = input.font {
+                draws.extend(editor.draws(font, &input.scaled));
+            }
+            return draws;
+        }
+        ScreenState::Book { .. } => {
             return draws;
         }
     };
@@ -10535,10 +10545,16 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_variant_draws_the_generic_frame() {
+    fn the_sign_editor_draws_its_title_lines_and_done() {
+        use oxide_client::screens::sign::{SIGN_DONE_TEXT, SIGN_EDIT_TITLE, SIGN_WIDGETS_SHEET};
         let font = chat_font();
         let mut screens = Screens::default();
-        screens.open_sign(0, 64, 0);
+        screens.open_sign(
+            0,
+            64,
+            0,
+            [String::new(), String::new(), String::new(), String::new()],
+        );
         let scaled = chat_resolution();
         let draws = screen_draws(
             &screens,
@@ -10552,16 +10568,34 @@ mod tests {
                 preview_skin: None,
             },
         );
-        // The world-present gradient alone: top 0xC0101010 over bottom
-        // 0xD0101010 (`GuiScreen.java`:668-683), no sheet and no title until
-        // the variant's task lands it (recorded).
-        assert_eq!(draws.len(), 2, "the background halves alone: {draws:?}");
-        for draw in &draws {
-            assert!(
-                matches!(draw, HudDraw::Rect { .. }),
-                "no textured or text draw: {draw:?}"
-            );
-        }
+        // The background halves, the board backing, the title, the four
+        // lines, the Done blit and its label: 2 + 1 + 1 + 4 + 2.
+        assert_eq!(draws.len(), 10, "the editor's full chrome: {draws:?}");
+        let texts: Vec<&str> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&SIGN_EDIT_TITLE),
+            "the title draws: {texts:?}"
+        );
+        assert!(
+            texts.contains(&SIGN_DONE_TEXT),
+            "the Done label draws: {texts:?}"
+        );
+        assert!(
+            draws.iter().any(|draw| matches!(
+                draw,
+                HudDraw::TexturedRect {
+                    texture: HudTexture::Named(SIGN_WIDGETS_SHEET),
+                    ..
+                }
+            )),
+            "the Done button blits the widgets sheet: {draws:?}"
+        );
     }
 
     #[test]

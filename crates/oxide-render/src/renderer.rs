@@ -18,6 +18,7 @@ use crate::gui_item::ItemIconSource;
 use crate::held_item::{HeldItemFrame, HeldItemPass};
 use crate::hud::{HudDraw, HudPass, ScaledResolution, scaled_resolution};
 use crate::overlay::OverlayPass;
+use crate::sign_text::{SignTextEntry, SignTextPass};
 use crate::sky::{
     CloudPass, SkyParams, SkyPass, SkyTextures, cloud_at_or_above_layer, cloud_under_layer,
 };
@@ -39,6 +40,9 @@ enum SceneDraw {
     /// The entity pass, drawn between the terrain's solid and translucent layers
     /// (`EntityRenderer.java:1402`).
     Entities,
+    /// The signs' front-face text, after the entities: the depth test hides
+    /// text behind blocks, and the text itself writes no depth.
+    SignText,
     /// The terrain's translucent layer, after the entities (`EntityRenderer.java:1467`).
     TerrainTranslucent,
     /// The world overlay: the aimed block's outline and the destroy-stage crack, the source's
@@ -66,6 +70,7 @@ fn scene_draws(camera: &Camera) -> Vec<SceneDraw> {
     }
     draws.push(SceneDraw::Terrain);
     draws.push(SceneDraw::Entities);
+    draws.push(SceneDraw::SignText);
     draws.push(SceneDraw::TerrainTranslucent);
     draws.push(SceneDraw::WorldOverlay);
     if cloud_at_or_above_layer(camera) {
@@ -202,6 +207,9 @@ pub struct Renderer {
     entity_textures: TextureRegistry,
     /// The entities the next frame draws, as the window last set them.
     entities: Vec<EntityDraw>,
+    /// The sign-text pass: the map's entries as board-fixed quads, drawn
+    /// after the entities.
+    sign_pass: SignTextPass,
     /// The boss bar's status cell: the last raised status and the frames left on it,
     /// `None` while the bar is hidden. A frame whose pass raises a wither's or a dragon's
     /// status overwrites it; every other frame's step spends one of its hundred frames
@@ -327,6 +335,7 @@ impl Renderer {
         let depth = DepthTarget::new(&device, config.width, config.height);
         let entity_textures = TextureRegistry::new(&device, &queue);
         let entity_pass = EntityPass::new(&device, &queue, format, entity_textures.layout());
+        let sign_pass = SignTextPass::new(&device, format);
 
         Ok(Self {
             surface,
@@ -348,6 +357,7 @@ impl Renderer {
             entity_pass,
             entity_textures,
             entities: Vec::new(),
+            sign_pass,
             boss_status: None,
             camera: None,
             fog: None,
@@ -438,6 +448,7 @@ impl Renderer {
             .set_font(&self.device, &self.queue, sheet)?;
         self.hud.set_font(&self.device, &self.queue, sheet)?;
         self.screen.set_font(&self.device, &self.queue, sheet)?;
+        self.sign_pass.set_font(&self.device, &self.queue, sheet)?;
         self.overlay.set_font(&self.device, &self.queue, sheet)
     }
 
@@ -616,6 +627,15 @@ impl Renderer {
         self.fog = Some(params);
     }
 
+    /// Sets the sign entries the world draws; empty draws nothing.
+    ///
+    /// The entries are laid out and uploaded on the call, so a frame draws
+    /// exactly the map the caller last set — nothing else, so positions
+    /// outside the map draw no text (the port's no-text rule).
+    pub fn set_sign_texts(&mut self, entries: Vec<SignTextEntry>) {
+        self.sign_pass.upload(&self.device, &self.queue, &entries);
+    }
+
     /// Sets the overlay lines drawn this frame; empty hides the overlay.
     ///
     /// The lines are laid out and uploaded on the call, so a frame draws exactly the lines the
@@ -769,6 +789,7 @@ impl Renderer {
             self.sky.set_camera(&self.queue, camera, aspect);
             self.cloud.set_camera(&self.queue, camera, aspect);
             self.entity_pass.set_camera(camera, aspect);
+            self.sign_pass.set_camera(&self.queue, camera, aspect);
             // The held item's own camera: the hand's projection (`far * 2`, the view
             // effect alone) and the lights turned by the pose.
             self.held_item
@@ -830,6 +851,7 @@ impl Renderer {
                                 &self.entity_textures,
                             );
                         }
+                        SceneDraw::SignText => self.sign_pass.draw(&mut pass),
                         SceneDraw::TerrainTranslucent => self.terrain.draw_translucent(&mut pass),
                         SceneDraw::WorldOverlay => self.world_overlay.draw(&mut pass),
                     }
@@ -1150,6 +1172,7 @@ mod tests {
                 SceneDraw::CloudsUnder,
                 SceneDraw::Terrain,
                 SceneDraw::Entities,
+                SceneDraw::SignText,
                 SceneDraw::TerrainTranslucent,
                 SceneDraw::WorldOverlay
             ]
@@ -1160,6 +1183,7 @@ mod tests {
                 SceneDraw::Sky,
                 SceneDraw::Terrain,
                 SceneDraw::Entities,
+                SceneDraw::SignText,
                 SceneDraw::TerrainTranslucent,
                 SceneDraw::WorldOverlay,
                 SceneDraw::CloudsAtOrAbove

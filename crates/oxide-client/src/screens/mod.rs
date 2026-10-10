@@ -9,8 +9,9 @@
 //! [`Screens`] holds the current screen. Five variants are declared here;
 //! Task 16 wires only the [`ScreenState::Container`] kind's `WindowOpened`
 //! path — the inventory open landed in Task 20, the creative open in Task
-//! 21; the opens for Sign and Book land in Tasks 22-23, and an open for a
-//! declared-but-unimplemented variant draws the generic frame (recorded).
+//! 21, the sign open in Task 22; the book open lands in Task 23, and an
+//! open for a declared-but-unimplemented variant draws the generic frame
+//! (recorded).
 //!
 //! The close rule: every close sends
 //! [`InputEvent::CloseWindow`](oxide_game::input::InputEvent::CloseWindow)
@@ -29,18 +30,22 @@
 //! closing it returns to the game, never to a container beneath — so the
 //! chat over the inventory stashes the screen and its close drops the stash.
 
+use std::collections::HashMap;
+
 use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
 use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
+use sign::{SignMapEntry, SignScreen};
 
 pub mod container;
 pub mod creative;
 pub mod family_a;
 pub mod family_b;
 pub mod inventory;
+pub mod sign;
 
 /// One open screen: a variant per screen the client can stand on.
 #[derive(Debug, Clone)]
@@ -51,15 +56,9 @@ pub enum ScreenState {
     /// The player's own inventory: window 0's 45-slot screen through the
     /// same container path (boxed like the container kind).
     Inventory(Box<ContainerScreen>),
-    /// A sign's editor at the block (Task 22 owns it).
-    Sign {
-        /// The sign's world x.
-        x: i32,
-        /// The sign's world y.
-        y: i32,
-        /// The sign's world z.
-        z: i32,
-    },
+    /// A sign's editor at the block: the `SignEditorOpen` (0x36) path stands
+    /// it on the session map's lines (Task 22 owns it).
+    Sign(Box<SignScreen>),
     /// A written book's screen (Task 23 owns it).
     Book {
         /// The book stack being read.
@@ -83,7 +82,7 @@ impl ScreenState {
                 Some(screen.window_id())
             }
             ScreenState::Creative(_) => Some(0),
-            ScreenState::Sign { .. } | ScreenState::Book { .. } => None,
+            ScreenState::Sign(_) | ScreenState::Book { .. } => None,
         }
     }
 
@@ -110,6 +109,11 @@ pub struct Screens {
     /// `open_creative` stands the screen on it, `close` saves it back —
     /// reopening keeps the last tab within the session.
     creative_tab: u8,
+    /// The last sign text per position: every `SignTextChanged` the frame
+    /// folds lands here, so the `SignEditorOpen` path stands the editor on
+    /// the map's lines — four empty lines when the map holds none (the
+    /// tile's own default). Cleared entries leave with the world.
+    sign_texts: HashMap<(i32, i32, i32), SignMapEntry>,
 }
 
 impl Screens {
@@ -239,10 +243,79 @@ impl Screens {
         Some(InputEvent::OpenInventory)
     }
 
-    /// Opens a sign's editor at the block. The editor lands in Task 22; the
-    /// variant draws the generic frame until then (recorded).
-    pub fn open_sign(&mut self, x: i32, y: i32, z: i32) {
-        self.current = Some(ScreenState::Sign { x, y, z });
+    /// The open sign editor, when the current screen is one: the frame's
+    /// feed, the pointer and the sign keys drive this.
+    pub fn sign_mut(&mut self) -> Option<&mut SignScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Sign(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Opens a sign's editor at the block on the session map's lines: one
+    /// `SignEditorOpen` (0x36) stands it — the lines are the last
+    /// `SignTextChanged` for the position, four empty lines when the map
+    /// holds none (the tile's own default). No guard exists: two opens
+    /// stand two editors.
+    pub fn open_sign(&mut self, x: i32, y: i32, z: i32, lines: [String; 4]) {
+        self.current = Some(ScreenState::Sign(Box::new(SignScreen::new(x, y, z, lines))));
+    }
+
+    /// Folds one sign-text report into the map: the last `SignTextChanged`
+    /// for the position, which the `SignEditorOpen` path reads. The block
+    /// and metadata ride along: the world draw needs the board's kind and
+    /// facing.
+    pub fn note_sign_text(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u16,
+        metadata: u8,
+        lines: [String; 4],
+    ) {
+        self.sign_texts.insert(
+            (x, y, z),
+            SignMapEntry {
+                block_id,
+                metadata,
+                lines,
+            },
+        );
+    }
+
+    /// Drops one sign-text entry: the position's board is gone, so the next
+    /// open stands on four empty lines.
+    pub fn forget_sign_text(&mut self, x: i32, y: i32, z: i32) {
+        self.sign_texts.remove(&(x, y, z));
+    }
+
+    /// The lines the next open at the position stands on: the map's last
+    /// text, four empty lines when it holds none.
+    pub fn sign_lines(&self, x: i32, y: i32, z: i32) -> [String; 4] {
+        self.sign_texts
+            .get(&(x, y, z))
+            .map(|entry| entry.lines.clone())
+            .unwrap_or_default()
+    }
+
+    /// The world draw's entries: the map's positions with their boards and
+    /// lines — nothing else, so positions outside the map draw no text (the
+    /// port's no-text rule).
+    pub fn sign_entries(&self) -> Vec<oxide_render::sign_text::SignTextEntry> {
+        self.sign_texts
+            .iter()
+            .map(
+                |((x, y, z), entry)| oxide_render::sign_text::SignTextEntry {
+                    x: *x,
+                    y: *y,
+                    z: *z,
+                    block_id: entry.block_id,
+                    metadata: entry.metadata,
+                    lines: entry.lines.clone(),
+                },
+            )
+            .collect()
     }
 
     /// Opens a written book's screen. The reader lands in Task 23; the
@@ -280,17 +353,23 @@ impl Screens {
 
     /// Closes the open screen: one `CloseWindow` carrying the screen's own
     /// window id — window 0 included — and the view's cursor copy dropped
-    /// with it. A screen on no window, and no screen at all, send nothing.
-    /// Closing the creative screen remembers its tab for the next open.
+    /// with it. The sign's close answers its own send instead: the update
+    /// with the position and the four lines as edited, on EVERY close
+    /// (`GuiEditSign.onGuiClosed`:52-63, the send at `:59`). A screen on no
+    /// other window, and no screen at all, send nothing. Closing the
+    /// creative screen remembers its tab for the next open.
     pub fn close(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
         if let Some(ScreenState::Creative(screen)) = self.current.as_ref() {
             self.creative_tab = screen.selected_tab();
         }
         let screen = self.current.take()?;
         *cursor = None;
-        screen
-            .window_id()
-            .map(|window_id| InputEvent::CloseWindow { window_id })
+        match &screen {
+            ScreenState::Sign(editor) => Some(editor.close_event()),
+            _ => screen
+                .window_id()
+                .map(|window_id| InputEvent::CloseWindow { window_id }),
+        }
     }
 
     /// One Escape press with the screen on top: the containers close through
@@ -387,6 +466,15 @@ impl Screens {
         }
     }
 
+    /// Steps the open sign editor's blink counter one session tick: the
+    /// editor's own `updateCounter` (`GuiEditSign.updateScreen`:68-71).
+    /// The fold no-ops with no sign open.
+    pub fn tick_sign(&mut self) {
+        if let Some(editor) = self.sign_mut() {
+            editor.tick();
+        }
+    }
+
     /// The chat opens over the screen: the screen stashes and the game shows
     /// the chat. Only the inventory can sit beneath it — containers swallow
     /// the chat key (`allowUserInput` false) — and the stash is dropped, not
@@ -420,6 +508,11 @@ mod tests {
             damage: 0,
             nbt: None,
         })
+    }
+
+    /// Four empty lines: the session map's default for a missing entry.
+    fn empty_sign_lines() -> [String; 4] {
+        [String::new(), String::new(), String::new(), String::new()]
     }
 
     #[test]
@@ -551,8 +644,102 @@ mod tests {
         screens.swap_to_creative();
         assert!(matches!(screens.current(), Some(ScreenState::Creative(_))));
         let mut screens = Screens::default();
-        screens.open_sign(1, 2, 3);
+        screens.open_sign(1, 2, 3, empty_sign_lines());
         screens.swap_to_creative();
-        assert!(matches!(screens.current(), Some(ScreenState::Sign { .. })));
+        assert!(matches!(screens.current(), Some(ScreenState::Sign(_))));
+    }
+
+    #[test]
+    fn the_sign_open_seeds_the_editor_with_the_map_lines() {
+        // The 0x36 path stands the editor on the last `SignTextChanged`
+        // for the position — four empty lines when the map holds none.
+        let mut screens = Screens::default();
+        let map_lines = [
+            "first".to_string(),
+            String::new(),
+            "third".to_string(),
+            String::new(),
+        ];
+        screens.open_sign(4, 65, -9, map_lines.clone());
+        let editor = screens.sign_mut().expect("the sign stands");
+        assert_eq!(editor.position(), (4, 65, -9));
+        assert_eq!(editor.lines(), &map_lines);
+        assert_eq!(editor.edit_line(), 0);
+    }
+
+    #[test]
+    fn the_sign_close_sends_the_update_on_done_and_on_escape() {
+        // `onGuiClosed` sends on every close (`GuiEditSign`:52-63): the
+        // Done button and Escape reach the same close, so both answer the
+        // update — never a window close, the sign stands on no window.
+        for close in [Screens::close, Screens::escape] {
+            let mut screens = Screens::default();
+            screens.open_sign(4, 65, -9, empty_sign_lines());
+            screens
+                .sign_mut()
+                .expect("the sign stands")
+                .type_text("hi", &sign_font());
+            let mut cursor = None;
+            assert_eq!(
+                close(&mut screens, &mut cursor),
+                Some(InputEvent::UpdateSign {
+                    x: 4,
+                    y: 65,
+                    z: -9,
+                    lines: [
+                        "hi".to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new()
+                    ],
+                })
+            );
+            assert!(!screens.is_open(), "the close drops the screen");
+        }
+    }
+
+    #[test]
+    fn the_sign_tick_steps_the_blink_counter() {
+        // The editor's own `updateCounter` (`updateScreen`:68-71): six
+        // ticks hide the markers a fresh open shows.
+        let mut screens = Screens::default();
+        screens.open_sign(0, 64, 0, empty_sign_lines());
+        assert!(screens.sign_mut().expect("the sign stands").blink_visible());
+        for _ in 0..6 {
+            screens.tick_sign();
+        }
+        assert!(!screens.sign_mut().expect("the sign stands").blink_visible());
+        // Anything but the sign no-ops.
+        let mut screens = Screens::default();
+        screens.open_inventory();
+        screens.tick_sign();
+    }
+
+    /// The synthetic sheet's measured font for the close path's typing:
+    /// the `h`/`i` cells ink columns 0..=4, six font pixels each.
+    fn sign_font() -> oxide_assets::font::Font {
+        const SIDE: u32 = 128;
+        const CELL: u32 = 8;
+        let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+        for code in ['h', 'i'] {
+            let code = code as u32;
+            let cell_x = (code % 16) * CELL;
+            let cell_y = (code / 16) * CELL;
+            for row in 0..CELL {
+                for column in 0..=4 {
+                    let offset = (((cell_y + row) * SIDE + cell_x + column) * 4) as usize;
+                    rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        oxide_assets::font::Font::load(
+            &oxide_assets::texture::Texture {
+                width: SIDE,
+                height: SIDE,
+                rgba,
+            },
+            None,
+        )
+        .expect("the synthetic sheet loads")
     }
 }

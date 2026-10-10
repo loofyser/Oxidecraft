@@ -200,7 +200,12 @@ fn only_the_inventory_and_creative_screens_take_user_input() {
     assert!(screens.allow_user_input(), "the inventory sets true");
     screens.open_creative();
     assert!(screens.allow_user_input(), "creative sets true");
-    screens.open_sign(1, 2, 3);
+    screens.open_sign(
+        1,
+        2,
+        3,
+        [String::new(), String::new(), String::new(), String::new()],
+    );
     assert!(
         !screens.allow_user_input(),
         "the sign editor leaves it false"

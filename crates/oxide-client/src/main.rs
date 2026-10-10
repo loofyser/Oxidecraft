@@ -58,7 +58,7 @@ use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
-use oxide_client::screens::{ScreenState, creative, inventory};
+use oxide_client::screens::{ScreenState, creative, inventory, sign::SignScreen};
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -1397,6 +1397,10 @@ impl ClientApp {
                 // book and the anvil blink. The fold no-ops with no family
                 // screen open.
                 self.screens.tick_family();
+                // The sign editor's blink steps on the same tick: the counter
+                // runs from `updateScreen` (`GuiEditSign.java`:68-71). The
+                // fold no-ops with no sign open.
+                self.screens.tick_sign();
                 self.camera.observe(CameraTick {
                     position: [*x, *y, *z],
                     on_ground: *on_ground,
@@ -1637,6 +1641,9 @@ impl ClientApp {
         // The entity pass's own clock, for the held item's glint scroll.
         renderer.set_entity_system_time(system_time_ms());
         renderer.set_hud(hud_draws);
+        // The world's sign text: the map's entries, fed every frame like the
+        // screen group — positions outside the map draw no text.
+        renderer.set_sign_texts(self.screens.sign_entries());
         // The screen group draws above the whole HUD/overlay group: the
         // source's `currentScreen.drawScreen` after the depth clear
         // (`EntityRenderer.java`:1185-1191) — the port's own screen pass, fed
@@ -1995,6 +2002,40 @@ impl ClientApp {
                 screens.set_offers(offers.clone());
                 None
             }
+            // The sign's last text per position: the map the `SignEditorOpen`
+            // path reads (`handleUpdateSign` hands the tile its lines).
+            ClientEvent::SignTextChanged {
+                x,
+                y,
+                z,
+                lines,
+                block_id,
+                metadata,
+            } => {
+                screens.note_sign_text(*x, *y, *z, *block_id, *metadata, lines.clone());
+                None
+            }
+            // The position's board is gone: the map drops the entry, so the
+            // next open stands on four empty lines.
+            ClientEvent::SignTextCleared { x, y, z } => {
+                screens.forget_sign_text(*x, *y, *z);
+                None
+            }
+            // The server's edit request stands the editor on the block: the
+            // map's lines, four empty lines when it holds none (the tile's
+            // own default, `TileEntitySign.java`:24-31). No guard exists —
+            // two opens stand two editors — and the pointer frees like any
+            // other window open (`openEditSign` reaches
+            // `displayGuiScreen(new GuiEditSign(tile))`).
+            ClientEvent::SignEditorOpen { x, y, z } => {
+                let lines = screens.sign_lines(*x, *y, *z);
+                screens.open_sign(*x, *y, *z, lines);
+                tab.open = false;
+                *cursor = None;
+                let step = capture.chat_open();
+                apply_step(window, session, capture, step);
+                None
+            }
             _ => None,
         }
     }
@@ -2094,8 +2135,29 @@ impl ClientApp {
         let PhysicalKey::Code(code) = event.physical_key else {
             return true;
         };
-        if code == KeyCode::KeyE {
+        // The sign editor owns its keys: E types `e` instead of closing —
+        // the editor has no inventory-key close (`keyTyped`:94-121 owns
+        // every key but Escape, which the caller routes).
+        if code == KeyCode::KeyE && self.screens.sign_mut().is_none() {
             self.close_screen(event_loop);
+            return true;
+        }
+        // The sign editor's own keys before the container path: editing
+        // keys navigate and characters type under the 90-pixel cap
+        // (`keyTyped`:94-116); every other key is the editor's to swallow.
+        if self.screens.sign_mut().is_some() {
+            if let Some(key) = keymap::translate(code) {
+                if let Some(screen) = self.screens.sign_mut() {
+                    screen.key(key);
+                }
+            }
+            if let Some(text) = event.text.as_deref() {
+                if let Some(font) = self.font.as_ref() {
+                    if let Some(screen) = self.screens.sign_mut() {
+                        screen.type_text(text, font);
+                    }
+                }
+            }
             return true;
         }
         // The anvil's name field owns every other key while it holds focus
@@ -2358,6 +2420,22 @@ impl ClientApp {
     ) {
         // The open screen holds the click: the container's own press and
         // release run here, above the grabbing click and the gameplay button.
+        // The sign editor's Done button closes the screen — and the close
+        // sends the update (`actionPerformed`:76-86 through
+        // `onGuiClosed`:52-63); any other click is the editor's to swallow.
+        if self.screens.sign_mut().is_some() {
+            if state == ElementState::Pressed {
+                let on_done = self.cursor.is_some_and(|point| {
+                    self.renderer.as_ref().is_some_and(|renderer| {
+                        SignScreen::done_pressed(&renderer.scaled_resolution(), point)
+                    })
+                });
+                if on_done {
+                    self.close_screen(event_loop);
+                }
+            }
+            return;
+        }
         if self.on_screen_button(state, button) {
             return;
         }
@@ -2904,6 +2982,7 @@ fn apply_session_event(
         | ClientEvent::Effects { .. }
         | ClientEvent::SignEditorOpen { .. }
         | ClientEvent::SignTextChanged { .. }
+        | ClientEvent::SignTextCleared { .. }
         | ClientEvent::MerchantOffers { .. } => false,
         ClientEvent::Disconnected { reason } => {
             tracing::info!(%reason, "the session ended");

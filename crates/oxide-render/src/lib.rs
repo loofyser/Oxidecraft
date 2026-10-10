@@ -15,6 +15,7 @@ pub mod hud;
 pub mod lightmap;
 pub mod overlay;
 pub mod renderer;
+pub mod sign_text;
 pub mod sky;
 pub mod terrain;
 pub mod terrain_pass;

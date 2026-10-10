@@ -674,7 +674,9 @@ pub enum ClientEvent {
     /// A sign's text arrived, from clientbound 0x33.
     ///
     /// The lines travel as sent — chat JSON — and the session's sign map holds
-    /// the last text per position for the view that draws the sign.
+    /// the last text per position for the view that draws the sign. The
+    /// block the store holds at the position rides along, so the draw knows
+    /// the board's variant and orientation without a block query of its own.
     SignTextChanged {
         /// The sign's world x.
         x: i32,
@@ -684,6 +686,28 @@ pub enum ClientEvent {
         z: i32,
         /// The four lines, as sent.
         lines: [String; 4],
+        /// The block id the store holds at the position (`63` standing,
+        /// `68` wall; anything else — usually air — when the text arrived
+        /// before its block).
+        block_id: u16,
+        /// The metadata nibble the store holds at the position: the
+        /// standing sign's rotation 0..15, the wall sign's facing.
+        metadata: u8,
+    },
+    /// A mapped sign's block stopped being a sign, from a block change, a
+    /// chunk load or an unload.
+    ///
+    /// A port rule (recorded): the source has no such event — its tile
+    /// entity dies with the block — but the port's view keeps its own copy
+    /// of the map and must drop the entry, or the text would float where
+    /// no board stands.
+    SignTextCleared {
+        /// The sign's world x.
+        x: i32,
+        /// The sign's world y.
+        y: i32,
+        /// The sign's world z.
+        z: i32,
     },
     /// A merchant's trade list, from the `MC|TrList` custom payload.
     ///
@@ -717,11 +741,41 @@ pub struct StatusEffect {
 /// One sign's last text, keyed by its position in the session's sign map.
 ///
 /// The lines are the source's chat components as sent; the sign they are drawn
-/// on is the world's, and an entry arrives only from clientbound 0x33.
+/// on is the world's, and an entry arrives only from clientbound 0x33. The
+/// block rides along so the draw knows the board's variant and orientation.
+///
+/// There is NO all-empty clearing rule: S33 always carries four strings and
+/// the map is insert-only — an entry leaves only when its block stops being
+/// a sign (a port rule, reported as [`ClientEvent::SignTextCleared`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SignText {
     /// The four lines, as sent.
     pub lines: [String; 4],
+    /// The block id the store held at the position when the text arrived.
+    pub block_id: u16,
+    /// The metadata nibble the store held at the position then.
+    pub metadata: u8,
+}
+
+/// The standing sign's block id (`Block.java`:1321).
+pub const SIGN_STANDING_ID: u16 = 63;
+/// The wall sign's block id (`Block.java`:1326).
+pub const SIGN_WALL_ID: u16 = 68;
+
+/// Whether the block id is a sign's: the standing and wall variants alone.
+pub fn is_sign_block(block_id: u16) -> bool {
+    block_id == SIGN_STANDING_ID || block_id == SIGN_WALL_ID
+}
+
+/// The packed store value's block id: the value shifted down four
+/// (`world_view`'s own split).
+pub fn block_id_of(packed: u16) -> u16 {
+    packed >> 4
+}
+
+/// The packed store value's metadata nibble.
+pub fn block_meta_of(packed: u16) -> u8 {
+    (packed & 0xF) as u8
 }
 
 /// Something went wrong in the session.
@@ -1268,6 +1322,14 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // tracked entities and the list go with it
                                 // (`NetHandlerPlayClient.handleRespawn`).
                                 entities.clear();
+                                // The signs go with that world too: every
+                                // mapped entry clears, so the view drops a
+                                // text no board stands behind anymore.
+                                let gone: Vec<(i32, i32, i32)> = signs.keys().copied().collect();
+                                for (x, y, z) in gone {
+                                    signs.remove(&(x, y, z));
+                                    report(events, ClientEvent::SignTextCleared { x, y, z });
+                                }
                                 let list_before = std::mem::take(&mut player_list);
                                 // The rebuilt world reports the emptied list
                                 // at once.
@@ -1432,8 +1494,21 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         column.chunk_x,
                                         column.chunk_z,
                                     );
+                                    refresh_sign_column(
+                                        store,
+                                        &mut signs,
+                                        events,
+                                        column.chunk_x,
+                                        column.chunk_z,
+                                    );
                                 } else {
                                     queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
+                                    drop_sign_column(
+                                        &mut signs,
+                                        events,
+                                        column.chunk_x,
+                                        column.chunk_z,
+                                    );
                                     report(
                                         events,
                                         ClientEvent::ChunkUnloaded {
@@ -1460,8 +1535,21 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                             column.chunk_x,
                                             column.chunk_z,
                                         );
+                                        refresh_sign_column(
+                                            store,
+                                            &mut signs,
+                                            events,
+                                            column.chunk_x,
+                                            column.chunk_z,
+                                        );
                                     } else {
                                         queue.mark_column_unloaded(column.chunk_x, column.chunk_z);
+                                        drop_sign_column(
+                                            &mut signs,
+                                            events,
+                                            column.chunk_x,
+                                            column.chunk_z,
+                                        );
                                         report(
                                             events,
                                             ClientEvent::ChunkUnloaded {
@@ -1485,6 +1573,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     change.z,
                                     change.value,
                                 );
+                                refresh_sign_at(
+                                    store, &mut signs, events, change.x, change.y, change.z,
+                                );
                             }
                             None => {
                                 warn!("a block change arrived before Join Game built the world")
@@ -1500,6 +1591,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     change.chunk_z,
                                     &change.updates,
                                 )?;
+                                refresh_sign_column(
+                                    store,
+                                    &mut signs,
+                                    events,
+                                    change.chunk_x,
+                                    change.chunk_z,
+                                );
                             }
                             None => {
                                 warn!(
@@ -2121,11 +2219,21 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             let sign = decoded(id, UpdateSign::decode(body))?;
                             // The last text per position is the view's to
                             // draw; the lines travel as sent
-                            // (`handleUpdateSign:1234-1261`).
+                            // (`handleUpdateSign:1234-1261`). The block the
+                            // store holds rides along for the board's
+                            // variant and orientation — air when the text
+                            // arrived before its chunk.
+                            let packed = world
+                                .as_ref()
+                                .map(|store| store.block(sign.x, sign.y, sign.z))
+                                .unwrap_or(0);
+                            let (block_id, metadata) = (block_id_of(packed), block_meta_of(packed));
                             signs.insert(
                                 (sign.x, sign.y, sign.z),
                                 SignText {
                                     lines: sign.lines.clone(),
+                                    block_id,
+                                    metadata,
                                 },
                             );
                             report(
@@ -2135,6 +2243,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     y: sign.y,
                                     z: sign.z,
                                     lines: sign.lines,
+                                    block_id,
+                                    metadata,
                                 },
                             );
                         }
@@ -3615,6 +3725,98 @@ fn apply_block_change(
     let cx = x.div_euclid(SECTION_SIZE as i32);
     let cz = z.div_euclid(SECTION_SIZE as i32);
     mark_recompute_region(store, queue, cx, cz);
+}
+
+/// Re-reads the block at a mapped sign position after the store moved: a
+/// sign block refreshes the entry's variant and orientation (re-reported so
+/// the view's copy follows), anything else drops the entry and reports the
+/// clear. Unmapped positions, and refreshes that change nothing, answer
+/// false.
+fn refresh_sign_at(
+    store: &World,
+    signs: &mut BTreeMap<(i32, i32, i32), SignText>,
+    events: &Sender<ClientEvent>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    let (lines, old_id, old_meta) = match signs.get(&(x, y, z)) {
+        Some(entry) => (entry.lines.clone(), entry.block_id, entry.metadata),
+        None => return false,
+    };
+    let packed = store.block(x, y, z);
+    let (block_id, metadata) = (block_id_of(packed), block_meta_of(packed));
+    if !is_sign_block(block_id) {
+        signs.remove(&(x, y, z));
+        report(events, ClientEvent::SignTextCleared { x, y, z });
+        return true;
+    }
+    if (old_id, old_meta) == (block_id, metadata) {
+        return false;
+    }
+    signs.insert(
+        (x, y, z),
+        SignText {
+            lines: lines.clone(),
+            block_id,
+            metadata,
+        },
+    );
+    report(
+        events,
+        ClientEvent::SignTextChanged {
+            x,
+            y,
+            z,
+            lines,
+            block_id,
+            metadata,
+        },
+    );
+    true
+}
+
+/// Re-reads every mapped sign in the column after a chunk or multi-block
+/// write landed.
+fn refresh_sign_column(
+    store: &World,
+    signs: &mut BTreeMap<(i32, i32, i32), SignText>,
+    events: &Sender<ClientEvent>,
+    cx: i32,
+    cz: i32,
+) {
+    let positions: Vec<(i32, i32, i32)> = signs
+        .keys()
+        .filter(|(x, _, z)| {
+            x.div_euclid(SECTION_SIZE as i32) == cx && z.div_euclid(SECTION_SIZE as i32) == cz
+        })
+        .copied()
+        .collect();
+    for (x, y, z) in positions {
+        refresh_sign_at(store, signs, events, x, y, z);
+    }
+}
+
+/// Drops every mapped sign in the column, reporting each clear: the column
+/// unloaded (or arrived empty), and the server re-sends the tile entities
+/// with the next load.
+fn drop_sign_column(
+    signs: &mut BTreeMap<(i32, i32, i32), SignText>,
+    events: &Sender<ClientEvent>,
+    cx: i32,
+    cz: i32,
+) {
+    let positions: Vec<(i32, i32, i32)> = signs
+        .keys()
+        .filter(|(x, _, z)| {
+            x.div_euclid(SECTION_SIZE as i32) == cx && z.div_euclid(SECTION_SIZE as i32) == cz
+        })
+        .copied()
+        .collect();
+    for (x, y, z) in positions {
+        signs.remove(&(x, y, z));
+        report(events, ClientEvent::SignTextCleared { x, y, z });
+    }
 }
 
 /// The refusal a Multi Block Change coordinate that cannot compose a block

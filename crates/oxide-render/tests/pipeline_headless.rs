@@ -56,6 +56,7 @@ use std::sync::mpsc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
+use oxide_assets::font::Font;
 use oxide_assets::model::Transform;
 use oxide_assets::texture::Texture;
 use oxide_render::camera::{
@@ -79,6 +80,7 @@ use oxide_render::sky::{
 };
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
+use oxide_render::text::string_width;
 use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline, WorldOverlay};
 
 use glam::Vec3;
@@ -10584,4 +10586,288 @@ fn t21_creative_draws_strip_grid_thumb_search_and_bin() {
         "the delete cell's magenta",
     );
     expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// Task 22's editor case: the editor's content through the real screen pass — the board
+/// backing in its brown, the white title, and the editing line with the cursor wrap
+/// (`"> || <"`): the `>`/`<` brackets are the cursor, glyph pixels on both sides.
+/// Positions are measured with the same width law the pass lays out with, so the pens
+/// agree by construction; the asserts pin the pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t22_sign_editor_draws_text_and_cursor() {
+    const WIDE: f32 = 448.0;
+    const TALL: f32 = 240.0;
+
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let depth = rows_depth(&device);
+    let sheet = t22_font_sheet();
+    let font = Font::load(&sheet, None).expect("the synthetic sheet is a 16x16 grid");
+    let title = "Edit sign message";
+    let line = "> || <";
+    // The editor's own centring (`draws`): title at y 40, the first line at y 80.
+    let title_x = WIDE / 2.0 - f64::from(string_width(&font, title)) as f32 / 2.0;
+    let line_x = WIDE / 2.0 - f64::from(string_width(&font, line)) as f32 / 2.0;
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, WIDE, TALL);
+    screen
+        .set_font(&device, &queue, &sheet)
+        .expect("the synthetic sheet is a 16x16 grid");
+    screen.set_draws(
+        &device,
+        &queue,
+        &[
+            // The board backing (the editor's brown), the title and the editing line.
+            HudDraw::Rect {
+                x: WIDE / 2.0 - 53.0,
+                y: 76.0,
+                width: 106.0,
+                height: 46.0,
+                colour: [0.55, 0.42, 0.28, 1.0],
+            },
+            HudDraw::Text {
+                text: title.to_string(),
+                x: title_x,
+                y: 40.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: true,
+            },
+            HudDraw::Text {
+                text: line.to_string(),
+                x: line_x,
+                y: 80.0,
+                scale: 1.0,
+                colour: [0.0, 0.0, 0.0, 1.0],
+                shadow: false,
+                blend: true,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t22 editor headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+    let pixels = read_rows_pixels(&device, &queue, &target);
+    // The board backing's bytes: 0.55/0.42/0.28 of 255, rounded.
+    let board = [
+        (0.55f32 * 255.0).round() as u8,
+        (0.42f32 * 255.0).round() as u8,
+        (0.28f32 * 255.0).round() as u8,
+    ];
+    expect_rows(
+        &pixels,
+        WIDE as u32 / 2,
+        100,
+        board,
+        "the editor's board backing",
+    );
+    // The white title's first cell inks at the measured pen.
+    expect_rows(
+        &pixels,
+        title_x as u32,
+        40,
+        [255, 255, 255],
+        "the title's first glyph",
+    );
+    // The editing line: the bars ink, and the cursor wrap brackets both sides.
+    expect_rows(&pixels, line_x as u32 + 6, 80, [0, 0, 0], "the line's bars");
+    expect_rows(
+        &pixels,
+        line_x as u32,
+        80,
+        [0, 0, 0],
+        "the cursor's opening bracket",
+    );
+    expect_rows(
+        &pixels,
+        line_x as u32 + 14,
+        80,
+        [0, 0, 0],
+        "the cursor's closing bracket",
+    );
+}
+
+/// Task 22's lettered sheet: the title and cursor cells inked in their first column —
+/// `E d i t s g n m a D o > < |` — so every one advances two font pixels and the pens
+/// the test measures match the pass's layout. Generated here; no asset pixel is embedded.
+fn t22_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for code in [
+        'E', 'd', 'i', 't', 's', 'g', 'n', 'm', 'a', 'D', 'o', '>', '<', '|',
+    ] {
+        let code = code as u32;
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// Task 22's close-up camera: the eye at the board's height, looking straight at the
+/// sign's face from one block out, so the ~0.4-world-unit text fills the 64x64 target.
+fn t22_camera() -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: [0.5, 1.5 - f64::from(EYE_HEIGHT), 1.6],
+            yaw: 180.0,
+            pitch: 0.0,
+            sneak: false,
+        },
+        fov_degrees: DEFAULT_FOV,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
+}
+
+/// One sign-text render: the entries through the sign pass alone over the sky clear,
+/// read back for the ink census.
+fn t22_sign_pixels(entries: &[oxide_render::sign_text::SignTextEntry]) -> Vec<u8> {
+    use oxide_render::sign_text::SignTextPass;
+
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+    let mut pass = SignTextPass::new(&device, format);
+    pass.set_camera(&queue, t22_camera(), 1.0);
+    pass.set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    pass.upload(&device, &queue, entries);
+    render_scene(&device, &queue, &target, &depth, |pass_in| {
+        pass.draw(pass_in);
+    })
+}
+
+/// The ink census of a 64x64 read-back: the non-sky pixels' bounding box and count.
+/// Pixel counts are reflection-invariant, so the orientation pins below compare box
+/// sides and widths across facings — never bare counts.
+fn t22_ink_census(pixels: &[u8]) -> Option<(u32, u32, u32, u32, usize)> {
+    let mut ink: Vec<(u32, u32)> = Vec::new();
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            if pixel(pixels, x, y) != SKY {
+                ink.push((x, y));
+            }
+        }
+    }
+    if ink.is_empty() {
+        return None;
+    }
+    let min_x = ink.iter().map(|&(x, _)| x).min().expect("ink");
+    let max_x = ink.iter().map(|&(x, _)| x).max().expect("ink");
+    let min_y = ink.iter().map(|&(_, y)| y).min().expect("ink");
+    let max_y = ink.iter().map(|&(_, y)| y).max().expect("ink");
+    Some((min_x, max_x, min_y, max_y, ink.len()))
+}
+
+/// Task 22's floor-sign case: a standing sign's text at rotation 0 lies flat on the
+/// board face, spreading along the world's x-axis — while the same text at rotation 4
+/// (a quarter turn) spreads along the depth axis and collapses on screen.
+///
+/// The width comparison is the orientation pin: a billboard, a mirrored quad or a
+/// rotation-ignoring draw renders both rotations equally wide and fails it; the side
+/// (wide at rotation 0) and the margin are recorded here.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t22_sign_floor_text_turns_with_its_rotation() {
+    use oxide_render::sign_text::SignTextEntry;
+
+    let lines = || ["|".repeat(20), String::new(), String::new(), String::new()];
+    let flat = t22_sign_pixels(&[SignTextEntry {
+        x: 0,
+        y: 1,
+        z: 0,
+        block_id: 63,
+        metadata: 0,
+        lines: lines(),
+    }]);
+    let turned = t22_sign_pixels(&[SignTextEntry {
+        x: 0,
+        y: 1,
+        z: 0,
+        block_id: 63,
+        metadata: 4,
+        lines: lines(),
+    }]);
+    let (flat_min, flat_max, _, _, flat_count) =
+        t22_ink_census(&flat).expect("rotation 0 leaves ink");
+    // The quarter turn stands the text along the depth axis: edge-on, it
+    // leaves a sliver at most — no census at all when the sliver misses.
+    let turned_wide = t22_ink_census(&turned)
+        .map(|(min, max, _, _, _)| max - min)
+        .unwrap_or(0);
+    let flat_wide = flat_max - flat_min;
+    assert!(flat_count > 0, "rotation 0 inks pixels");
+    // The recorded side and margin: rotation 0 spreads wide, rotation 4 stands narrow.
+    assert!(
+        flat_wide >= turned_wide + 8,
+        "rotation 0 (wide {flat_wide}) must outspread rotation 4 (narrow {turned_wide}) by 8px"
+    );
+}
+
+/// Task 22's wall-sign case: a wall sign with facing 2 shows its face (and its text)
+/// to this camera, while facing 4 turns the board edge-on and the ink collapses to a
+/// sliver.
+///
+/// The width comparison is the orientation pin: a facing-ignoring draw shows both
+/// equally wide and fails it; the side (wide at facing 2) and the margin are recorded
+/// here.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t22_sign_wall_text_turns_with_its_facing() {
+    use oxide_render::sign_text::SignTextEntry;
+
+    let lines = || ["|".repeat(20), String::new(), String::new(), String::new()];
+    let faced = t22_sign_pixels(&[SignTextEntry {
+        x: 0,
+        y: 1,
+        z: 0,
+        block_id: 68,
+        metadata: 2,
+        lines: lines(),
+    }]);
+    let edged = t22_sign_pixels(&[SignTextEntry {
+        x: 0,
+        y: 1,
+        z: 0,
+        block_id: 68,
+        metadata: 4,
+        lines: lines(),
+    }]);
+    let (faced_min, faced_max, _, _, faced_count) =
+        t22_ink_census(&faced).expect("facing 2 leaves ink");
+    // Facing 4 turns the board edge-on: the face offset leaves a sliver at
+    // most — no census at all when the sliver misses.
+    let edged_wide = t22_ink_census(&edged)
+        .map(|(min, max, _, _, _)| max - min)
+        .unwrap_or(0);
+    let faced_wide = faced_max - faced_min;
+    // The recorded side and margin: facing 2 spreads wide, facing 4 stands narrow.
+    assert!(
+        faced_count > 40,
+        "facing 2 inks the face, got {faced_count}"
+    );
+    assert!(
+        faced_wide >= edged_wide + 8,
+        "facing 2 (wide {faced_wide}) must outspread facing 4 (narrow {edged_wide}) by 8px"
+    );
 }
