@@ -51,8 +51,11 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///   (`GuiScreenHorseInventory.java`:12) and `inventory`
 ///   (`GuiInventory.java`:85-89 binds `inventoryBackground`), all under
 ///   `gui/container/`, plus the creative strip `creative_inventory/tabs`
-///   (`GuiContainerCreative.java`:38) and the twelve per-tab panels
-///   `creative_inventory/tab_<name>` (`:692-693`).
+///   (`GuiContainerCreative.java`:38) and the three panel sheets
+///   `creative_inventory/tab_items`, `tab_item_search` and `tab_inventory`
+///   (`tab_ + getBackgroundImageName()`, `:692`; the default `items.png`,
+///   the search override `item_search.png`, the inventory override
+///   `inventory.png` — `CreativeTabs.java`:61,103,108,158-165).
 /// - `gui/book` — the written book's frame (`GuiScreenBook.java`:33).
 /// - `entity/enchanting_table_book` — the enchanting table's book render
 ///   (`GuiEnchantment.java`:33, `TileEntityEnchantmentTableRenderer.java`:13).
@@ -65,7 +68,7 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///
 /// The hud's icon sheet, `gui/icons`, already travels under its own
 /// client-side name and is not repeated here.
-pub const GUI_SHEETS: [&str; 32] = [
+pub const GUI_SHEETS: [&str; 23] = [
     "gui/widgets",
     "gui/container/generic_54",
     "gui/container/dispenser",
@@ -80,17 +83,8 @@ pub const GUI_SHEETS: [&str; 32] = [
     "gui/container/horse",
     "gui/container/inventory",
     "gui/container/creative_inventory/tabs",
-    "gui/container/creative_inventory/tab_buildingBlocks",
-    "gui/container/creative_inventory/tab_decorations",
-    "gui/container/creative_inventory/tab_redstone",
-    "gui/container/creative_inventory/tab_transportation",
-    "gui/container/creative_inventory/tab_misc",
-    "gui/container/creative_inventory/tab_search",
-    "gui/container/creative_inventory/tab_food",
-    "gui/container/creative_inventory/tab_tools",
-    "gui/container/creative_inventory/tab_combat",
-    "gui/container/creative_inventory/tab_brewing",
-    "gui/container/creative_inventory/tab_materials",
+    "gui/container/creative_inventory/tab_items",
+    "gui/container/creative_inventory/tab_item_search",
     "gui/container/creative_inventory/tab_inventory",
     "gui/book",
     "entity/enchanting_table_book",
@@ -356,13 +350,43 @@ mod tests {
     }
 
     /// The list names the source's own sheets: the widgets sheet, the twelve
-    /// container frames, the two book sheets, the SGA glyph sheet and the chest
-    /// trio's icon sheets — extensionless keys, `gui/icons` not among them (the
-    /// hud's icon sheet travels under its own client-side name).
+    /// container frames, the creative strip with the THREE source panel sheets
+    /// (`tab_items` for the ten default tabs, `tab_item_search` for search,
+    /// `tab_inventory` for inventory — `GuiContainerCreative.java:692`,
+    /// `CreativeTabs.java:61,103,108,158-165`), the two book sheets, the SGA
+    /// glyph sheet and the chest trio's icon sheets — extensionless keys,
+    /// `gui/icons` not among them (the hud's icon sheet travels under its own
+    /// client-side name). Final list: `gui/widgets`, the twelve
+    /// `gui/container/` frames (`generic_54`, `dispenser`, `hopper`,
+    /// `furnace`, `brewing_stand`, `crafting_table`, `enchanting_table`,
+    /// `anvil`, `beacon`, `villager`, `horse`, `inventory`),
+    /// `gui/container/creative_inventory/tabs` + `tab_items` +
+    /// `tab_item_search` + `tab_inventory`, `gui/book`,
+    /// `entity/enchanting_table_book`, `font/ascii_sga`,
+    /// `entity/chest/normal`, `entity/chest/trapped`, `entity/chest/ender` —
+    /// 23 entries, no per-tab `tab_<label>` phantom.
     #[test]
     fn the_gui_sheet_list_names_the_sources_own_sheets() {
+        for phantom in [
+            "gui/container/creative_inventory/tab_buildingBlocks",
+            "gui/container/creative_inventory/tab_decorations",
+            "gui/container/creative_inventory/tab_redstone",
+            "gui/container/creative_inventory/tab_transportation",
+            "gui/container/creative_inventory/tab_misc",
+            "gui/container/creative_inventory/tab_search",
+            "gui/container/creative_inventory/tab_food",
+            "gui/container/creative_inventory/tab_tools",
+            "gui/container/creative_inventory/tab_combat",
+            "gui/container/creative_inventory/tab_brewing",
+            "gui/container/creative_inventory/tab_materials",
+        ] {
+            assert!(
+                !GUI_SHEETS.contains(&phantom),
+                "{phantom} is an invented per-tab name, not a source sheet"
+            );
+        }
         assert_eq!(
-            GUI_SHEETS,
+            &GUI_SHEETS[..],
             [
                 "gui/widgets",
                 "gui/container/generic_54",
@@ -378,17 +402,8 @@ mod tests {
                 "gui/container/horse",
                 "gui/container/inventory",
                 "gui/container/creative_inventory/tabs",
-                "gui/container/creative_inventory/tab_buildingBlocks",
-                "gui/container/creative_inventory/tab_decorations",
-                "gui/container/creative_inventory/tab_redstone",
-                "gui/container/creative_inventory/tab_transportation",
-                "gui/container/creative_inventory/tab_misc",
-                "gui/container/creative_inventory/tab_search",
-                "gui/container/creative_inventory/tab_food",
-                "gui/container/creative_inventory/tab_tools",
-                "gui/container/creative_inventory/tab_combat",
-                "gui/container/creative_inventory/tab_brewing",
-                "gui/container/creative_inventory/tab_materials",
+                "gui/container/creative_inventory/tab_items",
+                "gui/container/creative_inventory/tab_item_search",
                 "gui/container/creative_inventory/tab_inventory",
                 "gui/book",
                 "entity/enchanting_table_book",

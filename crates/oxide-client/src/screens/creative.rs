@@ -212,21 +212,15 @@ pub const PLAYER_SLOTS: usize = 45;
 pub const TABS_SHEET: &str = "gui/container/creative_inventory/tabs";
 
 /// The panel sheet for a tab, under the port's named-texture key
-/// (`…/creative_inventory/tab_<name>`, `:692-693`).
+/// (`…/creative_inventory/tab_ + getBackgroundImageName()`, `:692`): the
+/// TAB META sheet rows carry the source's own mapping — the default
+/// `items.png`, the search override `item_search.png`, the inventory
+/// override `inventory.png` (`CreativeTabs.java:61,103,108,158-165`).
 pub fn panel_sheet(tab: CreativeTab) -> &'static str {
-    match tab {
-        CreativeTab::BuildingBlocks => "gui/container/creative_inventory/tab_buildingBlocks",
-        CreativeTab::Decorations => "gui/container/creative_inventory/tab_decorations",
-        CreativeTab::Redstone => "gui/container/creative_inventory/tab_redstone",
-        CreativeTab::Transportation => "gui/container/creative_inventory/tab_transportation",
-        CreativeTab::Misc => "gui/container/creative_inventory/tab_misc",
-        CreativeTab::Search => "gui/container/creative_inventory/tab_search",
-        CreativeTab::Food => "gui/container/creative_inventory/tab_food",
-        CreativeTab::Tools => "gui/container/creative_inventory/tab_tools",
-        CreativeTab::Combat => "gui/container/creative_inventory/tab_combat",
-        CreativeTab::Brewing => "gui/container/creative_inventory/tab_brewing",
-        CreativeTab::Materials => "gui/container/creative_inventory/tab_materials",
-        CreativeTab::Inventory => "gui/container/creative_inventory/tab_inventory",
+    match tab.sheet() {
+        "item_search.png" => "gui/container/creative_inventory/tab_item_search",
+        "inventory.png" => "gui/container/creative_inventory/tab_inventory",
+        _ => "gui/container/creative_inventory/tab_items",
     }
 }
 
@@ -2174,5 +2168,46 @@ mod tests {
     #[test]
     fn the_default_tab_is_zero() {
         assert_eq!(CreativeScreen::new(0).selected_tab(), 0);
+    }
+
+    #[test]
+    fn every_tab_resolves_its_source_panel_sheet() {
+        // The source binds `tab_ + getBackgroundImageName()`
+        // (`GuiContainerCreative.java:692`): the default `items.png` for ten
+        // of the twelve tabs, the search override `item_search.png`, the
+        // inventory override `inventory.png` (`CreativeTabs.java:61,103,108,
+        // 158-165`). Final store keys: `tab_items` (10 tabs), `tab_item_search`
+        // (search), `tab_inventory` (inventory).
+        assert_eq!(
+            panel_sheet(CreativeTab::Search),
+            "gui/container/creative_inventory/tab_item_search",
+            "the search tab's override sheet"
+        );
+        assert_eq!(
+            panel_sheet(CreativeTab::Inventory),
+            "gui/container/creative_inventory/tab_inventory",
+            "the inventory tab's override sheet"
+        );
+        let defaults = CreativeTab::ALL
+            .iter()
+            .filter(|tab| panel_sheet(**tab) == "gui/container/creative_inventory/tab_items")
+            .count();
+        assert_eq!(
+            defaults, 10,
+            "ten of the twelve tabs resolve the default sheet"
+        );
+        for tab in CreativeTab::ALL {
+            let want = match tab.sheet() {
+                "item_search.png" => "gui/container/creative_inventory/tab_item_search",
+                "inventory.png" => "gui/container/creative_inventory/tab_inventory",
+                _ => "gui/container/creative_inventory/tab_items",
+            };
+            assert_eq!(
+                panel_sheet(tab),
+                want,
+                "tab {} resolves its TAB META row",
+                tab.label()
+            );
+        }
     }
 }
