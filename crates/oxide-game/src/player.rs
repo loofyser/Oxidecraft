@@ -366,7 +366,7 @@ impl Player {
     /// The player-local half of a respawn reset (clientbound 0x07).
     ///
     /// The source answers a respawn by building a fresh `EntityPlayerSP` and
-    /// spawning it in (`Minecraft.setDimensionAndSpawnPlayer:2430-2464`): the
+    /// spawning it in (`Minecraft.setDimensionAndSpawnPlayer:2430-2463`): the
     /// entity id and the client brand carry over, while every other transient
     /// field starts over — the fresh player begins at the origin
     /// (`Entity.java:278`) — and `preparePlayerToSpawn` zeroes the motion and
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn the_respawn_reset_clears_the_transients_and_keeps_the_abilities() {
-        // `Minecraft.setDimensionAndSpawnPlayer:2430-2464` with
+        // `Minecraft.setDimensionAndSpawnPlayer:2430-2463` with
         // `EntityPlayer.preparePlayerToSpawn:578-583`: motion, pitch, the hurt
         // flash, the death state and every movement transient start over; the
         // health returns to its maximum; the abilities the server last stated

@@ -221,7 +221,7 @@ fn the_sky_mix_carries_the_fog_towards_the_biomes_sky_colour() {
     // `1 - (0.25 + 0.75 * 8 / 32)^(1/4)` = 0.186711... fraction of the way to the sky colour
     // (`EntityRenderer.java:1767-1768`, `:1803-1805`), and the level-15 light factor is one
     // (`:362-365`). Before this step the client handed the frame the raw base, whose bytes are
-    // `(191, 215, 255)` — the band's uniform nine-to-fourteen count difference.
+    // `(192, 216, 255)` — the band's uniform nine-to-fourteen count difference.
     let band = fog_colour(0, 6000.0, 150.0, 0.03125, SAVANNA_SKY, 8, 15);
     assert_eq!(bytes(band), [178, 207, 255]);
     // The mixed value itself, to a float: 0.18671173 of the way from `(0.7529412, ...)` to

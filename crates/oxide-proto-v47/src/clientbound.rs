@@ -219,8 +219,9 @@ impl JoinGame {
 ///
 /// The world's age in ticks and its time of day in ticks, both big-endian `i64`s
 /// (`S03PacketTimeUpdate.java:36-49`). The server negates the time of day to freeze the
-/// sun (`:17-31`), so a negative [`Self::time_of_day`] is kept as received rather than
-/// normalised; the age is the counter that never stops.
+/// sun (`:17-31`), so [`Self::decode`] keeps a negative [`Self::time_of_day`] as received
+/// rather than normalising it — the session's receive rule (`received_time_of_day`)
+/// does the negation; the age is the counter that never stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeUpdate {
     /// The world's age in ticks.

@@ -617,7 +617,9 @@ pub fn placement_cursor(aim: &Aim) -> [u8; 3] {
 /// The target must then accept the block: the block there must itself be
 /// [`replaceable`], `World.canBlockBePlaced`'s material clause
 /// (`world/World.java:3153-3157`; with the null entity `ItemBlock` passes at
-/// `:56` its bounding-box clause never refuses), and the target must lie
+/// `ItemBlock.java:56`, whose bounding-box clause refuses only when a
+/// spawn-blocking entity occupies the box (`World.java:1960-1975`; the flag is set
+/// at `EntityLivingBase.java:202`)), and the target must lie
 /// inside the world's build range, 0 through 255 — the range the world's own
 /// write path takes (`World::block` answers air outside it, `World::set_block`
 /// refuses it).
@@ -2624,7 +2626,7 @@ mod tests {
     #[test]
     fn the_mode_from_a_change_game_state_value_follows_the_source() {
         // `NetHandlerPlayClient.handleChangeGameState` floors the wire float —
-        // `MathHelper.floor_float(f + 0.5F)` (`:1362`) — and asks
+        // `MathHelper.floor_float(f + 0.5F)` (`:1364`) — and asks
         // `WorldSettings.GameType.getByID` (`:1383`), whose exact matches are
         // the enum's ids and whose fallback is SURVIVAL
         // (`WorldSettings.java:203-214`). The reach asks the answer one

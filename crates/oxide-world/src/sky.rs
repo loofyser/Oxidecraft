@@ -7,7 +7,7 @@
 //! (`S03PacketTimeUpdate.java:36-49`). The client stores both (`NetHandlerPlayClient.java:952-957`).
 //! A server that has stopped the day-night cycle negates the time before sending it (`:17-31`),
 //! and the receiving client negates it back before the clock stores it: that is
-//! `WorldClient.setWorldTime`'s receive rule (`WorldClient.java:468-483`), so the value every
+//! `WorldClient.setWorldTime`'s receive rule (`WorldClient.java:468-481`), so the value every
 //! function here reads — the client's `worldTime` — is the positive one the source renders from
 //! (the wire's `-6000` is the clock's `6000`, noon). `World.getCelestialAngle` and
 //! `World.getMoonPhase` both read `worldTime` (`World.java:1493-1501`), so `time_of_day` is the

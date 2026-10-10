@@ -86,10 +86,10 @@ const RENDER_CENTRE: f32 = -0.5;
 /// The builtin trio's own tail (`TileEntityChestRenderer.renderTileEntityAt`:116-160):
 /// the block-entity offset, the y/z flip and `RenderItem.renderItem`:150's builtin turn
 /// about y. The renderer's own pair of 0.5 translates cancels
-/// (`TileEntityChestRenderer.renderTileEntityAt`:122, :131).
+/// (`TileEntityChestRenderer.renderTileEntityAt`:126, :160).
 const BUILTIN_OFFSET: f32 = 1.0;
 
-/// The builtin trio's turn about y in degrees (`RenderItem.renderItem`:150).
+/// The builtin trio's turn about y in degrees (`RenderItem.renderItem`:149).
 const BUILTIN_TURN: f32 = 180.0;
 
 /// The z-level step one icon raises the level by
@@ -147,9 +147,9 @@ pub struct ItemIcon {
     /// Whether the stack carries the enchant flag, from the source's own `hasEffect`
     /// rule (`ItemStack.hasEffect`:859-861 → the item's `hasEffect`, `Item.hasEffect`
     /// :416-419): the NBT default — a root compound's `ench` list
-    /// (`isItemEnchanted`:902-905) — or one of the five class overrides (the enchanted
-    /// book, the written book, the bottle o' enchanting, the golden apple's metadata and
-    /// the potion's effect list). The draw applies the source's own second gate on top:
+    /// (`ItemStack.isItemEnchanted`:902-905) — or one of the six class overrides (the enchanted
+    /// book, the written book, the bottle o' enchanting, the golden apple's metadata,
+    /// the potion's effect list and the nether star's always-true foil). The draw applies the source's own second gate on top:
     /// a builtin shape never glints (`RenderItem.renderItem`:154-165).
     pub enchanted: bool,
 }
@@ -344,7 +344,7 @@ pub fn icon_matrix(x: f32, y: f32, z_level: f32, shape: IconShape, transform: Tr
     matrix *= Mat4::from_translation(Vec3::splat(RENDER_CENTRE));
     if shape == IconShape::Builtin {
         // The block-entity renderer's own tail, after its pair of 0.5 translates
-        // cancels (`TileEntityChestRenderer.renderTileEntityAt`:120-131).
+        // cancels (`TileEntityChestRenderer.renderTileEntityAt`:126, :160).
         matrix *= Mat4::from_translation(Vec3::new(0.0, BUILTIN_OFFSET, BUILTIN_OFFSET));
         matrix *= Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0));
     }

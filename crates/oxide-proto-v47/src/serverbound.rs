@@ -192,7 +192,7 @@ pub enum DiggingStatus {
 pub const PLAYER_DIGGING_ID: i32 = 0x07;
 
 /// Writes Player Digging: the status VarInt, the Location Position and the
-/// face byte (`C07PacketPlayerDigging.writePacketData`, `:39-45`).
+/// face byte (`C07PacketPlayerDigging.writePacketData:42-46`).
 ///
 /// The position is packed as `BlockPos.toLong` packs it — x and z are 26
 /// signed bits, y is 12 (`util/BlockPos.java:200-203`) — and the face byte is
@@ -268,7 +268,7 @@ pub fn write_animation(mut out: impl Write) -> io::Result<()> {
 }
 
 /// The actions Entity Action carries (`C0BPacketEntityAction.Action`,
-/// `C0BPacketEntityAction.java:63-71`).
+/// `C0BPacketEntityAction.java:69-78`).
 ///
 /// The variants' declaration order is the id on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,7 +365,7 @@ pub fn write_plugin_message(mut out: impl Write, channel: &str, data: &[u8]) -> 
 /// Serverbound Held Item Change (play id 0x09).
 pub const HELD_ITEM_CHANGE_ID: i32 = 0x09;
 
-/// Writes Held Item Change (`C09PacketHeldItemChange.writePacketData:32-36`):
+/// Writes Held Item Change (`C09PacketHeldItemChange.writePacketData:32-35`):
 /// the hotbar slot as a short. The server takes slots 0 through 8 and ignores
 /// anything else (`NetHandlerPlayServer.processHeldItemChange:769-777`), so
 /// the writer does not police the range.

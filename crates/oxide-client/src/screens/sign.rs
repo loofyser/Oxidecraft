@@ -39,10 +39,10 @@
 //! The flat draw is a port choice (recorded): the source renders the 3D
 //! sign through the tile dispatcher under
 //! `translate(width / 2, 0, 50)` + `scale(-93.75, -93.75, -93.75)` +
-//! `rotate(180 Y)` (`drawScreen`:133-136, `:174`), which has no HUD-space
+//! `rotate(180 Y)` (`GuiEditSign.drawScreen`:133-136, `:174`), which has no HUD-space
 //! equivalent — so the editor draws the title, the four lines over a flat
 //! board-coloured backing, and the Done button (`GuiButton`'s own 200x20 at
-//! `width / 2 - 100, height / 4 + 120`, `initGui`:41-47).
+//! `width / 2 - 100, height / 4 + 120`, `GuiEditSign.initGui`:41-47).
 
 use oxide_assets::font::Font;
 use oxide_game::input::{InputEvent, Key};
@@ -65,11 +65,11 @@ pub const SIGN_EDIT_TITLE: &str = "Edit sign message";
 pub const SIGN_TITLE_Y: f32 = 40.0;
 /// The title's colour: 16777215, opaque white.
 pub const SIGN_TITLE_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-/// The Done button's label: `I18n "gui.done"` (`initGui`:44), English
+/// The Done button's label: `I18n "gui.done"` (`GuiEditSign.initGui:45`), English
 /// `gui.done=Done`.
 pub const SIGN_DONE_TEXT: &str = "Done";
 /// The Done button's size: `GuiButton(0, width / 2 - 100, height / 4 + 120,
-/// ...)` is the source's 200x20 button (`initGui`:44).
+/// ...)` is the source's 200x20 button (`GuiEditSign.initGui:45`).
 pub const SIGN_DONE_WIDTH: f32 = 200.0;
 /// The Done button's height (see [`SIGN_DONE_WIDTH`]).
 pub const SIGN_DONE_HEIGHT: f32 = 20.0;
@@ -253,7 +253,7 @@ impl SignScreen {
     }
 
     /// One editing key: up steps back, down and Enter step on, Backspace
-    /// drops the last character (`keyTyped`:94-109). Answers whether the
+    /// drops the last character (`GuiEditSign.keyTyped`:94-109). Answers whether the
     /// editor changed. Any other key is not the editor's.
     pub fn key(&mut self, key: Key) -> bool {
         match key {
@@ -283,7 +283,7 @@ impl SignScreen {
     }
 
     /// The Done button's rect in GUI pixels: `(width / 2 - 100,
-    /// height / 4 + 120)`, 200x20 (`initGui`:44).
+    /// height / 4 + 120)`, 200x20 (`GuiEditSign.initGui:45`).
     pub fn done_bounds(scaled: &ScaledResolution) -> (f32, f32, f32, f32) {
         let width = scaled.width as f32;
         let height = scaled.height as f32;

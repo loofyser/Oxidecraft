@@ -1155,8 +1155,8 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         lateral.fog_colour[channel] + (below_colour[channel] - lateral.fog_colour[channel]) * factor
     });
     // The corner sits straight under the eye, so it projects onto the frame's centre column;
-    // the pitch puts it 30.34 degrees below the view axis, which is
-    // `tan(30.34 deg) / tan(35 deg) = 0.836` of the half-height below the centre, i.e. row 58.
+    // the pitch puts it 30.25 degrees below the view axis, which is
+    // `tan(30.25 deg) / tan(35 deg) = 0.833` of the half-height below the centre, i.e. row 58.
     expect_pixel(
         &pixels,
         SIZE / 2,
@@ -6127,7 +6127,7 @@ fn the_hud_pass_draws_the_open_box_scrolled_slice() {
 /// field's right edge (`GuiPlayerTabOverlay.drawScoreboardValues`:365-366).
 ///
 /// The stand-ins: the probe's own cell width and panel span (the source's cell is
-/// name- and score-dependent and narrower at this width, `GuiPlayerTabOverlay.renderPlayerlist`:118`), the synthetic
+/// name- and score-dependent and narrower at this width, `GuiPlayerTabOverlay.renderPlayerlist`:118, the synthetic
 /// font's single `|` glyph for the header, the footer, the names and the score, and the
 /// synthetic sheet's bands for the two latencies; the heads resolve the registry's
 /// default (the placeholder image), so their cells show its texels where a real skin's
@@ -7666,7 +7666,7 @@ fn the_held_item_draws_nothing_while_the_player_sleeps() {
 }
 
 /// The builtin class's own tail (`RenderItem.renderItem`:147-154's `rotate(180, Y)`
-/// and `TileEntityChestRenderer.renderTileEntityAt`:125-127's lift and y/z flip): a
+/// and `TileEntityChestRenderer.renderTileEntityAt`:124-125's lift and y/z flip): a
 /// held chest carries what the flat class doesn't — the lid's own texels (the
 /// sheet's rows 0..19) sit above the base's (rows 19..44), told apart by their
 /// dominant channel. The lid cell is banded along u (the box's own face columns:

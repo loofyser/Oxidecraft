@@ -8,9 +8,9 @@
 //! (`:296-307`), then the wrapper's 3D scale (`ItemRenderer.renderItem`:67) or the
 //! generated class's `preTransform` scale (`RenderItem.java`:254-257, run at
 //! `:320`), then the display transform (`RenderItem.java`:327), then the render
-//! path's tail — `scale(0.5)` (`:145`) and `translate(-0.5,-0.5,-0.5)` (`:157`),
+//! path's tail — `scale(0.5)` (`:145`) and `translate(-0.5,-0.5,-0.5)` (`:150, :157`),
 //! with the builtin class's `rotate(180, Y)` (`:147-150`) between them and the
-//! block-entity tail (`TileEntityChestRenderer.renderTileEntityAt`:125-127) after
+//! block-entity tail (`TileEntityChestRenderer.renderTileEntityAt`:124-126) after
 //! — over the 1/16-unit mesh:
 //!
 //! ```text
@@ -89,19 +89,19 @@ const CLASS_SCALE: f32 = 2.0;
 /// The render path's own scale (`RenderItem.renderItem`:145).
 const RENDER_SCALE: f32 = 0.5;
 
-/// The render path's centring translate (`RenderItem.renderItem`:157).
+/// The render path's centring translate (`RenderItem.renderItem`:150, :157).
 const RENDER_CENTRE: f32 = -0.5;
 
-/// The builtin class's own turn about y in degrees (`RenderItem.renderItem`:150's
+/// The builtin class's own turn about y in degrees (`RenderItem.renderItem`:149's
 /// `rotate(180, Y)`; the GUI chain's own `BUILTIN_TURN`, `gui_item.rs`:93).
 const BUILTIN_TURN: f32 = 180.0;
 
 /// The block-entity tail's lift, both y and z (`TileEntityChestRenderer
-/// .renderTileEntityAt`:125's `translate(x, y + 1, z + 1)` with the fake chest's
+/// .renderTileEntityAt`:124's `translate(x, y + 1, z + 1)` with the fake chest's
 /// zero position; the GUI chain's `BUILTIN_OFFSET`, `gui_item.rs`:90).
 const BUILTIN_OFFSET: f32 = 1.0;
 
-/// The arm sway's own tenth (`ItemRenderer.rotateWithPlayerRotations`:127-128's
+/// The arm sway's own tenth (`ItemRenderer.rotateWithPlayerRotations`:126-127's
 /// `0.1F`).
 const ARM_SWAY: f32 = 0.1;
 
@@ -223,7 +223,7 @@ impl Swing {
 }
 
 /// The equip ease's counters, the source's `ItemRenderer` fields `equippedProgress`
-/// (:43) and `prevEquippedProgress` (:42).
+/// (:42) and `prevEquippedProgress` (:43).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Equip {
     /// The ease's current value (`equippedProgress`): 1 while the item is up.
@@ -283,8 +283,8 @@ impl Equip {
 }
 
 /// The arm's own rotation pair, the source's `EntityPlayerSP` fields
-/// `renderArmYaw`/`renderArmPitch` (`:115-117`) and their previous-tick latches
-/// (`prevRenderArmYaw`/`prevRenderArmPitch`, `:118-119`).
+/// `renderArmYaw`/`renderArmPitch` (`:115-116`) and their previous-tick latches
+/// (`prevRenderArmYaw`/`prevRenderArmPitch`, `:117-118`).
 ///
 /// The client owns the pair the way the source's own player does: it chases the
 /// camera's rotation at half each tick (`updateEntityActionState`:699-702), and
@@ -395,13 +395,13 @@ pub fn transform_first_person(equip: f32, swing: f32) -> Mat4 {
 /// ```
 ///
 /// The pair is the source's own arguments — the raw current rotation minus the
-/// lerped arm pair (`ItemRenderer.rotateWithPlayerRotations`:127-128) — applied
+/// lerped arm pair (`ItemRenderer.rotateWithPlayerRotations`:126-127) — applied
 /// outermost, ahead of the item's own chain (`:364` calls it before `:402`'s
 /// `doItemUsedTransformations`). Exactly one `S(2)` applies per class — the 3D
 /// class at `ItemRenderer`:67, the generated class at `RenderItem`:256 — so one
 /// constant covers both, and the bracketed terms are the builtin class's alone
 /// (`RenderItem.renderItem`:147-150; `TileEntityChestRenderer.renderTileEntityAt`
-/// :125-127).
+/// :124-126).
 pub fn held_matrix(
     equip: f32,
     swing: f32,
@@ -431,7 +431,7 @@ pub fn held_matrix(
 
 /// The two standard item lights in the hand's own eye space: the raw positions
 /// (`RenderHelper.java`:12-13), normalised and turned by `rotateArroundXAndY`'s
-/// pitch-about-x then yaw-about-y (`ItemRenderer.java`:99-106`) — the turn reaches
+/// pitch-about-x then yaw-about-y (`ItemRenderer.java`:99-106) — the turn reaches
 /// the lights only, never the geometry.
 pub fn hand_lights(pitch: f32, yaw: f32) -> [Vec3; 2] {
     let turn = Mat3::from_rotation_x(pitch.to_radians()) * Mat3::from_rotation_y(yaw.to_radians());
@@ -479,7 +479,7 @@ fn normal_matrix(matrix: Mat4) -> Mat3 {
 /// `f = 1 - lerp(prev, cur, partial)` at `:357`, `getSwingProgress(pt)` at
 /// `:359` and the arm pair's interpolation at `:124-125`), while
 /// `equip_prev`/`swing_prev` carry the source's raw previous-tick latches
-/// (`prevEquippedProgress` `:42`, `prevSwingProgress` `:85`) for the record.
+/// (`prevEquippedProgress` `:43`, `prevSwingProgress` `:85`) for the record.
 /// `brightness` is the lightmap's factor — the source enables the lightmap before
 /// the hand (`EntityRenderer.java`:865) — and `sleeping` is the source's own skip
 /// (`:861-863`), which the port has no state for yet: the pass honours it and the
@@ -1239,7 +1239,7 @@ mod tests {
         );
     }
 
-    /// The arm sway's rotation (`ItemRenderer.rotateWithPlayerRotations`:127-128):
+    /// The arm sway's rotation (`ItemRenderer.rotateWithPlayerRotations`:126-127):
     /// `R_x(0.1·sway_pitch) · R_y(0.1·sway_yaw)` sits outermost, ahead of the item's
     /// own chain — a camera turned to pitch 20 and yaw 40 with the arm still at rest
     /// turns the whole item by 2 and 4 degrees about the eye.

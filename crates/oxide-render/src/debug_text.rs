@@ -24,7 +24,7 @@
 //!   for a fragment at `pen + t` both quads map to texel column `t`, so every fragment the
 //!   trimmed quad draws reads the same texel the full-cell quad gives it.
 //! * The source's quad is 7.99 tall; the 1/100-texel it trims cannot move a fragment centre
-//!   across the last texel row, and the sheet's last cell row is blank in any case.
+//!   across the last texel row, which the trimmed quad still covers.
 //!
 //! The shadow copy's colour is the source's own byte rule: [`shadow_colour`].
 

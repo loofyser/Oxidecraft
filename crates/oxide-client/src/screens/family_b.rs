@@ -695,7 +695,7 @@ pub fn enchant_cost_text(cost: i32) -> String {
 }
 
 /// The white-italic clue line for the offered enchantment's composed `name`
-/// (`drawScreen`:244-252 wraps the translated name in WHITE + ITALIC; the
+/// (`GuiEnchantment.drawScreen`:244-252 wraps the translated name in WHITE + ITALIC; the
 /// port carries no I18n sentence, so the `container.enchant.clue` wrapper is
 /// the name alone — recorded above).
 pub fn enchant_clue_line(name: &str) -> String {
@@ -710,13 +710,13 @@ pub fn enchant_clue_name(id: i32) -> Option<String> {
     enchant_line((id & 0xFF) as u16, level)
 }
 
-/// One offer's hover lines (`drawScreen`:244-299): the clue when the offer
+/// One offer's hover lines (`GuiEnchantment.drawScreen`:244-299): the clue when the offer
 /// names a known enchantment, then — outside creative, which the port reads
 /// as survival always — the blank separator, the red level requirement while
 /// the level falls short, else the lapis line (grey when the lapis covers
 /// `index + 1`, red while short) and the grey level line. Both count lines
 /// name `index + 1` (`lapis.one|many`, `level.one|many` over `i1 = j + 1`,
-/// `:267-296`); the port's English follows the title convention — `1 Lapis
+/// `GuiEnchantment.drawScreen`:267-296); the port's English follows the title convention — `1 Lapis
 /// Lazuli` / `{n} Lapis Lazuli`, `1 Level` / `{n} Levels` — recorded above.
 pub fn enchant_tooltip(
     clue: Option<&str>,
@@ -1107,8 +1107,8 @@ pub struct HorseState {
     pub armoured: bool,
 }
 
-/// The anvil name field's panel rect: `GuiTextField(0, font, i + 62, j + 24,
-/// 103×12)` (`GuiRepair.java`:47).
+/// The anvil name field's panel rect `GuiTextField(0, font, i + 62, j + 24, 103, 12)`
+/// (`GuiRepair.java:47`).
 pub const NAME_FIELD_RECT: (i32, i32, i32, i32) = (62, 24, 103, 12);
 /// The name cursor's bar: 1px wide, `FONT_HEIGHT` tall, a pixel below the
 /// field's top and 4 (the inset) + 1 past the text before it
@@ -2087,8 +2087,8 @@ pub fn potion_icon(effect: i32) -> Option<i32> {
 }
 
 /// One effect icon's sheet origin on the inventory sheet: the strip formula
-/// the `PowerButton` constructor carries — `(index % 8 * 18, 198 + index / 8
-/// * 18)` (`GuiBeacon.java`:305).
+/// the power-button constructor carries — `(index % 8 * 18, 198 + index / 8
+/// * 18)` (`GuiBeacon.java:302-304`).
 pub fn potion_icon_uv(index: i32) -> (i32, i32) {
     ((index % 8) * 18, 198 + (index / 8) * 18)
 }

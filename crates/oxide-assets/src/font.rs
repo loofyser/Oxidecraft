@@ -10,7 +10,7 @@
 //! The source's two special cases are kept:
 //!
 //! * The space never reaches the scan: `renderChar` returns before `renderDefaultChar` for
-//!   it (`:210-213`) and `getCharWidth` answers 4 (`:664-667`), so [`Font::advance`] does too.
+//!   it (`FontRenderer.java:232-237`) and `getCharWidth` answers 4 (`:664-667`), so [`Font::advance`] does too.
 //! * A character outside printable ASCII has no cell in the width table; the source falls
 //!   back to the optional `font/glyph_sizes.bin` table, whose byte packs the glyph's start
 //!   and end columns, and to zero when that table has no entry (`:676-689`). The overlay

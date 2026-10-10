@@ -166,7 +166,7 @@ pub enum PoseExtra {
         /// `:312-316`).
         chested: bool,
         /// Whether the draw is an adult: the source's `flag`, which holds the saddle
-        /// geometry and the chests (`ModelHorse.java`:215-217`).
+        /// geometry and the chests (`ModelHorse.java`:215-217).
         adult: bool,
         /// The horse type, `ModelHorse.render`'s `flag3`: `1` and `2` (donkey and mule)
         /// draw the long ears, every other type the short pair (`ModelHorse.java`:142-149,
@@ -1519,7 +1519,7 @@ mod tests {
             (ModelRef::EnderMite, 0.3, [0.3, 1.0], [64.0, 32.0]),
             // The exotic families: each class's own size (`EntityHorse.java`:91,
             // `EntityWolf.java`:62, `EntityOcelot.java`:46, `EntityRabbit.java`:56,
-            // `EntityGhast.java`:32, the blaze's inherited default (`Entity.java`:269-270`),
+            // `EntityGhast.java`:32, the blaze's inherited default (`Entity.java`:269-270),
             // `EntityGuardian.java`:56, `:167`, `EntityDragon.java`:86,
             // `EntityWither.java`:63), their shadows the renderers' registrations
             // (`RenderManager.java`:142-166) and their sheets each class's own square
@@ -1838,7 +1838,7 @@ mod tests {
         // (`RenderHorse.getEntityTexture`:51-78, `EntityHorse.java`:53-58), the wolf's
         // coats and collar (`RenderWolf.getEntityTexture`:46-49,
         // `LayerWolfCollar.java`:16), the ocelot's and rabbit's coats
-        // (`RenderOcelot.getEntityTexture`:23-40, `RenderRabbit.getEntityTexture`:41-62`),
+        // (`RenderOcelot.getEntityTexture`:23-40, `RenderRabbit.getEntityTexture`:41-62,
         // the ghast's shooting sheet (`RenderGhast.getEntityTexture`:21-24), the
         // guardian's elder sheet (`RenderGuardian.getEntityTexture`:177-180) and the
         // wither's flicker sheet (`RenderWither.getEntityTexture`:33-37).

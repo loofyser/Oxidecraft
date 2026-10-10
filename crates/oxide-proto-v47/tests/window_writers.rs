@@ -4,14 +4,14 @@
 //! through the crate's own decoders.
 //!
 //! Every byte is packed by hand from the packet classes' own writers
-//! (`C09PacketHeldItemChange.writePacketData:32-36`,
+//! (`C09PacketHeldItemChange.writePacketData:32-35`,
 //! `C0DPacketCloseWindow.writePacketData:40-43`,
 //! `C0EPacketClickWindow.writePacketData:67-75`,
 //! `C0FPacketConfirmTransaction.writePacketData:46-51`,
 //! `C10PacketCreativeInventoryAction.writePacketData:44-48`,
 //! `C11PacketEnchantItem.writePacketData:43-47`,
 //! `C12PacketUpdateSign.writePacketData:44-53`) and from `PacketBuffer`'s own
-//! slot and string framing (`writeItemStackToBuffer:232-247`,
+//! slot and string framing (`writeItemStackToBuffer:232-250`,
 //! `writeString:304-317`; the protocol reference's §2.2 rows for
 //! 0x09 and 0x0D–0x12), never rebuilt with the writer's arithmetic, so a
 //! wrong field order or a dropped NBT tail cannot be confirmed by its own
@@ -118,8 +118,8 @@ const CREATIVE_ACTION_EMPTY: &[u8] = &[
 
 /// Creative Inventory Action (0x10) with a plain item: slot 1 holds the
 /// diamond sword, id 276, ×1, damage 0, and a no-data tag byte closing the
-/// stack (`PacketBuffer.writeNBTTagCompoundToBuffer` writes the zero byte for
-/// a null tag, `:213-227`'s inverse).
+/// stack (`PacketBuffer.writeNBTTagCompoundToBuffer:191-208` writes the zero byte for
+/// a null tag — the inverse of `readNBTTagCompoundFromBuffer:213-227`).
 const CREATIVE_ACTION_ITEM: &[u8] = &[
     0x10, // the packet id
     0x00, 0x01, // slot 1

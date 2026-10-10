@@ -124,7 +124,7 @@ const SNEAK_EDGE_STEP: f64 = 0.05;
 const LADDER_HORIZONTAL_MAX: f64 = 0.15000000596046448;
 
 /// The ladder's descent clamp: the double literal `-0.15D`
-/// (`EntityLivingBase.java:1645-1648`).
+/// (`EntityLivingBase.java:1644-1647`).
 const LADDER_DESCENT_CLAMP: f64 = 0.15;
 
 /// The climb a ladder gives on a horizontal collision: `motionY = 0.2D`

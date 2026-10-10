@@ -231,7 +231,7 @@ impl HeldItem {
             swing: self.swing.render(partial),
             swing_prev: self.swing.prev(),
             // The sway's own pair: the tick's rotation minus the arm pair at this
-            // fraction (`rotateWithPlayerRotations`:127-128).
+            // fraction (`rotateWithPlayerRotations`:126-127).
             sway_pitch: self.rotation_pitch - arm_pitch,
             sway_yaw: self.rotation_yaw - arm_yaw,
             brightness: 1.0,
@@ -3949,8 +3949,8 @@ fn stack_has_effect(stack: &MetadataItem) -> bool {
 }
 
 /// The union of the source's thirteen potion requirement patterns over a damage's low
-/// four bits (`PotionHelper.potionRequirements`:581-593, read through
-/// `parsePotionEffects`:220-341): bit `n` set means a damage whose low nibble is `n`
+/// four bits (`PotionHelper.java:581-593`, read through
+/// `parsePotionEffects`:220-384): bit `n` set means a damage whose low nibble is `n`
 /// answers at least one requirement, i.e. its effect list is non-empty. The holes are
 /// 0 (water), 7 and 15.
 const POTION_EFFECT_FLAGS: u16 = 0x7F7E;
@@ -4087,7 +4087,7 @@ const TAB_CELL: [f32; 4] = [1.0, 1.0, 1.0, 32.0 / 255.0];
 
 /// The header, footer, name and score text colour: the source's `-1` for the header, footer and
 /// name (`GuiPlayerTabOverlay.renderPlayerlist`:152, `:205`, `:231`) and `16777215` for the
-/// score (`GuiPlayerTabOverlay.drawScoreboardValues`:366`) — both opaque white, the score's own yellow coming from its `§e` prefix.
+/// score (`GuiPlayerTabOverlay.drawScoreboardValues:366`) — both opaque white, the score's own yellow coming from its `§e` prefix.
 const TAB_TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// A spectator's name colour: `-1862270977` = 0x90FFFFFF — white at alpha 144
@@ -10458,7 +10458,7 @@ mod tests {
     /// `renderArmPitch`/`renderArmYaw` move half the way toward the camera's
     /// rotation each tick (`EntityPlayerSP.updateEntityActionState`:699-702), and
     /// the frame's pair is the raw rotation minus the arm's own at the frame's
-    /// fraction (`ItemRenderer.rotateWithPlayerRotations`:124-128).
+    /// fraction (`ItemRenderer.rotateWithPlayerRotations`:126-127).
     #[test]
     fn the_held_frame_lags_the_camera_by_the_arm_sway() {
         let mut view = View::new();

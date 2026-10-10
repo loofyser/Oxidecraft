@@ -23,8 +23,8 @@ use oxide_proto_v47::entity::MetadataItem;
 /// One physical key the client binds.
 ///
 /// The source binds many more; these are the movement keys and the sprint key
-/// M3's input surface names (`GameSettings.java:127-133`) plus the chat keys
-/// M4 adds: the two openers (`keyBindChat`, `keyBindCommand` — `:139`, `:141`)
+/// the input surface names (`GameSettings.java:127-133`) plus the chat keys:
+/// the two openers (`keyBindChat`, `keyBindCommand` — `:139`, `:141`)
 /// and the editing keys the open chat field reads (`GuiChat.keyTyped`:87-138).
 /// Task 24 adds the inventory keys: E opens the inventory (`keyBindInventory`,
 /// `:134`, key code 18), Q drops (`keyBindDrop`, `:136`, key code 16) and the

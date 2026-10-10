@@ -938,7 +938,8 @@ impl ModelSource {
     /// foreign chain, a builtin outside the folded set — degrades to
     /// [`ItemModelSource::Missing`] rather than failing: the source's own item
     /// walk skips an item that does not bake with a warning
-    /// (`ModelBakery.bakeItemModels`), and the client's item pass never fails
+    /// (`ModelBakery.loadItemModels:283-286`; the block-side twin warns at
+    /// `bakeBlockModels:411`), and the client's item pass never fails
     /// its load over one.
     pub fn item_model(&self, name: &str) -> ItemModelSource {
         let Ok(resource) = item_model_resource(name) else {

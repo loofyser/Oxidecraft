@@ -498,7 +498,7 @@ pub enum ClientEvent {
     ///
     /// The time of day is the value the celestial angle and the moon phase are read from, after
     /// the receive rule's negation of the wire's frozen-sun sign
-    /// (`S03PacketTimeUpdate.java:17-31`, `WorldClient.java:468-483`): a stopped cycle's frame
+    /// (`S03PacketTimeUpdate.java:17-31`, `WorldClient.java:468-481`): a stopped cycle's frame
     /// reports the positive time its sky renders from — the wire's `-6000` is noon. The age is
     /// carried for later work.
     Time {
@@ -1486,7 +1486,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // The frozen-sun convention: a stopped day-night cycle puts a negative
                             // time on the wire (`S03PacketTimeUpdate.java:17-31`), and the client
                             // negates it back before it becomes the world clock
-                            // (`WorldClient.setWorldTime`, `WorldClient.java:468-482`), so the
+                            // (`WorldClient.setWorldTime`, `WorldClient.java:468-481`), so the
                             // clock — and the sky built from it — is the value vanilla renders.
                             // The sign the negation was read from is the source's own frozen-daylight
                             // rule: `setWorldTime` stops the cycle for a negative time, and
@@ -2555,7 +2555,7 @@ fn login<S: Read + Write>(
 /// day only while the day-night cycle runs (`WorldClient.java:66-74`); the
 /// frozen-sun convention puts the cycle's state on the wire as the time's sign,
 /// which `WorldClient.setWorldTime` reads back, negating a negative time and
-/// stopping the cycle (`:468-482`). [`received_time_of_day`] does the negation
+/// stopping the cycle (`:468-481`). [`received_time_of_day`] does the negation
 /// here, and the sign it was read from is this clock's `frozen` flag, so the
 /// tick's advance is gated exactly where the source gates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2737,10 +2737,10 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
 /// Applies one mouse button edge to the interaction input.
 ///
 /// The left button is the source's attack key: a press is one `clickMouse`
-/// call (`Minecraft.java:1454-1458`) and the held flag is
-/// `sendClickBlockToController`'s `leftClick` (`:1496-1505`). The right
+/// call (`Minecraft.java:1522-1524`) and the held flag is
+/// `sendClickBlockToController`'s `leftClick` (`Minecraft.java:1496-1498`). The right
 /// button is the use key: a press is one `rightClickMouse` call
-/// (`:2153-2156`), consumed by the placement step.
+/// (`Minecraft.java:1570-1572`), consumed by the placement step.
 fn apply_button(
     button: MouseButton,
     pressed: bool,
@@ -3413,7 +3413,7 @@ fn report_board_change(board: &Scoreboard, before: &Scoreboard, events: &Sender<
 }
 
 /// The client's receive rule for a Time Update's time of day: `WorldClient.setWorldTime`
-/// (`WorldClient.java:468-483`) negates a negative time — the frozen-sun convention on the wire
+/// (`WorldClient.java:468-481`) negates a negative time — the frozen-sun convention on the wire
 /// (`S03PacketTimeUpdate.java:17-31`) — before the clock stores it, so the sky functions read
 /// the positive value the source renders from: the wire's `-6000` is the `6000` of noon.
 ///
@@ -3981,7 +3981,8 @@ fn mesh_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
 
 /// Hands the queue's next columns to the pool and reports every finished build.
 ///
-/// Called when the read found nothing for a whole [`MESH_TICK`], so the work
+/// Called when the read found nothing for a whole [`MESH_TICK`] — and by
+/// [`finish_meshes`], which drains the queue on a clean stop — so the work
 /// here never delays a frame that was already readable. One pass spawns at
 /// most [`PENDING_JOBS_CAP`] builds: the snapshot copy happens here, on the
 /// session's thread — the world never leaves it — and the cap is what bounds
@@ -4135,7 +4136,7 @@ mod tests {
     fn a_frozen_tick_advances_the_world_age_and_holds_the_time_of_day() {
         // `WorldClient.tick` advances the world age every tick and the time of
         // day only while the cycle runs (`WorldClient.java:66-74`); the frozen
-        // flag is the sign the receive rule read (`:468-483`). One frozen
+        // flag is the sign the receive rule read (`:468-481`). One frozen
         // step: the age and the player's tick move, the time of day holds, and
         // no sky is reported — a step reports a sky exactly when it moved the
         // time of day.

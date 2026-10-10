@@ -106,7 +106,7 @@ pub enum ModelRef {
     /// with the eyes layer (`RenderSpider.java`:15).
     Spider,
     /// A cave spider: the spider's table and eyes under the cave spider's own sheet and
-    /// its renderer's seventh-tenths scale and shadow (`RenderCaveSpider.java`:9,`:14,`:23`).
+    /// its renderer's seventh-tenths scale and shadow (`RenderCaveSpider.java`:9, :14, :23).
     CaveSpider,
     /// An enderman: `ModelEnderman`'s outstretched biped (`ModelEnderman.java`:13), with
     /// the eyes layer (`RenderEnderman.java`:23).
@@ -126,7 +126,7 @@ pub enum ModelRef {
         size: u8,
     },
     /// A magma cube: `ModelMagmaCube`'s core and eight segments (`ModelMagmaCube.java`:12);
-    /// the size rides the renderer's squash pair (`RenderMagmaCube.java`:29-36`).
+    /// the size rides the renderer's squash pair (`RenderMagmaCube.java`:29-36).
     MagmaCube {
         /// The cube size, `1..=4`.
         size: u8,
@@ -167,7 +167,7 @@ pub enum ModelRef {
         /// Whether the wolf is angry — its own sheet and tail.
         angry: bool,
     },
-    /// An ocelot: `ModelOcelot`'s table (`ModelOcelot.java`:36-70`) under the cat type's
+    /// An ocelot: `ModelOcelot`'s table (`ModelOcelot.java`:36-70) under the cat type's
     /// sheet (`RenderOcelot.getEntityTexture`:23-40) and the taming's own scale
     /// (`RenderOcelot.preRenderCallback`:46-54).
     Ocelot {
@@ -179,7 +179,7 @@ pub enum ModelRef {
         /// tenths (`RenderOcelot.preRenderCallback`:46-54).
         tamed: bool,
     },
-    /// A rabbit: `ModelRabbit`'s table (`ModelRabbit.java`:49-115`) under the variant's
+    /// A rabbit: `ModelRabbit`'s table (`ModelRabbit.java`:49-115) under the variant's
     /// sheet (`RenderRabbit.getEntityTexture`:29-64).
     Rabbit {
         /// The rabbit type: `0..6` and `99`.
@@ -187,7 +187,7 @@ pub enum ModelRef {
         /// Whether the draw is a child (`ModelRabbit.render`:131-153).
         child: bool,
     },
-    /// A ghast: `ModelGhast`'s body and nine tentacles (`ModelGhast.java`:12-32`) under
+    /// A ghast: `ModelGhast`'s body and nine tentacles (`ModelGhast.java`:13-32) under
     /// the sheet its attacking flag swaps (`RenderGhast.getEntityTexture`:21-24).
     Ghast {
         /// Whether the draw is attacking — the shooting sheet's gate
@@ -197,17 +197,17 @@ pub enum ModelRef {
     /// A blaze: `ModelBlaze`'s head and twelve rods (`ModelBlaze.java`:12-22).
     Blaze,
     /// A guardian: `ModelGuardian`'s body, twelve spines, eye and tail
-    /// (`ModelGuardian.java`:16-49`).
+    /// (`ModelGuardian.java`:16-49).
     Guardian {
         /// Whether the draw is an elder: its own sheet and the renderer's `2.35` scale
         /// (`RenderGuardian.preRenderCallback`:168-170, `getEntityTexture`:177-180).
         elder: bool,
     },
     /// An ender dragon: `ModelDragon`'s head, body, wings, legs and spine chain
-    /// (`ModelDragon.java`:47-124`).
+    /// (`ModelDragon.java`:47-124).
     EnderDragon,
-    /// A wither: `ModelWither`'s three ribs and three heads (`ModelWither.java`:13-38`)
-    /// under the sheet its spawn invulnerability flickers (`RenderWither.getEntityTexture`:33-37`).
+    /// A wither: `ModelWither`'s three ribs and three heads (`ModelWither.java`:13-38)
+    /// under the sheet its spawn invulnerability flickers (`RenderWither.getEntityTexture`:33-37).
     Wither {
         /// The spawn invulnerability's timer, watcher 20's int (`EntityWither.getInvulTime`:623-626):
         /// the sheet flickers by it and the pre-render scale rises through it.
@@ -371,7 +371,7 @@ pub enum DrawExtra {
     },
     /// A dropped item: the stack the item path draws, with the bob and spin derived
     /// from the draw's pose age (`RenderEntityItem.doRender`:91-154; no `EntityItem`
-    /// update method carries the rotation — `func_177077_a`:47-48` does).
+    /// update method carries the rotation — `RenderEntityItem.func_177077_a`:47-48 does).
     Item {
         /// The item's id.
         id: i16,
@@ -391,7 +391,7 @@ pub enum DrawExtra {
         scale: f32,
     },
     /// An item frame's content: the frame's own rotation slot
-    /// (`RenderItemFrame.renderItem`:103-110`.
+    /// (`RenderItemFrame.renderItem`:103-110.
     Frame {
         /// The rotation, `0..8` (`EntityItemFrame.getRotation`).
         rotation: u8,

@@ -709,7 +709,7 @@ pub const ITEM_GROUND_LIFT: f32 = 0.25;
 pub const ITEM_COPY_STEP: f32 = 0.046875;
 
 /// The pre-step the flat copies' stack takes back to sit centred
-/// (`RenderEntityItem.java`:56-59`): `-0.046875 * (copies - 1) * 0.5`.
+/// (`RenderEntityItem.java`:56-59): `-0.046875 * (copies - 1) * 0.5`.
 pub fn item_copy_centre(copies: u8) -> f32 {
     -ITEM_COPY_STEP * (f32::from(copies) - 1.0) * 0.5
 }
@@ -718,11 +718,11 @@ pub fn item_copy_centre(copies: u8) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Billboard {
     /// `RenderSnowball`'s: the generated item, rotated `(-playerViewY, +playerViewX)`
-    /// inside the class's `0.5` scale (`RenderSnowball.java`:28-35`).
+    /// inside the class's `0.5` scale (`RenderSnowball.java`:28-35).
     Snowball,
     /// `RenderFireball`'s: the particle sprite's quad, rotated
     /// `(180 - playerViewY, -playerViewX)` inside the class's own scale
-    /// (`RenderFireball.java`:33-51`).
+    /// (`RenderFireball.java`:33-51).
     Fireball,
 }
 
@@ -765,7 +765,7 @@ pub fn dropped_item_scale(gui3d: bool) -> f32 {
 }
 
 /// The projectile's net scale: the caller's own scale times the pre-transform times the
-/// render path's (`RenderSnowball.java`:29` then `RenderItem.renderItemModelTransform`).
+/// render path's (`RenderSnowball.java`:29 then `RenderItem.renderItemModelTransform`).
 pub fn projectile_item_scale(caller: f32, gui3d: bool) -> f32 {
     caller * item_pretransform(gui3d) * ITEM_RENDER_SCALE
 }
@@ -862,7 +862,7 @@ fn add_span(spans: &mut Vec<(u8, i32, i32, i32)>, facing: u8, x: i32, y: i32) {
 }
 
 /// One span's element box and uv rect, the source's `func_178397_a` math
-/// (`ItemModelGenerator.java`:59-167`): the box's thin axis is the free coordinate's
+/// (`ItemModelGenerator.java`:59-167): the box's thin axis is the free coordinate's
 /// edge, and the uv rect runs the span's length with the source's stretched `16 / (size
 /// - 1)` scale on the thin axis.
 fn span_box(facing: u8, b: i32, c: i32, d: i32, w: f32, h: f32) -> ([f32; 3], [f32; 3], [f32; 4]) {
@@ -1516,7 +1516,7 @@ mod tests {
 
     /// The billboard turns: the snowball family's negated yaw and positive pitch; the
     /// fireballs' `180 - yaw` with the negated pitch (`RenderSnowball.java`:32-33,
-    /// `RenderFireball.java`:44-45`). `playerViewY` is the camera's yaw
+    /// `RenderFireball.java`:44-45). `playerViewY` is the camera's yaw
     /// (`RenderManager.java`:260-261).
     #[test]
     fn the_billboards_turn_to_the_camera_by_the_sources_signs() {

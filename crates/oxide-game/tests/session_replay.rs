@@ -2109,7 +2109,7 @@ fn a_keepalive_behind_a_large_burst_is_answered_before_the_burst_is_meshed() {
     // blocks change — and the burst's tail is an entity flood, the spawn and
     // movement frames a busy server interleaves with the columns, so the
     // entity arms read at the same speed. Each applied column's snapshot copy
-    // costs tens of milliseconds in a debug build: a loop that pumped between
+    // costs about 144 ms in a debug build: a loop that pumped between
     // packets would need far longer than the deadline below for these
     // hundreds of frames, and the diagnostic names how much of the burst was
     // meshed while the echo went unanswered. The harness's stream has no idle
@@ -2680,7 +2680,7 @@ fn a_bulk_frame_serves_two_columns_and_the_session_stays_live() {
         let indices: Vec<usize> = slots.iter().map(|(index, _)| *index).collect();
         assert_eq!(indices, sixteen, "({cx}, {cz}) reports them in order");
         // The sixteen slots are shape, not content: they come back even for a
-        // world that held no blocks. The fixture's bottom section is bedrock,
+        // world that held no blocks. The fixture's bottom section is bedrock-floored,
         // so the applied column must have drawn it.
         let mesh = slots[0]
             .1
@@ -2812,7 +2812,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
     // plains, `/time set 6000`'s own frame, the same frame with the time negated — what a
     // stopped day-night cycle puts on the wire — a teleport inside that column, and a third
     // day's frame. The clock comes back per update; the receive rule negates the frozen
-    // frame's negative time back (`WorldClient.java:468-483`), so its clock and sky are the
+    // frame's negative time back (`WorldClient.java:468-481`), so its clock and sky are the
     // noon values. The sky follows the clock and the view block, because the client cannot
     // sample the world itself.
     let (stream, _outgoing) = duplex(stream_with(&[
@@ -2903,7 +2903,7 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
 /// The frozen-sun convention end to end: a server with the day-night cycle stopped negates
 /// the time it sends (`S03PacketTimeUpdate.java:17-31`), and the client negates a negative
 /// time back before it becomes the world clock (`WorldClient.setWorldTime`,
-/// `WorldClient.java:468-483`). Each frozen frame's reported clock and sky must equal the
+/// `WorldClient.java:468-481`). Each frozen frame's reported clock and sky must equal the
 /// plain positive frame's — the noon the acceptance's `/time set 6000` means — not the night
 /// the raw negative value would answer.
 #[test]
@@ -2965,7 +2965,7 @@ fn a_frozen_time_update_reports_the_negated_clock_and_sky() {
 fn the_frozen_clock_holds_the_time_of_day_while_the_ticks_advance() {
     // A stopped day-night cycle puts a negative time on the wire
     // (`S03PacketTimeUpdate.java:17-31`); the receive rule reads its sign into
-    // the clock's frozen flag (`WorldClient.setWorldTime`, `WorldClient.java:468-483`)
+    // the clock's frozen flag (`WorldClient.setWorldTime`, `WorldClient.java:468-481`)
     // and the tick's advance of the time of day is gated on it (`WorldClient.tick`,
     // `:71-74`). The connection then goes quiet for whole ticks: the player steps and the
     // world age moves with every tick, the time of day holds at the frozen value, and no
@@ -6348,7 +6348,7 @@ fn a_dimension_respawn_keeps_the_scoreboard_and_reports_the_list_cleared() {
 fn a_time_update_of_the_smallest_value_freezes_the_clock_without_panicking() {
     // The receive rule's negation is a two's-complement wrap on every `i64`
     // (`S03PacketTimeUpdate.java:17-31`, `WorldClient.setWorldTime`,
-    // `WorldClient.java:468-483`): the smallest value negates to itself —
+    // `WorldClient.java:468-481`): the smallest value negates to itself —
     // still negative, so the frozen gate holds — and the sky the clock
     // renders from it is computed without the read loop faulting.
     let mut head = Vec::new();

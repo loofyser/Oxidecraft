@@ -8,7 +8,7 @@
 //!
 //! [`enchant_line`] answers one `ench`-list entry's line, or `None` for an
 //! id the registry never registered — the source's `getEnchantmentById(k) !=
-//! null` guard (`ItemStack.java`:697-714) skips those entries.
+//! `null` guard (`ItemStack.java`:697-714) skips those entries.
 
 /// One row of the 1.8 enchantment registry: the effect id and the en_US
 /// display string its lang key carries.

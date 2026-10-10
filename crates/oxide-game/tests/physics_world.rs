@@ -105,7 +105,7 @@ fn tick_displacement(player: &mut Player, intent: &Intent, view: &WorldView<'_>)
 fn a_walk_steps_up_the_lower_box_of_a_stair() {
     // The stair at (4, 64, 4) faces east: its base is the whole cell at half
     // height, its step the cell's east half at the top
-    // (`BlockStairs.java:292-406`, the east arm at `:313-340`).
+    // (`BlockStairs.java:292-406`, the east arm at `:313-335`).
     let world = world_of(floor(|x, y, z| {
         if (x, y, z) == (4, 64, 4) {
             STAIR_EAST
