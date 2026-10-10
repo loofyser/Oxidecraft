@@ -51,6 +51,7 @@ use oxide_client::items;
 use oxide_client::screens::container::{ContainerScreen, HOVER_COLOUR, title_rgba};
 use oxide_client::screens::family_a;
 use oxide_client::screens::family_b;
+use oxide_client::screens::inventory;
 use oxide_client::screens::{ScreenState, Screens};
 use oxide_client::tooltip;
 
@@ -316,6 +317,13 @@ pub struct ScreenDrawInput<'a> {
     /// The player's experience level: the enchanting offer faces and click
     /// gate read it (`ContainerEnchantment.enchantItem`'s level arms).
     pub level: i32,
+    /// The own player's live effects, ascending by id: the inventory overlay
+    /// reads them (`ClientEvent::Effects` after 0x1D/0x1E).
+    pub effects: &'a [StatusEffect],
+    /// The own player's resolved skin, or `None` before the login lands it:
+    /// the inventory preview samples it. Without one the preview stays out
+    /// while the sheet and slots still draw.
+    pub preview_skin: Option<SkinTexId>,
 }
 
 /// The screen group's own draws: the source's `currentScreen.drawScreen`
@@ -360,8 +368,11 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         height: height - height / 2.0,
         colour: [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 208.0 / 255.0],
     });
-    let ScreenState::Container(container) = screen else {
-        return draws;
+    let container = match screen {
+        ScreenState::Container(container) | ScreenState::Inventory(container) => container.as_ref(),
+        ScreenState::Sign { .. } | ScreenState::Book { .. } | ScreenState::Creative => {
+            return draws;
+        }
     };
     let layout = container.layout();
     let (gx, gy) = container.origin();
@@ -401,6 +412,11 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             ],
             colour: [1.0, 1.0, 1.0, 1.0],
         });
+    }
+    // The inventory's player preview over the sheet, before the slots: the
+    // pointer-facing silhouette (`GuiInventory.drawScreen`:73-91).
+    if matches!(screen, ScreenState::Inventory(_)) {
+        push_inventory_preview(&mut draws, input, gx, gy);
     }
     // The family-B widgets over the sheet, before the slots: the background
     // layer's extras — the horse's panels, the anvil's strip and arrow, the
@@ -551,7 +567,126 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             }
         }
     }
+    // The inventory's effects overlay, last over everything the screen drew
+    // (`InventoryEffectRenderer.drawScreen`:47-55 draws the list after the
+    // container). Hidden entirely with no effects.
+    if matches!(screen, ScreenState::Inventory(_)) {
+        push_inventory_effects(&mut draws, container, input, gx, gy);
+    }
     draws
+}
+
+/// The inventory's player preview: the skin-face silhouette centred on the
+/// derived anchor, facing the pointer (`GuiInventory.drawScreen`:73-91 and
+/// `drawEntityOnScreen`:96-134).
+///
+/// The entry is a GUI projection through the screen pass, not the entity
+/// pass (recorded in [`inventory`]): the anchor/scale, the per-frame facing
+/// angles from the pointer and the own player's skin face sampled flat —
+/// the source disables world lighting for the preview, which the flat
+/// sample honours by construction. The facing is derived here so the posed
+/// projection reads it; the flat quad itself stays unrotated. Before the
+/// first pointer move the preview faces forward (the pointer reads as the
+/// anchor, both arms zero).
+fn push_inventory_preview(draws: &mut Vec<HudDraw>, input: &ScreenDrawInput, gx: f32, gy: f32) {
+    let Some(skin) = input.preview_skin else {
+        return;
+    };
+    let (ax, ay) = inventory::preview_anchor(gx as i32, gy as i32);
+    let (ax, ay) = (ax as f32, ay as f32);
+    let (pointer_x, pointer_y) = input.mouse.unwrap_or((ax, ay));
+    let (_yaw, _offset, _pitch) = inventory::preview_facing(pointer_x, pointer_y, ax, ay);
+    let half = inventory::PREVIEW_SILHOUETTE / 2.0;
+    // The face, then the hat overlay — the tab list's own pair over the same
+    // skin space (`TAB_FACE_UV`/`TAB_HAT_UV`).
+    for uv in [TAB_FACE_UV, TAB_HAT_UV] {
+        draws.push(HudDraw::SkinRect {
+            texture: skin,
+            x: ax - half,
+            y: ay - half,
+            width: inventory::PREVIEW_SILHOUETTE,
+            height: inventory::PREVIEW_SILHOUETTE,
+            uv,
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+    }
+}
+
+/// The inventory's effects overlay: one row per live effect, ascending by id
+/// — the source iterates a `HashMap` (no order), the port's deterministic
+/// order is the recorded divergence — each on the row sprite with the status
+/// icon and the name/duration pens (`InventoryEffectRenderer.java`:60-109).
+/// Hidden entirely with no effects; an id outside the potion table draws no
+/// row (recorded). Without a font the rows and icons still draw while the
+/// texts stay out.
+fn push_inventory_effects(
+    draws: &mut Vec<HudDraw>,
+    container: &ContainerScreen,
+    input: &ScreenDrawInput,
+    gx: f32,
+    gy: f32,
+) {
+    let sheet = container.layout().sheet;
+    let mut rows: Vec<&StatusEffect> = input.effects.iter().collect();
+    rows.sort_by_key(|effect| effect.effect_id);
+    let mut named: Vec<(&StatusEffect, &str)> = Vec::with_capacity(rows.len());
+    for effect in rows {
+        if let Some(row) = items::potion_name(effect.effect_id) {
+            named.push((effect, row.name));
+        }
+    }
+    if named.is_empty() {
+        return;
+    }
+    let step = inventory::effect_step(named.len());
+    let [row_sx, row_sy, row_w, row_h] = inventory::EFFECT_ROW_RECT;
+    for (row, (effect, base)) in named.iter().enumerate() {
+        let dy = row as i32 * step;
+        sheet_blit(
+            draws,
+            sheet,
+            gx,
+            gy,
+            inventory::EFFECT_ROW_DX,
+            dy,
+            row_w,
+            row_h,
+            row_sx,
+            row_sy,
+        );
+        if let Some((col, icon_row)) = inventory::potion_icon_uv(effect.effect_id) {
+            sheet_blit(
+                draws,
+                sheet,
+                gx,
+                gy,
+                inventory::EFFECT_ROW_DX + inventory::EFFECT_ICON_DX,
+                dy + inventory::EFFECT_ICON_DY,
+                inventory::EFFECT_ICON_SIZE,
+                inventory::EFFECT_ICON_SIZE,
+                col * inventory::EFFECT_ICON_SIZE,
+                inventory::EFFECT_ICON_TOP + icon_row * inventory::EFFECT_ICON_SIZE,
+            );
+        }
+        if input.font.is_some() {
+            panel_text(
+                draws,
+                inventory::effect_name(base, effect.amplifier),
+                gx + (inventory::EFFECT_ROW_DX + inventory::EFFECT_NAME_DX) as f32,
+                gy + dy as f32 + inventory::EFFECT_NAME_DY as f32,
+                title_rgba(inventory::EFFECT_NAME_COLOUR),
+                true,
+            );
+            panel_text(
+                draws,
+                inventory::effect_duration(effect.duration),
+                gx + (inventory::EFFECT_ROW_DX + inventory::EFFECT_NAME_DX) as f32,
+                gy + dy as f32 + inventory::EFFECT_DURATION_DY as f32,
+                title_rgba(inventory::EFFECT_DURATION_COLOUR),
+                true,
+            );
+        }
+    }
 }
 
 /// One sheet blit over the panel at the centred origin.
@@ -1789,6 +1924,12 @@ impl View {
     /// gate read it (`ContainerEnchantment.enchantItem`'s level arms).
     pub fn level(&self) -> i32 {
         self.rows.level
+    }
+
+    /// The own player's live effects, ascending by id: the inventory overlay
+    /// reads them (`ClientEvent::Effects` after 0x1D/0x1E).
+    pub fn effects(&self) -> &[StatusEffect] {
+        &self.rows.effects
     }
 
     /// The survival rows' draws: the armour, hearts (with the absorption
@@ -10113,6 +10254,8 @@ mod tests {
                 mouse: Some((100.0, 50.0)),
                 advanced: false,
                 level: 0,
+                effects: &[],
+                preview_skin: None,
             },
         );
         assert!(draws.is_empty(), "no screen owns no draws");
@@ -10122,7 +10265,7 @@ mod tests {
     fn a_declared_variant_draws_the_generic_frame() {
         let font = chat_font();
         let mut screens = Screens::default();
-        screens.open_inventory();
+        screens.open_sign(0, 64, 0);
         let scaled = chat_resolution();
         let draws = screen_draws(
             &screens,
@@ -10132,6 +10275,8 @@ mod tests {
                 mouse: Some((100.0, 50.0)),
                 advanced: false,
                 level: 0,
+                effects: &[],
+                preview_skin: None,
             },
         );
         // The world-present gradient alone: top 0xC0101010 over bottom
@@ -10144,6 +10289,70 @@ mod tests {
                 "no textured or text draw: {draw:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_inventory_effects_overlay_lists_rows_in_ascending_id() {
+        // Two live effects, handed descending: the overlay lists Speed II
+        // (id 1) before Strength (id 5) — the port's deterministic order over
+        // the source's `HashMap` iteration (the recorded divergence) — each
+        // with its name/duration pens, after the screen's own title.
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_inventory();
+        let scaled = chat_resolution();
+        let effects = [
+            StatusEffect {
+                effect_id: 5,
+                amplifier: 0,
+                duration: 1200,
+            },
+            StatusEffect {
+                effect_id: 1,
+                amplifier: 1,
+                duration: 3600,
+            },
+        ];
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled,
+                mouse: Some((100.0, 50.0)),
+                advanced: false,
+                level: 0,
+                effects: &effects,
+                preview_skin: None,
+            },
+        );
+        let texts: Vec<String> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["Crafting", "Speed II", "3:00", "Strength", "1:00"],
+            "the title, then the rows in ascending id: {texts:?}"
+        );
+        let rows = draws
+            .iter()
+            .filter(|draw| {
+                matches!(
+                    draw,
+                    HudDraw::TexturedRect {
+                        texture: HudTexture::Named("gui/container/inventory"),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            rows, 5,
+            "the panel, two row sprites and two icons share the sheet: {draws:?}"
+        );
     }
 
     #[test]
@@ -10182,6 +10391,8 @@ mod tests {
                 mouse: Some((100.0, 50.0)),
                 advanced: false,
                 level: 0,
+                effects: &[],
+                preview_skin: None,
             },
         );
         // The 427x240 frame centres the 176x166 panel at (125, 37); the
@@ -10292,6 +10503,8 @@ mod tests {
                 mouse: Some((141.0, 63.0)),
                 advanced: false,
                 level: 0,
+                effects: &[],
+                preview_skin: None,
             },
         );
         assert!(
@@ -10311,6 +10524,8 @@ mod tests {
                 mouse: Some((141.0, 63.0)),
                 advanced: false,
                 level: 0,
+                effects: &[],
+                preview_skin: None,
             },
         );
         assert!(

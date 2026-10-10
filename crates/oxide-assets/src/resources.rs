@@ -47,8 +47,10 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///   (`GuiBrewingStand.java`:11), `crafting_table` (`GuiCrafting.java`:13),
 ///   `enchanting_table` (`GuiEnchantment.java`:28), `anvil`
 ///   (`GuiRepair.java`:25), `beacon` (`GuiBeacon.java`:27), `villager`
-///   (`GuiMerchant.java`:29) and `horse`
-///   (`GuiScreenHorseInventory.java`:12), all under `gui/container/`.
+///   (`GuiMerchant.java`:29), `horse`
+///   (`GuiScreenHorseInventory.java`:12) and `inventory`
+///   (`GuiInventory.java`:85-89 binds `inventoryBackground`), all under
+///   `gui/container/`.
 /// - `gui/book` — the written book's frame (`GuiScreenBook.java`:33).
 /// - `entity/enchanting_table_book` — the enchanting table's book render
 ///   (`GuiEnchantment.java`:33, `TileEntityEnchantmentTableRenderer.java`:13).
@@ -61,7 +63,7 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///
 /// The hud's icon sheet, `gui/icons`, already travels under its own
 /// client-side name and is not repeated here.
-pub const GUI_SHEETS: [&str; 18] = [
+pub const GUI_SHEETS: [&str; 19] = [
     "gui/widgets",
     "gui/container/generic_54",
     "gui/container/dispenser",
@@ -74,6 +76,7 @@ pub const GUI_SHEETS: [&str; 18] = [
     "gui/container/beacon",
     "gui/container/villager",
     "gui/container/horse",
+    "gui/container/inventory",
     "gui/book",
     "entity/enchanting_table_book",
     "font/ascii_sga",
@@ -337,7 +340,7 @@ mod tests {
         );
     }
 
-    /// The list names the source's own sheets: the widgets sheet, the eleven
+    /// The list names the source's own sheets: the widgets sheet, the twelve
     /// container frames, the two book sheets, the SGA glyph sheet and the chest
     /// trio's icon sheets — extensionless keys, `gui/icons` not among them (the
     /// hud's icon sheet travels under its own client-side name).
@@ -358,6 +361,7 @@ mod tests {
                 "gui/container/beacon",
                 "gui/container/villager",
                 "gui/container/horse",
+                "gui/container/inventory",
                 "gui/book",
                 "entity/enchanting_table_book",
                 "font/ascii_sga",

@@ -7324,6 +7324,36 @@ fn a_close_of_window_zero_drops_the_carried_stack() {
 }
 
 #[test]
+fn two_inventory_opens_send_two_client_status_twos() {
+    // The E key's open path (`Minecraft.java`:2090-2103): every non-riding
+    // open sends exactly one C16 carrying action 2
+    // (`OPEN_INVENTORY_ACHIEVEMENT` at :2100) — no guard, so two opens send
+    // two.
+    let head = feed_head(&[]);
+    let (_events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (2, InputEvent::OpenInventory),
+            (4, InputEvent::OpenInventory),
+        ],
+    );
+
+    let opens: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x16)
+        .cloned()
+        .collect();
+    assert_eq!(
+        opens,
+        vec![vec![0x16, 0x02], vec![0x16, 0x02]],
+        "two opens send two C16s carrying action 2: {frames:?}"
+    );
+}
+
+#[test]
 fn a_held_item_change_moves_the_selection_and_reports_it() {
     // The view's own change rule (`PlayerControllerMP.syncCurrentPlayItem:379-388`,
     // the C09 the running controller sends) hands each move here: the session

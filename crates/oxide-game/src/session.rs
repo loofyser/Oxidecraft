@@ -1033,6 +1033,18 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     })?;
                                     send_reply(&mut conn, &request)?;
                                 }
+                                InputEvent::OpenInventory => {
+                                    // The inventory key's open: one Client
+                                    // Status carrying action 2, the source's
+                                    // `OPEN_INVENTORY_ACHIEVEMENT`
+                                    // (`Minecraft.java:2090-2103`, send at
+                                    // :2100) — no guard, so every open sends
+                                    // one.
+                                    let request = payload_of(|out| {
+                                        write_client_status(out, ClientStatusAction::OpenInventory)
+                                    })?;
+                                    send_reply(&mut conn, &request)?;
+                                }
                                 other => looked |= apply_input(other, &mut intent, &mut player),
                             }
                         }
@@ -2559,6 +2571,7 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
         | InputEvent::CustomPayload { .. }
         | InputEvent::UpdateSign { .. }
         | InputEvent::HeldItemChange { .. }
+        | InputEvent::OpenInventory
         | InputEvent::DropItem { .. } => false,
     }
 }

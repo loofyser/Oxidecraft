@@ -200,6 +200,11 @@ pub enum InputEvent {
         /// Whether the whole stack drops (`true`) or one item (`false`).
         whole: bool,
     },
+    /// The inventory key's open: one Client Status carrying action 2, the
+    /// source's `OPEN_INVENTORY_ACHIEVEMENT` (`Minecraft.java:2090-2103`,
+    /// send at :2100, screen display at :2101). The source guards nothing —
+    /// every non-riding open sends exactly one — so two opens send two.
+    OpenInventory,
 }
 
 /// How many physical keys the intent tracks.

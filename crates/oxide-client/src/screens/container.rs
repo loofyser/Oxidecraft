@@ -628,6 +628,13 @@ impl ContainerScreen {
         );
     }
 
+    /// Sets the origin the layout's size reads from: the panel's top-left in
+    /// screen units, for the frames the centred rule cannot place (the
+    /// inventory's effects shift sets this from its own rule).
+    pub fn set_origin(&mut self, x: i32, y: i32) {
+        self.origin = (x, y);
+    }
+
     /// The panel's top-left in screen units.
     pub fn origin(&self) -> (i32, i32) {
         self.origin

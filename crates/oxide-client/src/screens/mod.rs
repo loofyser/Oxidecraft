@@ -38,6 +38,7 @@ use container::{ContainerLayout, ContainerScreen};
 pub mod container;
 pub mod family_a;
 pub mod family_b;
+pub mod inventory;
 
 /// One open screen: a variant per screen the client can stand on.
 #[derive(Debug, Clone)]
@@ -45,8 +46,9 @@ pub enum ScreenState {
     /// A container window's screen, standing on the window's id (boxed: the
     /// runtime dwarfs the other variants).
     Container(Box<ContainerScreen>),
-    /// The player's own inventory (window 0; Task 20 owns its screen).
-    Inventory,
+    /// The player's own inventory: window 0's 45-slot screen through the
+    /// same container path (boxed like the container kind).
+    Inventory(Box<ContainerScreen>),
     /// A sign's editor at the block (Task 22 owns it).
     Sign {
         /// The sign's world x.
@@ -70,8 +72,9 @@ impl ScreenState {
     /// the inventory, none for the windowless screens.
     pub fn window_id(&self) -> Option<u8> {
         match self {
-            ScreenState::Container(screen) => Some(screen.window_id()),
-            ScreenState::Inventory => Some(0),
+            ScreenState::Container(screen) | ScreenState::Inventory(screen) => {
+                Some(screen.window_id())
+            }
             ScreenState::Sign { .. } | ScreenState::Book { .. } | ScreenState::Creative => None,
         }
     }
@@ -79,7 +82,7 @@ impl ScreenState {
     /// The input ownership (`allowUserInput`, `GuiScreen`:68): the inventory
     /// and creative screens take user input; containers inherit false.
     pub fn allow_user_input(&self) -> bool {
-        matches!(self, ScreenState::Inventory | ScreenState::Creative)
+        matches!(self, ScreenState::Inventory(_) | ScreenState::Creative)
     }
 }
 
@@ -103,10 +106,23 @@ impl Screens {
     }
 
     /// The open container screen, when the current screen is one: the
-    /// window's own routing reads and drives it.
+    /// window's own routing reads and drives it. Window 0's inventory stands
+    /// on the same path — its clicks carry 0, its keys run the container's
+    /// own routing — so it answers here too; the family widgets keep the
+    /// container-only routing above.
     pub fn container_mut(&mut self) -> Option<&mut ContainerScreen> {
+        self.screen_mut()
+    }
+
+    /// The open screen's container path, when the current screen stands on
+    /// one: the server's windows and the player's own inventory (window 0)
+    /// alike. The per-frame feed, the pointer and the container keys drive
+    /// this; the family widgets keep the container-only routing above.
+    pub fn screen_mut(&mut self) -> Option<&mut ContainerScreen> {
         match self.current.as_mut() {
-            Some(ScreenState::Container(screen)) => Some(screen.as_mut()),
+            Some(ScreenState::Container(screen) | ScreenState::Inventory(screen)) => {
+                Some(screen.as_mut())
+            }
             _ => None,
         }
     }
@@ -184,9 +200,20 @@ impl Screens {
         ))));
     }
 
-    /// Opens the player's own inventory screen (window 0).
-    pub fn open_inventory(&mut self) {
-        self.current = Some(ScreenState::Inventory);
+    /// Opens the player's own inventory screen (window 0): one
+    /// [`InputEvent::OpenInventory`] — the C16 client status 2
+    /// (`Minecraft.java`:2090-2103, send at :2100, display at :2101) — and
+    /// the fresh 45-slot screen beside it. No guard exists: two opens send
+    /// two C16s. (The riding branch is out of scope, recorded; the creative
+    /// swap lands with Task 21.)
+    pub fn open_inventory(&mut self) -> Option<InputEvent> {
+        self.current = Some(ScreenState::Inventory(Box::new(ContainerScreen::new(
+            0,
+            WindowKind::Container,
+            String::new(),
+            &inventory::INVENTORY_LAYOUT,
+        ))));
+        Some(InputEvent::OpenInventory)
     }
 
     /// Opens a sign's editor at the block. The editor lands in Task 22; the
@@ -253,25 +280,36 @@ impl Screens {
         cursor: Option<MetadataItem>,
         properties: Vec<i16>,
     ) -> Option<InputEvent> {
-        if let Some(ScreenState::Container(screen)) = self.current.as_mut() {
-            if screen.window_id() == window_id {
-                screen.apply_snapshot(slots, cursor, properties);
-                let confirmed = screen.properties().to_vec();
-                let slot0 = screen.slot_stack(0).cloned().flatten();
-                match screen.family_mut() {
-                    family_b::FamilyState::Beacon(selection) => {
-                        selection.primary = confirmed.get(1).copied().unwrap_or(0) as i32;
-                        selection.secondary = confirmed.get(2).copied().unwrap_or(0) as i32;
-                    }
-                    family_b::FamilyState::Anvil(field) => {
-                        return family_b::anvil_sync(field, slot0.as_ref());
-                    }
-                    family_b::FamilyState::Enchanting(_)
-                    | family_b::FamilyState::Villager(_)
-                    | family_b::FamilyState::Horse(_)
-                    | family_b::FamilyState::None => {}
-                }
+        // Window 0's snapshots feed the inventory screen; any other window's
+        // the open container standing on it. The inventory answers no send —
+        // the beacon reseed and the anvil re-fire below are the container
+        // kinds' alone.
+        let screen = match self.current.as_mut() {
+            Some(ScreenState::Container(screen)) if screen.window_id() == window_id => {
+                screen.as_mut()
             }
+            Some(ScreenState::Inventory(screen)) if window_id == 0 => {
+                let screen = screen.as_mut();
+                screen.apply_snapshot(slots, cursor, properties);
+                return None;
+            }
+            _ => return None,
+        };
+        screen.apply_snapshot(slots, cursor, properties);
+        let confirmed = screen.properties().to_vec();
+        let slot0 = screen.slot_stack(0).cloned().flatten();
+        match screen.family_mut() {
+            family_b::FamilyState::Beacon(selection) => {
+                selection.primary = confirmed.get(1).copied().unwrap_or(0) as i32;
+                selection.secondary = confirmed.get(2).copied().unwrap_or(0) as i32;
+            }
+            family_b::FamilyState::Anvil(field) => {
+                return family_b::anvil_sync(field, slot0.as_ref());
+            }
+            family_b::FamilyState::Enchanting(_)
+            | family_b::FamilyState::Villager(_)
+            | family_b::FamilyState::Horse(_)
+            | family_b::FamilyState::None => {}
         }
         None
     }
@@ -308,5 +346,69 @@ impl Screens {
     pub fn uncover_from_chat(&mut self) {
         self.covered = None;
         self.current = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The inventory open path: one C16 per open, window 0's snapshot feed
+    //! and close.
+
+    use oxide_proto_v47::entity::MetadataItem;
+
+    use super::*;
+
+    /// One stack's view shape for the snapshot pins.
+    fn stack(id: i16) -> Option<MetadataItem> {
+        Some(MetadataItem {
+            id,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        })
+    }
+
+    #[test]
+    fn two_opens_send_two_c16s() {
+        // No guard exists on the open path (`Minecraft.java`:2090-2103): two
+        // opens send two C16s, each opening the screen beside it (:2101).
+        let mut screens = Screens::default();
+        assert_eq!(screens.open_inventory(), Some(InputEvent::OpenInventory));
+        assert!(matches!(screens.current(), Some(ScreenState::Inventory(_))));
+        assert_eq!(screens.open_inventory(), Some(InputEvent::OpenInventory));
+    }
+
+    #[test]
+    fn window_zero_snapshots_feed_the_inventory_screen() {
+        // Window 0 renders through the same container path: its snapshots
+        // land on the inventory screen's slots, live.
+        let mut screens = Screens::default();
+        screens.open_inventory();
+        let mut slots = vec![None; 45];
+        slots[0] = stack(264);
+        slots[1] = stack(265);
+        assert_eq!(
+            screens.apply_snapshot(0, slots, None, Vec::new()),
+            None,
+            "a window-0 snapshot answers no send"
+        );
+        let screen = screens.screen_mut().expect("the inventory stands");
+        assert_eq!(screen.window_id(), 0);
+        assert_eq!(screen.slot_stack(0).cloned().flatten(), stack(264));
+        assert_eq!(screen.slot_stack(1).cloned().flatten(), stack(265));
+    }
+
+    #[test]
+    fn the_inventory_close_carries_window_zero() {
+        // The close sends C0D with window id 0 like every other close
+        // (`EntityPlayerSP.closeScreen`:330-333).
+        let mut screens = Screens::default();
+        screens.open_inventory();
+        let mut cursor = stack(264);
+        assert_eq!(
+            screens.close(&mut cursor),
+            Some(InputEvent::CloseWindow { window_id: 0 })
+        );
+        assert_eq!(cursor, None, "the close drops the cursor copy");
     }
 }

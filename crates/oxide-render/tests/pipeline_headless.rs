@@ -10243,3 +10243,197 @@ fn t19_familyb_anvil_draws_cost_and_field() {
     expect_rows(&pixels, 163, 84, [0, 0, 0], "the input's item");
     expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
 }
+
+// ---------------------------------------------------------------------------------------
+// Task 20's inventory frame: the sheet, one grid item, the preview silhouette and two
+// effect rows.
+// ---------------------------------------------------------------------------------------
+
+/// Task 20's font sheet: the digit sheet's construction extended to the case's
+/// effect-row glyphs, so the names ("Speed II", "Strength") and the durations
+/// ("3:00", "1:00") ink. Each named cell inks its first column only, at two
+/// font pixels' advance — the pins read the first glyph's ink, never the
+/// advance math.
+///
+/// Generated here; no asset store is read and no Mojang pixel is embedded.
+fn t20_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for code in [
+        'S', 'p', 'e', 'd', 'I', 't', 'r', 'n', 'g', 'h', ':', '0', '1', '3',
+    ] {
+        let code = code as u32;
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// Task 20's frame runner: one screen pass over the sky clear with the named
+/// sheet, the lettered font and the given draws, through the item icon seam.
+/// The runner owns the preview draw — the 16x16 skin-face silhouette centred
+/// on the pinned anchor, mirroring `view.rs`'s inventory preview — so the
+/// case reads the sheet, the item and the effect rows; the mutation probe
+/// shifts the runner's rect.
+///
+/// The skin uploads flat under `uuid`, so the silhouette's pixels are the
+/// skin's own colour: the source draws the preview without world lighting,
+/// which the flat sample honours by construction.
+fn t20_inventory_pixels(
+    name: &'static str,
+    sheet: &Texture,
+    skin: [u8; 4],
+    uuid: &str,
+    draws: &[HudDraw],
+) -> Vec<u8> {
+    const ANCHOR_X: f32 = 247.0;
+    const ANCHOR_Y: f32 = 112.0;
+    const FACE: f32 = 16.0;
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    screen.set_texture(&device, &queue, name, sheet);
+    screen
+        .set_font(&device, &queue, &t20_font_sheet())
+        .expect("the lettered sheet is a 16x16 grid");
+    screen.set_atlas_icon(&device, &queue, &item_atlas());
+    screen.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    let mut skins = TextureRegistry::new(&device, &queue);
+    skins.set_skin(&device, &queue, uuid, Some(&flat_sheet(skin)), None);
+    let preview = skins.resolve(uuid, false).id();
+    let mut all = Vec::with_capacity(draws.len() + 2);
+    all.extend_from_slice(&draws[..1]);
+    all.push(HudDraw::SkinRect {
+        texture: preview,
+        x: ANCHOR_X - FACE / 2.0,
+        y: ANCHOR_Y - FACE / 2.0,
+        width: FACE,
+        height: FACE,
+        uv: [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    });
+    all.push(HudDraw::SkinRect {
+        texture: preview,
+        x: ANCHOR_X - FACE / 2.0,
+        y: ANCHOR_Y - FACE / 2.0,
+        width: FACE,
+        height: FACE,
+        uv: [40.0 / 64.0, 8.0 / 64.0, 48.0 / 64.0, 16.0 / 64.0],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    });
+    all.extend_from_slice(&draws[1..]);
+    screen.set_draws(&device, &queue, &all, &skins);
+    let depth = rows_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t20 inventory headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+    read_rows_pixels(&device, &queue, &target)
+}
+
+/// The populated inventory frame: the shifted 176x166 panel at (196, 37) —
+/// `160 + (448 - 176 - 200) / 2` while effects are non-empty — a checker
+/// item in grid slot 1, the skin-face preview centred on the (51, 75)
+/// anchor, and two effect rows (Speed II for 3:00, Strength for 1:00).
+///
+/// The geometry mirrors `view.rs`'s inventory draws, which the render crate
+/// cannot import. The pins: the sheet's green/blue, the grid item's black
+/// cell, the anchor's skin colour, each row's cyan, each icon's colour and
+/// each name/duration's ink, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t20_inventory_draws_sheet_item_preview_and_effects() {
+    const NAME: &str = "t20/inventory";
+    const GX: f32 = 196.0;
+    const GY: f32 = 37.0;
+    const SKIN: [u8; 4] = [200, 90, 40, 255];
+    const UUID: &str = "00000000-0000-0000-0000-000000000020";
+    let sheet = t18_family_sheet(&[
+        (0, 166, 140, 32, [0, 255, 255, 255]),
+        (0, 198, 18, 18, [255, 0, 255, 255]),
+        (72, 198, 18, 18, [255, 255, 0, 255]),
+    ]);
+    let pixels = t20_inventory_pixels(
+        NAME,
+        &sheet,
+        SKIN,
+        UUID,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_slot_item(GX + 88.0, GY + 26.0),
+            t18_blit(NAME, GX, GY, [-124, 0, 140, 32, 0, 166]),
+            t18_blit(NAME, GX, GY, [-118, 7, 18, 18, 0, 198]),
+            HudDraw::Text {
+                text: "Speed II".to_string(),
+                x: GX - 124.0 + 28.0,
+                y: GY + 6.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Text {
+                text: "3:00".to_string(),
+                x: GX - 124.0 + 28.0,
+                y: GY + 16.0,
+                scale: 1.0,
+                colour: [127.0 / 255.0, 127.0 / 255.0, 127.0 / 255.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            t18_blit(NAME, GX, GY, [-124, 33, 140, 32, 0, 166]),
+            t18_blit(NAME, GX, GY, [-118, 40, 18, 18, 72, 198]),
+            HudDraw::Text {
+                text: "Strength".to_string(),
+                x: GX - 124.0 + 28.0,
+                y: GY + 39.0,
+                scale: 1.0,
+                colour: [1.0, 1.0, 1.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Text {
+                text: "1:00".to_string(),
+                x: GX - 124.0 + 28.0,
+                y: GY + 49.0,
+                scale: 1.0,
+                colour: [127.0 / 255.0, 127.0 / 255.0, 127.0 / 255.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+        ],
+    );
+    expect_rows(&pixels, 250, 150, [0, 255, 0], "the sheet's green");
+    expect_rows(&pixels, 300, 150, [0, 0, 255], "the sheet's blue");
+    expect_rows(&pixels, 284, 63, [0, 0, 0], "grid slot 1's item");
+    expect_rows(&pixels, 247, 112, [200, 90, 40], "the preview's skin");
+    expect_rows(&pixels, 200, 40, [0, 255, 255], "the first row's cyan");
+    expect_rows(&pixels, 78, 44, [255, 0, 255], "the Speed icon's magenta");
+    expect_rows(&pixels, 100, 43, [255, 255, 255], "the Speed name's ink");
+    expect_rows(&pixels, 100, 53, [127, 127, 127], "the 3:00 ink");
+    expect_rows(&pixels, 78, 77, [255, 255, 0], "the Strength icon's yellow");
+    expect_rows(&pixels, 100, 76, [255, 255, 255], "the Strength name's ink");
+    expect_rows(&pixels, 100, 86, [127, 127, 127], "the 1:00 ink");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}

@@ -52,11 +52,13 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_assets::font::Font;
 use oxide_assets::skins::SkinCache;
+use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_assets::store::Store;
 use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
+use oxide_client::screens::{ScreenState, inventory};
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -71,6 +73,7 @@ use oxide_render::camera::{
     WalkDistance, bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll,
     interpolate_pose, render_eye,
 };
+use oxide_render::entity_pass::{SkinLookup, SkinTexId, TextureRegistry};
 use oxide_render::fog::{FogParams, fog_colour, linear_params};
 use oxide_render::fps::FpsCounter;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
@@ -1529,10 +1532,21 @@ impl ClientApp {
         );
         // The screen's frame: the panel centres in the scaled size and the free
         // pointer feeds the hover, so the draws the group assembles below read
-        // the frame's own state.
+        // the frame's own state. The inventory's effects shift moves the frame
+        // right while effects are live (`160 + (width - xSize - 200)/2`); the
+        // draws read the origin, so the shift lands before them.
         let screen_open = self.screens.is_open();
-        if let Some(screen) = self.screens.container_mut() {
+        let effects_shift = matches!(self.screens.current(), Some(ScreenState::Inventory(_)))
+            && !self.view.effects().is_empty();
+        if let Some(screen) = self.screens.screen_mut() {
             screen.set_screen_size(scaled.width as i32, scaled.height as i32);
+            if effects_shift {
+                let layout = screen.layout();
+                screen.set_origin(
+                    inventory::effects_frame_left(scaled.width as i32, layout.x_size),
+                    (scaled.height as i32 - layout.y_size) / 2,
+                );
+            }
         }
         // Inline — not the method — so the feed runs while the renderer
         // stays borrowed: the fields are disjoint.
@@ -1606,6 +1620,12 @@ impl ClientApp {
                 mouse: self.cursor,
                 advanced: self.advanced_tooltips,
                 level: self.view.level(),
+                effects: self.view.effects(),
+                preview_skin: Self::preview_skin_id(
+                    &self.tab,
+                    &self.own_name,
+                    renderer.entity_textures(),
+                ),
             },
         ));
         // The death view replaces the debug overlay while the player is dead:
@@ -1728,6 +1748,15 @@ impl ClientApp {
         // takes user input only for the inventory kind (`allowUserInput`),
         // but every screen swallows the rest.
         if self.on_screen_key(event_loop, &event) {
+            return;
+        }
+        // The inventory key's open path (the router seam — the keymap binding
+        // itself is Task 24's): a fresh E press with the pointer grabbed and
+        // no screen open stands the window-0 screen beside one C16
+        // (`Minecraft.java`:2090-2103; no guard, so two opens send two).
+        if self.capture.grabbed() && inventory_opener(event.state, event.repeat, event.physical_key)
+        {
+            self.open_inventory(event_loop);
             return;
         }
         // The held player list: a Tab edge while no screen consumes the keys
@@ -1941,6 +1970,28 @@ impl ClientApp {
         }
     }
 
+    /// The inventory preview's skin: the own player's resolved head texture —
+    /// the tab list's entry under the window's own account name, through the
+    /// entity registry's own resolver (the tab list's own rule). `None` while
+    /// the list carries no own entry, and the preview stays out while the
+    /// sheet and slots still draw.
+    ///
+    /// An associated function without a receiver — not a method — so the
+    /// frame borrows the tab list beside the renderer's own textures without
+    /// borrowing the whole app.
+    fn preview_skin_id(
+        tab: &view::TabState,
+        own_name: &str,
+        skins: &TextureRegistry,
+    ) -> Option<SkinTexId> {
+        let entry = tab.entries.iter().find(|entry| entry.name == own_name)?;
+        Some(
+            skins
+                .resolve(&entry.uuid, default_skin(&entry.uuid) == DefaultModel::Slim)
+                .id(),
+        )
+    }
+
     /// Closes the open screen from the window's own key: one `CloseWindow`
     /// carrying the screen's window id leaves — window 0 included — the
     /// view's cursor copy drops with it, and the pointer recaptures
@@ -1955,6 +2006,24 @@ impl ClientApp {
         self.send_input(event);
         self.cursor = None;
         let step = self.capture.chat_close();
+        self.apply_capture(event_loop, step);
+    }
+
+    /// Opens the player's own inventory from the window's own key: one C16
+    /// carrying action 2 leaves — the source's `OPEN_INVENTORY_ACHIEVEMENT`
+    /// (`Minecraft.java`:2090-2103, send at :2100) — and the window-0 screen
+    /// stands beside it (:2101). No guard exists, so every open sends one.
+    /// The pointer frees like any other window open, with no hover until the
+    /// mouse moves. (The riding branch is out of scope, recorded; the
+    /// creative swap lands with Task 21; the keymap binding itself is Task
+    /// 24's — this is the router seam.)
+    fn open_inventory(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(event) = self.screens.open_inventory() {
+            self.send_input(event);
+        }
+        self.tab.open = false;
+        self.cursor = None;
+        let step = self.capture.chat_open();
         self.apply_capture(event_loop, step);
     }
 
@@ -2895,6 +2964,17 @@ fn gameplay_key(
         })
 }
 
+/// The inventory's opener key while no screen is open: a fresh press of E
+/// stands the window-0 screen (`Minecraft.java`:2090-2103 drains the
+/// `keyBindInventory` press queue; the keymap binding itself is Task 24's,
+/// so this reads the physical key). A repeat is not a fresh press and opens
+/// nothing; a release is no open at all.
+fn inventory_opener(state: ElementState, repeat: bool, physical_key: PhysicalKey) -> bool {
+    if state != ElementState::Pressed || repeat {
+        return false;
+    }
+    matches!(physical_key, PhysicalKey::Code(KeyCode::KeyE))
+}
 /// The chat's opener keys while it is closed: a fresh press of T opens an
 /// empty field, `/` a slashed one — the source's two chat keys
 /// (`Minecraft.java`:2113-2121 over the `keyBindChat` and `keyBindCommand`
@@ -3648,10 +3728,10 @@ mod tests {
         SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
         apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
         clear_break_stage, command_text, cracks_in_view, escape_route, f3_hold_step, frame_params,
-        gameplay_key, interpolate_pose, is_enter_press, is_escape_press, is_f3_press, is_h_press,
-        number_key_index, parse_script, parse_server_address, scaled_cursor, screen_click_button,
-        scripted_chat_click, skin_requests, store_aim, store_break_stage, store_skins, tab_held,
-        tooltip_point, void_y_factor,
+        gameplay_key, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
+        is_f3_press, is_h_press, number_key_index, parse_script, parse_server_address,
+        scaled_cursor, screen_click_button, scripted_chat_click, skin_requests, store_aim,
+        store_break_stage, store_skins, tab_held, tooltip_point, void_y_factor,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
@@ -5419,6 +5499,26 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn the_inventory_opener_is_a_fresh_e_press() {
+        // E stands the window-0 screen beside one C16 (`Minecraft.runTick`
+        // :2090-2103 drains the `keyBindInventory` press queue; the keymap
+        // binding itself is Task 24's, so the seam reads the physical key).
+        // An opener is a fresh press: a release or a repeat is no open.
+        let e = PhysicalKey::Code(KeyCode::KeyE);
+        assert!(inventory_opener(ElementState::Pressed, false, e));
+        assert!(!inventory_opener(ElementState::Released, false, e));
+        assert!(
+            !inventory_opener(ElementState::Pressed, true, e),
+            "an auto-repeat is not a fresh press"
+        );
+        assert!(!inventory_opener(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::KeyW)
+        ));
     }
 
     #[test]
