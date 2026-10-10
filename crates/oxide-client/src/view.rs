@@ -491,9 +491,14 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     // The hovered slot's tooltip, last over everything the screen drew: the
     // builder's lines through the draw assembly at the pointer
     // (`GuiContainer.drawScreen` renders the hovered stack's tooltip after
-    // the cursor). Without a font there is no width to place, so the box
-    // stays out while the rest still draws.
-    if let (Some(mouse), Some(font)) = (input.mouse, input.font) {
+    // the cursor — and only with empty hands: `:190` renders it only when
+    // `getItemStack() == null`, so the tooltip and the carried stack never
+    // co-draw; the cursor stays `Some` through a port drag, so the one gate
+    // covers the drag too). Without a font there is no width to place, so
+    // the box stays out while the rest still draws.
+    if let (Some(mouse), Some(font)) = (input.mouse, input.font)
+        && container.cursor().is_none()
+    {
         if let Some(hovered) = container.hovered() {
             if let Some(stack) = container.slot_stack(hovered).cloned().flatten() {
                 let lines = tooltip::tooltip_lines(&stack, input.advanced);
@@ -9711,6 +9716,85 @@ mod tests {
             ),
             "the count overlay under the carried stack: {:?}",
             draws[5]
+        );
+    }
+
+    #[test]
+    fn the_hovered_tooltip_waits_for_the_empty_cursor() {
+        use oxide_client::screens::container::{ContainerLayout, SlotPos, TitleKind};
+        use oxide_game::container::BaseStackCaps;
+
+        static ONE: &[SlotPos] = &[SlotPos {
+            index: 0,
+            x: 8,
+            y: 18,
+        }];
+        static ONE_LAYOUT: ContainerLayout = ContainerLayout {
+            x_size: 176,
+            y_size: 166,
+            sheet: "unit/panel",
+            slots: ONE,
+            title: TitleKind::Generic,
+        };
+        fn stack(id: i16, count: u8) -> MetadataItem {
+            MetadataItem {
+                id,
+                count,
+                damage: 0,
+                nbt: None,
+            }
+        }
+        fn has_text(draws: &[HudDraw], want: &str) -> bool {
+            draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == want))
+        }
+
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.test_container(3, &ONE_LAYOUT);
+        let container = screens.container_mut().expect("the stood container");
+        container.set_screen_size(427, 240);
+        container.apply_snapshot(vec![Some(stack(276, 1))], Some(stack(1, 4)));
+        container.mouse_moved(16.0, 26.0, &BaseStackCaps);
+        assert_eq!(
+            container.hovered(),
+            Some(0),
+            "the pointer hovers the sword's slot"
+        );
+        // A stack carried over the hovered slot: the tooltip stays out
+        // (`GuiContainer.java:190` renders it only when `getItemStack() ==
+        // null` — tooltip and carried stack never co-draw).
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: Some((141.0, 63.0)),
+                advanced: false,
+            },
+        );
+        assert!(
+            !has_text(&draws, "Diamond Sword§r"),
+            "no tooltip under the carried stack: {draws:?}"
+        );
+        // Released, the pointer unmoved: the hovered slot's tooltip returns.
+        screens
+            .container_mut()
+            .expect("the stood container")
+            .apply_snapshot(vec![Some(stack(276, 1))], None);
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: Some((141.0, 63.0)),
+                advanced: false,
+            },
+        );
+        assert!(
+            has_text(&draws, "Diamond Sword§r"),
+            "the tooltip returns on release: {draws:?}"
         );
     }
 }

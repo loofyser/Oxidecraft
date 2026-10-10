@@ -237,13 +237,13 @@ fn name_line(
     };
     let mut line = format!("{base}§r");
     if advanced {
-        line.push_str(&format!(" (#{:04}", stack.id));
+        line.push_str(&format!("§f (#{:04}", stack.id));
         if has_subtypes(stack.id) {
             line.push_str(&format!("/{}", stack.damage));
         }
         line.push(')');
     } else if custom.is_none() && stack.id == FILLED_MAP_ID {
-        line.push_str(&format!(" #{}", stack.damage));
+        line.push_str(&format!("§f #{}", stack.damage));
     }
     line
 }
@@ -1332,7 +1332,7 @@ mod tests {
     #[test]
     fn a_filled_map_appends_its_damage() {
         let lines = tooltip_lines(&stack(358, 7, None), false);
-        assert_eq!(texts(&lines), ["Map§r #7"]);
+        assert_eq!(texts(&lines), ["Map§r§f #7"]);
     }
 
     #[test]
@@ -1341,7 +1341,7 @@ mod tests {
         assert_eq!(
             texts(&lines),
             [
-                "Diamond Sword§r (#0276)",
+                "Diamond Sword§r§f (#0276)",
                 "",
                 "§9+7 Attack Damage",
                 "Durability: 1511 / 1561",
@@ -1354,7 +1354,7 @@ mod tests {
         assert_eq!(
             texts(&lines),
             [
-                "§oX§r (#0276)",
+                "§oX§r§f (#0276)",
                 "",
                 "§9+7 Attack Damage",
                 "Durability: 1511 / 1561",
@@ -1367,7 +1367,7 @@ mod tests {
     #[test]
     fn the_advanced_id_carries_the_meta_for_subtypes() {
         let lines = tooltip_lines(&stack(322, 1, None), true);
-        assert_eq!(texts(&lines)[0], "Golden Apple§r (#0322/1)");
+        assert_eq!(texts(&lines)[0], "Golden Apple§r§f (#0322/1)");
     }
 
     #[test]

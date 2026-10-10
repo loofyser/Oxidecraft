@@ -33,7 +33,7 @@ use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
-use container::{ContainerScreen, GENERIC_LAYOUT};
+use container::{ContainerLayout, ContainerScreen, GENERIC_LAYOUT};
 
 pub mod container;
 
@@ -143,6 +143,18 @@ impl Screens {
             kind,
             title,
             &GENERIC_LAYOUT,
+        ))));
+    }
+
+    /// Stands a container screen on the given slot table. Test scaffolding:
+    /// the generic frame the opens use carries no slots, so hover pins stand
+    /// their own table.
+    pub fn test_container(&mut self, window_id: u8, layout: &'static ContainerLayout) {
+        self.current = Some(ScreenState::Container(Box::new(ContainerScreen::new(
+            window_id,
+            WindowKind::Chest,
+            String::new(),
+            layout,
         ))));
     }
 
