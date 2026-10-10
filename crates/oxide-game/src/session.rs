@@ -96,7 +96,7 @@ use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphen
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
-    mode_from_value, pick_entity_target, placement, raycast, reach, tool_not_required,
+    mode_from_value, pick_entity_target, placement, raycast, reach, spectator, tool_not_required,
 };
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
@@ -785,6 +785,26 @@ pub struct SignText {
 pub const SIGN_STANDING_ID: u16 = 63;
 /// The wall sign's block id (`Block.java`:1326).
 pub const SIGN_WALL_ID: u16 = 68;
+
+/// The stack a `MC|BOpen` custom payload opens: the session's held-slot
+/// snapshot at receive time, for the written-book identity alone.
+///
+/// The payload itself is empty and is never read — it takes no payload
+/// parameter by construction (`EntityPlayerMP.displayGUIBook:840-848` sends
+/// an empty buffer); the client opens its own held stack, guarded by the
+/// written-book identity (`NetHandlerPlayClient.handleCustomPayload:1855-1863`).
+/// Another channel, an empty hand or a non-written held item opens nothing.
+fn book_open_stack(channel: &str, held: &Option<MetadataItem>) -> Option<MetadataItem> {
+    if channel != BOOK_OPEN_CHANNEL {
+        return None;
+    }
+    let stack = held.clone()?;
+    if stack.id == WRITTEN_BOOK_ID {
+        Some(stack)
+    } else {
+        None
+    }
+}
 
 /// Whether the block id is a sign's: the standing and wall variants alone.
 pub fn is_sign_block(block_id: u16) -> bool {
@@ -2301,22 +2321,15 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // only for the written-book identity
                                 // (`NetHandlerPlayClient.handleCustomPayload:1855-1863`).
                                 // Anything else is silently ignored.
-                                if let Some(stack) =
-                                    windows.player.inventory.get_current_item().clone()
-                                {
-                                    if stack.id == WRITTEN_BOOK_ID {
-                                        report(events, ClientEvent::BookOpen { stack });
-                                    } else {
-                                        debug!(
-                                            channel = %message.channel,
-                                            id = stack.id,
-                                            "a book open for a non-written held item is ignored"
-                                        );
-                                    }
+                                if let Some(stack) = book_open_stack(
+                                    &message.channel,
+                                    windows.player.inventory.get_current_item(),
+                                ) {
+                                    report(events, ClientEvent::BookOpen { stack });
                                 } else {
                                     debug!(
                                         channel = %message.channel,
-                                        "a book open with an empty held slot is ignored"
+                                        "a book open without a held written book is ignored"
                                     );
                                 }
                             } else {
@@ -2435,6 +2448,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         world.as_mut(),
                         &mut queue,
                         aim,
+                        windows.player.inventory.get_current_item(),
+                        gamemode,
                         &mut right_presses,
                         dig.hitting(),
                         &mut conn,
@@ -3755,24 +3770,39 @@ fn step_use_entity<S: Read + Write>(
 }
 
 /// One tick of the placement input: each queued press, when an aim exists,
-/// runs the source's checks, sends 0x08 and predicts the block locally.
+/// runs the source's checks, sends 0x08 and predicts the block locally; a
+/// press with no aim falls through to the source's use-item path and sends
+/// the no-target 0x08.
 ///
-/// The source's path is `rightClickMouse` (`Minecraft.java:1570-1603`): it
-/// refuses while a dig runs (`:1572`'s `getIsHittingBlock`), drops a press
-/// with nothing aimed (`:1577-1581`), and hands the frame's hit result to
-/// `PlayerControllerMP.onPlayerRightClick` (`:395-396`'s `hitPos` and
-/// `side`). That method refuses a target that cannot take the block before
+/// The source's path is `rightClickMouse` (`Minecraft.java:1570-1638`): it
+/// refuses while a dig runs (`:1572`'s `getIsHittingBlock`), warns on a null
+/// hit result (`:1577-1581`), tries the `ENTITY` case first (`:1583-1592`,
+/// run here by the use-entity step before this one), then the `BLOCK` case
+/// (`:1594-1625`, the aimed send below). Whatever is still flagged — a miss,
+/// an air cell, a failed activation — falls through to `sendUseItem`
+/// (`:1628-1636`), which queues the no-target 0x08 for any non-null held
+/// stack and refuses spectator alone (`PlayerControllerMP.sendUseItem`,
+/// `:456-482`). The no-target composition is the single-argument constructor's
+/// (`C08PacketPlayerBlockPlacement.java:24-27`): `field_179726_a`
+/// (-1, -1, -1), direction 255, cursor 0,0,0 (`:13`).
+///
+/// That method refuses a target that cannot take the block before
 /// the packet (`:417-421`), queues 0x08 (`:424`) and then lets
 /// `onItemUse` write the block locally (`:436`, `:443`) — so the packet goes
 /// out before the prediction lands, the order the two calls run here.
 ///
 /// The prediction's value is [`ASSUMED_HELD_BLOCK`]: the packet's held stack
 /// is empty, and the server places from its own copy of the held item
-/// (`NetHandlerPlayServer.processPlayerBlockPlacement`, `:582`).
+/// (`NetHandlerPlayServer.processPlayerBlockPlacement`, `:582`). The
+/// no-target send keeps the same empty stack: the server's direction-255 arm
+/// reads its own held copy too (`:585-591`), so the book still opens there.
+#[allow(clippy::too_many_arguments)]
 fn step_place<S: Read + Write>(
     mut world: Option<&mut World>,
     queue: &mut MeshQueue,
     aim: Option<Aim>,
+    held: &Option<MetadataItem>,
+    gamemode: u8,
     presses: &mut u32,
     hitting: bool,
     conn: &mut Conn<S>,
@@ -3783,7 +3813,19 @@ fn step_place<S: Read + Write>(
     }
     for _ in 0..presses {
         let (Some(store), Some(aim)) = (world.as_deref_mut(), aim) else {
-            break;
+            // No block target: the source's `sendUseItem` fallthrough. The
+            // held stack gates it (`rightClickMouse:1632`'s null check) and
+            // spectator refuses it (`sendUseItem:456-460`); the cursor is
+            // 0,0,0, the packet's own default.
+            if !spectator(gamemode) && held.is_some() {
+                send_reply(
+                    conn,
+                    &tick_payload(|out| {
+                        write_player_block_placement(out, -1, -1, -1, 255, [0, 0, 0])
+                    }),
+                )?;
+            }
+            continue;
         };
         let Some(placed) = placement(&WorldView(store), &aim) else {
             continue;
@@ -4486,6 +4528,238 @@ mod tests {
                 .windows(3)
                 .any(|window| window == [0x02, 0x07, 0x00]),
             "the wire carries the 0x02 interact send for entity 7: {written:02x?}"
+        );
+    }
+
+    #[test]
+    fn a_use_press_with_a_written_book_held_and_no_target_sends_the_air_use_packet() {
+        // Fix6 (a): the no-target use press with a written book held emits
+        // the source's no-target use packet (`PlayerControllerMP.sendUseItem:456-482`
+        // queues `new C08PacketPlayerBlockPlacement(held)` whose composition
+        // is `field_179726_a` (-1, -1, -1), direction 255, cursor 0,0,0
+        // (`C08PacketPlayerBlockPlacement.java:13,24-27`)) instead of being
+        // dropped (`Minecraft.rightClickMouse:1628-1636` falls through to
+        // `sendUseItem` for any non-null held stack). The reader opens on
+        // the server's `MC|BOpen` echo of this send (pinned below); the send
+        // count goes 0 to 1 — exactly one 16-byte frame.
+        use std::io::Cursor;
+
+        use oxide_proto::conn::Conn;
+        use oxide_proto_v47::entity::MetadataItem;
+
+        use super::step_place;
+        use crate::mesh_queue::MeshQueue;
+
+        // The frame on the wire: the length prefix (15 payload bytes), the
+        // 0x08 id, the packed (-1,-1,-1) position (eight 0xFF), the 255
+        // direction byte, the empty held stack (the short -1, two 0xFF —
+        // this writer's established convention), the (0,0,0) cursor.
+        let air_use_frame = vec![
+            0x0F, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+            0x00, 0x00,
+        ];
+        let held = Some(MetadataItem {
+            id: 387,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        let mut presses = 1;
+        let cursor = Cursor::new(Vec::new());
+        let mut conn = Conn::new(cursor);
+        let mut queue = MeshQueue::new();
+        step_place(
+            None,
+            &mut queue,
+            None,
+            &held,
+            0,
+            &mut presses,
+            false,
+            &mut conn,
+        )
+        .expect("a cursor send cannot fail");
+        assert_eq!(presses, 0, "the press is consumed");
+        let written = conn.into_inner().into_inner();
+        assert_eq!(
+            written.len(),
+            air_use_frame.len(),
+            "one press sends exactly one frame: {written:02x?}"
+        );
+        assert_eq!(
+            written, air_use_frame,
+            "a written-book use press with no target sends the air-use C08: {written:02x?}"
+        );
+    }
+
+    #[test]
+    fn a_use_press_with_a_non_book_held_item_and_no_target_sends_the_same_air_use_packet() {
+        // Fix6 (c): the source's fallthrough is NOT book-gated — `sendUseItem`
+        // runs for any non-null held stack (`rightClickMouse:1632`), so a
+        // non-book held item with no target emits the same air-use packet.
+        use std::io::Cursor;
+
+        use oxide_proto::conn::Conn;
+        use oxide_proto_v47::entity::MetadataItem;
+
+        use super::step_place;
+        use crate::mesh_queue::MeshQueue;
+
+        let air_use_frame = vec![
+            0x0F, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+            0x00, 0x00,
+        ];
+        let held = Some(MetadataItem {
+            id: 1,
+            count: 64,
+            damage: 0,
+            nbt: None,
+        });
+        let mut presses = 1;
+        let cursor = Cursor::new(Vec::new());
+        let mut conn = Conn::new(cursor);
+        let mut queue = MeshQueue::new();
+        step_place(
+            None,
+            &mut queue,
+            None,
+            &held,
+            0,
+            &mut presses,
+            false,
+            &mut conn,
+        )
+        .expect("a cursor send cannot fail");
+        assert_eq!(presses, 0, "the press is consumed");
+        let written = conn.into_inner().into_inner();
+        assert_eq!(
+            written, air_use_frame,
+            "a stone use press with no target sends the same air-use C08: {written:02x?}"
+        );
+    }
+
+    #[test]
+    fn a_use_press_with_an_empty_hand_sends_nothing() {
+        // The fallthrough's own gate (`rightClickMouse:1632`'s null check):
+        // an empty hand sends no packet, and the press is still consumed.
+        use std::io::Cursor;
+
+        use oxide_proto::conn::Conn;
+        use oxide_proto_v47::entity::MetadataItem;
+
+        use super::step_place;
+        use crate::mesh_queue::MeshQueue;
+
+        let held: Option<MetadataItem> = None;
+        let mut presses = 1;
+        let cursor = Cursor::new(Vec::new());
+        let mut conn = Conn::new(cursor);
+        let mut queue = MeshQueue::new();
+        step_place(
+            None,
+            &mut queue,
+            None,
+            &held,
+            0,
+            &mut presses,
+            false,
+            &mut conn,
+        )
+        .expect("a cursor send cannot fail");
+        assert_eq!(presses, 0, "the press is consumed");
+        let written = conn.into_inner().into_inner();
+        assert!(
+            written.is_empty(),
+            "an empty hand sends nothing: {written:02x?}"
+        );
+    }
+
+    #[test]
+    fn a_use_press_in_spectator_sends_nothing() {
+        // `sendUseItem` refuses at once in spectator (`:456-460`), so a
+        // no-target press in gamemode 3 sends nothing even with a book held.
+        use std::io::Cursor;
+
+        use oxide_proto::conn::Conn;
+        use oxide_proto_v47::entity::MetadataItem;
+
+        use super::step_place;
+        use crate::mesh_queue::MeshQueue;
+
+        let held = Some(MetadataItem {
+            id: 387,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        let mut presses = 1;
+        let cursor = Cursor::new(Vec::new());
+        let mut conn = Conn::new(cursor);
+        let mut queue = MeshQueue::new();
+        step_place(
+            None,
+            &mut queue,
+            None,
+            &held,
+            3,
+            &mut presses,
+            false,
+            &mut conn,
+        )
+        .expect("a cursor send cannot fail");
+        assert_eq!(presses, 0, "the press is consumed");
+        let written = conn.into_inner().into_inner();
+        assert!(
+            written.is_empty(),
+            "a spectator use press sends nothing: {written:02x?}"
+        );
+    }
+
+    #[test]
+    fn the_book_open_stands_on_the_held_written_book_alone() {
+        // Fix6 (a/b, reader half): the `MC|BOpen` open carries no stack —
+        // the payload is EMPTY (`EntityPlayerMP.displayGUIBook:840-848`
+        // sends an empty buffer) — so the client opens its OWN held stack,
+        // guarded by the written-book identity
+        // (`NetHandlerPlayClient.handleCustomPayload:1855-1863`). The helper
+        // takes no payload bytes by construction: there is nothing to read.
+        use oxide_proto_v47::entity::MetadataItem;
+
+        use super::{BOOK_OPEN_CHANNEL, WRITTEN_BOOK_ID, book_open_stack};
+
+        assert_eq!(BOOK_OPEN_CHANNEL, "MC|BOpen");
+        assert_eq!(WRITTEN_BOOK_ID, 387);
+        let written = Some(MetadataItem {
+            id: 387,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        let stone = Some(MetadataItem {
+            id: 1,
+            count: 64,
+            damage: 0,
+            nbt: None,
+        });
+        assert_eq!(
+            book_open_stack("MC|BOpen", &written),
+            written,
+            "BOpen with a held written book opens that stack"
+        );
+        assert_eq!(
+            book_open_stack("MC|BOpen", &stone),
+            None,
+            "BOpen with a non-written held item opens nothing"
+        );
+        assert_eq!(
+            book_open_stack("MC|BOpen", &None),
+            None,
+            "BOpen with an empty hand opens nothing"
+        );
+        assert_eq!(
+            book_open_stack("MC|Brand", &written),
+            None,
+            "another channel never opens the reader"
         );
     }
 }

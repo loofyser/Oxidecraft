@@ -70,6 +70,9 @@ const HARDCORE_BIT: u8 = 0x08;
 /// `WorldSettings.GameType.CREATIVE`'s id (`world/WorldSettings.java:139`).
 const CREATIVE_ID: u8 = 1;
 
+/// `WorldSettings.GameType.SPECTATOR`'s id (`world/WorldSettings.java:139`).
+const SPECTATOR_ID: u8 = 3;
+
 /// The block reach in creative: the source's `5.0F`
 /// (`client/multiplayer/PlayerControllerMP.java:344-346`).
 pub const CREATIVE_REACH: f64 = 5.0;
@@ -100,6 +103,16 @@ pub fn reach(gamemode: u8) -> f64 {
 /// machine's instant branch both read (`PlayerControllerMP.java:230`, `:294`).
 pub fn creative(gamemode: u8) -> bool {
     gamemode & !HARDCORE_BIT == CREATIVE_ID
+}
+
+/// Whether the gamemode byte names spectator, its hardcore bit masked like
+/// [`creative`]'s.
+///
+/// The source's `sendUseItem` refuses at once in spectator
+/// (`PlayerControllerMP.java:456-460`); the ids are the `WorldSettings`
+/// enum's (`world/WorldSettings.java:137-141`).
+pub fn spectator(gamemode: u8) -> bool {
+    gamemode & !HARDCORE_BIT == SPECTATOR_ID
 }
 
 /// The gamemode byte a Change Game State value names.
