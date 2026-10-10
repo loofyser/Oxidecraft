@@ -141,6 +141,10 @@ pub enum Material {
     Plant,
     /// `Material.iron`, the metal blocks.
     Metal,
+    /// `Material.anvil` (`block/material/Material.java:11`): the anvil's own
+    /// material — `setRequiresTool`, so it reads tool-required, and otherwise
+    /// the defaults (blocks light, solid, opaque).
+    Anvil,
     /// `Material.ground`, dirt and farmland.
     Ground,
     /// `Material.sand`, sand, gravel and soul sand.
@@ -358,6 +362,17 @@ pub enum CollisionShape {
     /// A soul sand block: the full footprint, its top at 7/8
     /// ([`crate::collision::soul_sand_box`]; `BlockSoulSand.java:20-24`).
     SoulSand,
+    /// An enchanting table: the full footprint, its top at 3/4
+    /// ([`crate::collision::enchanting_table_box`];
+    /// `BlockEnchantmentTable.java:24`).
+    EnchantingTable,
+    /// A brewing stand: the centre column, 1/8 across and 7/8 high
+    /// ([`crate::collision::brewing_stand_box`];
+    /// `BlockBrewingStand.java:78-84`).
+    BrewingStand,
+    /// An anvil: the 3/4-wide plate, full height, on the facing's axis
+    /// ([`crate::collision::anvil_box`]; `BlockAnvil.java:83-95`).
+    Anvil,
 }
 
 /// The offset of a property that the metadata does not carry.
@@ -813,6 +828,20 @@ const STAIR_SHAPES: [&str; 5] = [
 /// The pumpkin's facing per metadata value: `getHorizontal(meta)`, which wraps
 /// modulo four, and `meta & 3` is that wrap.
 const PUMPKIN_FACINGS: [&str; 4] = ["south", "west", "north", "east"];
+
+/// The dispenser and hopper facings per metadata value: `getFacing(meta)`
+/// reads `EnumFacing.getFront(meta & 7)` (`BlockDispenser.java:244-247`,
+/// `BlockHopper.java:196-199`), so the low three bits name down, up, north,
+/// south, west, east and the triggered/enabled bit leaves the facing alone.
+const DISPENSER_FACINGS: [&str; 16] = [
+    "down", "up", "north", "south", "west", "east", "down", "up", "down", "up", "north", "south",
+    "west", "east", "down", "up",
+];
+
+/// The anvil's facing per metadata value: `EnumFacing.getHorizontal(meta & 3)`
+/// (`BlockAnvil.getStateFromMeta`, `BlockAnvil.java:133-136`) — south, west,
+/// north, east, the pumpkin's order.
+const ANVIL_FACINGS: [&str; 4] = ["south", "west", "north", "east"];
 
 /// The fence's and the pane's connection flags: metadata does not carry them,
 /// so the meta-derived state holds the default `false` for all four.
@@ -1341,6 +1370,42 @@ const TABLE: &[BlockBehaviour] = &[
         render: RenderKind::Model,
         collision: CollisionShape::Full,
         hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
+    // BlockDispenser: FACING + TRIGGERED (BlockDispenser.java:33-34, 278-302);
+    // Material.rock, opaque, hardness 3.5 (Block.java:1276). The in-world
+    // model is fix3b's scope — the mesher draws the fallback until then.
+    BlockBehaviour {
+        id: 23,
+        name: "dispenser",
+        properties: &[
+            PropertyDef {
+                name: "facing",
+                kind: PropertyKind::Enum {
+                    offset: 0,
+                    bits: 4,
+                    values: &DISPENSER_FACINGS,
+                },
+            },
+            PropertyDef {
+                name: "triggered",
+                kind: PropertyKind::Bool { offset: 3 },
+            },
+        ],
+        light_opacity: 255,
+        light_filter: 15,
+        light_emission: 0,
+        full_cube: true,
+        occludes: true,
+        translucent: false,
+        material: Material::Rock,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.5,
         climbable: false,
         slipperiness: 0.60,
     },
@@ -2039,6 +2104,37 @@ const TABLE: &[BlockBehaviour] = &[
         climbable: false,
         slipperiness: 0.60,
     },
+    // BlockStandingSign: ROTATION 0..15 (BlockStandingSign.java:18, 38-56);
+    // Material.wood, hardness 1.0 (Block.java:1321), no collision box
+    // (BlockSign.java:27-30) — the ray traces the 0.25..0.75 post through the
+    // selection-bounds arm. The in-world model is fix3b's scope.
+    BlockBehaviour {
+        id: 63,
+        name: "standing_sign",
+        properties: &[PropertyDef {
+            name: "rotation",
+            kind: PropertyKind::Int {
+                offset: 0,
+                bits: 4,
+                values: 16,
+            },
+        }],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Wood,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::None,
+        hardness: 1.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
     // BlockDoor with Material.wood: HALF + FACING + OPEN + HINGE + POWERED
     // (BlockDoor.java:28-38, 367-444), the cutout layer (BlockDoor.java:331).
     BlockBehaviour {
@@ -2164,6 +2260,38 @@ const TABLE: &[BlockBehaviour] = &[
         render: RenderKind::Model,
         collision: CollisionShape::Stairs,
         hardness: 2.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
+    // BlockWallSign: FACING, horizontal (BlockWallSign.java:14, 70-80) —
+    // getFront(meta) with the Y faces folded to north, the furnace/chest
+    // front order; Material.wood, hardness 1.0 (Block.java:1326), no
+    // collision box (BlockSign.java:27-30) — the ray traces the per-facing
+    // plate through the selection-bounds arm. The in-world model is fix3b's.
+    BlockBehaviour {
+        id: 68,
+        name: "wall_sign",
+        properties: &[PropertyDef {
+            name: "facing",
+            kind: PropertyKind::Enum {
+                offset: 0,
+                bits: 4,
+                values: &FRONT_FACINGS,
+            },
+        }],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Wood,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::None,
+        hardness: 1.0,
         climbable: false,
         slipperiness: 0.60,
     },
@@ -2615,6 +2743,68 @@ const TABLE: &[BlockBehaviour] = &[
         climbable: false,
         slipperiness: 0.60,
     },
+    // BlockEnchantmentTable: no properties; Material.rock, hardness 5.0
+    // (Block.java:1378), light opacity 0 (BlockEnchantmentTable.java:25),
+    // non-opaque, non-full-cube (:29-33, :71-77). The ray traces the 3/4 box.
+    // The in-world model is fix3b's scope.
+    BlockBehaviour {
+        id: 116,
+        name: "enchanting_table",
+        properties: &[],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Rock,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::EnchantingTable,
+        hardness: 5.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
+    // BlockBrewingStand: HAS_BOTTLE[3] (BlockBrewingStand.java:31, 182-215);
+    // Material.iron, hardness 0.5 and light level 0.125 — the emission 1
+    // (Block.java:1379) — non-opaque, non-full-cube (:50-56, :71-73), the
+    // cutout layer (:174-177). The ray traces the centre column. The
+    // in-world model is fix3b's scope.
+    BlockBehaviour {
+        id: 117,
+        name: "brewing_stand",
+        properties: &[
+            PropertyDef {
+                name: "has_bottle_0",
+                kind: PropertyKind::Bool { offset: 0 },
+            },
+            PropertyDef {
+                name: "has_bottle_1",
+                kind: PropertyKind::Bool { offset: 1 },
+            },
+            PropertyDef {
+                name: "has_bottle_2",
+                kind: PropertyKind::Bool { offset: 2 },
+            },
+        ],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 1,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Metal,
+        render_layer: RenderLayer::Cutout,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::BrewingStand,
+        hardness: 0.5,
+        climbable: false,
+        slipperiness: 0.60,
+    },
     BlockBehaviour {
         id: 129,
         name: "emerald_ore",
@@ -2627,6 +2817,31 @@ const TABLE: &[BlockBehaviour] = &[
         translucent: false,
         material: Material::Rock,
         render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
+    // BlockBeacon: no properties; Material.glass, hardness 3.0
+    // (BlockBeacon.java:26-28) and light level 1.0 — the emission 15
+    // (Block.java:1400) — non-opaque, non-full-cube (:62-70), the cutout
+    // layer (:112-115). The ray traces the full cube. The in-world model is
+    // fix3b's scope.
+    BlockBehaviour {
+        id: 138,
+        name: "beacon",
+        properties: &[],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 15,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Glass,
+        render_layer: RenderLayer::Cutout,
         tint: TintKind::None,
         liquid: None,
         render: RenderKind::Model,
@@ -2690,6 +2905,89 @@ const TABLE: &[BlockBehaviour] = &[
         climbable: false,
         slipperiness: 0.60,
     },
+    // BlockAnvil: FACING (horizontal) + DAMAGE 0..2 (BlockAnvil.java:30-31,
+    // 133-152); Material.anvil, hardness 5.0 (Block.java:1407), light opacity
+    // 0 (:37), non-opaque, non-full-cube (:41-53). The ray traces the 3/4
+    // plate on the facing's axis. The in-world model is fix3b's scope.
+    BlockBehaviour {
+        id: 145,
+        name: "anvil",
+        properties: &[
+            PropertyDef {
+                name: "facing",
+                kind: PropertyKind::Enum {
+                    offset: 0,
+                    bits: 2,
+                    values: &ANVIL_FACINGS,
+                },
+            },
+            PropertyDef {
+                name: "damage",
+                kind: PropertyKind::Int {
+                    offset: 2,
+                    bits: 2,
+                    values: 3,
+                },
+            },
+        ],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Anvil,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::Anvil,
+        hardness: 5.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
+    // BlockHopper: FACING + ENABLED (BlockHopper.java:31-38, 228-252) — the
+    // metadata stores the powered bit, so ENABLED reads it inverted
+    // (`isEnabled`, :205-209); Material.iron, hardness 3.0 (Block.java:1416),
+    // non-opaque, non-full-cube (:178-189). The ray traces the full cube
+    // (`setBlockBoundsBasedOnState`, :48-51). The in-world model is fix3b's.
+    BlockBehaviour {
+        id: 154,
+        name: "hopper",
+        properties: &[
+            PropertyDef {
+                name: "facing",
+                kind: PropertyKind::Enum {
+                    offset: 0,
+                    bits: 4,
+                    values: &DISPENSER_FACINGS,
+                },
+            },
+            PropertyDef {
+                name: "enabled",
+                kind: PropertyKind::Enum {
+                    offset: 3,
+                    bits: 1,
+                    values: &["true", "false"],
+                },
+            },
+        ],
+        light_opacity: 0,
+        light_filter: 0,
+        light_emission: 0,
+        full_cube: false,
+        occludes: false,
+        translucent: false,
+        material: Material::Metal,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.0,
+        climbable: false,
+        slipperiness: 0.60,
+    },
     // BlockQuartz: VARIANT (BlockQuartz.java:21, 94-110).
     BlockBehaviour {
         id: 155,
@@ -2715,6 +3013,42 @@ const TABLE: &[BlockBehaviour] = &[
         render: RenderKind::Model,
         collision: CollisionShape::Full,
         hardness: 0.8,
+        climbable: false,
+        slipperiness: 0.60,
+    },
+    // BlockDropper through BlockDispenser: FACING + TRIGGERED, Material.rock,
+    // opaque, hardness 3.5 (Block.java:1421) — the dispenser's row in every
+    // column. The in-world model is fix3b's scope.
+    BlockBehaviour {
+        id: 158,
+        name: "dropper",
+        properties: &[
+            PropertyDef {
+                name: "facing",
+                kind: PropertyKind::Enum {
+                    offset: 0,
+                    bits: 4,
+                    values: &DISPENSER_FACINGS,
+                },
+            },
+            PropertyDef {
+                name: "triggered",
+                kind: PropertyKind::Bool { offset: 3 },
+            },
+        ],
+        light_opacity: 255,
+        light_filter: 15,
+        light_emission: 0,
+        full_cube: true,
+        occludes: true,
+        translucent: false,
+        material: Material::Rock,
+        render_layer: RenderLayer::Solid,
+        tint: TintKind::None,
+        liquid: None,
+        render: RenderKind::Model,
+        collision: CollisionShape::Full,
+        hardness: 3.5,
         climbable: false,
         slipperiness: 0.60,
     },
@@ -2890,11 +3224,11 @@ const TABLE: &[BlockBehaviour] = &[
 ];
 
 /// The ids [`TABLE`] covers, sorted; the table's ids are this list in order.
-const COVERED: [u16; 75] = [
-    1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 24, 31, 32, 35, 37, 38, 39,
-    40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 64, 65, 67, 72,
-    73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
-    162, 166, 175,
+const COVERED: [u16; 84] = [
+    1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 23, 24, 31, 32, 35, 37, 38,
+    39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+    67, 68, 72, 73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 116, 117,
+    129, 138, 141, 142, 145, 154, 155, 158, 161, 162, 166, 175,
 ];
 
 /// The table answers for exactly the covered ids, in order, and every row's
@@ -2981,7 +3315,7 @@ mod tests {
     fn the_movement_columns_name_the_sources_classes() {
         // Every covered id's collision class, from its source block class'
         // overrides. The ids that are not the full cube:
-        let classes: [(u16, CollisionShape); 28] = [
+        let classes: [(u16, CollisionShape); 33] = [
             (8, CollisionShape::None),
             (9, CollisionShape::None),
             (10, CollisionShape::None),
@@ -2997,9 +3331,11 @@ mod tests {
             (53, CollisionShape::Stairs),
             (54, CollisionShape::Chest),
             (59, CollisionShape::None),
+            (63, CollisionShape::None),
             (64, CollisionShape::Door),
             (65, CollisionShape::Ladder),
             (67, CollisionShape::Stairs),
+            (68, CollisionShape::None),
             (72, CollisionShape::None),
             (78, CollisionShape::SnowLayers),
             (81, CollisionShape::Cactus),
@@ -3007,8 +3343,11 @@ mod tests {
             (85, CollisionShape::Fence),
             (88, CollisionShape::SoulSand),
             (102, CollisionShape::Pane),
+            (116, CollisionShape::EnchantingTable),
+            (117, CollisionShape::BrewingStand),
             (141, CollisionShape::None),
             (142, CollisionShape::None),
+            (145, CollisionShape::Anvil),
             (175, CollisionShape::None),
         ];
         for &id in covered_ids() {

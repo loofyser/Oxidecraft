@@ -60,12 +60,13 @@ use oxide_proto_v47::entity::{
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
-    ClientSettings, ClientStatusAction, DiggingStatus, EntityAction, write_animation,
-    write_click_window, write_client_settings, write_client_status, write_close_window,
-    write_confirm_transaction, write_creative_inventory_action, write_enchant_item,
-    write_entity_action, write_held_item_change, write_keep_alive, write_login_start, write_player,
-    write_player_abilities, write_player_block_placement, write_player_digging, write_player_look,
-    write_player_position, write_player_position_and_look, write_plugin_message, write_update_sign,
+    ClientSettings, ClientStatusAction, DiggingStatus, EntityAction, UseEntityAction,
+    write_animation, write_click_window, write_client_settings, write_client_status,
+    write_close_window, write_confirm_transaction, write_creative_inventory_action,
+    write_enchant_item, write_entity_action, write_held_item_change, write_keep_alive,
+    write_login_start, write_player, write_player_abilities, write_player_block_placement,
+    write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
+    write_plugin_message, write_update_sign, write_use_entity,
 };
 use oxide_proto_v47::ui::{
     ChatMessage, ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam,
@@ -95,7 +96,7 @@ use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphen
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
-    mode_from_value, placement, raycast, reach, tool_not_required,
+    mode_from_value, pick_entity_target, placement, raycast, reach, tool_not_required,
 };
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
@@ -2413,6 +2414,20 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // death view is up: a click is the respawn request then, and
                 // the presses and the dig step run only while alive.
                 if !dead {
+                    // The use-entity presses run against that same aim before
+                    // the placement presses: the source's `rightClickMouse`
+                    // tries the `ENTITY` case first and an entity target
+                    // consumes the click (`Minecraft.java:1583-1592`), so a
+                    // press that became 0x02 never becomes 0x08.
+                    step_use_entity(
+                        &entities,
+                        &player,
+                        gamemode,
+                        aim,
+                        &mut right_presses,
+                        dig.hitting(),
+                        &mut conn,
+                    )?;
                     // The placement presses run against that same aim, before the
                     // dig's step: the source's tick orders the use button's presses
                     // before `sendClickBlockToController` (`Minecraft.java:2153-2166`).
@@ -3683,6 +3698,62 @@ fn apply_dig_action<S: Read + Write>(
     }
 }
 
+/// One tick of the use-entity input: when the frame's pick stops on an
+/// entity nearer than the block aim, every queued press sends 0x02 and no
+/// press reaches the block path.
+///
+/// The source's path is `rightClickMouse` (`Minecraft.java:1570-1603`): the
+/// `ENTITY` case runs first (`:1583-1592`) — `isPlayerRightClickingOnEntity`
+/// queues the `INTERACT_AT` send (`PlayerControllerMP.java:523-529`), else
+/// `interactWithEntitySendPacket` queues the `INTERACT` send (`:509-514`) —
+/// and either success sets `flag = false`, which skips the block case, so an
+/// entity target consumes the click. This port sends the `INTERACT` form
+/// (`C02PacketUseEntity.java:22-27`): the id plus the zero ordinal, no hit
+/// vector (`writePacketData`, `:58-68` writes it for `INTERACT_AT` only).
+/// The server opens the villager's merchant window and the horse's inventory
+/// from `INTERACT` (`NetHandlerPlayServer.processUseEntity`, `:918-921`
+/// calls `playerEntity.interactWith`), so the standing screen routes fire.
+fn step_use_entity<S: Read + Write>(
+    entities: &Entities,
+    player: &Player,
+    gamemode: u8,
+    aim: Option<Aim>,
+    presses: &mut u32,
+    hitting: bool,
+    conn: &mut Conn<S>,
+) -> Result<(), SessionError> {
+    if hitting || *presses == 0 {
+        return Ok(());
+    }
+    let eye = [
+        player.position[0],
+        player.position[1] + player.eye_height(),
+        player.position[2],
+    ];
+    let block_distance = aim.map(|aim| {
+        let dx = aim.hit[0] - eye[0];
+        let dy = aim.hit[1] - eye[1];
+        let dz = aim.hit[2] - eye[2];
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    });
+    let Some(target) = pick_entity_target(
+        entities,
+        eye,
+        look_vector(player.yaw, player.pitch),
+        gamemode,
+        block_distance,
+    ) else {
+        return Ok(());
+    };
+    for _ in 0..std::mem::take(presses) {
+        send_reply(
+            conn,
+            &tick_payload(|out| write_use_entity(out, target, UseEntityAction::Interact, None)),
+        )?;
+    }
+    Ok(())
+}
+
 /// One tick of the placement input: each queued press, when an aim exists,
 /// runs the source's checks, sends 0x08 and predicts the block locally.
 ///
@@ -4379,5 +4450,42 @@ mod tests {
         assert!(chat_over_cap(&"x".repeat(101)));
         assert!(!chat_over_cap(&"é".repeat(100)), "characters, not bytes");
         assert!(chat_over_cap(&"é".repeat(101)));
+    }
+
+    #[test]
+    fn a_use_click_on_a_villager_sends_the_interact_packet() {
+        // The entity-use dispatch pin: a use-click with a villager in reach
+        // sends serverbound 0x02 with the interact composition — the id plus
+        // the zero ordinal, no hit vector — and consumes the press, so the
+        // block path never sees it.
+        use std::io::Cursor;
+
+        use oxide_proto::conn::Conn;
+        use oxide_world::entity::{Entity, EntityKind};
+
+        use super::step_use_entity;
+
+        let mut entities = Entities::new();
+        let mut villager = Entity::new(7, EntityKind::Villager);
+        villager.position = [0.5, 64.0, 2.0];
+        villager.last_tick_position = [0.5, 64.0, 2.0];
+        entities.insert(villager);
+        let mut player = Player::new();
+        player.position = [0.5, 64.0, 0.5];
+        player.yaw = 0.0;
+        player.pitch = 0.0;
+        let mut presses = 1;
+        let cursor = Cursor::new(Vec::new());
+        let mut conn = Conn::new(cursor);
+        step_use_entity(&entities, &player, 0, None, &mut presses, false, &mut conn)
+            .expect("a cursor send cannot fail");
+        assert_eq!(presses, 0, "the entity target consumes the press");
+        let written = conn.into_inner().into_inner();
+        assert!(
+            written
+                .windows(3)
+                .any(|window| window == [0x02, 0x07, 0x00]),
+            "the wire carries the 0x02 interact send for entity 7: {written:02x?}"
+        );
     }
 }

@@ -422,6 +422,94 @@ impl EntityKind {
     fn is_living(self) -> bool {
         self == EntityKind::Player || self.is_mob()
     }
+
+    /// Whether the mouse-over pick can stop on this kind
+    /// (`Entity.canBeCollidedWith`, `entity/Entity.java:1511-1514`, which
+    /// answers false): the living kinds (`EntityLivingBase.java:2211-2214`,
+    /// true while not dead — the store drops the dead, so the dead check has
+    /// nothing to read), the boats and minecarts (which override it true,
+    /// `EntityBoat.java:166`, `EntityMinecart.java:225`) and the hanging
+    /// kinds (`EntityHanging.java:163-166`, true). The dragon answers false
+    /// (`EntityDragon.java:748-751`) and every other kind keeps the base
+    /// false.
+    pub fn is_collidable(self) -> bool {
+        self.is_living()
+            || matches!(
+                self,
+                EntityKind::Boat | EntityKind::Minecart | EntityKind::ItemFrame
+            )
+    }
+
+    /// The click hitbox's width and height, from the class's `setSize`
+    /// (values only). Kinds whose box the port never sizes — the painting,
+    /// whose art names the box (`EntityPainting.onValidSurface`), and the
+    /// typeless `Unknown`/`Global` — answer `None` and the pick skips them.
+    /// The slime answer is the default spawn's (`EntitySlime.java:50-53`
+    /// watches size 1; `setSlimeSize`, `:54-62`, sizes `0.51 * size`):
+    /// per-size boxes from the metadata byte are out of scope.
+    pub fn hitbox(self) -> Option<(f64, f64)> {
+        let (w, h): (f32, f32) = match self {
+            EntityKind::Player => (0.6, 1.8), // EntityPlayer.java:580
+            EntityKind::Item => (0.25, 0.25), // EntityItem.java:43
+            EntityKind::XpOrb => (0.5, 0.5),  // EntityXPOrb.java:38
+            EntityKind::Arrow => (0.5, 0.5),  // EntityArrow.java:56
+            EntityKind::Snowball
+            | EntityKind::Egg
+            | EntityKind::EnderPearl
+            | EntityKind::Potion
+            | EntityKind::XpBottle => (0.25, 0.25), // EntityThrowable.java:40
+            EntityKind::EyeOfEnder => (0.25, 0.25), // EntityEnderEye.java:28
+            EntityKind::Firework => (0.25, 0.25), // EntityFireworkRocket.java:23
+            EntityKind::Fireball => (1.0, 1.0), // EntityFireball.java:36
+            EntityKind::SmallFireball | EntityKind::WitherSkull => (0.3125, 0.3125),
+            // EntitySmallFireball.java:16, EntityWitherSkull.java:21
+            EntityKind::ItemFrame => (0.5, 0.5), // EntityHanging.java:25
+            EntityKind::Boat => (1.5, 0.6),      // EntityBoat.java:42
+            EntityKind::Minecart => (0.98, 0.7), // EntityMinecart.java:56
+            EntityKind::Creeper => (0.6, 1.8),   // Entity defaults, Entity.java:269-270
+            EntityKind::Skeleton => (0.6, 1.95), // EntitySkeleton.java:388
+            EntityKind::Spider => (1.4, 0.9),    // EntitySpider.java:35
+            EntityKind::Giant => (3.6, 10.8), // EntityGiantZombie.java:12, six times the defaults
+            EntityKind::Zombie | EntityKind::PigZombie => (0.6, 1.95), // EntityZombie.java:79
+            EntityKind::Slime | EntityKind::LavaSlime => (0.51, 0.51), // default spawn
+            EntityKind::Ghast => (4.0, 4.0),  // EntityGhast.java:32
+            EntityKind::Enderman => (0.6, 2.9), // EntityEnderman.java:52
+            EntityKind::CaveSpider => (0.7, 0.5), // EntityCaveSpider.java:18
+            EntityKind::Silverfish => (0.4, 0.3), // EntitySilverfish.java:31
+            EntityKind::Blaze => (0.6, 1.8),  // Entity defaults
+            EntityKind::WitherBoss => (0.9, 3.5), // EntityWither.java:63
+            EntityKind::Bat => (0.5, 0.9),    // EntityBat.java:22
+            EntityKind::Witch => (0.6, 1.95), // EntityWitch.java:47
+            EntityKind::Endermite => (0.4, 0.3), // EntityEndermite.java:29
+            EntityKind::Guardian => (0.85, 0.85), // EntityGuardian.java:56
+            EntityKind::Pig => (0.9, 0.9),    // EntityPig.java:35
+            EntityKind::Sheep => (0.9, 1.3),  // EntitySheep.java:66
+            EntityKind::Cow => (0.9, 1.3),    // EntityCow.java:27
+            EntityKind::MushroomCow => (0.9, 1.3), // EntityMooshroom.java:17
+            EntityKind::Chicken => (0.4, 0.7), // EntityChicken.java:39
+            EntityKind::Squid => (0.95, 0.95), // EntitySquid.java:45
+            EntityKind::Wolf => (0.6, 0.8),   // EntityWolf.java:62
+            EntityKind::SnowMan => (0.7, 1.9), // EntitySnowman.java:29
+            EntityKind::Ozelot => (0.6, 0.7), // EntityOcelot.java:46
+            EntityKind::VillagerGolem => (1.4, 2.9), // EntityIronGolem.java:48
+            EntityKind::EntityHorse => (1.4, 1.6), // EntityHorse.java:91
+            EntityKind::Rabbit => (0.6, 0.7), // EntityRabbit.java:56
+            EntityKind::Villager => (0.6, 1.8), // EntityVillager.java:108
+            EntityKind::Painting | EntityKind::Global | EntityKind::Unknown => return None,
+            EntityKind::EnderDragon => return None, // never collidable; no box needed
+        };
+        Some((f64::from(w), f64::from(h)))
+    }
+
+    /// The pick's border expansion for this kind
+    /// (`Entity.getCollisionBorderSize`, `entity/Entity.java:2036-2039`:
+    /// 0.1; the item frame answers 0.0, `EntityItemFrame.java:39-42`).
+    pub fn border_size(self) -> f64 {
+        match self {
+            EntityKind::ItemFrame => 0.0,
+            _ => 0.1,
+        }
+    }
 }
 
 impl Entity {

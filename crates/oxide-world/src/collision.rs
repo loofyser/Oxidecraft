@@ -566,6 +566,51 @@ pub const fn ladder_box(facing: Facing) -> CollisionBox {
     }
 }
 
+/// The horizontal facing a metadata nibble names.
+///
+/// `EnumFacing.getHorizontal(meta & 3)` (`util/EnumFacing.java:273-276`,
+/// over the `Plane.HORIZONTAL` order): south at 0, west at 1, north at 2
+/// and east at 3 — the order the behaviour table's pumpkin facings pin.
+pub const fn horizontal_facing(meta: u8) -> Facing {
+    match meta & 3 {
+        0 => Facing::South,
+        1 => Facing::West,
+        2 => Facing::North,
+        _ => Facing::East,
+    }
+}
+
+/// An enchanting table's box: the full footprint, its top at 3/4.
+///
+/// `BlockEnchantmentTable`'s constructor (`BlockEnchantmentTable.java:24`):
+/// `setBlockBounds(0.0F, 0.0F, 0.0F, 1.0F, 0.75F, 1.0F)`, with no
+/// `setBlockBoundsBasedOnState` override, so the ray traces this box.
+pub const fn enchanting_table_box() -> CollisionBox {
+    CollisionBox::of([0.0, 0.0, 0.0], [1.0, 0.75, 1.0])
+}
+
+/// A brewing stand's box: the centre column, 1/8 across, 7/8 high.
+///
+/// `BlockBrewingStand.setBlockBoundsBasedOnState`
+/// (`BlockBrewingStand.java:78-84`): `setBlockBounds(0.4375F, 0.0F,
+/// 0.4375F, 0.5625F, 0.875F, 0.5625F)` — the box the ray traces, not the
+/// item-render plate beside it (`:90-93`).
+pub const fn brewing_stand_box() -> CollisionBox {
+    CollisionBox::of([0.4375, 0.0, 0.4375], [0.5625, 0.875, 0.5625])
+}
+
+/// An anvil's box: the 3/4-wide plate, full height, on the facing's axis.
+///
+/// `BlockAnvil.setBlockBoundsBasedOnState` (`BlockAnvil.java:83-95`): a
+/// facing on the x axis stands at `x` full and `z` 0.125..0.875, a facing on
+/// the z axis at `x` 0.125..0.875 and `z` full.
+pub const fn anvil_box(facing: Facing) -> CollisionBox {
+    match facing {
+        Facing::East | Facing::West => CollisionBox::of([0.0, 0.0, 0.125], [1.0, 1.0, 0.875]),
+        Facing::North | Facing::South => CollisionBox::of([0.125, 0.0, 0.0], [0.875, 1.0, 1.0]),
+    }
+}
+
 /// A door's box: a 3/16 plate, hinged open or closed.
 ///
 /// `BlockDoor.setBoundBasedOnMeta` (`BlockDoor.java:83-154`): the closed

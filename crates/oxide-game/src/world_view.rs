@@ -21,8 +21,9 @@
 
 use oxide_world::behaviour::{BlockBehaviour, CollisionShape, LiquidKind, Material, behaviour};
 use oxide_world::collision::{
-    CollisionBox, Connections, Facing, StairState, cactus_box, chest_box, door_box, door_facing,
-    fence_boxes, front_facing, ladder_box, pane_boxes, slab_boxes, slab_half, snow_layer_box,
+    CollisionBox, Connections, Facing, StairState, anvil_box, brewing_stand_box, cactus_box,
+    chest_box, door_box, door_facing, enchanting_table_box, fence_boxes, front_facing,
+    horizontal_facing, ladder_box, pane_boxes, slab_boxes, slab_half, snow_layer_box,
     soul_sand_box, stair_facing, stair_half, stairs_boxes, wall_box,
 };
 use oxide_world::world::World;
@@ -118,6 +119,15 @@ impl CollisionView for WorldView<'_> {
             }
             CollisionShape::Ladder => {
                 out.push(ladder_box(front_facing(meta)).offset(ox, oy, oz));
+            }
+            CollisionShape::EnchantingTable => {
+                out.push(enchanting_table_box().offset(ox, oy, oz));
+            }
+            CollisionShape::BrewingStand => {
+                out.push(brewing_stand_box().offset(ox, oy, oz));
+            }
+            CollisionShape::Anvil => {
+                out.push(anvil_box(horizontal_facing(meta)).offset(ox, oy, oz));
             }
             CollisionShape::SoulSand => out.push(soul_sand_box().offset(ox, oy, oz)),
         }

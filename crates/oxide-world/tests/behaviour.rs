@@ -19,11 +19,11 @@ use oxide_world::behaviour::{
 /// cube, and the barrier (166), covered after the acceptance's boss frames
 /// rendered its cage the same way. The scan added no id the palette did not
 /// already carry.
-const COVERED: [u16; 75] = [
-    1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 24, 31, 32, 35, 37, 38, 39,
-    40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 64, 65, 67, 72,
-    73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 129, 141, 142, 155, 161,
-    162, 166, 175,
+const COVERED: [u16; 84] = [
+    1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 23, 24, 31, 32, 35, 37, 38,
+    39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+    67, 68, 72, 73, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 98, 99, 100, 102, 110, 116, 117,
+    129, 138, 141, 142, 145, 154, 155, 158, 161, 162, 166, 175,
 ];
 
 /// The non-air ids the M1 acceptance world scan reported, in the scan's order.
@@ -91,9 +91,7 @@ fn the_acceptance_world_scan_ids_are_covered() {
 fn ids_outside_the_set_have_no_entry() {
     // 44 is the short stone slab: the M1 palette and the acceptance world scan
     // carry the double slab (43), so the short slab is outside the covered set.
-    for id in [
-        0, 6, 19, 22, 23, 30, 44, 74, 92, 125, 143, 163, 197, 255, 4096,
-    ] {
+    for id in [0, 6, 19, 22, 30, 44, 74, 92, 125, 143, 163, 197, 255, 4096] {
         assert!(
             behaviour(id).is_none(),
             "id {id} is outside the covered set"
@@ -439,9 +437,9 @@ fn the_barrier_row_holds_its_source_values() {
 /// overrides among the covered set: `BlockLeaves.java:278-281` answers
 /// `!fancyGraphics`, which under Fast graphics is true, so they occlude like
 /// the full cubes they are.
-const OCCLUDING: [u16; 44] = [
-    1, 2, 3, 4, 5, 7, 12, 13, 14, 15, 16, 17, 18, 21, 24, 35, 41, 42, 43, 45, 46, 47, 48, 49, 56,
-    57, 58, 61, 62, 73, 80, 82, 86, 87, 88, 89, 98, 99, 100, 110, 129, 155, 161, 162,
+const OCCLUDING: [u16; 46] = [
+    1, 2, 3, 4, 5, 7, 12, 13, 14, 15, 16, 17, 18, 21, 23, 24, 35, 41, 42, 43, 45, 46, 47, 48, 49,
+    56, 57, 58, 61, 62, 73, 80, 82, 86, 87, 88, 89, 98, 99, 100, 110, 129, 155, 158, 161, 162,
 ];
 
 #[test]

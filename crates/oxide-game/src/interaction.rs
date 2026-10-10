@@ -57,7 +57,8 @@ use std::collections::BTreeMap;
 
 use oxide_world::behaviour::{CollisionShape, Material, behaviour};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
-use oxide_world::collision::CollisionBox;
+use oxide_world::collision::{CollisionBox, Facing, front_facing};
+use oxide_world::entity::Entities;
 
 use crate::physics::CollisionView;
 use crate::world_view::WorldView;
@@ -342,6 +343,90 @@ fn cell_of(point: [f64; 3]) -> [i32; 3] {
     ]
 }
 
+/// The use-click's entity target: the id of the nearest collidable entity
+/// whose border-expanded hitbox the eye ray meets before the block hit.
+///
+/// The source's mouse-over pick (`EntityRenderer.getMouseOver`,
+/// `client/renderer/EntityRenderer.java:409-530`): the block ray runs first
+/// and its hit distance `d1` is the bar (`:440-443`); the entity sweep runs
+/// over the collidable entities in the look corridor
+/// (`getEntitiesInAABBexcluding` with `canBeCollidedWith`, `:447-456`),
+/// each box expanded by its collision border
+/// (`getEntityBoundingBox().expand(border)`, `:461-462`), the eye inside a
+/// box winning at once (`isVecInside`, `:464-471`), else the nearest
+/// intercept (`calculateIntercept`, `:472-495`); the entity replaces the
+/// block target only when nearer (`d2 < d1`, `:505-513`). Beyond the block
+/// reach nothing is swept (`vec32`, `:445-446`): creative extends the sweep
+/// to 6 (`extendedReach`, `:433-438`), survival drops entities past 3.0
+/// (`flag`, `:436-440` and `:499-503`).
+///
+/// `block_distance` is the eye-to-`Aim::hit` distance when the block ray
+/// stopped, `None` when it missed. The ridden-entity exception (`:481-489`)
+/// has nothing to read here — the port tracks no mount — so every collidable
+/// kind is swept.
+pub fn pick_entity_target(
+    entities: &Entities,
+    eye: [f64; 3],
+    look: [f64; 3],
+    gamemode: u8,
+    block_distance: Option<f64>,
+) -> Option<i32> {
+    if !eye.iter().chain(look.iter()).all(|value| value.is_finite()) {
+        return None;
+    }
+    let extended = creative(gamemode);
+    let sweep = if extended { 6.0 } else { reach(gamemode) };
+    let to = [
+        eye[0] + look[0] * sweep,
+        eye[1] + look[1] * sweep,
+        eye[2] + look[2] * sweep,
+    ];
+    let mut nearest: Option<(i32, f64)> = None;
+    for entity in entities.iter() {
+        if !entity.kind.is_collidable() {
+            continue;
+        }
+        let Some((w, h)) = entity.kind.hitbox() else {
+            continue;
+        };
+        let border = entity.kind.border_size();
+        let min = [
+            entity.position[0] - w / 2.0 - border,
+            entity.position[1] - border,
+            entity.position[2] - w / 2.0 - border,
+        ];
+        let max = [
+            entity.position[0] + w / 2.0 + border,
+            entity.position[1] + h + border,
+            entity.position[2] + w / 2.0 + border,
+        ];
+        let inside = (0..3).all(|axis| min[axis] <= eye[axis] && eye[axis] <= max[axis]);
+        let distance = if inside {
+            0.0
+        } else {
+            let box_ = CollisionBox { min, max };
+            let Some((t, _)) = box_entry(&box_, eye, to) else {
+                continue;
+            };
+            if t < 0.0 || t > 1.0 {
+                continue;
+            }
+            t * sweep
+        };
+        if nearest.is_none_or(|(_, best)| distance < best) {
+            nearest = Some((entity.id, distance));
+        }
+    }
+    let (id, distance) = nearest?;
+    if !extended && distance > 3.0 {
+        return None;
+    }
+    if block_distance.is_some_and(|block| distance >= block) {
+        return None;
+    }
+    Some(id)
+}
+
 /// The aim one cell answers for the segment `from..to`, when one of the bounds
 /// its block reports meets it: the nearest entry, on the cell's own block.
 fn cell_aim(
@@ -431,12 +516,27 @@ fn ray_bounds(view: &WorldView<'_>, cell: [i32; 3], out: &mut Vec<CollisionBox>)
 ///   powered and 1/16 otherwise (`block/BlockBasePressurePlate.java:34-46`,
 ///   over `BlockPressurePlate.getStateFromMeta`, `:73-76`: metadata 1 is
 ///   powered).
+/// * the standing sign, `[0.25, 0, 0.25]..[0.75, 1, 0.75]`
+///   (`block/BlockSign.java:21-25`: `f` 0.25, `f1` 1.0 — the rotation does
+///   not move the bounds, and the class answers no collision box, `:27-30`);
+/// * the wall sign, the 1/8 plate on its attached face
+///   (`block/BlockWallSign.java:22-50`: `f` 0.28125, `f1` 0.78125, `f4`
+///   0.125 — north at `z` 0.875..1, south at `z` 0..0.125, west at `x`
+///   0.875..1, east at `x` 0..0.125 — and the class answers no collision
+///   box, `BlockSign.java:27-30`).
 fn selection_bounds(id: u16, meta: u8, cell: [i32; 3], out: &mut Vec<CollisionBox>) {
     let (min, max): ([f64; 3], [f64; 3]) = match id {
         31 | 32 => ([0.1, 0.0, 0.1], [0.9, 0.8, 0.9]),
         37 | 38 => ([0.3, 0.0, 0.3], [0.7, 0.6, 0.7]),
         39 | 40 => ([0.3, 0.0, 0.3], [0.7, 0.4, 0.7]),
         59 | 141 | 142 => ([0.0, 0.0, 0.0], [1.0, 0.25, 1.0]),
+        63 => ([0.25, 0.0, 0.25], [0.75, 1.0, 0.75]),
+        68 => match front_facing(meta) {
+            Facing::North => ([0.0, 0.28125, 0.875], [1.0, 0.78125, 1.0]),
+            Facing::South => ([0.0, 0.28125, 0.0], [1.0, 0.78125, 0.125]),
+            Facing::West => ([0.875, 0.28125, 0.0], [1.0, 0.78125, 1.0]),
+            Facing::East => ([0.0, 0.28125, 0.0], [0.125, 0.78125, 1.0]),
+        },
         83 => ([0.125, 0.0, 0.125], [0.875, 1.0, 0.875]),
         175 => ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
         50 => match meta {
@@ -690,14 +790,15 @@ pub fn hand_rate(hardness: f32, tool_not_required: bool) -> f32 {
 ///
 /// In this table's vocabulary those are [`Material::Rock`] and
 /// [`Material::Stone`] (both `Material.rock`), [`Material::Metal`],
-/// [`Material::Snow`], [`Material::CraftedSnow`], [`Material::Web`] and
-/// [`Material::Barrier`]; the anvil material is not a covered id yet.
+/// [`Material::Anvil`], [`Material::Snow`], [`Material::CraftedSnow`],
+/// [`Material::Web`] and [`Material::Barrier`].
 pub fn tool_not_required(material: Material) -> bool {
     !matches!(
         material,
         Material::Rock
             | Material::Stone
             | Material::Metal
+            | Material::Anvil
             | Material::Snow
             | Material::CraftedSnow
             | Material::Web
@@ -1198,12 +1299,13 @@ mod tests {
 
     use super::{
         Aim, BreakStages, CREATIVE_REACH, DigAction, DigAim, DigState, Face, Placement,
-        SURVIVAL_REACH, creative, hand_rate, look_vector, mode_from_value, placement,
-        placement_cursor, raycast, reach, replaceable, tool_not_required,
+        SURVIVAL_REACH, creative, hand_rate, look_vector, mode_from_value, pick_entity_target,
+        placement, placement_cursor, raycast, reach, replaceable, tool_not_required,
     };
     use crate::player::Player;
     use crate::world_view::WorldView;
     use oxide_world::behaviour::Material;
+    use oxide_world::entity::{Entities, Entity, EntityKind};
 
     /// Air.
     const AIR: u16 = 0;
@@ -1278,6 +1380,19 @@ mod tests {
     /// plus `Player::eye_height()`'s `1.62`.
     fn pose_eye(feet: [f64; 3]) -> [f64; 3] {
         [feet[0], feet[1] + 1.62, feet[2]]
+    }
+
+    /// An entity store holding one entity per `(id, kind, feet position)`:
+    /// the use-click pick's fixture.
+    fn entities_of<const N: usize>(members: [(i32, EntityKind, [f64; 3]); N]) -> Entities {
+        let mut entities = Entities::new();
+        for (id, kind, position) in members {
+            let mut entity = Entity::new(id, kind);
+            entity.position = position;
+            entity.last_tick_position = position;
+            entities.insert(entity);
+        }
+        entities
     }
 
     /// The eye a sneaking player at `feet` looks from: the same pose eye
@@ -2661,5 +2776,152 @@ mod tests {
                 "{value} reads creative only for id 1"
             );
         }
+    }
+
+    #[test]
+    fn the_uncovered_container_blocks_stop_the_ray() {
+        // F11's mechanism: the ids absent from COVERED push no bounds, so the
+        // ray passes through them. Each world holds one block at (0, 65, 2),
+        // in the eye's own row; the pin is the ray stopping there.
+        let row_eye = [0.5, 64.0, 0.5]; // eye y 65.62
+        // The full cubes: dispenser 23, hopper 154, dropper 158, beacon 138.
+        for (id, name) in [
+            (23u16, "the dispenser"),
+            (154u16, "the hopper"),
+            (158u16, "the dropper"),
+            (138u16, "the beacon"),
+        ] {
+            assert_stops_at(
+                id << 4,
+                row_eye,
+                0.0,
+                0.0,
+                Face::North,
+                [0.5, 65.62, 2.0],
+                &format!("{name} stops the ray on its north face"),
+            );
+        }
+        // The enchanting table: the full footprint at 0..0.75 high.
+        assert_stops_at(
+            116 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.0],
+            "the enchanting table stops the ray",
+        );
+        // The brewing stand: the 0.4375..0.5625 column, met on its north edge.
+        assert_stops_at(
+            117 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.4375],
+            "the brewing stand stops the ray on its column",
+        );
+        // The anvil: the 0.75-wide plate, full height — facing south (meta 0)
+        // it spans x, facing west (meta 1) it spans z.
+        assert_stops_at(
+            145 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.0],
+            "the south-facing anvil stops the ray",
+        );
+        assert_stops_at(
+            (145 << 4) | 1,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.125],
+            "the west-facing anvil stops the ray on its z edge",
+        );
+        // The standing sign: the 0.25..0.75 post, full height.
+        assert_stops_at(
+            63 << 4,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.25],
+            "the standing sign stops the ray",
+        );
+        // The north-facing wall sign (meta 2): the plate at z 0.875..1.
+        assert_stops_at(
+            (68 << 4) | 2,
+            row_eye,
+            0.0,
+            0.0,
+            Face::North,
+            [0.5, 65.62, 2.875],
+            "the wall sign stops the ray on its plate",
+        );
+    }
+
+    #[test]
+    fn the_ray_no_longer_passes_through_to_the_wall_behind() {
+        // The F11 signature with values: a dispenser at (0, 65, 2) with stone
+        // at (0, 65, 5) behind it — pre-fix the ray addresses the stone.
+        let world = world_of(|x, y, z| match (x, y, z) {
+            (0, 65, 2) => 23 << 4,
+            (0, 65, 5) => STONE,
+            _ => AIR,
+        });
+        let aim = aim_in(&world, [0.5, 64.0, 0.5], 0.0, 0.0, SURVIVAL_REACH);
+        assert_eq!(
+            aim.map(|aim| (aim.x, aim.y, aim.z, aim.face)),
+            Some((0, 65, 2, Face::North)),
+            "the dispenser stops the ray before the stone behind it"
+        );
+    }
+
+    #[test]
+    fn a_villager_in_reach_is_the_use_clicks_entity_target() {
+        // The entity-use RED: a villager two blocks down the look ray, no
+        // block in the way — pre-fix no dispatch exists, so no target.
+        let entities = entities_of([(7, EntityKind::Villager, [0.5, 64.0, 2.0])]);
+        let target =
+            pick_entity_target(&entities, [0.5, 65.62, 0.5], look_vector(0.0, 0.0), 0, None);
+        assert_eq!(
+            target,
+            Some(7),
+            "a villager in reach is the use-click's entity target"
+        );
+    }
+
+    #[test]
+    fn a_horse_behind_the_aimed_block_loses_to_the_block() {
+        // The reference's ordering (`d2 < d1`): a horse past the aimed
+        // dispenser's face is not the target — the block keeps the click.
+        let entities = entities_of([(9, EntityKind::EntityHorse, [0.5, 64.0, 4.0])]);
+        let target = pick_entity_target(
+            &entities,
+            [0.5, 65.62, 0.5],
+            look_vector(0.0, 0.0),
+            0,
+            Some(2.5),
+        );
+        assert_eq!(
+            target, None,
+            "a horse behind the aimed block is not the use-click's target"
+        );
+    }
+
+    #[test]
+    fn an_item_on_the_ground_is_never_the_use_clicks_target() {
+        // `canBeCollidedWith` is false for drops: an item in the ray's path
+        // does not capture the click.
+        let entities = entities_of([(3, EntityKind::Item, [0.5, 64.0, 1.5])]);
+        let target =
+            pick_entity_target(&entities, [0.5, 65.62, 0.5], look_vector(0.0, 0.0), 0, None);
+        assert_eq!(
+            target, None,
+            "a dropped item is never the use-click's entity target"
+        );
     }
 }

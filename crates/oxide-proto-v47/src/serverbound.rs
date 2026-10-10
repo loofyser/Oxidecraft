@@ -261,6 +261,46 @@ pub fn write_player_block_placement(
 /// Serverbound Animation (play id 0x0A).
 pub const ANIMATION_ID: i32 = 0x0A;
 
+/// Serverbound Use Entity (play id 0x02).
+pub const USE_ENTITY_ID: i32 = 0x02;
+
+/// The actions Use Entity carries (`C02PacketUseEntity.Action`,
+/// `network/play/client/C02PacketUseEntity.java:103-108`).
+///
+/// The variants' declaration order is the id on the wire (`writeEnumValue`
+/// writes the ordinal, `network/PacketBuffer.java:92-95`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseEntityAction {
+    /// Interact with the entity (action 0).
+    Interact,
+    /// Attack the entity (action 1).
+    Attack,
+    /// Interact with the entity at a hit position (action 2).
+    InteractAt,
+}
+
+/// Writes Use Entity: the entity id, the action's ordinal, then the hit
+/// vector's three big-endian floats for `InteractAt` only
+/// (`C02PacketUseEntity.writePacketData`,
+/// `network/play/client/C02PacketUseEntity.java:58-68`).
+pub fn write_use_entity(
+    mut out: impl Write,
+    entity_id: i32,
+    action: UseEntityAction,
+    hit: Option<[f32; 3]>,
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, USE_ENTITY_ID)?;
+    oxide_proto::varint::write_varint(&mut out, entity_id)?;
+    oxide_proto::varint::write_varint(&mut out, action as i32)?;
+    if action == UseEntityAction::InteractAt {
+        let [x, y, z] = hit.unwrap_or([0.0, 0.0, 0.0]);
+        out.write_all(&x.to_be_bytes())?;
+        out.write_all(&y.to_be_bytes())?;
+        out.write_all(&z.to_be_bytes())?;
+    }
+    Ok(())
+}
+
 /// Writes Animation: the packet id alone — the packet carries no fields
 /// (`C0APacketAnimation.writePacketData`, `network/play/client/C0APacketAnimation.java:21-23`).
 pub fn write_animation(mut out: impl Write) -> io::Result<()> {
@@ -557,8 +597,8 @@ mod tests {
 
     use super::{
         CLICK_WINDOW_ID, CLOSE_WINDOW_ID, CONFIRM_TRANSACTION_ID, CREATIVE_INVENTORY_ACTION_ID,
-        DiggingStatus, ENCHANT_ITEM_ID, HELD_ITEM_CHANGE_ID, UPDATE_SIGN_ID, write_animation,
-        write_player_block_placement, write_player_digging,
+        DiggingStatus, ENCHANT_ITEM_ID, HELD_ITEM_CHANGE_ID, UPDATE_SIGN_ID, UseEntityAction,
+        write_animation, write_player_block_placement, write_player_digging, write_use_entity,
     };
 
     /// The bytes `write_player_block_placement` writes, for byte-exact
@@ -723,5 +763,49 @@ mod tests {
         );
         assert_eq!(ENCHANT_ITEM_ID, 0x11, "0x11 Enchant Item");
         assert_eq!(UPDATE_SIGN_ID, 0x12, "0x12 Update Sign");
+    }
+
+    /// The bytes `write_use_entity` writes, for byte-exact assertions.
+    fn use_entity_bytes(entity_id: i32, action: UseEntityAction, hit: Option<[f32; 3]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_use_entity(&mut out, entity_id, action, hit).expect("writing to a Vec cannot fail");
+        out
+    }
+
+    #[test]
+    fn use_entity_interact_writes_the_id_and_a_bare_ordinal() {
+        // 0x02: the entity id as a VarInt, then the action's ordinal as a
+        // VarInt (`writeEnumValue` writes the ordinal,
+        // `PacketBuffer.java:92-95`), and no hit vector for INTERACT
+        // (`C02PacketUseEntity.writePacketData`, `:58-68` only writes it for
+        // INTERACT_AT). Entity 7, INTERACT (ordinal 0).
+        assert_eq!(
+            use_entity_bytes(7, UseEntityAction::Interact, None),
+            vec![
+                0x02, // the packet id
+                0x07, // the entity id
+                0x00, // INTERACT
+            ],
+            "the interact send for entity 7"
+        );
+    }
+
+    #[test]
+    fn use_entity_interact_at_appends_the_hit_floats() {
+        // Entity 300 (two-byte VarInt `0xAC 0x02`), INTERACT_AT (ordinal 2),
+        // then the hit vector's three big-endian floats: 1.5 is `3F C0 00
+        // 00`, -0.25 is `BE 80 00 00`, 0.0 is four zero bytes.
+        assert_eq!(
+            use_entity_bytes(300, UseEntityAction::InteractAt, Some([1.5, -0.25, 0.0])),
+            vec![
+                0x02, // the packet id
+                0xac, 0x02, // the entity id
+                0x02, // INTERACT_AT
+                0x3f, 0xc0, 0x00, 0x00, // 1.5
+                0xbe, 0x80, 0x00, 0x00, // -0.25
+                0x00, 0x00, 0x00, 0x00, // 0.0
+            ],
+            "the interact-at send with its hit vector"
+        );
     }
 }
