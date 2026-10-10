@@ -2090,31 +2090,70 @@ fn air_split(air: i16) -> (i32, i32) {
 /// brightness with a half alpha (`ItemRenderer.java:511`'s `color(f, f, f, 0.5F)`).
 const WATER_OVERLAY_ALPHA: f32 = 0.5;
 
+/// The water overlay's look offsets, in texture units: the source shifts its
+/// UV span by the player's look (`ItemRenderer.java:521-522` — `f7 =
+/// -rotationYaw / 64.0F`, `f8 = rotationPitch / 64.0F`).
+fn water_overlay_uv_offset(yaw_degrees: f32, pitch_degrees: f32) -> (f32, f32) {
+    (-yaw_degrees / 64.0, pitch_degrees / 64.0)
+}
+
+/// The unit fraction: the overlay tiles below wrap each quarter-slot into
+/// `[0, 1)` so the clamped hud sampler reads the source's repeat wrap.
+fn frac_unit(value: f32) -> f32 {
+    value - value.floor()
+}
+
 /// The first-person water overlay's draws: the port equivalent of
-/// `ItemRenderer.renderWaterOverlayTexture` (`ItemRenderer.java:450-505`) — the
-/// fullscreen `misc/underwater` quad, SRC_ALPHA-blended through the hud pass's own
+/// `ItemRenderer.renderWaterOverlayTexture` (`ItemRenderer.java:505-532`) — the
+/// `misc/underwater` overlay, SRC_ALPHA-blended through the hud pass's own
 /// `TexturedRect` pipeline and tinted by the player's brightness — drawn when the eye
 /// is submerged, and nothing when it is dry. The frame prepends these draws to its hud
 /// list, which is the source's own order: the overlay draws between the hand pass and
 /// the GUI (`EntityRenderer.java:864-876`, `:1482-1486` for the hand, then the GUI's
 /// own pass), so the HUD bubbles land on top of it untouched.
+///
+/// The source draws ONE quad whose UVs span `0..4` on both axes under its
+/// repeating sampler (`:523-527`, offsets `:521-522`), so the texture tiles
+/// 4×4 and slides with the look. The hud sampler clamps, so the port lays the
+/// same four repeats out as sixteen quads: tile `(col, row)` covers its
+/// sixteenth of the screen and samples its wrapped quarter-slot — U falling
+/// left to right (`:524` gives the left edge `4 + f7`, `:525` the right edge
+/// `0 + f7`) and V growing downward (`:524` gives the bottom `4 + f8`, `:527`
+/// the top-right `0 + f8`, and the GUI's V grows the same way down the screen).
 pub(crate) fn water_overlay_draws(
     submerged: bool,
     brightness: f32,
+    yaw_degrees: f32,
+    pitch_degrees: f32,
     scaled: &ScaledResolution,
 ) -> Vec<HudDraw> {
     if !submerged {
         return Vec::new();
     }
-    vec![HudDraw::TexturedRect {
-        texture: HudTexture::Named(UNDERWATER_OVERLAY),
-        x: 0.0,
-        y: 0.0,
-        width: scaled.width as f32,
-        height: scaled.height as f32,
-        uv: [0.0, 0.0, 1.0, 1.0],
-        colour: [brightness, brightness, brightness, WATER_OVERLAY_ALPHA],
-    }]
+    let (u_offset, v_offset) = water_overlay_uv_offset(yaw_degrees, pitch_degrees);
+    let width = scaled.width as f32;
+    let height = scaled.height as f32;
+    let colour = [brightness, brightness, brightness, WATER_OVERLAY_ALPHA];
+    let mut draws = Vec::with_capacity(16);
+    for row in 0..4 {
+        for col in 0..4 {
+            draws.push(HudDraw::TexturedRect {
+                texture: HudTexture::Named(UNDERWATER_OVERLAY),
+                x: col as f32 * width / 4.0,
+                y: row as f32 * height / 4.0,
+                width: width / 4.0,
+                height: height / 4.0,
+                uv: [
+                    frac_unit(4.0 + u_offset - col as f32 / 4.0),
+                    frac_unit(v_offset + row as f32 / 4.0),
+                    frac_unit(4.0 + u_offset - (col + 1) as f32 / 4.0),
+                    frac_unit(v_offset + (row + 1) as f32 / 4.0),
+                ],
+                colour,
+            });
+        }
+    }
+    draws
 }
 
 /// The experience fill's width: the truncated `bar × 183`
@@ -10272,50 +10311,95 @@ mod tests {
 
     /// The first-person water overlay (`ItemRenderer.renderWaterOverlayTexture`,
     /// `ItemRenderer.java:450-505`): a submerged eye opens the frame's draw
-    /// list with the fullscreen `misc/underwater` quad, tinted by the
-    /// player's brightness with the source's half alpha — and a dry eye draws
+    /// list with a 4×4 grid of `misc/underwater` tiles covering the screen,
+    /// each sampling its quarter-slot of the texture shifted by the look
+    /// offsets (`:521-527` — `-yaw/64`, `pitch/64`), tinted by the player's
+    /// brightness with the source's half alpha — and a dry eye draws
     /// nothing. The overlay leads because the source draws it between the
     /// hand and the GUI, so the HUD bubbles land on top of it untouched.
     #[test]
     fn the_submerged_frame_opens_with_the_water_overlay() {
         let scaled = chat_resolution();
-        let draws = water_overlay_draws(true, 1.0, &scaled);
-        assert_eq!(draws.len(), 1, "one fullscreen quad: {draws:?}");
-        match &draws[0] {
-            HudDraw::TexturedRect {
-                texture,
-                x,
-                y,
-                width,
-                height,
-                uv,
-                colour,
-            } => {
-                assert_eq!(*texture, HudTexture::Named("misc/underwater"));
-                assert_eq!(
-                    (*x, *y, *width, *height),
-                    (0.0, 0.0, scaled.width as f32, scaled.height as f32),
-                    "the quad covers the whole GUI"
-                );
-                assert_eq!(*uv, [0.0, 0.0, 1.0, 1.0]);
-                assert_eq!(
-                    *colour,
-                    [1.0, 1.0, 1.0, 0.5],
-                    "the brightness tint at half alpha"
-                );
+        // Level look: the offsets are zero, so the tiles sample the raw slots.
+        let draws = water_overlay_draws(true, 1.0, 0.0, 0.0, &scaled);
+        assert_eq!(draws.len(), 16, "the overlay tiles four by four: {draws:?}");
+        let mut slots = Vec::with_capacity(16);
+        for (index, draw) in draws.iter().enumerate() {
+            match draw {
+                HudDraw::TexturedRect {
+                    texture,
+                    x,
+                    y,
+                    width,
+                    height,
+                    uv,
+                    colour,
+                } => {
+                    assert_eq!(
+                        *texture,
+                        HudTexture::Named("misc/underwater"),
+                        "tile {index} samples the underwater sheet"
+                    );
+                    assert_eq!(
+                        *colour,
+                        [1.0, 1.0, 1.0, 0.5],
+                        "tile {index} carries the brightness tint at half alpha"
+                    );
+                    let col = (index % 4) as f32;
+                    let row = (index / 4) as f32;
+                    assert_eq!(
+                        (*x, *y, *width, *height),
+                        (
+                            col * scaled.width as f32 / 4.0,
+                            row * scaled.height as f32 / 4.0,
+                            scaled.width as f32 / 4.0,
+                            scaled.height as f32 / 4.0
+                        ),
+                        "tile {index} covers its sixteenth"
+                    );
+                    slots.push(*uv);
+                }
+                other => panic!("the overlay is a textured rect, not {other:?}"),
             }
-            other => panic!("the overlay is a textured rect, not {other:?}"),
         }
-        // Half brightness tints the quad down without touching the alpha.
-        let dim = water_overlay_draws(true, 0.5, &scaled);
-        match &dim[0] {
-            HudDraw::TexturedRect { colour, .. } => {
-                assert_eq!(*colour, [0.5, 0.5, 0.5, 0.5]);
-            }
+        // The sixteen UV rects tile the texture: no two tiles share a slot.
+        let mut sorted = slots;
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN uvs"));
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), before, "sixteen distinct slots: {sorted:?}");
+        assert_eq!(before, 16, "sixteen tiles: {sorted:?}");
+        // A sampled pair at level look: the top-left and bottom-right slots.
+        assert!(
+            sorted.contains(&[0.0, 0.0, 0.75, 0.25]),
+            "the top-left slot: {sorted:?}"
+        );
+        assert!(
+            sorted.contains(&[0.25, 0.75, 0.0, 0.0]),
+            "the bottom-right slot: {sorted:?}"
+        );
+        // The look offsets shift the slots: yaw 32 drops U by half a texture
+        // and pitch 32 lifts V by half a texture (`:521-522`).
+        let turned = water_overlay_draws(true, 1.0, 32.0, 32.0, &scaled);
+        let turned_first = match &turned[0] {
+            HudDraw::TexturedRect { uv, .. } => *uv,
             other => panic!("the overlay is a textured rect, not {other:?}"),
+        };
+        assert_eq!(turned_first, [0.5, 0.5, 0.25, 0.75]);
+        assert_ne!(turned_first, [0.0, 0.0, 0.75, 0.25]);
+        // Half brightness tints every tile down without touching the alpha.
+        let dim = water_overlay_draws(true, 0.5, 0.0, 0.0, &scaled);
+        assert_eq!(dim.len(), 16);
+        for draw in &dim {
+            match draw {
+                HudDraw::TexturedRect { colour, .. } => {
+                    assert_eq!(*colour, [0.5, 0.5, 0.5, 0.5]);
+                }
+                other => panic!("the overlay is a textured rect, not {other:?}"),
+            }
         }
         assert!(
-            water_overlay_draws(false, 1.0, &scaled).is_empty(),
+            water_overlay_draws(false, 1.0, 0.0, 0.0, &scaled).is_empty(),
             "a dry eye draws no overlay"
         );
     }

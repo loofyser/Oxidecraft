@@ -1931,12 +1931,15 @@ impl ClientApp {
         // rides the frame's own state now.
         // Ahead of all of it, the first-person water overlay when the eye is
         // submerged: the source draws it between the hand and the GUI
-        // (`ItemRenderer.renderWaterOverlayTexture`, `ItemRenderer.java:450-505`),
+        // (`ItemRenderer.renderWaterOverlayTexture`, `ItemRenderer.java:505-532`),
         // so the bubbles land on top of it untouched. The tint is the player's
         // brightness (`Entity.getBrightness`, `Entity.java:1256-1260`) read
         // through the Overworld's table at the view block's light level — the
         // same block the fog chain reads — and full light before the first sky
-        // event lands.
+        // event lands. The overlay's UV warp follows the latest tick's look
+        // (`:521-522` — the source reads the live `rotationYaw`/`rotationPitch`
+        // with no partial-tick interpolation, so the uninterpolated pose is
+        // the faithful input).
         let water_brightness = self
             .sky
             .sky
@@ -1944,8 +1947,13 @@ impl ClientApp {
                 BrightnessTable::overworld().levels()[usize::from(values.light_level).min(15)]
             })
             .unwrap_or(1.0);
-        let mut hud_draws =
-            view::water_overlay_draws(self.camera.in_water, water_brightness, &scaled);
+        let mut hud_draws = view::water_overlay_draws(
+            self.camera.in_water,
+            water_brightness,
+            self.player.current.yaw,
+            self.player.current.pitch,
+            &scaled,
+        );
         hud_draws.extend(self.view.hotbar_draws(
             Instant::now(),
             &view::HotbarInput {
