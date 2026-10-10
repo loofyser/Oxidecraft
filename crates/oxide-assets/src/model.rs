@@ -92,8 +92,13 @@ const MAX_BOUND: f32 = 32.0;
 const POSITION_EPSILON: f32 = 0.001;
 
 /// The locations the client adds to the atlas beyond the variant scan
-/// (`ModelBakery.LOCATIONS_BUILTIN_TEXTURES`).
-const BUILTIN_TEXTURE_LOCATIONS: [&str; 18] = [
+/// (`ModelBakery.LOCATIONS_BUILTIN_TEXTURES`): the liquid and
+/// destroy-stage sheets, the armour-slot icons — and the three entity
+/// sheets the built-in block models sample (`TileEntityChestRenderer`
+/// and `TileEntitySignRenderer` bind them outside the block atlas, but
+/// this port's chest and sign boards mesh through the terrain atlas, so
+/// they stitch here or the boards read the fallback).
+const BUILTIN_TEXTURE_LOCATIONS: [&str; 21] = [
     "blocks/water_flow",
     "blocks/water_still",
     "blocks/lava_flow",
@@ -112,6 +117,9 @@ const BUILTIN_TEXTURE_LOCATIONS: [&str; 18] = [
     "items/empty_armor_slot_chestplate",
     "items/empty_armor_slot_leggings",
     "items/empty_armor_slot_boots",
+    "entity/chest/normal",
+    "entity/chest/normal_double",
+    "entity/sign",
 ];
 
 /// The item layers of a `builtin/generated` model, in the client's order.

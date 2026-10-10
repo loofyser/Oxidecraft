@@ -301,7 +301,9 @@ impl Screens {
 
     /// The world draw's entries: the map's positions with their boards and
     /// lines — nothing else, so positions outside the map draw no text (the
-    /// port's no-text rule).
+    /// port's no-text rule). The lines draw parsed: the wire's chat JSON as
+    /// the `§`-coded string the board-fixed layout reads (the skill's
+    /// sign-text pin), while the map keeps the raw lines for the editor.
     pub fn sign_entries(&self) -> Vec<oxide_render::sign_text::SignTextEntry> {
         self.sign_texts
             .iter()
@@ -312,7 +314,9 @@ impl Screens {
                     z: *z,
                     block_id: entry.block_id,
                     metadata: entry.metadata,
-                    lines: entry.lines.clone(),
+                    lines: entry.lines.clone().map(|line| {
+                        oxide_game::chat::to_legacy(&oxide_game::chat::parse_json(&line))
+                    }),
                 },
             )
             .collect()
@@ -778,5 +782,44 @@ mod tests {
             None,
         )
         .expect("the synthetic sheet loads")
+    }
+}
+
+#[cfg(test)]
+mod fix3b_tests {
+    //! The sign world-draw text: parsed components, not raw chat JSON.
+
+    use super::*;
+
+    /// The world draw's entries carry the parsed lines: the wire's chat
+    /// JSON as the `§`-coded string the board-fixed layout draws.
+    #[test]
+    fn the_world_entries_carry_parsed_sign_text() {
+        let mut screens = Screens::default();
+        screens.note_sign_text(
+            4,
+            65,
+            -9,
+            63,
+            0,
+            [
+                "{\"text\":\"Hi\"}".to_string(),
+                "{\"text\":\"Bye\",\"color\":\"red\"}".to_string(),
+                String::new(),
+                String::new(),
+            ],
+        );
+        let entries = screens.sign_entries();
+        assert_eq!(entries.len(), 1, "the map's one entry");
+        assert_eq!(
+            entries[0].lines,
+            [
+                "Hi§r".to_string(),
+                "§cBye§r".to_string(),
+                String::new(),
+                String::new(),
+            ],
+            "parsed component text, not the raw JSON"
+        );
     }
 }

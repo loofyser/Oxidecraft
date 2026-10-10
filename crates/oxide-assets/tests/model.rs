@@ -1223,6 +1223,11 @@ fn texture_paths_covers_the_blockstates_and_the_builtin_locations() {
         "items/empty_armor_slot_chestplate",
         "items/empty_armor_slot_leggings",
         "items/empty_armor_slot_boots",
+        // The entity sheets the built-in block models sample (fix3b): the
+        // chest and the sign boards mesh through the terrain atlas.
+        "entity/chest/normal",
+        "entity/chest/normal_double",
+        "entity/sign",
     ]
     .into_iter()
     .map(str::to_string)

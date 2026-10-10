@@ -694,6 +694,50 @@ fn flatten_into(component: &TextComponent, runs: &mut Vec<StyledRun>) {
     }
 }
 
+/// Renders a parsed component as the `§`-coded string the world draws
+/// consume: the source's `ChatComponentStyle.getFormattedText` (87-99).
+///
+/// Each element draws its own formatting codes, then its text, then a `§r`,
+/// in tree order (own text first, children depth first); an element with no
+/// text of its own contributes nothing. A `§` code inside the text rides
+/// along untouched — the text wins over the JSON from its position on, per
+/// the module's colour-precedence rule.
+pub fn to_legacy(component: &TextComponent) -> String {
+    let mut out = String::new();
+    append_legacy(component, &mut out);
+    out
+}
+
+/// Appends one component's legacy rendering to `out`.
+fn append_legacy(component: &TextComponent, out: &mut String) {
+    if !component.text.is_empty() {
+        if let Some(colour) = component.colour {
+            if usize::from(colour) < 16 {
+                out.push('§');
+                out.push(CODES.as_bytes()[usize::from(colour)] as char);
+            }
+        }
+        // The style codes in the table's own order (`FontRenderer.java`:400).
+        for (flag, code) in [
+            (component.obfuscated, 'k'),
+            (component.bold, 'l'),
+            (component.strikethrough, 'm'),
+            (component.underlined, 'n'),
+            (component.italic, 'o'),
+        ] {
+            if flag {
+                out.push('§');
+                out.push(code);
+            }
+        }
+        out.push_str(&component.text);
+        out.push_str("§r");
+    }
+    for child in &component.children {
+        append_legacy(child, out);
+    }
+}
+
 /// The client's language table: translation keys to their template strings,
 /// as the store's `en_US.lang` carries them (`StringTranslate`; the chat
 /// keys at `:227-235`).

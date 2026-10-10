@@ -67,17 +67,15 @@
 //!
 //! # Known interim state
 //!
-//! Of the client's built-in covered ids, the chest still draws the magenta
-//! fallback cube from the atlas's own fallback sprite — as do ids outside the
-//! behaviour table and states the model set could not resolve — while the
-//! barrier draws nothing at all: its row's `Invisible` kind answers the
-//! client's `getRenderType()` -1. The standing (63) and wall (68) signs take
-//! the barrier's way out as an interim: they have no row and no 1.8.9
-//! blockstate, so the lookup always misses, but the fallback cube would bury
-//! the sign pass's board-fixed text inside the cell — so the missing arm
-//! skips them and their text floats with no board until a board-meshing task
-//! lands (recorded).
+//! Of the client's built-in covered ids, the chest meshes its synthesised
+//! closed model (single or double) and the two signs their boards from the
+//! [`builtin`] module, while the barrier draws nothing at all: its row's
+//! `Invisible` kind answers the client's `getRenderType()` -1. Ids outside
+//! the behaviour table and states the model set could not resolve still draw
+//! the magenta fallback cube from the atlas's own fallback sprite. The chest
+//! lid animation is the deferred carry: every chest draws closed.
 
+mod builtin;
 mod liquid;
 mod models;
 mod snapshot;
@@ -295,15 +293,20 @@ fn append_block(
     );
     match ctx.models.model(id, meta, world.0, world.1, world.2) {
         ModelChoice::Model(model) => append_model(builder, snapshot, position, block, model, ctx),
-        // The standing (63) and wall (68) signs have no behaviour row and no
-        // 1.8.9 blockstate, so the lookup always misses — but the fallback
-        // cube would bury the board-fixed text the sign pass draws inside
-        // the cell (LessEqual against the cube's own written depth). The
-        // barrier's `Invisible` precedent answers this: mesh nothing until a
-        // board-meshing task lands, and let the text float (recorded).
-        ModelChoice::Missing
-            if id == crate::session::SIGN_STANDING_ID || id == crate::session::SIGN_WALL_ID => {}
-        ModelChoice::Missing => append_fallback(builder, snapshot, position, layer, ctx),
+        // The client's built-in blocks have no blockstate, so the lookup
+        // always misses — but the fallback cube would bury the sign text
+        // the sign pass draws inside the cell (LessEqual against the cube's
+        // own written depth). The barrier's `Invisible` precedent answers
+        // the missing arm; the chest and the two signs mesh their
+        // synthesised models instead (the double chest's silent half meshes
+        // nothing).
+        ModelChoice::Missing => match builtin::builtin(snapshot, id, meta, position) {
+            builtin::Builtin::Model(model) => {
+                append_model(builder, snapshot, position, block, &model, ctx)
+            }
+            builtin::Builtin::Empty => {}
+            builtin::Builtin::Absent => append_fallback(builder, snapshot, position, layer, ctx),
+        },
     }
 }
 

@@ -1547,43 +1547,52 @@ fn a_covered_barrier_draws_no_geometry_at_all() {
 }
 
 #[test]
-fn sign_cells_mesh_no_fallback_cube_until_the_board_task_lands() {
-    let (models, atlas) = loaded();
+fn sign_cells_mesh_their_boards_not_the_fallback_cube() {
+    let (models, atlas) = fix3b_loaded();
     let maps = white_maps();
     let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
 
-    // The standing (63) and wall (68) signs have no behaviour row and no
-    // 1.8.9 blockstate (`Block.java`:1321,1326), so the model lookup misses
-    // — but the fallback cube would bury the board-fixed text the sign pass
-    // draws inside the cell (LessEqual against the cube's own written
-    // depth). The barrier's `Invisible` precedent answers this: the mesher
-    // emits nothing for either cell until a board-meshing task lands, and
-    // the text floats (recorded). A stone beside them keeps every face:
-    // the signs hide nothing.
+    // The standing (63) and wall (68) signs are the client's built-in
+    // blocks (`Block.java`:1321,1326; `registerBuiltInBlocks`), so the
+    // model lookup misses — but the fallback cube would bury the
+    // board-fixed text the sign pass draws inside the cell (LessEqual
+    // against the cube's own written depth). The mesher synthesises the
+    // boards instead: the standing board with its post (twelve quads) and
+    // the wall board alone (six), over the sign sheet. A stone beside them
+    // keeps every face: the signs hide nothing. Twelve plus six board
+    // quads read 72 vertices against the stone's 24 — a fallback cube in
+    // either cell would read 24, not 48 or 24 with the board's span.
     let world = daylight(&[
         (0, 64, 0, state(STONE, 0)),
         (4, 64, 0, state(SIGN_STANDING, 0)),
         (8, 64, 0, state(SIGN_WALL, 0)),
     ]);
     let mesh = mesh_of(&world, &ctx);
-    assert_eq!(mesh.vertex_count(), 24, "the stone's six faces alone");
+    assert_eq!(
+        mesh.vertex_count(),
+        96,
+        "the stone's six faces and the two boards"
+    );
+    let mut in_sign_cells = 0;
     for vertex in vertices(&mesh) {
-        assert!(
-            vertex.position[0] < 4.0,
-            "no vertex in either sign's cell: {:?}",
-            vertex.position
-        );
+        if vertex.position[0] >= 4.0 {
+            in_sign_cells += 1;
+        }
     }
+    assert_eq!(in_sign_cells, 72, "both boards mesh inside their cells");
 
-    // Sign cells alone mesh to no section at all — above all, no opaque
-    // fallback quads.
+    // Sign cells alone mesh a section — above all, with board quads, not
+    // the opaque fallback cube.
     let world = daylight(&[
         (0, 64, 0, state(SIGN_STANDING, 0)),
         (1, 64, 1, state(SIGN_WALL, 0)),
     ]);
-    for (section, mesh) in meshes(&world, &ctx) {
-        assert!(mesh.is_none(), "section {section} stays empty");
-    }
+    let found: Vec<_> = meshes(&world, &ctx)
+        .into_iter()
+        .filter_map(|(section, mesh)| mesh.map(|mesh| (section, mesh)))
+        .collect();
+    assert_eq!(found.len(), 1, "one section meshes");
+    assert_eq!(found[0].1.vertex_count(), 72, "the two boards, no fallback");
 }
 
 #[test]
@@ -1809,4 +1818,467 @@ fn the_baked_model_is_what_the_mesher_reads() {
             .all(|quad| quad.texture == "blocks/probe")
     );
     assert!(stone.quads.iter().all(|quad| quad.cullface.is_some()));
+}
+
+// -- fix3b: the modelled blocks -------------------------------------------------
+//
+// The F10 world side: every id below drew the magenta fallback cube (or, for
+// the signs, nothing at all so the text floats). The pins assert the model
+// path per id: the mapped variant key, then the mesh itself — not the
+// fallback (no missing-sprite uv) with the model's distinguishing
+// texture and quad count.
+
+/// The fix3b ids the tests mesh.
+const CHEST: u16 = 54;
+const DISPENSER: u16 = 23;
+const HOPPER: u16 = 154;
+const DROPPER: u16 = 158;
+const ENCHANTING_TABLE: u16 = 116;
+const BREWING_STAND: u16 = 117;
+const BEACON: u16 = 138;
+const ANVIL: u16 = 145;
+
+/// The dispenser and hopper facings per metadata value, the port's own
+/// `DISPENSER_FACINGS` order (`getFront(meta & 7)`): down, up, north, south,
+/// west, east, then the triggered/enabled-bit aliases.
+const FACINGS: [&str; 16] = [
+    "down", "up", "north", "south", "west", "east", "down", "up", "down", "up", "north", "south",
+    "west", "east", "down", "up",
+];
+
+/// Extends the probe tree with the fix3b blockstates: the real variant keys
+/// of each id (the triggered/enabled bit dropped, per the source's state
+/// maps) over probe cube models with one distinguishing texture per id.
+fn fix3b_tree() -> Tree {
+    let tree = probe_tree();
+    let facing_variants = |model: &str| {
+        FACINGS
+            .iter()
+            .map(|facing| format!("\"facing={facing}\": [{{\"model\": \"minecraft:{model}\"}}]"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for (file, model) in [
+        ("dispenser", "probe_dispenser"),
+        ("dropper", "probe_dropper"),
+        ("hopper", "probe_hopper"),
+    ] {
+        tree.model(model, &cube(&format!("blocks/{model}"), false));
+        tree.blockstates(
+            file,
+            &format!("{{\"variants\": {{{}}}}}", facing_variants(model)),
+        );
+    }
+    tree.model("probe_table", &cube("blocks/probe_table", false));
+    tree.blockstates(
+        "enchanting_table",
+        r#"{"variants": {"normal": [{"model": "minecraft:probe_table"}]}}"#,
+    );
+    tree.model("probe_beacon", &cube("blocks/probe_beacon", false));
+    tree.blockstates(
+        "beacon",
+        r#"{"variants": {"normal": [{"model": "minecraft:probe_beacon"}]}}"#,
+    );
+    // The brewing stand's eight bottle states: the empty stand and the
+    // full one, the sampled pair.
+    tree.model(
+        "probe_stand_empty",
+        &cube("blocks/probe_stand_empty", false),
+    );
+    tree.model("probe_stand_full", &cube("blocks/probe_stand_full", false));
+    let mut bottles = Vec::new();
+    for meta in 0..8u8 {
+        let key = format!(
+            "\"has_bottle_0={},has_bottle_1={},has_bottle_2={}\": [{{\"model\": \"minecraft:{}\"}}]",
+            meta & 1 != 0,
+            meta & 2 != 0,
+            meta & 4 != 0,
+            if meta == 0 {
+                "probe_stand_empty"
+            } else {
+                "probe_stand_full"
+            },
+        );
+        bottles.push(key);
+    }
+    tree.blockstates(
+        "brewing_stand",
+        &format!("{{\"variants\": {{{}}}}}", bottles.join(", ")),
+    );
+    // The anvil's twelve states: one probe model per damage value.
+    tree.model("probe_anvil_0", &cube("blocks/probe_anvil_0", false));
+    tree.model("probe_anvil_1", &cube("blocks/probe_anvil_1", false));
+    tree.model("probe_anvil_2", &cube("blocks/probe_anvil_2", false));
+    let mut anvil = Vec::new();
+    for damage in 0..3u8 {
+        for facing in ["south", "west", "north", "east"] {
+            anvil.push(format!(
+                "\"damage={damage},facing={facing}\": [{{\"model\": \"minecraft:probe_anvil_{damage}\"}}]"
+            ));
+        }
+    }
+    tree.blockstates(
+        "anvil",
+        &format!("{{\"variants\": {{{}}}}}", anvil.join(", ")),
+    );
+    tree
+}
+
+/// The atlas the fix3b mesh tests use: the probe atlas plus one sprite per
+/// fix3b texture, including the three entity sheets the built-in models
+/// sample.
+fn fix3b_atlas() -> Atlas {
+    atlas(&[
+        "missingno",
+        "blocks/probe",
+        "blocks/probe_overlay",
+        "blocks/probe_cross",
+        "blocks/probe_dispenser",
+        "blocks/probe_dropper",
+        "blocks/probe_hopper",
+        "blocks/probe_table",
+        "blocks/probe_beacon",
+        "blocks/probe_stand_empty",
+        "blocks/probe_stand_full",
+        "blocks/probe_anvil_0",
+        "blocks/probe_anvil_1",
+        "blocks/probe_anvil_2",
+        "entity/chest/normal",
+        "entity/chest/normal_double",
+        "entity/sign",
+    ])
+}
+
+/// The fix3b models over the fix3b atlas.
+fn fix3b_loaded() -> (BlockModelSet, Atlas) {
+    let tree = fix3b_tree();
+    let models = BlockModelSet::load(&tree.source());
+    (models, fix3b_atlas())
+}
+
+/// The uv box of a sprite in the fix3b atlas.
+fn sprite_box(atlas: &Atlas, name: &str) -> [[f32; 2]; 2] {
+    atlas.uv(&atlas.sprites[name])
+}
+
+/// One sampled mesh quad: its four corner positions and four uvs.
+type Sample = ([[f32; 3]; 4], [[f32; 2]; 4]);
+
+/// Every quad of one section's mesh as owned corner data: positions and uvs
+/// per quad, empty when the section meshes nothing (the signs' pre-fix
+/// answer, where the count assert itself is the pin).
+fn section_samples(world: &World, ctx: &MeshContext<'_>, section: usize) -> Vec<Sample> {
+    let snapshot = ColumnSnapshot::from_world(world, 0, 0);
+    build_column_meshes(&snapshot, ctx)
+        .into_iter()
+        .find_map(|(index, mesh)| (index == section).then_some(mesh))
+        .flatten()
+        .map(|mesh| {
+            mesh.layers
+                .iter()
+                .flat_map(|layer| layer.vertices.chunks_exact(4))
+                .map(|quad| {
+                    (
+                        quad.iter()
+                            .map(|vertex| vertex.position)
+                            .collect::<Vec<_>>()
+                            .try_into()
+                            .expect("four corners"),
+                        quad.iter()
+                            .map(|vertex| vertex.uv)
+                            .collect::<Vec<_>>()
+                            .try_into()
+                            .expect("four uvs"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Asserts sampled quads read no fallback: every uv inside the named
+/// sprite's box and none inside the fallback's.
+fn assert_samples_no_fallback(samples: &[Sample], atlas: &Atlas, texture: &str, what: &str) {
+    let [[min_u, min_v], [max_u, max_v]] = sprite_box(atlas, texture);
+    let [[miss_min_u, miss_min_v], [miss_max_u, miss_max_v]] = sprite_box(atlas, "missingno");
+    assert!(!samples.is_empty(), "{what} emits no quads at all");
+    for (_, uvs) in samples {
+        for &[u, v] in uvs.iter() {
+            assert!(
+                u >= min_u && u <= max_u && v >= min_v && v <= max_v,
+                "{what}: uv [{u}, {v}] outside {texture} [{min_u}, {min_v}]..[{max_u}, {max_v}]"
+            );
+            assert!(
+                !(u >= miss_min_u && u <= miss_max_u && v >= miss_min_v && v <= miss_max_v),
+                "{what}: uv [{u}, {v}] reads the fallback sprite"
+            );
+        }
+    }
+}
+
+/// Asserts every vertex uv of every quad lies inside the named sprite's box:
+/// a quad reading the fallback sprite fails this.
+fn assert_no_fallback(quads: &[&[Vertex]], atlas: &Atlas, texture: &str, what: &str) {
+    let [[min_u, min_v], [max_u, max_v]] = sprite_box(atlas, texture);
+    let [[miss_min_u, miss_min_v], [miss_max_u, miss_max_v]] = sprite_box(atlas, "missingno");
+    assert!(!quads.is_empty(), "{what} emits no quads at all");
+    for quad in quads {
+        for vertex in *quad {
+            let [u, v] = vertex.uv;
+            assert!(
+                u >= min_u && u <= max_u && v >= min_v && v <= max_v,
+                "{what}: uv [{u}, {v}] outside {texture} [{min_u}, {min_v}]..[{max_u}, {max_v}]"
+            );
+            assert!(
+                !(u >= miss_min_u && u <= miss_max_u && v >= miss_min_v && v <= miss_max_v),
+                "{what}: uv [{u}, {v}] reads the fallback sprite"
+            );
+        }
+    }
+}
+
+/// The fix3b ids map to the real variant keys: the dispenser's, dropper's
+/// and hopper's triggered/enabled bit leaves the key (the source's
+/// `StateMap` ignores), and the stations name their files' keys.
+#[test]
+fn fix3b_ids_map_to_their_real_variant_keys() {
+    for id in [DISPENSER, DROPPER, HOPPER] {
+        let row = behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"));
+        for (meta, facing) in FACINGS.iter().enumerate() {
+            let meta = meta as u8;
+            let name = match id {
+                DISPENSER => "dispenser",
+                DROPPER => "dropper",
+                _ => "hopper",
+            };
+            assert_eq!(
+                blockstate_target(row, meta),
+                Some((name.to_string(), format!("facing={facing}"))),
+                "id {id} meta {meta}"
+            );
+        }
+    }
+    let row = behaviour(ANVIL).unwrap_or_else(|| panic!("the anvil is covered"));
+    for meta in 0..16u8 {
+        // The damage int carries values 0..2, so damage 3 clamps to 0
+        // (the row's own rule); the blockstate names only the three.
+        let raw = (meta >> 2) & 3;
+        let damage = if raw >= 3 { 0 } else { raw };
+        let facing = ["south", "west", "north", "east"][usize::from(meta & 3)];
+        assert_eq!(
+            blockstate_target(row, meta),
+            Some((
+                "anvil".to_string(),
+                format!("damage={damage},facing={facing}")
+            )),
+            "anvil meta {meta}"
+        );
+    }
+    let row = behaviour(BREWING_STAND).unwrap_or_else(|| panic!("the stand is covered"));
+    for meta in 0..16u8 {
+        let bits = meta & 7;
+        assert_eq!(
+            blockstate_target(row, meta),
+            Some((
+                "brewing_stand".to_string(),
+                format!(
+                    "has_bottle_0={},has_bottle_1={},has_bottle_2={}",
+                    bits & 1 != 0,
+                    bits & 2 != 0,
+                    bits & 4 != 0
+                )
+            )),
+            "brewing stand meta {meta}"
+        );
+    }
+    for (id, file) in [(ENCHANTING_TABLE, "enchanting_table"), (BEACON, "beacon")] {
+        let row = behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"));
+        assert_eq!(
+            blockstate_target(row, 0),
+            Some((file.to_string(), "normal".to_string())),
+            "id {id}"
+        );
+    }
+    let row = behaviour(CHEST).unwrap_or_else(|| panic!("the chest is covered"));
+    assert_eq!(blockstate_target(row, 0), None, "the chest is built in");
+    for id in [63, 68] {
+        let row = behaviour(id).unwrap_or_else(|| panic!("id {id} is covered"));
+        assert_eq!(
+            blockstate_target(row, 0),
+            None,
+            "id {id}: the sign is built in"
+        );
+    }
+}
+
+/// The dispenser, hopper and dropper mesh their models, not the fallback:
+/// six faces over the id's own texture.
+#[test]
+fn fix3b_dispenser_hopper_and_dropper_mesh_their_models() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    for (id, texture) in [
+        (DISPENSER, "blocks/probe_dispenser"),
+        (HOPPER, "blocks/probe_hopper"),
+        (DROPPER, "blocks/probe_dropper"),
+    ] {
+        let world = daylight(&[(0, 64, 0, state(id, 2))]);
+        let mesh = mesh_of(&world, &ctx);
+        let found = quads(&mesh);
+        assert_eq!(found.len(), 6, "id {id}: the model's six faces");
+        assert_no_fallback(&found, &atlas, texture, &format!("id {id}"));
+    }
+}
+
+/// The stations mesh their models, not the fallback: the table and beacon
+/// as cubes, the stand empty and full, the anvil per damage value.
+#[test]
+fn fix3b_stations_mesh_their_models() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    for (id, meta, texture) in [
+        (ENCHANTING_TABLE, 0, "blocks/probe_table"),
+        (BEACON, 0, "blocks/probe_beacon"),
+        (BREWING_STAND, 0, "blocks/probe_stand_empty"),
+        (BREWING_STAND, 7, "blocks/probe_stand_full"),
+        (ANVIL, 0, "blocks/probe_anvil_0"),
+        (ANVIL, 8, "blocks/probe_anvil_2"),
+    ] {
+        let world = daylight(&[(0, 64, 0, state(id, meta))]);
+        let mesh = mesh_of(&world, &ctx);
+        let found = quads(&mesh);
+        assert_eq!(found.len(), 6, "id {id} meta {meta}: the model's six faces");
+        assert_no_fallback(&found, &atlas, texture, &format!("id {id} meta {meta}"));
+    }
+}
+
+/// A lone chest meshes the closed model — lid, knob and base, eighteen
+/// quads over the normal sheet — not the six-quad fallback.
+#[test]
+fn fix3b_a_lone_chest_meshes_the_closed_model() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    let world = daylight(&[(0, 64, 0, state(CHEST, 3))]);
+    let mesh = mesh_of(&world, &ctx);
+    let found = quads(&mesh);
+    assert_eq!(found.len(), 18, "lid, knob and base, six faces each");
+    assert_no_fallback(&found, &atlas, "entity/chest/normal", "the lone chest");
+    let max_z = found
+        .iter()
+        .flat_map(|quad| quad.iter())
+        .map(|vertex| vertex.position[2])
+        .fold(f32::MIN, f32::max);
+    assert!(
+        (max_z - 1.0).abs() < 1e-4,
+        "the south-facing knob reaches the cell's south face: {max_z}"
+    );
+}
+
+/// Two adjacent chests mesh the double model once: eighteen quads over the
+/// double sheet spanning both cells, the second cell silent.
+#[test]
+fn fix3b_adjacent_chests_mesh_the_double_model_once() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    let world = daylight(&[(0, 64, 0, state(CHEST, 3)), (1, 64, 0, state(CHEST, 3))]);
+    let mesh = mesh_of(&world, &ctx);
+    let found = quads(&mesh);
+    assert_eq!(found.len(), 18, "one large model, not two singles");
+    assert_no_fallback(
+        &found,
+        &atlas,
+        "entity/chest/normal_double",
+        "the double chest",
+    );
+    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+    for quad in &found {
+        for vertex in *quad {
+            min_x = min_x.min(vertex.position[0]);
+            max_x = max_x.max(vertex.position[0]);
+        }
+    }
+    assert!(
+        (min_x - 0.0625).abs() < 1e-4 && (max_x - 1.9375).abs() < 1e-4,
+        "the large model spans both cells: {min_x}..{max_x}"
+    );
+}
+
+/// The chest's knob side follows the facing: north puts it on the north
+/// face, east on the east face, west on the west face.
+#[test]
+fn fix3b_the_chest_knob_follows_the_facing() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    for (meta, axis, end) in [(2u8, 2usize, 0.0f32), (5, 0, 1.0), (4, 0, 0.0)] {
+        let world = daylight(&[(0, 64, 0, state(CHEST, meta))]);
+        let mesh = mesh_of(&world, &ctx);
+        let found = quads(&mesh);
+        assert_eq!(found.len(), 18, "meta {meta}: the closed model");
+        let extreme = found
+            .iter()
+            .flat_map(|quad| quad.iter())
+            .map(|vertex| vertex.position[axis])
+            .fold(
+                if end == 0.0 { f32::MAX } else { f32::MIN },
+                |best, value| {
+                    if end == 0.0 {
+                        best.min(value)
+                    } else {
+                        best.max(value)
+                    }
+                },
+            );
+        assert!(
+            (extreme - end).abs() < 1e-4,
+            "meta {meta}: the knob reaches {end} on axis {axis}: {extreme}"
+        );
+    }
+}
+
+/// The sign boards mesh — the standing board with its post, the wall board
+/// alone — over the sign sheet, not nothing at all.
+#[test]
+fn fix3b_sign_boards_mesh() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    let world = daylight(&[(0, 64, 0, state(SIGN_STANDING, 0))]);
+    let standing = section_samples(&world, &ctx, 4);
+    assert_eq!(standing.len(), 12, "board and post, six faces each");
+    assert_samples_no_fallback(&standing, &atlas, "entity/sign", "the standing board");
+    let world = daylight(&[(0, 64, 0, state(SIGN_WALL, 2))]);
+    let wall = section_samples(&world, &ctx, 4);
+    assert_eq!(wall.len(), 6, "the wall board alone");
+    assert_samples_no_fallback(&wall, &atlas, "entity/sign", "the wall board");
+}
+
+/// The standing board turns with the metadata: rotation 0 spreads along x,
+/// rotation 4 along z.
+#[test]
+fn fix3b_the_standing_board_turns_with_the_rotation() {
+    let (models, atlas) = fix3b_loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+    let span = |meta: u8, axis: usize| {
+        let world = daylight(&[(0, 64, 0, state(SIGN_STANDING, meta))]);
+        let found = section_samples(&world, &ctx, 4);
+        assert_eq!(found.len(), 12, "meta {meta}: board and post");
+        let (mut min, mut max) = (f32::MAX, f32::MIN);
+        for (corners, _) in &found {
+            for corner in corners {
+                min = min.min(corner[axis]);
+                max = max.max(corner[axis]);
+            }
+        }
+        max - min
+    };
+    assert!(span(0, 0) > 0.9, "rotation 0 spreads along x");
+    assert!(span(0, 2) < 0.2, "rotation 0 is thin along z");
+    assert!(span(4, 2) > 0.9, "rotation 4 spreads along z");
+    assert!(span(4, 0) < 0.2, "rotation 4 is thin along x");
 }
