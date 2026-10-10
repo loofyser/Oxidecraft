@@ -6,8 +6,12 @@
 //! strength comes from the render distance (`EntityRenderer.java:1767-1768`, `:1803-1805`), the
 //! light-brightness factor the render loop's `fogColor1` converges to (`:362-365`, `:1856-1859`)
 //! and the void-fog altitude factor (`:1860-1887`) — plus the default linear range `setupFog`
-//! installs for terrain (`:2002-2016`). The rain and thunder blends, the sunset band, the boss
-//! tint, the night-vision term and the per-block overrides are the later scene work's.
+//! installs for terrain (`:2002-2016`), and the water arm the eye's own block
+//! selects when it is water ([`water_fog_for_eye`]: EXP at density 0.1 over
+//! (0.02, 0.02, 0.2), `setupFog`'s `:1985-1995` with `updateFogColor`'s
+//! `:1845-1847`). The rain and thunder blends, the sunset band, the boss
+//! tint, the night-vision term and the remaining per-block overrides are the
+//! later scene work's.
 //!
 //! The colour is also the window's clear colour: the source ends `updateFogColor` by handing it
 //! to `glClearColor` with an alpha of zero (`:1927`), which is how the horizon and the fog meet
@@ -34,6 +38,75 @@ pub struct FogParams {
     pub end: f32,
     /// The far plane the frame was drawn with, in blocks.
     pub far_plane: f32,
+    /// The fixed-function mode the frame draws with: linear over the range above, or
+    /// exponential at [`FogParams::density`].
+    pub mode: FogMode,
+    /// The EXP density, read only when [`FogParams::mode`] is [`FogMode::Exp`]: zero on
+    /// every linear frame, so the uniform word it rides in stays the zero it always was.
+    pub density: f32,
+}
+
+/// The fixed-function fog mode `setupFog` installs (`EntityRenderer.java:1960-2021`):
+/// linear over a start..end range for air, EXP at a density for water, lava and clouds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FogMode {
+    /// Linear fog (`GL_LINEAR`): the terrain arm's start..end fade (`:2014-2015`).
+    Linear,
+    /// Exponential fog (`GL_EXP`, `GlStateManager.setFog(2048)`): the water arm's
+    /// density falloff (`:1985-1995`).
+    Exp,
+}
+
+/// One frame's water fog: the branch `setupFog` installs when the eye block is water
+/// (`EntityRenderer.java:1985-1995`), wearing the colour `updateFogColor` computes for
+/// it (`:1845-1847`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaterFog {
+    /// Always [`FogMode::Exp`] on the water branch.
+    pub mode: FogMode,
+    /// The EXP density: `0.1` less `0.03` per respiration level — `0.01` flat while
+    /// water breathing holds.
+    pub density: f32,
+    /// `(0.02, 0.02, 0.2)` plus the respiration lift on every channel.
+    pub colour: [f32; 3],
+}
+
+/// The water fog for a respiration level and the water-breathing potion.
+///
+/// `respiration` is `EnchantmentHelper.getRespiration(entity)`'s level and
+/// `water_breathing` whether `Potion.waterBreathing` is active on the view entity.
+/// The colour lifts `respiration * 0.2` on every channel over the `(0.02, 0.02, 0.2)`
+/// base, folded to `0.3x + 0.6` while the potion holds (`EntityRenderer.java:1845-1847`);
+/// the density is `0.1` less `0.03` a level, pinned at `0.01` while the potion holds
+/// (`:1985-1995`).
+pub fn water_fog(respiration: u8, water_breathing: bool) -> WaterFog {
+    let level = f32::from(respiration);
+    let (density, lift) = if water_breathing {
+        (0.01, level * 0.2 * 0.3 + 0.6)
+    } else {
+        (0.1 - level * 0.03, level * 0.2)
+    };
+    WaterFog {
+        mode: FogMode::Exp,
+        density,
+        colour: [0.02 + lift, 0.02 + lift, 0.2 + lift],
+    }
+}
+
+/// The fog branch for an eye: the water arm when the eye block is water, nothing in
+/// air. `submerged` is `ActiveRenderInfo.getBlockAtEntityViewpoint`'s material test
+/// (`EntityRenderer.java:1828`, `:1985`) read as a bool — the caller resolves the eye
+/// block; the remaining arguments are [`water_fog`]'s.
+pub fn water_fog_for_eye(
+    submerged: bool,
+    respiration: u8,
+    water_breathing: bool,
+) -> Option<WaterFog> {
+    if submerged {
+        Some(water_fog(respiration, water_breathing))
+    } else {
+        None
+    }
 }
 
 /// The Overworld's fog base (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`).
@@ -204,8 +277,8 @@ fn celestial_angle(time_of_day: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FogParams, celestial_angle, fog_colour, light_factor, linear_params, sky_mix_strength,
-        surface_fog,
+        FogMode, FogParams, celestial_angle, fog_colour, light_factor, linear_params,
+        sky_mix_strength, surface_fog, water_fog_for_eye,
     };
 
     /// The sky the chain's tests mix towards: the same flat triple every time, so a failure
@@ -267,7 +340,73 @@ mod tests {
             start: linear_params(128.0).0,
             end: linear_params(128.0).1,
             far_plane: 128.0,
+            mode: FogMode::Linear,
+            density: 0.0,
         };
         assert_eq!(params.end, params.far_plane);
+    }
+
+    /// The submerged eye's branch (`EntityRenderer.java:1985-1995` for the mode
+    /// and density, `:1845-1847` for the colour): EXP at density 0.1 over
+    /// (0.02, 0.02, 0.2) with no respiration and no potion; respiration
+    /// thins the density `0.03` a level and lifts every colour channel `0.2`
+    /// a level, while water breathing pins the density at `0.01` and folds
+    /// the lift to `0.3x + 0.6`. Dry eyes take no branch.
+    #[test]
+    fn the_submerged_eye_selects_the_exp_water_branch() {
+        let water =
+            water_fog_for_eye(true, 0, false).expect("a submerged eye takes the water branch");
+        assert_eq!(water.mode, FogMode::Exp);
+        assert!(
+            (water.density - 0.1).abs() < 1e-6,
+            "the still-water density is 0.1; got {}",
+            water.density
+        );
+        for (channel, expected) in water.colour.iter().zip([0.02, 0.02, 0.2]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the still-water colour is (0.02, 0.02, 0.2); got {:?}",
+                water.colour
+            );
+        }
+        // Respiration III, no potion: `0.1 - 3 * 0.03` over the lifted triple.
+        let skilled = water_fog_for_eye(true, 3, false).expect("respiration keeps the branch");
+        assert!(
+            (skilled.density - 0.01).abs() < 1e-6,
+            "respiration III thins the density to 0.01; got {}",
+            skilled.density
+        );
+        for (channel, expected) in skilled.colour.iter().zip([0.62, 0.62, 0.8]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "respiration III lifts the colour to (0.62, 0.62, 0.8); got {:?}",
+                skilled.colour
+            );
+        }
+        // Water breathing, no respiration: the density pins at `0.01` and the
+        // lift folds to `0.6`.
+        let potion = water_fog_for_eye(true, 0, true).expect("the potion keeps the branch");
+        assert!(
+            (potion.density - 0.01).abs() < 1e-6,
+            "water breathing pins the density at 0.01; got {}",
+            potion.density
+        );
+        for (channel, expected) in potion.colour.iter().zip([0.62, 0.62, 0.8]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "water breathing lifts the colour to (0.62, 0.62, 0.8); got {:?}",
+                potion.colour
+            );
+        }
+        assert_eq!(
+            water_fog_for_eye(false, 0, false),
+            None,
+            "a dry eye takes no branch"
+        );
+        assert_eq!(
+            water_fog_for_eye(false, 3, true),
+            None,
+            "respiration and potion are dry-eyed no-ops"
+        );
     }
 }

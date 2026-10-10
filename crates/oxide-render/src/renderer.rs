@@ -1080,7 +1080,7 @@ mod tests {
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
     use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
-    use crate::fog::{FogParams, fog_colour};
+    use crate::fog::{FogMode, FogParams, fog_colour};
 
     /// A raised status at `fraction`, for the countdown's own tests.
     fn raised_boss(fraction: f32) -> BossStatus {
@@ -1230,6 +1230,8 @@ mod tests {
             start: 24.0,
             end: 32.0,
             far_plane: 32.0,
+            mode: FogMode::Linear,
+            density: 0.0,
         }));
         assert!((clear.r - f64::from(colour[0])).abs() < 1e-9);
         assert!((clear.g - f64::from(colour[1])).abs() < 1e-9);

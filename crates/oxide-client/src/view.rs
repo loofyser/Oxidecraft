@@ -46,6 +46,7 @@ use oxide_world::entity::EntityKind;
 
 use crate::CHAT_TEXT_CAP;
 use crate::ChatInput;
+use crate::assets::UNDERWATER_OVERLAY;
 use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
 use oxide_client::screens::container::{ContainerScreen, HOVER_COLOUR, title_rgba};
@@ -2083,6 +2084,37 @@ fn air_split(air: i16) -> (i32, i32) {
     let full = ceil_double_int((f64::from(air) - 2.0) * 10.0 / 300.0);
     let total = ceil_double_int(f64::from(air) * 10.0 / 300.0);
     (full, total - full)
+}
+
+/// The water overlay's alpha: the source tints the fullscreen quad by the player's
+/// brightness with a half alpha (`ItemRenderer.java:511`'s `color(f, f, f, 0.5F)`).
+const WATER_OVERLAY_ALPHA: f32 = 0.5;
+
+/// The first-person water overlay's draws: the port equivalent of
+/// `ItemRenderer.renderWaterOverlayTexture` (`ItemRenderer.java:450-505`) — the
+/// fullscreen `misc/underwater` quad, SRC_ALPHA-blended through the hud pass's own
+/// `TexturedRect` pipeline and tinted by the player's brightness — drawn when the eye
+/// is submerged, and nothing when it is dry. The frame prepends these draws to its hud
+/// list, which is the source's own order: the overlay draws between the hand pass and
+/// the GUI (`EntityRenderer.java:864-876`, `:1482-1486` for the hand, then the GUI's
+/// own pass), so the HUD bubbles land on top of it untouched.
+pub(crate) fn water_overlay_draws(
+    submerged: bool,
+    brightness: f32,
+    scaled: &ScaledResolution,
+) -> Vec<HudDraw> {
+    if !submerged {
+        return Vec::new();
+    }
+    vec![HudDraw::TexturedRect {
+        texture: HudTexture::Named(UNDERWATER_OVERLAY),
+        x: 0.0,
+        y: 0.0,
+        width: scaled.width as f32,
+        height: scaled.height as f32,
+        uv: [0.0, 0.0, 1.0, 1.0],
+        colour: [brightness, brightness, brightness, WATER_OVERLAY_ALPHA],
+    }]
 }
 
 /// The experience fill's width: the truncated `bar × 183`
@@ -10235,6 +10267,56 @@ mod tests {
                 .iter()
                 .any(|(_, _, uv)| (uv[1] - 18.0 / 256.0).abs() < 1e-9),
             "no bubbles out of water: {draws:?}"
+        );
+    }
+
+    /// The first-person water overlay (`ItemRenderer.renderWaterOverlayTexture`,
+    /// `ItemRenderer.java:450-505`): a submerged eye opens the frame's draw
+    /// list with the fullscreen `misc/underwater` quad, tinted by the
+    /// player's brightness with the source's half alpha — and a dry eye draws
+    /// nothing. The overlay leads because the source draws it between the
+    /// hand and the GUI, so the HUD bubbles land on top of it untouched.
+    #[test]
+    fn the_submerged_frame_opens_with_the_water_overlay() {
+        let scaled = chat_resolution();
+        let draws = water_overlay_draws(true, 1.0, &scaled);
+        assert_eq!(draws.len(), 1, "one fullscreen quad: {draws:?}");
+        match &draws[0] {
+            HudDraw::TexturedRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv,
+                colour,
+            } => {
+                assert_eq!(*texture, HudTexture::Named("misc/underwater"));
+                assert_eq!(
+                    (*x, *y, *width, *height),
+                    (0.0, 0.0, scaled.width as f32, scaled.height as f32),
+                    "the quad covers the whole GUI"
+                );
+                assert_eq!(*uv, [0.0, 0.0, 1.0, 1.0]);
+                assert_eq!(
+                    *colour,
+                    [1.0, 1.0, 1.0, 0.5],
+                    "the brightness tint at half alpha"
+                );
+            }
+            other => panic!("the overlay is a textured rect, not {other:?}"),
+        }
+        // Half brightness tints the quad down without touching the alpha.
+        let dim = water_overlay_draws(true, 0.5, &scaled);
+        match &dim[0] {
+            HudDraw::TexturedRect { colour, .. } => {
+                assert_eq!(*colour, [0.5, 0.5, 0.5, 0.5]);
+            }
+            other => panic!("the overlay is a textured rect, not {other:?}"),
+        }
+        assert!(
+            water_overlay_draws(false, 1.0, &scaled).is_empty(),
+            "a dry eye draws no overlay"
         );
     }
 

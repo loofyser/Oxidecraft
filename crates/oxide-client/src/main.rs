@@ -74,8 +74,9 @@ use oxide_render::camera::{
     interpolate_pose, render_eye,
 };
 use oxide_render::entity_pass::{SkinLookup, SkinTexId, TextureRegistry};
-use oxide_render::fog::{FogParams, fog_colour, linear_params};
+use oxide_render::fog::{FogMode, FogParams, fog_colour, linear_params, water_fog_for_eye};
 use oxide_render::fps::FpsCounter;
+use oxide_render::lightmap::BrightnessTable;
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use oxide_render::sky::SkyParams;
 use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
@@ -1335,6 +1336,13 @@ fn camera_pose(pose: Pose) -> CameraPose {
 /// [`linear_params`] of it. The render distance's chunk count also feeds the fog colour's sky
 /// mix and brightness factor (`EntityRenderer.java:1767-1768`, `:363-364`), so it travels
 /// alongside the far plane it derives rather than being recovered from it.
+///
+/// `submerged` is the eye's own water test — `ActiveRenderInfo.getBlockAtEntityViewpoint`'s
+/// material read as a bool — and answers the water branch ([`water_fog_for_eye`]) instead of
+/// the linear chain: EXP at its density over its colour, while the range still spans the far
+/// plane. `respiration` and `water_breathing` are that branch's own adjustments; the session
+/// feeds neither yet, so the frame reads them as still, unpotioned water (recorded).
+#[allow(clippy::too_many_arguments)]
 fn frame_params(
     time_of_day: i64,
     dimension: i8,
@@ -1343,23 +1351,35 @@ fn frame_params(
     render_distance: u8,
     values: SkyValues,
     cloud_ticks: i64,
+    submerged: bool,
+    respiration: u8,
+    water_breathing: bool,
 ) -> (FogParams, SkyParams) {
     let far_plane = f32::from(render_distance) * 16.0;
     let (start, end) = linear_params(far_plane);
-    let colour = fog_colour(
-        dimension,
-        time_of_day as f32,
-        eye_y,
-        void_y_factor,
-        values.colour,
-        render_distance,
-        values.light_level,
-    );
+    let (mode, density, colour) = match water_fog_for_eye(submerged, respiration, water_breathing) {
+        Some(water) => (water.mode, water.density, water.colour),
+        None => (
+            FogMode::Linear,
+            0.0,
+            fog_colour(
+                dimension,
+                time_of_day as f32,
+                eye_y,
+                void_y_factor,
+                values.colour,
+                render_distance,
+                values.light_level,
+            ),
+        ),
+    };
     let fog = FogParams {
         colour,
         start,
         end,
         far_plane,
+        mode,
+        density,
     };
     let sky = SkyParams {
         celestial_angle: values.celestial_angle,
@@ -1828,6 +1848,13 @@ impl ClientApp {
                     self.render_distance,
                     values,
                     self.player.tick as i64,
+                    // The eye's own water test: the tick's in-water flag, the same
+                    // submersion signal the air bubbles already gate on. The session
+                    // feeds no respiration level and no potion state yet, so the
+                    // branch reads still, unpotioned water (recorded).
+                    self.camera.in_water,
+                    0,
+                    false,
                 );
                 renderer.set_fog(fog);
                 renderer.set_sky(sky);
@@ -1902,7 +1929,24 @@ impl ClientApp {
         // hotbar's gates rest at their playing defaults and the mode at
         // survival (recorded; later tasks feed them) — but the open screen
         // rides the frame's own state now.
-        let mut hud_draws = self.view.hotbar_draws(
+        // Ahead of all of it, the first-person water overlay when the eye is
+        // submerged: the source draws it between the hand and the GUI
+        // (`ItemRenderer.renderWaterOverlayTexture`, `ItemRenderer.java:450-505`),
+        // so the bubbles land on top of it untouched. The tint is the player's
+        // brightness (`Entity.getBrightness`, `Entity.java:1256-1260`) read
+        // through the Overworld's table at the view block's light level — the
+        // same block the fog chain reads — and full light before the first sky
+        // event lands.
+        let water_brightness = self
+            .sky
+            .sky
+            .map(|values| {
+                BrightnessTable::overworld().levels()[usize::from(values.light_level).min(15)]
+            })
+            .unwrap_or(1.0);
+        let mut hud_draws =
+            view::water_overlay_draws(self.camera.in_water, water_brightness, &scaled);
+        hud_draws.extend(self.view.hotbar_draws(
             Instant::now(),
             &view::HotbarInput {
                 font: self.font.as_ref(),
@@ -1912,7 +1956,7 @@ impl ClientApp {
                 screen_open,
                 survival: true,
             },
-        );
+        ));
         hud_draws.extend(self.view.stat_rows_draws(&view::RowsInput {
             font: self.font.as_ref(),
             scaled,
@@ -4315,6 +4359,9 @@ impl ApplicationHandler for ClientApp {
             // The hud's icon sheet: the tab list's latency bars and heart
             // glyphs sample it under the name their draws carry.
             renderer.set_hud_texture(assets::HUD_ICONS, &assets.hud_icons);
+            // The underwater sheet: the first-person water overlay samples it
+            // under the name its draw carries.
+            renderer.set_hud_texture(assets::UNDERWATER_OVERLAY, &assets.underwater);
             // The GUI sheets: the widgets, the container family, the book sheets,
             // the SGA glyph sheet and the chest trio's icon sheets, under the keys
             // the screens and the chest item model name them.
@@ -4727,7 +4774,7 @@ mod tests {
     use super::{
         Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClickButton,
         ClientApp, DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute,
-        ItemTable, Key, MouseButton, PlayerState, ScriptDriver, ScriptGesture, ScriptKey,
+        FogMode, ItemTable, Key, MouseButton, PlayerState, ScriptDriver, ScriptGesture, ScriptKey,
         SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
         WorldOverlayState, aim_outline, apply_overlay_event, bound_mouse_button, camera_pose,
         chat_opener, chat_wheel_lines, clear_break_stage, command_text, cracks_in_view,
@@ -5002,7 +5049,18 @@ mod tests {
             moon_phase: 5,
             light_level: 15,
         };
-        let (_, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, player.tick as i64);
+        let (_, sky) = frame_params(
+            6000,
+            0,
+            64.0,
+            0.03125,
+            8,
+            values,
+            player.tick as i64,
+            false,
+            0,
+            false,
+        );
         assert_eq!(sky.cloud_offset_ticks, 41);
     }
 
@@ -5017,7 +5075,7 @@ mod tests {
             moon_phase: 5,
             light_level: 15,
         };
-        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7);
+        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false);
         // The Overworld's noon fog at the eye on the ground starts from the provider's base
         // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`) and takes the render
         // distance's sky mix: 0.186711... of the way to the frame's own sky colour
@@ -5037,6 +5095,43 @@ mod tests {
         assert_eq!(sky.cloud_offset_ticks, 7);
         assert_eq!(sky.cloud_colour, [1.0, 0.5, 0.25]);
         assert_eq!(sky.moon_phase, 5);
+        assert_eq!(fog.mode, FogMode::Linear);
+        assert_eq!(fog.density, 0.0, "the air branch carries no EXP density");
+    }
+
+    #[test]
+    fn the_submerged_eye_takes_the_water_fog_branch() {
+        let values = SkyValues {
+            celestial_angle: 0.25,
+            colour: [0.5, 0.6, 0.7],
+            sun_brightness: 0.9,
+            star_brightness: 0.1,
+            cloud_colour: [1.0, 0.5, 0.25],
+            moon_phase: 5,
+            light_level: 15,
+        };
+        // The same noon frame with the eye submerged: the linear sky chain
+        // drops out and the water branch answers — EXP at density 0.1 over
+        // (0.02, 0.02, 0.2) — while the range still spans the far plane.
+        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false);
+        assert_eq!(fog.mode, FogMode::Exp);
+        assert!(
+            (fog.density - 0.1).abs() < 1e-6,
+            "the submerged density is 0.1; got {}",
+            fog.density
+        );
+        for (channel, expected) in fog.colour.iter().zip([0.02, 0.02, 0.2]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the submerged colour is (0.02, 0.02, 0.2); got {:?}",
+                fog.colour
+            );
+        }
+        assert_eq!((fog.start, fog.end, fog.far_plane), (96.0, 128.0, 128.0));
+        assert_eq!(
+            sky.fog_colour, fog.colour,
+            "the clear follows the water colour"
+        );
     }
 
     #[test]

@@ -110,7 +110,7 @@ use glam::{Mat4, Vec3};
 use oxide_assets::texture::Texture;
 
 use crate::camera::{Camera, FIRST_PERSON_OFFSET};
-use crate::fog::FogParams;
+use crate::fog::{FogMode, FogParams};
 use crate::terrain_pass::DEPTH_FORMAT;
 
 /// One cell of the sky's grids, in blocks (`RenderGlobal.java:342`).
@@ -1559,6 +1559,8 @@ const NO_FOG: FogParams = FogParams {
     start: 0.0,
     end: 0.0,
     far_plane: 0.0,
+    mode: FogMode::Linear,
+    density: 0.0,
 };
 
 impl CloudPass {

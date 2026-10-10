@@ -1716,7 +1716,7 @@ impl EntityPass {
     /// Writes the frame's fog for the frames that follow.
     pub fn set_fog(&mut self, params: FogParams) {
         self.frame.fog_colour = [params.colour[0], params.colour[1], params.colour[2], 0.0];
-        self.frame.fog_params = [params.start, params.end, params.far_plane, 0.0];
+        self.frame.fog_params = [params.start, params.end, params.far_plane, params.density];
         self.write_frame();
     }
 
@@ -3018,7 +3018,7 @@ struct FrameUniform {
     eye: [f32; 4],
     /// The fog colour, the alpha unused.
     fog_colour: [f32; 4],
-    /// The fog's start, end and far plane.
+    /// The fog's start, end, far plane and EXP density.
     fog_params: [f32; 4],
     /// The first standard item light's world direction.
     light0: [f32; 4],
@@ -3297,8 +3297,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {{
 }}
 
 // The linear fog, the terrain pass's own rule: the factor is one at the fade's start and zero
-// at its end; a range that does not run forwards leaves the colour alone.
+// at its end; a range that does not run forwards leaves the colour alone. A positive density
+// draws the source's EXP falloff instead — `exp(-(density * distance)^2)`, the water arm's
+// `setupFog` density (`EntityRenderer.java:1985-1995`) — which reads neither the start nor
+// the end.
 fn fogged(colour: vec4<f32>, distance: f32) -> vec4<f32> {{
+    if (frame.fog_params.w > 0.0) {{
+        let d = frame.fog_params.w * distance;
+        let factor = exp(-d * d);
+        return vec4<f32>(mix(frame.fog_colour.rgb, colour.rgb, factor), colour.a);
+    }}
     let span = frame.fog_params.y - frame.fog_params.x;
     if (span <= 0.0) {{
         return colour;

@@ -67,7 +67,7 @@ use oxide_render::entity_pass::{
     BOSS_STATUS_TIME, BossStatus, DrawExtra, EntityDraw, EntityPass, EquipmentDraw, ModelRef,
     NametagDraw, SkinLookup, TextureRef, TextureRegistry,
 };
-use oxide_render::fog::{FogParams, fog_colour};
+use oxide_render::fog::{FogMode, FogParams, fog_colour, water_fog};
 use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
 use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
@@ -810,6 +810,8 @@ fn the_frames_fog_fades_the_terrain_towards_its_colour() {
         start: 2.0,
         end: 6.0,
         far_plane: 8.0,
+        mode: FogMode::Linear,
+        density: 0.0,
     };
     let (device, queue) = headless_device();
     let lit = shaded(WHITE, WHITE, light_cell(15, 15));
@@ -881,6 +883,8 @@ fn the_frames_fog_measures_the_radial_distance_from_the_eye() {
         start: 2.0,
         end: 6.0,
         far_plane: 8.0,
+        mode: FogMode::Linear,
+        density: 0.0,
     };
     let (device, queue) = headless_device();
     let mut mesh = ChunkMesh::default();
@@ -902,6 +906,59 @@ fn the_frames_fog_measures_the_radial_distance_from_the_eye() {
         SIZE / 2,
         [150, 159, 175],
         "the off-axis surface at the eye's radial distance",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_frames_water_fog_falls_off_exponentially() {
+    // The submerged eye's branch (`EntityRenderer.java:1985-1995` with `:1845-1847`):
+    // EXP at density 0.1 over (0.02, 0.02, 0.2), so a fragment's factor is
+    // `exp(-(0.1 * distance)^2)` with the eye's radial distance — the linear
+    // start and end below are degenerate on purpose, pinning that the EXP arm
+    // reads neither of them. At four blocks the factor is `exp(-0.16)` and the
+    // lit `(252, 252, 252)` surface reads `(215, 215, 222)`; at eight it is
+    // `exp(-0.64)` for `(135, 135, 157)`. A linear frame with this degenerate
+    // range would draw both unfogged.
+    let water = water_fog(0, false);
+    assert_eq!(water.mode, FogMode::Exp);
+    let fog = FogParams {
+        colour: water.colour,
+        start: 0.0,
+        end: 0.0,
+        far_plane: 8.0,
+        mode: water.mode,
+        density: water.density,
+    };
+    let (device, queue) = headless_device();
+    let lit = shaded(WHITE, WHITE, light_cell(15, 15));
+
+    let frame = |depth: f32| -> Vec<u8> {
+        let mut mesh = ChunkMesh::default();
+        push_quad(&mut mesh, Layer::Opaque, flat_quad(depth, 0.0), WHITE);
+        render_terrain_with_fog(
+            &device,
+            &queue,
+            &solid_atlas(4, [255, 255, 255, 255]),
+            &mesh,
+            Some(fog),
+        )
+    };
+
+    assert_eq!(lit, [252, 252, 252, 255], "the unfogged surface");
+    expect_pixel(
+        &frame(4.0),
+        SIZE / 2,
+        SIZE / 2,
+        [215, 215, 222],
+        "the surface four blocks out under EXP water fog",
+    );
+    expect_pixel(
+        &frame(8.0),
+        SIZE / 2,
+        SIZE / 2,
+        [135, 135, 157],
+        "the surface eight blocks out under EXP water fog",
     );
 }
 

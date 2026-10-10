@@ -195,6 +195,11 @@ pub const DEFAULT_SKIN_SLIM: &str = "entity/alex.png";
 /// latency bars and heart glyphs sample it under the name every draw of it carries.
 pub const HUD_ICONS: &str = "gui/icons";
 
+/// The underwater sheet's key, the extraction tree's `misc/underwater.png`: the
+/// first-person water overlay samples it under the name its draw carries — the
+/// source's `RES_UNDERWATER_OVERLAY` file (`ItemRenderer.java:33`).
+pub const UNDERWATER_OVERLAY: &str = "misc/underwater";
+
 /// The enchanted glint's sheet, the extraction tree's `misc/enchanted_item_glint.png`:
 /// the glint passes of an enchanted icon sample it, the source's own
 /// `RenderItem.RES_ITEM_GLINT` file (`RenderItem.java`:63).
@@ -330,6 +335,9 @@ pub struct ClientAssets {
     /// The hud's icon sheet, under [`HUD_ICONS`]: the tab list's latency bars and
     /// heart glyphs sample it.
     pub hud_icons: Texture,
+    /// The underwater sheet, under [`UNDERWATER_OVERLAY`]: the first-person water
+    /// overlay samples it.
+    pub underwater: Texture,
     /// The enchanted glint's sheet, under [`GLINT_SHEET`]: the glint passes of an
     /// enchanted icon sample it.
     pub glint_sheet: Texture,
@@ -428,6 +436,9 @@ impl ClientAssets {
         // The hud's icon sheet: the tab list's latency bars and heart glyphs sample
         // it under the name every draw of it carries.
         let hud_icons = texture(&textures, HUD_ICONS)?.clone();
+        // The underwater sheet: the first-person water overlay samples it under
+        // the name its draw carries.
+        let underwater = texture(&textures, UNDERWATER_OVERLAY)?.clone();
         // The enchanted glint's sheet: the glint passes of an enchanted icon sample
         // it, under the name the hud's glint registration carries.
         let glint_sheet = texture(&textures, GLINT_SHEET)?.clone();
@@ -484,6 +495,7 @@ impl ClientAssets {
             skin_wide,
             skin_slim,
             hud_icons,
+            underwater,
             glint_sheet,
             gui_sheets,
             item_meshes,

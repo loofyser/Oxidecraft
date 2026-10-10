@@ -78,7 +78,7 @@ use glam::{Mat4, Vec3};
 
 use crate::atlas_texture::AtlasTexture;
 use crate::camera::{Camera, FIRST_PERSON_OFFSET};
-use crate::fog::FogParams;
+use crate::fog::{FogMode, FogParams};
 use crate::frustum::{Aabb3, Frustum};
 use crate::lightmap::{BrightnessTable, lightmap_image};
 use crate::terrain::{ChunkMesh, Layer, LayerMesh, SectionKey, VERTEX_BYTES, vertex_bytes};
@@ -164,9 +164,17 @@ fn shade(uv: vec2<f32>, light: vec2<f32>, colour: vec4<f32>, distance: f32) -> v
 
 // The linear fog: the factor is one at the fade's start and zero at its end, and the colour is
 // mixed towards the fog colour as the source's fixed-function fog does — the alpha is left as
-// the fragment wrote it. The distance is the eye's radial one. A range that does not run
-// forwards leaves the colour alone: that is the state a frame with no fog set draws in.
+// the fragment wrote it. The distance is the eye's radial one. A positive density draws the
+// source's EXP falloff instead — `exp(-(density * distance)^2)`, `GL_EXP`'s own curve, the
+// water arm's `setupFog` density (`EntityRenderer.java:1985-1995`) — which reads neither the
+// start nor the end. A range that does not run forwards leaves the colour alone: that is the
+// state a frame with no fog set draws in.
 fn fogged(colour: vec4<f32>, distance: f32) -> vec4<f32> {{
+    if (fog.params.w > 0.0) {{
+        let d = fog.params.w * distance;
+        let factor = exp(-d * d);
+        return vec4<f32>(mix(fog.colour.rgb, colour.rgb, factor), colour.a);
+    }}
     let span = fog.params.y - fog.params.x;
     if (span <= 0.0) {{
         return colour;
@@ -253,6 +261,8 @@ const NO_FOG: FogParams = FogParams {
     start: 0.0,
     end: 0.0,
     far_plane: 0.0,
+    mode: FogMode::Linear,
+    density: 0.0,
 };
 
 /// The terrain vertex attributes: a position at offset 0, the uv at offset 12,
@@ -944,8 +954,9 @@ fn index_bytes(indices: &[u32]) -> Vec<u8> {
 
 /// Packs a frame's fog into the 32 little-endian bytes of the shader's two `vec4`s.
 ///
-/// The first `vec4` holds the colour, the second the fade's start, its end and the far plane,
-/// with the components the mix does not read left zero. WGSL lays a uniform struct's `vec4`
+/// The first `vec4` holds the colour, the second the fade's start, its end, the far plane
+/// and the EXP density — zero on every linear frame, so a linear frame's bytes are the
+/// bytes they always were. WGSL lays a uniform struct's `vec4`
 /// fields out in declaration order, so the bytes go out in that order field by field.
 fn fog_bytes(params: FogParams) -> [u8; FOG_BYTES] {
     let mut bytes = [0u8; FOG_BYTES];
@@ -957,7 +968,7 @@ fn fog_bytes(params: FogParams) -> [u8; FOG_BYTES] {
         params.start,
         params.end,
         params.far_plane,
-        0.0,
+        params.density,
     ];
     for (index, value) in values.iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
@@ -1047,7 +1058,7 @@ mod tests {
         shader_source, vertex_layout,
     };
     use crate::atlas_texture::{ATLAS_BINDING, SAMPLER_BINDING};
-    use crate::fog::FogParams;
+    use crate::fog::{FogMode, FogParams};
     use crate::lightmap::{BrightnessTable, lightmap_image};
     use crate::terrain::{Layer, VERTEX_BYTES};
 
@@ -1244,6 +1255,8 @@ mod tests {
             start: 96.0,
             end: 128.0,
             far_plane: 128.0,
+            mode: FogMode::Linear,
+            density: 0.0,
         };
         let bytes = fog_bytes(params);
         assert_eq!(bytes.len(), FOG_BYTES, "two `vec4<f32>`");
@@ -1251,7 +1264,7 @@ mod tests {
             0.25f32, 0.5, 0.75,
             0.0, // the first vec4: the colour, its unused fourth left zero
             96.0, 128.0, 128.0,
-            0.0, // the second: the fade's start and end, the far plane, zero
+            0.0, // the second: the fade's start and end, the far plane, the density
         ]
         .iter()
         .enumerate()
@@ -1259,6 +1272,14 @@ mod tests {
             let value = f32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
             assert_eq!(value, *expected, "component {index}");
         }
+        // A water frame's density rides the same word the linear frame leaves zero.
+        let wet = FogParams {
+            density: 0.1,
+            ..params
+        };
+        let wet_bytes = fog_bytes(wet);
+        let word = f32::from_le_bytes(wet_bytes[28..32].try_into().unwrap());
+        assert_eq!(word, 0.1, "the density word carries the EXP density");
     }
 
     #[test]
