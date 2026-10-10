@@ -8,6 +8,7 @@ vanilla exactly. Add an entry only after the project owner accepts the differenc
 | 1 | Java-specific options such as "Advanced OpenGL" keep their 1.8.9 layout but have no effect | The native renderer has no equivalent setting | None; the button stores its value and nothing changes |
 | 2 | Account tokens are stored in the OS keyring instead of a launcher profile file | Security | None |
 | 3 | The title screen shows "Oxidecraft 1.8.9" where vanilla shows "Minecraft 1.8.9" | Honest identification of the running program | Cosmetic; one line of text |
+| 4 | Book-and-quill editing is post-v1; opening an editable book shows its stored pages read-only | The signing view and the edit sends are not built yet | An editable book opens the same reader with no editing buttons, and closing it sends nothing |
 
 Notes:
 

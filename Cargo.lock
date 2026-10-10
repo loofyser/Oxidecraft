@@ -1594,6 +1594,7 @@ dependencies = [
  "oxide-proto-v47",
  "oxide-render",
  "oxide-world",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",

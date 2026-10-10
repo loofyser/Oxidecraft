@@ -36,10 +36,12 @@ use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
+use book::BookScreen;
 use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
 use sign::{SignMapEntry, SignScreen};
 
+pub mod book;
 pub mod container;
 pub mod creative;
 pub mod family_a;
@@ -59,11 +61,9 @@ pub enum ScreenState {
     /// A sign's editor at the block: the `SignEditorOpen` (0x36) path stands
     /// it on the session map's lines (Task 22 owns it).
     Sign(Box<SignScreen>),
-    /// A written book's screen (Task 23 owns it).
-    Book {
-        /// The book stack being read.
-        stack: MetadataItem,
-    },
+    /// A written book's screen: the reader over the held stack the
+    /// `MC|BOpen` path snapshotted (Task 23 owns it).
+    Book(Box<BookScreen>),
     /// The creative screen: the tab strip, the paged grid and the search
     /// field over the player's own inventory window (boxed like the
     /// container kinds).
@@ -82,7 +82,7 @@ impl ScreenState {
                 Some(screen.window_id())
             }
             ScreenState::Creative(_) => Some(0),
-            ScreenState::Sign(_) | ScreenState::Book { .. } => None,
+            ScreenState::Sign(_) | ScreenState::Book(_) => None,
         }
     }
 
@@ -318,10 +318,21 @@ impl Screens {
             .collect()
     }
 
-    /// Opens a written book's screen. The reader lands in Task 23; the
-    /// variant draws the generic frame until then (recorded).
+    /// The open book reader, when the current screen is one: the frame's
+    /// feed, the pointer and the book keys drive this.
+    pub fn book_mut(&mut self) -> Option<&mut BookScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Book(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Opens a written book's screen on the held stack: one `MC|BOpen`
+    /// stands the reader on page 0 over the stack the session snapshotted
+    /// (`NetHandlerPlayClient.handleCustomPayload:1855-1863` opens the
+    /// held stack). No guard exists: two opens stand two readers.
     pub fn open_book(&mut self, stack: MetadataItem) {
-        self.current = Some(ScreenState::Book { stack });
+        self.current = Some(ScreenState::Book(Box::new(BookScreen::new(stack))));
     }
 
     /// Opens the creative screen on the remembered tab: one
@@ -557,6 +568,32 @@ mod tests {
             Some(InputEvent::CloseWindow { window_id: 0 })
         );
         assert_eq!(cursor, None, "the close drops the cursor copy");
+    }
+
+    #[test]
+    fn two_book_opens_stand_two_readers_and_the_close_sends_nothing() {
+        // One `MC|BOpen` stands the reader on page 0 over the snapshotted
+        // stack; two opens stand two readers. The close sends nothing — the
+        // reader stands on no window, and the unsigned `MC|BEdit` send is
+        // the editor's, not the reader's (recorded).
+        let mut screens = Screens::default();
+        screens.open_book(stack(387).expect("the written stack"));
+        let reader = screens.book_mut().expect("the reader stands");
+        assert_eq!(reader.current_page(), 0);
+        assert_eq!(reader.stack().id, 387);
+        screens.open_book(stack(386).expect("the editable stack"));
+        assert_eq!(
+            screens
+                .book_mut()
+                .expect("the second reader stands")
+                .stack()
+                .id,
+            386
+        );
+        let mut cursor = stack(264);
+        assert_eq!(screens.close(&mut cursor), None, "no window, no send");
+        assert_eq!(cursor, None, "the close still drops the cursor copy");
+        assert!(screens.book_mut().is_none(), "the reader is gone");
     }
 
     #[test]

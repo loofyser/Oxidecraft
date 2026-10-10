@@ -342,11 +342,11 @@ pub struct ScreenDrawInput<'a> {
 /// `:245-248`, and a capped one counts yellow), and last the hovered slot's
 /// tooltip over the cursor.
 ///
-/// The declared-but-unimplemented variant (book) and the unknown
-/// kinds draw the generic frame — the background and the title alone —
-/// until their tasks land their tables (recorded). The inventory screen
-/// landed in Task 20, the creative screen in Task 21, the sign editor in
-/// Task 22.
+/// The declared-but-unimplemented unknown kinds draw the generic frame —
+/// the background and the title alone — until their tasks land their
+/// tables (recorded). The inventory screen landed in Task 20, the creative
+/// screen in Task 21, the sign editor in Task 22, the book reader in
+/// Task 23.
 pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDraw> {
     let Some(screen) = screens.current() else {
         return Vec::new();
@@ -387,7 +387,10 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             }
             return draws;
         }
-        ScreenState::Book { .. } => {
+        ScreenState::Book(reader) => {
+            if let Some(font) = input.font {
+                draws.extend(reader.draws(font, &input.scaled, input.mouse));
+            }
             return draws;
         }
     };
@@ -10615,6 +10618,57 @@ mod tests {
             blit,
             [0.0, 66.0 / 256.0, 200.0 / 256.0, 86.0 / 256.0],
             "the idle strip off the button: {draws:?}"
+        );
+    }
+
+    #[test]
+    fn the_book_reader_draws_its_sheet_indicator_and_done() {
+        use oxide_client::screens::book::BOOK_SHEET;
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_book(MetadataItem {
+            id: 386,
+            count: 1,
+            damage: 0,
+            nbt: None,
+        });
+        let scaled = chat_resolution();
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled,
+                mouse: Some((100.0, 50.0)),
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+            },
+        );
+        // The background halves, the 192x192 sheet, the indicator, the one
+        // empty page's line, the Done blit and its label: 2 + 1 + 1 + 1 + 2.
+        // No arrow draws: the single page shows neither.
+        assert_eq!(draws.len(), 7, "the reader's full chrome: {draws:?}");
+        let texts: Vec<&str> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Page 1 of 1"),
+            "the indicator draws: {texts:?}"
+        );
+        assert!(
+            draws.iter().any(|draw| matches!(
+                draw,
+                HudDraw::TexturedRect {
+                    texture: HudTexture::Named(BOOK_SHEET),
+                    ..
+                }
+            )),
+            "the reader blits the book sheet: {draws:?}"
         );
     }
 

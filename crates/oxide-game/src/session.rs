@@ -115,6 +115,16 @@ const BRAND_CHANNEL: &str = "MC|Brand";
 /// (`NetHandlerPlayClient.handleCustomPayload:1826-1845`).
 const TRADE_LIST_CHANNEL: &str = "MC|TrList";
 
+/// The written book's open channel: the server sends an empty `MC|BOpen`
+/// buffer (`EntityPlayerMP.displayGUIBook:840-848`) and the client opens
+/// its own held stack (`NetHandlerPlayClient.handleCustomPayload:1855-1863`).
+const BOOK_OPEN_CHANNEL: &str = "MC|BOpen";
+
+/// The written book's item id, the open guard's identity test
+/// (`== Items.written_book`, never `instanceof`, `EntityPlayerMP:844` and
+/// `NetHandlerPlayClient:1859`).
+const WRITTEN_BOOK_ID: i16 = 387;
+
 /// Clientbound Held Item Change's play id (0x09): one byte, the selected
 /// hotbar slot (`S09PacketHeldItemChange.readPacketData:24-27`).
 ///
@@ -718,6 +728,19 @@ pub enum ClientEvent {
     MerchantOffers {
         /// The offers, in wire order.
         offers: Vec<MerchantOffer>,
+    },
+    /// A written book's open, from the `MC|BOpen` custom payload.
+    ///
+    /// The payload itself is empty
+    /// (`EntityPlayerMP.displayGUIBook:840-848` sends an empty buffer); the
+    /// stack is the session's held-slot snapshot at receive time — the own
+    /// player's currently held item
+    /// (`NetHandlerPlayClient.handleCustomPayload:1855-1863` opens
+    /// `getCurrentEquippedItem`). A payload arriving with no held written
+    /// book opens nothing and reports nothing.
+    BookOpen {
+        /// The held stack, as the inventory held it at receive time.
+        stack: MetadataItem,
     },
 }
 
@@ -2270,6 +2293,31 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         offers: trade_list.offers,
                                     },
                                 );
+                            } else if message.channel == BOOK_OPEN_CHANNEL {
+                                // The open carries no stack — the buffer is
+                                // never read — so the held slot snapshots it:
+                                // the own player's currently held item, opened
+                                // only for the written-book identity
+                                // (`NetHandlerPlayClient.handleCustomPayload:1855-1863`).
+                                // Anything else is silently ignored.
+                                if let Some(stack) =
+                                    windows.player.inventory.get_current_item().clone()
+                                {
+                                    if stack.id == WRITTEN_BOOK_ID {
+                                        report(events, ClientEvent::BookOpen { stack });
+                                    } else {
+                                        debug!(
+                                            channel = %message.channel,
+                                            id = stack.id,
+                                            "a book open for a non-written held item is ignored"
+                                        );
+                                    }
+                                } else {
+                                    debug!(
+                                        channel = %message.channel,
+                                        "a book open with an empty held slot is ignored"
+                                    );
+                                }
                             } else {
                                 debug!(channel = %message.channel, bytes = message.data.len(), "plugin message");
                             }

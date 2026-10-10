@@ -58,7 +58,7 @@ use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
-use oxide_client::screens::{ScreenState, creative, inventory, sign::SignScreen};
+use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -2036,6 +2036,20 @@ impl ClientApp {
                 apply_step(window, session, capture, step);
                 None
             }
+            // The server's book open stands the reader on the held stack the
+            // session snapshotted: page 0 over its stored pages
+            // (`NetHandlerPlayClient.handleCustomPayload:1855-1863` opens
+            // the held written book). No guard exists — two opens stand two
+            // readers — and the pointer frees like any other window open
+            // (`displayGuiScreen(new GuiScreenBook(...))`).
+            ClientEvent::BookOpen { stack } => {
+                screens.open_book(stack.clone());
+                tab.open = false;
+                *cursor = None;
+                let step = capture.chat_open();
+                apply_step(window, session, capture, step);
+                None
+            }
             _ => None,
         }
     }
@@ -2137,8 +2151,16 @@ impl ClientApp {
         };
         // The sign editor owns its keys: E types `e` instead of closing —
         // the editor has no inventory-key close (`keyTyped`:94-121 owns
-        // every key but Escape, which the caller routes).
-        if code == KeyCode::KeyE && self.screens.sign_mut().is_none() {
+        // every key but Escape, which the caller routes). The book reader
+        // owns its keys the same way: it has no inventory-key close
+        // (`GuiScreenBook.keyTyped` edits unsigned pages or nothing, and
+        // Escape closes through the base rule) — and the read-only port
+        // swallows every other key with no page-turn binding (a port
+        // choice; Task 24 owns key routing).
+        if code == KeyCode::KeyE
+            && self.screens.sign_mut().is_none()
+            && self.screens.book_mut().is_none()
+        {
             self.close_screen(event_loop);
             return true;
         }
@@ -2432,6 +2454,37 @@ impl ClientApp {
                 });
                 if on_done {
                     self.close_screen(event_loop);
+                }
+            }
+            return;
+        }
+        // The book reader holds the click the same way: Done closes the
+        // reader (the close sends nothing), the arrows turn the page
+        // (`actionPerformed` ids 0/1/2), and any other click is the
+        // reader's to swallow.
+        if self.screens.book_mut().is_some() {
+            if state == ElementState::Pressed {
+                let click = self.cursor.and_then(|point| {
+                    self.renderer.as_ref().map(|renderer| {
+                        self.screens
+                            .book_mut()
+                            .map(|reader| reader.click_at(&renderer.scaled_resolution(), point))
+                            .unwrap_or(BookClick::None)
+                    })
+                });
+                match click {
+                    Some(BookClick::Done) => self.close_screen(event_loop),
+                    Some(BookClick::Next) => {
+                        if let Some(reader) = self.screens.book_mut() {
+                            reader.next_page();
+                        }
+                    }
+                    Some(BookClick::Prev) => {
+                        if let Some(reader) = self.screens.book_mut() {
+                            reader.prev_page();
+                        }
+                    }
+                    Some(BookClick::None) | None => {}
                 }
             }
             return;
@@ -2983,6 +3036,7 @@ fn apply_session_event(
         | ClientEvent::SignEditorOpen { .. }
         | ClientEvent::SignTextChanged { .. }
         | ClientEvent::SignTextCleared { .. }
+        | ClientEvent::BookOpen { .. }
         | ClientEvent::MerchantOffers { .. } => false,
         ClientEvent::Disconnected { reason } => {
             tracing::info!(%reason, "the session ended");

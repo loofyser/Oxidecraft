@@ -6933,6 +6933,49 @@ fn a_merchant_trade_list_publishes_its_offers() {
 }
 
 #[test]
+fn a_book_open_reports_the_held_written_book() {
+    let head = feed_head(&[
+        set_slot_frame(0, 36, Some((387, 1, 0))),
+        plugin_message_frame("MC|BOpen", &[]),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    let stack = events
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::BookOpen { stack } => Some(stack.clone()),
+            _ => None,
+        })
+        .expect("the open publishes the held stack");
+    assert_eq!(stack.id, 387, "the held written book: {events:?}");
+}
+
+#[test]
+fn a_book_open_without_a_held_written_book_reports_nothing() {
+    // An empty held slot opens nothing.
+    let head = feed_head(&[plugin_message_frame("MC|BOpen", &[])]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::BookOpen { .. })),
+        "no held book, no open: {events:?}"
+    );
+    // A held editable book (386) opens nothing either: the guard is the
+    // written-book identity (`NetHandlerPlayClient:1859`).
+    let head = feed_head(&[
+        set_slot_frame(0, 36, Some((386, 1, 0))),
+        plugin_message_frame("MC|BOpen", &[]),
+    ]);
+    let (events, _) = run_feed_session(head, Vec::new(), 0, 0);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::BookOpen { .. })),
+        "a held book-and-quill opens nothing: {events:?}"
+    );
+}
+
+#[test]
 fn a_sign_update_and_editor_open_publish_the_position() {
     let head = feed_head(&[
         update_sign_frame(4, 65, -9, ["first", "", "third", ""]),

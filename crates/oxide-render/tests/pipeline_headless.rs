@@ -11011,3 +11011,239 @@ fn t22_sign_wall_text_turns_with_its_facing() {
         "facing 2 (wide {faced_wide}) must outspread facing 4 (narrow {edged_wide}) by 8px"
     );
 }
+
+/// Task 23's reader case: a three-page unsigned book standing open on page 2 through
+/// the real screen pass — the sheet's panel pixels, both page-text rows' ink, the
+/// indicator's ink, the two arrow sprites and the Done button with its label.
+///
+/// The draws mirror `oxide-client/src/screens/book.rs`'s `draws` draw for draw — the
+/// render crate may not take the client edge (`scripts/check-graph.sh` forbids it) —
+/// with every literal cited below; the client's unit suite pins the real `draws`
+/// structurally. Positions are measured with the same width law the pass lays out
+/// with, so the pens agree by construction; the asserts pin the pixels. Both sheets
+/// are generated here; no asset pixel is embedded.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t23_book_reader_draws_sheet_text_and_indicator() {
+    const WIDE: f32 = 448.0;
+    const TALL: f32 = 240.0;
+    // The reader's own literals (`screens/book.rs`, from `GuiScreenBook.java`):
+    // the 192x192 frame at ((448-192)/2, 2), the text pen at (frame+36, 2+32),
+    // the indicator row at 2+16, the arrows at (frame+120/38, 2+154) 23x13 on
+    // rows 192/205, the Done 200x20 at (centre-100, 4+192) with its label 6
+    // below its top. The wrap mirrors `wrap_lines` at 116 with the lettered
+    // sheet's 2-pixel advances, so the 70-glyph run cuts mid-word at 58.
+    const T23_WRAP: i32 = 116;
+    const T23_ADVANCE: i32 = 2;
+    const FRAME_X: f32 = 128.0;
+    const TEXT_X: f32 = 164.0;
+    const TEXT_Y: f32 = 34.0;
+    const CUT: usize = (T23_WRAP / T23_ADVANCE) as usize;
+    let run = "A".repeat(70);
+    let line_one: String = run.chars().take(CUT).collect();
+    let line_two: String = run.chars().skip(CUT).collect();
+    // `Page 2 of 3` weighs 8 two-pixel glyphs plus 3 four-pixel spaces: 28.
+    // Right-aligned at (128 - 28 + 192 - 44, 18).
+    const INDICATOR: &str = "Page 2 of 3";
+    const INDICATOR_X: f32 = 248.0;
+    const INDICATOR_Y: f32 = 18.0;
+
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let depth = rows_depth(&device);
+    let font_sheet = t23_font_sheet();
+    let font = Font::load(&font_sheet, None).expect("the lettered sheet is a 16x16 grid");
+    let indicator_width = f64::from(string_width(&font, INDICATOR)) as f32;
+    assert_eq!(indicator_width, 28.0, "the pen math the test asserts");
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, WIDE, TALL);
+    screen.set_texture(&device, &queue, "gui/book", &t23_book_sheet());
+    screen.set_texture(&device, &queue, "gui/widgets", &t23_widgets_sheet());
+    screen
+        .set_font(&device, &queue, &font_sheet)
+        .expect("the lettered sheet is a 16x16 grid");
+    let black = [0.0, 0.0, 0.0, 1.0];
+    screen.set_draws(
+        &device,
+        &queue,
+        &[
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/book"),
+                x: FRAME_X,
+                y: 2.0,
+                width: 192.0,
+                height: 192.0,
+                uv: [0.0, 0.0, 192.0 / 256.0, 192.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            HudDraw::Text {
+                text: INDICATOR.to_string(),
+                x: INDICATOR_X,
+                y: INDICATOR_Y,
+                scale: 1.0,
+                colour: black,
+                shadow: false,
+                blend: true,
+            },
+            HudDraw::Text {
+                text: line_one,
+                x: TEXT_X,
+                y: TEXT_Y,
+                scale: 1.0,
+                colour: black,
+                shadow: false,
+                blend: true,
+            },
+            HudDraw::Text {
+                text: line_two,
+                x: TEXT_X,
+                y: TEXT_Y + 9.0,
+                scale: 1.0,
+                colour: black,
+                shadow: false,
+                blend: true,
+            },
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/book"),
+                x: FRAME_X + 120.0,
+                y: 156.0,
+                width: 23.0,
+                height: 13.0,
+                uv: [0.0, 192.0 / 256.0, 23.0 / 256.0, 205.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/book"),
+                x: FRAME_X + 38.0,
+                y: 156.0,
+                width: 23.0,
+                height: 13.0,
+                uv: [0.0, 205.0 / 256.0, 23.0 / 256.0, 218.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named("gui/widgets"),
+                x: 124.0,
+                y: 196.0,
+                width: 200.0,
+                height: 20.0,
+                uv: [0.0, 66.0 / 256.0, 200.0 / 256.0, 86.0 / 256.0],
+                colour: [1.0, 1.0, 1.0, 1.0],
+            },
+            HudDraw::Text {
+                text: "Done".to_string(),
+                x: 220.0,
+                y: 202.0,
+                scale: 1.0,
+                colour: [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0],
+                shadow: true,
+                blend: true,
+            },
+        ],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t23 book headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+    let pixels = read_rows_pixels(&device, &queue, &target);
+    // The sheet's own panel colour: the synthetic book sheet's base.
+    const PANEL: [u8; 3] = [150, 110, 70];
+    expect_rows(&pixels, 200, 100, PANEL, "the sheet's panel");
+    expect_rows(&pixels, 100, 100, SKY, "the sky past the frame");
+    // The wrapped text: the run's first glyph inks both rows, the 54th glyph
+    // still inks inside the 116 wrap, and the pixel past the cut stays panel.
+    expect_rows(&pixels, 164, 34, [0, 0, 0], "page 2's first glyph");
+    expect_rows(&pixels, 270, 34, [0, 0, 0], "a glyph inside the 116 wrap");
+    expect_rows(&pixels, 281, 34, PANEL, "the panel past the wrap cut");
+    expect_rows(&pixels, 164, 43, [0, 0, 0], "the wrapped second row");
+    // The indicator's first glyph inks at the right-aligned pen.
+    expect_rows(&pixels, 248, 18, [0, 0, 0], "the indicator's first glyph");
+    // The arrows sample their idle sprites: red next, blue previous.
+    expect_rows(&pixels, 249, 157, [255, 0, 0], "the next arrow's sprite");
+    expect_rows(
+        &pixels,
+        167,
+        157,
+        [0, 0, 255],
+        "the previous arrow's sprite",
+    );
+    // The Done button's white strip and its grey label.
+    expect_rows(&pixels, 200, 200, [255, 255, 255], "the Done strip");
+    expect_rows(&pixels, 220, 202, [224, 224, 224], "the Done label");
+}
+
+/// Task 23's lettered sheet: the page, indicator and label cells inked in their
+/// first column — `A P a g e 2 o f 3 D n` — so every one advances two font pixels
+/// and the pens the test measures match the pass's layout. Generated here; no asset
+/// pixel is embedded.
+fn t23_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for code in ['A', 'P', 'a', 'g', 'e', '2', 'o', 'f', '3', 'D', 'n'] {
+        let code = code as u32;
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// Task 23's synthetic book sheet: the panel base with the next arrow's idle sprite
+/// in red at `(0..23, 192..205)` and the previous arrow's in blue at
+/// `(0..23, 205..218)` — the source's own sprite cells. Generated here; no asset
+/// pixel is embedded.
+fn t23_book_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let offset = ((y * SIDE + x) * 4) as usize;
+            let colour = if x < 23 && (192..205).contains(&y) {
+                [255, 0, 0, 255]
+            } else if x < 23 && (205..218).contains(&y) {
+                [0, 0, 255, 255]
+            } else {
+                [150, 110, 70, 255]
+            };
+            rgba[offset..offset + 4].copy_from_slice(&colour);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// Task 23's synthetic widgets strip: the Done button's idle row white at v 66..86 —
+/// `GuiButton`'s enabled strip — over transparency. Generated here; no asset pixel is
+/// embedded.
+fn t23_widgets_sheet() -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 66..86u32 {
+        for x in 0..200u32 {
+            let offset = ((y * SIDE + x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
