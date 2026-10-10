@@ -803,23 +803,23 @@ feat: sign editing and the sign text draw
 
 ### Task 23: Book reading
 
-**Goal:** The server's book open shows the reader: the page, the page-turn buttons, the author line; an editable book opens read-only, recorded.
+**Goal:** The server's book open shows the reader: the page, the page-turn buttons; an editable book opens read-only, recorded. The reading view shows NO author/title line (the author lives in the signing view and the item tooltip; recorded).
 
 **Files:**
 - Create: `crates/oxide-client/src/screens/book.rs` — the reader.
-- Modify: `crates/oxide-client/src/screens/mod.rs` — the `MC\|BOpen` dispatch (the session surfaces the custom payload as an event — add `ClientEvent::BookOpen { stack: MetadataItem }` if the M4 payload path does not already carry it; the M4 custom-payload channel list ends at `MC\|TrList`/`MC\|Brand`/`MC\|BOpen` handling sites — derive which of those M4 wired and extend at its seam).
+- Modify: `crates/oxide-client/src/screens/mod.rs` — the `MC\|BOpen` dispatch (M4 wired ONLY `MC\|TrList` (decoded) + `MC\|Brand` (sent); BOpen appears nowhere — add the channel arm + `ClientEvent::BookOpen { stack: MetadataItem }` (the held-slot snapshot at receive time) at the M4 seam).
 - Test: `crates/oxide-client/src/screens/book.rs` — inline tests.
 - Test: `crates/oxide-render/tests/pipeline_headless.rs` — the reader case.
 
 **Interfaces:**
 - Produces (derive from `GuiScreenBook`, its reading path, and the item's NBT; pin each):
-  - The reader: the book background sheets (`gui/book`), the current page's wrapped text (the source's own wrap at the book's fixed width — derive `GuiScreenBook`'s text-width rule), the page indicator ("Page 1 of 3" — the sourced format), the author/title line? (derive which lines 1.8's reader shows beyond the page text), the Done and page-turn buttons (the source's own sprites from the book sheet), the page flip.
-  - Pages from the NBT (`pages` string list through Task 1's reader — a missing or malformed list draws one empty page, the source's own default; the cap: a hostile page count is bounded by the reader's cap, recorded).
+  - The reader: the book background sheets (`textures/gui/book.png`), the current page's wrapped text (the source's own wrap at the book's fixed width — derive `GuiScreenBook`'s text-width rule), the page indicator ("Page 1 of 3" — the sourced format), NO author/title line (the reading branch draws the page indicator + page text only; the author/title are the signing view's and the tooltip's — recorded), the Done button (a text `GuiButton`) and the page-turn arrows (the sheet's 23×13 two-state sprites at u 0/23, v 192/205), the page flip.
+  - Pages from the NBT (`pages` string list through Task 1's reader — the fallbacks SPLIT: unsigned + missing list → one empty page; signed + missing/malformed list → the dark-red `* Invalid book tag *` line (both total 1); there is NO source-side read cap — any page-count cap is a recorded PORT choice (the NBT/collection caps bound the wire)).
   - The editable book (Q4 yes): opens the same reader on its stored pages; no editing affordances; a `docs/DIVERGENCES.md` entry ("book-and-quill editing is post-v1; the open shows the stored pages read-only" — the file's own format, tooling-neutral).
-  - The open path: the custom payload for the own player's held book (the source's handler opens for the held stack; derive its guard and pin).
+  - The open path: the custom payload for the own player's held book (the payload is EMPTY — the client opens its OWN held stack, guarded by the written-book identity test; derive and pin).
 - Consumes: Task 1's reader; Task 16's framework; the shared text path.
 
-- [ ] **Step 1: Tests (RED).** The page count and index navigation (first/last bounds); the wrap rule literals at the book's width; a malformed `pages` tag's fallback; the page indicator's text. Run: `cargo test -p oxide-client book` — red.
+- [ ] **Step 1: Tests (RED).** The page count and index navigation (first/last bounds); the wrap rule literals at the book's width; the malformed/missing `pages` fallbacks (both branches: the unsigned empty page vs the signed invalid-tag line); the page indicator's text. Run: `cargo test -p oxide-client book` — red.
 - [ ] **Step 2: Implement the reader.** Run — green.
 - [ ] **Step 3: GPU case (RED).** A three-page book at page 2: the sheet's pixels, the wrapped text pixels, the indicator text. Run: `cargo test -p oxide-render --test pipeline_headless book -- --ignored` — red.
 - [ ] **Step 4: Implement the wiring and the DIVERGENCES entry.** Run — green.
