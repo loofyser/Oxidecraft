@@ -721,6 +721,29 @@ mod tests {
         );
     }
 
+    /// The item projection's own fractional input: at (1280,720)@3 the HUD
+    /// feeds the 1280/3 = 426.667 double, not the ceil 427
+    /// (`EntityRenderer.setupOverlayRendering`:1754) — so the fractional
+    /// right edge lands on clip x = 1 and an integer-fed projection reads
+    /// off by the x0.99922 compression.
+    #[test]
+    fn the_gui_projection_builds_on_the_fractional_scaled_width() {
+        let fractional = 1280.0f32 / 3.0;
+        let projection = gui_projection(fractional, 240.0);
+        assert_eq!(
+            projection.to_cols_array()[0],
+            2.0 / fractional,
+            "the x scale is 2/426.667, not 2/427"
+        );
+        let right = projection.project_point3(Vec3::new(fractional, 240.0, 0.0));
+        assert_eq!((right.x, right.y), (1.0, -1.0));
+        let integer_fed = gui_projection(427.0, 240.0);
+        assert!(
+            (integer_fed.to_cols_array()[0] - projection.to_cols_array()[0]).abs() > 0.0,
+            "the integer-fed projection must differ: 2/427 != 2/426.667"
+        );
+    }
+
     /// The glint's two passes: the periods, the turns, the eightfold uv scale, the
     /// colour and the uv transform itself, all pinned.
     #[test]

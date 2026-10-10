@@ -175,6 +175,17 @@ fn ceiling_div(value: u32, divisor: u32) -> u32 {
     (f64::from(value) / f64::from(divisor)).ceil() as u32
 }
 
+/// The fractional projection size for a display and scale factor: vanilla's
+/// `scaledWidthD`/`scaledHeightD` doubles (`ScaledResolution.java`:33-36) — the
+/// input the HUD/screen ortho builds on (`EntityRenderer.java`:1754), not the
+/// ceil ints the draw lists lay out in (`:37-40`).
+pub fn projection_size(display_width: u32, display_height: u32, scale_factor: u32) -> (f64, f64) {
+    (
+        f64::from(display_width) / f64::from(scale_factor),
+        f64::from(display_height) / f64::from(scale_factor),
+    )
+}
+
 /// The icon sheet the boss bar's slices sample: `gui/icons.png` (`Gui.java`:14's `icons`),
 /// under the key the client registers it by.
 const ICONS_TEXTURE: &str = "gui/icons";
@@ -1885,7 +1896,7 @@ mod tests {
     use super::{
         Batch, BatchState, BatchTexture, BuiltGeometry, HudDraw, HudTexture, ICONS_TEXTURE,
         ItemIcon, MIN_HEIGHT, MIN_WIDTH, SkinTexId, VERTEX_BYTES, WHITE_UV, boss_bar_draws, build,
-        scaled_resolution, vertex_layout,
+        ortho, projection_size, scaled_resolution, vertex_layout,
     };
     use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
     use crate::text::string_width;
@@ -2072,6 +2083,27 @@ mod tests {
         // 1000/3 does not divide: the width rounds up (`ScaledResolution.java`:37-40).
         let scaled = scaled_resolution(1000, 720, 0);
         assert_eq!((scaled.width, scaled.height), (334, 240));
+    }
+
+    #[test]
+    fn the_hud_ortho_builds_on_the_fractional_scaled_size() {
+        // (1280,720) at the auto scale: the factor is three and layout keeps
+        // the ceil 427x240 — but the ortho the six renderer sites upload must
+        // compose on the fractional 1280/3 = 426.667 x 240.0 doubles
+        // (`EntityRenderer.setupOverlayRendering`:1754), not the ceil ints:
+        // every HUD quad is otherwise compressed x0.99922 about screen-left.
+        let scaled = scaled_resolution(1280, 720, 0);
+        assert_eq!(
+            (scaled.width, scaled.height, scaled.scale_factor),
+            (427, 240, 3)
+        );
+        let (width, height) = projection_size(1280, 720, scaled.scale_factor);
+        assert_eq!((width, height), (1280.0 / 3.0, 240.0));
+        assert_eq!(
+            ortho(width as f32, height as f32),
+            ortho(1280.0 / 3.0, 240.0),
+            "the HUD ortho for (1280,720)@3 composes on 426.667x240.0"
+        );
     }
 
     #[test]

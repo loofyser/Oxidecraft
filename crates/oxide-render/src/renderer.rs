@@ -16,7 +16,7 @@ use crate::entity_pass::{BossStatus, EntityDraw, EntityPass, ItemMeshSource, Tex
 use crate::fog::FogParams;
 use crate::gui_item::ItemIconSource;
 use crate::held_item::{HeldItemFrame, HeldItemPass};
-use crate::hud::{HudDraw, HudPass, ScaledResolution, scaled_resolution};
+use crate::hud::{HudDraw, HudPass, ScaledResolution, projection_size, scaled_resolution};
 use crate::overlay::OverlayPass;
 use crate::sign_text::{SignTextEntry, SignTextPass};
 use crate::sky::{
@@ -328,9 +328,11 @@ impl Renderer {
         let dim = DimPass::new(&device, format);
         let mut hud = HudPass::new(&device, &queue, format);
         let scaled = scaled_resolution(config.width, config.height, 0);
-        hud.set_resolution(&queue, scaled.width as f32, scaled.height as f32);
+        let (projection_width, projection_height) =
+            projection_size(config.width, config.height, scaled.scale_factor);
+        hud.set_resolution(&queue, projection_width as f32, projection_height as f32);
         let mut screen = HudPass::new(&device, &queue, format);
-        screen.set_resolution(&queue, scaled.width as f32, scaled.height as f32);
+        screen.set_resolution(&queue, projection_width as f32, projection_height as f32);
         let held_item = HeldItemPass::new(&device, format);
         let depth = DepthTarget::new(&device, config.width, config.height);
         let entity_textures = TextureRegistry::new(&device, &queue);
@@ -399,10 +401,18 @@ impl Renderer {
                 self.config.height as f32,
             );
             let scaled = self.scaled_resolution();
-            self.hud
-                .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
-            self.screen
-                .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
+            let (projection_width, projection_height) =
+                projection_size(self.config.width, self.config.height, scaled.scale_factor);
+            self.hud.set_resolution(
+                &self.queue,
+                projection_width as f32,
+                projection_height as f32,
+            );
+            self.screen.set_resolution(
+                &self.queue,
+                projection_width as f32,
+                projection_height as f32,
+            );
         }
     }
 
@@ -460,10 +470,18 @@ impl Renderer {
     pub fn set_gui_scale(&mut self, gui_scale: u8) {
         self.gui_scale = gui_scale;
         let scaled = self.scaled_resolution();
-        self.hud
-            .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
-        self.screen
-            .set_resolution(&self.queue, scaled.width as f32, scaled.height as f32);
+        let (projection_width, projection_height) =
+            projection_size(self.config.width, self.config.height, scaled.scale_factor);
+        self.hud.set_resolution(
+            &self.queue,
+            projection_width as f32,
+            projection_height as f32,
+        );
+        self.screen.set_resolution(
+            &self.queue,
+            projection_width as f32,
+            projection_height as f32,
+        );
     }
 
     /// The scaled resolution the hud draws at, for the window's own draw assembly.
