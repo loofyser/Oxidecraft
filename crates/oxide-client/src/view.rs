@@ -2097,10 +2097,46 @@ fn water_overlay_uv_offset(yaw_degrees: f32, pitch_degrees: f32) -> (f32, f32) {
     (-yaw_degrees / 64.0, pitch_degrees / 64.0)
 }
 
-/// The unit fraction: the overlay tiles below wrap each quarter-slot into
-/// `[0, 1)` so the clamped hud sampler reads the source's repeat wrap.
-fn frac_unit(value: f32) -> f32 {
-    value - value.floor()
+/// One axis of a water overlay tile split at its integer crossing: the
+/// segment's UV edges and its screen fraction within the tile. A tile whose
+/// raw span straddles an integer cannot interpolate across the wrap under
+/// the clamped hud sampler, so it draws as the segments either side.
+type OverlaySplit = (f32, f32, f32, f32);
+
+/// Splits a falling full-unit span — raw U running from `edge` down to
+/// `edge - 1` left to right across the tile — at its integer crossing, with
+/// the live segment count. Each segment is `(u0, u1, x0, x1)`: the UV edges
+/// and the screen fractions. An edge already on an integer spans `1 → 0`
+/// whole (the `1.0` samples the edge texel the wrap would repeat, so the
+/// interpolation still sweeps the full texture); otherwise the span breaks
+/// into `phase → 0` and `1 → phase` at the crossing.
+fn split_falling_span(edge: f32) -> ([OverlaySplit; 2], usize) {
+    let phase = edge - edge.floor();
+    if phase == 0.0 {
+        ([(1.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, 0.0)], 1)
+    } else {
+        ([(phase, 0.0, 0.0, phase), (1.0, phase, phase, 1.0)], 2)
+    }
+}
+
+/// Splits a rising full-unit span — raw V running from `base` up to
+/// `base + 1` down the tile — at its integer crossing, with the live segment
+/// count. Each segment is `(v0, v1, y0, y1)`: the UV edges and the screen
+/// fractions. A base already on an integer spans `0 → 1` whole; otherwise
+/// the span breaks into `phase → 1` and `0 → phase` at the crossing.
+fn split_rising_span(base: f32) -> ([OverlaySplit; 2], usize) {
+    let phase = base - base.floor();
+    if phase == 0.0 {
+        ([(0.0, 1.0, 0.0, 1.0), (0.0, 0.0, 0.0, 0.0)], 1)
+    } else {
+        (
+            [
+                (phase, 1.0, 0.0, 1.0 - phase),
+                (0.0, phase, 1.0 - phase, 1.0),
+            ],
+            2,
+        )
+    }
 }
 
 /// The first-person water overlay's draws: the port equivalent of
@@ -2114,12 +2150,14 @@ fn frac_unit(value: f32) -> f32 {
 ///
 /// The source draws ONE quad whose UVs span `0..4` on both axes under its
 /// repeating sampler (`:523-527`, offsets `:521-522`), so the texture tiles
-/// 4×4 and slides with the look. The hud sampler clamps, so the port lays the
-/// same four repeats out as sixteen quads: tile `(col, row)` covers its
-/// sixteenth of the screen and samples its wrapped quarter-slot — U falling
-/// left to right (`:524` gives the left edge `4 + f7`, `:525` the right edge
-/// `0 + f7`) and V growing downward (`:524` gives the bottom `4 + f8`, `:527`
-/// the top-right `0 + f8`, and the GUI's V grows the same way down the screen).
+/// 4×4 and slides with the look. The hud sampler clamps, so the port lays
+/// the same four repeats out as sixteen screen tiles with each tile spanning
+/// one FULL unit of the texture — U falling left to right (`:524` gives the
+/// left edge `4 + f7`, `:525` the right edge `0 + f7`) and V growing
+/// downward (`:524` gives the bottom `4 + f8`, `:527` the top-right `0 + f8`,
+/// and the GUI's V grows the same way down the screen). A tile whose span
+/// straddles an integer draws as its split segments either side of the
+/// crossing, so no sub-rect interpolates across the wrap.
 pub(crate) fn water_overlay_draws(
     submerged: bool,
     brightness: f32,
@@ -2134,23 +2172,24 @@ pub(crate) fn water_overlay_draws(
     let width = scaled.width as f32;
     let height = scaled.height as f32;
     let colour = [brightness, brightness, brightness, WATER_OVERLAY_ALPHA];
-    let mut draws = Vec::with_capacity(16);
+    let mut draws = Vec::with_capacity(64);
     for row in 0..4 {
         for col in 0..4 {
-            draws.push(HudDraw::TexturedRect {
-                texture: HudTexture::Named(UNDERWATER_OVERLAY),
-                x: col as f32 * width / 4.0,
-                y: row as f32 * height / 4.0,
-                width: width / 4.0,
-                height: height / 4.0,
-                uv: [
-                    frac_unit(4.0 + u_offset - col as f32 / 4.0),
-                    frac_unit(v_offset + row as f32 / 4.0),
-                    frac_unit(4.0 + u_offset - (col + 1) as f32 / 4.0),
-                    frac_unit(v_offset + (row + 1) as f32 / 4.0),
-                ],
-                colour,
-            });
+            let (u_splits, u_count) = split_falling_span(4.0 + u_offset - col as f32);
+            let (v_splits, v_count) = split_rising_span(v_offset + row as f32);
+            for &(u0, u1, fx0, fx1) in &u_splits[..u_count] {
+                for &(v0, v1, fy0, fy1) in &v_splits[..v_count] {
+                    draws.push(HudDraw::TexturedRect {
+                        texture: HudTexture::Named(UNDERWATER_OVERLAY),
+                        x: (col as f32 + fx0) * width / 4.0,
+                        y: (row as f32 + fy0) * height / 4.0,
+                        width: (fx1 - fx0) * width / 4.0,
+                        height: (fy1 - fy0) * height / 4.0,
+                        uv: [u0, v0, u1, v1],
+                        colour,
+                    });
+                }
+            }
         }
     }
     draws
@@ -10310,20 +10349,30 @@ mod tests {
     }
 
     /// The first-person water overlay (`ItemRenderer.renderWaterOverlayTexture`,
-    /// `ItemRenderer.java:450-505`): a submerged eye opens the frame's draw
-    /// list with a 4×4 grid of `misc/underwater` tiles covering the screen,
-    /// each sampling its quarter-slot of the texture shifted by the look
-    /// offsets (`:521-527` — `-yaw/64`, `pitch/64`), tinted by the player's
-    /// brightness with the source's half alpha — and a dry eye draws
+    /// `ItemRenderer.java:505-532`): a submerged eye opens the frame's draw
+    /// list with `misc/underwater` tiles covering the screen, tinted by the
+    /// player's brightness with the source's half alpha — and a dry eye draws
     /// nothing. The overlay leads because the source draws it between the
     /// hand and the GUI, so the HUD bubbles land on top of it untouched.
+    ///
+    /// The source draws ONE quad whose UVs span `0..4` on both axes under its
+    /// repeating sampler (`:523-527`, offsets `:521-522`), so each
+    /// screen-sixteenth traverses a FULL unit of the texture — four repeats
+    /// per axis. The hud sampler clamps, so the port lays the same repeats
+    /// out as sixteen screen tiles with each tile spanning one full unit — U
+    /// falling left to right (`:524` gives the left edge `4 + f7`, `:525` the
+    /// right edge `0 + f7`) and V growing down the screen (`:524` gives the
+    /// bottom `4 + f8`, `:527` the top `0 + f8`, and the GUI's V grows the
+    /// same way down) — split at integer crossings so no sub-rect straddles
+    /// the wrap under the clamped sampler.
     #[test]
     fn the_submerged_frame_opens_with_the_water_overlay() {
         let scaled = chat_resolution();
-        // Level look: the offsets are zero, so the tiles sample the raw slots.
+        // Level look: every tile edge sits on an integer, so no tile splits —
+        // each of the sixteen tiles spans one full unit, U 1→0 falling and
+        // V 0→1 rising.
         let draws = water_overlay_draws(true, 1.0, 0.0, 0.0, &scaled);
         assert_eq!(draws.len(), 16, "the overlay tiles four by four: {draws:?}");
-        let mut slots = Vec::with_capacity(16);
         for (index, draw) in draws.iter().enumerate() {
             match draw {
                 HudDraw::TexturedRect {
@@ -10357,36 +10406,68 @@ mod tests {
                         ),
                         "tile {index} covers its sixteenth"
                     );
-                    slots.push(*uv);
+                    assert_eq!(
+                        *uv,
+                        [1.0, 0.0, 0.0, 1.0],
+                        "tile {index} spans one full unit: {draws:?}"
+                    );
                 }
                 other => panic!("the overlay is a textured rect, not {other:?}"),
             }
         }
-        // The sixteen UV rects tile the texture: no two tiles share a slot.
-        let mut sorted = slots;
-        sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN uvs"));
-        let before = sorted.len();
-        sorted.dedup();
-        assert_eq!(sorted.len(), before, "sixteen distinct slots: {sorted:?}");
-        assert_eq!(before, 16, "sixteen tiles: {sorted:?}");
-        // A sampled pair at level look: the top-left and bottom-right slots.
-        assert!(
-            sorted.contains(&[0.0, 0.0, 0.75, 0.25]),
-            "the top-left slot: {sorted:?}"
-        );
-        assert!(
-            sorted.contains(&[0.25, 0.75, 0.0, 0.0]),
-            "the bottom-right slot: {sorted:?}"
-        );
-        // The look offsets shift the slots: yaw 32 drops U by half a texture
-        // and pitch 32 lifts V by half a texture (`:521-522`).
+        // A turned look (yaw 32, pitch 32) shifts U by half a texture and V by
+        // half a texture (`:521-522`), so every tile straddles an integer on
+        // both axes and splits into four sub-rects — 64 draws — with the first
+        // tile's four corners pinning the wrap literally.
         let turned = water_overlay_draws(true, 1.0, 32.0, 32.0, &scaled);
+        assert_eq!(turned.len(), 64, "every tile splits four ways: {turned:?}");
+        let corners: Vec<(f32, f32, f32, f32, [f32; 4])> = turned
+            .iter()
+            .map(|draw| match draw {
+                HudDraw::TexturedRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                    uv,
+                    ..
+                } => (*x, *y, *width, *height, *uv),
+                other => panic!("the overlay is a textured rect, not {other:?}"),
+            })
+            .collect();
+        for expected in [
+            (0.0, 0.0, 53.375, 30.0, [0.5, 0.5, 0.0, 1.0]),
+            (0.0, 30.0, 53.375, 30.0, [0.5, 0.0, 0.0, 0.5]),
+            (53.375, 0.0, 53.375, 30.0, [1.0, 0.5, 0.5, 1.0]),
+            (53.375, 30.0, 53.375, 30.0, [1.0, 0.0, 0.5, 0.5]),
+        ] {
+            assert!(
+                corners.contains(&expected),
+                "the first tile wraps mid-quad: {corners:?}"
+            );
+        }
+        // No sub-rect straddles the wrap: every span is a positive fraction of
+        // the full unit.
+        for (_, _, _, _, uv) in &corners {
+            let (span_u, span_v) = ((uv[2] - uv[0]).abs(), (uv[3] - uv[1]).abs());
+            assert!(
+                span_u > 0.0 && span_u <= 1.0 && span_v > 0.0 && span_v <= 1.0,
+                "each sub-rect stays inside one unit: {corners:?}"
+            );
+        }
+        // The look offsets shift the phase: the first draw's UV differs
+        // between the two poses, both values asserted.
+        let first = match &draws[0] {
+            HudDraw::TexturedRect { uv, .. } => *uv,
+            other => panic!("the overlay is a textured rect, not {other:?}"),
+        };
         let turned_first = match &turned[0] {
             HudDraw::TexturedRect { uv, .. } => *uv,
             other => panic!("the overlay is a textured rect, not {other:?}"),
         };
-        assert_eq!(turned_first, [0.5, 0.5, 0.25, 0.75]);
-        assert_ne!(turned_first, [0.0, 0.0, 0.75, 0.25]);
+        assert_eq!(first, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(turned_first, [0.5, 0.5, 0.0, 1.0]);
+        assert_ne!(turned_first, first);
         // Half brightness tints every tile down without touching the alpha.
         let dim = water_overlay_draws(true, 0.5, 0.0, 0.0, &scaled);
         assert_eq!(dim.len(), 16);
