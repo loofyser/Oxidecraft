@@ -73,15 +73,23 @@ pub const SIGN_DONE_TEXT: &str = "Done";
 pub const SIGN_DONE_WIDTH: f32 = 200.0;
 /// The Done button's height (see [`SIGN_DONE_WIDTH`]).
 pub const SIGN_DONE_HEIGHT: f32 = 20.0;
-/// The Done label's colour: `GuiButton`'s enabled text, 14737632
-/// (0xE0E0E0).
+/// The Done label's idle colour: `GuiButton`'s enabled text, 14737632
+/// (0xE0E0E0) — answered while the pointer stands off the button.
 pub const SIGN_DONE_COLOUR: [f32; 4] = [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0];
+/// The Done label's hovered colour: `GuiButton`'s hovered text, 16777120
+/// (0xFFFFA0) — answered while the pointer stands on the button
+/// (`drawButton`'s hovered arm).
+pub const SIGN_DONE_COLOUR_HOVER: [f32; 4] = [1.0, 1.0, 160.0 / 255.0, 1.0];
 /// The widgets sheet the button blits: the extraction tree's
 /// `gui/widgets.png`, the sheet `GuiButton` draws from.
 pub const SIGN_WIDGETS_SHEET: &str = "gui/widgets";
-/// The button sprite's enabled row: `GuiButton`'s first strip at v 46,
-/// 20 tall.
-pub const SIGN_BUTTON_V: f32 = 46.0;
+/// The button sprite's idle row: `GuiButton` blits `46 + i * 20` with
+/// `i = 1` while the pointer stands off the button (`drawButton`) — the
+/// enabled strip at v 66, 20 tall.
+pub const SIGN_BUTTON_V_IDLE: f32 = 66.0;
+/// The button sprite's hovered row: `i = 2` while the pointer stands on
+/// the button — the hot strip at v 86, 20 tall.
+pub const SIGN_BUTTON_V_HOVER: f32 = 86.0;
 /// The first line's top edge in GUI pixels: the four rows run at the
 /// board's own 10-pixel pitch under the title (a port choice — the source
 /// lays the lines on the 3D board, which has no HUD-space position).
@@ -294,8 +302,17 @@ impl SignScreen {
     }
 
     /// The editor's draws: the title, the four lines over the board
-    /// backing, and the Done button with its label.
-    pub fn draws(&self, font: &Font, scaled: &ScaledResolution) -> Vec<HudDraw> {
+    /// backing, and the Done button with its label. The button's strip and
+    /// tint follow the free pointer's scaled position — the hot row and
+    /// tint on the button, the idle row and tint off it — like
+    /// `GuiButton.drawButton`'s hovered arm; `None` (before the first move)
+    /// draws idle.
+    pub fn draws(
+        &self,
+        font: &Font,
+        scaled: &ScaledResolution,
+        mouse: Option<(f32, f32)>,
+    ) -> Vec<HudDraw> {
         let width = scaled.width as f32;
         let mut draws = Vec::new();
         draws.push(HudDraw::Rect {
@@ -328,6 +345,17 @@ impl SignScreen {
             });
         }
         let (bx, by, bw, bh) = Self::done_bounds(scaled);
+        let hovered = mouse.is_some_and(|point| Self::done_pressed(scaled, point));
+        let button_v = if hovered {
+            SIGN_BUTTON_V_HOVER
+        } else {
+            SIGN_BUTTON_V_IDLE
+        };
+        let label_colour = if hovered {
+            SIGN_DONE_COLOUR_HOVER
+        } else {
+            SIGN_DONE_COLOUR
+        };
         draws.push(HudDraw::TexturedRect {
             texture: HudTexture::Named(SIGN_WIDGETS_SHEET),
             x: bx,
@@ -336,9 +364,9 @@ impl SignScreen {
             height: bh,
             uv: [
                 0.0,
-                SIGN_BUTTON_V / 256.0,
+                button_v / 256.0,
                 200.0 / 256.0,
-                (SIGN_BUTTON_V + 20.0) / 256.0,
+                (button_v + 20.0) / 256.0,
             ],
             colour: [1.0, 1.0, 1.0, 1.0],
         });
@@ -348,7 +376,7 @@ impl SignScreen {
             x: bx + bw / 2.0 - label_width as f32 / 2.0,
             y: by + (bh - 8.0) / 2.0,
             scale: 1.0,
-            colour: SIGN_DONE_COLOUR,
+            colour: label_colour,
             shadow: true,
             blend: true,
         });
@@ -610,6 +638,109 @@ mod tests {
     }
 
     #[test]
+    fn the_done_button_rests_on_the_idle_row() {
+        // `GuiButton.drawButton` blits `46 + i * 20` with `i = 1` idle — the
+        // enabled strip at v 66; v 46 is the disabled row the port
+        // hardcodes today.
+        let font = editor_font();
+        let scaled = oxide_render::hud::scaled_resolution(1280, 720, 0);
+        let screen = SignScreen::new(0, 64, 0, empty_lines());
+        let blit = screen
+            .draws(&font, &scaled, None)
+            .into_iter()
+            .find_map(|draw| match draw {
+                HudDraw::TexturedRect {
+                    texture: HudTexture::Named(SIGN_WIDGETS_SHEET),
+                    uv,
+                    ..
+                } => Some(uv),
+                _ => None,
+            })
+            .expect("the Done button blits the widgets sheet");
+        assert_eq!(
+            blit,
+            [0.0, 66.0 / 256.0, 200.0 / 256.0, 86.0 / 256.0],
+            "the idle strip"
+        );
+    }
+
+    #[test]
+    fn the_done_button_stays_idle_while_the_pointer_stands_off_it() {
+        // Off the button — and before the first move — the strip stays v 66
+        // and the label 14737632 (0xE0E0E0).
+        let font = editor_font();
+        let scaled = oxide_render::hud::scaled_resolution(1280, 720, 0);
+        let screen = SignScreen::new(0, 64, 0, empty_lines());
+        for mouse in [None, Some((100.0, 50.0))] {
+            let draws = screen.draws(&font, &scaled, mouse);
+            let blit = draws
+                .iter()
+                .find_map(|draw| match draw {
+                    HudDraw::TexturedRect {
+                        texture: HudTexture::Named(SIGN_WIDGETS_SHEET),
+                        uv,
+                        ..
+                    } => Some(*uv),
+                    _ => None,
+                })
+                .expect("the Done button blits the widgets sheet");
+            assert_eq!(
+                blit,
+                [0.0, 66.0 / 256.0, 200.0 / 256.0, 86.0 / 256.0],
+                "the idle strip for {mouse:?}"
+            );
+            let label = draws
+                .iter()
+                .find_map(|draw| match draw {
+                    HudDraw::Text { text, colour, .. } if text == SIGN_DONE_TEXT => Some(*colour),
+                    _ => None,
+                })
+                .expect("the Done label draws");
+            assert_eq!(
+                label,
+                [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0],
+                "the idle tint for {mouse:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hovered_done_button_takes_the_hot_row_and_tint() {
+        // `i = 2` hovered: the hot strip at v 86, the label 16777120
+        // (0xFFFFA0). At 427x240 the Done rect is (113.5, 180, 200, 20),
+        // so (213.5, 190.0) stands on it.
+        let font = editor_font();
+        let scaled = oxide_render::hud::scaled_resolution(1280, 720, 0);
+        let screen = SignScreen::new(0, 64, 0, empty_lines());
+        assert!(SignScreen::done_pressed(&scaled, (213.5, 190.0)));
+        let draws = screen.draws(&font, &scaled, Some((213.5, 190.0)));
+        let blit = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::TexturedRect {
+                    texture: HudTexture::Named(SIGN_WIDGETS_SHEET),
+                    uv,
+                    ..
+                } => Some(*uv),
+                _ => None,
+            })
+            .expect("the Done button blits the widgets sheet");
+        assert_eq!(
+            blit,
+            [0.0, 86.0 / 256.0, 200.0 / 256.0, 106.0 / 256.0],
+            "the hot strip"
+        );
+        let label = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text { text, colour, .. } if text == SIGN_DONE_TEXT => Some(*colour),
+                _ => None,
+            })
+            .expect("the Done label draws");
+        assert_eq!(label, [1.0, 1.0, 160.0 / 255.0, 1.0], "the hovered tint");
+    }
+
+    #[test]
     fn the_draws_carry_the_title_lines_and_done_button() {
         // The title, the four display lines over the backing, the button
         // blit and its label: ten draws over the frame's own background.
@@ -626,7 +757,7 @@ mod tests {
                 String::new(),
             ],
         );
-        let draws = screen.draws(&font, &scaled);
+        let draws = screen.draws(&font, &scaled, None);
         let texts: Vec<&str> = draws
             .iter()
             .filter_map(|draw| match draw {

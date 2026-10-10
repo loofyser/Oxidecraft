@@ -10824,6 +10824,146 @@ fn t22_sign_floor_text_turns_with_its_rotation() {
     );
 }
 
+/// One opaque stone cube spanning `y0..y0 + 1` in the terrain mesh: the
+/// integrated client's terrain for one cell — the ground under the sign, or
+/// the sign cell itself as the mesher fills it today with the fallback cube
+/// (a full opaque cube with depth write; the stand-in atlas is one colour,
+/// so the sprite is immaterial). The faces reuse `stone_block_mesh`'s own
+/// corner table and brightness values, shifted up by `y0`.
+fn t22_push_stone_cube(mesh: &mut ChunkMesh, y0: f32) {
+    const FACES: [([[f32; 3]; 4], f32); 6] = [
+        (
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ],
+            1.0,
+        ),
+        (
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+            0.5,
+        ),
+        (
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            0.8,
+        ),
+        (
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [0.0, 1.0, 1.0],
+            ],
+            0.8,
+        ),
+        (
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+            ],
+            0.6,
+        ),
+        (
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            0.6,
+        ),
+    ];
+    for (corners, brightness) in FACES {
+        let lifted = corners.map(|[x, y, z]| [x, y + y0, z]);
+        push_face(mesh, lifted, brightness, STONE_COLOUR);
+    }
+}
+
+/// Task 22's integrated-client case: the standing sign's text over the
+/// terrain layer in the client's own layer order (the solid terrain layer
+/// with depth write before `SignText`, `renderer.rs:scene_draws`).
+///
+/// Two terrains go through the same frame: the ground cube alone — what the
+/// fixed mesher emits, the sign cell empty — and the ground cube plus a full
+/// opaque cube at the sign's own cell, the fallback the mesher used to emit
+/// (a stone stand-in: the atlas is one colour, so the sprite is immaterial).
+/// The text must ink pixels the bare terrain lacks over the fixed terrain
+/// (it survives), while over the cubed cell it inks nothing new (the text
+/// quads sit inside the cube and fail the LessEqual test — the burial F1
+/// removes). The control arm keeps the survival pin honest: a vacuous pass
+/// would ink both frames alike.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t22_sign_text_survives_over_the_terrain_layer() {
+    use oxide_render::sign_text::{SignTextEntry, SignTextPass};
+
+    let entries = [SignTextEntry {
+        x: 0,
+        y: 1,
+        z: 0,
+        block_id: 63,
+        metadata: 0,
+        lines: ["|".repeat(20), String::new(), String::new(), String::new()],
+    }];
+    let frame = |cells: &ChunkMesh, texts: &[SignTextEntry]| {
+        let (device, queue) = headless_device();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let target = create_target(&device, format);
+        let depth = create_depth(&device);
+        let mut terrain = TerrainPass::new(&device, &queue, format);
+        terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+        terrain.set_camera(&queue, t22_camera(), 1.0);
+        terrain.upload(&device, &queue, (0, 0, 0), cells);
+        let mut text = SignTextPass::new(&device, format);
+        text.set_camera(&queue, t22_camera(), 1.0);
+        text.set_font(&device, &queue, &overlay_font_sheet())
+            .expect("the synthetic sheet is a 16x16 grid");
+        text.upload(&device, &queue, texts);
+        render_scene(&device, &queue, &target, &depth, |pass| {
+            terrain.draw_solid(pass);
+            text.draw(pass);
+        })
+    };
+    let fresh_bytes = |cells: &ChunkMesh| {
+        let bare = frame(cells, &[]);
+        let with = frame(cells, &entries);
+        with.iter()
+            .zip(bare.iter())
+            .filter(|(pixel, plain)| pixel != plain)
+            .count()
+    };
+    // The fixed terrain: the ground cube alone, the sign cell empty.
+    let mut fixed = ChunkMesh::default();
+    t22_push_stone_cube(&mut fixed, 0.0);
+    // The old terrain: the fallback cube fills the sign's cell too.
+    let mut cubed = ChunkMesh::default();
+    t22_push_stone_cube(&mut cubed, 0.0);
+    t22_push_stone_cube(&mut cubed, 1.0);
+    let buried = fresh_bytes(&cubed);
+    assert_eq!(
+        buried, 0,
+        "inside the fallback cube the text inks nothing new"
+    );
+    let survived = fresh_bytes(&fixed);
+    assert!(
+        survived > 40,
+        "over the fixed terrain the text survives, {survived} fresh bytes"
+    );
+}
 /// Task 22's wall-sign case: a wall sign with facing 2 shows its face (and its text)
 /// to this camera, while facing 4 turns the board edge-on and the ink collapses to a
 /// sliver.

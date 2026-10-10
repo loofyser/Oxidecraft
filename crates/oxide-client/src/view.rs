@@ -378,10 +378,12 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         }
         // The sign editor draws its own title, lines and Done button over
         // the background (Task 22); without a measured font the background
-        // alone stands, like the titles that stay out.
+        // alone stands, like the titles that stay out. The free pointer
+        // rides along so the Done button takes its hovered strip and tint
+        // on the button (`GuiButton.drawButton`'s hovered arm).
         ScreenState::Sign(editor) => {
             if let Some(font) = input.font {
-                draws.extend(editor.draws(font, &input.scaled));
+                draws.extend(editor.draws(font, &input.scaled, input.mouse));
             }
             return draws;
         }
@@ -10595,6 +10597,24 @@ mod tests {
                 }
             )),
             "the Done button blits the widgets sheet: {draws:?}"
+        );
+        // The pointer at (100.0, 50.0) stands off the Done button, so the
+        // threaded pointer leaves the idle strip (v 66) on the blit.
+        let blit = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::TexturedRect {
+                    texture: HudTexture::Named(SIGN_WIDGETS_SHEET),
+                    uv,
+                    ..
+                } => Some(*uv),
+                _ => None,
+            })
+            .expect("the Done blit");
+        assert_eq!(
+            blit,
+            [0.0, 66.0 / 256.0, 200.0 / 256.0, 86.0 / 256.0],
+            "the idle strip off the button: {draws:?}"
         );
     }
 

@@ -37,6 +37,8 @@ const STAIRS: u16 = 67;
 const GLOWSTONE: u16 = 89;
 const SNOW_LAYER: u16 = 78;
 const BARRIER: u16 = 166;
+const SIGN_STANDING: u16 = 63;
+const SIGN_WALL: u16 = 68;
 
 /// One state mapper arm's expectation: the block id, the metadata value, and
 /// the literal `(file, key)` the mapper must answer — `None` for the six ids
@@ -1539,6 +1541,46 @@ fn a_covered_barrier_draws_no_geometry_at_all() {
 
     // A column of barrier cells alone meshes to no section at all.
     let world = daylight(&[(0, 64, 0, state(BARRIER, 0)), (1, 64, 1, state(BARRIER, 0))]);
+    for (section, mesh) in meshes(&world, &ctx) {
+        assert!(mesh.is_none(), "section {section} stays empty");
+    }
+}
+
+#[test]
+fn sign_cells_mesh_no_fallback_cube_until_the_board_task_lands() {
+    let (models, atlas) = loaded();
+    let maps = white_maps();
+    let ctx = context(&models, &atlas, &maps, SmoothLighting::Off);
+
+    // The standing (63) and wall (68) signs have no behaviour row and no
+    // 1.8.9 blockstate (`Block.java`:1321,1326), so the model lookup misses
+    // — but the fallback cube would bury the board-fixed text the sign pass
+    // draws inside the cell (LessEqual against the cube's own written
+    // depth). The barrier's `Invisible` precedent answers this: the mesher
+    // emits nothing for either cell until a board-meshing task lands, and
+    // the text floats (recorded). A stone beside them keeps every face:
+    // the signs hide nothing.
+    let world = daylight(&[
+        (0, 64, 0, state(STONE, 0)),
+        (4, 64, 0, state(SIGN_STANDING, 0)),
+        (8, 64, 0, state(SIGN_WALL, 0)),
+    ]);
+    let mesh = mesh_of(&world, &ctx);
+    assert_eq!(mesh.vertex_count(), 24, "the stone's six faces alone");
+    for vertex in vertices(&mesh) {
+        assert!(
+            vertex.position[0] < 4.0,
+            "no vertex in either sign's cell: {:?}",
+            vertex.position
+        );
+    }
+
+    // Sign cells alone mesh to no section at all — above all, no opaque
+    // fallback quads.
+    let world = daylight(&[
+        (0, 64, 0, state(SIGN_STANDING, 0)),
+        (1, 64, 1, state(SIGN_WALL, 0)),
+    ]);
     for (section, mesh) in meshes(&world, &ctx) {
         assert!(mesh.is_none(), "section {section} stays empty");
     }

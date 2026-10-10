@@ -350,11 +350,16 @@ impl SignTextPass {
     ///
     /// The pipeline depth-tests (`LessEqual`, the terrain's own comparison)
     /// but writes no depth — the source's `depthMask(false)` — and culls
-    /// nothing: a face turned from the camera still shows its text through
-    /// the board it stands on, because the port meshes no board to hide it
-    /// behind (recorded). The fragment writes the sampled sheet straight
-    /// through and discards at or below the 0.1 alpha test, the overlay's
-    /// own rule.
+    /// nothing: the source draws the text with face culling off, so a quad
+    /// whose winding faces away still draws. What hides text behind solid
+    /// geometry is the depth test against the terrain, which draws first
+    /// with depth write (`renderer.rs:scene_draws`) — an opaque cube at the
+    /// sign's cell buries the text inside it. The mesher emits no such cube
+    /// for 63/68 (the fallback is skipped, the barrier's `Invisible`
+    /// precedent, until a board-meshing task lands), so the text floats
+    /// with no board (recorded). The fragment writes the sampled sheet
+    /// straight through and discards at or below the 0.1 alpha test, the
+    /// overlay's own rule.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide sign text shader"),
