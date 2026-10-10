@@ -146,8 +146,8 @@ pub const TRACK_H: i32 = 112;
 pub const THUMB_W: i32 = 12;
 /// See [`THUMB_W`].
 pub const THUMB_H: i32 = 15;
-/// The thumb's left: centred in the 14-wide track.
-pub const THUMB_DX: i32 = TRACK_DX + 1;
+/// The thumb's left (`guiLeft + 175`, `:696-704` — the track's own left).
+pub const THUMB_DX: i32 = TRACK_DX;
 /// The thumb travel: `(k − j − 17)` = 112 − 17 = 95 (`:696-704`).
 pub const THUMB_SPAN: i32 = TRACK_H - 17;
 /// The thumb's sheet x while the list scrolls (`needsScrollBars`, 232).
@@ -186,10 +186,10 @@ pub const BIN_DY: i32 = HOTBAR_TOP;
 /// The delete slot's side (a plain 16×16 slot).
 pub const BIN_SIZE: i32 = 16;
 /// The bin shift-clear's wire span: the source loops `0..size` over the
-/// 46-slot player container list, and the server honours only 1–44 — wire
-/// slots 0 and 45 are silent no-ops (`:117-123`, `:1074-1132`). The port
-/// sends exactly what the source sends.
-pub const BIN_CLEAR_WIRES: i16 = 46;
+/// 45-slot player container (1+4+4+27+9), and the server honours only
+/// 1–44 — wire slot 0 is a silent no-op (`:117-123`, `:1074-1132`). The
+/// port sends exactly what the source sends.
+pub const BIN_CLEAR_WIRES: i16 = 45;
 
 /// The inventory tab's armour block: 2×2 at (`9 + (j−5)/2·54`,
 /// `6 + (j−5)%2·27`) for j = 5..8 (`:481-509`).
@@ -344,7 +344,7 @@ pub fn drag_scroll(pointer_y: f32) -> f32 {
 }
 
 /// The thumb's top-left, panel-relative, or `None` on the inventory tab:
-/// `(176, 18 + 95·scroll)`, 12×15 (`:696-704`).
+/// `(175, 18 + 95·scroll)`, 12×15 (`:696-704`).
 pub fn thumb_rect(scroll: f32, index: u8) -> Option<(i32, i32)> {
     if tab_hides_chrome(index) {
         return None;
@@ -1991,14 +1991,16 @@ mod tests {
     }
 
     #[test]
-    fn the_bin_shift_clear_sends_forty_six_nulls() {
-        // The source loops 0..size over the 46-slot player list with no
-        // local clear; wire slots 0/45 are server no-ops (`:117-123`).
+    fn the_bin_shift_clear_sends_forty_five_nulls() {
+        // The source loops 0..size over the 45-slot player container
+        // (1+4+4+27+9) with no local clear; wire slot 0 is a server
+        // silent no-op (`:117-123`, `:1074-1132`).
+        assert_eq!(BIN_CLEAR_WIRES, 45);
         for tab in [0, INVENTORY_TAB] {
             let mut screen = screen_on(tab);
             screen.set_player_for_test(9, stack(264, 5));
             let events = screen.press_at_for_test(Hover::Bin, ClickButton::Left, true);
-            assert_eq!(events.len(), BIN_CLEAR_WIRES as usize);
+            assert_eq!(events.len(), 45);
             for (wire, event) in events.iter().enumerate() {
                 match event {
                     InputEvent::CreativeAction { slot, item } => {
@@ -2105,11 +2107,12 @@ mod tests {
 
     #[test]
     fn the_thumb_parks_by_scroll_with_the_source_slices() {
-        // 12×15 at (176, 18 + 95·scroll); sheet x 232 scrolling, 244 idle.
-        assert_eq!(thumb_rect(0.0, 0), Some((THUMB_DX, TRACK_DY)));
-        assert_eq!(thumb_rect(1.0, 0), Some((THUMB_DX, TRACK_DY + THUMB_SPAN)));
+        // 12×15 at (175, 18 + 95·scroll); sheet x 232 scrolling, 244 idle.
+        assert_eq!(THUMB_DX, 175);
+        assert_eq!(thumb_rect(0.0, 0), Some((175, TRACK_DY)));
+        assert_eq!(thumb_rect(1.0, 0), Some((175, TRACK_DY + THUMB_SPAN)));
         assert_eq!((THUMB_W, THUMB_H), (12, 15));
-        assert_eq!(THUMB_DX, TRACK_DX + 1);
+        assert_eq!(THUMB_DX, TRACK_DX);
         assert_eq!(thumb_rect(0.0, INVENTORY_TAB), None);
         assert_eq!(thumb_sheet_x(600, 0), THUMB_SHEET_X);
         assert_eq!(thumb_sheet_x(600, 0), 232);

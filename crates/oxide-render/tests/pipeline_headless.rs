@@ -10513,32 +10513,40 @@ fn t21_creative_draws_strip_grid_thumb_search_and_bin() {
         (232, 0, 12, 15, [255, 255, 255, 255]),
     ]);
     let mut draws = Vec::new();
-    // The strip: every unselected tab first — the top row at y -32, the
-    // bottom at +136, the sheet column 28 wide with the odd row at v 32 —
-    // mirroring `tab_sprite`/`tab_uv`.
+    // The strip: every unselected tab first — mirroring `tab_sprite` (the
+    // col-5 nudge to 167, the +col step, the -28/+132 sprite rows) and
+    // `tab_uv` (u = col·28, v = 0/64 by row, +32 when selected).
     for index in 0..12 {
         if index == SEARCH {
             continue;
         }
-        let col = (index % 6) * 28;
-        let (dy, v) = if index < 6 {
-            (-32, (index % 2) * 32)
+        let col = index % 6;
+        let x = if col == 5 {
+            167
+        } else if col > 0 {
+            28 * col + col
         } else {
-            (136, (index % 2) * 32)
+            0
         };
-        draws.push(t18_blit(STRIP, GX, GY, [col, dy, 28, 32, col, v]));
+        let (dy, v) = if index < 6 { (-28, 0) } else { (132, 64) };
+        draws.push(t18_blit(STRIP, GX, GY, [x, dy, 28, 32, 28 * col, v]));
     }
     // The panel second, the selected tab last.
     draws.push(t18_blit(PANEL, GX, GY, [0, 0, 195, 136, 0, 0]));
-    draws.push(t18_blit(STRIP, GX, GY, [140, -32, 28, 32, 140, 32]));
+    draws.push(t18_blit(STRIP, GX, GY, [167, -28, 28, 32, 140, 32]));
     // The twelve tab icons over the strip, then the page cells with the
     // hotbar row — checker items throughout.
     for index in 0..12 {
-        let iy = if index < 6 { -23 } else { 145 };
-        draws.push(t18_slot_item(
-            GX + ((index % 6) * 28 + 5) as f32,
-            GY + iy as f32,
-        ));
+        let col = index % 6;
+        let x = if col == 5 {
+            167
+        } else if col > 0 {
+            28 * col + col
+        } else {
+            0
+        };
+        let iy = if index < 6 { -19 } else { 139 };
+        draws.push(t18_slot_item(GX + (x + 6) as f32, GY + iy as f32));
     }
     for cell in 0..45 {
         draws.push(t18_slot_item(
@@ -10562,7 +10570,7 @@ fn t21_creative_draws_strip_grid_thumb_search_and_bin() {
     });
     let pixels = t21_creative_pixels(PANEL, &panel, STRIP, &strip, &draws);
     expect_rows(&pixels, 150, 36, [255, 0, 0], "unselected tab 0's red");
-    expect_rows(&pixels, 290, 36, [255, 255, 0], "the selected tab's yellow");
+    expect_rows(&pixels, 296, 36, [255, 255, 0], "the selected tab's yellow");
     expect_rows(&pixels, 150, 150, [0, 255, 0], "the panel's green");
     expect_rows(&pixels, 300, 150, [0, 0, 255], "the panel's blue");
     expect_rows(&pixels, 135, 70, [0, 0, 0], "grid cell 0's item");
