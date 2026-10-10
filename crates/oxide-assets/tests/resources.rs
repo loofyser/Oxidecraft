@@ -2,12 +2,13 @@
 //! laid out the way the extractor lays out a real one
 //! (`<root>/assets/minecraft/textures/...`).
 //!
-//! The tree's PNGs are built by the small writer at the bottom of this file,
-//! so no file from the game is involved. The writer is a second copy of the
-//! one `tests/texture.rs` carries: each integration test is a crate of its
-//! own and cannot reach another one's helpers without a module file of its
-//! own.
+//! The tree's PNGs are built by the shared writer in `common.rs`, so no file
+//! from the game is involved. Each integration test is a crate of its own
+//! and reaches the shared module with `mod common;`.
 
+mod common;
+
+use common::{rgba_png, solid_png};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,7 +30,7 @@ fn a_synthetic_tree_loads_its_textures_and_sidecars() {
     let tree = Tree::new();
     tree.write(
         "assets/minecraft/textures/blocks/stone.png",
-        &png(2, 2, &STONE_TEXELS),
+        &rgba_png(2, 2, &STONE_TEXELS),
     );
     tree.write(
         "assets/minecraft/textures/blocks/stone.png.mcmeta",
@@ -371,117 +372,4 @@ impl Tree {
     fn root(&self) -> &Path {
         &self.root
     }
-}
-
-/// Builds an 8-bit RGBA PNG whose every texel is `rgba`, with the writer
-/// below.
-fn solid_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
-    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
-    for _ in 0..width as usize * height as usize {
-        pixels.extend_from_slice(&rgba);
-    }
-    png(width, height, &pixels)
-}
-
-/// Builds an 8-bit RGBA PNG of `width` x `height` texels from raw pixel bytes
-/// in row-major order.
-///
-/// Every scanline is written with filter type `None`; the scanlines go into a
-/// zlib stream of stored (uncompressed) blocks; every chunk's CRC and the
-/// stream's Adler-32 are computed here, so the bytes are a complete PNG built
-/// without an encoder.
-fn png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
-    assert_eq!(
-        pixels.len(),
-        width as usize * height as usize * 4,
-        "the fixture must supply whole RGBA scanlines"
-    );
-
-    let mut scanlines = Vec::with_capacity(pixels.len() + height as usize);
-    for row in pixels.chunks_exact(width as usize * 4) {
-        scanlines.push(0); // the filter type: None
-        scanlines.extend_from_slice(row);
-    }
-
-    let mut out = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a].to_vec();
-    out.extend_from_slice(&ihdr(width, height));
-    out.extend_from_slice(&chunk(b"IDAT", &zlib_stored(&scanlines)));
-    out.extend_from_slice(&chunk(b"IEND", &[]));
-    out
-}
-
-/// The IHDR chunk of an 8-bit RGBA image: dimensions, colour type 6, and the
-/// three method bytes, all zero (no compression, adaptive filtering, no
-/// interlace).
-fn ihdr(width: u32, height: u32) -> Vec<u8> {
-    let mut data = Vec::with_capacity(13);
-    data.extend_from_slice(&width.to_be_bytes());
-    data.extend_from_slice(&height.to_be_bytes());
-    data.extend_from_slice(&[8, 6, 0, 0, 0]);
-    chunk(b"IHDR", &data)
-}
-
-/// One PNG chunk: length, type, data and the CRC of type and data.
-fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-    let mut crc_input = Vec::with_capacity(4 + data.len());
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(data);
-
-    let mut out = Vec::with_capacity(12 + data.len());
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(&crc_input);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-    out
-}
-
-/// Wraps `raw` in a zlib stream: the header, stored deflate blocks of at most
-/// 65535 bytes each (the last one marked as final), and the Adler-32.
-fn zlib_stored(raw: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x78, 0x01];
-
-    let mut offset = 0;
-    loop {
-        let end = (offset + 65_535).min(raw.len());
-        let block = &raw[offset..end];
-        let last = end == raw.len();
-
-        out.push(u8::from(last)); // BFINAL in bit 0, BTYPE 00: stored
-        let length = block.len() as u16;
-        out.extend_from_slice(&length.to_le_bytes());
-        out.extend_from_slice(&(!length).to_le_bytes());
-        out.extend_from_slice(block);
-
-        offset = end;
-        if last {
-            break;
-        }
-    }
-
-    out.extend_from_slice(&adler32(raw).to_be_bytes());
-    out
-}
-
-/// The CRC-32 PNG chunks carry: the reflected polynomial `0xedb88320`.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-/// The Adler-32 of `bytes`, the checksum a zlib stream ends with.
-fn adler32(bytes: &[u8]) -> u32 {
-    const MODULUS: u32 = 65_521;
-    let mut a = 1u32;
-    let mut b = 0u32;
-    for &byte in bytes {
-        a = (a + u32::from(byte)) % MODULUS;
-        b = (b + a) % MODULUS;
-    }
-    (b << 16) | a
 }
