@@ -37,6 +37,7 @@ use container::{ContainerLayout, ContainerScreen};
 
 pub mod container;
 pub mod family_a;
+pub mod family_b;
 
 /// One open screen: a variant per screen the client can stand on.
 #[derive(Debug, Clone)]
@@ -130,34 +131,45 @@ impl Screens {
 
     /// Folds one `WindowOpened` into the screens: Task 16 wires the
     /// Container kind's path only — every kind opens a container screen, and
-    /// an unlisted kind draws the generic frame (recorded).
+    /// an unlisted kind draws the generic frame (recorded). The horse window
+    /// carries its entity id for the preview and the chested/armour flags;
+    /// every other kind carries none.
     pub fn on_window_opened(
         &mut self,
         window_id: u8,
         kind: WindowKind,
         title: String,
         slot_count: u8,
+        entity_id: Option<i32>,
     ) {
-        self.open_container(window_id, kind, title, slot_count);
+        self.open_container(window_id, kind, title, slot_count, entity_id);
     }
 
     /// Opens the container screen on the window. The family-A tables resolve
     /// by kind in [`family_a::layout_for_kind`] — the chest's row count rides
-    /// the window's slot count — while the unlanded kinds keep the generic
-    /// frame (recorded).
+    /// the window's slot count — the family-B five in
+    /// [`family_b::layout_for_kind`], and the unlanded kinds keep the generic
+    /// frame (recorded). The family-B widget state stands up with the screen
+    /// from the window's kind and entity id.
     pub fn open_container(
         &mut self,
         window_id: u8,
         kind: WindowKind,
         title: String,
         slot_count: u8,
+        entity_id: Option<i32>,
     ) {
-        self.current = Some(ScreenState::Container(Box::new(ContainerScreen::new(
-            window_id,
-            kind,
-            title,
-            family_a::layout_for_kind(kind, slot_count),
-        ))));
+        let layout = match kind {
+            WindowKind::Beacon
+            | WindowKind::EnchantingTable
+            | WindowKind::Villager
+            | WindowKind::Anvil
+            | WindowKind::EntityHorse => family_b::layout_for_kind(kind, slot_count),
+            _ => family_a::layout_for_kind(kind, slot_count),
+        };
+        let mut screen = ContainerScreen::new(window_id, kind, title, layout);
+        screen.set_family(family_b::FamilyState::for_kind(kind, entity_id));
+        self.current = Some(ScreenState::Container(Box::new(screen)));
     }
 
     /// Stands a container screen on the given slot table. Test scaffolding:
@@ -228,18 +240,58 @@ impl Screens {
         live
     }
 
-    /// Folds one window snapshot into the open screen's view copies.
+    /// Folds one window snapshot into the open screen's view copies. The
+    /// beacon's selection reseeds from properties 1/2 (the confirmed state —
+    /// local row clicks update it between snapshots), and the anvil's slot-0
+    /// sync resets the name field and re-fires `MC|ItemName` on a presence
+    /// change (`GuiRepair.sendSlotContents`:200-212) — the re-fire travels
+    /// back for the send. Anything else answers `None`.
     pub fn apply_snapshot(
         &mut self,
         window_id: u8,
         slots: Vec<Option<MetadataItem>>,
         cursor: Option<MetadataItem>,
         properties: Vec<i16>,
-    ) {
+    ) -> Option<InputEvent> {
         if let Some(ScreenState::Container(screen)) = self.current.as_mut() {
             if screen.window_id() == window_id {
                 screen.apply_snapshot(slots, cursor, properties);
+                let confirmed = screen.properties().to_vec();
+                let slot0 = screen.slot_stack(0).cloned().flatten();
+                match screen.family_mut() {
+                    family_b::FamilyState::Beacon(selection) => {
+                        selection.primary = confirmed.get(1).copied().unwrap_or(0) as i32;
+                        selection.secondary = confirmed.get(2).copied().unwrap_or(0) as i32;
+                    }
+                    family_b::FamilyState::Anvil(field) => {
+                        return family_b::anvil_sync(field, slot0.as_ref());
+                    }
+                    family_b::FamilyState::Enchanting(_)
+                    | family_b::FamilyState::Villager(_)
+                    | family_b::FamilyState::Horse(_)
+                    | family_b::FamilyState::None => {}
+                }
             }
+        }
+        None
+    }
+
+    /// Folds one `MC|TrList` trade list into the open villager screen: the
+    /// pager clamps its selection into the fresh list. A list with no
+    /// villager open changes nothing.
+    pub fn set_offers(&mut self, offers: Vec<oxide_proto_v47::window::MerchantOffer>) {
+        if let Some(ScreenState::Container(screen)) = self.current.as_mut() {
+            if let family_b::FamilyState::Villager(pager) = screen.family_mut() {
+                pager.set_offers(offers);
+            }
+        }
+    }
+
+    /// Steps the open screen's family-B widgets one session tick: the
+    /// enchanting book and the anvil blink (`tick_family`).
+    pub fn tick_family(&mut self) {
+        if let Some(ScreenState::Container(screen)) = self.current.as_mut() {
+            family_b::tick_family(screen);
         }
     }
 

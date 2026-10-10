@@ -6688,13 +6688,14 @@ fn an_open_window_replaces_the_live_one_and_a_close_clears_it() {
         kind,
         title,
         slot_count,
+        entity_id,
     } = windows[0]
     else {
         panic!("the open publishes first: {:?}", windows[0]);
     };
     assert_eq!(
-        (*window_id, kind, title.as_str(), *slot_count),
-        (1, &WindowKind::Chest, "Loot", 27)
+        (*window_id, kind, title.as_str(), *slot_count, *entity_id),
+        (1, &WindowKind::Chest, "Loot", 27, None)
     );
 
     let ClientEvent::WindowSnapshot {

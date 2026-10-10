@@ -56,6 +56,7 @@ use oxide_assets::store::Store;
 use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
+use oxide_client::screens::family_b;
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -1268,8 +1269,10 @@ impl ClientApp {
         for event in events {
             self.view.apply(&event);
             // The screens fold the window's own events — a free function, so
-            // the fold runs while the renderer below stays borrowed.
-            Self::apply_screen_event(
+            // the fold runs while the renderer below stays borrowed. The
+            // fold's answer (the anvil's slot-0 re-fire) leaves for the
+            // session here.
+            if let Some(input) = Self::apply_screen_event(
                 &mut self.screens,
                 &mut self.tab,
                 &mut self.cursor,
@@ -1277,7 +1280,16 @@ impl ClientApp {
                 self.window.as_ref(),
                 self.session.as_ref(),
                 &event,
-            );
+            ) {
+                // Inline `send_input`: the renderer stays mutably borrowed
+                // below, so the `&self` send cannot run here — the channel
+                // send reads the session alone.
+                if let Some(session) = self.session.as_ref() {
+                    if session.input_tx.send(input).is_err() {
+                        tracing::warn!("the session's input channel is closed");
+                    }
+                }
+            }
             // The tab list folds its own events in — the player-list entries
             // and the header and footer pair — and a scoreboard report
             // becomes the frame's mirror, the board the assembly reads.
@@ -1357,6 +1369,10 @@ impl ClientApp {
                 if self.chat_input.open {
                     self.chat_input.tick();
                 }
+                // The family-B widgets step on the same tick: the enchanting
+                // book and the anvil blink. The fold no-ops with no family
+                // screen open.
+                self.screens.tick_family();
                 self.camera.observe(CameraTick {
                     position: [*x, *y, *z],
                     on_ground: *on_ground,
@@ -1589,6 +1605,7 @@ impl ClientApp {
                 scaled,
                 mouse: self.cursor,
                 advanced: self.advanced_tooltips,
+                level: self.view.level(),
             },
         ));
         // The death view replaces the debug overlay while the player is dead:
@@ -1829,7 +1846,7 @@ impl ClientApp {
         window: Option<&Arc<Window>>,
         session: Option<&SessionLink>,
         event: &ClientEvent,
-    ) {
+    ) -> Option<InputEvent> {
         /// Runs one capture step's window half: the grab or the release, with
         /// the step's own input send. The exit arm never reaches this fold.
         fn apply_step(
@@ -1881,8 +1898,9 @@ impl ClientApp {
                 kind,
                 title,
                 slot_count,
+                entity_id,
             } => {
-                screens.on_window_opened(*window_id, *kind, title.clone(), *slot_count);
+                screens.on_window_opened(*window_id, *kind, title.clone(), *slot_count, *entity_id);
                 tab.open = false;
                 // The pointer was grabbed until this open: there is no free
                 // position yet, so no hover or hit-test point until the mouse
@@ -1890,6 +1908,7 @@ impl ClientApp {
                 *cursor = None;
                 let step = capture.chat_open();
                 apply_step(window, session, capture, step);
+                None
             }
             ClientEvent::WindowClosed { window_id } => {
                 if screens.on_server_close(*window_id) {
@@ -1897,6 +1916,7 @@ impl ClientApp {
                     let step = capture.chat_close();
                     apply_step(window, session, capture, step);
                 }
+                None
             }
             ClientEvent::WindowSnapshot {
                 window_id,
@@ -1904,15 +1924,20 @@ impl ClientApp {
                 cursor: snapshot_cursor,
                 properties,
                 ..
-            } => {
-                screens.apply_snapshot(
-                    *window_id,
-                    slots.clone(),
-                    snapshot_cursor.clone(),
-                    properties.clone(),
-                );
+            } => screens.apply_snapshot(
+                *window_id,
+                slots.clone(),
+                snapshot_cursor.clone(),
+                properties.clone(),
+            ),
+            // The merchant's trade list rides the villager's pager: the open
+            // villager clamps its selection into it, anything else ignores it
+            // (`NetHandlerPlayClient.handleCustomPayload`:1826-1845).
+            ClientEvent::MerchantOffers { offers } => {
+                screens.set_offers(offers.clone());
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -1959,6 +1984,33 @@ impl ClientApp {
             self.close_screen(event_loop);
             return true;
         }
+        // The anvil's name field owns every other key while it holds focus
+        // with an input in slot 0: editing keys edit, characters type, and
+        // the container's number/drop keys stay out. The borrows run one at
+        // a time — the sends leave after the screen's borrow ends.
+        if self
+            .screens
+            .container_mut()
+            .is_some_and(|screen| family_b::field_owns_input(screen))
+        {
+            let mut events = Vec::new();
+            if let PhysicalKey::Code(code) = event.physical_key {
+                if let Some(key) = keymap::translate(code) {
+                    if let Some(screen) = self.screens.container_mut() {
+                        events.extend(family_b::family_key(screen, key));
+                    }
+                }
+            }
+            if let Some(text) = event.text.as_deref() {
+                if let Some(screen) = self.screens.container_mut() {
+                    events.extend(family_b::family_type(screen, text));
+                }
+            }
+            for event in events {
+                self.send_input(event);
+            }
+            return true;
+        }
         // Copied out before the screen borrows: the key sends read it while
         // the screen stays mutably borrowed.
         let ctrl = self.ctrl;
@@ -2003,12 +2055,21 @@ impl ClientApp {
         };
         self.feed_screen_mouse();
         let shift = self.shift;
+        let level = self.view.level();
         let Some(screen) = self.screens.container_mut() else {
             return true;
         };
         let now = system_time_ms();
         let events = match state {
-            ElementState::Pressed => screen.press(button, shift, now),
+            // The press runs the family-B widgets first — the beacon's rows
+            // and confirm, the enchanting offers, the villager pager, the
+            // anvil focus — then the base slot path; a widget point is never
+            // a slot point, so the two never double-send.
+            ElementState::Pressed => {
+                let mut events = family_b::family_click(screen, button, level);
+                events.extend(screen.press(button, shift, now));
+                events
+            }
             ElementState::Released => screen.release(button, shift, now, &ItemTable),
         };
         for event in events {

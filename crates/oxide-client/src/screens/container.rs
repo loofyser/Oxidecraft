@@ -33,6 +33,8 @@ use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
+use super::family_b::FamilyState;
+
 /// One slot's panel-local position: the wire index, the cell's top-left in
 /// panel units (`Slot.xDisplayPosition/yDisplayPosition`), and the inventory
 /// block the slot belongs to — the shift-double-click fan-out's
@@ -110,6 +112,30 @@ pub enum TitleKind {
         /// The crafting label's source.
         label: TitleSource,
     },
+    /// The beacon's centred pair: `tile.beacon.primary` at x 62 and
+    /// `tile.beacon.secondary` at x 169, both at y 10 in the light grey
+    /// (`GuiBeacon.java`:178-179). The window title draws nowhere — the tile
+    /// names the screen.
+    Beacon {
+        /// The primary label's source.
+        primary: TitleSource,
+        /// The secondary label's source.
+        secondary: TitleSource,
+    },
+    /// The enchanting table's pair: the table's display name at `(12, 5)` and
+    /// the player name at `(8, ySize − 96 + 2)` (`GuiEnchantment.java`:67-71).
+    Enchanting {
+        /// The table name's source: the window's title.
+        upper: TitleSource,
+    },
+    /// The anvil's pair: `container.repair` at `(60, 6)` and the player name
+    /// at `(8, ySize − 96 + 2)` (`GuiRepair.java`:73).
+    Anvil {
+        /// The top label's source.
+        top: TitleSource,
+        /// The bottom label's source.
+        lower: TitleSource,
+    },
     /// The generic frame's single window title at `(8, 6)`.
     Generic,
 }
@@ -180,6 +206,22 @@ pub const CURSOR_OFFSET: f32 = 8.0;
 pub const HOVER_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 128.0 / 255.0];
 /// The title lines' colour (4210752 = 0x404040).
 pub const TITLE_COLOUR: [f32; 4] = [64.0 / 255.0, 64.0 / 255.0, 64.0 / 255.0, 1.0];
+/// The title lines' packed grey (4210752 = 0x404040): every container title
+/// but the beacon's pair.
+pub const TITLE_GREY: u32 = 4_210_752;
+/// The beacon titles' packed light grey (14737632 = 0xE0E0E0,
+/// `GuiBeacon.java`:178-179).
+pub const BEACON_TITLE_GREY: u32 = 14_737_632;
+
+/// Unpacks a title line's RGB int into the draw's straight RGBA.
+pub fn title_rgba(colour: u32) -> [f32; 4] {
+    [
+        ((colour >> 16) & 0xFF) as f32 / 255.0,
+        ((colour >> 8) & 0xFF) as f32 / 255.0,
+        (colour & 0xFF) as f32 / 255.0,
+        1.0,
+    ]
+}
 /// The double-click window: a press on the same slot within 250 ms of the
 /// last, with the same button, gathers (`mouseClicked`:359-365).
 pub const DOUBLE_CLICK_MS: u64 = 250;
@@ -358,7 +400,9 @@ pub struct CursorDraw {
     pub alt_text: Option<String>,
 }
 
-/// One title line the frame reads: the text and the panel-local pen.
+/// One title line the frame reads: the text, the panel-local pen and the
+/// packed RGB the source's `drawString` takes (4210752 = 0x404040 for the
+/// container greys, 14737632 = 0xE0E0E0 for the beacon's pair).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TitleLine {
     /// The line's text: the window title as sent, or the fixed label.
@@ -367,6 +411,8 @@ pub struct TitleLine {
     pub x: i32,
     /// The pen's y in panel units.
     pub y: i32,
+    /// The packed RGB int (no alpha; the draws are opaque).
+    pub colour: u32,
 }
 
 /// The last press the double-click rule reads (`lastClickSlot/Time/Button`
@@ -467,6 +513,10 @@ pub struct ContainerScreen {
     /// The shift-clicked stack the double-click's shift arm merges
     /// (`shiftClickedSlot`, recorded at :417 and :633-636).
     shift_clicked: Option<MetadataItem>,
+    /// The family-B widget state when the screen stands on one of the five
+    /// (`family_b::FamilyState`, stood up by `Screens::open_container` from
+    /// the window's kind and entity id; `None` otherwise).
+    family: FamilyState,
 }
 
 impl ContainerScreen {
@@ -494,6 +544,7 @@ impl ContainerScreen {
             last: None,
             double_click: false,
             shift_clicked: None,
+            family: FamilyState::None,
         }
     }
 
@@ -641,6 +692,27 @@ impl ContainerScreen {
     /// The view's copy of the window's properties by index.
     pub fn properties(&self) -> &[i16] {
         &self.properties
+    }
+
+    /// Stands the family-B widget state up (or clears it): the kind dispatch
+    /// in `Screens::open_container` owns this.
+    pub fn set_family(&mut self, family: FamilyState) {
+        self.family = family;
+    }
+
+    /// The family-B widget state.
+    pub fn family(&self) -> &FamilyState {
+        &self.family
+    }
+
+    /// The family-B widget state, mutably: the click/key/tick folds own it.
+    pub fn family_mut(&mut self) -> &mut FamilyState {
+        &mut self.family
+    }
+
+    /// The pointer in panel-local units: the widget hit tests read it.
+    pub fn panel_mouse(&self) -> (f32, f32) {
+        self.mouse
     }
 
     /// Recomputes the drag's preview into the run (`updateDragSplitting`
@@ -940,6 +1012,7 @@ impl ContainerScreen {
                     text: self.title.clone(),
                     x: 8,
                     y: 6,
+                    colour: TITLE_GREY,
                 },
                 TitleLine {
                     text: match lower {
@@ -948,6 +1021,7 @@ impl ContainerScreen {
                     },
                     x: 8,
                     y: self.layout.y_size - 96 + 2,
+                    colour: TITLE_GREY,
                 },
             ],
             TitleKind::Centred { lower } => vec![
@@ -955,6 +1029,7 @@ impl ContainerScreen {
                     text: self.title.clone(),
                     x: self.layout.x_size / 2 - measure(self.title.as_str()) / 2,
                     y: 6,
+                    colour: TITLE_GREY,
                 },
                 TitleLine {
                     text: match lower {
@@ -963,6 +1038,7 @@ impl ContainerScreen {
                     },
                     x: 8,
                     y: self.layout.y_size - 96 + 2,
+                    colour: TITLE_GREY,
                 },
             ],
             TitleKind::Crafting { top, lower } => vec![
@@ -973,6 +1049,7 @@ impl ContainerScreen {
                     },
                     x: 28,
                     y: 6,
+                    colour: TITLE_GREY,
                 },
                 TitleLine {
                     text: match lower {
@@ -981,6 +1058,7 @@ impl ContainerScreen {
                     },
                     x: 8,
                     y: self.layout.y_size - 96 + 2,
+                    colour: TITLE_GREY,
                 },
             ],
             TitleKind::Inventory { label } => vec![TitleLine {
@@ -990,11 +1068,74 @@ impl ContainerScreen {
                 },
                 x: 86,
                 y: 16,
+                colour: TITLE_GREY,
             }],
+            TitleKind::Beacon { primary, secondary } => {
+                let prime = match primary {
+                    TitleSource::WindowTitle => self.title.clone(),
+                    TitleSource::Fixed(label) => String::from(label),
+                };
+                let second = match secondary {
+                    TitleSource::WindowTitle => self.title.clone(),
+                    TitleSource::Fixed(label) => String::from(label),
+                };
+                vec![
+                    TitleLine {
+                        x: 62 - measure(prime.as_str()) / 2,
+                        y: 10,
+                        text: prime,
+                        colour: BEACON_TITLE_GREY,
+                    },
+                    TitleLine {
+                        x: 169 - measure(second.as_str()) / 2,
+                        y: 10,
+                        text: second,
+                        colour: BEACON_TITLE_GREY,
+                    },
+                ]
+            }
+            TitleKind::Enchanting { upper } => vec![
+                TitleLine {
+                    text: match upper {
+                        TitleSource::WindowTitle => self.title.clone(),
+                        TitleSource::Fixed(label) => String::from(label),
+                    },
+                    x: 12,
+                    y: 5,
+                    colour: TITLE_GREY,
+                },
+                TitleLine {
+                    text: String::from("Inventory"),
+                    x: 8,
+                    y: self.layout.y_size - 96 + 2,
+                    colour: TITLE_GREY,
+                },
+            ],
+            TitleKind::Anvil { top, lower } => vec![
+                TitleLine {
+                    text: match top {
+                        TitleSource::WindowTitle => self.title.clone(),
+                        TitleSource::Fixed(label) => String::from(label),
+                    },
+                    x: 60,
+                    y: 6,
+                    colour: TITLE_GREY,
+                },
+                TitleLine {
+                    text: match lower {
+                        TitleSource::WindowTitle => self.title.clone(),
+                        TitleSource::Fixed(label) => String::from(label),
+                    },
+                    x: 8,
+                    y: self.layout.y_size - 96 + 2,
+                    colour: TITLE_GREY,
+                },
+            ],
             TitleKind::Generic => vec![TitleLine {
                 text: self.title.clone(),
                 x: 8,
                 y: 6,
+                colour: TITLE_GREY,
             }],
         }
     }
@@ -1182,12 +1323,14 @@ mod unit {
                 TitleLine {
                     text: String::from("Chest"),
                     x: 8,
-                    y: 6
+                    y: 6,
+                    colour: TITLE_GREY,
                 },
                 TitleLine {
                     text: String::from("Inventory"),
                     x: 8,
-                    y: 168 - 96 + 2
+                    y: 168 - 96 + 2,
+                    colour: TITLE_GREY,
                 },
             ]
         );
@@ -1219,12 +1362,14 @@ mod unit {
                 TitleLine {
                     text: String::from("Furnace"),
                     x: 58,
-                    y: 6
+                    y: 6,
+                    colour: TITLE_GREY,
                 },
                 TitleLine {
                     text: String::from("Inventory"),
                     x: 8,
-                    y: 166 - 96 + 2
+                    y: 166 - 96 + 2,
+                    colour: TITLE_GREY,
                 },
             ]
         );
@@ -1258,12 +1403,14 @@ mod unit {
                 TitleLine {
                     text: String::from("Crafting"),
                     x: 28,
-                    y: 6
+                    y: 6,
+                    colour: TITLE_GREY,
                 },
                 TitleLine {
                     text: String::from("Inventory"),
                     x: 8,
-                    y: 166 - 96 + 2
+                    y: 166 - 96 + 2,
+                    colour: TITLE_GREY,
                 },
             ]
         );
@@ -1287,7 +1434,8 @@ mod unit {
             vec![TitleLine {
                 text: String::from("Crafting"),
                 x: 86,
-                y: 16
+                y: 16,
+                colour: TITLE_GREY,
             }]
         );
     }

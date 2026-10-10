@@ -575,6 +575,17 @@ pub struct MerchantOffer {
     pub max_uses: i32,
 }
 
+impl MerchantOffer {
+    /// Whether the recipe is disabled: `MerchantRecipe.isRecipeDisabled`
+    /// reads `toolUses >= maxTradeUses` (`MerchantRecipe.java`:109-112), and
+    /// the packet's disabled flag carries the same bit
+    /// (`MerchantRecipeList.java`:70) — so the port derives the lock from the
+    /// uses pair it kept instead of carrying the dropped flag.
+    pub fn is_disabled(&self) -> bool {
+        self.uses >= self.max_uses
+    }
+}
+
 /// The merchant trade list: a `MC|TrList` custom payload's body.
 ///
 /// `MerchantRecipeList.readFromBuf:76-106` behind

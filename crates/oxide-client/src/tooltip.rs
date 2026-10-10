@@ -130,6 +130,17 @@ fn grey_colour() -> [f32; 4] {
     [red, green, blue, 1.0]
 }
 
+/// Plain pre-coded lines (container-button and offer hovers) wrapped for the
+/// draw assembly: the `§` codes inside the text win at render, so the base
+/// stays the below-the-name grey.
+pub fn plain_tooltip_lines(texts: Vec<String>) -> Vec<TooltipLine> {
+    let grey = grey_colour();
+    texts
+        .into_iter()
+        .map(|text| TooltipLine { text, colour: grey })
+        .collect()
+}
+
 /// One stack's full tooltip: the builder's lines wrapped in the rarity and
 /// grey (`renderToolTip`:158-175), with the advanced appendix when the F3+H
 /// flag is set.
@@ -246,6 +257,24 @@ fn name_line(
         line.push_str(&format!("§f #{}", stack.damage));
     }
     line
+}
+
+/// One stack's plain display name, without colour codes: the NBT custom name
+/// when one is set, else the sub-item's composed string, else the damage-0
+/// table string (`ItemStack.getDisplayName`:578-592 over
+/// `getItemStackDisplayName`). The anvil's name field resets to this on its
+/// slot-0 sync (`GuiRepair.sendSlotContents`:200-212); unlike the tooltip's
+/// name line it carries no `§` codes and no advanced appendix, exactly as the
+/// source's `setText` receives the raw name.
+pub fn display_name(stack: &MetadataItem) -> String {
+    let root = compound_of(stack);
+    if let Some(name) = root.as_ref().and_then(|root| custom_name(root)) {
+        return name.to_string();
+    }
+    stack_name(stack.id, stack.damage)
+        .or_else(|| item_entry(stack.id).map(|entry| entry.name))
+        .unwrap_or("Unknown")
+        .to_string()
 }
 
 /// The stack's parsed root compound, or `None` without a tail or past a

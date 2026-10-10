@@ -163,6 +163,21 @@ pub enum InputEvent {
         /// The offer's zero-based index.
         index: i8,
     },
+    /// A custom-payload send on a registered channel: the three container
+    /// screens whose confirms ride `C17PacketCustomPayload` rather than a
+    /// dedicated packet — the beacon's `MC|Beacon` confirm (two big-endian
+    /// i32s, `GuiBeacon.actionPerformed`:137-144), the villager's `MC|TrSel`
+    /// page select (one big-endian i32, `GuiMerchant.actionPerformed`:126-132)
+    /// and the anvil's `MC|ItemName` rename (the raw string, varint-prefixed
+    /// UTF-8 per `PacketBuffer.writeString`, `GuiRepair.renameItem`:136-148).
+    /// The payload's framing is the caller's: [`write_plugin_message`](oxide_proto_v47::serverbound::write_plugin_message)
+    /// writes the channel and the data verbatim.
+    CustomPayload {
+        /// The payload's channel, for example `MC|Beacon`.
+        channel: String,
+        /// The payload's body, already framed for the channel.
+        data: Vec<u8>,
+    },
     /// The sign editor saved its lines (`GuiEditSign.onGuiClosed:52-60`).
     UpdateSign {
         /// The sign's x coordinate.

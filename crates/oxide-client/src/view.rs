@@ -48,8 +48,9 @@ use crate::CHAT_TEXT_CAP;
 use crate::ChatInput;
 use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
-use oxide_client::screens::container::{HOVER_COLOUR, TITLE_COLOUR};
+use oxide_client::screens::container::{ContainerScreen, HOVER_COLOUR, title_rgba};
 use oxide_client::screens::family_a;
+use oxide_client::screens::family_b;
 use oxide_client::screens::{ScreenState, Screens};
 use oxide_client::tooltip;
 
@@ -312,6 +313,9 @@ pub struct ScreenDrawInput<'a> {
     /// Whether F3+H has the advanced tooltips showing (`ItemStack.getTooltip`'s
     /// flag at `GuiScreen.java`:160 — the appendix Task 17 reads).
     pub advanced: bool,
+    /// The player's experience level: the enchanting offer faces and click
+    /// gate read it (`ContainerEnchantment.enchantItem`'s level arms).
+    pub level: i32,
 }
 
 /// The screen group's own draws: the source's `currentScreen.drawScreen`
@@ -398,6 +402,11 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             colour: [1.0, 1.0, 1.0, 1.0],
         });
     }
+    // The family-B widgets over the sheet, before the slots: the background
+    // layer's extras — the horse's panels, the anvil's strip and arrow, the
+    // book, the offer rows, the beacon buttons, the villager pager — then the
+    // slots, then the foreground labels.
+    push_family_b_draws(&mut draws, container, input, gx, gy);
     // The slots in slot order, each cell's item through the icon seam. A
     // covered slot draws its preview count with the white rect; a lone
     // covered slot draws nothing at all (`drawSlot`:243-303).
@@ -485,7 +494,9 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
                     x: gx + line.x as f32,
                     y: gy + line.y as f32,
                     scale: 1.0,
-                    colour: TITLE_COLOUR,
+                    // The line's own packed colour: the beacon's labels are
+                    // grey, everything else the dark title grey.
+                    colour: title_rgba(line.colour),
                     shadow: false,
                     blend: false,
                 });
@@ -522,7 +533,17 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     // the box stays out while the rest still draws.
     if let (Some(mouse), Some(font)) = (input.mouse, input.font) {
         if container.cursor().is_none() {
-            if let Some(hovered) = container.hovered() {
+            // The family-B hover lines first: a beacon button or an
+            // enchanting offer under the pointer owns the tooltip — the rows
+            // never overlap a slot, so the slot's tooltip is the fallback.
+            if let Some(lines) = family_b_tooltip(container, input, gx, gy) {
+                draws.extend(tooltip::tooltip_draws(
+                    &tooltip::plain_tooltip_lines(lines),
+                    font,
+                    mouse,
+                    (width, height),
+                ));
+            } else if let Some(hovered) = container.hovered() {
                 if let Some(stack) = container.slot_stack(hovered).cloned().flatten() {
                     let lines = tooltip::tooltip_lines(&stack, input.advanced);
                     draws.extend(tooltip::tooltip_draws(&lines, font, mouse, (width, height)));
@@ -531,6 +552,462 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         }
     }
     draws
+}
+
+/// One sheet blit over the panel at the centred origin.
+#[allow(clippy::too_many_arguments)]
+fn sheet_blit(
+    draws: &mut Vec<HudDraw>,
+    sheet: &'static str,
+    gx: f32,
+    gy: f32,
+    dx: i32,
+    dy: i32,
+    w: i32,
+    h: i32,
+    sx: i32,
+    sy: i32,
+) {
+    draws.push(HudDraw::TexturedRect {
+        texture: HudTexture::Named(sheet),
+        x: gx + dx as f32,
+        y: gy + dy as f32,
+        width: w as f32,
+        height: h as f32,
+        uv: [
+            sx as f32 / 256.0,
+            sy as f32 / 256.0,
+            (sx + w) as f32 / 256.0,
+            (sy + h) as f32 / 256.0,
+        ],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    });
+}
+
+/// One unblended label over the panel.
+fn panel_text(
+    draws: &mut Vec<HudDraw>,
+    text: String,
+    x: f32,
+    y: f32,
+    colour: [f32; 4],
+    shadow: bool,
+) {
+    draws.push(HudDraw::Text {
+        text,
+        x,
+        y,
+        scale: 1.0,
+        colour,
+        shadow,
+        blend: false,
+    });
+}
+
+/// The family-B widgets over the sheet (`screen_draws` calls this between the
+/// property blits and the slots, where the background layer paints). Every
+/// rect is panel units; the pointer reads `input.mouse` in screen units, so
+/// the hover arms subtract the centred origin first.
+fn push_family_b_draws(
+    draws: &mut Vec<HudDraw>,
+    container: &ContainerScreen,
+    input: &ScreenDrawInput,
+    gx: f32,
+    gy: f32,
+) {
+    use oxide_proto_v47::window::WindowKind;
+    let kind = container.kind();
+    let props = container.properties();
+    let prop = |index: usize| props.get(index).copied().unwrap_or(0) as i32;
+    let present = |index: u8| {
+        container
+            .slot_stack(index.into())
+            .is_some_and(|slot| slot.is_some())
+    };
+    let mouse = input.mouse.map(|(x, y)| (x - gx, y - gy));
+    let cell = mouse.map(|(x, y)| (x as i32, y as i32));
+    let sheet = container.layout().sheet;
+    match kind {
+        WindowKind::EntityHorse => {
+            // The chested panel rides the slot count's layout; the armour
+            // frame the stood-up state (always true — the live horse never
+            // reaches the screens — recorded in `HorseState`).
+            if std::ptr::eq(container.layout(), &family_b::HORSE_CHESTED) {
+                let (dx, dy, w, h) = family_b::HORSE_CHEST_RECT;
+                let (sx, sy) = family_b::HORSE_CHEST_UV;
+                sheet_blit(draws, sheet, gx, gy, dx, dy, w, h, sx, sy);
+            }
+            if let family_b::FamilyState::Horse(state) = container.family() {
+                if state.armoured {
+                    let (dx, dy, w, h) = family_b::HORSE_ARMOUR_RECT;
+                    let (sx, sy) = family_b::HORSE_ARMOUR_UV;
+                    sheet_blit(draws, sheet, gx, gy, dx, dy, w, h, sx, sy);
+                }
+            }
+        }
+        WindowKind::Anvil => {
+            let (dx, dy, w, h) = family_b::ANVIL_STRIP_RECT;
+            sheet_blit(
+                draws,
+                sheet,
+                gx,
+                gy,
+                dx,
+                dy,
+                w,
+                h,
+                0,
+                family_b::anvil_strip_v(present(0)),
+            );
+            if family_b::anvil_arrow_broken(present(0), present(1), present(2)) {
+                let (ax, ay, aw, ah) = family_b::ANVIL_ARROW_RECT;
+                let (asx, asy) = family_b::ANVIL_ARROW_UV;
+                sheet_blit(draws, sheet, gx, gy, ax, ay, aw, ah, asx, asy);
+            }
+            if let Some(font) = input.font {
+                let maximum = prop(0);
+                if let Some(cost) =
+                    family_b::anvil_cost(maximum, false, present(2), input.level >= maximum)
+                {
+                    let text = cost.value.to_string();
+                    let width = string_width(font, &text);
+                    panel_text(
+                        draws,
+                        text,
+                        gx + family_b::anvil_cost_x(width) as f32,
+                        gy + family_b::ANVIL_COST_Y as f32,
+                        title_rgba(cost.colour),
+                        true,
+                    );
+                }
+                if let family_b::FamilyState::Anvil(field) = container.family() {
+                    let enabled = family_b::name_enabled(present(0));
+                    panel_text(
+                        draws,
+                        field.text().to_string(),
+                        gx + 62.0,
+                        gy + 24.0,
+                        title_rgba(if enabled { 14_737_632 } else { 7_368_816 }),
+                        false,
+                    );
+                    if enabled && field.is_focused() && field.cursor_visible() {
+                        let before = field.text().get(..field.cursor()).unwrap_or("");
+                        draws.push(HudDraw::Rect {
+                            x: gx
+                                + 62.0
+                                + family_b::NAME_CURSOR_DX as f32
+                                + string_width(font, before) as f32,
+                            y: gy + 24.0 + family_b::NAME_CURSOR_DY as f32,
+                            width: family_b::NAME_CURSOR_W as f32,
+                            height: family_b::NAME_CURSOR_H as f32,
+                            colour: family_b::NAME_CURSOR_COLOUR,
+                        });
+                    }
+                }
+            }
+        }
+        WindowKind::EnchantingTable => {
+            let costs = [prop(0), prop(1), prop(2)];
+            let lapis = container
+                .slot_stack(1)
+                .and_then(|slot| slot.as_ref())
+                .map(|stack| i32::from(stack.count))
+                .unwrap_or(0);
+            let seed = prop(3);
+            let hovered = cell.and_then(|(x, y)| {
+                (0..3i32).find(|k| {
+                    (family_b::ENCHANT_ROW_X..family_b::ENCHANT_ROW_X + 108).contains(&x)
+                        && y >= family_b::enchant_row_y(*k)
+                        && y < family_b::enchant_row_y(*k) + 19
+                })
+            });
+            for (index, cost) in costs.iter().enumerate() {
+                let row = index as i32;
+                let face =
+                    family_b::enchant_face(index, *cost, lapis, input.level, hovered == Some(row));
+                sheet_blit(
+                    draws,
+                    sheet,
+                    gx,
+                    gy,
+                    family_b::ENCHANT_ROW_X,
+                    family_b::enchant_row_y(row),
+                    108,
+                    19,
+                    0,
+                    face.bg_v,
+                );
+                if let Some(clasp_v) = face.clasp_v {
+                    let (cx, cy) = family_b::enchant_clasp_pos(row);
+                    sheet_blit(
+                        draws,
+                        sheet,
+                        gx,
+                        gy,
+                        cx,
+                        cy,
+                        16,
+                        16,
+                        family_b::enchant_clasp_u(row),
+                        clasp_v,
+                    );
+                }
+                if *cost > 0 {
+                    if let Some(font) = input.font {
+                        panel_text(
+                            draws,
+                            family_b::glyph_word_at(seed, index),
+                            gx + 80.0,
+                            gy + family_b::enchant_glyph_y(row) as f32,
+                            title_rgba(face.glyph),
+                            false,
+                        );
+                        let number = family_b::enchant_cost_text(*cost);
+                        let width = string_width(font, &number);
+                        panel_text(
+                            draws,
+                            number,
+                            gx + family_b::enchant_cost_x(width) as f32,
+                            gy + family_b::enchant_cost_y(row) as f32,
+                            title_rgba(face.cost),
+                            true,
+                        );
+                    }
+                }
+            }
+            // The book's 2D stand-in: the cover always, the two page rects
+            // opening from the spine by the ticked open amount.
+            if let family_b::FamilyState::Enchanting(book) = container.family() {
+                let (open, flip_a, flip_b) = book.frame(1.0);
+                let (cx, cy, cw, ch) = family_b::BOOK_RECT;
+                draws.push(HudDraw::Rect {
+                    x: gx + cx as f32,
+                    y: gy + cy as f32,
+                    width: cw as f32,
+                    height: ch as f32,
+                    colour: title_rgba(family_b::BOOK_COLOUR),
+                });
+                let half = family_b::BOOK_PAGE_W as f32 * open;
+                let left = (half * (1.0 - flip_a)) as i32;
+                if left > 0 {
+                    draws.push(HudDraw::Rect {
+                        x: gx + (88 - left) as f32,
+                        y: gy + 2.0,
+                        width: left as f32,
+                        height: 10.0,
+                        colour: title_rgba(family_b::BOOK_PAGE_COLOUR),
+                    });
+                }
+                let right = (half * (1.0 - flip_b)) as i32;
+                if right > 0 {
+                    draws.push(HudDraw::Rect {
+                        x: gx + 88.0,
+                        y: gy + 2.0,
+                        width: right as f32,
+                        height: 10.0,
+                        colour: title_rgba(family_b::BOOK_PAGE_COLOUR),
+                    });
+                }
+            }
+        }
+        WindowKind::Beacon => {
+            // The selection seeds from the window's properties and local row
+            // clicks update it between snapshots (the seam reseeds on every
+            // snapshot — recorded in `Screens::apply_snapshot`).
+            let selection = match container.family() {
+                family_b::FamilyState::Beacon(selection) => *selection,
+                _ => family_b::BeaconSelection {
+                    primary: prop(1),
+                    secondary: prop(2),
+                },
+            };
+            let rows = family_b::beacon_rows(prop(0), selection.primary, selection.secondary);
+            let hovered = cell.and_then(|(x, y)| family_b::beacon_hit(&rows, x, y));
+            for row in &rows {
+                sheet_blit(
+                    draws,
+                    sheet,
+                    gx,
+                    gy,
+                    row.x,
+                    row.y,
+                    22,
+                    22,
+                    family_b::beacon_button_u(row.enabled, row.selected, hovered == Some(row.id)),
+                    family_b::BEACON_STRIP_V,
+                );
+                if let Some(icon) = family_b::potion_icon(row.effect) {
+                    let (sx, sy) = family_b::potion_icon_uv(icon);
+                    sheet_blit(
+                        draws,
+                        family_b::INVENTORY_SHEET,
+                        gx,
+                        gy,
+                        row.x + 2,
+                        row.y + 2,
+                        18,
+                        18,
+                        sx,
+                        sy,
+                    );
+                }
+            }
+            let (mx, my) = cell.unwrap_or((-1, -1));
+            let confirm_on = family_b::beacon_confirm_enabled(present(0), selection.primary);
+            for (pos, icon, enabled) in [
+                (
+                    family_b::BEACON_CONFIRM_POS,
+                    family_b::BEACON_CONFIRM_UV,
+                    confirm_on,
+                ),
+                (
+                    family_b::BEACON_CANCEL_POS,
+                    family_b::BEACON_CANCEL_UV,
+                    true,
+                ),
+            ] {
+                let hov = mx >= pos.0
+                    && mx < pos.0 + family_b::BEACON_BUTTON_SIDE
+                    && my >= pos.1
+                    && my < pos.1 + family_b::BEACON_BUTTON_SIDE;
+                sheet_blit(
+                    draws,
+                    sheet,
+                    gx,
+                    gy,
+                    pos.0,
+                    pos.1,
+                    family_b::BEACON_BUTTON_SIDE,
+                    family_b::BEACON_BUTTON_SIDE,
+                    family_b::beacon_button_u(enabled, false, hov),
+                    family_b::BEACON_STRIP_V,
+                );
+                sheet_blit(
+                    draws,
+                    sheet,
+                    gx,
+                    gy,
+                    pos.0 + 2,
+                    pos.1 + 2,
+                    18,
+                    18,
+                    icon.0,
+                    icon.1,
+                );
+            }
+        }
+        WindowKind::Villager => {
+            if let family_b::FamilyState::Villager(pager) = container.family() {
+                if pager.offers.len() > 1 {
+                    let (mx, my) = cell.unwrap_or((-1, -1));
+                    for (pos, forward) in [
+                        (family_b::VILLAGER_NEXT_POS, true),
+                        (family_b::VILLAGER_PREV_POS, false),
+                    ] {
+                        let (sx, sy) = family_b::merchant_button_uv(
+                            family_b::pager_enabled(pager.selected, pager.offers.len(), forward),
+                            family_b::pager_hit(pos, mx, my),
+                            forward,
+                        );
+                        sheet_blit(
+                            draws,
+                            sheet,
+                            gx,
+                            gy,
+                            pos.0,
+                            pos.1,
+                            family_b::VILLAGER_BUTTON_W,
+                            family_b::VILLAGER_BUTTON_H,
+                            sx,
+                            sy,
+                        );
+                    }
+                }
+                // The red X over both arrow lanes while the shown recipe is
+                // disabled (`:160-164` draws both rects).
+                if pager.current().is_some_and(|offer| offer.is_disabled()) {
+                    for (_, ay) in [(83, 21), (83, 51)] {
+                        let (sx, sy, sw, sh) = family_b::VILLAGER_RED_X_UV;
+                        sheet_blit(draws, sheet, gx, gy, 83, ay, sw, sh, sx, sy);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The family-B hover lines, if the pointer stands on a beacon button or an
+/// enchanting offer with empty hands (`screen_draws` asks this before the
+/// slot's own tooltip — the rows never overlap a slot).
+fn family_b_tooltip(
+    container: &ContainerScreen,
+    input: &ScreenDrawInput,
+    gx: f32,
+    gy: f32,
+) -> Option<Vec<String>> {
+    use oxide_proto_v47::window::WindowKind;
+    let (mx, my) = input
+        .mouse
+        .map(|(x, y)| ((x - gx) as i32, (y - gy) as i32))?;
+    let props = container.properties();
+    let prop = |index: usize| props.get(index).copied().unwrap_or(0) as i32;
+    match container.kind() {
+        WindowKind::Beacon => {
+            let selection = match container.family() {
+                family_b::FamilyState::Beacon(selection) => *selection,
+                _ => family_b::BeaconSelection {
+                    primary: prop(1),
+                    secondary: prop(2),
+                },
+            };
+            let rows = family_b::beacon_rows(prop(0), selection.primary, selection.secondary);
+            if let Some(id) = family_b::beacon_hit(&rows, mx, my) {
+                return family_b::beacon_tooltip(&rows, id).map(|tip| vec![tip]);
+            }
+            let side = family_b::BEACON_BUTTON_SIDE;
+            for (pos, text) in [
+                (family_b::BEACON_CONFIRM_POS, family_b::BEACON_DONE_TEXT),
+                (family_b::BEACON_CANCEL_POS, family_b::BEACON_CANCEL_TEXT),
+            ] {
+                if mx >= pos.0 && mx < pos.0 + side && my >= pos.1 && my < pos.1 + side {
+                    return Some(vec![String::from(text)]);
+                }
+            }
+            None
+        }
+        WindowKind::EnchantingTable => {
+            let lapis = container
+                .slot_stack(1)
+                .and_then(|slot| slot.as_ref())
+                .map(|stack| i32::from(stack.count))
+                .unwrap_or(0);
+            for row in 0..3i32 {
+                // The tooltip's lane is 17 tall, two shorter than the click's
+                // (`drawScreen`:244 tests `108, 17`).
+                if (family_b::ENCHANT_ROW_X..family_b::ENCHANT_ROW_X + 108).contains(&mx)
+                    && my >= family_b::enchant_row_y(row)
+                    && my < family_b::enchant_row_y(row) + 17
+                {
+                    let cost = prop(row as usize);
+                    let clue = prop(4 + row as usize);
+                    if cost > 0 && clue >= 0 {
+                        let name = family_b::enchant_clue_name(clue);
+                        return Some(family_b::enchant_tooltip(
+                            name.as_deref(),
+                            true,
+                            row as usize,
+                            cost,
+                            lapis,
+                            input.level,
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// A covered slot's overlay text: past the cap the count draws as the yellow
@@ -1308,6 +1785,12 @@ fn rows_icons_slice(x: f32, y: f32, u: i32, v: i32) -> HudDraw {
 }
 
 impl View {
+    /// The player's experience level: the enchanting offer faces and click
+    /// gate read it (`ContainerEnchantment.enchantItem`'s level arms).
+    pub fn level(&self) -> i32 {
+        self.rows.level
+    }
+
     /// The survival rows' draws: the armour, hearts (with the absorption
     /// overlay), food, air and experience rows (`renderPlayerStats`:609-900 and
     /// `renderExpBar`:414-450).
@@ -9629,6 +10112,7 @@ mod tests {
                 scaled: chat_resolution(),
                 mouse: Some((100.0, 50.0)),
                 advanced: false,
+                level: 0,
             },
         );
         assert!(draws.is_empty(), "no screen owns no draws");
@@ -9647,6 +10131,7 @@ mod tests {
                 scaled,
                 mouse: Some((100.0, 50.0)),
                 advanced: false,
+                level: 0,
             },
         );
         // The world-present gradient alone: top 0xC0101010 over bottom
@@ -9672,6 +10157,7 @@ mod tests {
             WindowKind::Unknown,
             String::from("{\"text\":\"Chest\"}"),
             0,
+            None,
         );
         screens
             .container_mut()
@@ -9695,6 +10181,7 @@ mod tests {
                 scaled: chat_resolution(),
                 mouse: Some((100.0, 50.0)),
                 advanced: false,
+                level: 0,
             },
         );
         // The 427x240 frame centres the 176x166 panel at (125, 37); the
@@ -9804,6 +10291,7 @@ mod tests {
                 scaled: chat_resolution(),
                 mouse: Some((141.0, 63.0)),
                 advanced: false,
+                level: 0,
             },
         );
         assert!(
@@ -9822,6 +10310,7 @@ mod tests {
                 scaled: chat_resolution(),
                 mouse: Some((141.0, 63.0)),
                 advanced: false,
+                level: 0,
             },
         );
         assert!(

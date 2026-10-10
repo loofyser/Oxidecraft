@@ -574,6 +574,12 @@ pub enum ClientEvent {
         /// The window's container-side slot count, exactly as sent: the
         /// chest's row pick reads `slot count / 9`.
         slot_count: u8,
+        /// The horse's entity id, carried only by a horse window
+        /// (`S2DPacketOpenWindow.readPacketData:51-61` reads it when the type
+        /// is `EntityHorse`): the horse screen resolves the live horse for
+        /// its preview and its chested/armour flags from it, while the title
+        /// stays the packet string (`handleOpenWindow:1092-1120`).
+        entity_id: Option<i32>,
     },
     /// A window left the state: the server closed it (clientbound 0x2E) or the
     /// view closed its own screen and the session's close put the window away.
@@ -978,6 +984,16 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 InputEvent::EnchantItem { window_id, index } => {
                                     let request = payload_of(|out| {
                                         write_enchant_item(out, window_id, index)
+                                    })?;
+                                    send_reply(&mut conn, &request)?;
+                                }
+                                InputEvent::CustomPayload { channel, data } => {
+                                    // The containers' C17 confirms (beacon,
+                                    // villager, anvil): the channel and the
+                                    // caller-framed body ride the landed
+                                    // plugin-message writer verbatim.
+                                    let request = payload_of(|out| {
+                                        write_plugin_message(out, &channel, &data)
                                     })?;
                                     send_reply(&mut conn, &request)?;
                                 }
@@ -1943,6 +1959,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     kind: open.kind,
                                     title: open.title,
                                     slot_count: open.slot_count,
+                                    entity_id: open.entity_id,
                                 },
                             );
                         }
@@ -2539,6 +2556,7 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
         | InputEvent::CloseWindow { .. }
         | InputEvent::CreativeAction { .. }
         | InputEvent::EnchantItem { .. }
+        | InputEvent::CustomPayload { .. }
         | InputEvent::UpdateSign { .. }
         | InputEvent::HeldItemChange { .. }
         | InputEvent::DropItem { .. } => false,

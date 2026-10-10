@@ -9877,3 +9877,369 @@ fn t18_familya_crafting_draws_result_and_grid() {
     expect_rows(&pixels, 202, 90, [0, 0, 0], "grid slot 9's item");
     expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
 }
+
+/// Task 19's digit sheet: the `hotbar_font_sheet` construction extended to
+/// every digit, so the enchanting costs ("1", "6") and the anvil's cost
+/// ("41") and field ("11") ink. Each cell inks its first column only, at two
+/// font pixels' advance — the pins read the ink, never the advance math.
+fn t19_font_sheet() -> Texture {
+    const SIDE: u32 = 128;
+    const CELL: u32 = 8;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for code in '0' as u32..='9' as u32 {
+        let cell_x = (code % 16) * CELL;
+        let cell_y = (code / 16) * CELL;
+        for row in 0..CELL {
+            let offset = (((cell_y + row) * SIDE + cell_x) * 4) as usize;
+            rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// Task 19's family-B frame runner: `t18_family_pixels` with the digit sheet
+/// bound, for the cases whose cost and field texts ink.
+fn t19_family_pixels(name: &'static str, sheet: &Texture, draws: &[HudDraw]) -> Vec<u8> {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    screen.set_texture(&device, &queue, name, sheet);
+    screen
+        .set_font(&device, &queue, &t19_font_sheet())
+        .expect("the digit sheet is a 16x16 grid");
+    screen.set_atlas_icon(&device, &queue, &item_atlas());
+    screen.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    screen.set_draws(
+        &device,
+        &queue,
+        draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let depth = rows_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t19 family headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+    read_rows_pixels(&device, &queue, &target)
+}
+
+/// The beacon frame at pyramid level 4 with speed chosen and the payment in:
+/// the 230x219 panel at (109, 10), the selected row-0 speed button on the
+/// +22 strip, its enabled neighbour and the lower rows on the idle strip,
+/// the enabled confirm with its white icon and the cancel with its purple
+/// one, and a checker item in the payment slot.
+///
+/// The pins: the selected strip's cyan against the idle strip's yellow, the
+/// confirm's and cancel's icons, the payment item's black cell, the sheet's
+/// blue past the panel's middle, and the sky past the frame. The potion icons
+/// sample a second sheet the runner does not bind, so they stay out of the
+/// mirror — the client's `potion_icon_uv` pins own them.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t19_familyb_beacon_draws_rows_and_confirm() {
+    const NAME: &str = "t19/beacon";
+    const GX: f32 = 109.0;
+    const GY: f32 = 10.0;
+    let sheet = t18_family_sheet(&[
+        (0, 219, 22, 22, [255, 255, 0, 255]),
+        (22, 219, 22, 22, [0, 255, 255, 255]),
+        (44, 219, 22, 22, [255, 128, 0, 255]),
+        (66, 219, 22, 22, [255, 0, 255, 255]),
+        (90, 220, 18, 18, [255, 255, 255, 255]),
+        (112, 220, 18, 18, [128, 0, 128, 255]),
+    ]);
+    let pixels = t19_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 230, 219, 0, 0]),
+            t18_blit(NAME, GX, GY, [53, 22, 22, 22, 22, 219]),
+            t18_blit(NAME, GX, GY, [77, 22, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [53, 47, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [65, 72, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [144, 47, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [168, 47, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [164, 107, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [166, 109, 18, 18, 90, 220]),
+            t18_blit(NAME, GX, GY, [190, 107, 22, 22, 0, 219]),
+            t18_blit(NAME, GX, GY, [192, 109, 18, 18, 112, 220]),
+            t18_slot_item(GX + 136.0, GY + 110.0),
+        ],
+    );
+    expect_rows(&pixels, 164, 34, [0, 255, 255], "the chosen row's cyan");
+    expect_rows(
+        &pixels,
+        188,
+        34,
+        [255, 255, 0],
+        "the neighbour row's yellow",
+    );
+    expect_rows(&pixels, 176, 84, [255, 255, 0], "the single third-tier row");
+    expect_rows(&pixels, 255, 59, [255, 255, 0], "the regeneration row");
+    expect_rows(&pixels, 273, 117, [255, 255, 0], "the confirm's idle strip");
+    expect_rows(&pixels, 276, 120, [255, 255, 255], "the confirm's icon");
+    expect_rows(&pixels, 301, 119, [128, 0, 128], "the cancel's icon");
+    expect_rows(&pixels, 245, 120, [0, 0, 0], "the payment's item");
+    expect_rows(&pixels, 309, 110, [0, 0, 255], "the sheet's blue");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The enchanting frame with costs [1, 6, 0], one lapis and level 6: the
+/// 176x166 panel at (136, 37), row 0 on the idle strip with its cyan clasp
+/// and green "1", row 1 on the empty strip with its magenta dim clasp and dim
+/// "6", row 2 empty, the book's brown cover with both cream pages open, and
+/// checker items in the item and lapis slots.
+///
+/// The pins: the two clasps, the affordable green against the dim cost, the
+/// cover against the pages, the two items' black cells, and the sky past the
+/// frame. The glyph runs stay out of the mirror — the client's
+/// `glyph_word_at` pins own them, as the titles stay out per the t16 case.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t19_familyb_enchanting_draws_book_and_offer() {
+    const NAME: &str = "t19/enchanting";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[
+        (0, 166, 108, 19, [255, 128, 0, 255]),
+        (0, 185, 108, 19, [255, 0, 0, 255]),
+        (0, 223, 16, 16, [0, 255, 255, 255]),
+        (16, 239, 16, 16, [255, 0, 255, 255]),
+    ]);
+    let pixels = t19_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_blit(NAME, GX, GY, [60, 14, 108, 19, 0, 166]),
+            t18_blit(NAME, GX, GY, [61, 15, 16, 16, 0, 223]),
+            t18_blit(NAME, GX, GY, [60, 33, 108, 19, 0, 185]),
+            t18_blit(NAME, GX, GY, [61, 34, 16, 16, 16, 239]),
+            t18_blit(NAME, GX, GY, [60, 52, 108, 19, 0, 185]),
+            HudDraw::Text {
+                text: "1".to_string(),
+                x: GX + 164.0,
+                y: GY + 23.0,
+                scale: 1.0,
+                colour: [128.0 / 255.0, 1.0, 32.0 / 255.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Text {
+                text: "6".to_string(),
+                x: GX + 164.0,
+                y: GY + 42.0,
+                scale: 1.0,
+                colour: [64.0 / 255.0, 127.0 / 255.0, 16.0 / 255.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Rect {
+                x: GX + 62.0,
+                y: GY + 2.0,
+                width: 52.0,
+                height: 10.0,
+                colour: [107.0 / 255.0, 74.0 / 255.0, 53.0 / 255.0, 1.0],
+            },
+            HudDraw::Rect {
+                x: GX + 64.0,
+                y: GY + 2.0,
+                width: 24.0,
+                height: 10.0,
+                colour: [216.0 / 255.0, 207.0 / 255.0, 168.0 / 255.0, 1.0],
+            },
+            HudDraw::Rect {
+                x: GX + 88.0,
+                y: GY + 2.0,
+                width: 24.0,
+                height: 10.0,
+                colour: [216.0 / 255.0, 207.0 / 255.0, 168.0 / 255.0, 1.0],
+            },
+            t18_slot_item(GX + 15.0, GY + 47.0),
+            t18_slot_item(GX + 35.0, GY + 47.0),
+        ],
+    );
+    expect_rows(&pixels, 236, 57, [255, 128, 0], "the idle row's strip");
+    expect_rows(&pixels, 198, 53, [0, 255, 255], "the affordable clasp");
+    expect_rows(&pixels, 300, 60, [128, 255, 32], "the affordable one's ink");
+    expect_rows(&pixels, 236, 77, [255, 0, 0], "the dim row's strip");
+    expect_rows(&pixels, 198, 72, [255, 0, 255], "the dim clasp");
+    expect_rows(&pixels, 300, 79, [64, 127, 16], "the dim six's ink");
+    expect_rows(&pixels, 249, 40, [107, 74, 53], "the book's cover");
+    expect_rows(&pixels, 206, 42, [216, 207, 168], "the book's left page");
+    expect_rows(&pixels, 236, 42, [216, 207, 168], "the book's right page");
+    expect_rows(&pixels, 151, 84, [0, 0, 0], "the item's icon");
+    expect_rows(&pixels, 171, 84, [0, 0, 0], "the lapis's icon");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The villager frame on the first of two enabled recipes: the 176x166 panel
+/// at (136, 37), the enabled next button cyan and the disabled previous
+/// orange, the baked arrow lane magenta, and checker items for the buy and
+/// the sell.
+///
+/// The pins: the two pager states, the arrow lane, both recipe items, the
+/// sheet's green past the buttons, and the sky past the frame. The red X
+/// stays out — the shown recipe is enabled — and the client's pager tests pin
+/// the disabled draw's flag.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t19_familyb_villager_draws_recipe_and_pager() {
+    const NAME: &str = "t19/villager";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[
+        (176, 0, 12, 19, [0, 255, 255, 255]),
+        (200, 19, 12, 19, [255, 128, 0, 255]),
+        (84, 28, 32, 8, [255, 0, 255, 255]),
+    ]);
+    let pixels = t19_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_blit(NAME, GX, GY, [147, 23, 12, 19, 176, 0]),
+            t18_blit(NAME, GX, GY, [17, 23, 12, 19, 200, 19]),
+            t18_slot_item(GX + 36.0, GY + 24.0),
+            t18_slot_item(GX + 120.0, GY + 24.0),
+        ],
+    );
+    expect_rows(&pixels, 285, 62, [0, 255, 255], "the next button's cyan");
+    expect_rows(
+        &pixels,
+        155,
+        62,
+        [255, 128, 0],
+        "the previous button's orange",
+    );
+    expect_rows(&pixels, 226, 67, [255, 0, 255], "the arrow lane");
+    expect_rows(&pixels, 172, 61, [0, 0, 0], "the buy's item");
+    expect_rows(&pixels, 256, 61, [0, 0, 0], "the sell's item");
+    expect_rows(&pixels, 140, 45, [0, 255, 0], "the sheet's green");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The chested horse frame: the 176x166 panel at (136, 37), the cyan chest
+/// block and the magenta armour frame, a checker item in the saddle slot and
+/// one in the first chest slot.
+///
+/// The pins: the chest block beside its item, the armour frame past the
+/// saddle, both items' black cells, and the sky past the frame. The live
+/// preview stays out — it is Task 20's `drawEntityOnScreen` — and the port
+/// carries only its anchor.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t19_familyb_horse_draws_chested_layout() {
+    const NAME: &str = "t19/horse";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[
+        (0, 166, 90, 54, [0, 255, 255, 255]),
+        (0, 220, 18, 18, [255, 0, 255, 255]),
+    ]);
+    let pixels = t19_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_blit(NAME, GX, GY, [79, 17, 90, 54, 0, 166]),
+            t18_blit(NAME, GX, GY, [7, 35, 18, 18, 0, 220]),
+            t18_slot_item(GX + 8.0, GY + 18.0),
+            t18_slot_item(GX + 80.0, GY + 18.0),
+        ],
+    );
+    expect_rows(&pixels, 215, 54, [0, 255, 255], "the chest block's cyan");
+    expect_rows(
+        &pixels,
+        143,
+        72,
+        [255, 0, 255],
+        "the armour frame's magenta",
+    );
+    expect_rows(&pixels, 144, 55, [0, 0, 0], "the saddle's item");
+    expect_rows(&pixels, 216, 55, [0, 0, 0], "the chest slot's item");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The anvil frame with both inputs, no output and cost 41: the 176x166 panel
+/// at (136, 37), the cyan field strip, the magenta broken arrow, the red "41"
+/// cost, the grey "11" field with its grey cursor, and a checker item in the
+/// first input slot.
+///
+/// The pins: the strip, the arrow, the red cost's ink, the field's ink and
+/// cursor, the input's black cell, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t19_familyb_anvil_draws_cost_and_field() {
+    const NAME: &str = "t19/anvil";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[
+        (0, 166, 110, 16, [0, 255, 255, 255]),
+        (176, 0, 28, 21, [255, 0, 255, 255]),
+    ]);
+    let pixels = t19_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_blit(NAME, GX, GY, [59, 20, 110, 16, 0, 166]),
+            t18_blit(NAME, GX, GY, [99, 45, 28, 21, 176, 0]),
+            HudDraw::Text {
+                text: "41".to_string(),
+                x: GX + 164.0,
+                y: GY + 67.0,
+                scale: 1.0,
+                colour: [1.0, 96.0 / 255.0, 96.0 / 255.0, 1.0],
+                shadow: true,
+                blend: false,
+            },
+            HudDraw::Text {
+                text: "11".to_string(),
+                x: GX + 62.0,
+                y: GY + 24.0,
+                scale: 1.0,
+                colour: [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0],
+                shadow: false,
+                blend: false,
+            },
+            HudDraw::Rect {
+                x: GX + 71.0,
+                y: GY + 25.0,
+                width: 1.0,
+                height: 9.0,
+                colour: [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0],
+            },
+            t18_slot_item(GX + 27.0, GY + 47.0),
+        ],
+    );
+    expect_rows(&pixels, 195, 57, [0, 255, 255], "the field strip's cyan");
+    expect_rows(
+        &pixels,
+        236,
+        83,
+        [255, 0, 255],
+        "the broken arrow's magenta",
+    );
+    expect_rows(&pixels, 300, 104, [255, 96, 96], "the red cost's ink");
+    expect_rows(&pixels, 198, 61, [224, 224, 224], "the field's ink");
+    expect_rows(&pixels, 207, 62, [208, 208, 208], "the field's cursor");
+    expect_rows(&pixels, 163, 84, [0, 0, 0], "the input's item");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}

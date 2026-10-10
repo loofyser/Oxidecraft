@@ -1590,6 +1590,7 @@ dependencies = [
  "dirs",
  "oxide-assets",
  "oxide-game",
+ "oxide-proto",
  "oxide-proto-v47",
  "oxide-render",
  "oxide-world",

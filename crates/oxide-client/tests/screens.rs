@@ -116,7 +116,7 @@ fn clicks(events: Vec<InputEvent>) -> Vec<(i16, i8, i8)> {
 #[test]
 fn a_window_open_opens_the_container_screen() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
     assert!(screens.is_open(), "the window opens a screen");
     assert_eq!(screens.current_window_id(), Some(7));
 }
@@ -126,7 +126,7 @@ fn a_window_open_opens_the_container_screen() {
 #[test]
 fn escape_on_a_chest_sends_its_own_close() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
     let mut cursor = Some(stack(1, 3));
     let event = screens.escape(&mut cursor);
     assert_eq!(event, Some(InputEvent::CloseWindow { window_id: 7 }));
@@ -152,7 +152,7 @@ fn escape_on_the_inventory_sends_window_zero() {
 #[test]
 fn a_server_close_clears_its_open_screen() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
     assert!(screens.on_server_close(7), "the matching close clears");
     assert!(!screens.is_open());
 }
@@ -162,7 +162,7 @@ fn a_server_close_clears_its_open_screen() {
 #[test]
 fn a_server_close_for_another_window_keeps_the_screen() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
     assert!(!screens.on_server_close(9), "nothing held window 9");
     assert!(screens.is_open(), "the screen stands");
 }
@@ -172,7 +172,7 @@ fn a_server_close_for_another_window_keeps_the_screen() {
 #[test]
 fn an_unknown_kind_opens_the_generic_frame() {
     let mut screens = Screens::default();
-    screens.on_window_opened(4, WindowKind::Unknown, String::from("???"), 0);
+    screens.on_window_opened(4, WindowKind::Unknown, String::from("???"), 0, None);
     assert!(screens.is_open(), "even an unknown window opens");
     let generic = match screens.current() {
         Some(oxide_client::screens::ScreenState::Container(screen)) => screen.generic_frame(),
@@ -194,7 +194,7 @@ fn closing_with_no_screen_sends_nothing() {
 #[test]
 fn only_the_inventory_and_creative_screens_take_user_input() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
     assert!(!screens.allow_user_input(), "containers inherit false");
     screens.open_inventory();
     assert!(screens.allow_user_input(), "the inventory sets true");
@@ -680,7 +680,7 @@ fn an_open_resolves_the_family_layouts_by_kind() {
 #[test]
 fn an_open_stands_the_resolved_table() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Furnace, String::from("Furnace"), 3);
+    screens.on_window_opened(7, WindowKind::Furnace, String::from("Furnace"), 3, None);
     let slots = match screens.current() {
         Some(oxide_client::screens::ScreenState::Container(screen)) => screen.layout().slots.len(),
         other => panic!("a furnace opens a container screen, got {other:?}"),
