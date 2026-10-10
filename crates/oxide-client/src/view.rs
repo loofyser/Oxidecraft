@@ -11075,6 +11075,161 @@ mod tests {
         );
     }
 
+    /// Fix round 3c's draw-list guard: a three-row chest screen's list carries the
+    /// chest's split background pair and one item draw per slot for a sampled
+    /// inventory state, with the count text staying on. The draw list is healthy —
+    /// the silent bail sits one layer down, in the pass bindings — so this pin
+    /// passes pre-fix and guards the assembly while the bind pins do the failing.
+    #[test]
+    fn fix3c_chest_screen_draws_split_panel_and_slot_items() {
+        use oxide_proto_v47::window::WindowKind;
+
+        fn stack(id: i16, count: u8) -> MetadataItem {
+            MetadataItem {
+                id,
+                count,
+                damage: 0,
+                nbt: None,
+            }
+        }
+
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_container(
+            3,
+            WindowKind::Chest,
+            String::from("{\"text\":\"Chest\"}"),
+            27,
+            None,
+        );
+        screens
+            .container_mut()
+            .expect("the open is a container")
+            .set_screen_size(427, 240);
+        let mut slots: Vec<Option<MetadataItem>> = vec![None; 63];
+        slots[0] = Some(stack(1, 16));
+        slots[27] = Some(stack(3, 8));
+        screens.apply_snapshot(3, slots, None, Vec::new());
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: None,
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+            },
+        );
+        // The 427x240 frame centres the 176x168 three-row panel at (125, 36).
+        let blits: Vec<(f32, f32, f32, f32, [f32; 4])> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::TexturedRect {
+                    texture: HudTexture::Named("gui/container/generic_54"),
+                    x,
+                    y,
+                    width,
+                    height,
+                    uv,
+                    ..
+                } => Some((*x, *y, *width, *height, *uv)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blits,
+            vec![
+                (
+                    125.0,
+                    36.0,
+                    176.0,
+                    71.0,
+                    [0.0, 0.0, 176.0 / 256.0, 71.0 / 256.0]
+                ),
+                (
+                    125.0,
+                    107.0,
+                    176.0,
+                    96.0,
+                    [0.0, 126.0 / 256.0, 176.0 / 256.0, 222.0 / 256.0]
+                ),
+            ],
+            "the chest's split pair on generic_54: {draws:?}"
+        );
+        // One item draw per slot of the 27+36 table, the first cell at the
+        // panel's (8, 18).
+        let items: Vec<(f32, f32)> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Item { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 63, "every slot draws its cell: {draws:?}");
+        assert_eq!(
+            items[0],
+            (133.0, 54.0),
+            "the first chest cell at the panel's (8, 18): {draws:?}"
+        );
+        // The sampled stacks ride their cells, and the count text stays on.
+        let stacked: Vec<Option<i16>> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Item { stack, .. } => Some(stack.as_ref().map(|icon| icon.id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stacked.len(), 63, "one cell per slot: {draws:?}");
+        assert_eq!(stacked[0], Some(1), "slot 0's stone: {draws:?}");
+        assert_eq!(
+            stacked[27],
+            Some(3),
+            "the first player slot's dirt: {draws:?}"
+        );
+        assert!(
+            draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "16")),
+            "the count text stays: {draws:?}"
+        );
+        assert!(
+            draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "Inventory")),
+            "the ghost label draws: {draws:?}"
+        );
+    }
+
+    /// Fix round 3c's hotbar-side guard: the strip's list carries one item draw per
+    /// stocked slot — the assembly is healthy, so the HUD-side break was the same
+    /// missing icon-atlas bind the shared fix heals (the headless hud pin proves
+    /// the pixels). No separate HUD break, nothing for fix5.
+    #[test]
+    fn fix3c_hotbar_draws_one_item_per_stocked_slot() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(1, 16, 0);
+        slots[4] = hotbar_stack(276, 1, 0);
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        let draws = view.hotbar_draws(Instant::now(), &hotbar_input(None));
+        // An empty slot draws nothing (`GuiIngame.java:1039-1041`), so the two
+        // stocked cells are the whole item run.
+        let ids: Vec<Option<i16>> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Item { stack, .. } => Some(stack.as_ref().map(|icon| icon.id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(1), Some(276)],
+            "the stocked cells carry, the rest stay out: {draws:?}"
+        );
+    }
+
     #[test]
     fn the_hovered_tooltip_waits_for_the_empty_cursor() {
         use oxide_client::screens::container::{ContainerLayout, SlotPos, TitleKind};

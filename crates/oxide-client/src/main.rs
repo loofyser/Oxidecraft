@@ -4372,9 +4372,10 @@ impl ApplicationHandler for ClientApp {
             renderer.set_hud_texture(assets::UNDERWATER_OVERLAY, &assets.underwater);
             // The GUI sheets: the widgets, the container family, the book sheets,
             // the SGA glyph sheet and the chest trio's icon sheets, under the keys
-            // the screens and the chest item model name them.
+            // the screens and the chest item model name them — on both GUI
+            // passes, so a screen draw never names a texture only the hud holds.
             for (key, texture) in &assets.gui_sheets {
-                renderer.set_hud_texture(key, texture);
+                renderer.set_gui_sheet(key, texture);
             }
             renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
             // The entity pass's icon source: the same resolver the hud's item draws

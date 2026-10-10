@@ -73,7 +73,7 @@ use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
 use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
-use oxide_render::renderer::{SKY_COLOR, boss_status_step};
+use oxide_render::renderer::{SKY_COLOR, bind_gui_atlas, bind_gui_sheet, boss_status_step};
 use oxide_render::sky::{
     CloudPass, HORIZON, MOON_HEIGHT, SkyParams, SkyPass, SkyTextures, celestial_rotation,
     star_field,
@@ -11303,4 +11303,156 @@ fn t23_widgets_sheet() -> Texture {
         height: SIDE,
         rgba,
     }
+}
+
+/// Fix round 3c's synthetic container sheet: a 32x32 panel, green left half and blue
+/// right half, fully opaque. Generated here; no asset pixel is embedded.
+fn fix3c_panel_sheet() -> Texture {
+    const SIDE: u32 = 32;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let colour = if x < SIDE / 2 {
+                [0, 200, 0, 255]
+            } else {
+                [0, 60, 220, 255]
+            };
+            let at = ((y * SIDE + x) * 4) as usize;
+            rgba[at..at + 4].copy_from_slice(&colour);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// Fix round 3c's GUI pass pair, wired the way the live bootstrap wires it: the two
+/// passes share one resolution, the pair's sheets and icon atlas land through the
+/// production bind helpers ([`bind_gui_sheet`], [`bind_gui_atlas`]), and both passes
+/// resolve icons through the fixture source. The draws stay the caller's.
+fn fix3c_gui_pair(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> (HudPass, HudPass) {
+    let mut hud = HudPass::new(device, queue, format);
+    hud.set_resolution(queue, SIZE as f32, SIZE as f32);
+    let mut screen = HudPass::new(device, queue, format);
+    screen.set_resolution(queue, SIZE as f32, SIZE as f32);
+    bind_gui_sheet(
+        &mut hud,
+        &mut screen,
+        device,
+        queue,
+        "fix3c/panel",
+        &fix3c_panel_sheet(),
+    );
+    bind_gui_atlas(&mut hud, &mut screen, device, queue, &item_atlas());
+    let source = Arc::new(TestIcons {
+        atlas: item_atlas(),
+    });
+    hud.set_icon_source(device, queue, source.clone());
+    screen.set_icon_source(device, queue, source);
+    (hud, screen)
+}
+
+/// Fix round 3c RED — the container panel's bind: the screen pass draws the sheet blit
+/// it names. The live screen pass's registry never receives the container sheets
+/// (`set_screen_texture` has no live caller), so the batch is skipped silently and the
+/// panel stays sky. RED: both panel halves read sky (0 panel pixels).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn fix3c_screen_draws_the_panel_blit_it_names() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let (_hud, mut screen) = fix3c_gui_pair(&device, &queue, format);
+    screen.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::TexturedRect {
+            texture: HudTexture::Named("fix3c/panel"),
+            x: 16.0,
+            y: 16.0,
+            width: 32.0,
+            height: 32.0,
+            uv: [0.0, 0.0, 1.0, 1.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = item_frame(&device, &queue, &target, &screen);
+    expect_pixel(&pixels, 20, 20, [0, 200, 0], "the panel's left half");
+    expect_pixel(&pixels, 44, 20, [0, 60, 220], "the panel's right half");
+    expect_pixel(&pixels, 4, 4, SKY, "the sky past the panel");
+}
+
+/// Fix round 3c RED — the container slot sprites' bind: the screen pass draws an
+/// atlas-mapped icon over the panel. Neither live GUI pass uploads the icon atlas
+/// binding, so the icon batch is skipped silently and the cell stays sky. RED: the
+/// icon owns 0 pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn fix3c_screen_draws_the_slot_item_it_names() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let (_hud, mut screen) = fix3c_gui_pair(&device, &queue, format);
+    screen.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::Item {
+            stack: Some(ItemIcon {
+                id: 2,
+                damage: 0,
+                enchanted: false,
+            }),
+            x: 24.0,
+            y: 24.0,
+            pop: 0.0,
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = item_frame(&device, &queue, &target, &screen);
+    let own = non_sky(&pixels);
+    assert!(
+        own > 200,
+        "the icon's own pixel count: the flat checker's cell, got {own}"
+    );
+}
+
+/// Fix round 3c RED — the hotbar strip's shared path: the hud pass draws an
+/// atlas-mapped icon too. The icon path is shared with the container slots, and the
+/// hud pass misses the same binding — the strip keeps its bar, counts and durability
+/// ramp (all 2D draws) while every sprite stays sky. RED: the icon owns 0 pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn fix3c_hud_draws_the_hotbar_item_it_names() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let (mut hud, _screen) = fix3c_gui_pair(&device, &queue, format);
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::Item {
+            stack: Some(ItemIcon {
+                id: 2,
+                damage: 0,
+                enchanted: false,
+            }),
+            x: 24.0,
+            y: 24.0,
+            pop: 0.0,
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = item_frame(&device, &queue, &target, &hud);
+    let own = non_sky(&pixels);
+    assert!(
+        own > 200,
+        "the icon's own pixel count: the flat checker's cell, got {own}"
+    );
 }

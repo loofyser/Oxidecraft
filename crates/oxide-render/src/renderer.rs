@@ -221,6 +221,39 @@ pub struct Renderer {
     fog: Option<FogParams>,
 }
 
+/// Registers one GUI sheet on the GUI pass pair: on both. The screen pass keeps its
+/// own registry beside the hud's, so the bootstrap must fill both — a screen draw
+/// naming a sheet only the hud holds is skipped, silently, at the batch's bind
+/// (`hud.rs`'s unbound-texture skip). That was the container panel's own bail: the
+/// background blits (and the builtin chest icons) named sheets the screen pass never
+/// received, with zero texture errors in the log.
+pub fn bind_gui_sheet(
+    hud: &mut HudPass,
+    screen: &mut HudPass,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    name: &'static str,
+    texture: &Texture,
+) {
+    hud.set_texture(device, queue, name, texture);
+    screen.set_texture(device, queue, name, texture);
+}
+
+/// Uploads the block atlas's level-0 icon binding on the GUI pass pair: on both. The
+/// icons' meshes sample it, so until both passes hold it the hud's and the screen's
+/// [`HudDraw::Item`] batches are skipped, silently, at the batch's bind. That was the
+/// shared item-sprite bail — the container slots' and the hotbar strip's alike.
+pub fn bind_gui_atlas(
+    hud: &mut HudPass,
+    screen: &mut HudPass,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atlas: &Atlas,
+) {
+    hud.set_atlas_icon(device, queue, atlas);
+    screen.set_atlas_icon(device, queue, atlas);
+}
+
 impl Renderer {
     /// Creates the device for `window` and configures its surface.
     ///
@@ -440,10 +473,21 @@ impl Renderer {
     /// — the shipping client sets one from its bootstrap — still renders its clear colour
     /// rather than sampling an unbound texture. M6 re-uploads here when an animated sprite
     /// advances.
+    ///
+    /// The same call binds the atlas's level-0 icon view on both GUI passes
+    /// ([`bind_gui_atlas`]): the item icons' meshes sample it, so until this call the
+    /// hud's and the screen's [`HudDraw::Item`] draws contribute nothing.
     pub fn set_atlas(&mut self, atlas: &Atlas) {
         self.terrain.set_atlas(&self.device, &self.queue, atlas);
         self.world_overlay
             .set_atlas(&self.device, &self.queue, atlas);
+        bind_gui_atlas(
+            &mut self.hud,
+            &mut self.screen,
+            &self.device,
+            &self.queue,
+            atlas,
+        );
     }
 
     /// Uploads the ascii font sheet the debug overlay, the entity pass's nametags and the hud
@@ -697,6 +741,21 @@ impl Renderer {
     pub fn set_screen_texture(&mut self, name: &'static str, texture: &Texture) {
         self.screen
             .set_texture(&self.device, &self.queue, name, texture);
+    }
+
+    /// Registers one GUI sheet on both GUI passes, through the pair's shared
+    /// rule ([`bind_gui_sheet`]): the container family's sheets, the book sheets,
+    /// the SGA glyph sheet and the chest trio's icon sheets — every sheet a screen
+    /// draw names, under the key its draw carries.
+    pub fn set_gui_sheet(&mut self, name: &'static str, texture: &Texture) {
+        bind_gui_sheet(
+            &mut self.hud,
+            &mut self.screen,
+            &self.device,
+            &self.queue,
+            name,
+            texture,
+        );
     }
 
     /// Uploads the glint sheet the hud's enchanted icons' glint passes sample.
