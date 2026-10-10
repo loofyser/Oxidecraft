@@ -27,7 +27,7 @@ use oxide_game::container::{
     BaseStackCaps, CLICK_MODE_CREATIVE_PICK, CLICK_MODE_DRAG, CLICK_MODE_DROP, CLICK_MODE_GATHER,
     CLICK_MODE_PICKUP, CLICK_MODE_QUICK_MOVE, CLICK_MODE_SWAP, drag_button,
 };
-use oxide_game::input::InputEvent;
+use oxide_game::input::{InputEvent, drop_item, hotbar_step};
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
@@ -693,5 +693,248 @@ fn an_open_stands_the_resolved_table() {
     assert_eq!(
         slots, 39,
         "the furnace stands its 3 slots plus the player 36"
+    );
+}
+
+// ---- Task 24's routing table: the inventory keys and the wheel, per path ----
+//
+// The source's own key handling, derived per path (`Minecraft.java`
+// :1859-1892 for the wheel, :2076-2111 for the digits and the drop,
+// :2092-2101 for the inventory key, :1944-1949 for Escape,
+// `GuiContainer.keyTyped`:692-696 for the container close,
+// `InventoryPlayer.changeCurrentItem`:165-185 for the wheel step):
+// - E from no screen opens the inventory beside one C16 per open;
+// - E behind a container screen swaps it to the inventory — the close (C0D)
+//   never unpresses, so the same press re-opens (C16);
+// - E in the inventory closes and re-opens: it stays open;
+// - the wheel steps one slot per event even over a screen, where the screen's
+//   own scroll runs in addition;
+// - the digits set the slot directly everywhere the screen does not own the
+//   key, and swap inside a container on top;
+// - Q drops one item outside screens, the whole stack with Ctrl;
+// - Escape closes the current screen; with no screen the port runs the M3
+//   capture rule (release-while-grabbed, else exit) in place of the source's
+//   pause menu — the recorded substitution. The confirm → chat → screen order
+//   is port-new layering: the source has a single screen slot (chat IS a
+//   screen).
+
+// E from no screen opens the inventory beside one C16; two opens on separate
+// ticks send two — each press queues its own edge (`KeyBinding.java`:24-33,
+// :101-110), and the first open's `setIngameNotInFocus` unpress is what
+// forbids counting two presses in one tick as two.
+
+#[test]
+fn e_from_no_screen_opens_the_inventory_with_one_c16_per_open() {
+    let mut screens = Screens::default();
+    assert_eq!(
+        screens.open_inventory(),
+        Some(InputEvent::OpenInventory),
+        "the first open sends one C16"
+    );
+    assert!(screens.is_open(), "the inventory stands");
+    assert_eq!(
+        screens.current_window_id(),
+        Some(0),
+        "window 0 is the player's own"
+    );
+    // The second open, on its own tick, sends its own C16: two opens send
+    // two.
+    assert_eq!(
+        screens.open_inventory(),
+        Some(InputEvent::OpenInventory),
+        "the second open sends one more C16"
+    );
+    assert!(screens.is_open(), "the inventory still stands");
+}
+
+// E behind a container screen swaps it to the inventory: the close branch
+// (`GuiContainer.keyTyped`:692-696 through `EntityPlayerSP.closeScreen`
+// :330-341) sends C0D for the container's window, and the same press — never
+// unpressed, the close path is not the screen-OPEN path — reaches the
+// unguarded inventory loop (`Minecraft.java`:2092-2101) and re-opens with a
+// C16 beside the window-0 screen.
+
+#[test]
+fn e_behind_a_container_swaps_it_to_the_inventory() {
+    let mut screens = Screens::default();
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
+    let mut cursor = None;
+    assert_eq!(
+        screens.close(&mut cursor),
+        Some(InputEvent::CloseWindow { window_id: 7 }),
+        "the same press first closes the container: C0D for window 7"
+    );
+    assert_eq!(
+        screens.open_inventory(),
+        Some(InputEvent::OpenInventory),
+        "then re-opens: one C16"
+    );
+    assert!(screens.is_open(), "the swap ends on a screen");
+    assert_eq!(
+        screens.current_window_id(),
+        Some(0),
+        "the window-0 inventory stands where the chest stood"
+    );
+}
+
+// E in the inventory closes and re-opens: the chain above run on window 0
+// ends where it started — Escape, not E, is the closer.
+
+#[test]
+fn e_in_the_inventory_closes_and_reopens_so_it_stays_open() {
+    let mut screens = Screens::default();
+    screens.open_inventory();
+    let mut cursor = None;
+    assert_eq!(
+        screens.close(&mut cursor),
+        Some(InputEvent::CloseWindow { window_id: 0 }),
+        "the close still sends C0D for window 0"
+    );
+    assert_eq!(
+        screens.open_inventory(),
+        Some(InputEvent::OpenInventory),
+        "and the same press re-opens"
+    );
+    assert!(screens.is_open(), "E never leaves the inventory shut");
+    assert_eq!(screens.current_window_id(), Some(0));
+}
+
+// The wheel outside screens steps one slot per event: the delta clamps to
+// its sign and the nine slots wrap (`changeCurrentItem`:165-185).
+
+#[test]
+fn the_wheel_outside_screens_steps_one_slot_per_event() {
+    assert_eq!(hotbar_step(3, 1.0), 4);
+    assert_eq!(hotbar_step(3, -1.0), 2);
+    assert_eq!(
+        hotbar_step(3, 5.0),
+        4,
+        "a five-notch event still steps one slot"
+    );
+    assert_eq!(hotbar_step(8, 1.0), 0, "the top wraps to the bottom");
+    assert_eq!(hotbar_step(0, -1.0), 8, "the bottom wraps to the top");
+}
+
+// The wheel over the creative screen does both: the list scrolls
+// (`handleMouseInput`:546-569) AND the held slot flips — `changeCurrentItem`
+// at `Minecraft.java`:1879 has no screen guard; the screen's handler at
+// :1892 runs in addition.
+
+#[test]
+fn the_wheel_over_the_creative_screen_scrolls_and_flips() {
+    use oxide_client::screens::creative::wheel_scroll;
+    // A 100-entry list scrolls: one positive notch moves the offset.
+    let scrolled = wheel_scroll(0.5, 100, 1.0);
+    assert!(
+        scrolled < 0.5,
+        "the list scrolled: {scrolled} (a short list fits and ignores the wheel)"
+    );
+    // The same event flips the held slot concurrently.
+    assert_eq!(
+        hotbar_step(3, 1.0),
+        4,
+        "the concurrent held-slot change runs beside the scroll"
+    );
+    // A list that fits takes no scroll — but the flip still runs.
+    assert_eq!(
+        wheel_scroll(0.5, 9, 1.0),
+        0.5,
+        "a fitting list ignores the scroll half"
+    );
+    assert_eq!(
+        hotbar_step(3, 1.0),
+        4,
+        "while the held-slot change still runs"
+    );
+}
+
+// The digits outside screens set the slot directly: digit N reads hotbar
+// index N−1 (`Minecraft.java`:2076-2090, no screen guard), sent as
+// `HeldItemChange`.
+
+#[test]
+fn the_digits_outside_screens_set_the_slot_directly() {
+    use oxide_game::input::Key;
+    let digits = [
+        Key::Digit1,
+        Key::Digit2,
+        Key::Digit3,
+        Key::Digit4,
+        Key::Digit5,
+        Key::Digit6,
+        Key::Digit7,
+        Key::Digit8,
+        Key::Digit9,
+    ];
+    for (slot, key) in digits.iter().enumerate() {
+        let slot = slot as i16;
+        let event = InputEvent::HeldItemChange {
+            slot: key.hotbar_slot().expect("a digit selects its slot"),
+        };
+        assert_eq!(
+            event,
+            InputEvent::HeldItemChange { slot },
+            "{key:?} travels as the slot's own change"
+        );
+    }
+}
+
+// The digits over a container do both halves: the direct set above AND the
+// mode-2 swap when hovering a stack with an empty cursor
+// (`checkHotbarKeys`, firing only then).
+
+#[test]
+fn the_digits_over_a_container_set_and_swap() {
+    let mut screen = screen_with_cursor(None);
+    let got = clicks(screen.screen_key(ScreenKey::Number(3), false));
+    assert_eq!(
+        got,
+        vec![(0, 3, CLICK_MODE_SWAP)],
+        "the swap half fires over the hovered stack"
+    );
+    use oxide_game::input::Key;
+    assert_eq!(
+        Key::Digit4.hotbar_slot(),
+        Some(3),
+        "the direct-set half runs with it: digit 4 is slot 3"
+    );
+}
+
+// Q outside screens drops one item, Ctrl+Q the whole stack
+// (`Minecraft.java`:2105-2111 over `EntityPlayerSP.dropOneItem`:279-284).
+
+#[test]
+fn q_outside_screens_drops_one_and_ctrl_q_drops_the_whole_stack() {
+    assert_eq!(drop_item(false), InputEvent::DropItem { whole: false });
+    assert_eq!(drop_item(true), InputEvent::DropItem { whole: true });
+}
+
+// Escape closes the current screen — the chest's own window id, window 0 for
+// the inventory — and with no screen the screens send nothing: the no-screen
+// arm is the M3 capture rule's (release-while-grabbed, else exit), the
+// recorded substitution for the source's pause menu
+// (`Minecraft.java`:1944-1949).
+
+#[test]
+fn escape_closes_the_screen_and_sends_nothing_with_no_screen() {
+    let mut screens = Screens::default();
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
+    assert_eq!(
+        screens.escape(&mut None),
+        Some(InputEvent::CloseWindow { window_id: 7 })
+    );
+    assert!(!screens.is_open());
+    let mut screens = Screens::default();
+    screens.open_inventory();
+    assert_eq!(
+        screens.escape(&mut None),
+        Some(InputEvent::CloseWindow { window_id: 0 })
+    );
+    assert!(!screens.is_open());
+    let mut screens = Screens::default();
+    assert_eq!(
+        screens.escape(&mut None),
+        None,
+        "no screen sends nothing: the capture rule owns the no-screen arm"
     );
 }

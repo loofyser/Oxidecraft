@@ -37,6 +37,21 @@ pub(crate) fn translate(code: KeyCode) -> Option<Key> {
         KeyCode::ArrowRight => Some(Key::ArrowRight),
         KeyCode::ArrowUp => Some(Key::ArrowUp),
         KeyCode::ArrowDown => Some(Key::ArrowDown),
+        // The inventory keys Task 24 routes: E opens (`keyBindInventory`,
+        // `GameSettings.java`:134), Q drops (`keyBindDrop`, `:136`) and the
+        // digits 1–9 are the hotbar bindings (`keyBindsHotbar[0..8]`, `:151`,
+        // key codes 2–10) — the top row and the numpad alike.
+        KeyCode::KeyE => Some(Key::E),
+        KeyCode::KeyQ => Some(Key::Q),
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some(Key::Digit1),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some(Key::Digit2),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some(Key::Digit3),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some(Key::Digit4),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some(Key::Digit5),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some(Key::Digit6),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some(Key::Digit7),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some(Key::Digit8),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some(Key::Digit9),
         _ => None,
     }
 }
@@ -64,10 +79,9 @@ mod tests {
 
     #[test]
     fn an_unbound_key_maps_to_nothing() {
-        // Movement keys are bound; Q and the right-hand modifiers are not,
-        // and must never reach the session. Escape is not bound either: the
-        // capture and chat rules route it before this table.
-        assert_eq!(translate(KeyCode::KeyQ), None);
+        // Movement keys are bound; the right-hand modifiers are not, and must
+        // never reach the session. Escape is not bound either: the capture
+        // and chat rules route it before this table.
         assert_eq!(translate(KeyCode::Escape), None);
         assert_eq!(translate(KeyCode::ShiftRight), None);
         assert_eq!(translate(KeyCode::ControlRight), None);
@@ -90,5 +104,28 @@ mod tests {
         assert_eq!(translate(KeyCode::ArrowRight), Some(Key::ArrowRight));
         assert_eq!(translate(KeyCode::ArrowUp), Some(Key::ArrowUp));
         assert_eq!(translate(KeyCode::ArrowDown), Some(Key::ArrowDown));
+    }
+
+    #[test]
+    fn the_inventory_and_drop_and_hotbar_keys_map_to_the_game_keys() {
+        // The inventory keys Task 24 routes: E opens (`keyBindInventory`,
+        // `GameSettings.java`:134, key code 18), Q drops (`keyBindDrop`,
+        // `:136`, key code 16) and the digits 1–9 are the hotbar bindings
+        // (`keyBindsHotbar[0..8]`, `:151`, key codes 2–10) — the top row and
+        // the numpad alike.
+        assert_eq!(translate(KeyCode::KeyE), Some(Key::E));
+        assert_eq!(translate(KeyCode::KeyQ), Some(Key::Q));
+        assert_eq!(translate(KeyCode::Digit1), Some(Key::Digit1));
+        assert_eq!(translate(KeyCode::Digit2), Some(Key::Digit2));
+        assert_eq!(translate(KeyCode::Digit3), Some(Key::Digit3));
+        assert_eq!(translate(KeyCode::Digit4), Some(Key::Digit4));
+        assert_eq!(translate(KeyCode::Digit5), Some(Key::Digit5));
+        assert_eq!(translate(KeyCode::Digit6), Some(Key::Digit6));
+        assert_eq!(translate(KeyCode::Digit7), Some(Key::Digit7));
+        assert_eq!(translate(KeyCode::Digit8), Some(Key::Digit8));
+        assert_eq!(translate(KeyCode::Digit9), Some(Key::Digit9));
+        assert_eq!(translate(KeyCode::Numpad1), Some(Key::Digit1));
+        assert_eq!(translate(KeyCode::Numpad5), Some(Key::Digit5));
+        assert_eq!(translate(KeyCode::Numpad9), Some(Key::Digit9));
     }
 }

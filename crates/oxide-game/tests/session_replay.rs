@@ -7410,6 +7410,39 @@ fn two_inventory_opens_send_two_client_status_twos() {
 }
 
 #[test]
+fn the_drop_key_sends_the_digging_pair_at_the_origin_facing_down() {
+    // The drop key's own pair (`EntityPlayerSP.dropOneItem:279-284`): the
+    // whole stack is `DROP_ALL_ITEMS` (status 3), one item `DROP_ITEM`
+    // (status 4), both at the origin and facing down — the session's
+    // `DropItem` arm writes exactly that pair.
+    let head = feed_head(&[]);
+    let (_events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (2, InputEvent::DropItem { whole: false }),
+            (4, InputEvent::DropItem { whole: true }),
+        ],
+    );
+
+    let digs: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x07)
+        .cloned()
+        .collect();
+    assert_eq!(
+        digs,
+        vec![
+            vec![0x07, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0x00],
+            vec![0x07, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0x00],
+        ],
+        "one item sends status 4, the whole stack status 3, both at the origin facing down: {frames:?}"
+    );
+}
+
+#[test]
 fn a_held_item_change_moves_the_selection_and_reports_it() {
     // The view's own change rule (`PlayerControllerMP.syncCurrentPlayItem:379-388`,
     // the C09 the running controller sends) hands each move here: the session

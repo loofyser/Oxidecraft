@@ -26,8 +26,11 @@ use oxide_proto_v47::entity::MetadataItem;
 /// M3's input surface names (`GameSettings.java:127-133`) plus the chat keys
 /// M4 adds: the two openers (`keyBindChat`, `keyBindCommand` — `:139`, `:141`)
 /// and the editing keys the open chat field reads (`GuiChat.keyTyped`:87-138).
-/// Escape is not here: the capture and chat rules route it before the key
-/// table, so it needs no slot.
+/// Task 24 adds the inventory keys: E opens the inventory (`keyBindInventory`,
+/// `:134`, key code 18), Q drops (`keyBindDrop`, `:136`, key code 16) and the
+/// digits 1–9 are the hotbar bindings (`keyBindsHotbar[0..8]`, `:151`, key
+/// codes 2–10). Escape is not here: the capture and chat rules route it before
+/// the key table, so it needs no slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     /// Forward: `keyBindForward`, key code 17.
@@ -63,6 +66,35 @@ pub enum Key {
     ArrowUp,
     /// The down arrow: the recall walks forward again (`GuiChat.getSentHistory`:275-292).
     ArrowDown,
+    /// The inventory key: `keyBindInventory`, key code 18. A fresh press with
+    /// no screen open stands the inventory beside one C16 (`Minecraft.java`
+    /// :2092-2101); behind a container screen the same press swaps it to the
+    /// inventory (the close at `GuiContainer.keyTyped`:692-696 never unpresses,
+    /// so the unguarded loop consumes the same press).
+    E,
+    /// The drop key: `keyBindDrop`, key code 16. Outside screens a press drops
+    /// one item, the whole stack with Ctrl held (`Minecraft.java`:2105-2111
+    /// over `EntityPlayerSP.dropOneItem`:279-284); over a container the
+    /// screen's own drop routing answers instead.
+    Q,
+    /// Hotbar 1: `keyBindsHotbar[0]`, key code 2.
+    Digit1,
+    /// Hotbar 2: `keyBindsHotbar[1]`, key code 3.
+    Digit2,
+    /// Hotbar 3: `keyBindsHotbar[2]`, key code 4.
+    Digit3,
+    /// Hotbar 4: `keyBindsHotbar[3]`, key code 5.
+    Digit4,
+    /// Hotbar 5: `keyBindsHotbar[4]`, key code 6.
+    Digit5,
+    /// Hotbar 6: `keyBindsHotbar[5]`, key code 7.
+    Digit6,
+    /// Hotbar 7: `keyBindsHotbar[6]`, key code 8.
+    Digit7,
+    /// Hotbar 8: `keyBindsHotbar[7]`, key code 9.
+    Digit8,
+    /// Hotbar 9: `keyBindsHotbar[8]`, key code 10.
+    Digit9,
 }
 
 /// One mouse button the client binds.
@@ -209,10 +241,10 @@ pub enum InputEvent {
 
 /// How many physical keys the intent tracks.
 ///
-/// The movement and sprint keys and the chat keys the field rides; the count
-/// is the [`Key`] variant count so [`Key::index`] stays total, but only the
-/// gameplay keys drive any intent.
-const KEY_COUNT: usize = 16;
+/// The movement and sprint keys, the chat keys the field rides and the
+/// inventory keys Task 24 routes; the count is the [`Key`] variant count so
+/// [`Key::index`] stays total, but only the gameplay keys drive any intent.
+const KEY_COUNT: usize = 27;
 
 /// The sneak input scale: `MovementInputFromOptions.java:42-46` multiplies
 /// both movement axes by 0.3 while sneak is held.
@@ -275,6 +307,37 @@ impl Key {
             Key::ArrowRight => 13,
             Key::ArrowUp => 14,
             Key::ArrowDown => 15,
+            Key::E => 16,
+            Key::Q => 17,
+            Key::Digit1 => 18,
+            Key::Digit2 => 19,
+            Key::Digit3 => 20,
+            Key::Digit4 => 21,
+            Key::Digit5 => 22,
+            Key::Digit6 => 23,
+            Key::Digit7 => 24,
+            Key::Digit8 => 25,
+            Key::Digit9 => 26,
+        }
+    }
+
+    /// The hotbar slot this key selects, if it is one of the digit keys.
+    ///
+    /// The digits 1–9 read hotbar indices 0–8 (`Minecraft.java`:2076-2090 sets
+    /// `thePlayer.inventory.currentItem` with no screen guard); every other
+    /// key selects nothing.
+    pub fn hotbar_slot(self) -> Option<i16> {
+        match self {
+            Key::Digit1 => Some(0),
+            Key::Digit2 => Some(1),
+            Key::Digit3 => Some(2),
+            Key::Digit4 => Some(3),
+            Key::Digit5 => Some(4),
+            Key::Digit6 => Some(5),
+            Key::Digit7 => Some(6),
+            Key::Digit8 => Some(7),
+            Key::Digit9 => Some(8),
+            _ => None,
         }
     }
 
@@ -282,14 +345,41 @@ impl Key {
     ///
     /// The movement update reads the movement slots only — the chat keys
     /// carry slots so the index space stays total but drive no movement — and
-    /// the window's gameplay translation filters on this, so a chat key's
-    /// edge never travels to the session as gameplay input.
+    /// the inventory keys are the same: E, Q and the digits route to the
+    /// screens and the session's own sends, never to the movement intent, so
+    /// the window's gameplay translation filters on this and their edges
+    /// never travel as gameplay input.
     pub fn is_gameplay(self) -> bool {
         matches!(
             self,
             Key::W | Key::A | Key::S | Key::D | Key::Space | Key::ShiftLeft | Key::ControlLeft
         )
     }
+}
+
+/// One wheel event's held-slot step: the slot the selection moves to.
+///
+/// The source clamps the event's delta to its sign — one slot per wheel event
+/// — and wraps the nine hotbar slots (`InventoryPlayer.changeCurrentItem`
+/// :165-185). A zero delta steps nowhere. The caller sends the result as
+/// [`InputEvent::HeldItemChange`]; the screen's own scroll, when one is open,
+/// runs in addition (`Minecraft.java`:1879/:1892).
+pub fn hotbar_step(current: i16, delta: f32) -> i16 {
+    let step = if delta > 0.0 {
+        1
+    } else if delta < 0.0 {
+        -1
+    } else {
+        0
+    };
+    (current + step).rem_euclid(9)
+}
+
+/// The drop key's send for one press outside screens: one item, or the whole
+/// stack with Ctrl held (`Minecraft.java`:2105-2111 over
+/// `EntityPlayerSP.dropOneItem`:279-284).
+pub fn drop_item(ctrl_held: bool) -> InputEvent {
+    InputEvent::DropItem { whole: ctrl_held }
 }
 
 impl Intent {
@@ -439,7 +529,7 @@ pub fn look_delta(dx: f64, dy: f64, sensitivity: f32) -> (f32, f32) {
 mod tests {
     //! The binding table, the double-tap sprint rule and the look mapping.
 
-    use super::{Intent, Key, SprintTap, look_delta};
+    use super::{InputEvent, Intent, Key, SprintTap, drop_item, hotbar_step, look_delta};
 
     /// The intent with `key` alone held.
     fn press(key: Key) -> Intent {
@@ -796,5 +886,145 @@ mod tests {
         ] {
             assert!(!key.is_gameplay(), "{key:?} is not gameplay input");
         }
+    }
+
+    #[test]
+    fn the_inventory_keys_hold_slots_but_drive_no_intent() {
+        // E, Q and the digits route to the screens and the session's own
+        // sends (`keyBindInventory` :134, `keyBindDrop` :136,
+        // `keyBindsHotbar` :151); like the chat keys they carry held slots so
+        // the index space stays total but drive no movement.
+        for key in [
+            Key::E,
+            Key::Q,
+            Key::Digit1,
+            Key::Digit2,
+            Key::Digit3,
+            Key::Digit4,
+            Key::Digit5,
+            Key::Digit6,
+            Key::Digit7,
+            Key::Digit8,
+            Key::Digit9,
+        ] {
+            assert!(!key.is_gameplay(), "{key:?} is not gameplay input");
+            let mut intent = Intent::neutral();
+            intent.apply_key(key, true);
+            let motion = (
+                intent.forward,
+                intent.strafe,
+                intent.jump,
+                intent.sneak,
+                intent.sprint,
+            );
+            assert_eq!(
+                motion,
+                (0.0, 0.0, false, false, false),
+                "{key:?} drives no movement"
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_index_space_is_total_over_all_twenty_seven_keys() {
+        // The count is the variant count: every key holds a distinct slot
+        // under it, so no two keys share held state.
+        let keys = [
+            Key::W,
+            Key::A,
+            Key::S,
+            Key::D,
+            Key::Space,
+            Key::ShiftLeft,
+            Key::ControlLeft,
+            Key::T,
+            Key::Slash,
+            Key::Tab,
+            Key::Enter,
+            Key::Backspace,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::E,
+            Key::Q,
+            Key::Digit1,
+            Key::Digit2,
+            Key::Digit3,
+            Key::Digit4,
+            Key::Digit5,
+            Key::Digit6,
+            Key::Digit7,
+            Key::Digit8,
+            Key::Digit9,
+        ];
+        assert_eq!(keys.len(), 27, "every variant is listed");
+        let mut seen = [false; 27];
+        for key in keys {
+            // Each key's slot is its own: pressing one and releasing another
+            // leaves the first held.
+            let mut intent = Intent::neutral();
+            intent.apply_key(key, true);
+            assert_ne!(intent, Intent::neutral(), "{key:?} holds its slot");
+            seen[key.index()] = true;
+        }
+        assert!(seen.iter().all(|slot| *slot), "no two keys share a slot");
+    }
+
+    #[test]
+    fn the_digits_map_to_the_hotbar_slots_and_nothing_else_does() {
+        // `Minecraft.java`:2076-2090 reads `keyBindsHotbar[l]` as slot `l`:
+        // digit 1 is slot 0 through digit 9 at slot 8.
+        let digits = [
+            Key::Digit1,
+            Key::Digit2,
+            Key::Digit3,
+            Key::Digit4,
+            Key::Digit5,
+            Key::Digit6,
+            Key::Digit7,
+            Key::Digit8,
+            Key::Digit9,
+        ];
+        for (slot, key) in digits.iter().enumerate() {
+            assert_eq!(key.hotbar_slot(), Some(slot as i16), "{key:?} selects");
+        }
+        for key in [
+            Key::W,
+            Key::E,
+            Key::Q,
+            Key::T,
+            Key::Space,
+            Key::Enter,
+            Key::ArrowUp,
+        ] {
+            assert_eq!(key.hotbar_slot(), None, "{key:?} selects nothing");
+        }
+    }
+
+    #[test]
+    fn the_wheel_steps_one_slot_per_event_and_wraps_the_hotbar() {
+        // `InventoryPlayer.changeCurrentItem`:165-185: the delta clamps to
+        // its sign — a five-notch event still steps one slot — and the nine
+        // slots wrap.
+        assert_eq!(hotbar_step(3, 1.0), 4);
+        assert_eq!(hotbar_step(3, -1.0), 2);
+        assert_eq!(
+            hotbar_step(3, 5.0),
+            4,
+            "a five-notch event still steps one slot"
+        );
+        assert_eq!(hotbar_step(3, -5.0), 2);
+        assert_eq!(hotbar_step(8, 1.0), 0, "the top wraps to the bottom");
+        assert_eq!(hotbar_step(0, -1.0), 8, "the bottom wraps to the top");
+        assert_eq!(hotbar_step(4, 0.0), 4, "a zero delta steps nowhere");
+    }
+
+    #[test]
+    fn the_drop_key_sends_one_item_or_the_whole_stack() {
+        // `Minecraft.java`:2105-2111 over `EntityPlayerSP.dropOneItem`
+        // :279-284: plain Q drops one item, Ctrl+Q the whole stack.
+        assert_eq!(drop_item(false), InputEvent::DropItem { whole: false });
+        assert_eq!(drop_item(true), InputEvent::DropItem { whole: true });
     }
 }

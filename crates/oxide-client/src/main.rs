@@ -62,7 +62,7 @@ use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, s
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
-use oxide_game::input::{InputEvent, Key, MouseButton};
+use oxide_game::input::{InputEvent, Key, MouseButton, drop_item, hotbar_step};
 use oxide_game::interaction::Aim;
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
@@ -188,6 +188,89 @@ enum DirectiveAction {
     /// the character path and the send leaves on the line's own tick — the
     /// same field machine the window's T and typing drive, not a shortcut.
     Chat(String),
+    /// `move <x> <y>`: set the freed-pointer cursor to the GUI-unit point —
+    /// the window's own cursor position, which the hover and the click's
+    /// hit-test read. A rig run has no pointer to free, so the script sets
+    /// it directly.
+    Move { x: f32, y: f32 },
+    /// `click <x> <y> <button> [shift]`: the screen's own press-then-release
+    /// at the point — `GuiContainer.mouseClicked` then `mouseReleased`
+    /// (:359-465, :515-652) through the same derivation the window's own
+    /// button runs — with the pointer fed first.
+    Click {
+        x: f32,
+        y: f32,
+        button: ClickButton,
+        shift: bool,
+    },
+    /// `drag <x1> <y1> <x2> <y2> <button>`: press at the first point, move the
+    /// cursor to the second (accumulating the drag through `mouseClickMove`,
+    /// :466-513), then release — the release sends the drag's three-step
+    /// sequence like the manual path.
+    Drag {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        button: ClickButton,
+    },
+    /// `wheel <notches>`: one ±1 held-slot step per notch — N notches are N
+    /// wheel events, the source consumes only the sign
+    /// (`InventoryPlayer.changeCurrentItem`:165-185) — chained from the live
+    /// selection.
+    Wheel { notches: i32 },
+    /// `key <name>`: a named key's press edge only — `e`, `q`, `escape`,
+    /// `1`…`9`, `f3`, `h` — driven through the same route as the real key.
+    /// The edge-queue bindings consume presses, not holds, so no release
+    /// follows; `escape` and `f3` are the window's own toggles and `h` needs
+    /// the F3 chord held (Task 17's live `f3_held`), which a script's
+    /// press-only edge never holds — the acceptance scripts avoid it.
+    ScriptKey(ScriptKey),
+}
+
+/// One named key a `key <name>` directive presses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptKey {
+    /// `e`: the inventory key — open from no screen, swap behind one.
+    Inventory,
+    /// `q`: the drop key — one item outside screens.
+    Drop,
+    /// `1`…`9`: the hotbar digit — the slot it selects, 0…8.
+    Digit(i16),
+    /// `escape`: the window's own Escape route.
+    Escape,
+    /// `f3`: the debug overlay toggle.
+    F3,
+    /// `h`: the advanced-tooltips chord — live only with F3 held.
+    H,
+}
+
+/// One queued gesture a `move`/`click`/`drag`/`wheel`/`key` directive left
+/// for the frame's owner: the owner runs each through the window's own path
+/// once the frame's events are in, in file order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScriptGesture {
+    /// `move`: set the freed-pointer cursor.
+    Move { x: f32, y: f32 },
+    /// `click`: the screen's own press-then-release at the point.
+    Click {
+        x: f32,
+        y: f32,
+        button: ClickButton,
+        shift: bool,
+    },
+    /// `drag`: press at the first point, cursor-move, then release.
+    Drag {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        button: ClickButton,
+    },
+    /// `wheel`: the notch count, each notch one ±1 wheel event.
+    Wheel { notches: i32 },
+    /// `key`: the named key's press edge.
+    Key(ScriptKey),
 }
 
 /// The `--input-script` replay: the parsed directives and the tick log.
@@ -229,6 +312,9 @@ struct ScriptDriver {
     /// Whether a scripted gameplay press is waiting for the frame's owner to
     /// start the held item's swing.
     pending_swing: bool,
+    /// The queued container gestures, in file order: the frame's owner runs
+    /// each through the window's own path once the frame's events are in.
+    pending_gestures: Vec<ScriptGesture>,
     /// The tick log, one line per tick.
     log: File,
 }
@@ -260,6 +346,7 @@ impl ScriptDriver {
             last_tick: None,
             pending_chat_click: false,
             pending_swing: false,
+            pending_gestures: Vec::new(),
             log,
         })
     }
@@ -438,6 +525,55 @@ impl ScriptDriver {
                         }
                     }
                 }
+                DirectiveAction::Move { x, y } => {
+                    // The freed-pointer cursor is the owner's to set: the
+                    // gesture queues for the frame's owner with the rest.
+                    self.pending_gestures
+                        .push(ScriptGesture::Move { x: *x, y: *y });
+                }
+                DirectiveAction::Click {
+                    x,
+                    y,
+                    button,
+                    shift,
+                } => {
+                    // The screen's own press-then-release at the point — the
+                    // frame's owner runs it once the frame's events are in.
+                    self.pending_gestures.push(ScriptGesture::Click {
+                        x: *x,
+                        y: *y,
+                        button: *button,
+                        shift: *shift,
+                    });
+                }
+                DirectiveAction::Drag {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    button,
+                } => {
+                    // Press at the first point, cursor-move, then release —
+                    // the frame's owner runs the three like the manual path.
+                    self.pending_gestures.push(ScriptGesture::Drag {
+                        x1: *x1,
+                        y1: *y1,
+                        x2: *x2,
+                        y2: *y2,
+                        button: *button,
+                    });
+                }
+                DirectiveAction::Wheel { notches } => {
+                    // One ±1 wheel event per notch — the frame's owner runs
+                    // each through the window's own wheel.
+                    self.pending_gestures
+                        .push(ScriptGesture::Wheel { notches: *notches });
+                }
+                DirectiveAction::ScriptKey(key) => {
+                    // The named key's press edge — the frame's owner drives it
+                    // through the same route as the real key.
+                    self.pending_gestures.push(ScriptGesture::Key(*key));
+                }
             }
             self.applied += 1;
         }
@@ -485,6 +621,13 @@ impl ScriptDriver {
     fn take_swing(&mut self) -> bool {
         std::mem::take(&mut self.pending_swing)
     }
+
+    /// Takes the queued container gestures, in file order: the frame's owner
+    /// runs each through the window's own path once the frame's events are
+    /// in ([`ClientApp::run_gesture`]).
+    fn take_gestures(&mut self) -> Vec<ScriptGesture> {
+        std::mem::take(&mut self.pending_gestures)
+    }
 }
 
 /// Parses an input script into its directives, in file order.
@@ -501,6 +644,14 @@ impl ScriptDriver {
 /// `#` starts a comment that runs to the end of the line, and blank lines are
 /// ignored. A line the grammar does not cover is refused, and the refusal
 /// names its line number.
+///
+/// The container gestures queue for the frame's owner instead of sending: a
+/// `move` line sets the freed-pointer cursor, `click` is the screen's own
+/// press-then-release at the point, `drag` is press at the first point, one
+/// cursor-move, then release, `wheel` runs one ±1 wheel event per notch, and
+/// `key <name>` drives one named key's press edge (`e`, `q`, `escape`,
+/// `1`…`9`, `f3`, `h`) through the same route as the real key — each through
+/// the window's own path, with no privileged internals.
 fn parse_script(text: &str) -> anyhow::Result<Vec<Directive>> {
     let mut directives = Vec::new();
     for (index, raw) in text.lines().enumerate() {
@@ -535,11 +686,22 @@ fn parse_directive(code: &str, fields: &[&str]) -> anyhow::Result<Directive> {
         anyhow::bail!("the tick is not followed by a directive");
     };
     let action = match name {
-        "key" => DirectiveAction::Input(parse_key(arguments)?),
+        "key" => match arguments {
+            // The named-once form is a press edge only; the two-argument form
+            // keeps the old closed set untouched (additive, never replaced).
+            [name] => DirectiveAction::ScriptKey(parse_script_key(name)?),
+            _ => DirectiveAction::Input(parse_key(arguments)?),
+        },
         "mouse" => DirectiveAction::Input(parse_mouse(arguments)?),
         "look" => DirectiveAction::Input(parse_look(arguments)?),
         "chat" => DirectiveAction::Chat(chat_text(code)?),
-        other => anyhow::bail!("{other:?} is not one of key, mouse, look or chat"),
+        "move" => parse_move(arguments)?,
+        "click" => parse_click(arguments)?,
+        "drag" => parse_drag(arguments)?,
+        "wheel" => parse_wheel(arguments)?,
+        other => anyhow::bail!(
+            "{other:?} is not one of key, mouse, look, chat, move, click, drag or wheel"
+        ),
     };
     Ok(Directive { tick, action })
 }
@@ -563,9 +725,123 @@ fn chat_text(code: &str) -> anyhow::Result<String> {
     Ok(text.to_string())
 }
 
+/// Parses a `key <name>` directive: one named key's press edge
+/// ([`ScriptKey`]) — `e`, `q`, `escape`, `1`…`9`, `f3`, `h`.
+///
+/// The edge-queue bindings consume presses, not holds, so the form carries no
+/// `down|up`: it is a press edge only, driven through the same route as the
+/// real key. `escape` and `f3` are the window's own toggles; `h` needs the F3
+/// chord held (Task 17's live `f3_held`), which a press-only edge never
+/// holds — the acceptance scripts avoid it.
+fn parse_script_key(name: &str) -> anyhow::Result<ScriptKey> {
+    if name.len() == 1 {
+        let digit = name.as_bytes()[0];
+        if (b'1'..=b'9').contains(&digit) {
+            return Ok(ScriptKey::Digit(i16::from(digit - b'1')));
+        }
+    }
+    match name {
+        "e" => Ok(ScriptKey::Inventory),
+        "q" => Ok(ScriptKey::Drop),
+        "escape" => Ok(ScriptKey::Escape),
+        "f3" => Ok(ScriptKey::F3),
+        "h" => Ok(ScriptKey::H),
+        other => anyhow::bail!("{other:?} is not a scripted key"),
+    }
+}
+
+/// Parses a `move <x> <y>` directive: the freed-pointer cursor in the frame's
+/// GUI units — the position the hover and the click's hit-test read.
+fn parse_move(arguments: &[&str]) -> anyhow::Result<DirectiveAction> {
+    let [x, y] = arguments else {
+        anyhow::bail!("move takes an x and a y, got {arguments:?}");
+    };
+    let x: f32 = x
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the move x {x:?} is not a number"))?;
+    let y: f32 = y
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the move y {y:?} is not a number"))?;
+    Ok(DirectiveAction::Move { x, y })
+}
+
+/// Parses a `click <x> <y> <button> [shift]` directive: the screen's own
+/// press-then-release at the point. The optional `shift` forces the
+/// shift-click the live modifiers would give a player — a rig run has no
+/// keyboard to hold.
+fn parse_click(arguments: &[&str]) -> anyhow::Result<DirectiveAction> {
+    let (x, y, button, shift) = match arguments {
+        [x, y, button] => (*x, *y, *button, false),
+        [x, y, button, "shift"] => (*x, *y, *button, true),
+        _ => anyhow::bail!("click takes x, y, a button and an optional shift, got {arguments:?}"),
+    };
+    let x: f32 = x
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the click x {x:?} is not a number"))?;
+    let y: f32 = y
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the click y {y:?} is not a number"))?;
+    Ok(DirectiveAction::Click {
+        x,
+        y,
+        button: parse_click_button(button)?,
+        shift,
+    })
+}
+
+/// Parses a `drag <x1> <y1> <x2> <y2> <button>` directive: press at the first
+/// point, one cursor-move to the second, then release.
+fn parse_drag(arguments: &[&str]) -> anyhow::Result<DirectiveAction> {
+    let [x1, y1, x2, y2, button] = arguments else {
+        anyhow::bail!("drag takes two points and a button, got {arguments:?}");
+    };
+    let point = |label: &str, text: &str| {
+        text.parse::<f32>()
+            .map_err(|_| anyhow::anyhow!("the drag {label} {text:?} is not a number"))
+    };
+    Ok(DirectiveAction::Drag {
+        x1: point("x1", x1)?,
+        y1: point("y1", y1)?,
+        x2: point("x2", x2)?,
+        y2: point("y2", y2)?,
+        button: parse_click_button(button)?,
+    })
+}
+
+/// Parses a `wheel <notches>` directive: the wheel's notch count — N notches
+/// are N ±1 wheel events, chained from the live selection. Zero notches send
+/// nothing.
+fn parse_wheel(arguments: &[&str]) -> anyhow::Result<DirectiveAction> {
+    let [notches] = arguments else {
+        anyhow::bail!("wheel takes a notch count, got {arguments:?}");
+    };
+    let notches: i32 = notches
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the wheel notches {notches:?} is not a whole number"))?;
+    Ok(DirectiveAction::Wheel { notches })
+}
+
+/// Parses a `click`/`drag` button through the window's own mapping: left,
+/// right, and middle — the pick-block binding's own — exactly as a real
+/// press maps them ([`screen_click_button`]).
+fn parse_click_button(name: &str) -> anyhow::Result<ClickButton> {
+    let button = match name {
+        "Left" => WinitMouseButton::Left,
+        "Right" => WinitMouseButton::Right,
+        "Middle" => WinitMouseButton::Middle,
+        other => anyhow::bail!("{other:?} is not a bound click button"),
+    };
+    screen_click_button(button)
+        .ok_or_else(|| anyhow::anyhow!("{name:?} is not a bound click button"))
+}
+
 /// Parses a `key <name> down|up` directive: the movement keys and the chat
 /// screen's own — `T`, `Tab` and `Enter` — which the replay routes as the
 /// window routes them.
+///
+/// The two-argument form keeps this closed set: the named inventory keys
+/// (`e`, `q`, the digits, `escape`, `f3`, `h`) live in the one-argument form
+/// ([`parse_script_key`]) and stay refused here, exactly as before.
 fn parse_key(arguments: &[&str]) -> anyhow::Result<InputEvent> {
     let [name, edge] = arguments else {
         anyhow::bail!("key takes a key name and down or up, got {arguments:?}");
@@ -764,6 +1040,12 @@ struct ClientApp {
     /// Whether either control key is held: the drop key's whole-stack arm
     /// reads it (`isCtrlKeyDown` at `GuiContainer.java`:707).
     ctrl: bool,
+    /// The window's selected hotbar slot, 0..8 (`InventoryPlayer.currentItem`):
+    /// the live selection the wheel steps and the digits set. The session's
+    /// `HeldItemSlot` reports fold in at the frame's drain; the window's own
+    /// digit and wheel sends update it at once, so the next step chains from
+    /// the live value (`changeCurrentItem`:165-185 reads the live slot).
+    held: i16,
     /// The free pointer's position in the frame's GUI units while the chat is
     /// open: the hover and the box's hit-test read it, and nothing about it
     /// reaches the session (`GuiChat.drawScreen`:305-310 reads the free mouse;
@@ -1227,6 +1509,7 @@ impl ClientApp {
             creative: false,
             shift: false,
             ctrl: false,
+            held: 0,
             cursor: None,
             opener: Box::new(spawn_url_opener),
             script,
@@ -1269,6 +1552,19 @@ impl ClientApp {
         };
         // The worker's updates land before the frame reads the map.
         self.drain_skins();
+        // The queued container gestures, run once the frame's events are in —
+        // each through the window's own path, in file order. The take ends
+        // the driver's borrow before the run starts. This sits before the
+        // window and renderer borrows below, so the run may hold the whole
+        // frame's state.
+        let gestures = self
+            .script
+            .as_mut()
+            .map(|script| script.take_gestures())
+            .unwrap_or_default();
+        for gesture in gestures {
+            self.run_gesture(event_loop, gesture);
+        }
         let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
@@ -1289,6 +1585,11 @@ impl ClientApp {
                     if self.creative {
                         self.screens.swap_to_creative();
                     }
+                }
+                // The session's held-slot echo folds into the live selection
+                // the wheel steps and the digits set chain from.
+                ClientEvent::HeldItemSlot { slot } => {
+                    self.held = *slot;
                 }
                 _ => {}
             }
@@ -1795,6 +2096,26 @@ impl ClientApp {
             self.open_inventory(event_loop);
             return;
         }
+        // The digits' direct set and the drop key outside screens: the screen
+        // path above already answered when one is open, so anything reaching
+        // here is the unguarded runTick half (`Minecraft.java`:2076-2090 sets
+        // `currentItem` with no screen guard; `:2105-2111` drops, the whole
+        // stack with Ctrl). Fresh-press edges only, like the inventory key's.
+        if event.state == ElementState::Pressed && !event.repeat {
+            if let PhysicalKey::Code(code) = event.physical_key {
+                if let Some(select) = hotbar_select(code) {
+                    if let InputEvent::HeldItemChange { slot } = select {
+                        self.held = slot;
+                    }
+                    self.send_input(select);
+                    return;
+                }
+                if code == KeyCode::KeyQ {
+                    self.send_input(drop_item(self.ctrl));
+                    return;
+                }
+            }
+        }
         // The held player list: a Tab edge while no screen consumes the keys
         // — the open chat above answers first — sets the held state the
         // frame's list draws gate on (`Minecraft.java`:1904-1912 sets every
@@ -2125,6 +2446,77 @@ impl ClientApp {
         }
     }
 
+    /// The E-key swap's own sends, without the capture step: the open
+    /// screen's close (C0D for its window) beside the inventory's open (one
+    /// C16) — `GuiContainer.keyTyped`:692-696 closes, and the same press,
+    /// never unpressed, reaches the unguarded inventory loop
+    /// (`Minecraft.java`:2092-2101) and re-opens. The caller sends the pair
+    /// in order and frees the pointer around them.
+    fn swap_to_inventory_events(&mut self) -> Vec<InputEvent> {
+        let mut dropped = None;
+        let Some(close) = self.screens.close(&mut dropped) else {
+            return Vec::new();
+        };
+        let mut events = vec![close];
+        if let Some(open) = self.inventory_open_event() {
+            events.push(open);
+        }
+        events
+    }
+
+    /// The unguarded direct set beside a screen digit's own swap: the slot the
+    /// key selects, folded into the live selection at once and sent as
+    /// `HeldItemChange` (`Minecraft.java`:2076-2090 sets `currentItem` with
+    /// no screen guard, so a digit over a screen sets it too — the swap fires
+    /// only conditionally, beside it).
+    fn direct_set(&mut self, slot: i16) -> InputEvent {
+        self.held = slot;
+        InputEvent::HeldItemChange { slot }
+    }
+
+    /// One digit press's sends behind the creative screen: the screen's own
+    /// number swap when it fires, beside the unguarded direct set
+    /// ([`ClientApp::direct_set`]). `None` when the search field owns the key
+    /// — it types instead, and the port scopes the direct set to keys the
+    /// screen consumes as hotbar keys.
+    fn creative_digit_events(&mut self, index: u8) -> Option<Vec<InputEvent>> {
+        let mut events = self.screens.creative_mut()?.number_key(index, &ItemTable)?;
+        let slot = i16::from(index);
+        events.push(self.direct_set(slot));
+        Some(events)
+    }
+
+    /// One digit press's sends behind a container screen: the screen's own
+    /// mode-2 swap (which fires only hovering a stack with an empty cursor),
+    /// beside the unguarded direct set ([`ClientApp::direct_set`]) — the
+    /// source's runTick half has no screen guard, so both land per press, the
+    /// swap first.
+    fn container_digit_events(&mut self, index: u8) -> Vec<InputEvent> {
+        let ctrl = self.ctrl;
+        let mut events = self
+            .screens
+            .container_mut()
+            .map(|screen| screen.screen_key(ScreenKey::Number(index), ctrl))
+            .unwrap_or_default();
+        let slot = i16::from(index);
+        events.push(self.direct_set(slot));
+        events
+    }
+
+    /// Swaps the open screen to the inventory from the window's own E key:
+    /// the swap's sends leave in order — the open screen's C0D first, then
+    /// the inventory's C16 — and the pointer frees around them like any other
+    /// window open (`displayGuiScreen(new GuiInventory)`).
+    fn swap_to_inventory(&mut self, event_loop: &ActiveEventLoop) {
+        for event in self.swap_to_inventory_events() {
+            self.send_input(event);
+        }
+        self.tab.open = false;
+        self.cursor = None;
+        let step = self.capture.chat_open();
+        self.apply_capture(event_loop, step);
+    }
+
     /// Routes one key press to the open screen: the inventory key closes every
     /// container screen, the number keys swap with mode 2 and the drop key
     /// drops — `GuiContainer.keyTyped`:692-712 with `checkHotbarKeys`:718-733 —
@@ -2161,7 +2553,7 @@ impl ClientApp {
             && self.screens.sign_mut().is_none()
             && self.screens.book_mut().is_none()
         {
-            self.close_screen(event_loop);
+            self.swap_to_inventory(event_loop);
             return true;
         }
         // The sign editor's own keys before the container path: editing
@@ -2233,12 +2625,7 @@ impl ClientApp {
                 return true;
             }
             if let Some(index) = number_key_index(code) {
-                if let Some(events) = self
-                    .screens
-                    .creative_mut()
-                    .expect("the creative screen is open")
-                    .number_key(index, &ItemTable)
-                {
+                if let Some(events) = self.creative_digit_events(index) {
                     for event in events {
                         self.send_input(event);
                     }
@@ -2275,12 +2662,7 @@ impl ClientApp {
             return true;
         }
         if let Some(index) = number_key_index(code) {
-            let events = self
-                .screens
-                .container_mut()
-                .map(|screen| screen.screen_key(ScreenKey::Number(index), ctrl))
-                .unwrap_or_default();
-            for event in events {
+            for event in self.container_digit_events(index) {
                 self.send_input(event);
             }
             return true;
@@ -2316,39 +2698,309 @@ impl ClientApp {
             return true;
         };
         self.feed_screen_mouse();
-        let shift = self.shift;
-        let level = self.view.level();
-        if let Some(screen) = self.screens.creative_mut() {
-            let now = system_time_ms();
-            let events = match state {
-                ElementState::Pressed => screen.press(button, shift, &ItemTable, now),
-                ElementState::Released => screen.release(button, shift, &ItemTable, now),
-            };
-            for event in events {
-                self.send_input(event);
-            }
-            return true;
-        }
-        let Some(screen) = self.screens.container_mut() else {
-            return true;
-        };
-        let now = system_time_ms();
-        let events = match state {
-            // The press runs the family-B widgets first — the beacon's rows
-            // and confirm, the enchanting offers, the villager pager, the
-            // anvil focus — then the base slot path; a widget point is never
-            // a slot point, so the two never double-send.
-            ElementState::Pressed => {
-                let mut events = family_b::family_click(screen, button, level);
-                events.extend(screen.press(button, shift, now));
-                events
-            }
-            ElementState::Released => screen.release(button, shift, now, &ItemTable),
-        };
+        let events = screen_button_events(
+            &mut self.screens,
+            state,
+            button,
+            self.shift,
+            self.view.level(),
+            system_time_ms(),
+        );
         for event in events {
             self.send_input(event);
         }
         true
+    }
+
+    /// One wheel event's own route: the chat log's while the field is open
+    /// (`GuiChat.handleMouseInput`:143-167), the creative list's over the
+    /// creative screen (`handleMouseInput`:546-569) — and the held-slot
+    /// change concurrently in every case: `changeCurrentItem` has no screen
+    /// guard, so the screen's own handler runs in addition
+    /// (`Minecraft.java`:1879/:1892).
+    fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.chat_input.open {
+            let lines = chat_wheel_lines(delta);
+            if lines != 0 {
+                self.chat.scroll(lines);
+            }
+        } else if let Some(screen) = self.screens.creative_mut() {
+            screen.wheel(creative_wheel_notch(delta));
+        }
+        if let Some((slot, event)) = wheel_held_step(self.held, delta) {
+            self.held = slot;
+            self.send_input(event);
+        }
+    }
+
+    /// Press at the first point, one cursor-move to the second, then release:
+    /// the scripted drag's own path — the release sends the drag's three-step
+    /// sequence like the manual path's. No screen open means no screen path:
+    /// the drag is warned and dropped.
+    fn run_drag(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, button: ClickButton) {
+        if !self.screens.is_open() {
+            tracing::warn!(
+                x1,
+                y1,
+                x2,
+                y2,
+                "no screen is open; the scripted drag was dropped"
+            );
+            return;
+        }
+        // Press at the first point, one cursor-move to the second,
+        // then release — the release sends the drag's three-step
+        // sequence like the manual path's.
+        self.cursor = Some((x1, y1));
+        self.feed_screen_mouse();
+        let level = self.view.level();
+        let now = system_time_ms();
+        let pressed = screen_button_events(
+            &mut self.screens,
+            ElementState::Pressed,
+            button,
+            false,
+            level,
+            now,
+        );
+        for event in pressed {
+            self.send_input(event);
+        }
+        self.cursor = Some((x2, y2));
+        self.feed_screen_mouse();
+        let released = screen_button_events(
+            &mut self.screens,
+            ElementState::Released,
+            button,
+            false,
+            level,
+            now,
+        );
+        for event in released {
+            self.send_input(event);
+        }
+    }
+
+    /// Runs one queued script gesture through the window's own path, once the
+    /// frame's events are in — the owner end of
+    /// [`ScriptDriver::take_gestures`].
+    ///
+    /// `move` sets the freed-pointer cursor and feeds it; `click` is the
+    /// screen's own press-then-release at the point through the shared
+    /// derivation ([`screen_button_events`]); `drag` is press at the first
+    /// point, cursor-move, then release; `wheel` runs one ±1 wheel event per
+    /// notch through [`ClientApp::on_wheel`]; `key` drives the named key's
+    /// press edge ([`ClientApp::script_key`]).
+    ///
+    /// The gestures use no privileged internals: every arm calls the same
+    /// methods and derivations the window's own events run. A `click`/`drag`
+    /// with no screen open has no screen path — it is warned and dropped.
+    fn run_gesture(&mut self, event_loop: &ActiveEventLoop, gesture: ScriptGesture) {
+        match gesture {
+            ScriptGesture::Move { x, y } => {
+                self.cursor = Some((x, y));
+                self.feed_screen_mouse();
+            }
+            ScriptGesture::Click {
+                x,
+                y,
+                button,
+                shift,
+            } => {
+                if !self.screens.is_open() {
+                    tracing::warn!(x, y, "no screen is open; the scripted click was dropped");
+                    return;
+                }
+                self.cursor = Some((x, y));
+                self.feed_screen_mouse();
+                let level = self.view.level();
+                let now = system_time_ms();
+                for state in [ElementState::Pressed, ElementState::Released] {
+                    let events =
+                        screen_button_events(&mut self.screens, state, button, shift, level, now);
+                    for event in events {
+                        self.send_input(event);
+                    }
+                }
+            }
+            ScriptGesture::Drag {
+                x1,
+                y1,
+                x2,
+                y2,
+                button,
+            } => self.run_drag(x1, y1, x2, y2, button),
+            ScriptGesture::Wheel { notches } => {
+                // N notches are N ±1 wheel events, chained from the live
+                // selection; zero notches send nothing.
+                let direction = f32::from(notches.signum() as i8);
+                for _ in 0..notches.unsigned_abs() {
+                    self.on_wheel(MouseScrollDelta::LineDelta(0.0, direction));
+                }
+            }
+            ScriptGesture::Key(key) => self.script_key(event_loop, key),
+        }
+    }
+
+    /// Drives one named key's press edge through the same route as the real
+    /// key — the owner end of a `key <name>` gesture.
+    ///
+    /// Behind a screen the edge runs the screen's own routing
+    /// ([`ClientApp::on_screen_key`]) with the key's own press event, exactly
+    /// as the window's key does — the swap chain, the number swap, the drop.
+    /// With no screen it runs the same leaf arms the window's key runs past
+    /// the screen: `e` stands the window-0 screen beside one C16, the digits
+    /// set the held slot, `q` drops. The window's grabbed gate is a window
+    /// precondition — a rig run has no pointer to free — so the edge is
+    /// authoritative and the gate is not re-checked.
+    ///
+    /// `escape` runs the window's own Escape route, `f3` its overlay toggle,
+    /// and `h` its chord — which needs Task 17's live `f3_held`, so a
+    /// press-only edge never flips it (documented at [`parse_script_key`]).
+    fn script_key(&mut self, event_loop: &ActiveEventLoop, key: ScriptKey) {
+        match key {
+            ScriptKey::Escape => {
+                match escape_route(
+                    self.chat_input.open,
+                    self.chat.confirm_open(),
+                    self.screens.is_open(),
+                    &mut self.capture,
+                ) {
+                    EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
+                    EscapeRoute::CloseChat => self.close_chat(event_loop),
+                    EscapeRoute::CloseScreen => self.close_screen(event_loop),
+                    EscapeRoute::Capture(step) => self.apply_capture(event_loop, step),
+                }
+            }
+            ScriptKey::F3 => {
+                self.overlay_visible = !self.overlay_visible;
+                tracing::info!(
+                    visible = self.overlay_visible,
+                    "the debug overlay was toggled"
+                );
+            }
+            ScriptKey::H => {
+                if f3_chord_live(self.screens.is_open(), self.screens.allow_user_input())
+                    && is_h_press(
+                        ElementState::Pressed,
+                        false,
+                        PhysicalKey::Code(KeyCode::KeyH),
+                    )
+                    && self.f3_held
+                {
+                    self.advanced_tooltips = !self.advanced_tooltips;
+                }
+            }
+            ScriptKey::Inventory | ScriptKey::Drop | ScriptKey::Digit(_) => {
+                if self.screens.is_open() {
+                    // The screen's own routing for the key, arm for arm with what
+                    // the window's key runs behind a screen
+                    // ([`ClientApp::on_screen_key`]) — the swap chain, the sign
+                    // and book swallow, the anvil field, the creative number and
+                    // drop, the container number and drop. The edge is a press by
+                    // construction, and its logical read is a character, so the
+                    // debug-key branch stays out the way it does for the live key.
+                    let (code, label) = match key {
+                        ScriptKey::Inventory => (KeyCode::KeyE, "e"),
+                        ScriptKey::Drop => (KeyCode::KeyQ, "q"),
+                        ScriptKey::Digit(slot) => (
+                            SCRIPT_DIGIT_CODES[slot as usize],
+                            SCRIPT_DIGIT_LABELS[slot as usize],
+                        ),
+                        _ => unreachable!("escape, F3 and H route above"),
+                    };
+                    if code == KeyCode::KeyE
+                        && self.screens.sign_mut().is_none()
+                        && self.screens.book_mut().is_none()
+                    {
+                        self.swap_to_inventory(event_loop);
+                        return;
+                    }
+                    if self.screens.sign_mut().is_some() {
+                        if let Some(key) = keymap::translate(code) {
+                            if let Some(screen) = self.screens.sign_mut() {
+                                screen.key(key);
+                            }
+                        }
+                        if let Some(font) = self.font.as_ref() {
+                            if let Some(screen) = self.screens.sign_mut() {
+                                screen.type_text(label, font);
+                            }
+                        }
+                        return;
+                    }
+                    if self
+                        .screens
+                        .container_mut()
+                        .is_some_and(|screen| family_b::field_owns_input(screen))
+                    {
+                        let mut events = Vec::new();
+                        if let Some(key) = keymap::translate(code) {
+                            if let Some(screen) = self.screens.container_mut() {
+                                events.extend(family_b::family_key(screen, key));
+                            }
+                        }
+                        if let Some(screen) = self.screens.container_mut() {
+                            events.extend(family_b::family_type(screen, label));
+                        }
+                        for event in events {
+                            self.send_input(event);
+                        }
+                        return;
+                    }
+                    let ctrl = self.ctrl;
+                    if self.screens.creative_mut().is_some() {
+                        if let Some(index) = number_key_index(code) {
+                            if let Some(events) = self.creative_digit_events(index) {
+                                for event in events {
+                                    self.send_input(event);
+                                }
+                            }
+                            return;
+                        }
+                        if code == KeyCode::KeyQ {
+                            for event in self
+                                .screens
+                                .creative_mut()
+                                .expect("the creative screen is open")
+                                .screen_key(ScreenKey::Drop, ctrl)
+                            {
+                                self.send_input(event);
+                            }
+                        }
+                        return;
+                    }
+                    if let Some(index) = number_key_index(code) {
+                        for event in self.container_digit_events(index) {
+                            self.send_input(event);
+                        }
+                        return;
+                    }
+                    if code == KeyCode::KeyQ {
+                        let events = self
+                            .screens
+                            .container_mut()
+                            .map(|screen| screen.screen_key(ScreenKey::Drop, ctrl))
+                            .unwrap_or_default();
+                        for event in events {
+                            self.send_input(event);
+                        }
+                    }
+                } else {
+                    match key {
+                        ScriptKey::Inventory => self.open_inventory(event_loop),
+                        ScriptKey::Drop => self.send_input(drop_item(self.ctrl)),
+                        ScriptKey::Digit(slot) => {
+                            self.held = slot;
+                            self.send_input(InputEvent::HeldItemChange { slot });
+                        }
+                        ScriptKey::Escape | ScriptKey::F3 | ScriptKey::H => {
+                            unreachable!("the window-level keys route above")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Feeds the free pointer into the open screen's hover and drag: the
@@ -3493,6 +4145,65 @@ fn screen_click_button(button: WinitMouseButton) -> Option<ClickButton> {
     }
 }
 
+/// One screen-button edge's own derivation: the creative screen's press and
+/// release, or the container's — the family-B widgets first, then the base
+/// slot path (`GuiScreen.mouseClicked`:382-414 and the widgets'
+/// `mouseClicked` chain, then `mouseReleased`).
+///
+/// The window's own click ([`ClientApp::on_screen_button`]) and the scripted
+/// `click`/`drag` ([`ClientApp::run_gesture`]) share this: both feed the free
+/// pointer first, then derive and send. `level` is the view's own read (the
+/// family widgets' gate) and `now` the edge's millisecond clock.
+fn screen_button_events(
+    screens: &mut Screens,
+    state: ElementState,
+    button: ClickButton,
+    shift: bool,
+    level: i32,
+    now: u64,
+) -> Vec<InputEvent> {
+    if let Some(screen) = screens.creative_mut() {
+        return match state {
+            ElementState::Pressed => screen.press(button, shift, &ItemTable, now),
+            ElementState::Released => screen.release(button, shift, &ItemTable, now),
+        };
+    }
+    let Some(screen) = screens.container_mut() else {
+        return Vec::new();
+    };
+    match state {
+        // The press runs the family-B widgets first — the beacon's rows
+        // and confirm, the enchanting offers, the villager pager, the
+        // anvil focus — then the base slot path; a widget point is never
+        // a slot point, so the two never double-send.
+        ElementState::Pressed => {
+            let mut events = family_b::family_click(screen, button, level);
+            events.extend(screen.press(button, shift, now));
+            events
+        }
+        ElementState::Released => screen.release(button, shift, now, &ItemTable),
+    }
+}
+
+/// The digit keys' own codes, slot order: the `key <digit>` edge's physical
+/// read behind a screen.
+const SCRIPT_DIGIT_CODES: [KeyCode; 9] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+];
+
+/// The digit keys' own labels, slot order: the edge's logical read and
+/// character text — a real press carries both, so the sign and field paths
+/// read the scripted edge as a typed key.
+const SCRIPT_DIGIT_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
 /// The hotbar index a number key maps to, or `None` for any other key: the
 /// top-row digits and the numpad both swap (`checkHotbarKeys`:718-733 reads
 /// the hotbar bindings 0..8, sent as mode 2's button).
@@ -3509,6 +4220,32 @@ fn number_key_index(code: KeyCode) -> Option<u8> {
         KeyCode::Digit9 | KeyCode::Numpad9 => Some(8),
         _ => None,
     }
+}
+
+/// The digit press's direct set outside screens: the slot the key selects,
+/// sent as `HeldItemChange` (`Minecraft.java`:2076-2090 sets `currentItem`
+/// with no screen guard). `None` for any other key.
+fn hotbar_select(code: KeyCode) -> Option<InputEvent> {
+    number_key_index(code).map(|slot| InputEvent::HeldItemChange {
+        slot: i16::from(slot),
+    })
+}
+
+/// One wheel event's held-slot step from the live selection: the new slot
+/// beside its `HeldItemChange`, or `None` when the event carries no notch.
+/// The delta clamps to its sign — one slot per event — and the nine slots
+/// wrap (`InventoryPlayer.changeCurrentItem`:165-185); the screen's own
+/// scroll, when one is open, runs in addition (`Minecraft.java`:1879/:1892).
+fn wheel_held_step(held: i16, delta: MouseScrollDelta) -> Option<(i16, InputEvent)> {
+    let notches = match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(position) => position.y as f32,
+    };
+    if notches == 0.0 {
+        return None;
+    }
+    let slot = hotbar_step(held, notches);
+    Some((slot, InputEvent::HeldItemChange { slot }))
 }
 
 impl ApplicationHandler for ClientApp {
@@ -3651,19 +4388,7 @@ impl ApplicationHandler for ClientApp {
                 self.ctrl = state.control_key();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // The wheel is the chat log's while the chat is open
-                // (`GuiChat.handleMouseInput`:143-167); over the creative
-                // screen it scrolls the list (`handleMouseInput`:546-569) —
-                // a closed chat has no other wheel surface yet — the hotbar's
-                // is a later task's.
-                if self.chat_input.open {
-                    let lines = chat_wheel_lines(delta);
-                    if lines != 0 {
-                        self.chat.scroll(lines);
-                    }
-                } else if let Some(screen) = self.screens.creative_mut() {
-                    screen.wheel(creative_wheel_notch(delta));
-                }
+                self.on_wheel(delta);
             }
             WindowEvent::Focused(false) => {
                 tracing::info!("the window lost focus, dropping capture");
@@ -4002,25 +4727,29 @@ mod tests {
     use super::{
         Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClickButton,
         ClientApp, DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute,
-        Key, MouseButton, PlayerState, ScriptDriver, SessionLink, SkinRequest, SkinUpdate,
-        SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
-        apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
-        clear_break_stage, command_text, cracks_in_view, creative_wheel_notch, escape_route,
-        f3_hold_step, frame_params, gameplay_key, interpolate_pose, inventory_opener,
-        is_enter_press, is_escape_press, is_f3_press, is_h_press, number_key_index, parse_script,
-        parse_server_address, scaled_cursor, screen_click_button, scripted_chat_click,
+        ItemTable, Key, MouseButton, PlayerState, ScriptDriver, ScriptGesture, ScriptKey,
+        SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
+        WorldOverlayState, aim_outline, apply_overlay_event, bound_mouse_button, camera_pose,
+        chat_opener, chat_wheel_lines, clear_break_stage, command_text, cracks_in_view,
+        creative_wheel_notch, escape_route, f3_hold_step, frame_params, gameplay_key,
+        hotbar_select, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
+        is_f3_press, is_h_press, number_key_index, parse_script, parse_server_address,
+        scaled_cursor, screen_button_events, screen_click_button, scripted_chat_click,
         skin_requests, store_aim, store_break_stage, store_skins, tab_held, tooltip_point,
-        void_y_factor,
+        void_y_factor, wheel_held_step,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
     use oxide_game::chat::{ClickAction, ClickEvent};
+    use oxide_game::container::{CLICK_MODE_DRAG, CLICK_MODE_PICKUP, CLICK_MODE_SWAP, drag_button};
     use oxide_game::entity_view::{EntityExtra, EntityFrame, PlayerListRecord};
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
     use oxide_game::session::ClientEvent;
+    use oxide_proto_v47::entity::MetadataItem;
+    use oxide_proto_v47::window::WindowKind;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
     use oxide_world::entity::EntityKind;
     use std::cell::RefCell;
@@ -4508,6 +5237,121 @@ mod tests {
     }
 
     #[test]
+    fn a_digit_press_selects_its_slot_outside_screens() {
+        // The unguarded direct set (`Minecraft.java`:2076-2090): digit N is
+        // slot N−1, sent as `HeldItemChange` — anything else is no digit.
+        assert_eq!(
+            hotbar_select(KeyCode::Digit1),
+            Some(InputEvent::HeldItemChange { slot: 0 })
+        );
+        assert_eq!(
+            hotbar_select(KeyCode::Digit4),
+            Some(InputEvent::HeldItemChange { slot: 3 })
+        );
+        assert_eq!(
+            hotbar_select(KeyCode::Digit9),
+            Some(InputEvent::HeldItemChange { slot: 8 })
+        );
+        assert_eq!(
+            hotbar_select(KeyCode::Numpad5),
+            Some(InputEvent::HeldItemChange { slot: 4 }),
+            "the numpad selects too"
+        );
+        assert_eq!(hotbar_select(KeyCode::KeyE), None);
+        assert_eq!(hotbar_select(KeyCode::KeyQ), None);
+        assert_eq!(hotbar_select(KeyCode::KeyW), None);
+    }
+
+    #[test]
+    fn the_wheel_steps_the_live_selection_one_slot_per_event() {
+        // `InventoryPlayer.changeCurrentItem`:165-185 from the live slot: the
+        // delta clamps to its sign and the nine slots wrap; a zero event
+        // steps nowhere.
+        assert_eq!(
+            wheel_held_step(3, MouseScrollDelta::LineDelta(0.0, 1.0)),
+            Some((4, InputEvent::HeldItemChange { slot: 4 }))
+        );
+        assert_eq!(
+            wheel_held_step(3, MouseScrollDelta::LineDelta(0.0, -1.0)),
+            Some((2, InputEvent::HeldItemChange { slot: 2 }))
+        );
+        assert_eq!(
+            wheel_held_step(3, MouseScrollDelta::LineDelta(0.0, 5.0)),
+            Some((4, InputEvent::HeldItemChange { slot: 4 })),
+            "a five-notch event still steps one slot"
+        );
+        assert_eq!(
+            wheel_held_step(8, MouseScrollDelta::LineDelta(0.0, 1.0)),
+            Some((0, InputEvent::HeldItemChange { slot: 0 })),
+            "the top wraps to the bottom"
+        );
+        assert_eq!(
+            wheel_held_step(0, MouseScrollDelta::LineDelta(0.0, -1.0)),
+            Some((8, InputEvent::HeldItemChange { slot: 8 })),
+            "the bottom wraps to the top"
+        );
+        assert_eq!(
+            wheel_held_step(4, MouseScrollDelta::LineDelta(0.0, 0.0)),
+            None,
+            "a zero event steps nowhere"
+        );
+    }
+
+    #[test]
+    fn the_e_swap_sends_the_close_beside_the_open() {
+        // The same-press chain: the open screen's C0D first, then the
+        // inventory's C16 (`GuiContainer.keyTyped`:692-696 closes without
+        // unpressing; the unguarded `Minecraft.java`:2092-2101 loop re-opens).
+        let mut app = test_app();
+        app.screens
+            .on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
+        assert_eq!(
+            app.swap_to_inventory_events(),
+            vec![
+                InputEvent::CloseWindow { window_id: 7 },
+                InputEvent::OpenInventory,
+            ]
+        );
+        assert!(app.screens.is_open(), "the swap ends on a screen");
+        assert_eq!(app.screens.current_window_id(), Some(0));
+        // In the inventory the same chain stays open: close window 0, reopen.
+        assert_eq!(
+            app.swap_to_inventory_events(),
+            vec![
+                InputEvent::CloseWindow { window_id: 0 },
+                InputEvent::OpenInventory,
+            ]
+        );
+        assert!(app.screens.is_open(), "E never leaves the inventory shut");
+        // With no screen there is no swap and nothing sends.
+        let mut app = test_app();
+        assert_eq!(
+            app.swap_to_inventory_events(),
+            Vec::<InputEvent>::new(),
+            "no screen sends nothing"
+        );
+    }
+
+    #[test]
+    fn escape_with_no_screen_runs_the_capture_rule_not_a_pause_menu() {
+        // The recorded substitution: the source opens the pause menu
+        // (`Minecraft.java`:1944-1949) but the port has none, so the no-screen
+        // arm is the M3 capture rule — release-while-grabbed, else exit.
+        let mut capture = Capture::default();
+        capture.click();
+        assert_eq!(
+            escape_route(false, false, false, &mut capture),
+            EscapeRoute::Capture(CaptureStep::Release),
+            "grabbed: the first escape releases"
+        );
+        assert_eq!(
+            escape_route(false, false, false, &mut capture),
+            EscapeRoute::Capture(CaptureStep::Exit),
+            "free: the next escape exits"
+        );
+    }
+
+    #[test]
     fn a_release_carries_the_key_clearing_event() {
         // The source's focus loss unpresses every held key
         // (`Minecraft.java:1469-1478`): the release must carry the session's
@@ -4736,7 +5580,11 @@ mod tests {
         let cases = [
             ("10 key W sideways", 1, "neither down nor up"),
             ("10 key Q down", 1, "not a bound key"),
-            ("10 jump", 1, "not one of key, mouse, look or chat"),
+            (
+                "10 jump",
+                1,
+                "not one of key, mouse, look, chat, move, click, drag or wheel",
+            ),
             ("10 chat", 1, "no message"),
             ("10 chat   ", 1, "no message"),
             ("x key W down", 1, "not a whole number"),
@@ -4762,6 +5610,474 @@ mod tests {
                 "{script:?} must say {needle:?}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn the_gesture_directives_parse_beside_the_old_ones() {
+        // Task 24's additive syntax: the old `key <UPPER> down|up` lines keep
+        // parsing untouched, and the new gestures land beside them — `move`,
+        // `click`, `drag`, `wheel` and the named-once `key <name>`, a press
+        // edge only.
+        let script = "30 move 100 200\n31 click 100 200 Left\n32 click 100 200 Right shift\n33 click 40 60 Middle\n34 drag 10 20 30 40 Left\n35 drag 10 20 30 40 Right\n36 wheel 3\n37 wheel -2\n38 key e\n39 key q\n40 key escape\n41 key 1\n42 key 9\n43 key f3\n44 key h\n45 key W down\n46 mouse Left down\n";
+        assert_eq!(
+            parse_script(script).expect("the gestures parse"),
+            [
+                Directive {
+                    tick: 30,
+                    action: DirectiveAction::Move { x: 100.0, y: 200.0 },
+                },
+                Directive {
+                    tick: 31,
+                    action: DirectiveAction::Click {
+                        x: 100.0,
+                        y: 200.0,
+                        button: ClickButton::Left,
+                        shift: false,
+                    },
+                },
+                Directive {
+                    tick: 32,
+                    action: DirectiveAction::Click {
+                        x: 100.0,
+                        y: 200.0,
+                        button: ClickButton::Right,
+                        shift: true,
+                    },
+                },
+                Directive {
+                    tick: 33,
+                    action: DirectiveAction::Click {
+                        x: 40.0,
+                        y: 60.0,
+                        button: ClickButton::Pick,
+                        shift: false,
+                    },
+                },
+                Directive {
+                    tick: 34,
+                    action: DirectiveAction::Drag {
+                        x1: 10.0,
+                        y1: 20.0,
+                        x2: 30.0,
+                        y2: 40.0,
+                        button: ClickButton::Left,
+                    },
+                },
+                Directive {
+                    tick: 35,
+                    action: DirectiveAction::Drag {
+                        x1: 10.0,
+                        y1: 20.0,
+                        x2: 30.0,
+                        y2: 40.0,
+                        button: ClickButton::Right,
+                    },
+                },
+                Directive {
+                    tick: 36,
+                    action: DirectiveAction::Wheel { notches: 3 },
+                },
+                Directive {
+                    tick: 37,
+                    action: DirectiveAction::Wheel { notches: -2 },
+                },
+                Directive {
+                    tick: 38,
+                    action: DirectiveAction::ScriptKey(ScriptKey::Inventory),
+                },
+                Directive {
+                    tick: 39,
+                    action: DirectiveAction::ScriptKey(ScriptKey::Drop),
+                },
+                Directive {
+                    tick: 40,
+                    action: DirectiveAction::ScriptKey(ScriptKey::Escape),
+                },
+                Directive {
+                    tick: 41,
+                    action: DirectiveAction::ScriptKey(ScriptKey::Digit(0)),
+                },
+                Directive {
+                    tick: 42,
+                    action: DirectiveAction::ScriptKey(ScriptKey::Digit(8)),
+                },
+                Directive {
+                    tick: 43,
+                    action: DirectiveAction::ScriptKey(ScriptKey::F3),
+                },
+                Directive {
+                    tick: 44,
+                    action: DirectiveAction::ScriptKey(ScriptKey::H),
+                },
+                Directive {
+                    tick: 45,
+                    action: DirectiveAction::Input(InputEvent::Key {
+                        key: Key::W,
+                        pressed: true,
+                    }),
+                },
+                Directive {
+                    tick: 46,
+                    action: DirectiveAction::Input(InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        pressed: true,
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_gestures_are_refused_with_their_line() {
+        let cases = [
+            ("10 move 100", 1, "move takes an x and a y"),
+            ("10 move 100 deep", 1, "the move y"),
+            ("10 click 100 200", 1, "click takes x, y, a button"),
+            ("10 click 100 200 Left now", 1, "click takes x, y, a button"),
+            ("10 click 100 200 Back", 1, "not a bound click button"),
+            ("10 drag 10 20 30", 1, "drag takes two points and a button"),
+            ("10 drag 10 20 30 40 Back", 1, "not a bound click button"),
+            ("10 wheel", 1, "wheel takes a notch count"),
+            ("10 wheel many", 1, "not a whole number"),
+            ("10 key", 1, "key takes a key name"),
+            ("10 key e extra", 1, "not a bound key"),
+            ("10 key bogus", 1, "not a scripted key"),
+            ("10 key W sideways", 1, "neither down nor up"),
+            (
+                "10 jump",
+                1,
+                "not one of key, mouse, look, chat, move, click, drag or wheel",
+            ),
+        ];
+        for (script, line, needle) in cases {
+            let error = parse_script(script).expect_err("the line must be refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("line {line}")),
+                "{script:?} must name line {line}: {message}"
+            );
+            assert!(
+                message.contains(needle),
+                "{script:?} must say {needle:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gestures_queue_behind_the_tick_in_file_order() {
+        // The gestures queue for the frame's owner instead of sending: the
+        // owner runs them through the window's own paths, in file order.
+        let dir =
+            std::env::temp_dir().join(format!("oxide-client-gestures-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
+        let script_path = dir.join("gestures.script");
+        std::fs::write(
+            &script_path,
+            "4 move 10 20\n4 click 10 20 Left\n5 wheel 2\n5 key e\n6 drag 10 20 30 40 Left\n",
+        )
+        .expect("the script is written");
+        let (input_tx, input_rx) = unbounded();
+        let mut driver = ScriptDriver::load(&script_path, input_tx).expect("the script loads");
+        let mut chat = ChatInput::default();
+        let mut view = super::view::ChatView::new();
+        let mut tab_open = false;
+        let mut cursor = None;
+        driver
+            .observe(
+                6,
+                0.0,
+                64.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+                1,
+                &mut chat,
+                &mut view,
+                &mut tab_open,
+                &mut cursor,
+            )
+            .expect("the log line writes");
+        assert_eq!(
+            driver.take_gestures(),
+            [
+                ScriptGesture::Move { x: 10.0, y: 20.0 },
+                ScriptGesture::Click {
+                    x: 10.0,
+                    y: 20.0,
+                    button: ClickButton::Left,
+                    shift: false,
+                },
+                ScriptGesture::Wheel { notches: 2 },
+                ScriptGesture::Key(ScriptKey::Inventory),
+                ScriptGesture::Drag {
+                    x1: 10.0,
+                    y1: 20.0,
+                    x2: 30.0,
+                    y2: 40.0,
+                    button: ClickButton::Left,
+                },
+            ]
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "queued gestures send nothing themselves"
+        );
+        assert!(driver.take_gestures().is_empty(), "the take drains");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The clicks a derivation sends, as `(slot, button, mode)`: every send
+    /// names the screen's window.
+    fn gesture_clicks(events: Vec<InputEvent>) -> Vec<(i16, i8, i8)> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                InputEvent::ClickWindow {
+                    window_id,
+                    slot,
+                    button,
+                    mode,
+                } => {
+                    assert_eq!(window_id, 7, "every click names the screen's window");
+                    (slot, button, mode)
+                }
+                other => panic!("the derivation sends clicks only, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A chest with a stack in slot 0, hovered on slot 0's centre: the
+    /// scripted click and drag run their derivation on this.
+    fn gesture_chest() -> ClientApp {
+        let mut app = test_app();
+        app.screens
+            .on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27, None);
+        let mut slots = vec![None; 27];
+        slots[0] = Some(MetadataItem {
+            id: 1,
+            count: 4,
+            damage: 0,
+            nbt: None,
+        });
+        app.screens
+            .container_mut()
+            .expect("the chest stands")
+            .apply_snapshot(slots, None, Vec::new());
+        app.screens
+            .container_mut()
+            .expect("the chest stands")
+            .mouse_moved(16.0, 26.0, &ItemTable);
+        app
+    }
+
+    #[test]
+    fn a_scripted_click_derives_the_screens_own_click_window() {
+        // The click is the screen's own press-then-release through the shared
+        // derivation: the press picks slot 0 up, and the press's own swallow
+        // leaves the release silent.
+        let mut app = gesture_chest();
+        let pressed = screen_button_events(
+            &mut app.screens,
+            ElementState::Pressed,
+            ClickButton::Left,
+            false,
+            0,
+            1_000,
+        );
+        assert_eq!(
+            gesture_clicks(pressed),
+            vec![(0, 0, CLICK_MODE_PICKUP)],
+            "the press reaches the screen's own path"
+        );
+        let released = screen_button_events(
+            &mut app.screens,
+            ElementState::Released,
+            ClickButton::Left,
+            false,
+            0,
+            1_100,
+        );
+        assert!(released.is_empty(), "the swallowed press releases nothing");
+    }
+
+    #[test]
+    fn a_scripted_drag_releases_the_three_step_sequence() {
+        // The drag is press at the first point, one cursor-move, then release,
+        // driven through the gesture's own path: the single move covers slot
+        // 2, so the release sends the drag's three-step sequence — start, the
+        // one covered slot, end — like the manual path's.
+        let mut app = gesture_chest();
+        app.screens
+            .container_mut()
+            .expect("the chest stands")
+            .apply_snapshot(
+                vec![None; 27],
+                Some(MetadataItem {
+                    id: 1,
+                    count: 64,
+                    damage: 0,
+                    nbt: None,
+                }),
+                Vec::new(),
+            );
+        let (_events_tx, events_rx) = unbounded();
+        let (input_tx, input_rx) = unbounded();
+        app.session = Some(SessionLink {
+            server: "test".into(),
+            events: events_rx,
+            input_tx,
+        });
+        app.run_drag(16.0, 26.0, 52.0, 26.0, ClickButton::Left);
+        assert_eq!(
+            app.cursor,
+            Some((52.0, 26.0)),
+            "the drag moves before it releases"
+        );
+        let mut sent = Vec::new();
+        while let Ok(event) = input_rx.try_recv() {
+            sent.push(event);
+        }
+        assert_eq!(
+            gesture_clicks(sent),
+            vec![
+                (-999, drag_button(0, 0) as i8, CLICK_MODE_DRAG),
+                (2, drag_button(1, 0) as i8, CLICK_MODE_DRAG),
+                (-999, drag_button(2, 0) as i8, CLICK_MODE_DRAG),
+            ],
+            "one move covers one slot: start, slot, end"
+        );
+    }
+
+    /// Attaches a session link to the app and returns the input channel the
+    /// window's sends land on.
+    fn linked_inputs(app: &mut ClientApp) -> crossbeam_channel::Receiver<InputEvent> {
+        let (_events_tx, events_rx) = unbounded();
+        let (input_tx, input_rx) = unbounded();
+        app.session = Some(SessionLink {
+            server: "test".into(),
+            events: events_rx,
+            input_tx,
+        });
+        input_rx
+    }
+
+    #[test]
+    fn a_digit_over_a_container_sets_and_swaps() {
+        // The unguarded direct-set half lands beside the swap: digit 4 over
+        // the hovered stack sends the mode-2 swap first, then the slot's own
+        // `HeldItemChange` — and the live selection follows it
+        // (`Minecraft.java`:2076-2090 has no screen guard).
+        let mut app = gesture_chest();
+        let input_rx = linked_inputs(&mut app);
+        for event in app.container_digit_events(3) {
+            app.send_input(event);
+        }
+        let mut sent = Vec::new();
+        while let Ok(event) = input_rx.try_recv() {
+            sent.push(event);
+        }
+        assert_eq!(
+            sent,
+            vec![
+                InputEvent::ClickWindow {
+                    window_id: 7,
+                    slot: 0,
+                    button: 3,
+                    mode: CLICK_MODE_SWAP,
+                },
+                InputEvent::HeldItemChange { slot: 3 },
+            ],
+            "the swap lands first, the direct set beside it"
+        );
+        assert_eq!(app.held, 3, "the live selection follows the direct set");
+    }
+
+    #[test]
+    fn a_digit_with_a_carried_stack_sets_without_swapping() {
+        // The swap fires only hovering a stack with an empty cursor — with a
+        // stack on the cursor the digit still sets the slot directly.
+        let mut app = gesture_chest();
+        app.screens
+            .container_mut()
+            .expect("the chest stands")
+            .apply_snapshot(
+                vec![None; 27],
+                Some(MetadataItem {
+                    id: 1,
+                    count: 64,
+                    damage: 0,
+                    nbt: None,
+                }),
+                Vec::new(),
+            );
+        let input_rx = linked_inputs(&mut app);
+        for event in app.container_digit_events(3) {
+            app.send_input(event);
+        }
+        let mut sent = Vec::new();
+        while let Ok(event) = input_rx.try_recv() {
+            sent.push(event);
+        }
+        assert_eq!(
+            sent,
+            vec![InputEvent::HeldItemChange { slot: 3 }],
+            "no swap fires, the direct set still lands"
+        );
+        assert_eq!(app.held, 3, "the live selection follows the direct set");
+    }
+
+    #[test]
+    fn a_digit_over_the_creative_screen_swaps_and_sets() {
+        // The creative screen's own number swap beside the same unguarded
+        // direct set: digit 4 over a grid cell echoes the hotbar write, then
+        // the slot's own `HeldItemChange`.
+        let mut app = test_app();
+        app.screens.open_creative();
+        app.cursor = Some((17.0, 26.0));
+        app.feed_screen_mouse();
+        let input_rx = linked_inputs(&mut app);
+        let events = app
+            .creative_digit_events(3)
+            .expect("the grid cell owns the digit");
+        for event in events {
+            app.send_input(event);
+        }
+        let mut sent = Vec::new();
+        while let Ok(event) = input_rx.try_recv() {
+            sent.push(event);
+        }
+        assert_eq!(sent.len(), 2, "the swap beside the direct set");
+        match &sent[0] {
+            InputEvent::CreativeAction { slot, item } => {
+                assert_eq!(*slot, 36 + 3, "the hotbar write echoes its wire slot");
+                assert!(
+                    item.clone().is_some_and(|stack| stack.count == 64),
+                    "the swap writes the max copy"
+                );
+            }
+            other => panic!("the swap echoes C10, sent {other:?}"),
+        }
+        assert_eq!(
+            sent[1],
+            InputEvent::HeldItemChange { slot: 3 },
+            "the direct set lands beside the swap"
+        );
+        assert_eq!(app.held, 3, "the live selection follows the direct set");
+    }
+
+    #[test]
+    fn the_scripted_wheel_chains_notch_events_from_the_live_slot() {
+        // Each notch is one ±1 wheel event from the live selection: two
+        // notches step twice, and a downward notch steps back.
+        let mut app = test_app();
+        app.held = 3;
+        app.on_wheel(MouseScrollDelta::LineDelta(0.0, 1.0));
+        assert_eq!(app.held, 4, "the first notch steps to 4");
+        app.on_wheel(MouseScrollDelta::LineDelta(0.0, 1.0));
+        assert_eq!(app.held, 5, "the second notch chains from 4");
+        app.on_wheel(MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert_eq!(app.held, 4, "a downward notch steps back");
     }
 
     #[test]

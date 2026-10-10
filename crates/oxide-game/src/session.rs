@@ -4079,8 +4079,9 @@ mod tests {
     use oxide_world::world::World;
 
     use super::{
-        ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT, MeshAssets,
-        MeshQueue, TICK_PERIOD, chat_over_cap, finish_meshes, mesh_pool, step_tick,
+        ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT,
+        INPUTS_PER_PASS, MeshAssets, MeshQueue, TICK_PERIOD, chat_over_cap, finish_meshes,
+        mesh_pool, step_tick,
     };
     use crate::entity_view::PlayerList;
     use crate::input::Intent;
@@ -4088,6 +4089,18 @@ mod tests {
     use crate::scoreboard::Scoreboard;
     use crate::ticker::Ticker;
     use std::sync::Arc;
+
+    #[test]
+    fn the_input_backlog_drains_thirty_two_events_per_pass() {
+        // The bound is port-only: the source's input arrives from the window
+        // it already owns, so no source pass caps it. The backlog still
+        // drains across passes and nothing is dropped; the bound only keeps
+        // one pass' work finite when the window outruns the session.
+        assert_eq!(
+            INPUTS_PER_PASS, 32,
+            "one pass drains thirty-two inputs before yielding"
+        );
+    }
 
     #[test]
     fn the_tick_period_is_fifty_milliseconds() {
