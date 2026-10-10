@@ -18,9 +18,9 @@
 use oxide_client::screens::{
     Screens,
     container::{
-        CHEST_SHIFT_STEP, ClickButton, ContainerLayout, ContainerScreen, HOTBAR_TOP, MAIN_TOP,
-        SLOT_LEFT, SLOT_STEP, ScreenKey, TitleKind, chest_row_shift, hovered_last, player_section,
-        point_in_slot, slot_at_first,
+        BackgroundKind, CHEST_SHIFT_STEP, ClickButton, ContainerLayout, ContainerScreen,
+        HOTBAR_TOP, MAIN_TOP, SLOT_LEFT, SLOT_STEP, ScreenKey, SlotBlock, TitleKind,
+        chest_row_shift, hovered_last, player_section, point_in_slot, slot_at_first,
     },
 };
 use oxide_game::container::{
@@ -36,21 +36,25 @@ static SUITE_SLOTS: &[oxide_client::screens::container::SlotPos] = &[
         index: 0,
         x: 8,
         y: 18,
+        block: SlotBlock::Container,
     },
     oxide_client::screens::container::SlotPos {
         index: 1,
         x: 26,
         y: 18,
+        block: SlotBlock::Container,
     },
     oxide_client::screens::container::SlotPos {
         index: 2,
         x: 8,
         y: 36,
+        block: SlotBlock::Container,
     },
     oxide_client::screens::container::SlotPos {
         index: 3,
         x: 26,
         y: 36,
+        block: SlotBlock::Container,
     },
 ];
 static SUITE_LAYOUT: ContainerLayout = ContainerLayout {
@@ -59,6 +63,7 @@ static SUITE_LAYOUT: ContainerLayout = ContainerLayout {
     sheet: "suite/panel",
     slots: SUITE_SLOTS,
     title: TitleKind::Generic,
+    background: BackgroundKind::Full,
 };
 
 fn stack(id: i16, count: u8) -> MetadataItem {
@@ -81,6 +86,7 @@ fn screen_with_cursor(cursor: Option<MetadataItem>) -> ContainerScreen {
             Some(stack(3, 64)),
         ],
         cursor,
+        Vec::new(),
     );
     // Slot 0's cell is (8..24, 18..34); its centre is (16, 26).
     screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
@@ -110,7 +116,7 @@ fn clicks(events: Vec<InputEvent>) -> Vec<(i16, i8, i8)> {
 #[test]
 fn a_window_open_opens_the_container_screen() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"));
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
     assert!(screens.is_open(), "the window opens a screen");
     assert_eq!(screens.current_window_id(), Some(7));
 }
@@ -120,7 +126,7 @@ fn a_window_open_opens_the_container_screen() {
 #[test]
 fn escape_on_a_chest_sends_its_own_close() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"));
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
     let mut cursor = Some(stack(1, 3));
     let event = screens.escape(&mut cursor);
     assert_eq!(event, Some(InputEvent::CloseWindow { window_id: 7 }));
@@ -146,7 +152,7 @@ fn escape_on_the_inventory_sends_window_zero() {
 #[test]
 fn a_server_close_clears_its_open_screen() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"));
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
     assert!(screens.on_server_close(7), "the matching close clears");
     assert!(!screens.is_open());
 }
@@ -156,7 +162,7 @@ fn a_server_close_clears_its_open_screen() {
 #[test]
 fn a_server_close_for_another_window_keeps_the_screen() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"));
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
     assert!(!screens.on_server_close(9), "nothing held window 9");
     assert!(screens.is_open(), "the screen stands");
 }
@@ -166,7 +172,7 @@ fn a_server_close_for_another_window_keeps_the_screen() {
 #[test]
 fn an_unknown_kind_opens_the_generic_frame() {
     let mut screens = Screens::default();
-    screens.on_window_opened(4, WindowKind::Unknown, String::from("???"));
+    screens.on_window_opened(4, WindowKind::Unknown, String::from("???"), 0);
     assert!(screens.is_open(), "even an unknown window opens");
     let generic = match screens.current() {
         Some(oxide_client::screens::ScreenState::Container(screen)) => screen.generic_frame(),
@@ -188,7 +194,7 @@ fn closing_with_no_screen_sends_nothing() {
 #[test]
 fn only_the_inventory_and_creative_screens_take_user_input() {
     let mut screens = Screens::default();
-    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"));
+    screens.on_window_opened(7, WindowKind::Chest, String::from("Chest"), 27);
     assert!(!screens.allow_user_input(), "containers inherit false");
     screens.open_inventory();
     assert!(screens.allow_user_input(), "the inventory sets true");
@@ -239,11 +245,13 @@ fn the_click_reads_the_first_match_and_the_highlight_the_last() {
             index: 5,
             x: 8,
             y: 18,
+            block: SlotBlock::Container,
         },
         SlotPos {
             index: 9,
             x: 8,
             y: 18,
+            block: SlotBlock::Container,
         },
     ];
     // (10, 20) sits inside both cells.
@@ -375,7 +383,7 @@ fn a_drag_release_sends_start_slots_and_end() {
     // different item and can never join.
     screen.mouse_moved(16.0, 44.0, &BaseStackCaps);
     screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
-    let got = clicks(screen.release(ClickButton::Left, false, 1_100));
+    let got = clicks(screen.release(ClickButton::Left, false, 1_100, &BaseStackCaps));
     assert_eq!(
         got,
         vec![
@@ -395,7 +403,7 @@ fn a_right_drag_packs_limit_one() {
     screen.press(ClickButton::Right, false, 1_000);
     screen.mouse_moved(16.0, 44.0, &BaseStackCaps);
     screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
-    let got = clicks(screen.release(ClickButton::Right, false, 1_100));
+    let got = clicks(screen.release(ClickButton::Right, false, 1_100, &BaseStackCaps));
     assert_eq!(
         got,
         vec![
@@ -414,7 +422,11 @@ fn releasing_another_button_cancels_the_drag() {
     let mut screen = screen_with_cursor(Some(stack(1, 64)));
     screen.press(ClickButton::Left, false, 1_000);
     screen.mouse_moved(16.0, 44.0, &BaseStackCaps);
-    assert!(screen.release(ClickButton::Right, false, 1_100).is_empty());
+    assert!(
+        screen
+            .release(ClickButton::Right, false, 1_100, &BaseStackCaps)
+            .is_empty()
+    );
     assert!(!screen.dragging(), "the drag is cancelled");
 }
 
@@ -424,7 +436,7 @@ fn releasing_another_button_cancels_the_drag() {
 fn an_undragged_release_clicks_on_release() {
     let mut screen = screen_with_cursor(Some(stack(1, 64)));
     screen.press(ClickButton::Left, false, 1_000);
-    let got = clicks(screen.release(ClickButton::Left, false, 1_100));
+    let got = clicks(screen.release(ClickButton::Left, false, 1_100, &BaseStackCaps));
     assert_eq!(got, vec![(0, 0, CLICK_MODE_PICKUP)]);
 }
 
@@ -435,7 +447,7 @@ fn a_double_click_gathers() {
     let mut screen = screen_with_cursor(Some(stack(1, 64)));
     // The first click picks up (no drag movement, so release clicks).
     screen.press(ClickButton::Left, false, 1_000);
-    screen.release(ClickButton::Left, false, 1_050);
+    screen.release(ClickButton::Left, false, 1_050, &BaseStackCaps);
     // The second press lands 100 ms later on the same slot.
     screen.apply_snapshot(
         vec![
@@ -445,9 +457,10 @@ fn a_double_click_gathers() {
             Some(stack(3, 64)),
         ],
         Some(stack(1, 60)),
+        Vec::new(),
     );
     screen.press(ClickButton::Left, false, 1_100);
-    let got = clicks(screen.release(ClickButton::Left, false, 1_150));
+    let got = clicks(screen.release(ClickButton::Left, false, 1_150, &BaseStackCaps));
     assert_eq!(got, vec![(0, 0, CLICK_MODE_GATHER)]);
 }
 
@@ -457,7 +470,7 @@ fn a_double_click_gathers() {
 fn a_slow_second_click_is_ordinary() {
     let mut screen = screen_with_cursor(Some(stack(1, 64)));
     screen.press(ClickButton::Left, false, 1_000);
-    screen.release(ClickButton::Left, false, 1_050);
+    screen.release(ClickButton::Left, false, 1_050, &BaseStackCaps);
     screen.apply_snapshot(
         vec![
             Some(stack(1, 4)),
@@ -466,9 +479,10 @@ fn a_slow_second_click_is_ordinary() {
             Some(stack(3, 64)),
         ],
         Some(stack(1, 60)),
+        Vec::new(),
     );
     screen.press(ClickButton::Left, false, 1_400);
-    let got = clicks(screen.release(ClickButton::Left, false, 1_450));
+    let got = clicks(screen.release(ClickButton::Left, false, 1_450, &BaseStackCaps));
     assert_eq!(got, vec![(0, 0, CLICK_MODE_PICKUP)]);
 }
 
@@ -532,4 +546,147 @@ fn the_drag_previews_the_even_split() {
     // 64 across two slots is 32 each; slot 0 already holds 4 of item 1, so
     // it takes 32 + 4 = 36 and slot 2 takes 32: the remnant is 64 − 64.
     assert_eq!(screen.remnant_count(), Some(0));
+}
+
+// The T16-F2 rider: the shift-double-click fan-out keeps the source's gates
+// — the same inventory, a takable stack, a slot that takes the stack —
+// instead of fanning over every matching slot.
+
+#[test]
+fn a_shift_double_click_fans_out_within_its_own_gates() {
+    use oxide_client::screens::container::SlotPos;
+
+    static RIDER_SLOTS: &[SlotPos] = &[
+        SlotPos {
+            index: 0,
+            x: 8,
+            y: 18,
+            block: SlotBlock::Container,
+        },
+        SlotPos {
+            index: 1,
+            x: 26,
+            y: 18,
+            block: SlotBlock::Player,
+        },
+        SlotPos {
+            index: 2,
+            x: 8,
+            y: 36,
+            block: SlotBlock::Container,
+        },
+        SlotPos {
+            index: 3,
+            x: 26,
+            y: 36,
+            block: SlotBlock::Container,
+        },
+    ];
+    static RIDER_LAYOUT: ContainerLayout = ContainerLayout {
+        x_size: 176,
+        y_size: 166,
+        sheet: "suite/rider",
+        slots: RIDER_SLOTS,
+        title: TitleKind::Generic,
+        background: BackgroundKind::Full,
+    };
+    let mut screen =
+        ContainerScreen::new(7, WindowKind::Chest, String::from("Chest"), &RIDER_LAYOUT);
+    screen.apply_snapshot(
+        vec![
+            Some(stack(1, 4)),
+            Some(stack(1, 4)),
+            Some(stack(1, 200)),
+            Some(stack(1, 10)),
+        ],
+        None,
+        Vec::new(),
+    );
+    // Slot 0's centre is (16, 26), like the suite's.
+    screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
+    // Two shift presses on slot 0 inside the 250 ms window arm the
+    // double-click; the release fans mode 1 out.
+    screen.press(ClickButton::Left, true, 1_000);
+    screen.press(ClickButton::Left, true, 1_100);
+    let got = clicks(screen.release(ClickButton::Left, true, 1_150, &BaseStackCaps));
+    // Slot 1 holds the same stack in the other inventory, slot 2 holds the
+    // same stack past the cap (200 > 64): neither fans. Slot 3 has room.
+    assert_eq!(
+        got,
+        vec![(0, 0, CLICK_MODE_QUICK_MOVE), (3, 0, CLICK_MODE_QUICK_MOVE)]
+    );
+}
+
+// The opens resolve the family-A tables by kind: the chest's rows ride the
+// window's slot count, the dropper shares the dispenser, and the unlanded
+// kinds keep the generic frame.
+
+#[test]
+fn an_open_resolves_the_family_layouts_by_kind() {
+    use oxide_client::screens::family_a;
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::Chest, 27).slots.len(),
+        63,
+        "a 27-slot chest window opens 3 rows plus the player 36"
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::Chest, 54).slots.len(),
+        90,
+        "a 54-slot chest window opens 6 rows plus the player 36"
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::Hopper, 5).slots.len(),
+        41
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::Dispenser, 9)
+            .slots
+            .len(),
+        45
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::Dropper, 9)
+            .slots
+            .len(),
+        45,
+        "the dropper shares the dispenser's 3×3"
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::Furnace, 3)
+            .slots
+            .len(),
+        39
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::BrewingStand, 4)
+            .slots
+            .len(),
+        40
+    );
+    assert_eq!(
+        family_a::layout_for_kind(WindowKind::CraftingTable, 10)
+            .slots
+            .len(),
+        46
+    );
+    assert!(
+        family_a::layout_for_kind(WindowKind::EnchantingTable, 2)
+            .slots
+            .is_empty(),
+        "the unlanded kinds keep the slotless generic frame"
+    );
+}
+
+#[test]
+fn an_open_stands_the_resolved_table() {
+    let mut screens = Screens::default();
+    screens.on_window_opened(7, WindowKind::Furnace, String::from("Furnace"), 3);
+    let slots = match screens.current() {
+        Some(oxide_client::screens::ScreenState::Container(screen)) => screen.layout().slots.len(),
+        other => panic!("a furnace opens a container screen, got {other:?}"),
+    };
+    assert_eq!(
+        slots, 39,
+        "the furnace stands its 3 slots plus the player 36"
+    );
 }

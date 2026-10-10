@@ -561,7 +561,9 @@ pub enum ClientEvent {
     /// it from Join Game — and the server opens at most one further window at
     /// a time (`NetHandlerPlayClient.handleOpenWindow:1092-1120`). The title
     /// travels as sent — chat JSON — and the kind names the screen the window
-    /// belongs to.
+    /// belongs to. The slot count travels too: the container-side size the
+    /// screen's layout pick reads (`S2DPacketOpenWindow.readPacketData:51-61`
+    /// carries the window id, the type string, the title and the slot count).
     WindowOpened {
         /// The window id the server assigned.
         window_id: u8,
@@ -569,6 +571,9 @@ pub enum ClientEvent {
         kind: WindowKind,
         /// The title as chat JSON, exactly as sent.
         title: String,
+        /// The window's container-side slot count, exactly as sent: the
+        /// chest's row pick reads `slot count / 9`.
+        slot_count: u8,
     },
     /// A window left the state: the server closed it (clientbound 0x2E) or the
     /// view closed its own screen and the session's close put the window away.
@@ -1937,6 +1942,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     window_id: open.window_id,
                                     kind: open.kind,
                                     title: open.title,
+                                    slot_count: open.slot_count,
                                 },
                             );
                         }

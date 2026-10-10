@@ -49,6 +49,7 @@ use crate::ChatInput;
 use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
 use oxide_client::screens::container::{HOVER_COLOUR, TITLE_COLOUR};
+use oxide_client::screens::family_a;
 use oxide_client::screens::{ScreenState, Screens};
 use oxide_client::tooltip;
 
@@ -361,22 +362,42 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     let layout = container.layout();
     let (gx, gy) = container.origin();
     let (gx, gy) = (gx as f32, gy as f32);
-    // The sheet blit at the panel's top-left (the generic frame's single
-    // blit; the chest's split pair is Task 18's).
-    draws.push(HudDraw::TexturedRect {
-        texture: HudTexture::Named(layout.sheet),
-        x: gx,
-        y: gy,
-        width: layout.x_size as f32,
-        height: layout.y_size as f32,
-        uv: [
-            0.0,
-            0.0,
-            layout.x_size as f32 / 256.0,
-            layout.y_size as f32 / 256.0,
-        ],
-        colour: [1.0, 1.0, 1.0, 1.0],
-    });
+    // The background's sheet blits at the panel's top-left: the full panel,
+    // or the chest's split pair (Task 18) — then the live property blits,
+    // which the background layer draws before the slots
+    // (`GuiFurnace.java`:44-55, `GuiBrewingStand.java`:52-82).
+    for blit in family_a::background_blits(layout) {
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(layout.sheet),
+            x: gx + blit.dx as f32,
+            y: gy + blit.dy as f32,
+            width: blit.w as f32,
+            height: blit.h as f32,
+            uv: [
+                blit.sx as f32 / 256.0,
+                blit.sy as f32 / 256.0,
+                (blit.sx + blit.w) as f32 / 256.0,
+                (blit.sy + blit.h) as f32 / 256.0,
+            ],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+    }
+    for blit in family_a::property_blits(container.kind(), container.properties()) {
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(layout.sheet),
+            x: gx + blit.dx as f32,
+            y: gy + blit.dy as f32,
+            width: blit.w as f32,
+            height: blit.h as f32,
+            uv: [
+                blit.sx as f32 / 256.0,
+                blit.sy as f32 / 256.0,
+                (blit.sx + blit.w) as f32 / 256.0,
+                (blit.sy + blit.h) as f32 / 256.0,
+            ],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+    }
     // The slots in slot order, each cell's item through the icon seam. A
     // covered slot draws its preview count with the white rect; a lone
     // covered slot draws nothing at all (`drawSlot`:243-303).
@@ -453,7 +474,10 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     // the chest's pair, the inventory's label, the generic title). Without
     // a font the titles stay out while the sheet and items still draw.
     if input.font.is_some() {
-        for line in container.title_lines() {
+        // The centred top line measures its display text through the same
+        // font the draw measures with.
+        let measure = |text: &str| input.font.map_or(0, |font| string_width(font, text));
+        for line in container.title_lines(measure) {
             let text = plain_text(&chat::parse_json(&line.text));
             if !text.is_empty() {
                 draws.push(HudDraw::Text {
@@ -9643,7 +9667,12 @@ mod tests {
 
         let font = chat_font();
         let mut screens = Screens::default();
-        screens.open_container(3, WindowKind::Chest, String::from("{\"text\":\"Chest\"}"));
+        screens.open_container(
+            3,
+            WindowKind::Unknown,
+            String::from("{\"text\":\"Chest\"}"),
+            0,
+        );
         screens
             .container_mut()
             .expect("the open is a container")
@@ -9657,6 +9686,7 @@ mod tests {
                 damage: 0,
                 nbt: None,
             }),
+            Vec::new(),
         );
         let draws = screen_draws(
             &screens,
@@ -9728,6 +9758,7 @@ mod tests {
             index: 0,
             x: 8,
             y: 18,
+            block: oxide_client::screens::container::SlotBlock::Container,
         }];
         static ONE_LAYOUT: ContainerLayout = ContainerLayout {
             x_size: 176,
@@ -9735,6 +9766,7 @@ mod tests {
             sheet: "unit/panel",
             slots: ONE,
             title: TitleKind::Generic,
+            background: oxide_client::screens::container::BackgroundKind::Full,
         };
         fn stack(id: i16, count: u8) -> MetadataItem {
             MetadataItem {
@@ -9755,7 +9787,7 @@ mod tests {
         screens.test_container(3, &ONE_LAYOUT);
         let container = screens.container_mut().expect("the stood container");
         container.set_screen_size(427, 240);
-        container.apply_snapshot(vec![Some(stack(276, 1))], Some(stack(1, 4)));
+        container.apply_snapshot(vec![Some(stack(276, 1))], Some(stack(1, 4)), Vec::new());
         container.mouse_moved(16.0, 26.0, &BaseStackCaps);
         assert_eq!(
             container.hovered(),
@@ -9782,7 +9814,7 @@ mod tests {
         screens
             .container_mut()
             .expect("the stood container")
-            .apply_snapshot(vec![Some(stack(276, 1))], None);
+            .apply_snapshot(vec![Some(stack(276, 1))], None, Vec::new());
         let draws = screen_draws(
             &screens,
             &ScreenDrawInput {

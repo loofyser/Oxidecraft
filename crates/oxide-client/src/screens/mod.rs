@@ -33,9 +33,10 @@ use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
-use container::{ContainerLayout, ContainerScreen, GENERIC_LAYOUT};
+use container::{ContainerLayout, ContainerScreen};
 
 pub mod container;
+pub mod family_a;
 
 /// One open screen: a variant per screen the client can stand on.
 #[derive(Debug, Clone)]
@@ -130,19 +131,32 @@ impl Screens {
     /// Folds one `WindowOpened` into the screens: Task 16 wires the
     /// Container kind's path only — every kind opens a container screen, and
     /// an unlisted kind draws the generic frame (recorded).
-    pub fn on_window_opened(&mut self, window_id: u8, kind: WindowKind, title: String) {
-        self.open_container(window_id, kind, title);
+    pub fn on_window_opened(
+        &mut self,
+        window_id: u8,
+        kind: WindowKind,
+        title: String,
+        slot_count: u8,
+    ) {
+        self.open_container(window_id, kind, title, slot_count);
     }
 
-    /// Opens the container screen on the window. The per-kind tables land in
-    /// Tasks 18-20; until then every container draws the generic frame
-    /// (recorded) while the kind still records which table it will take.
-    pub fn open_container(&mut self, window_id: u8, kind: WindowKind, title: String) {
+    /// Opens the container screen on the window. The family-A tables resolve
+    /// by kind in [`family_a::layout_for_kind`] — the chest's row count rides
+    /// the window's slot count — while the unlanded kinds keep the generic
+    /// frame (recorded).
+    pub fn open_container(
+        &mut self,
+        window_id: u8,
+        kind: WindowKind,
+        title: String,
+        slot_count: u8,
+    ) {
         self.current = Some(ScreenState::Container(Box::new(ContainerScreen::new(
             window_id,
             kind,
             title,
-            &GENERIC_LAYOUT,
+            family_a::layout_for_kind(kind, slot_count),
         ))));
     }
 
@@ -220,10 +234,11 @@ impl Screens {
         window_id: u8,
         slots: Vec<Option<MetadataItem>>,
         cursor: Option<MetadataItem>,
+        properties: Vec<i16>,
     ) {
         if let Some(ScreenState::Container(screen)) = self.current.as_mut() {
             if screen.window_id() == window_id {
-                screen.apply_snapshot(slots, cursor);
+                screen.apply_snapshot(slots, cursor, properties);
             }
         }
     }

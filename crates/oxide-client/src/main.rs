@@ -1880,8 +1880,9 @@ impl ClientApp {
                 window_id,
                 kind,
                 title,
+                slot_count,
             } => {
-                screens.on_window_opened(*window_id, *kind, title.clone());
+                screens.on_window_opened(*window_id, *kind, title.clone(), *slot_count);
                 tab.open = false;
                 // The pointer was grabbed until this open: there is no free
                 // position yet, so no hover or hit-test point until the mouse
@@ -1901,9 +1902,15 @@ impl ClientApp {
                 window_id,
                 slots,
                 cursor: snapshot_cursor,
+                properties,
                 ..
             } => {
-                screens.apply_snapshot(*window_id, slots.clone(), snapshot_cursor.clone());
+                screens.apply_snapshot(
+                    *window_id,
+                    slots.clone(),
+                    snapshot_cursor.clone(),
+                    properties.clone(),
+                );
             }
             _ => {}
         }
@@ -2002,7 +2009,7 @@ impl ClientApp {
         let now = system_time_ms();
         let events = match state {
             ElementState::Pressed => screen.press(button, shift, now),
-            ElementState::Released => screen.release(button, shift, now),
+            ElementState::Released => screen.release(button, shift, now, &ItemTable),
         };
         for event in events {
             self.send_input(event);

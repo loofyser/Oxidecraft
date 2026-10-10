@@ -33,8 +33,10 @@ use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 
-/// One slot's panel-local position: the wire index and the cell's top-left in
-/// panel units (`Slot.xDisplayPosition/yDisplayPosition`).
+/// One slot's panel-local position: the wire index, the cell's top-left in
+/// panel units (`Slot.xDisplayPosition/yDisplayPosition`), and the inventory
+/// block the slot belongs to — the shift-double-click fan-out's
+/// same-inventory gate (`slot.inventory == ...`, Task 18's T16-F2 rider).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotPos {
     /// The wire slot number the click names.
@@ -43,6 +45,20 @@ pub struct SlotPos {
     pub x: i32,
     /// The cell's top edge in panel units.
     pub y: i32,
+    /// Which inventory the slot reads from: the tile's own block or the
+    /// player's 27+9.
+    pub block: SlotBlock,
+}
+
+/// Which inventory a slot belongs to: the tile's own slots (the chest rows,
+/// the hopper five, the furnace three, the brewing four, the crafting ten)
+/// or the player's 27 main plus 9 hotbar (one `InventoryPlayer` either way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotBlock {
+    /// The container side: the tile's own slots.
+    Container,
+    /// The player side: main and hotbar share the block.
+    Player,
 }
 
 /// Where a screen's title lines come from: the window's sent title or a fixed
@@ -60,10 +76,32 @@ pub enum TitleSource {
 /// by the draws, not here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleKind {
-    /// The chest's pair: the lower inventory's name at `(8, 6)` and the upper
-    /// window's at `(8, ySize − 96 + 2)` (`GuiChest.java`:36-40).
+    /// The chest's and hopper's pair: the window's own title (the container
+    /// inventory's name, as the server sent it) at `(8, 6)` and the lower
+    /// inventory's name at `(8, ySize − 96 + 2)` (`GuiChest.java`:36-40,
+    /// `GuiHopper.java`:36-40 — the port corrected the order in Task 18:
+    /// the top line is the server title, never the player label).
     Chest {
-        /// The lower inventory's display name.
+        /// The lower (player) inventory's display name.
+        lower: TitleSource,
+    },
+    /// The dispenser's, furnace's and brewing stand's pair: the window's own
+    /// title CENTRED at `(xSize / 2 − width / 2, 6)` and the player name at
+    /// `(8, ySize − 96 + 2)` (`GuiDispenser.java`:31-35,
+    /// `GuiFurnace.java`:31-35, `GuiBrewingStand.java`:35-39). The centred
+    /// pen needs a width measure, so [`ContainerScreen::title_lines`] takes
+    /// one.
+    Centred {
+        /// The lower (player) inventory's display name.
+        lower: TitleSource,
+    },
+    /// The crafting table's fixed pair: the `container.crafting` label at
+    /// `(28, 6)` and the `container.inventory` label at `(8, ySize − 96 + 2)`
+    /// (`GuiCrafting.java`:32-36) — the family's only fixed top label.
+    Crafting {
+        /// The top label's source.
+        top: TitleSource,
+        /// The bottom label's source.
         lower: TitleSource,
     },
     /// The inventory's single crafting label at `(86, 16)`
@@ -74,6 +112,20 @@ pub enum TitleKind {
     },
     /// The generic frame's single window title at `(8, 6)`.
     Generic,
+}
+
+/// How a layout's background blits its sheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundKind {
+    /// One full-panel blit at the panel's top-left.
+    Full,
+    /// The chest's split pair (`GuiChest.java`:45-53): the sheet's upper
+    /// slice `rows × 18 + 17` tall at the panel's top-left, then the 96-row
+    /// bottom blit from sheet row 126 at `y = rows × 18 + 17`.
+    ChestSplit {
+        /// The chest's row count: `rows = slot count / 9`.
+        rows: i32,
+    },
 }
 
 /// One container panel: the size, the sheet and the slot table it lays out.
@@ -90,6 +142,9 @@ pub struct ContainerLayout {
     pub slots: &'static [SlotPos],
     /// Which title lines draw over the panel.
     pub title: TitleKind,
+    /// How the background blits the sheet: the full panel, or the chest's
+    /// split pair.
+    pub background: BackgroundKind,
 }
 
 /// The generic frame's layout: the default 176×166 panel with no slot table.
@@ -104,6 +159,7 @@ pub static GENERIC_LAYOUT: ContainerLayout = ContainerLayout {
     sheet: "gui/container/generic_54",
     slots: &[],
     title: TitleKind::Generic,
+    background: BackgroundKind::Full,
 };
 
 /// The default panel width (`GuiContainer.java`:28).
@@ -238,6 +294,7 @@ pub fn player_section(base: i16) -> Vec<SlotPos> {
                 index: base + row as i16 * 9 + col as i16,
                 x: SLOT_LEFT + col * SLOT_STEP,
                 y: MAIN_TOP + row * SLOT_STEP,
+                block: SlotBlock::Player,
             });
         }
     }
@@ -246,6 +303,7 @@ pub fn player_section(base: i16) -> Vec<SlotPos> {
             index: base + 27 + col as i16,
             x: SLOT_LEFT + col * SLOT_STEP,
             y: HOTBAR_TOP,
+            block: SlotBlock::Player,
         });
     }
     slots
@@ -268,6 +326,7 @@ pub fn chest_player_section(base: i16, rows: i32) -> Vec<SlotPos> {
                 index: base + row as i16 * 9 + col as i16,
                 x: SLOT_LEFT + col * SLOT_STEP,
                 y: CHEST_MAIN_TOP + row * SLOT_STEP + shift,
+                block: SlotBlock::Player,
             });
         }
     }
@@ -276,6 +335,7 @@ pub fn chest_player_section(base: i16, rows: i32) -> Vec<SlotPos> {
             index: base + 27 + col as i16,
             x: SLOT_LEFT + col * SLOT_STEP,
             y: CHEST_HOTBAR_TOP + shift,
+            block: SlotBlock::Player,
         });
     }
     slots
@@ -383,6 +443,10 @@ pub struct ContainerScreen {
     layout: &'static ContainerLayout,
     /// The view's copy of the window's slots, in wire order.
     slots: Vec<Option<MetadataItem>>,
+    /// The view's copy of the window's properties by index (a furnace's burn
+    /// and cook state, a brewing stand's brew time): the property draws read
+    /// these, an absent index reading 0.
+    properties: Vec<i16>,
     /// The view's copy of the carried stack.
     cursor: Option<MetadataItem>,
     /// The pointer in panel-local units.
@@ -420,6 +484,7 @@ impl ContainerScreen {
             title,
             layout,
             slots: Vec::new(),
+            properties: Vec::new(),
             cursor: None,
             mouse: (0.0, 0.0),
             origin: (0, 0),
@@ -458,9 +523,11 @@ impl ContainerScreen {
         &mut self,
         slots: Vec<Option<MetadataItem>>,
         cursor: Option<MetadataItem>,
+        properties: Vec<i16>,
     ) {
         self.slots = slots;
         self.cursor = cursor;
+        self.properties = properties;
     }
 
     /// Moves the pointer and refreshes the hover and the drag's add rule.
@@ -569,6 +636,11 @@ impl ContainerScreen {
     /// The view's copy of the wire slot's stack.
     pub fn slot_stack(&self, index: i16) -> Option<&Option<MetadataItem>> {
         usize::try_from(index).ok().and_then(|i| self.slots.get(i))
+    }
+
+    /// The view's copy of the window's properties by index.
+    pub fn properties(&self) -> &[i16] {
+        &self.properties
     }
 
     /// Recomputes the drag's preview into the run (`updateDragSplitting`
@@ -682,7 +754,14 @@ impl ContainerScreen {
     /// different-button cancel, the swallowed press release, the drag's
     /// 1+n+1 mode-5 batch, and otherwise the carried-stack click (pick →
     /// mode 3, shift → mode 1, else mode 0).
-    pub fn release(&mut self, button: ClickButton, shift: bool, now_ms: u64) -> Vec<InputEvent> {
+    pub fn release(
+        &mut self,
+        button: ClickButton,
+        shift: bool,
+        now_ms: u64,
+        caps: &impl StackCaps,
+    ) -> Vec<InputEvent> {
+        let _ = caps;
         let _ = now_ms;
         let mut events = Vec::new();
         let slot = self.click_slot();
@@ -697,19 +776,23 @@ impl ContainerScreen {
         if self.double_click && slot.is_some() && button == ClickButton::Left {
             if shift {
                 if let Some(want) = self.shift_clicked.clone() {
+                    // The shift arm fans mode 1 out over the matching slots
+                    // (`:536-556`): the source's own inventory block, a stack
+                    // to take (`canTakeStack` + `getHasStack`), and room for
+                    // the wanted stack (`canAddItemToSlot`).
+                    let source = slot
+                        .and_then(|index| self.layout.slots.iter().find(|pos| pos.index == index));
+                    let cap = max_stack_size(&want, caps);
                     for pos in self.layout.slots {
-                        let same =
-                            self.slot_stack(pos.index)
-                                .cloned()
-                                .flatten()
-                                .is_some_and(|held| {
-                                    held.id == want.id
-                                        && held.damage == want.damage
-                                        && held.nbt == want.nbt
-                                });
-                        if same {
-                            events.push(self.click(pos.index, button.raw(), CLICK_MODE_QUICK_MOVE));
+                        if source.is_some_and(|from| pos.block != from.block) {
+                            continue;
                         }
+                        let held = self.slot_stack(pos.index).cloned().flatten();
+                        let Some(held) = held else { continue };
+                        if !can_add_item_to_slot(&Some(held), &want, cap) {
+                            continue;
+                        }
+                        events.push(self.click(pos.index, button.raw(), CLICK_MODE_QUICK_MOVE));
                     }
                 }
             } else {
@@ -846,20 +929,56 @@ impl ContainerScreen {
         }
     }
 
-    /// The title lines the frame reads, in panel-local units.
-    pub fn title_lines(&self) -> Vec<TitleLine> {
+    /// The title lines the frame reads, in panel-local units. The centred top
+    /// line measures its display text through `measure` (`xSize / 2 −
+    /// width / 2`, `GuiDispenser.java`:31-35 and its kin); every other pen is
+    /// pinned.
+    pub fn title_lines(&self, measure: impl Fn(&str) -> i32) -> Vec<TitleLine> {
         match self.layout.title {
             TitleKind::Chest { lower } => vec![
+                TitleLine {
+                    text: self.title.clone(),
+                    x: 8,
+                    y: 6,
+                },
                 TitleLine {
                     text: match lower {
                         TitleSource::WindowTitle => self.title.clone(),
                         TitleSource::Fixed(label) => String::from(label),
                     },
                     x: 8,
+                    y: self.layout.y_size - 96 + 2,
+                },
+            ],
+            TitleKind::Centred { lower } => vec![
+                TitleLine {
+                    text: self.title.clone(),
+                    x: self.layout.x_size / 2 - measure(self.title.as_str()) / 2,
                     y: 6,
                 },
                 TitleLine {
-                    text: self.title.clone(),
+                    text: match lower {
+                        TitleSource::WindowTitle => self.title.clone(),
+                        TitleSource::Fixed(label) => String::from(label),
+                    },
+                    x: 8,
+                    y: self.layout.y_size - 96 + 2,
+                },
+            ],
+            TitleKind::Crafting { top, lower } => vec![
+                TitleLine {
+                    text: match top {
+                        TitleSource::WindowTitle => self.title.clone(),
+                        TitleSource::Fixed(label) => String::from(label),
+                    },
+                    x: 28,
+                    y: 6,
+                },
+                TitleLine {
+                    text: match lower {
+                        TitleSource::WindowTitle => self.title.clone(),
+                        TitleSource::Fixed(label) => String::from(label),
+                    },
                     x: 8,
                     y: self.layout.y_size - 96 + 2,
                 },
@@ -893,6 +1012,7 @@ mod unit {
         index: 0,
         x: 8,
         y: 18,
+        block: SlotBlock::Container,
     }];
     static PIN_LAYOUT: ContainerLayout = ContainerLayout {
         x_size: 176,
@@ -900,6 +1020,7 @@ mod unit {
         sheet: "unit/panel",
         slots: PINS,
         title: TitleKind::Generic,
+        background: BackgroundKind::Full,
     };
 
     #[test]
@@ -931,7 +1052,7 @@ mod unit {
     #[test]
     fn the_cursor_draws_eight_up_and_left_of_the_pointer() {
         let mut screen = ContainerScreen::new(1, WindowKind::Chest, String::new(), &PIN_LAYOUT);
-        screen.apply_snapshot(vec![None], Some(stack(1, 4)));
+        screen.apply_snapshot(vec![None], Some(stack(1, 4)), Vec::new());
         let draw = screen.cursor_draw((100.0, 50.0)).expect("a cursor draws");
         assert_eq!((draw.x, draw.y), (92.0, 42.0));
         assert_eq!(draw.stack.count, 4);
@@ -941,7 +1062,7 @@ mod unit {
     #[test]
     fn a_single_slot_drag_draws_the_cursor_whole() {
         let mut screen = ContainerScreen::new(1, WindowKind::Chest, String::new(), &PIN_LAYOUT);
-        screen.apply_snapshot(vec![None], Some(stack(1, 1)));
+        screen.apply_snapshot(vec![None], Some(stack(1, 1)), Vec::new());
         screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
         screen.press(ClickButton::Left, false, 1_000);
         // A lone carried item dragged over one slot: the set holds one, so
@@ -959,11 +1080,13 @@ mod unit {
                 index: 0,
                 x: 8,
                 y: 18,
+                block: SlotBlock::Container,
             },
             SlotPos {
                 index: 1,
                 x: 26,
                 y: 18,
+                block: SlotBlock::Container,
             },
         ];
         static TWO_LAYOUT: ContainerLayout = ContainerLayout {
@@ -972,9 +1095,10 @@ mod unit {
             sheet: "unit/pair",
             slots: TWO,
             title: TitleKind::Generic,
+            background: BackgroundKind::Full,
         };
         let mut screen = ContainerScreen::new(1, WindowKind::Chest, String::new(), &TWO_LAYOUT);
-        screen.apply_snapshot(vec![None, None], Some(stack(1, 2)));
+        screen.apply_snapshot(vec![None, None], Some(stack(1, 2)), Vec::new());
         screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
         screen.press(ClickButton::Left, false, 1_000);
         screen.mouse_moved(16.0, 26.0, &BaseStackCaps);
@@ -992,11 +1116,13 @@ mod unit {
                 index: 0,
                 x: 8,
                 y: 18,
+                block: SlotBlock::Container,
             },
             SlotPos {
                 index: 1,
                 x: 26,
                 y: 18,
+                block: SlotBlock::Container,
             },
         ];
         static CAPPED_LAYOUT: ContainerLayout = ContainerLayout {
@@ -1005,12 +1131,13 @@ mod unit {
             sheet: "unit/capped",
             slots: CAPPED_TWO,
             title: TitleKind::Generic,
+            background: BackgroundKind::Full,
         };
         // Sixty-four shovels (cap 1) split evenly over two slots: the raw
         // thirty-two runs past the cap, so each preview draws capped at one
         // (`drawSlot`:253-264 states the yellow cap while clamping).
         let mut screen = ContainerScreen::new(1, WindowKind::Chest, String::new(), &CAPPED_LAYOUT);
-        screen.apply_snapshot(vec![None, None], Some(stack(256, 64)));
+        screen.apply_snapshot(vec![None, None], Some(stack(256, 64)), Vec::new());
         screen.mouse_moved(16.0, 26.0, &crate::items::ItemTable);
         screen.press(ClickButton::Left, false, 1_000);
         screen.mouse_moved(16.0, 26.0, &crate::items::ItemTable);
@@ -1040,21 +1167,103 @@ mod unit {
             title: TitleKind::Chest {
                 lower: TitleSource::Fixed("Inventory"),
             },
+            background: BackgroundKind::Full,
         };
         let screen =
             ContainerScreen::new(1, WindowKind::Chest, String::from("Chest"), &CHEST_LAYOUT);
+        // The top line is the window's own title (the chest inventory's
+        // name, as the server sent it); the bottom line is the player
+        // inventory's name (`GuiChest.java`:36-40, order corrected in Task
+        // 18 — the ctor's `upperInv`/`lowerChestInventory` names are
+        // inverted vs physical position).
         assert_eq!(
-            screen.title_lines(),
+            screen.title_lines(|_| 0),
             vec![
                 TitleLine {
-                    text: String::from("Inventory"),
+                    text: String::from("Chest"),
                     x: 8,
                     y: 6
                 },
                 TitleLine {
-                    text: String::from("Chest"),
+                    text: String::from("Inventory"),
                     x: 8,
                     y: 168 - 96 + 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_centred_title_halves_the_measured_width() {
+        static CENTRED_LAYOUT: ContainerLayout = ContainerLayout {
+            x_size: 176,
+            y_size: 166,
+            sheet: "unit/furnace",
+            slots: PINS,
+            title: TitleKind::Centred {
+                lower: TitleSource::Fixed("Inventory"),
+            },
+            background: BackgroundKind::Full,
+        };
+        let screen = ContainerScreen::new(
+            1,
+            WindowKind::Furnace,
+            String::from("Furnace"),
+            &CENTRED_LAYOUT,
+        );
+        // A 60-wide top line centres at 176 / 2 − 60 / 2 = 58
+        // (`GuiFurnace.java`:31-35); the player line stays left at (8, 72).
+        assert_eq!(
+            screen.title_lines(|_| 60),
+            vec![
+                TitleLine {
+                    text: String::from("Furnace"),
+                    x: 58,
+                    y: 6
+                },
+                TitleLine {
+                    text: String::from("Inventory"),
+                    x: 8,
+                    y: 166 - 96 + 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_crafting_titles_are_the_fixed_pair() {
+        static CRAFTING_LAYOUT: ContainerLayout = ContainerLayout {
+            x_size: 176,
+            y_size: 166,
+            sheet: "unit/crafting",
+            slots: PINS,
+            title: TitleKind::Crafting {
+                top: TitleSource::Fixed("Crafting"),
+                lower: TitleSource::Fixed("Inventory"),
+            },
+            background: BackgroundKind::Full,
+        };
+        let screen = ContainerScreen::new(
+            0,
+            WindowKind::CraftingTable,
+            String::from("ignored server title"),
+            &CRAFTING_LAYOUT,
+        );
+        // The family's only fixed top label: `container.crafting` at (28, 6),
+        // the player label below — the server title draws nowhere
+        // (`GuiCrafting.java`:32-36).
+        assert_eq!(
+            screen.title_lines(|_| 0),
+            vec![
+                TitleLine {
+                    text: String::from("Crafting"),
+                    x: 28,
+                    y: 6
+                },
+                TitleLine {
+                    text: String::from("Inventory"),
+                    x: 8,
+                    y: 166 - 96 + 2
                 },
             ]
         );
@@ -1070,10 +1279,11 @@ mod unit {
             title: TitleKind::Inventory {
                 label: TitleSource::Fixed("Crafting"),
             },
+            background: BackgroundKind::Full,
         };
         let screen = ContainerScreen::new(0, WindowKind::Container, String::new(), &INV_LAYOUT);
         assert_eq!(
-            screen.title_lines(),
+            screen.title_lines(|_| 0),
             vec![TitleLine {
                 text: String::from("Crafting"),
                 x: 86,

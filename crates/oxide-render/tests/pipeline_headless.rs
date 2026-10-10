@@ -9530,3 +9530,350 @@ fn t17_tooltip_paints_fill_border_lines_and_flip() {
         "the sky where the unflipped box would run off",
     );
 }
+
+/// Task 18's family-A sheet in miniature: the t16-style zoning — green left
+/// of sheet x 88, blue right of it — with the caller's rect fills painted
+/// over it, so each screen's property-source rects read in their own colour.
+///
+/// Generated here; no asset store is read and no sheet pixel is copied.
+fn t18_family_sheet(fills: &[(u32, u32, u32, u32, [u8; 4])]) -> Texture {
+    const SIDE: u32 = 256;
+    let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let at = ((y * SIDE + x) * 4) as usize;
+            let mut texel = if x < 88 {
+                [0, 255, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            for (rx, ry, rw, rh, colour) in fills {
+                if x >= *rx && x < rx + rw && y >= *ry && y < ry + rh {
+                    texel = *colour;
+                }
+            }
+            rgba[at..at + 4].copy_from_slice(&texel);
+        }
+    }
+    Texture {
+        width: SIDE,
+        height: SIDE,
+        rgba,
+    }
+}
+
+/// One sheet-space blit as the screen pass reads it: the panel-dest rect and
+/// the sheet-src origin, mirroring `view.rs`'s Task 18 background loop.
+/// The six blit terms in order: the dest x/y, the width/height, the sheet
+/// x/y. One array (not nine arguments) keeps the helper under the lint's
+/// arity cap.
+fn t18_blit(name: &'static str, gx: f32, gy: f32, r: [i32; 6]) -> HudDraw {
+    let (dx, dy, w, h, sx, sy) = (r[0], r[1], r[2], r[3], r[4], r[5]);
+    HudDraw::TexturedRect {
+        texture: HudTexture::Named(name),
+        x: gx + dx as f32,
+        y: gy + dy as f32,
+        width: w as f32,
+        height: h as f32,
+        uv: [
+            sx as f32 / 256.0,
+            sy as f32 / 256.0,
+            (sx + w) as f32 / 256.0,
+            (sy + h) as f32 / 256.0,
+        ],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    }
+}
+
+/// One functional slot's checker item (id 2, whose top-left cell is black),
+/// mirroring the screen pass's per-slot item draw.
+fn t18_slot_item(x: f32, y: f32) -> HudDraw {
+    HudDraw::Item {
+        stack: Some(ItemIcon {
+            id: 2,
+            damage: 0,
+            enchanted: false,
+        }),
+        x,
+        y,
+        pop: 0.0,
+    }
+}
+
+/// Task 18's family-A frame runner: one screen pass over the sky clear with
+/// the named sheet and the given draws, through the item icon seam. The
+/// background gradient and the title lines stay out of the mirror — the
+/// client-side assembly pins own them, as in the t16 frame case.
+fn t18_family_pixels(name: &'static str, sheet: &Texture, draws: &[HudDraw]) -> Vec<u8> {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = rows_target(&device, format);
+    let mut screen = HudPass::new(&device, &queue, format);
+    screen.set_resolution(&queue, ROWS_WIDE as f32, ROWS_TALL as f32);
+    screen.set_texture(&device, &queue, name, sheet);
+    screen.set_atlas_icon(&device, &queue, &item_atlas());
+    screen.set_icon_source(
+        &device,
+        &queue,
+        Arc::new(TestIcons {
+            atlas: item_atlas(),
+        }),
+    );
+    screen.set_draws(
+        &device,
+        &queue,
+        draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let depth = rows_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide t18 family headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        screen.draw(pass);
+    });
+    queue.submit(Some(encoder.finish()));
+    read_rows_pixels(&device, &queue, &target)
+}
+
+/// The six-row chest frame: the 176x222 panel at the centred origin
+/// (136, 9), the split pair (the 125-tall upper slice, the 96-row bottom
+/// blit from sheet row 126, here white), and a checker item in two chest
+/// slots and two player slots.
+///
+/// The geometry mirrors `view.rs`'s screen draws for `CHEST_90`, which the
+/// render crate cannot import. The pins: the upper slice's green/blue, the
+/// white bottom on both sides of the split line, the four items' black
+/// cells, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t18_familya_chest_draws_both_blits_and_items() {
+    const NAME: &str = "t18/chest";
+    const GX: f32 = 136.0;
+    const GY: f32 = 9.0;
+    let sheet = t18_family_sheet(&[(0, 126, 256, 130, [255, 255, 255, 255])]);
+    let pixels = t18_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 125, 0, 0]),
+            t18_blit(NAME, GX, GY, [0, 125, 176, 96, 0, 126]),
+            t18_slot_item(GX + 8.0, GY + 18.0),
+            t18_slot_item(GX + 152.0, GY + 108.0),
+            t18_slot_item(GX + 8.0, GY + 139.0),
+            t18_slot_item(GX + 152.0, GY + 197.0),
+        ],
+    );
+    expect_rows(&pixels, 140, 20, [0, 255, 0], "the upper slice's green");
+    expect_rows(&pixels, 230, 20, [0, 0, 255], "the upper slice's blue");
+    expect_rows(
+        &pixels,
+        140,
+        133,
+        [0, 255, 0],
+        "the green just above the split",
+    );
+    expect_rows(
+        &pixels,
+        140,
+        135,
+        [255, 255, 255],
+        "the white just below the split",
+    );
+    expect_rows(&pixels, 140, 150, [255, 255, 255], "the bottom blit");
+    expect_rows(&pixels, 144, 27, [0, 0, 0], "chest slot 0's item");
+    expect_rows(&pixels, 288, 117, [0, 0, 0], "chest slot 53's item");
+    expect_rows(&pixels, 144, 148, [0, 0, 0], "player slot 54's item");
+    expect_rows(&pixels, 288, 206, [0, 0, 0], "player slot 89's item");
+    expect_rows(&pixels, 320, 100, SKY, "the sky right of the panel");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The hopper frame: the 176x133 panel at the centred origin (136, 53) with
+/// a checker item in each of the five hopper slots.
+///
+/// The pins: the sheet's green/blue, the five items' black cells, and the
+/// sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t18_familya_hopper_draws_five_slots() {
+    const NAME: &str = "t18/hopper";
+    const GX: f32 = 136.0;
+    const GY: f32 = 53.0;
+    let sheet = t18_family_sheet(&[]);
+    let pixels = t18_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 133, 0, 0]),
+            t18_slot_item(GX + 44.0, GY + 20.0),
+            t18_slot_item(GX + 62.0, GY + 20.0),
+            t18_slot_item(GX + 80.0, GY + 20.0),
+            t18_slot_item(GX + 98.0, GY + 20.0),
+            t18_slot_item(GX + 116.0, GY + 20.0),
+        ],
+    );
+    expect_rows(&pixels, 140, 60, [0, 255, 0], "the sheet's green");
+    expect_rows(&pixels, 260, 60, [0, 0, 255], "the sheet's blue");
+    expect_rows(&pixels, 180, 73, [0, 0, 0], "hopper slot 0's item");
+    expect_rows(&pixels, 198, 73, [0, 0, 0], "hopper slot 1's item");
+    expect_rows(&pixels, 216, 73, [0, 0, 0], "hopper slot 2's item");
+    expect_rows(&pixels, 234, 73, [0, 0, 0], "hopper slot 3's item");
+    expect_rows(&pixels, 252, 73, [0, 0, 0], "hopper slot 4's item");
+    expect_rows(&pixels, 140, 40, SKY, "the sky above the panel");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The dispenser frame: the 176x166 panel at the centred origin (136, 37)
+/// with a checker item in each of the nine grid slots.
+///
+/// The pins: the sheet's green/blue, the grid corners' and centre's black
+/// cells, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t18_familya_dispenser_draws_nine_slots() {
+    const NAME: &str = "t18/dispenser";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[]);
+    let pixels = t18_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_slot_item(GX + 62.0, GY + 17.0),
+            t18_slot_item(GX + 80.0, GY + 17.0),
+            t18_slot_item(GX + 98.0, GY + 17.0),
+            t18_slot_item(GX + 62.0, GY + 35.0),
+            t18_slot_item(GX + 80.0, GY + 35.0),
+            t18_slot_item(GX + 98.0, GY + 35.0),
+            t18_slot_item(GX + 62.0, GY + 53.0),
+            t18_slot_item(GX + 80.0, GY + 53.0),
+            t18_slot_item(GX + 98.0, GY + 53.0),
+        ],
+    );
+    expect_rows(&pixels, 140, 45, [0, 255, 0], "the sheet's green");
+    expect_rows(&pixels, 260, 45, [0, 0, 255], "the sheet's blue");
+    expect_rows(&pixels, 198, 54, [0, 0, 0], "grid slot 0's item");
+    expect_rows(&pixels, 234, 54, [0, 0, 0], "grid slot 2's item");
+    expect_rows(&pixels, 216, 72, [0, 0, 0], "grid slot 4's item");
+    expect_rows(&pixels, 198, 90, [0, 0, 0], "grid slot 6's item");
+    expect_rows(&pixels, 234, 90, [0, 0, 0], "grid slot 8's item");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The furnace frame mid-burn (burn 100/200, cook 100/200): the 176x166
+/// panel at (136, 37), the red flame 14x7 at (56, 42) from sheet (176, 6),
+/// the magenta arrow 13x16 at (79, 34) from sheet (176, 14), and a checker
+/// item in the input, fuel and output slots.
+///
+/// The pins: the flame's and arrow's pixels at the pinned sizes, the three
+/// items' black cells, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t18_familya_furnace_draws_flame_and_arrow() {
+    const NAME: &str = "t18/furnace";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[
+        (176, 0, 14, 13, [255, 0, 0, 255]),
+        (176, 14, 25, 16, [255, 0, 255, 255]),
+    ]);
+    let pixels = t18_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_blit(NAME, GX, GY, [56, 42, 14, 7, 176, 6]),
+            t18_blit(NAME, GX, GY, [79, 34, 13, 16, 176, 14]),
+            t18_slot_item(GX + 56.0, GY + 17.0),
+            t18_slot_item(GX + 56.0, GY + 53.0),
+            t18_slot_item(GX + 116.0, GY + 35.0),
+        ],
+    );
+    expect_rows(&pixels, 194, 81, [255, 0, 0], "the flame's pixels");
+    expect_rows(&pixels, 217, 73, [255, 0, 255], "the arrow's pixels");
+    expect_rows(&pixels, 192, 54, [0, 0, 0], "the input's item");
+    expect_rows(&pixels, 192, 90, [0, 0, 0], "the fuel's item");
+    expect_rows(&pixels, 252, 72, [0, 0, 0], "the output's item");
+    expect_rows(&pixels, 300, 45, [0, 0, 255], "the sheet's blue");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The brewing frame mid-brew (brewTime 200): the 176x166 panel at
+/// (136, 37), the cyan fill 9x14 at (97, 16) from sheet (176, 0), the orange
+/// bubble frame 12x20 at (65, 23) from sheet (185, 9), and a checker item in
+/// the three potion slots and the ingredient slot.
+///
+/// The pins: the fill's and bubbles' pixels at the pinned sizes, the four
+/// items' black cells, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t18_familya_brewing_draws_fill_and_bubbles() {
+    const NAME: &str = "t18/brewing";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[
+        (176, 0, 9, 28, [0, 255, 255, 255]),
+        (185, 0, 12, 29, [255, 128, 0, 255]),
+    ]);
+    let pixels = t18_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_blit(NAME, GX, GY, [97, 16, 9, 14, 176, 0]),
+            t18_blit(NAME, GX, GY, [65, 23, 12, 20, 185, 9]),
+            t18_slot_item(GX + 56.0, GY + 46.0),
+            t18_slot_item(GX + 79.0, GY + 53.0),
+            t18_slot_item(GX + 102.0, GY + 46.0),
+            t18_slot_item(GX + 79.0, GY + 17.0),
+        ],
+    );
+    expect_rows(&pixels, 235, 55, [0, 255, 255], "the fill's pixels");
+    expect_rows(&pixels, 203, 62, [255, 128, 0], "the bubbles' pixels");
+    expect_rows(&pixels, 192, 83, [0, 0, 0], "potion slot 0's item");
+    expect_rows(&pixels, 215, 90, [0, 0, 0], "potion slot 1's item");
+    expect_rows(&pixels, 238, 83, [0, 0, 0], "potion slot 2's item");
+    expect_rows(&pixels, 215, 54, [0, 0, 0], "the ingredient's item");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
+
+/// The crafting frame: the 176x166 panel at (136, 37) with a checker item
+/// in the result slot and each of the nine grid slots.
+///
+/// The pins: the sheet's green/blue, the result's and three grid items'
+/// black cells, and the sky past the frame.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn t18_familya_crafting_draws_result_and_grid() {
+    const NAME: &str = "t18/crafting";
+    const GX: f32 = 136.0;
+    const GY: f32 = 37.0;
+    let sheet = t18_family_sheet(&[]);
+    let pixels = t18_family_pixels(
+        NAME,
+        &sheet,
+        &[
+            t18_blit(NAME, GX, GY, [0, 0, 176, 166, 0, 0]),
+            t18_slot_item(GX + 124.0, GY + 35.0),
+            t18_slot_item(GX + 30.0, GY + 17.0),
+            t18_slot_item(GX + 48.0, GY + 17.0),
+            t18_slot_item(GX + 66.0, GY + 17.0),
+            t18_slot_item(GX + 30.0, GY + 35.0),
+            t18_slot_item(GX + 48.0, GY + 35.0),
+            t18_slot_item(GX + 66.0, GY + 35.0),
+            t18_slot_item(GX + 30.0, GY + 53.0),
+            t18_slot_item(GX + 48.0, GY + 53.0),
+            t18_slot_item(GX + 66.0, GY + 53.0),
+        ],
+    );
+    expect_rows(&pixels, 140, 45, [0, 255, 0], "the sheet's green");
+    expect_rows(&pixels, 260, 45, [0, 0, 255], "the sheet's blue");
+    expect_rows(&pixels, 260, 72, [0, 0, 0], "the result's item");
+    expect_rows(&pixels, 166, 54, [0, 0, 0], "grid slot 1's item");
+    expect_rows(&pixels, 184, 72, [0, 0, 0], "grid slot 5's item");
+    expect_rows(&pixels, 202, 90, [0, 0, 0], "grid slot 9's item");
+    expect_rows(&pixels, 400, 230, SKY, "the sky past the frame");
+}
