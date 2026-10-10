@@ -520,13 +520,13 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     // co-draw; the cursor stays `Some` through a port drag, so the one gate
     // covers the drag too). Without a font there is no width to place, so
     // the box stays out while the rest still draws.
-    if let (Some(mouse), Some(font)) = (input.mouse, input.font)
-        && container.cursor().is_none()
-    {
-        if let Some(hovered) = container.hovered() {
-            if let Some(stack) = container.slot_stack(hovered).cloned().flatten() {
-                let lines = tooltip::tooltip_lines(&stack, input.advanced);
-                draws.extend(tooltip::tooltip_draws(&lines, font, mouse, (width, height)));
+    if let (Some(mouse), Some(font)) = (input.mouse, input.font) {
+        if container.cursor().is_none() {
+            if let Some(hovered) = container.hovered() {
+                if let Some(stack) = container.slot_stack(hovered).cloned().flatten() {
+                    let lines = tooltip::tooltip_lines(&stack, input.advanced);
+                    draws.extend(tooltip::tooltip_draws(&lines, font, mouse, (width, height)));
+                }
             }
         }
     }

@@ -93,12 +93,14 @@ pub fn rarity_of(stack: &MetadataItem) -> Rarity {
     if (RECORD_MIN_ID..=RECORD_MAX_ID).contains(&stack.id) {
         return Rarity::Rare;
     }
-    if stack.id == ENCHANTED_BOOK_ID
-        && let Some(root) = root.as_ref()
-        && let Some(NbtValue::List(stored)) = child(root, "StoredEnchantments")
-        && !stored.is_empty()
-    {
-        return Rarity::Uncommon;
+    if stack.id == ENCHANTED_BOOK_ID {
+        if let Some(root) = root.as_ref() {
+            if let Some(NbtValue::List(stored)) = child(root, "StoredEnchantments") {
+                if !stored.is_empty() {
+                    return Rarity::Uncommon;
+                }
+            }
+        }
     }
     let enchanted = root
         .as_ref()
@@ -186,19 +188,17 @@ pub fn advanced_tooltip_lines(stack: &MetadataItem) -> Vec<TooltipLine> {
     let grey = grey_colour();
     let mut lines = Vec::new();
     let root = compound_of(stack);
-    if let Some(entry) = item_entry(stack.id)
-        && entry.max_damage > 0
-        && stack.damage > 0
-        && !unbreakable(root.as_ref())
-    {
-        lines.push(TooltipLine {
-            text: format!(
-                "Durability: {} / {}",
-                entry.max_damage - stack.damage,
-                entry.max_damage
-            ),
-            colour: grey,
-        });
+    if let Some(entry) = item_entry(stack.id) {
+        if entry.max_damage > 0 && stack.damage > 0 && !unbreakable(root.as_ref()) {
+            lines.push(TooltipLine {
+                text: format!(
+                    "Durability: {} / {}",
+                    entry.max_damage - stack.damage,
+                    entry.max_damage
+                ),
+                colour: grey,
+            });
+        }
     }
     lines.push(TooltipLine {
         text: format!(
@@ -447,17 +447,17 @@ fn attribute_section(
         .filter(|entry| entry.id == SHARPNESS_ID)
         .map(|entry| f64::from(entry.level) * SHARPNESS_FOLD)
         .sum();
-    if let Some(root) = root
-        && let Some(modifiers) = nbt_modifiers(root)
-    {
-        let lines = modifiers
-            .iter()
-            .filter_map(|modifier| {
-                let amount = modifier.amount + if modifier.weapon_uuid { fold } else { 0.0 };
-                attribute_line(&modifier.key, amount, modifier.operation)
-            })
-            .collect();
-        return (!modifiers.is_empty(), lines);
+    if let Some(root) = root {
+        if let Some(modifiers) = nbt_modifiers(root) {
+            let lines = modifiers
+                .iter()
+                .filter_map(|modifier| {
+                    let amount = modifier.amount + if modifier.weapon_uuid { fold } else { 0.0 };
+                    attribute_line(&modifier.key, amount, modifier.operation)
+                })
+                .collect();
+            return (!modifiers.is_empty(), lines);
+        }
     }
     match item_entry(stack.id).and_then(|entry| entry.attributes.tooltip_inputs()) {
         Some((key, amount)) => {
