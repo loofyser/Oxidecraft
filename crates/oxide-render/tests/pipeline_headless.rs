@@ -962,6 +962,64 @@ fn the_frames_water_fog_falls_off_exponentially() {
     );
 }
 
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_submerged_clouds_fall_off_exponentially() {
+    // Fix8's live divergence: the overhead clouds read wholly unfogged (linear factor
+    // 1.0 over 96..128) where the source's submerged arm (`EntityRenderer.java:1984-1995`)
+    // draws them at EXP density 0.1 — factor `exp(-(0.1 * 58.6)^2)` ≈ 0, full fog colour.
+    // The camera stands at the live pool eye (feet 69) looking 80 degrees up, and the
+    // celestial frame is turned a quarter turn so the sun and the moon sit on the horizon,
+    // clear of the frame. The white clouds over the black band then read the water fog
+    // colour `(0.02, 0.02, 0.2)` = `(5, 5, 51)` at 0.8 alpha over the fogged band `(5, 5, 47)`.
+    let water = water_fog(0, false);
+    assert_eq!(water.mode, FogMode::Exp);
+    let fog = FogParams {
+        colour: water.colour,
+        start: 96.0,
+        end: 128.0,
+        far_plane: 128.0,
+        mode: water.mode,
+        density: water.density,
+    };
+    let (device, queue) = headless_device();
+    let textures = synthetic_sky_textures();
+    let mut sky = SkyPass::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+    sky.set_textures(&device, &queue, &textures.sun, &textures.moon_phases);
+    let mut cloud = CloudPass::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+    cloud.set_texture(&device, &queue, &textures.clouds);
+    let pixels = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: SkyParams {
+                celestial_angle: 0.25,
+                sky_colour: [0.0, 0.0, 0.0],
+                sun_brightness: 1.0,
+                star_brightness: 0.0,
+                fog_colour: water.colour,
+                far_plane: 128.0,
+                cloud_offset_ticks: 0,
+                cloud_colour: [1.0, 1.0, 1.0],
+                moon_phase: 0,
+            },
+            camera: sky_camera(69.0, 0.0, -80.0, DEFAULT_FOV),
+            clear: [1.0, 0.0, 1.0],
+            clouds: true,
+            fog: Some(fog),
+        },
+    );
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        [5, 5, 50],
+        "the overhead clouds under EXP water fog",
+    );
+}
+
 /// The sky and cloud passes: the band's read-back over a contrasting clear, the star brightness
 /// gate, the moon's phase cell, the under-horizon plane's fog and the layer's blend.
 #[test]
@@ -1004,6 +1062,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
             camera: sky_camera(65.0, 0.0, -20.0, DEFAULT_FOV),
             clear: [1.0, 0.0, 1.0],
             clouds: false,
+            fog: None,
         },
     );
     expect_pixel(
@@ -1047,6 +1106,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
             camera,
             clear: [0.0, 0.0, 0.0],
             clouds: false,
+            fog: None,
         },
     );
     let dark = render_sky(
@@ -1062,6 +1122,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
             camera,
             clear: [0.0, 0.0, 0.0],
             clouds: false,
+            fog: None,
         },
     );
     assert!(
@@ -1106,6 +1167,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
                 camera: moon_camera,
                 clear: [0.0, 0.0, 0.0],
                 clouds: false,
+                fog: None,
             },
         );
         expect_pixel(
@@ -1147,6 +1209,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
             camera: sky_camera(f64::from(feet), 0.0, pitch, DEFAULT_FOV),
             clear: below_sky,
             clouds: false,
+            fog: None,
         },
     );
     let d0 = (feet + EYE_HEIGHT) - HORIZON;
@@ -1199,6 +1262,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
             camera,
             clear: below_sky,
             clouds: false,
+            fog: None,
         },
     );
     // The corner of the plane's own grid that sits under the eye, in the pass's local frame:
@@ -1238,6 +1302,7 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
             camera: sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV),
             clear: below_sky,
             clouds: true,
+            fog: None,
         },
     );
     expect_pixel(
@@ -1260,6 +1325,9 @@ struct SkyRequest {
     clear: [f32; 3],
     /// Whether the cloud layer draws after the sky.
     clouds: bool,
+    /// The frame's fog for the cloud layer (and, once the sky pass carries it,
+    /// the sky): `None` leaves both passes' defaults, the air-frame behaviour.
+    fog: Option<FogParams>,
 }
 
 /// The camera's yaw and pitch for a local target position, from the camera at
@@ -1349,9 +1417,15 @@ fn render_sky(
     let depth = create_depth(device);
     sky.set_params(queue, request.params);
     sky.set_camera(queue, request.camera, 1.0);
+    if let Some(fog) = request.fog {
+        sky.set_fog(queue, fog);
+    }
     if request.clouds {
         cloud.set_params(queue, request.params);
         cloud.set_camera(queue, request.camera, 1.0);
+    }
+    if let Some(fog) = request.fog {
+        cloud.set_fog(queue, fog);
     }
     let clear = to_color(request.clear);
 

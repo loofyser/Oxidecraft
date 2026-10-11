@@ -676,7 +676,9 @@ impl Renderer {
     /// Sets the fog every following frame is drawn and cleared with.
     ///
     /// The colour and the range go to the terrain pass and the cloud pass, which mix them into
-    /// every fragment they draw, and the same colour becomes the clear the sky behind the
+    /// every fragment they draw, and the sky pass takes the same frame's fog for its own
+    /// fogged surfaces — the linear range on air frames, the water arm's EXP density when
+    /// the eye is submerged — while the same colour becomes the clear the sky behind the
     /// terrain is drawn in, so the two agree where the terrain ends. What the colour is for a
     /// given world is the caller's step — [`crate::fog::fog_colour`] produces one for a
     /// dimension, a time and an eye position, and [`crate::fog::linear_params`] the range for a
@@ -685,6 +687,7 @@ impl Renderer {
     pub fn set_fog(&mut self, params: FogParams) {
         self.terrain.set_fog(&self.queue, params);
         self.cloud.set_fog(&self.queue, params);
+        self.sky.set_fog(&self.queue, params);
         self.entity_pass.set_fog(params);
         self.fog = Some(params);
     }

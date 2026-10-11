@@ -109,6 +109,26 @@ pub fn water_fog_for_eye(
     }
 }
 
+/// The EXP density a fogged pass reads from a frame's fog: the water arm's density
+/// when the frame takes the submerged branch, zero on every linear frame — the word
+/// the terrain and entity shaders already key their EXP arm on, and the sky and cloud
+/// shaders key theirs on after fix8 (`EntityRenderer.java:1985-1995` arms EXP at that
+/// density for every draw that follows, whatever `startCoords` it was installed with).
+pub fn exp_fog_density(params: &FogParams) -> f32 {
+    match params.mode {
+        FogMode::Exp => params.density,
+        FogMode::Linear => 0.0,
+    }
+}
+
+/// The EXP fog factor at a radial distance: `exp(-(density * distance)^2)`, `GL_EXP`'s
+/// own curve — the falloff every fogged pass draws under the submerged arm, which
+/// reads neither the linear start nor the end.
+pub fn exp_fog_factor(density: f32, distance: f32) -> f32 {
+    let d = density * distance;
+    (-d * d).exp()
+}
+
 /// The Overworld's fog base (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`).
 const SURFACE_FOG: [f32; 3] = [0.7529412, 0.84705883, 1.0];
 
@@ -277,8 +297,8 @@ fn celestial_angle(time_of_day: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FogMode, FogParams, celestial_angle, fog_colour, light_factor, linear_params,
-        sky_mix_strength, surface_fog, water_fog_for_eye,
+        FogMode, FogParams, celestial_angle, exp_fog_density, exp_fog_factor, fog_colour,
+        light_factor, linear_params, sky_mix_strength, surface_fog, water_fog_for_eye,
     };
 
     /// The sky the chain's tests mix towards: the same flat triple every time, so a failure
@@ -408,5 +428,40 @@ mod tests {
             None,
             "respiration and potion are dry-eyed no-ops"
         );
+    }
+
+    #[test]
+    fn the_density_word_is_the_water_arms_on_submerged_frames() {
+        // The word the fogged shaders key their EXP arm on: the frame's density on
+        // submerged frames, zero on air frames — whatever the linear start and end
+        // say, which the EXP arm never reads.
+        let water = FogParams {
+            colour: [0.02, 0.02, 0.2],
+            start: 96.0,
+            end: 128.0,
+            far_plane: 128.0,
+            mode: FogMode::Exp,
+            density: 0.1,
+        };
+        assert_eq!(exp_fog_density(&water), 0.1);
+        let air = FogParams {
+            mode: FogMode::Linear,
+            density: 0.0,
+            ..water
+        };
+        assert_eq!(exp_fog_density(&air), 0.0);
+    }
+
+    #[test]
+    fn the_exp_factor_crushes_distant_fragments_to_the_fog_colour() {
+        // `exp(-(density * distance)^2)` at the still-water 0.1: 0.612626... at
+        // seven blocks, 0.018316... at twenty, and nothing left past forty — where
+        // the live pass's overhead clouds sit (~57 blocks: the linear 96..128 range
+        // reads the exact 1.0 there, wholly unfogged, which is the recorded gap).
+        assert!((exp_fog_factor(0.1, 0.0) - 1.0).abs() < 1e-6);
+        assert!((exp_fog_factor(0.1, 7.0) - 0.612_626).abs() < 1e-5);
+        assert!((exp_fog_factor(0.1, 20.0) - 0.018_316).abs() < 1e-5);
+        assert!(exp_fog_factor(0.1, 57.0) < 1e-6);
+        assert!(exp_fog_factor(0.0, 57.0) - 1.0 < 1e-6);
     }
 }

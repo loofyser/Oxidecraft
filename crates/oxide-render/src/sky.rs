@@ -11,7 +11,9 @@
 //!   (`RenderGlobal.java:340-365`) at `y = +16` (`:325`), flat in the frame's sky colour. The
 //!   source draws it with fog enabled (`:1231`), disables fog for the celestial quads (`:1248`)
 //!   and re-enables it for the void and the below-horizon plane (`:1349`), all under the sky
-//!   range `setupFog(-1)` installs (`EntityRenderer.java:1348`, `:2009-2010`).
+//!   range `setupFog(-1)` installs (`EntityRenderer.java:1348`, `:2009-2010`) — or under the
+//!   water arm's EXP density when the eye is submerged, which that arm installs
+//!   unconditionally (`:1984-1995`), the range then reading nothing.
 //! * The below-horizon plane is the same grid generated at `y = -16` with its winding reversed
 //!   (`:291`, `renderSky(worldrenderer, -16.0F, true)`), lifted so it sits at the world horizon:
 //!   the source translates it by `16 - (eyeY - 63)` `RenderGlobal.java`:1412, reaching
@@ -51,7 +53,9 @@
 //! `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` (`:1438`). Culling is off for the layer (`:1430`), the depth
 //! test is on and — because `renderSky` restores `depthMask(true)` before this (`:1416`) and the
 //! fast arm masks nothing — the depth writes are on too. The fog is the terrain range
-//! (`EntityRenderer.setupFog(0)`, `EntityRenderer.java:1361`, `:1500`).
+//! (`EntityRenderer.setupFog(0)`, `EntityRenderer.java:1361`, `:1500`) — or the water arm's
+//! EXP density when the eye is submerged, which that arm installs unconditionally
+//! (`:1984-1995`), the range then reading nothing.
 //!
 //! The uv offset is the source's own chain (`:1454-1464`): the camera's interpolated x plus
 //! `(cloudTickCounter + partialTicks) * 0.03` blocks of drift, wrapped on `±2048` on each axis
@@ -83,7 +87,9 @@
 //! `SkyParams.far_plane * 2` and the cloud's at `* 4`, with `SkyParams.far_plane` the source's
 //! `farPlaneDistance` — the render distance in blocks, 128 for the default eight chunks — which
 //! is also the fog's reference distance (the sky's range is `0..far_plane`, the terrain's and the
-//! clouds' `setupFog(0)` range comes from [`crate::fog::linear_params`]).
+//! clouds' `setupFog(0)` range comes from [`crate::fog::linear_params`]) — while a submerged
+//! frame's fogged surfaces all read the water arm's EXP density instead
+//! ([`crate::fog::exp_fog_density`]).
 //!
 //! The modelview the source draws the sky with ends with
 //! `GlStateManager.translate(0.0F, -f, 0.0F)` with `f = getEyeHeight()` (`EntityRenderer.java:738`),
@@ -110,7 +116,7 @@ use glam::{Mat4, Vec3};
 use oxide_assets::texture::Texture;
 
 use crate::camera::{Camera, FIRST_PERSON_OFFSET};
-use crate::fog::{FogMode, FogParams};
+use crate::fog::{FogMode, FogParams, exp_fog_density};
 use crate::terrain_pass::DEPTH_FORMAT;
 
 /// One cell of the sky's grids, in blocks (`RenderGlobal.java:342`).
@@ -305,6 +311,13 @@ pub fn cloud_under_layer(camera: &Camera) -> bool {
 /// second draw (`EntityRenderer.java:1474`, `entity.posY + eyeHeight >= 128.0`).
 pub fn cloud_at_or_above_layer(camera: &Camera) -> bool {
     entity_eye_y(camera) >= f64::from(CLOUD_HEIGHT)
+}
+
+/// The sky uniform's EXP density word for a frame's fog: the water arm's density in
+/// `x` when the eye is submerged, zeros on air frames — the word the sky shader keys
+/// its EXP arm on, mirroring the terrain and entity convention.
+fn sky_fog_density(fog: &FogParams) -> [f32; 4] {
+    [exp_fog_density(fog), 0.0, 0.0, 0.0]
 }
 
 /// The void box's floor for an eye height: `-(d0 + 65)` with `d0 = eyeY - horizon`
@@ -531,8 +544,8 @@ static SKY_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
 static CLOUD_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
 
 /// The sky's frame uniform: 16 floats of view-projection, 16 of celestial rotation, then the four
-/// colours and the two parameter `vec4`s.
-const SKY_UNIFORM_BYTES: usize = (16 + 16 + 4 + 4 + 4 + 4 + 4) * 4;
+/// colours, the two parameter `vec4`s and the EXP density word.
+const SKY_UNIFORM_BYTES: usize = (16 + 16 + 4 + 4 + 4 + 4 + 4 + 4) * 4;
 
 /// The cloud frame uniform: the view-projection, the colour, the origin and uv offset, the
 /// fog's colour and range, and the eye.
@@ -558,6 +571,9 @@ struct Sky {
     // x: the stars' brightness, y/z/w: the eye's position in the frame's local coordinates, the
     // point the fog's radial distance is measured from (`GL_EYE_RADIAL_NV`).
     params: vec4<f32>,
+    // x: the EXP density the water arm fills when the eye is submerged
+    // (`EntityRenderer.java:1984-1995`), zeros on air frames.
+    fog_density: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> sky: Sky;
@@ -628,9 +644,17 @@ fn base(input: VertexOutput) -> vec4<f32> {
     }
 }
 
-// The linear fog every ground-facing sky surface mixes in, the same mix the terrain uses: the
-// distance is the eye's radial one.
+// The fog every ground-facing sky surface mixes in: the linear range on air frames,
+// and the source's EXP falloff instead — `exp(-(density * distance)^2)`, `GL_EXP`'s
+// own curve, the water arm's `setupFog` density (`EntityRenderer.java:1985-1995`) —
+// on submerged frames, which reads neither the start nor the end. The distance is
+// the eye's radial one.
 fn fogged(colour: vec4<f32>, distance: f32) -> vec4<f32> {
+    if (sky.fog_density.x > 0.0) {
+        let d = sky.fog_density.x * distance;
+        let factor = exp(-d * d);
+        return vec4<f32>(mix(sky.fog_colour.rgb, colour.rgb, factor), colour.a);
+    }
     let span = sky.fog_range.y - sky.fog_range.x;
     if (span <= 0.0) {
         return colour;
@@ -653,6 +677,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// The cloud layer's fog words for a frame's fog: the terrain range the clouds fade
+/// over (`EntityRenderer.setupFog(0)`, `EntityRenderer.java:1361`, `:1500`) with
+/// the frame's far plane alongside — and the EXP density word the water arm fills
+/// when the eye is submerged (`:1984-1995`, which that arm never conditions on the
+/// start), zero on air frames.
+fn cloud_fog_words(fog: &FogParams) -> [f32; 4] {
+    [fog.start, fog.end, fog.far_plane, exp_fog_density(fog)]
+}
+
 /// The cloud shader source, with the layer's constants injected.
 fn cloud_shader() -> String {
     format!(
@@ -663,7 +696,9 @@ struct Cloud {{
     // x: the view x, y: the view z, z: the uv's u offset, w: its v offset.
     origin: vec4<f32>,
     fog_colour: vec4<f32>,
-    // x: the fog's start, y: its end.
+    // x: the fog's start, y: its end, z: the far plane alongside, w: the EXP density
+    // the water arm fills when the eye is submerged (`EntityRenderer.java:1984-1995`),
+    // zero on air frames.
     fog_range: vec4<f32>,
     // x, y, z: the eye's world position, the point the fog's radial distance is measured from;
     // the fourth component is unused.
@@ -712,6 +747,14 @@ fn vs_main(input: VertexInput) -> VertexOutput {{
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {{
     let texel = textureSample(cloud_texture, cloud_sampler, input.uv);
     let colour = texel * vec4<f32>(cloud.colour.rgb, CLOUD_ALPHA);
+    // A positive density draws the source's EXP falloff instead — `exp(-(density *
+    // distance)^2)`, `GL_EXP`'s own curve, the water arm's `setupFog` density
+    // (`EntityRenderer.java:1985-1995`) — which reads neither the start nor the end.
+    if (cloud.fog_range.w > 0.0) {{
+        let d = cloud.fog_range.w * input.distance;
+        let factor = exp(-d * d);
+        return vec4<f32>(mix(cloud.fog_colour.rgb, colour.rgb, factor), colour.a);
+    }}
     let span = cloud.fog_range.y - cloud.fog_range.x;
     if (span <= 0.0) {{
         return colour;
@@ -1255,6 +1298,9 @@ pub struct SkyPass {
     aspect: f32,
     /// Whether the eye sits below the horizon, the gate on the void's draw.
     below_horizon: bool,
+    /// The frame's fog, as [`crate::fog::FogParams`] carried it: the sky's fogged
+    /// surfaces read its EXP density word when the eye is submerged.
+    fog: FogParams,
 }
 
 impl SkyPass {
@@ -1380,6 +1426,7 @@ impl SkyPass {
             camera: None,
             aspect: 1.0,
             below_horizon: false,
+            fog: NO_FOG,
         }
     }
 
@@ -1401,6 +1448,17 @@ impl SkyPass {
     pub fn set_camera(&mut self, queue: &wgpu::Queue, camera: Camera, aspect: f32) {
         self.camera = Some(camera);
         self.aspect = aspect;
+        self.refresh(queue);
+    }
+
+    /// Stores the frame's fog and refreshes the uniform.
+    ///
+    /// The sky's fogged surfaces draw under the same arm the terrain does: the linear
+    /// `0..far_plane` range on air frames, and the water arm's EXP density when the eye
+    /// is submerged (`EntityRenderer.setupFog(-1)`, `EntityRenderer.java:1348`, arms the
+    /// same unconditional water branch `:1984-1995` for the sky draw that follows).
+    pub fn set_fog(&mut self, queue: &wgpu::Queue, fog: FogParams) {
+        self.fog = fog;
         self.refresh(queue);
     }
 
@@ -1469,6 +1527,7 @@ impl SkyPass {
         ]);
         values.extend_from_slice(&[0.0, params.far_plane, below_lift, void_box_low(eye_y)]);
         values.extend_from_slice(&[params.star_brightness, eye.x, eye.y, eye.z]);
+        values.extend_from_slice(&sky_fog_density(&self.fog));
         let mut bytes = [0u8; SKY_UNIFORM_BYTES];
         f32_bytes(&values, &mut bytes);
         queue.write_buffer(&self.frame_buffer, 0, &bytes);
@@ -1740,7 +1799,7 @@ impl CloudPass {
             self.fog.colour[2],
             1.0,
         ]);
-        values.extend_from_slice(&[self.fog.start, self.fog.end, self.fog.far_plane, 0.0]);
+        values.extend_from_slice(&cloud_fog_words(&self.fog));
         // The cloud's view is the world view (`camera.view()`), whose origin is the eye less the
         // first-person offset; the fog's radial distance is measured from the same point.
         let eye = camera.eye() - FIRST_PERSON_OFFSET * camera.forward();
@@ -1776,11 +1835,13 @@ mod tests {
 
     use super::{
         CLOUD_DRIFT_PER_TICK, CLOUD_UV_PER_BLOCK, KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend,
-        celestial_rotation, cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_layer_y,
-        cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv, sky_depth_state, sky_eye,
-        sky_vertex_layout, star_field, sun_quad_vertices, void_box_low,
+        celestial_rotation, cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_fog_words,
+        cloud_layer_y, cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv,
+        sky_depth_state, sky_eye, sky_fog_density, sky_vertex_layout, star_field,
+        sun_quad_vertices, void_box_low,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::fog::{FogMode, FogParams};
 
     #[test]
     fn the_sky_vertex_layout_matches_the_byte_stream() {
@@ -2003,6 +2064,67 @@ mod tests {
         assert!(
             sun.abs_diff_eq(Vec3::new(-100.0, 0.0, 0.0), 1e-4),
             "the quarter turn puts the sun on the western horizon: {sun:?}"
+        );
+    }
+
+    #[test]
+    fn submerged_clouds_carry_the_water_arms_exp_density() {
+        // The live pass's divergence (fix8): overhead clouds at ~57 blocks read wholly
+        // unfogged (linear factor 1.0 over 96..128) where the source's submerged arm
+        // (`EntityRenderer.java:1984-1995`) draws them at EXP density 0.1 — factor
+        // `exp(-(0.1 * 57)^2)` ≈ 0, full fog colour. The fourth fog word is that
+        // density on submerged frames and stays zero on air frames.
+        let water = FogParams {
+            colour: [0.02, 0.02, 0.2],
+            start: 96.0,
+            end: 128.0,
+            far_plane: 128.0,
+            mode: FogMode::Exp,
+            density: 0.1,
+        };
+        let words = cloud_fog_words(&water);
+        assert_eq!(&words[0..3], &[96.0, 128.0, 128.0]);
+        assert!(
+            (words[3] - 0.1).abs() < 1e-6,
+            "the submerged density is 0.1; got {}",
+            words[3]
+        );
+        let air = FogParams {
+            mode: FogMode::Linear,
+            density: 0.0,
+            ..water
+        };
+        assert_eq!(
+            cloud_fog_words(&air)[3],
+            0.0,
+            "the air frame keeps the zero density word"
+        );
+    }
+
+    #[test]
+    fn submerged_sky_carries_the_water_arms_exp_density() {
+        // The sky-side half of the same divergence (fix8): the band, the void and the
+        // below-horizon plane draw under `setupFog(-1)` (`EntityRenderer.java:1348`), which
+        // arms the same unconditional water branch (`:1984-1995`). The uniform's density
+        // word is that density on submerged frames and zeros on air frames.
+        let water = FogParams {
+            colour: [0.02, 0.02, 0.2],
+            start: 0.0,
+            end: 128.0,
+            far_plane: 128.0,
+            mode: FogMode::Exp,
+            density: 0.1,
+        };
+        assert_eq!(sky_fog_density(&water), [0.1, 0.0, 0.0, 0.0]);
+        let air = FogParams {
+            mode: FogMode::Linear,
+            density: 0.0,
+            ..water
+        };
+        assert_eq!(
+            sky_fog_density(&air),
+            [0.0, 0.0, 0.0, 0.0],
+            "the air frame keeps the zero density word"
         );
     }
 }
