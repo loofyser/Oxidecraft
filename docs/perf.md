@@ -128,3 +128,9 @@ performance-relevant observation is the mesh pump's drain under the server's ent
 (idle-gated, ≈1.2 columns/s; captures soak past it) — recorded in the milestone's acceptance
 report. The M2 baseline (textured terrain, tagged `m2` 2026-10-02) above stands as the comparison
 point for M9's full protocol.
+
+M5 (HUD and inventory) closed and tagged `m5` on 2026-10-11; its state entry and acceptance
+record are in `docs/STATE.md` ("M5 evidence"). M5 added no image-metric classes; its one
+performance-relevant observation is the acceptance run's keepalive soak behaviour (rates on
+cadence under the acceptance server's entity flood) — recorded in the milestone's live-pass
+report.

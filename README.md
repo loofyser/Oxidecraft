@@ -14,12 +14,12 @@ faster, more stable, lighter, and open source.
 
 ## Development status
 
-Pre-alpha and playable on the rig: M0 (foundations), M1 (bytes to world), M2 (textured terrain) and
-M3 (the player) are complete, and M4 (entities and chat) closed on 2026-10-07 — the client draws
-the 1.8.9 entity families with their skins, nametags and objects, and it chats, clicks and agrees
-with a live 1.8.9 server on the HUD surfaces (chat, tab list, scoreboard, boss bar). Milestone M5
-(the HUD and the inventory) is next. See `docs/STATE.md` for where the project stands, what is
-verified, and the evidence.
+Pre-alpha and playable on the rig: M0 (foundations), M1 (bytes to world), M2 (textured terrain),
+M3 (the player) and M4 (entities and chat) are complete, and M5 (HUD and inventory) closed on
+2026-10-11 — the client draws the HUD and plays the inventory, container, sign and book
+surfaces, and agrees with a live 1.8.9 server on the item, window and slot paths. Milestone M6
+(sound, particles, weather, screens) is next. See `docs/STATE.md` for where the project stands,
+what is verified, and the evidence.
 
 ## Building
 

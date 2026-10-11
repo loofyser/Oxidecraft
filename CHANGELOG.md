@@ -7,6 +7,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Milestone M5: HUD and inventory
+
+Delivered and tagged `m5` on 2026-10-11. The client's HUD and inventory are complete: the hotbar
+with the held-item popup and the crosshair; the health, food, armour, air and experience rows;
+the item registry with its icons, tooltips and creative lists; the container surfaces (the
+inventory with the crafting grid, the chest, hopper, dispenser, furnace, brewing, crafting
+table, beacon, enchanting, villager, horse and anvil screens, the creative inventory, sign
+editing and the book reader) with the click, drag and split semantics; held items and armour
+drawn on entities and first-person; the window, sign and experience packets with the slot NBT
+round-trip — carried through a live acceptance run whose every headline number was re-derived
+from the recorded artifacts; the defects the run surfaced (the HUD projection's fractional
+scale, the underwater overlay and water fog, the use-click reach, the modelled blocks, the
+container and creative screen draws, the book open, the water fog's falloff and eye-light term,
+and the window drag chain) were fixed in the milestone's scoped fix rounds. The documented
+classes and the operator's by-eye list are in `docs/STATE.md`.
+
+### Added
+
+- The window/inventory packet set — the window items, set-slot, sign and experience decodes; the
+  click, creative and sign writers; the slot NBT round-trip.
+- The item registry: the sub-items, names and creative lists; the item sprites' stitch; the GUI
+  sheets and the baked item models with the source's display transforms.
+- The HUD: the hotbar with the held-item popup, the crosshair, the health/food/armour/air/XP
+  rows, the item tooltips, and the held items and armour on entities and first-person.
+- The container surfaces: the screen framework and the container base; the inventory, chest,
+  hopper, dispenser, furnace, brewing, crafting, beacon, enchanting, villager, horse and anvil
+  screens; the creative inventory; sign editing; the book reader; the click/drag/split machine.
+- The acceptance machinery: the scripted gesture runner and the live-pass recipes under
+  `refs/m5-task-27/` (local evidence, not shipped).
+
+New dependencies: none — `oxide-client` gains edges to the existing `oxide-proto` and
+`serde_json` workspace dependencies (the window events and the replay fixtures). The milestone's
+corrected documents ride its commits.
+
 ### Milestone M4: entities and chat
 
 Delivered and tagged `m4` on 2026-10-07. The client is a participant among entities: the entity

@@ -8,38 +8,41 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
-- Stage: **milestone M4 (entities and chat) is complete and tagged `m4`** — spec section 13 of
-  `docs/specs/oxidecraft-v1-design.md` (v6), plan `docs/plans/2026-10-04-m4-entities-and-chat.md`
-  (twenty-three tasks plus the acceptance run's fix chain; base `653eb12`; all closed and
+- Stage: **milestone M5 (HUD and inventory) is complete and tagged `m5`** — spec section 13 of
+  `docs/specs/oxidecraft-v1-design.md` (v6), plan `docs/plans/2026-10-08-m5-hud-and-inventory.md`
+  (twenty-eight tasks plus the acceptance run's fix chain; base `025a211`; all closed and
   independently reviewed). The annotated tag marks this close-out commit; the reviewed code head
-  is `103549e`, and the final whole-branch review over the milestone — 80 commits,
-  `35f2d217..103549e` (the frozen range from the `m3` tag; +54,417/−909, 79 files) — returned
-  **approved**: 0 code must-fixes, the deferred triage 0 material / 2 landed as records / 35
-  re-carried / 50 open with named triggers, and the two minor findings are record/route
-  corrections carried by the close's sweep notes. The task chain: T1 the entity spawns and
-  metadata (`48c7ba8`); T2 the movement and lifecycle packets (`4b10ac3`); T3 the chat,
-  player-list and scoreboard packets (`bff0619`); T4 the entity table (`1e542f0`, fix `20ae162`);
-  T5 the session tracking (`d57eea4`, fix `e566807`); T6 the scoreboard state (`9ee3987`); T7 the
-  skins (`32f2dd2`, fix `3784c9b`); T8 the entity draws (`3b7aa9f`, fix `95cdfa0`); T9 the biped
-  and quadruped families (`ad95127`, fix `3bbc003`); T10 the crawler, cube and arthropod families
-  (`b38be25`, fix `c863c1f`, `661667d`); T11 the exotic families (`e6ffe08`, fix `8ec6769`,
-  `8772c70`); T12 the object entities (`4a69ee2`, fix `0684a8d`, `be81fc7`); T13 the nametags
-  (`8ed6bd6`, fix `92b7039`); T14 the chat parse and the HUD (`8213ea7`, `61c6352`); T15 the chat
-  field and click events (`7885de8`, `3d7898c`); T16 the tab list (`7881617`, `55a92e5`); T17 the
-  scoreboard sidebar (`79cdc54`, `283588b`, fix `e62fb38`); T18 the boss bar (`acf9f4f`); T19 the
-  dig carry (`93c75e0`); T20 the player carry (`2f64829`); T21 the carried items (`1ee4052`,
-  `a2854c7`); T22 the acceptance run (`f59414d` plus the fix chain `0164f067`…`103549e`); T23 the
-  close. M3 (the player) is complete and tagged `m3` — the annotated tag marks its close-out
-  commit `35f2d21`, its reviewed code head was `2276d22`, and its final whole-branch review
-  returned approved (its task chain lives in `docs/plans/2026-10-02-m3-player.md` and its
-  2026-10-04 update bullet below). M2 (textured terrain) is complete and tagged `m2` — the
-  annotated tag marks its close-out commit `e90a30d`, its reviewed code head was `38ac081`, and
-  its final whole-branch review returned PASS (its task chain lives in
-  `docs/plans/2026-09-27-m2-textured-terrain.md` and its 2026-10-02 update bullet below). M1 is
-  complete and tagged `m1` (the annotated tag marks the close-out commit `930ccab`; the reviewed
-  code head is `854ca85` and its final whole-branch review returned ready to merge). M0 is
-  complete and tagged `m0`. Every task's brief, report, review and every ruling live in the
-  milestone ledgers (local, git-ignored; the M4 ledger is the newest).
+  is `8b49246`, and the final whole-branch review over the milestone — 70 commits,
+  `a86f765..8b49246` (the frozen range from the `m4` tag; +61,734/−4,890, 98 files) — returned
+  **approved**: 0 code must-fixes; the deferred triage 0 material / 22 landed / 6 closed as
+  records / 38 open with named triggers / 4 splits; and two minor findings carried as the first
+  items of the next window/GUI round (F-01 the stale HUD GPU pins, F-02 the compass/clock
+  display poses; fix shapes in `refs/m5-task-28/final-review.md` §6). The task chain: T1 the slot
+  NBT and the tree (`1c53c8c`); T2 the window, sign and experience decode (`a2d8230`); T3 the
+  window, sign and creative writers (`42a3fc5`); T4 the player inventory model (`2031281`); T5
+  the session window state and the inventory events (`95944a3`); T6 the container click machine
+  and its actions (`e483176`, fix `5f4b8a2`); T7 the item model set (`9ce86f0`); T8 the item
+  registry table (`a9792ab`); T9 the item sub-items, names and creative lists (`28ceb51`, fix
+  `90096bc`); T10 the item sprites and the GUI sheets (`b0f8104`); T11 the HUD item icons
+  (`abc7562`, fix `714b5b7`); T12 the first-person held item (`c0adafc`, fix `58d90d2`); T13 the
+  held items and armour on entities (`5f046a3`); T14 the hotbar, the held-item popup and the
+  crosshair (`9c71867`); T15 the health, food, armour, air and experience rows (`953a0b9`, fix
+  `7a335d6`); T16 the screen framework and the container screen base (`47fe6dd`); T17 the item
+  tooltips (`89dfd87`, fix `9c8e5f0`); T18 the chest, hopper, dispenser, furnace, brewing and
+  crafting screens (`5a261c4`, fix `5fbe042`); T19 the beacon, enchanting, villager, horse and
+  anvil screens (`4d39162`); T20 the inventory screen (`1f528b8`); T21 the creative inventory
+  (`b8f235b`, fix `f135238`); T22 the sign editing and the sign text draw (`6cf3488`, fix
+  `8f7d095`); T23 the book reader (`e6e673e`); T24 the inventory keys and the scripted gestures
+  (`b3b79ab`); T25 the citation sweep and the extractor (`520bed4`); T26 the PNG-helper
+  consolidation and the tRNS strip fixture (`1a28cff`); T27 the acceptance run (`0c09e3e` plus
+  the fix chain `4238b20`…`8b49246`); T28 the close. M4 (entities and chat) is complete and
+  tagged `m4` — the annotated tag marks its close-out commit `a86f765`, its reviewed code head
+  was `103549e`, and its final whole-branch review returned approved. M3 (the player) is complete
+  and tagged `m3` (close-out `35f2d21`, reviewed head `2276d22`, approved); M2 (textured terrain)
+  complete and tagged `m2` (close-out `e90a30d`, reviewed head `38ac081`, PASS); M1 tagged `m1`
+  (close-out `930ccab`, reviewed head `854ca85`); M0 tagged `m0`. Every task's brief, report,
+  review and every ruling live in the milestone ledgers (local, git-ignored; the M5 ledger is
+  the newest).
 - **2026-10-02 update — M2 closed.** After the stop, the fluids round resumed and closed
   (`f366236`, reviewed clean); the full acceptance re-capture (continuations #3/#3b) followed; the
   residual round refuted the carried ~1 % frame-scale class on the current frames and fixed two
@@ -91,6 +94,26 @@ specification and continue without asking questions that are already answered he
   milestone's record: `refs/m4-acceptance/`, `refs/m4-task-22/` (the fix chain and the validation
   legs), `refs/m4-task-23/` (the frozen archive and the final review), and the M4 ledger
   (local, git-ignored).
+- **2026-10-11 update — M5 closed.** The acceptance run (Task 27) finished with its fix chain:
+  the combined live pass (legs L1–L10) with its continuations, the bounded leg batch, two
+  close-smoke legs and eleven scoped fix rounds (`4238b20` the HUD projection, `8dc1303` /
+  `7767c1a` / `2d9076c` the underwater overlay and the water fog, `8b7cf87` the use-click reach,
+  `316a95b` the modelled blocks, `cc1c790` the container panels and slots, `2209895` / `3e9675e`
+  the creative screens, `ad92adc` the book open, `31e9d49` the water-fog falloff, `d53b7f2` the
+  window drag chain, `c0f3751` the water-fog colour's eye-light term, `8b49246` the pickup-hold
+  regression pins), each RED at its layer, live-closed and gated standalone; the FINISH commit
+  `0c09e3e` finalised the checklist rows and the plan's recordings. The run's open questions
+  settled by bounded live discriminators: the sign editor never opens under scripted aim (a
+  server-side condition; no port verdict) and the enchanting pose divergence is a staging
+  geometry effect, not a port defect (both recorded in `refs/m5-task-27/legbatch/report.md`);
+  the pickup-hold render residual was falsified as a frame misread (the carried cursor over the
+  just-emptied cell) and pinned by two regression tests (`8b49246`). The final whole-branch
+  review over the milestone returned **approved** (0 code must-fixes; the triage 0 material / 22
+  landed / 6 closed as records / 38 open with triggers / 4 splits; the two minors — F-01, F-02 —
+  carried as the next window/GUI round's first items). The milestone's record:
+  `refs/m5-task-27/` (the live pass, the leg batch and the close-smokes with their reports,
+  briefs and wire captures), `refs/m5-task-28/` (the frozen archive and the final review), and
+  the M5 ledger (local, git-ignored).
 - M0 delivered and verified: the eight-crate workspace with its enforced dependency graph; the
   VarInt codec and length-prefixed framing with the 1.8 compression rules; handshake, status ping
   and the launcher CLI; the hash-verified atomic store; piston-meta metadata parsing; the full
@@ -103,15 +126,16 @@ specification and continue without asking questions that are already answered he
   the block palette and the section mesher; the terrain types and camera; the wgpu terrain pipeline
   with the depth buffer and the text overlay; the client's `--server` wiring with the F3-style
   overlay; and the negative self-tests for the asset and crate-graph guards, wired into CI.
-- Tests: 1322 passing workspace-wide, 69 ignored, zero failures at the M4 reviewed head
-  (`cargo test --workspace`; `#[test]` 1391 − 69 `#[ignore]`; the close's gate re-run EXIT 0,
-  `refs/m4-task-22/close-gate.log`; the milestone's base `35f2d217` reads 786 passing / 0 failed /
-  25 ignored, 811 − 25). The ignored set at the close is 69 — the render GPU cases (53 in
-  `pipeline_headless`, one in `headless`; they pass locally on the T500), the store-dependent and
-  live-endpoint cases in `oxide-assets` (8), `oxide-client` (3 — the entity-texture store suite)
-  and `oxide-game` (3 — the barrier, behaviour-store and snow-layer headless cases), and the
-  sample-wall rig helper in `oxide-world` (`behaviour.rs`); the store cases run when
-  `OXIDECRAFT_STORE` points at the store (`~/.local/share/oxidecraft`).
+- Tests: 1873 passing workspace-wide, 121 ignored, zero failures at the M5 reviewed head
+  (`cargo test --workspace`; `#[test]` 1994 − 121 `#[ignore]`; the close's gate re-run EXIT 0,
+  `refs/m5-task-28/close-gate.log`; the milestone's base `a86f765` reads 1322 passing / 0 failed
+  / 69 ignored, 1391 − 69). The ignored set at the close is 121 — the render GPU cases (103; the
+  M5 item-icon, container-panel, HUD and creative-screen families included; they pass locally on
+  the T500 — two HUD/creative pins stand red at the close, F-01, carried to the next window/GUI
+  round), the store-dependent and live-endpoint cases in `oxide-assets` (9), `oxide-client`
+  (5) and `oxide-game` (3 — the barrier, behaviour-store and snow-layer headless cases), and the
+  sample-wall rig helper in `oxide-world` (1); the store cases run when `OXIDECRAFT_STORE` points
+  at the store (`~/.local/share/oxidecraft`).
 - Live evidence: the M0 ping and captures stand; M1's acceptance run — the join, 180 seconds of
   keep-alives, the mark and both screenshots, and the proxy capture of our client's own traffic — is
   recorded under "M1 evidence" below, with the raw files under `refs/rig/evidence/m1/`. M2's live
@@ -125,7 +149,12 @@ specification and continue without asking questions that are already answered he
   "M3 evidence" below. M4's live evidence is the acceptance run (`refs/m4-acceptance/`: the scene
   frames and the report, the console and tick logs, the wire captures) and the fix chain's round
   evidence with the validation legs (`refs/m4-task-22/`: the re-shoots and their archives, the
-  discriminator and v7 reports, the e1/e2 wire decodes) — numbers in "M4 evidence" below.
+  discriminator and v7 reports, the e1/e2 wire decodes) — numbers in "M4 evidence" below. M5's
+  live evidence is the combined pass and its continuations (`refs/m5-task-27/livepass/`: the
+  checklists, frames and wire captures for legs L1–L10), the leg batch
+  (`refs/m5-task-27/legbatch/`: the enchanting, sign, R5 and beacon discriminators) and the
+  close-smokes (`refs/m5-task-27/closesmoke/`, `refs/m5-task-27/closesmoke2/`: the fix7/8/9 and
+  fix10/11 closes, with the pinned client's md5 recorded) — numbers in "M5 evidence" below.
 - CI: seven jobs — format/lint/test, MSRV 1.85.0, portability (`x86_64-pc-windows-gnu`), release
   build, crate graph, asset guard, licences and advisories. The M0 tagged head `fe2d3b6` is green in
   run `35873490870` (six jobs; the release build was added after the tag). The M1 reviewed head
@@ -145,19 +174,23 @@ specification and continue without asking questions that are already answered he
   closed: both guards carry `--self-test` modes since `854ca85`, and CI runs each one before its
   normal check. **M4:** every checkpoint was CI-checked as it landed; the T22 chain's pushed head
   `103549e` is green in run `37711182425` (all seven jobs), and the close-out commit `a86f765`
-  (the commit the `m4` tag marks) is green in run `37713937089` (all seven jobs).
+  (the commit the `m4` tag marks) is green in run `37713937089` (all seven jobs). **M5:** every
+  checkpoint was CI-checked as it landed; the pushed head `ad92adc` — the parent of the
+  acceptance fix chain — is green in run `38088487115` (all seven jobs); the close-out run is
+  recorded in the follow-up commit below.
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding; the
   per-task reviews, the fix-round reviews and each milestone's final whole-branch review are in the
   milestone ledgers and round dirs (local, git-ignored: M2's in
   `refs/m2-final-review/review-report.md`; M3's in its milestone ledger,
   including the approved `final-review.md`; M4's in `refs/m4-task-23/final-review.md`, approved —
-  0 Critical / 0 Important).
+  0 Critical / 0 Important; M5's in `refs/m5-task-28/final-review.md`, approved — 0 Critical /
+  0 Important, with the two minors F-01/F-02 carried to the next window/GUI round).
 - Research: five evidence-backed reports in `docs/research/`, indexed in Appendix B of the spec.
 - Parity checklist classification: `docs/parity/checklist.md`.
 - Verification rig: under `refs/rig/` (offline-mode 1.8.9 server plus a vanilla client, see
   `refs/rig/README.md`).
-- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed and tagged (`m0`, `m1`, `m2`, `m3`, `m4`), with
-  the M4 chain pushed through the close-out this record closes. Confirm HEAD with `git log --oneline -3`.
+- Repo: https://github.com/loofyser/Oxidecraft — `main` pushed and tagged (`m0`, `m1`, `m2`, `m3`, `m4`, `m5`), with
+  the M5 chain pushed through the close-out this record closes. Confirm HEAD with `git log --oneline -3`.
 
 ## M0 evidence
 
@@ -396,6 +429,49 @@ and the barrier's translucent read — closed in the milestone's scoped rounds (
 standalone), with two comment-only corrections (`1b20fb0`, `9cc477e`). The operator's by-eye list
 (the acceptance's frames) stands as listed under Caveats.
 
+## M5 evidence
+
+Acceptance: the Task 27 run (`refs/m5-task-27/` — the combined live pass on the rig, its two
+continuations, the bounded leg batch and the two close-smoke legs; the vanilla client and ours,
+both connected; the recorder proxy on `:25566` for the wire legs), recorded 2026-10-09/11. The
+headline numbers, all re-derived from the artifacts at verification:
+
+- The HUD surfaces live: the F2 screenshot leg's strip diff 0.07 % / 0.00 % (satpx
+  `[0,531,962,153,771,63,990,201,0]`); the hotbar's held-item popup, the selection swap and the
+  wheel scroll; the health/food/armour/air/XP rows (the poison-mirror correction — 22 vs 9 —
+  the blink phase and the XP level text); the crosshair.
+- The container surfaces live: the inventory with the crafting grid; the chest, furnace and
+  crafting table; the creative inventory's six windows (the tab labels `Building Blocks` /
+  `Search Items` resolved, the compass icon, the 45/45/47-cell textured grids over the pre-fix
+  6); the beacon's in-reach activation (the C08 at `(115,72,113)` face 1 from the pose
+  `(115.5,75,115.5,180,61)`); the villager and horse trades (the trade-list payloads
+  2120/2434; the `S2D` fires and the horse's ride leg).
+- The drag and click machine: the two close-smoke legs' wire and pixel records — the
+  `win2/slot0` pickups (`act1`/`mode0`, the stone-16 echo), the `1+1+1` mode-5 chain, the
+  `S32 5/5 accepted=1` responses, no C0F, zero post-accept `S2F`s; the held icon at the pointer
+  (`dx 0` / `dy +3`, the wash ring, no tooltip while carried — matching the reference's guard).
+- The wire counts: the combined pass's protocol legs (the `C10 ×48` window stream: the set-36,
+  delete-36 + set-38 and the 0-44 clear), the book chain (the reader's `Page 1 of 3` /
+  `Page one alpha.`; the sky-aim all-FF `C08 ×2` followed by the `MC|BOpen ×2` sends), and the
+  enchanting discriminator's crossing sequence (`z 115.99 / 115.26 / 115.33`).
+- The underwater pair (the S2 close-smoke re-measure): the opening-region factors
+  `1.008/1.000/1.095` (vanilla B stable across sessions; shift-robust B `1.093–1.098`), the
+  dark-edge cells' B `−3.6` fog-direction against a bit-identical vanilla side, and the
+  documented in-band residual (`dB +10.0` against the predicted `+20.9`; the light-read nuance
+  recorded under Caveats).
+- The persistence and hygiene legs: the keepalive soak rates on cadence; the L10 hygiene sweep;
+  the vanilla-control legs (the furnace smelt and the horse); the R7 burn closed with the
+  recorded `BurnTime 1480` seconds.
+
+The defects the run surfaced — the HUD projection's fractional scale, the underwater overlay and
+the water-fog branch, the use-click reach, the modelled blocks' fallback cube, the container
+panels and slots, the creative screens' labels/icons/contents, the book open, the water-fog
+falloff and its colour's eye-light term, and the window drag chain — closed in the milestone's
+scoped rounds (`4238b20`…`8b49246`; each RED at its layer, live-closed, gated standalone). The
+pickup-hold render residual was falsified as a frame misread and pinned by two regression tests
+(`8b49246`). The operator's by-eye list (the acceptance's frames) stands as listed under
+Caveats.
+
 ## Caveats
 
 Carried by M1 as delivered (each confirmed by the final whole-branch review):
@@ -503,6 +579,42 @@ Carried by M4 as delivered (each confirmed by the final whole-branch review,
   the s3 sneak pair), the fixes are labelled follow-ups, and the re-shot frames are marked as
   later generations.
 
+Carried by M5 as delivered (each confirmed by the final whole-branch review,
+`refs/m5-task-28/final-review.md`):
+
+- **Two ignored GPU pins stand red at the reviewed head** (the review's F-01 and F-02, carried
+  as the next window/GUI round's first two items): F-01 — the HUD/creative overlap pins encode
+  the pre-fix `50·(index+1)` rung rule rather than the shipped constant-50 `icon_z_level()`
+  (no in-game effect; no two icon draws overlap in any screen); F-02 — the compass and clock
+  entries build without their first-person display poses (the pin's 208-vs-210 catch; vanilla
+  carries `[0,−135,25]`/`[0,4,2]`/`1.7` behind `builtin/*` parents the port's pose source does
+  not follow — a real, small pose gap with no live impact). Fix shapes in the final review's §6.
+- **The window-click prediction is unwired for modes 1, 2, 3 and 6** (shift transfer,
+  number-key swap, creative pick, double-click gather) — the legacy snapshot echo is kept — and
+  creative whole-stack (limit-2) drags don't arm the predictor; those modes render post-echo
+  (one tick late). Trigger: the next window-click/prediction round.
+- **The water-fog colour reads the view block's own light** where the reference's term takes the
+  feet-neighbour maximum (~2 B-units per light step; in band at both live re-measures). Trigger:
+  the next water-fog / light touch (M6's sky work).
+- **The rows-440+ R/G-only lift (+4..+5, B ≈ 0)** on the underwater pair — fragment-side, not
+  fog-path; a watch item that mints its own round if it survives M6's weather/light work.
+- **The dark-surface cells of the S2 pair are recorded by their re-based coordinates** (the
+  original `dw1`/wall-L names were never coordinate-pinned; ours B `−3.6` fog-direction, vanilla
+  bit-identical).
+- **The R3 residuals stand recorded**: brewing (3/3 good-aim opens fail) and the anvil
+  shelf-pocket pose (3 bad poses); the sign editor's never-open is a server-side condition (no
+  port verdict); the acceptance residue (R10b's grey-pattern counts partial; G3 closed, G5
+  partial, G10-row57 sighted).
+- **The comment/citation sweep is landed (T25 `520bed4`) with the extractor's grammar delivered**;
+  the record-only review nits (reviewer-7's line pins, reviewer-11's denominator note,
+  reviewer-9's `screens/container.rs` shorthand) are recorded; the fix8 f13-exclusion note is
+  struck (fix10 proved the term matters at the S2 pose).
+- **The operator's by-eye list** (cannot be closed agent-side): the M5 acceptance frames per the
+  reports' lists, plus M3's and M4's carried operator items.
+- **The M4 caveats this milestone closed**: the comment/citation sweep set and the sweep-tooling
+  round (T25); the PNG-helper consolidation and the 16-bit/tRNS strip fixture (T26); the M4
+  known-limits 1 (held items and armour), 2 (the non-block item table) and 3 (the potion tint).
+
 ## Decisions locked
 
 See spec section 4 for the full table. The short version: multiplayer-first v1; Microsoft
@@ -512,60 +624,68 @@ are comparative (1.5x FPS, under 50% memory, under 1 second cold start).
 
 ## Next actions
 
-Milestone M4 is complete and tagged; milestone M5 (spec section 13: HUD and inventory) is next.
-Start it the same way M4 started: write the M5 plan into `docs/plans/<date>-m5-<name>.md` from
-the spec's M5 row plus the ordered backlog below, have it reviewed and approved by the owner,
-then execute it task by task in the established loop. The M4 close handoff is
-`docs/handoff/2026-10-07-m4-close.md`; the M4 final review's cross-cutting section names what
-M5's work will trip on (the item-model class, the second atlas upload, `set_gui_scale`'s missing
-caller, the input surface, the citation sweep).
+Milestone M5 is complete and tagged; milestone M6 (spec section 13: sound, particles, weather,
+screens) is next. Start it the same way M5 started: write the M6 plan into
+`docs/plans/<date>-m6-<name>.md` from the spec's M6 row plus the ordered backlog below, have it
+reviewed and approved by the owner, then execute it task by task in the established loop. The M5
+close handoff is `docs/handoff/2026-10-11-m5-close.md`; the M5 final review's cross-cutting
+section (its §2.4) names what M6's work will trip on: the settings store is the critical path
+(the GUI-scale setting and the four-scale table, `ALL_PARTS`, pointer scaling, the chat mirror
+halves, the anvil-name/book field engines, the render-distance range), the sky/weather carries
+(the horizon, the celestial closing term, the fog colour's day-night term, the eye-light read,
+the rows-440+ lift), the camera overrides, the language loader, the prediction splits, and the
+riding HUD + own-player effect limits. The Azure application id and the Minecraft API permission
+(M7's external dependency) remain a tracked owner action to start before M6.
 
-The ordered M5 backlog (from the M4 final review's triage and the deferred sweep —
-`refs/m4-homework/t23-m5-backlog.md`, each row re-derived at `103549e` in
-`refs/m4-task-23/final-review.md` §1):
+The ordered M6 backlog (from the M5 final review's triage and the deferred sweep —
+`refs/m5-task-28/deferred-list.md`, each row re-derived at `8b49246` in
+`refs/m5-task-28/final-review.md` §1):
 
-1. M5's own scope: the hotbar, health/hunger/armour/xp/air, item icons, tooltips, the containers
-   with drag and split semantics, sign editing, book reading and the creative inventory (the
-   spec's M5 row) — the milestone's plan.
-2. Held items and armour drawn on entities (M4 known-limit 1); the non-block item table (limit 2);
-   the thrown potions' brewed tint (limit 3); the deferred model layers (limit 14).
-3. The comment/citation sweep bundle: the M2 F3 remainder (items 1/31.1/31.2/32/33/37/38/39) with
-   D1–D9/D12/D27, `view.rs`'s stray backtick, the `light.rs`:123 drift, the twelve-site
-   `WorldClient.java` family and `clientbound.rs`:222 (by name), at each file's next touch.
-4. The sweep-tooling round: the extractor's range-inside grammar (~450 + 88 tokens).
-5. The PNG-helper consolidation (its trigger is met: three test paths) at the next assets-test
-   touch; the 16-bit/tRNS strip fixture when a real tree or fixture pass carries it.
-6. The neighbour-brightness light term at the next light touch (with the `light.rs`:123 fix).
-7. The `slab_half` fixture when a protocol surface needs it; T8's F7 with the next break-path
-   packet work; the `INPUTS_PER_PASS` pin at the next input touch.
-8. The fog colour's time term (Backlog 6) at the next client-fog touch; `CHUNK_COORDINATE_BOUND`
-   if the light recompute footprint changes; the keepalive one-core margin as a standing CI watch.
-9. The operator's list: M3's three audit carries plus M4's by-eye list (the acceptance report).
-10. Later homes as recorded: M6 (the settings store, `GuiConfirmOpenLink`, weather/lightning),
-    M7 (sounds, the online-mode fetch), M9 (the full animation sweep, interest management).
+1. The final review's two carried minors: F-01 the stale HUD/creative GPU pins (update to the
+   constant-50 rule and keep the tie-break assert) and F-02 the compass/clock first-person
+   display poses (follow the `builtin/*` parent chain or pin the two entries) — the next
+   window/GUI round's first items.
+2. M6's own scope: the sound engine and the music ticker, particles, weather, the sky and stars
+   with the celestial term, the overlays, the full screen list from section 11.2, the keybinds,
+   F3 with sub-modes, F2 screenshots, the 1.8 render-distance range to 16 chunks, window resize
+   and fullscreen — the milestone's plan.
+3. The weather/light-touch carries: the fog colour's time term (Backlog 6), the water-fog
+   colour's light read, the rows-440+ lift, the neighbour-brightness light term (with the
+   `light.rs`:123 drift), the sky horizon (row 24) and the celestial closing term (row 25).
+4. The screen/setting rows the M6 screens absorb: the chat tab completion and mirror, the
+   pointer scaling, the part toggles, the camera-mode overrides, the render-distance option, the
+   GUI scale's four-scale table (rec 42), `set_gui_scale`'s caller and the lang loader (row 55).
+5. The still-open comment/citation rows (D3, the D5 remainder, D12, D14, D15, D16, D19, D26,
+   D27, D30, D31, the Backlog 7 row, T8-F7, 73a, 73c, 78b, 38, T18-N1's weaker guard) at each
+   file's next touch; the `slab_half` fixture when a protocol surface needs it.
+6. The operator's list: M3's three audit carries plus M4's and M5's by-eye lists (the acceptance
+   reports).
+7. Later homes as recorded: M7 (the sounds' remaining rows, the online-mode fetch), M9 (the full
+   animation sweep, the F3 FPS-readout gap, interest management).
 
-The close recommendations (recorded 2026-10-07, for the owner's review): the deferred triage
-stands (0 material; 2 rows landed as records; 35 re-carried; 50 open with triggers); the two
-record/route minors were carried by the sweep corrections; the operator's by-eye list stands as
-listed.
+The close recommendations (recorded 2026-10-11, for the owner's review): the deferred triage
+stands (0 material; 22 landed; 6 closed as records; 38 open with triggers; 4 splits); the two
+minors (F-01/F-02) are carried per above; the operator's by-eye list stands as listed.
 
-The milestone's acceptance evidence lives under `refs/m4-acceptance/` and `refs/m4-task-22/`
-(the fix chain and the validation legs), with the earlier milestones' under
-`refs/rig/evidence/m2/`, `refs/m3-acceptance/` (the completion and crack runs under
-`refs/m3-task-13-completion/` and `refs/m3-task-13-crack/`); the rig runs against the store at
-`~/.local/share/oxidecraft` (`OXIDECRAFT_STORE`).
+The milestone's acceptance evidence lives under `refs/m5-task-27/` (the live pass, the leg batch
+and the close-smokes) and `refs/m5-task-28/` (the frozen archive and the final review), with the
+earlier milestones' under `refs/m4-acceptance/`, `refs/m4-task-22/`, `refs/rig/evidence/m2/` and
+`refs/m3-acceptance/`; the rig runs against the store at `~/.local/share/oxidecraft`
+(`OXIDECRAFT_STORE`).
 
 Then, as always: keep `docs/STATE.md` and `CHANGELOG.md` current and tag each milestone when it
 closes; run the local gate before every push (`cargo test --workspace`, `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`,
-`bash scripts/check-assets.sh`, `bash scripts/check-graph.sh`). The post-v1 programme (owner-directed
-2026-09-23, spec section 17: singleplayer worlds and Java mod compatibility) starts only after v1
-completes and does not affect the M2–M9 sequence.
+`bash scripts/check-assets.sh` (+ `--self-test`), `bash scripts/check-graph.sh` (+ `--self-test`),
+`python3 scripts/parity-diff.py --self-test`, `cargo +1.85.0 check --workspace --all-targets`).
+The post-v1 programme (owner-directed 2026-09-23, spec section 17: singleplayer worlds and Java
+mod compatibility) starts only after v1 completes and does not affect the M2–M9 sequence.
 
 ## Resolved dependency versions
 
-Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M4 (the M0 set, plus the M1,
-M2 and M3 additions; M4 added `base64` 0.23.1 and made `serde_json` direct in `oxide-game`):
+Pinned in `Cargo.lock` (committed). Direct dependencies as resolved at M5 (the M0 set, plus the
+M1–M4 additions; M5 added no new crates — `oxide-client` gained edges to the existing
+`oxide-proto` and `serde_json` workspace dependencies):
 
 | Crate | Version | Notes |
 | --- | --- | --- |
@@ -590,9 +710,9 @@ M2 and M3 additions; M4 added `base64` 0.23.1 and made `serde_json` direct in `o
 
 | Fact | Value |
 | --- | --- |
-| OS / desktop | CachyOS, kernel 7.2.8, Wayland; **KWin (KDE Plasma)** — current at the M4 close (the desktop has changed between niri 26.04 and KWin across milestones; re-check before a rig run) on **two outputs**; `xwayland-satellite` on DISPLAY=:1, so the 1.8.9 rig client (LWJGL 2) runs without extra setup |
-| Screenshots | On KWin (current): `spectacle -b -n -f -o <file>` full-screen, then crop to the window content rect (the M2 acceptance rect: window at (2000, 728, 1280×720); the overlay sits at screen (1720-1919, 1034-1079) — keep crops clear of it). **Calibrate the content scale before trusting a rect** (the M4-era desktop rendered content at 1.2× in physical captures while the fit checks stayed green; the M4-era rect is (348, 4, 1536×864) for the 1280×720 content window — re-verify each session with a marker), keep the rect free of other windows (a `keepAbove` take is the recorded workaround for overlapping windows), and treat a preflight screen-read failure as the check's own parse until proven otherwise. On niri (past): the portal fails (niri asserts a single output); the substitute was `niri msg action screenshot-screen --write-to-disk true --show-pointer false --path <file>`. HUD keys: `wtype` cannot reach KWin (no virtual-keyboard protocol); `xdotool` delivered F1 but not F3 — the fps-readout gap is M9's. `computer_use` cannot enumerate windows unless `CUA_DRIVER_RS_ENABLE_WAYLAND=1` is set |
-| Rust | rustc 1.99.0, cargo 1.99.0 (aligned to the CI runner's stable on 2026-10-02; `rust-toolchain.toml` says `channel = "stable"` — keep it current) |
+| OS / desktop | CachyOS, kernel 7.2.8, Wayland; **KWin (KDE Plasma)** — current at the M5 close (re-checked 2026-10-11; the desktop has changed between niri and KWin across milestones — re-check before a rig run) on **two outputs**; `xwayland-satellite` on DISPLAY=:1, so the 1.8.9 rig client (LWJGL 2) runs without extra setup |
+| Screenshots | On KWin (current): `spectacle -b -n -f -o <file>` full-screen, then crop to the window content rect (the M2 acceptance rect: window at (2000, 728, 1280×720); the overlay sits at screen (1720-1919, 1034-1079) — keep crops clear of it). **Calibrate the content scale before trusting a rect** (a past desktop rendered content at 1.2× in physical captures while the fit checks stayed green; the M5-era rect places the content at (640, 379) with a 1280×720 crop — the `PLACE_X=640`/`PLACE_Y=351` overrides — re-verify each session with a marker), keep the rect free of other windows (a `keepAbove` take is the recorded workaround), and treat a preflight screen-read failure as the check's own parse until proven otherwise. On niri (past): the portal fails (niri asserts a single output); the substitute was `niri msg action screenshot-screen --write-to-disk true --show-pointer false --path <file>`. HUD keys: `wtype` cannot reach KWin (no virtual-keyboard protocol); `xdotool` delivered F1 but not F3 — the fps-readout gap is M9's. `computer_use` cannot enumerate windows unless `CUA_DRIVER_RS_ENABLE_WAYLAND=1` is set |
+| Rust | rustc 1.99.0, cargo 1.99.0 (re-checked 2026-10-11, no change; aligned to the CI runner's stable on 2026-10-02; `rust-toolchain.toml` says `channel = "stable"` — keep it current) |
 | Dependency pin | `wgpu 26.0.1` is the newest release whose declared rust-version (1.84) fits the workspace's 1.85 floor (wgpu 27.0.0 declares 1.88, 28.0.0 declares 1.92, 29 and 30 declare 1.87), so cargo's resolver picked it; the pin is not a hand-downgrade. `winit 0.30.13` declares 1.70 (crates.io index metadata, 2026-09-23) |
 | Vulkan | instance 1.4.357; Intel Iris Xe (card2) and NVIDIA T500 (card1) |
 | Java | Java 26 system-wide; the rig uses a standalone JRE 8 tarball |
@@ -600,7 +720,7 @@ M2 and M3 additions; M4 added `base64` 0.23.1 and made `serde_json` direct in `o
 | git push | uses gh as the credential helper for github.com (`gh auth setup-git` has been run; plain `git push` works now) |
 | Minecraft installs | none on this machine; assets are downloaded into the Oxidecraft store |
 | sudo | password required, and only usable as the leading command of a foreground call |
-| Verification rig | `refs/rig/` — Temurin JRE 8, vanilla 1.8.9 server listening on 25565 (offline mode, seed `oxidecraft`, view-distance 10, compression threshold 256; capture runs move it to 25566 behind the recorder proxy on 25565), Prism instance `OxideRef-1.8.9` with an offline account. The proxy's upstream uses the machine's LAN address (10.0.0.84 on wlan0 at the acceptance run — DHCP, re-check before use). `refs/rig/README.md` documents start/stop; its screenshots section still describes the portal route — use the Screenshots row above instead. M2 added: run-stamped consoles (`logs/console-<UTC>.log`), the sample wall (`refs/rig/tools/sample_wall_cells.txt`), and the metric (`scripts/parity-diff.py`). M3 added the acceptance machinery (`refs/m3-acceptance/`; `shot.sh` is now executable — a 644 mode silently broke a burst run), the completion machinery (`refs/m3-task-13-completion/`), and two rig rules: give items AFTER any respawn (a give to a dead player is discarded by the respawn), and a window activation kicks the vanilla camera (~+18°/−4.4° per activation — re-issue the pose teleport and take captures window-free). M4 added the acceptance machinery (`refs/m4-acceptance/`) and the fix chain's round machinery (`refs/m4-task-22/`), plus three rig rules: guard every teleport leg against the free fall (restore the player's playerdata before the run and grant Resistance V); a stalled chunk shift poisons its session (re-take on a fresh session, and validate a post-teleport take by the wire — load columns > 0 — before trusting its frames); the mesh pump is idle-gated (≈1.2 columns/s under the server's entity flood — soak past the drain before capturing) |
+| Verification rig | `refs/rig/` — Temurin JRE 8, vanilla 1.8.9 server listening on 25565 (offline mode, seed `oxidecraft`, view-distance 10, compression threshold 256; capture runs move it to 25566 behind the recorder proxy on 25565), Prism instance `OxideRef-1.8.9` with an offline account. The proxy's upstream uses the machine's LAN address (10.0.0.84 on wlan0 at the acceptance run — DHCP, re-check before use). `refs/rig/README.md` documents start/stop; its screenshots section still describes the portal route — use the Screenshots row above instead. M2 added: run-stamped consoles (`logs/console-<UTC>.log`), the sample wall (`refs/rig/tools/sample_wall_cells.txt`), and the metric (`scripts/parity-diff.py`). M3 added the acceptance machinery (`refs/m3-acceptance/`; `shot.sh` is now executable — a 644 mode silently broke a burst run), the completion machinery (`refs/m3-task-13-completion/`), and two rig rules: give items AFTER any respawn (a give to a dead player is discarded by the respawn), and a window activation kicks the vanilla camera (~+18°/−4.4° per activation — re-issue the pose teleport and take captures window-free). M4 added the acceptance machinery (`refs/m4-acceptance/`) and the fix chain's round machinery (`refs/m4-task-22/`), plus three rig rules: guard every teleport leg against the free fall (restore the player's playerdata before the run and grant Resistance V); a stalled chunk shift poisons its session (re-take on a fresh session, and validate a post-teleport take by the wire — load columns > 0 — before trusting its frames); the mesh pump is idle-gated (≈1.2 columns/s under the server's entity flood — soak past the drain before capturing). M5 added: the recorder proxy on `:25566` for wire legs; window-targeted button delivery (`xdotool click|mousedown|mouseup --window <win>` — pointer-routed buttons are state-dependently swallowed); the pinned-client practice (build, copy, record md5); re-sending the scene setup + `/time set 6000` + `/weather clear` before every capture |
 
 ## Local-only directories
 
