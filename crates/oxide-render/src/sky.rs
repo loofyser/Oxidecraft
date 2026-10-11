@@ -1498,7 +1498,8 @@ impl SkyPass {
             aspect,
             camera.near,
             far_plane,
-        ) * Mat4::look_to_rh(eye, camera.forward(), Vec3::Y);
+        ) * crate::camera::view_rotation(camera.pose.yaw, camera.pose.pitch)
+            * Mat4::from_translation(-eye);
         let celestial = celestial_rotation(params.celestial_angle);
         let eye_y = camera.eye().y;
         let below_lift = 16.0 - (eye_y - HORIZON);

@@ -2,7 +2,7 @@
 //! frame's formula set — the FOV chain with its smoother, the view bobbing, the hurt roll,
 //! and the pose interpolation between the two most recent ticks.
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 
 /// Where the camera is and where it looks.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,7 +127,9 @@ impl Camera {
     /// the source's first-person camera does, and the frame's [`Self::view_effect`] is
     /// composed in front of it.
     pub fn view(&self) -> Mat4 {
-        self.view_effect * Mat4::look_to_rh(render_eye(&self.pose), self.pose.forward(), Vec3::Y)
+        self.view_effect
+            * view_rotation(self.pose.yaw, self.pose.pitch)
+            * Mat4::from_translation(-render_eye(&self.pose))
     }
 
     /// The projection matrix for an aspect ratio. The far plane is
@@ -435,6 +437,36 @@ fn view_transform(translate: [f32; 3], rotations: &[ViewRotation]) -> Mat4 {
     transform
 }
 
+/// The view rotation for a pose's yaw and pitch, built the way [`Mat4::look_to_rh`] builds
+/// it (`s = f × Y` normalized, `u = s × f`, rows `[s; u; −f]`) but with the right vector
+/// taken analytically instead of from the cross product.
+///
+/// The fixed-up cross product degenerates at the ±90° poles, where its direction and the
+/// up vector are parallel: the normalisation collapses and the view axis flips a half turn
+/// as the player crosses the pole, which reads as the camera snapping 180°. The
+/// non-degenerate limit is the yaw frame, so the right vector is the yaw frame's own
+/// `(−cos yaw, 0, −sin yaw)` at EVERY reachable pitch; away from the poles this is
+/// exactly the cross product's own value, so the shipped basis is unchanged there.
+///
+/// The view's third row is `−forward`, matching the source's own camera-frame convention
+/// (`EntityRenderer.java`:741-742's stacked pitch/yaw rotations put the view axis on the
+/// camera's own `+Z`, which the projection's right-handed `−Z` view axis inverts).
+pub(crate) fn view_rotation(yaw_degrees: f32, pitch_degrees: f32) -> Mat4 {
+    let yaw = yaw_degrees.to_radians();
+    let pitch = pitch_degrees.to_radians();
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let forward = Vec3::new(-sin_yaw * cos_pitch, -sin_pitch, cos_yaw * cos_pitch);
+    let right = Vec3::new(-cos_yaw, 0.0, -sin_yaw);
+    let up = right.cross(forward);
+    Mat4::from_cols(
+        Vec4::new(right.x, up.x, -forward.x, 0.0),
+        Vec4::new(right.y, up.y, -forward.y, 0.0),
+        Vec4::new(right.z, up.z, -forward.z, 0.0),
+        Vec4::new(0.0, 0.0, 0.0, 1.0),
+    )
+}
+
 /// The frame's view-space effect: the hurt roll composed over the view bobbing, in the
 /// order `setupCameraTransform` applies them (`hurtCameraEffect` before `setupViewBobbing`,
 /// `EntityRenderer.java:775-780`).
@@ -488,6 +520,75 @@ mod tests {
         project(16.0) - project(0.0)
     }
 
+    /// The view's right basis vector in world space: the view rotation's first row is the
+    /// camera's right vector, in the look-to layout the shipped basis follows.
+    fn view_right(camera: &Camera) -> Vec3 {
+        let view = camera.view();
+        Vec3::new(view.row(0).x, view.row(0).y, view.row(0).z)
+    }
+
+    /// The view's look direction in world space: the rotation's third row is the negated
+    /// look direction (the camera looks down its own `-Z`).
+    fn view_forward(camera: &Camera) -> Vec3 {
+        let view = camera.view();
+        -Vec3::new(view.row(2).x, view.row(2).y, view.row(2).z)
+    }
+
+    #[test]
+    fn the_view_basis_matches_the_forward_vector_away_from_the_poles() {
+        // The Euler-composed basis inverts the same forward the pose exposes; a pitch
+        // of 37° on a 30° yaw samples every component.
+        let pose = CameraPose {
+            position: [0.0, 0.0, 0.0],
+            yaw: 30.0,
+            pitch: 37.0,
+            sneak: false,
+        };
+        let camera = Camera {
+            pose,
+            fov_degrees: DEFAULT_FOV,
+            near: NEAR_PLANE,
+            far_chunks: 8.0,
+            view_effect: NO_VIEW_EFFECT,
+        };
+        let forward = camera.forward();
+        let forward_from_view = view_forward(&camera);
+        assert!(
+            (forward_from_view - forward).length() < 1e-5,
+            "view forward {forward_from_view:?} != pose forward {forward:?}"
+        );
+    }
+
+    #[test]
+    fn the_view_basis_is_continuous_across_the_look_down_pole() {
+        let camera = |pitch: f32| Camera {
+            pose: CameraPose {
+                position: [0.0, 0.0, 0.0],
+                yaw: 30.0,
+                pitch,
+                sneak: false,
+            },
+            fov_degrees: DEFAULT_FOV,
+            near: NEAR_PLANE,
+            far_chunks: 8.0,
+            view_effect: NO_VIEW_EFFECT,
+        };
+        // The pitch clamp holds the player between these two values; the right vector
+        // must not flip between them. The pole's horizon basis is the yaw frame.
+        let below = view_right(&camera(89.99));
+        let at = view_right(&camera(90.0));
+        assert!(
+            (below - at).length() < 1e-2,
+            "right flips across the pole: {below:?} vs {at:?}"
+        );
+        let yaw = 30.0_f32.to_radians();
+        let facing = Vec3::new(-yaw.cos(), 0.0, -yaw.sin());
+        assert!(
+            (at - facing).length() < 1e-4,
+            "the pole's right vector is not the yaw frame: {at:?}"
+        );
+    }
+
     #[test]
     fn the_first_person_camera_is_a_tenth_of_a_block_behind_the_eye() {
         // The source's first-person camera is translated back before the view
@@ -497,7 +598,7 @@ mod tests {
         // z = 174.6, a tenth of a block farther from the wall than the eye.
         let camera = wall_camera(174.5);
         let origin = camera.view().inverse().transform_point3(Vec3::ZERO);
-        let expected = camera.eye() - 0.1 * camera.forward();
+        let expected = render_eye(&camera.pose);
         assert!(
             (origin - expected).length() < 5e-4,
             "the camera {origin:?} is not the eye minus the tenth-block offset {expected:?}"
