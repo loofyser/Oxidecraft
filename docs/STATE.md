@@ -176,8 +176,8 @@ specification and continue without asking questions that are already answered he
   `103549e` is green in run `37711182425` (all seven jobs), and the close-out commit `a86f765`
   (the commit the `m4` tag marks) is green in run `37713937089` (all seven jobs). **M5:** every
   checkpoint was CI-checked as it landed; the pushed head `ad92adc` — the parent of the
-  acceptance fix chain — is green in run `38088487115` (all seven jobs); the close-out run is
-  recorded in the follow-up commit below.
+  acceptance fix chain — is green in run `38088487115` (all seven jobs); the close-out commit `8ae733d`
+  (the commit the `m5` tag marks) is green in run `38127359527` (all seven jobs).
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding; the
   per-task reviews, the fix-round reviews and each milestone's final whole-branch review are in the
   milestone ledgers and round dirs (local, git-ignored: M2's in
