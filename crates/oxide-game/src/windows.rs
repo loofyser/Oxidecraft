@@ -17,6 +17,11 @@
 //! [`MAX_WINDOW_PROPERTIES`] all land in [`Windows::ignored`] — the counter the
 //! tests read — rather than in a panic or in an allocation sized by the wire.
 
+use crate::container::{
+    BASE_MAX_STACK_SIZE, BaseStackCaps, CLICK_MODE_DRAG, CLICK_MODE_DROP, CLICK_MODE_PICKUP,
+    CLICK_MODE_QUICK_MOVE, can_add_item_to_slot, compute_stack_size, extract_drag_mode,
+    get_drag_event, is_valid_drag_mode, max_stack_size,
+};
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 use oxide_world::inventory::Inventory;
@@ -111,6 +116,17 @@ pub struct Windows {
     /// (`NetHandlerPlayClient.java:1152-1161`) and the tick decrements
     /// (`InventoryPlayer.decrementAnimations:352-362`).
     pub hotbar_pop: [u8; HOTBAR_SIZE],
+    /// The drag's event, the source's `Container.dragEvent:27`: 0 idle, 1 the
+    /// set is filling, 2 the end. The click prediction runs the source's own
+    /// drag machine against it (`Container.slotClick`'s mode-5 arm,
+    /// `Container.java:145-227`).
+    pub drag_event: i32,
+    /// The drag's mode, the source's `Container.dragMode:24` — −1 before any
+    /// drag, then `extractDragMode`'s read of a start button (`:158-170`).
+    pub drag_mode: i32,
+    /// The slots the drag covers, the source's `Container.dragSlots:28` — a
+    /// set there, so a slot joins once however often the packet names it.
+    pub drag_slots: Vec<i16>,
     /// How many writes the state ignored: a window id it does not hold, a slot
     /// index a window cannot carry, a property index outside the cap, a close
     /// that named nothing. Hostile input is counted here, never fatal.
@@ -136,9 +152,12 @@ pub struct WindowSnapshot {
 impl Windows {
     /// The fresh state: window 0 empty, nothing open, the action number at
     /// zero — the field's own default (`Container.transactionID` starts at 0,
-    /// `Container.java:561-565`).
+    /// `Container.java:561-565`) — and no drag (`dragMode:24` starts at −1).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            drag_mode: -1,
+            ..Self::default()
+        }
     }
 
     /// Applies one Set Slot (0x2F).
@@ -232,6 +251,7 @@ impl Windows {
     /// reaches the drop through here.
     pub fn drop_cursor(&mut self) {
         self.set_cursor(None);
+        self.reset_drag();
     }
 
     /// Applies one Window Items (0x30).
@@ -325,6 +345,7 @@ impl Windows {
     /// come from the packet and nothing of the old window survives.
     pub fn apply_open(&mut self, open: OpenWindowState) {
         self.open = Some(open);
+        self.reset_drag();
     }
 
     /// Applies a Close Window (0x2E): the window it names leaves the state and
@@ -348,6 +369,7 @@ impl Windows {
         }
         self.open = None;
         self.set_cursor(None);
+        self.reset_drag();
         true
     }
 
@@ -357,6 +379,324 @@ impl Windows {
     pub fn next_action_number(&mut self) -> i16 {
         self.action_number = self.action_number.wrapping_add(1);
         self.action_number
+    }
+
+    /// Drops the drag the source drops (`Container.resetDrag`, beside
+    /// `Container.java:221-226`): the event back to idle and the covered set
+    /// cleared; the mode stands, as the source leaves it.
+    pub fn reset_drag(&mut self) {
+        self.drag_event = 0;
+        self.drag_slots.clear();
+    }
+
+    /// One window's slot read for the click prediction: the open window's own
+    /// vector, or window 0's 45-slot projection. The outer `None` names no
+    /// slot the state carries; the inner one is an empty slot.
+    fn click_slot(&self, window_id: i8, slot: i16) -> Option<Option<MetadataItem>> {
+        if window_id == 0 {
+            return usize::try_from(slot)
+                .ok()
+                .and_then(|index| self.window0_slots().get(index).cloned());
+        }
+        let open = self
+            .open
+            .as_ref()
+            .filter(|open| i16::from(open.window_id) == i16::from(window_id))?;
+        usize::try_from(slot)
+            .ok()
+            .and_then(|index| open.slots.get(index).cloned())
+    }
+
+    /// One window's slot write for the click prediction. `false` names no
+    /// slot the state carries.
+    fn write_click_slot(&mut self, window_id: i8, slot: i16, item: Option<MetadataItem>) -> bool {
+        if window_id == 0 {
+            return self.write_window0_slot(slot, item);
+        }
+        let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|open| i16::from(open.window_id) == i16::from(window_id))
+        else {
+            return false;
+        };
+        match usize::try_from(slot)
+            .ok()
+            .and_then(|index| open.slots.get_mut(index))
+        {
+            Some(target) => {
+                *target = item;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Runs one click against the state's own slots before its packet goes
+    /// out, answering the packet's echo with the branch's own return.
+    ///
+    /// The source runs every click against the client container first
+    /// (`PlayerControllerMP.windowClick:534-540` runs `openContainer.slotClick`
+    /// and sends what it returned): the echo is the branch return, and the
+    /// container keeps the mutation until the server's resync overwrites it.
+    /// The predicted modes are the R5 chain's — 0 the pickup and place
+    /// (`Container.java:232-388`), 4 the drop (`:446-456`) and 5 the drag
+    /// (`:145-227`) — with the base's own answers behind the slot hooks
+    /// (`isItemValid`/`canTakeStack`/`canDragIntoSlot`/`canMergeSlot` true,
+    /// the per-slot stack limit 64); every other mode keeps the snapshot's
+    /// echo and mutates nothing. Answers the echo with whether the state
+    /// moved, so the caller republishes the window.
+    pub fn predict_click(
+        &mut self,
+        window_id: i8,
+        slot: i16,
+        button: i8,
+        mode: i8,
+    ) -> (Option<MetadataItem>, bool) {
+        if mode == CLICK_MODE_DRAG {
+            self.predict_drag(window_id, slot, button);
+            return (None, true);
+        }
+        if self.drag_event != 0 {
+            // A click of any other mode with a drag open drops the drag and
+            // lands nowhere (`Container.java:228-231`).
+            self.reset_drag();
+            return (None, true);
+        }
+        match mode {
+            CLICK_MODE_PICKUP => (self.predict_pickup(window_id, slot, button), true),
+            CLICK_MODE_DROP => {
+                self.predict_drop(window_id, slot, button);
+                (None, true)
+            }
+            CLICK_MODE_QUICK_MOVE => (self.click_slot(window_id, slot).flatten(), false),
+            _ => (None, false),
+        }
+    }
+
+    /// The pickup and place prediction (`Container.slotClick`'s mode-0 arm,
+    /// `Container.java:232-388`): answers the branch return — the slot's
+    /// pre-click stack on a filled slot (`:291-296`), nothing otherwise.
+    /// Clicks the view never sends (a button outside 0/1, a slot outside
+    /// −999's drop and the windows' vectors) answer nothing and land nowhere.
+    fn predict_pickup(&mut self, window_id: i8, slot: i16, button: i8) -> Option<MetadataItem> {
+        if button != 0 && button != 1 {
+            return None;
+        }
+        if slot == -999 {
+            // The carried stack's own drop outside every slot (`:234-254`):
+            // button 0 drops the whole stack, button 1 a single item.
+            let mut cursor = self.cursor.clone()?;
+            if button != 0 && cursor.count > 1 {
+                cursor.count -= 1;
+                self.set_cursor(Some(cursor));
+            } else {
+                self.set_cursor(None);
+            }
+            return None;
+        }
+        if slot < 0 {
+            return None;
+        }
+        let held = self.click_slot(window_id, slot)?;
+        let echo = held.clone();
+        match held {
+            None => {
+                // Place onto the empty slot (`:299-319`): button 0 the whole
+                // stack, button 1 a single item, capped at the slot limit.
+                let cursor = self.cursor.clone()?;
+                let take = i32::from(cursor.count).min(if button == 0 {
+                    i32::from(cursor.count)
+                } else {
+                    1
+                });
+                let take = take.min(BASE_MAX_STACK_SIZE);
+                if take <= 0 || i32::from(cursor.count) < take {
+                    return echo;
+                }
+                let mut placed = cursor.clone();
+                placed.count = take as u8;
+                self.write_click_slot(window_id, slot, Some(placed));
+                if i32::from(cursor.count) == take {
+                    self.set_cursor(None);
+                } else {
+                    let mut rest = cursor;
+                    rest.count -= take as u8;
+                    self.set_cursor(Some(rest));
+                }
+            }
+            Some(stack) => {
+                // `canTakeStack` answers true for every slot of the base
+                // (recorded), so the filled slot always answers.
+                let echo = stack.clone();
+                match self.cursor.clone() {
+                    None => {
+                        // The pickup (`:309-319`): button 0 the whole stack,
+                        // button 1 half rounded up.
+                        let take = if button == 0 {
+                            i32::from(stack.count)
+                        } else {
+                            (i32::from(stack.count) + 1) / 2
+                        };
+                        let mut lifted = stack.clone();
+                        lifted.count = take as u8;
+                        self.set_cursor(Some(lifted));
+                        if i32::from(stack.count) == take {
+                            self.write_click_slot(window_id, slot, None);
+                        } else {
+                            let mut rest = stack;
+                            rest.count -= take as u8;
+                            self.write_click_slot(window_id, slot, Some(rest));
+                        }
+                    }
+                    Some(cursor) => {
+                        let same = stack.id == cursor.id
+                            && stack.damage == cursor.damage
+                            && stack.nbt == cursor.nbt;
+                        if same {
+                            // The merge (`:322-342`): button 0 the whole
+                            // cursor, button 1 a single item, capped at what
+                            // the slot still takes.
+                            let room = (BASE_MAX_STACK_SIZE - i32::from(stack.count)).min(
+                                max_stack_size(&cursor, &BaseStackCaps) - i32::from(stack.count),
+                            );
+                            let mut move_count = if button == 0 {
+                                i32::from(cursor.count)
+                            } else {
+                                1
+                            };
+                            move_count = move_count.min(room);
+                            if move_count > 0 {
+                                let mut grown = stack;
+                                grown.count += move_count as u8;
+                                self.write_click_slot(window_id, slot, Some(grown));
+                                if i32::from(cursor.count) == move_count {
+                                    self.set_cursor(None);
+                                } else {
+                                    let mut rest = cursor;
+                                    rest.count -= move_count as u8;
+                                    self.set_cursor(Some(rest));
+                                }
+                            }
+                        } else if i32::from(cursor.count) <= BASE_MAX_STACK_SIZE {
+                            // The swap (`:343-346`): the cursor fits the
+                            // slot's own limit, so the two trade places.
+                            self.write_click_slot(window_id, slot, Some(cursor));
+                            self.set_cursor(Some(stack));
+                        }
+                    }
+                }
+                return Some(echo);
+            }
+        }
+        echo
+    }
+
+    /// The drop prediction (`Container.slotClick`'s mode-4 arm,
+    /// `Container.java:446-456`): with an empty cursor over a filled slot,
+    /// button 0 drops one item and any other button the whole stack. The
+    /// carrier stays null, so the echo is always empty; a carried cursor
+    /// leaves the click a no-op.
+    fn predict_drop(&mut self, window_id: i8, slot: i16, button: i8) {
+        if self.cursor.is_some() || slot < 0 {
+            return;
+        }
+        let Some(Some(stack)) = self.click_slot(window_id, slot) else {
+            return;
+        };
+        // The view sends button 0 for one item and 1 for the whole stack
+        // (`ContainerScreen.screen_key`); the source drops one on button 0
+        // and the slot's whole count otherwise (`:451`).
+        if button != 0 || stack.count <= 1 {
+            self.write_click_slot(window_id, slot, None);
+        } else {
+            let mut rest = stack;
+            rest.count -= 1;
+            self.write_click_slot(window_id, slot, Some(rest));
+        }
+    }
+
+    /// The drag prediction (`Container.slotClick`'s mode-5 arm,
+    /// `Container.java:145-227`): the begin arms the mode, each add joins one
+    /// slot, the end distributes over the covered set and the cursor keeps
+    /// the remnant. The arm never sets the source's carrier, so the echo is
+    /// always empty. The whole-stack mode reads invalid outside creative
+    /// (`isValidDragMode:705-708`); the prediction runs survival, so it never
+    /// arms.
+    fn predict_drag(&mut self, window_id: i8, slot: i16, button: i8) {
+        let event = get_drag_event(i32::from(button));
+        let was = self.drag_event;
+        self.drag_event = event;
+        if ((was != 1 || event != 2) && was != event) || self.cursor.is_none() {
+            self.reset_drag();
+        } else if event == 0 {
+            let mode = extract_drag_mode(i32::from(button));
+            if is_valid_drag_mode(mode, false) {
+                self.drag_event = 1;
+                self.drag_mode = mode;
+                self.drag_slots.clear();
+            } else {
+                self.reset_drag();
+            }
+        } else if event == 1 {
+            let Some(cursor) = self.cursor.clone() else {
+                self.reset_drag();
+                return;
+            };
+            let Some(stack) = self.click_slot(window_id, slot) else {
+                return;
+            };
+            let cap = max_stack_size(&cursor, &BaseStackCaps);
+            if (cursor.count as usize) > self.drag_slots.len()
+                && can_add_item_to_slot(&stack, &cursor, cap)
+                && !self.drag_slots.contains(&slot)
+            {
+                self.drag_slots.push(slot);
+            }
+        } else if event == 2 {
+            if !self.drag_slots.is_empty() {
+                self.finish_drag(window_id);
+            }
+            self.reset_drag();
+        } else {
+            self.reset_drag();
+        }
+    }
+
+    /// The drag end's distribution (`Container.java:183-220`): the mode's own
+    /// share over the covered set, capped at the dragged item's limit and the
+    /// slot's own 64, with the cursor keeping what the set did not take.
+    fn finish_drag(&mut self, window_id: i8) {
+        let Some(cursor) = self.cursor.clone() else {
+            return;
+        };
+        let set = self.drag_slots.clone();
+        if (cursor.count as usize) < set.len() {
+            return;
+        }
+        let mode = self.drag_mode;
+        let caps = BaseStackCaps;
+        let others: Vec<Option<MetadataItem>> = set
+            .iter()
+            .map(|slot| self.click_slot(window_id, *slot).unwrap_or(None))
+            .collect();
+        let mut left = i32::from(cursor.count);
+        for (slot, before) in set.iter().zip(others.iter()) {
+            let mut piece = compute_stack_size(mode, &cursor, before.as_ref(), &others, &caps);
+            piece = piece.min(BASE_MAX_STACK_SIZE);
+            let held = before.as_ref().map_or(0, |stack| i32::from(stack.count));
+            left -= piece - held;
+            let mut landed = cursor.clone();
+            landed.count = piece as u8;
+            self.write_click_slot(window_id, *slot, Some(landed));
+        }
+        if left <= 0 {
+            self.set_cursor(None);
+        } else {
+            let mut remnant = cursor;
+            remnant.count = left as u8;
+            self.set_cursor(Some(remnant));
+        }
     }
 
     /// Whether a window id names a container the state holds: window 0, which

@@ -7188,20 +7188,21 @@ fn a_click_sends_the_slots_own_echo_and_the_containers_next_action() {
     );
 
     // The click's premise rides the state, not the fixture: the window −1
-    // write must land, and its own snapshot reads the carried stack back, so
-    // a dead write can never again leave the echo checked against a null
-    // cursor.
+    // write must land, and one of its snapshots reads the carried stack back,
+    // so a dead write can never again leave the echo checked against a null
+    // cursor. Any snapshot carries the read — the predicting click publishes
+    // a newer one behind it.
     let carried = events
         .iter()
-        .rev()
-        .find_map(|event| match event {
-            ClientEvent::WindowSnapshot { cursor, .. } => Some(cursor.clone()),
+        .filter_map(|event| match event {
+            ClientEvent::WindowSnapshot { cursor, .. } => cursor.clone(),
             _ => None,
         })
+        .find(|cursor| cursor.id == 5 && cursor.count == 64)
         .unwrap_or_else(|| panic!("the window writes publish snapshots: {events:?}"));
     assert_eq!(
-        carried.as_ref().map(|item| (item.id, item.count)),
-        Some((5, 64)),
+        (carried.id, carried.count),
+        (5, 64),
         "the fixture write must land, or the claim runs against a null cursor: {events:?}"
     );
 
@@ -7583,5 +7584,337 @@ fn the_creative_and_enchant_writes_and_the_sign_save_go_out() {
             sign_save_payload(4, 65, -9, ["one", "two", "", "four"]),
         ],
         "the drop, the slot write, the offer and the save, in the flips' own order: {frames:?}"
+    );
+}
+
+#[test]
+fn a_drop_click_takes_one_item_from_the_slot() {
+    // The Q key's drop over a filled slot with an empty cursor
+    // (`Container.java:446-456` with button 0): the slot loses one stone and
+    // the carrier stays null, so the echo is empty. A second drop with the
+    // stone-16 cursor the pickup lifts is the source's no-op (`mode == 4`
+    // requires an empty cursor), echoing empty and moving nothing.
+    let mut slots: Vec<Option<(i16, u8, i16)>> = vec![None; 27];
+    slots[0] = Some((1, 16, 0));
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &slots),
+    ]);
+    let (events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (
+                2,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 4,
+                },
+            ),
+            (
+                4,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+            (
+                6,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 1,
+                    button: 0,
+                    mode: 4,
+                },
+            ),
+        ],
+    );
+
+    let clicks = clicks(&frames);
+    assert_eq!(
+        clicks,
+        vec![
+            click_frame(1, 0, 0, 1, 4, &empty_echo()),
+            click_frame(1, 0, 0, 2, 0, &stone15_echo()),
+            click_frame(1, 1, 0, 3, 4, &empty_echo()),
+        ],
+        "the drop echoes empty with action 1, the pickup echoes stone 15 with action 2, the carried drop echoes empty with action 3: {frames:?}"
+    );
+    let (slots, cursor) =
+        last_snapshot(&events, 1).expect("the predicting clicks publish window 1: {events:?}");
+    assert_eq!(
+        slots[0].as_ref().map(|item| (item.id, item.count)),
+        None,
+        "the pickup lifts the dropped-once slot empty: {events:?}"
+    );
+    assert_eq!(
+        cursor.as_ref().map(|item| (item.id, item.count)),
+        Some((1, 15)),
+        "the cursor carries the fifteen the drop left: {events:?}"
+    );
+}
+
+/// The plain stone-fifteen slot payload: id 1, count 15, damage 0, no NBT.
+fn stone15_echo() -> Vec<u8> {
+    let mut echo = Vec::new();
+    push_slot(&mut echo, Some((1, 15, 0)));
+    echo
+}
+
+/// The plain stone-sixteen slot payload: id 1, count 16, damage 0, no NBT.
+fn stone16_echo() -> Vec<u8> {
+    let mut echo = Vec::new();
+    push_slot(&mut echo, Some((1, 16, 0)));
+    echo
+}
+
+/// The plain dirt-eight slot payload: id 3, count 8, damage 0, no NBT.
+fn dirt8_echo() -> Vec<u8> {
+    let mut echo = Vec::new();
+    push_slot(&mut echo, Some((3, 8, 0)));
+    echo
+}
+
+/// The last snapshot the session published for `window_id`, if any.
+fn last_snapshot(
+    events: &[ClientEvent],
+    window_id: u8,
+) -> Option<(Vec<Option<MetadataItem>>, Option<MetadataItem>)> {
+    events.iter().rev().find_map(|event| match event {
+        ClientEvent::WindowSnapshot {
+            window_id: id,
+            slots,
+            cursor,
+            ..
+        } if *id == window_id => Some((slots.clone(), cursor.clone())),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_pickup_click_predicts_the_carried_stack_into_the_snapshot() {
+    // The source runs the click against its own container before anything
+    // goes out (`PlayerControllerMP.windowClick:534-540` runs
+    // `openContainer.slotClick` and sends what it returned): a mode-0 pickup
+    // on the chest's filled slot 0 lifts stone 16 onto the cursor, and the
+    // packet's echo is the slot's pre-click stack (`Container.java:291-296`).
+    let mut slots: Vec<Option<(i16, u8, i16)>> = vec![None; 27];
+    slots[0] = Some((1, 16, 0));
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &slots),
+    ]);
+    let (events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![(
+            2,
+            InputEvent::ClickWindow {
+                window_id: 1,
+                slot: 0,
+                button: 0,
+                mode: 0,
+            },
+        )],
+    );
+
+    let clicks = clicks(&frames);
+    assert_eq!(
+        clicks,
+        vec![click_frame(1, 0, 0, 1, 0, &stone16_echo())],
+        "one pickup: window 1, slot 0, button 0, action 1, mode 0, echo stone 16: {frames:?}"
+    );
+    let (slots, cursor) =
+        last_snapshot(&events, 1).expect("the predicting click publishes window 1: {events:?}");
+    assert!(
+        slots[0].is_none(),
+        "the pickup lifts the slot empty: {events:?}"
+    );
+    assert_eq!(
+        cursor.as_ref().map(|item| (item.id, item.count)),
+        Some((1, 16)),
+        "the cursor carries stone 16: {events:?}"
+    );
+}
+
+#[test]
+fn a_swap_click_echoes_the_slots_own_stack() {
+    // The pickup lifts stone 16 onto the cursor; the second mode-0 click
+    // names slot 1's dirt with that cursor carried. The source answers every
+    // filled-slot mode-0 click with the slot's pre-click stack
+    // (`Container.java:291-296` copies it before the pickup, place, merge and
+    // swap arms run), so the swap's echo is the dirt — the server's own
+    // return for the same click — never null.
+    let mut slots: Vec<Option<(i16, u8, i16)>> = vec![None; 27];
+    slots[0] = Some((1, 16, 0));
+    slots[1] = Some((3, 8, 0));
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &slots),
+    ]);
+    let (events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (
+                2,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+            (
+                4,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 1,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+        ],
+    );
+
+    let clicks = clicks(&frames);
+    assert_eq!(
+        clicks,
+        vec![
+            click_frame(1, 0, 0, 1, 0, &stone16_echo()),
+            click_frame(1, 1, 0, 2, 0, &dirt8_echo()),
+        ],
+        "the pickup echoes stone 16 with action 1, the swap echoes the dirt with action 2: {frames:?}"
+    );
+    let (slots, cursor) =
+        last_snapshot(&events, 1).expect("the predicting clicks publish window 1: {events:?}");
+    assert_eq!(
+        slots[1].as_ref().map(|item| (item.id, item.count)),
+        Some((1, 16)),
+        "the swap lands the stone in slot 1: {events:?}"
+    );
+    assert_eq!(
+        cursor.as_ref().map(|item| (item.id, item.count)),
+        Some((3, 8)),
+        "the dirt rides the cursor after the swap: {events:?}"
+    );
+}
+
+#[test]
+fn a_drag_batch_distributes_and_leaves_the_remnant_on_the_cursor() {
+    // The R5 arm: pickup lifts stone 16, then the release's 1+n+1 mode-5
+    // batch (`GuiContainer.mouseReleased:615-625`, buttons from
+    // `Container.func_94534_d:700-703` with the left limit 0) covers slot 2.
+    // Every drag packet echoes null (the mode-5 arm never sets the source's
+    // carrier, `Container.java:145-227`); the end splits the carried 16
+    // across the one covered slot, leaving the cursor empty.
+    let mut slots: Vec<Option<(i16, u8, i16)>> = vec![None; 27];
+    slots[0] = Some((1, 16, 0));
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &slots),
+    ]);
+    let (events, frames) = flip_session(
+        head,
+        Vec::new(),
+        8,
+        0,
+        vec![
+            (
+                2,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                },
+            ),
+            (
+                4,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: -999,
+                    button: 0,
+                    mode: 5,
+                },
+            ),
+            (
+                6,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: 2,
+                    button: 1,
+                    mode: 5,
+                },
+            ),
+            (
+                8,
+                InputEvent::ClickWindow {
+                    window_id: 1,
+                    slot: -999,
+                    button: 2,
+                    mode: 5,
+                },
+            ),
+        ],
+    );
+
+    let clicks = clicks(&frames);
+    assert_eq!(
+        clicks,
+        vec![
+            click_frame(1, 0, 0, 1, 0, &stone16_echo()),
+            click_frame(1, -999, 0, 2, 5, &empty_echo()),
+            click_frame(1, 2, 1, 3, 5, &empty_echo()),
+            click_frame(1, -999, 2, 4, 5, &empty_echo()),
+        ],
+        "actions 1-4 run pickup, drag-begin, drag-add, drag-end, every drag echo null: {frames:?}"
+    );
+    let (slots, cursor) =
+        last_snapshot(&events, 1).expect("the drag end publishes window 1: {events:?}");
+    assert_eq!(
+        slots[2].as_ref().map(|item| (item.id, item.count)),
+        Some((1, 16)),
+        "the even split lands the whole stack on the one covered slot: {events:?}"
+    );
+    assert!(
+        cursor.is_none(),
+        "the remnant cursor is empty after the even split: {events:?}"
+    );
+}
+
+#[test]
+fn a_cursor_set_slot_reaches_the_open_windows_snapshot() {
+    // The cursor rides the wire as window −1 but belongs to the shared
+    // player inventory every open screen draws
+    // (`NetHandlerPlayClient.handleSetSlot:1133-1168` writes
+    // `inventory.setItemStack`, and `GuiContainer.drawScreen:144-170` draws
+    // `inventoryplayer.getItemStack()`): with the chest standing, its write
+    // must publish the open window's own snapshot carrying the cursor — not
+    // window 0's alone.
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &vec![None; 27]),
+        set_slot_frame(-1, -1, Some((1, 16, 0))),
+    ]);
+    let (events, _) = flip_session(head, Vec::new(), 8, 0, Vec::new());
+
+    let (slots, cursor) =
+        last_snapshot(&events, 1).expect("the cursor write publishes window 1: {events:?}");
+    assert_eq!(slots.len(), 27, "the open window's own vector: {events:?}");
+    assert_eq!(
+        cursor.as_ref().map(|item| (item.id, item.count)),
+        Some((1, 16)),
+        "the open window's snapshot carries stone 16: {events:?}"
     );
 }

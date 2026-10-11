@@ -91,7 +91,6 @@ use oxide_world::world::World;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
-use crate::container::{CLICK_MODE_PICKUP, CLICK_MODE_QUICK_MOVE};
 use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
@@ -106,7 +105,7 @@ use crate::physics;
 use crate::player::{Abilities, Player};
 use crate::scoreboard::{Scoreboard, colour_from_wire};
 use crate::ticker::Ticker;
-use crate::windows::{HOTBAR_SIZE, OpenWindowState, Windows};
+use crate::windows::{CURSOR_WINDOW_ID, HOTBAR_SIZE, OpenWindowState, Windows};
 use crate::world_view::WorldView;
 
 /// The plugin channel a vanilla client announces itself on.
@@ -1041,10 +1040,14 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     // One 0x0E per click, carrying the
                                     // container's own next action number
                                     // (`Container.getNextTransactionID:561-565`)
-                                    // and the echo the click's branch returned
+                                    // and the echo the local prediction's
+                                    // branch returned
                                     // (`PlayerControllerMP.windowClick:534-540`),
-                                    // never the cursor.
-                                    if let Some(request) = click_window_packet(
+                                    // never the cursor. A predicting click
+                                    // republishes the window, the way the
+                                    // source's own container mutation is what
+                                    // the view draws.
+                                    if let Some((request, mutated)) = click_window_packet(
                                         &mut windows,
                                         window_id,
                                         slot,
@@ -1052,6 +1055,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         mode,
                                     )? {
                                         send_reply(&mut conn, &request)?;
+                                        if mutated {
+                                            let snapshot_id = u8::try_from(window_id)
+                                                .expect("a held window fits the wire's byte");
+                                            report_window_snapshot(&windows, snapshot_id, events);
+                                        }
                                     }
                                 }
                                 InputEvent::CloseWindow { window_id } => {
@@ -2137,13 +2145,26 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // The state's own branches: window −1 is the
                             // carried stack, window 0 the player's layout and
                             // the rest the open window's
-                            // (`handleSetSlot:1133-1168`).
+                            // (`handleSetSlot:1133-1168`). The cursor belongs
+                            // to the shared player inventory every open
+                            // screen draws (`GuiContainer.drawScreen:144-170`
+                            // draws `inventoryplayer.getItemStack()`), so its
+                            // write republishes the open window too — window
+                            // 0's snapshot alone never reaches the standing
+                            // screen.
                             if windows.apply_set_slot(slot.window_id, slot.slot, slot.item) {
                                 report_window_snapshot(
                                     &windows,
                                     slot_window(slot.window_id),
                                     events,
                                 );
+                                if slot.window_id == CURSOR_WINDOW_ID {
+                                    if let Some(open) =
+                                        windows.open.as_ref().map(|open| open.window_id)
+                                    {
+                                        report_window_snapshot(&windows, open, events);
+                                    }
+                                }
                             }
                         }
                         WindowItems::ID => {
@@ -2654,14 +2675,16 @@ fn chat_over_cap(text: &str) -> bool {
 /// run and sends nothing — the window and its slot are checked before anything
 /// is written — and a click that lands steps the container's own action number
 /// (`Container.getNextTransactionID:561-565`, counting from one in
-/// [`Windows`]) and carries the echo the click's branch produced.
+/// [`Windows`]), carries the echo the local prediction's branch produced, and
+/// reports whether the prediction moved the state so the caller republishes
+/// the window.
 fn click_window_packet(
     windows: &mut Windows,
     window_id: i32,
     slot: i16,
     button: i8,
     mode: i8,
-) -> Result<Option<Vec<u8>>, SessionError> {
+) -> Result<Option<(Vec<u8>, bool)>, SessionError> {
     let Ok(wire_id) = i8::try_from(window_id) else {
         debug!(window_id, "a click names a window the wire cannot carry");
         return Ok(None);
@@ -2670,30 +2693,14 @@ fn click_window_packet(
         debug!(window_id, "a click names no window the state holds");
         return Ok(None);
     }
-    let echo = click_echo(windows, wire_id, slot, mode);
+    let (echo, mutated) = windows.predict_click(wire_id, slot, button, mode);
     let action = windows.next_action_number();
-    Ok(Some(payload_of(|out| {
-        write_click_window(out, wire_id, slot, button, action, echo.as_ref(), mode)
-    })?))
-}
-
-/// The echo one click's packet carries: the click's own branch return in the
-/// source's `Container.slotClick`.
-///
-/// The pickup and the shift quick-move are the two branches that answer with a
-/// stack — the clicked slot's own, read before the click's mutation
-/// (`Container.java:291-296` for the pickup, `:266-271` for the quick-move) —
-/// while every other mode, the click outside every slot (−999) and the drag
-/// leave the source's carrier null (`:446-456`, `:457-491`, `:145-227`). The
-/// stack rides from the state's own snapshot: the session is the container the
-/// view clicks, and nothing is mutated here. The echo is never the cursor
-/// (`PlayerControllerMP.windowClick:534-540`).
-fn click_echo(windows: &Windows, window_id: i8, slot: i16, mode: i8) -> Option<MetadataItem> {
-    if mode != CLICK_MODE_PICKUP && mode != CLICK_MODE_QUICK_MOVE {
-        return None;
-    }
-    let snapshot = windows.snapshot(u8::try_from(window_id).ok()?)?;
-    snapshot.slots.get(usize::try_from(slot).ok()?)?.clone()
+    Ok(Some((
+        payload_of(|out| {
+            write_click_window(out, wire_id, slot, button, action, echo.as_ref(), mode)
+        })?,
+        mutated,
+    )))
 }
 
 /// Whether one close the view sent writes its packet: the state must take the
