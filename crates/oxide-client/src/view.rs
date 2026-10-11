@@ -11559,4 +11559,138 @@ mod tests {
             "the tooltip returns on release: {draws:?}"
         );
     }
+
+    #[test]
+    fn a_pickup_hold_renders_the_carried_stack_not_the_staged_state() {
+        // Fix round 11's guard: the S3 hold window renders the prediction,
+        // not the staged state. Staged chest win2, panel pointer on slot 0,
+        // press sends the mode-0 pickup; the session's published prediction
+        // (slot 0 empty, cursor stone 16) folds into the screen; the draws
+        // must empty slot 0 and carry the stack at the pointer minus 8
+        // (`GuiContainer.drawScreen`:144-170, `ContainerScreen::cursor_draw`).
+        // The carried icon lands on the emptied cell when the pointer sits
+        // on the slot's centre, which is what the S3 frames misread as a
+        // staged slot (the offset icon, the hover wash and the missing
+        // tooltip tell them apart).
+        use oxide_client::screens::container::ClickButton;
+        use oxide_game::input::InputEvent;
+        use oxide_proto_v47::window::WindowKind;
+
+        fn stack(id: i16, count: u8) -> MetadataItem {
+            MetadataItem {
+                id,
+                count,
+                damage: 0,
+                nbt: None,
+            }
+        }
+
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_container(
+            2,
+            WindowKind::Chest,
+            String::from("{\"text\":\"Chest\"}"),
+            27,
+            None,
+        );
+        let mut staged: Vec<Option<MetadataItem>> = vec![None; 27];
+        staged[0] = Some(stack(1, 16));
+        screens.apply_snapshot(2, staged, None, Vec::new());
+        let (cell, origin) = {
+            let screen = screens.container_mut().expect("the chest stands");
+            screen.set_screen_size(427, 240);
+            let layout = screen.layout();
+            let pos = layout
+                .slots
+                .iter()
+                .find(|pos| pos.index == 0)
+                .expect("slot 0 is laid out");
+            ((pos.x as f32, pos.y as f32), screen.origin())
+        };
+        {
+            let screen = screens.container_mut().expect("the chest stands");
+            screen.mouse_moved(cell.0 + 8.0, cell.1 + 8.0, &items::ItemTable);
+            let events = screen.press(ClickButton::Left, false, 1_000);
+            assert_eq!(
+                events,
+                vec![InputEvent::ClickWindow {
+                    window_id: 2,
+                    slot: 0,
+                    button: 0,
+                    mode: 0,
+                }],
+                "the press picks slot 0 up: {events:?}"
+            );
+        }
+        let carried: Vec<Option<MetadataItem>> = vec![None; 27];
+        screens.apply_snapshot(2, carried, Some(stack(1, 16)), Vec::new());
+        let screen = screens.container_mut().expect("the chest stands");
+        assert_eq!(
+            screen.hovered(),
+            Some(0),
+            "the pointer still hovers the picked slot"
+        );
+        assert!(
+            screen.slot_stack(0).cloned().flatten().is_none(),
+            "slot 0 empties on the screen"
+        );
+        assert_eq!(
+            screen.cursor().map(|item| (item.id, item.count)),
+            Some((1, 16)),
+            "the screen carries stone 16"
+        );
+        let (gx, gy) = (origin.0 as f32, origin.1 as f32);
+        let pointer = (gx + cell.0 + 8.0, gy + cell.1 + 8.0);
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: Some(pointer),
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+                language: None,
+            },
+        );
+        let cell_draw = draws.iter().find(|draw| {
+            matches!(
+                draw, HudDraw::Item { x, y, .. }
+                if (*x - (gx + cell.0)).abs() < f32::EPSILON
+                    && (*y - (gy + cell.1)).abs() < f32::EPSILON
+            )
+        });
+        assert!(
+            matches!(cell_draw, Some(HudDraw::Item { stack: None, .. })),
+            "slot 0's cell draws empty during the hold: {draws:?}"
+        );
+        assert!(
+            draws.iter().any(|draw| {
+                matches!(
+                    draw,
+                    HudDraw::Item {
+                        stack: Some(icon),
+                        x,
+                        y,
+                        ..
+                    }
+                    if icon.id == 1
+                        && (*x - (gx + cell.0)).abs() < f32::EPSILON
+                        && (*y - (gy + cell.1)).abs() < f32::EPSILON
+                )
+            }),
+            "the carried stone draws at the pointer minus 8: {draws:?}"
+        );
+        assert!(
+            draws.iter().any(|draw| {
+                matches!(
+                    draw,
+                    HudDraw::Text { text, .. } if text == "16"
+                )
+            }),
+            "the carried count draws with the stack: {draws:?}"
+        );
+    }
 }

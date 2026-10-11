@@ -7918,3 +7918,73 @@ fn a_cursor_set_slot_reaches_the_open_windows_snapshot() {
         "the open window's snapshot carries stone 16: {events:?}"
     );
 }
+
+#[test]
+fn a_double_open_pickup_hold_publishes_the_carried_stack() {
+    // Fix round 11's state-side guard: the live S3 sequence (cs3 wire,
+    // server frames 1539-1580 + client 8515) — S2D win1 + S30 +
+    // empty-cursor S2F, S2E win1, S2D win2 + S30 + empty-cursor S2F, then
+    // the mode-0 pickup on win2/slot0, then the S32 accept. The predicting
+    // click must publish the open window's snapshot with slot 0 lifted
+    // empty and the cursor carrying stone 16; the S32 only confirms.
+    let mut sync: Vec<Option<(i16, u8, i16)>> = vec![None; 27];
+    sync[0] = Some((1, 16, 0));
+    sync[1] = Some((3, 10, 0));
+    let head = feed_head(&[
+        open_window_frame(1, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(1, &sync),
+        set_slot_frame(-1, -1, None),
+        close_window_frame(1),
+        open_window_frame(2, "minecraft:chest", "Loot", 27, None),
+        window_items_frame(2, &sync),
+        set_slot_frame(-1, -1, None),
+    ]);
+    let tail = framed(&[confirm_transaction_frame(2, 1, true)]);
+    let (events, frames) = flip_session(
+        head,
+        tail,
+        8,
+        0,
+        vec![(
+            2,
+            InputEvent::ClickWindow {
+                window_id: 2,
+                slot: 0,
+                button: 0,
+                mode: 0,
+            },
+        )],
+    );
+    let clicks = clicks(&frames);
+    assert_eq!(
+        clicks,
+        vec![click_frame(2, 0, 0, 1, 0, &stone16_echo())],
+        "one pickup: window 2, slot 0, button 0, action 1, mode 0, echo stone 16: {frames:?}"
+    );
+    let held: Vec<(bool, Option<(i16, u8)>)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::WindowSnapshot {
+                window_id: 2,
+                slots,
+                cursor,
+                ..
+            } => Some((
+                slots[0].is_none(),
+                cursor.as_ref().map(|item| (item.id, item.count)),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !held.is_empty(),
+        "the predicting click publishes window 2: {events:?}"
+    );
+    let (empty, carried) = held.last().copied().unwrap();
+    assert!(empty, "the pickup lifts slot 0 empty: {held:?}");
+    assert_eq!(
+        carried,
+        Some((1, 16)),
+        "the cursor carries stone 16 after the double open: {held:?}"
+    );
+}
