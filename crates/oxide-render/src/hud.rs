@@ -357,8 +357,10 @@ pub enum HudDraw {
     ///
     /// The pass lays the icon out through the resolver the frame handed over
     /// ([`HudPass::set_icon_source`]): the model's mesh and its own `display.gui`
-    /// transform, composed by [`icon_matrix`] with the draw's own rung of the z-level
-    /// ladder, so the list's order survives the item pipeline's depth test. A stack
+    /// transform, composed by [`icon_matrix`] at the balanced level — the
+    /// source raises and lowers `zLevel` around each item call, so every icon
+    /// shares one depth and the list's order decides overlaps
+    /// (`RenderItem`:402/`:443`). A stack
     /// the resolver cannot place draws its missing-sprite fallback
     /// ([`ItemIconSource::missing_icon`]); `None` draws nothing — an empty cell. An
     /// enchanted stack ([`ItemIcon::enchanted`]) draws its two glint passes after the
@@ -501,9 +503,6 @@ fn build(
     time_ms: u64,
 ) -> BuiltGeometry {
     let mut built = BuiltGeometry::default();
-    // The rung of the z-level ladder the next icon draw takes: the list's own item
-    // draws count, the 2D draws in between do not.
-    let mut item_index = 0;
     for draw in draws {
         if let HudDraw::Item { stack, x, y, pop } = draw {
             let Some(stack) = stack else { continue };
@@ -515,7 +514,10 @@ fn build(
                 continue;
             };
             let icon = GuiItemDraw::from_icon(&resolved);
-            let matrix = icon_matrix(*x, *y, icon_z_level(item_index), icon.shape, icon.transform);
+            // The balanced level: the source raises and lowers `zLevel`
+            // around each item call, so every icon shares one depth and the
+            // list's order decides overlaps (`RenderItem`:402/`:443`).
+            let matrix = icon_matrix(*x, *y, icon_z_level(), icon.shape, icon.transform);
             // The pop scales about the pivot while `f > 0`, in GUI space around
             // the icon's own matrix — the source's push/scale/translate sequence
             // (`GuiIngame.renderHotbarItem`:1045-1052), which wraps the item draw
@@ -526,7 +528,6 @@ fn build(
             } else {
                 matrix
             };
-            item_index += 1;
             push_item(&mut built, &icon, matrix, time_ms, stack.enchanted);
             continue;
         }
@@ -843,7 +844,7 @@ pub struct HudPass {
     /// The bind group the pipeline reads the projection through.
     ortho_bind_group: wgpu::BindGroup,
     /// The uniform buffer holding the item draws' own GUI projection, whose z carries
-    /// the source's `100 + zLevel` ladder into the depth test.
+    /// the source's `100 + zLevel` level into the depth test.
     item_buffer: wgpu::Buffer,
     /// The bind group the item and glint pipelines read that projection through.
     item_bind_group: wgpu::BindGroup,

@@ -2015,6 +2015,7 @@ impl ClientApp {
                     &self.own_name,
                     renderer.entity_textures(),
                 ),
+                language: self.assets.as_ref().map(|assets| &assets.lang),
             },
         ));
         // The death view replaces the debug overlay while the player is dead:

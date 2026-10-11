@@ -235,9 +235,11 @@ fn the_resolution_classes_pin_the_sources_own() {
     let count =
         |kind: fn(&ItemModel) -> bool| rows.iter().filter(|row| kind(&row.resolution)).count();
     assert_eq!(count(|model| matches!(model, ItemModel::Block(_))), 122);
-    assert_eq!(count(|model| matches!(model, ItemModel::Generated(_))), 208);
+    // 210 generated / 2 missing since fix round 7 bound the compass and the
+    // clock to their own generated layers.
+    assert_eq!(count(|model| matches!(model, ItemModel::Generated(_))), 210);
     assert_eq!(count(|model| matches!(model, ItemModel::Builtin(_))), 3);
-    assert_eq!(count(|model| matches!(model, ItemModel::Missing)), 4);
+    assert_eq!(count(|model| matches!(model, ItemModel::Missing)), 2);
     for row in rows {
         if let ItemModel::Generated(layers) = row.resolution {
             assert!(!layers.is_empty(), "id {} has layers", row.id);
@@ -274,7 +276,12 @@ fn the_resolutions_map_into_task_sevens_classes() {
         entry(373).resolution,
         ItemModel::Generated(&["items/potion_overlay", "items/potion_bottle_drinkable"])
     );
-    assert_eq!(entry(345).resolution, ItemModel::Missing);
+    // Fix round 7 binds the compass to its own generated layer (the search
+    // tab's icon) instead of the missing cube.
+    assert_eq!(
+        entry(345).resolution,
+        ItemModel::Generated(&["items/compass"])
+    );
     assert_eq!(
         entry(1).resolution.source(),
         ItemModelSource::Block("block/stone".to_string())
@@ -290,7 +297,10 @@ fn the_resolutions_map_into_task_sevens_classes() {
             "items/potion_bottle_drinkable".to_string(),
         ])
     );
-    assert_eq!(entry(345).resolution.source(), ItemModelSource::Missing);
+    assert_eq!(
+        entry(345).resolution.source(),
+        ItemModelSource::Generated(vec!["items/compass".to_string()])
+    );
 }
 
 #[test]

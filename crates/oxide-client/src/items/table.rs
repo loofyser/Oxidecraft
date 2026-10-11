@@ -2295,7 +2295,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 345,
         name: "Compass",
-        resolution: ItemModel::Missing,
+        resolution: ItemModel::Generated(&["items/compass"]),
         max_stack: 64,
         max_damage: 0,
         attributes: ItemAttributes::NONE,
@@ -2313,7 +2313,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 347,
         name: "Clock",
-        resolution: ItemModel::Missing,
+        resolution: ItemModel::Generated(&["items/clock"]),
         max_stack: 64,
         max_damage: 0,
         attributes: ItemAttributes::NONE,

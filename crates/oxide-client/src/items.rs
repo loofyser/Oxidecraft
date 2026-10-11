@@ -426,6 +426,25 @@ mod tests {
         }
     }
 
+    /// Fix round 7's search-icon pin (RED): the compass and the clock bind
+    /// their own layer-0 sprites — the search tab's icon is the compass
+    /// (`CreativeTabs.tabAllSearch.getTabIconItem`, `CreativeTabs.java`:55-61;
+    /// both item files parent a `builtin/*` over `items/<name>`) — instead of
+    /// falling back to the missing cube.
+    #[test]
+    fn the_compass_and_the_clock_bind_their_own_sprites() {
+        assert_eq!(
+            resolve(345, 0),
+            ItemResolution::Sprite("items/compass"),
+            "the search tab's compass icon binds"
+        );
+        assert_eq!(
+            resolve(347, 0),
+            ItemResolution::Sprite("items/clock"),
+            "the clock binds"
+        );
+    }
+
     #[test]
     fn the_table_holds_the_sources_own_ids() {
         assert_eq!(resolve(260, 0), ItemResolution::Sprite("items/apple"));

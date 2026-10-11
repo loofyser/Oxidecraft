@@ -58,6 +58,7 @@
 //! [`search_matches`]: crate::items::search_matches
 //! [`SEARCH_ITEMS`]: crate::items::creative_tab_items
 
+use oxide_game::chat::LanguageTable;
 use oxide_game::container::{
     CLICK_MODE_CREATIVE_PICK, CLICK_MODE_DRAG, CLICK_MODE_DROP, CLICK_MODE_GATHER,
     CLICK_MODE_PICKUP, CLICK_MODE_QUICK_MOVE, LocalContainer, StackCaps, drag_button,
@@ -299,13 +300,21 @@ pub fn tab_hides_chrome(index: u8) -> bool {
 }
 
 /// The title line a tab draws, or `None` on the inventory tab
-/// (`itemGroup.<label>` at (8, 6), `:392-400`). The key is untranslated:
-/// resolution is a locale-table concern the port does not carry.
-pub fn tab_title(index: u8) -> Option<String> {
+/// (`itemGroup.<label>` at (8, 6), `:392-400`). The key resolves through the
+/// language table the client hands over — the source's `StatCollector` lookup
+/// behind `getTranslatedTabLabel` — falling back to the key itself, the
+/// source's own missing-key rule (`StringTranslate.tryTranslateKey`:110-114).
+pub fn tab_title(index: u8, language: Option<&LanguageTable>) -> Option<String> {
     if tab_hides_chrome(index) {
         return None;
     }
-    CreativeTab::from_index(index).map(|tab| format!("itemGroup.{}", tab.label()))
+    CreativeTab::from_index(index).map(|tab| {
+        let key = format!("itemGroup.{}", tab.label());
+        language
+            .and_then(|table| table.get(&key))
+            .unwrap_or(&key)
+            .to_owned()
+    })
 }
 
 /// The scrolled row count: `(size + 8)/9 − 5`, the ceiling form
@@ -1728,9 +1737,43 @@ mod tests {
     fn only_the_inventory_tab_hides_the_scrollbar_and_the_title() {
         for index in 0..TAB_COUNT {
             assert_eq!(tab_hides_chrome(index), index == INVENTORY_TAB);
-            assert_eq!(tab_title(index).is_none(), index == INVENTORY_TAB);
+            assert_eq!(tab_title(index, None).is_none(), index == INVENTORY_TAB);
         }
-        assert_eq!(tab_title(0).as_deref(), Some("itemGroup.buildingBlocks"));
+        assert_eq!(
+            tab_title(0, None).as_deref(),
+            Some("itemGroup.buildingBlocks")
+        );
+    }
+
+    /// Fix round 7's label pin (RED): the title resolves through the language
+    /// table — the source's `getTranslatedTabLabel` — while a missing key
+    /// falls back to the key itself, the source's own missing-key rule.
+    #[test]
+    fn the_tab_title_resolves_through_the_language_table() {
+        let table = LanguageTable::from_lang(
+            "itemGroup.buildingBlocks=Building Blocks\nitemGroup.search=Search Items\n",
+        );
+        assert_eq!(
+            tab_title(0, Some(&table)).as_deref(),
+            Some("Building Blocks"),
+            "the building-blocks title resolves"
+        );
+        assert_eq!(
+            tab_title(SEARCH_TAB, Some(&table)).as_deref(),
+            Some("Search Items"),
+            "the search title resolves"
+        );
+        assert_eq!(
+            tab_title(INVENTORY_TAB, Some(&table)),
+            None,
+            "the inventory tab still draws no title"
+        );
+        let thin = LanguageTable::from_lang("itemGroup.search=Search Items\n");
+        assert_eq!(
+            tab_title(0, Some(&thin)).as_deref(),
+            Some("itemGroup.buildingBlocks"),
+            "a missing key falls back to the key itself"
+        );
     }
 
     #[test]

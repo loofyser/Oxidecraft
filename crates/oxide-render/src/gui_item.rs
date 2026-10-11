@@ -21,8 +21,8 @@
 //!
 //! The item pipeline's projection is the source's own GUI projection
 //! (`EntityRenderer.setupOverlayRendering`:1748-1758), so a draw's GUI-space z orders
-//! the icons: the list's own order is the source's `zLevel` ladder ([`icon_z_level`])
-//! and the depth test resolves overlaps the way the source's ladder does.
+//! the icons: every icon shares the source's balanced `zLevel` ([`icon_z_level`])
+//! and the depth test resolves overlaps the way the source's draw order does.
 
 use glam::{Mat3, Mat4, Vec3};
 use oxide_assets::model::Transform;
@@ -352,17 +352,17 @@ pub fn icon_matrix(x: f32, y: f32, z_level: f32, shape: IconShape, transform: Tr
     matrix
 }
 
-/// The z-level one icon draw carries, from its own place among the list's item draws.
+/// The z-level every icon draw carries: the source's own balanced level.
 ///
-/// The source raises the level by 50 before each `renderItemAndEffectIntoGUI` call
-/// (`RenderItem`:402) and lowers it by 50 once the call returns (`:443`), so its own
-/// hotbar loop is balanced — every call walks the same 50 (`GuiPlayerTabOverlay`'s pair
-/// does the same with its own 100, `:269`/`:271`). The ladder here is the plan's
-/// recorded generalization: the container contexts' own bases folded into the list's
-/// order, with the first icon of a frame at 50 and every later one 50 nearer — the
-/// reason a later icon's geometry sorts strictly in front of an earlier one's.
-pub fn icon_z_level(index: usize) -> f32 {
-    Z_LEVEL_STEP * (index as f32 + 1.0)
+/// The source raises the level by 50 before each `renderItemAndEffectIntoGUI`
+/// call (`RenderItem`:402) and lowers it by 50 once the call returns (`:443`),
+/// so every icon of a frame renders at the same level — the first icon's 50.
+/// The port's old ladder (50 per list position) was the plan's recorded
+/// generalization, and it walked the grid's later cells past the near plane;
+/// the balanced level keeps the whole frame inside the clip range while the
+/// list's draw order still decides overlaps, the source's own rule.
+pub fn icon_z_level() -> f32 {
+    Z_LEVEL_STEP
 }
 
 /// The GUI projection the item draws use: the source's own pair — the orthographic
@@ -641,30 +641,48 @@ mod tests {
         );
     }
 
-    /// The ladder: the first icon of a frame sits at 50 and every later one 50 nearer,
-    /// and the composed matrix carries the level in its own z.
+    /// Fix round 7's grid-depth pin: every icon of a full creative frame — the
+    /// twelve tab icons, the 45 grid cells and the 9 hotbar cells — keeps its
+    /// stored depth inside the viewport's own range, or the GPU clips the
+    /// icon. The stored depth is the projection's own fold (`0.5 - z/2000`
+    /// over `GUI_Z_BASE + z_level`, pinned two tests down). The balanced
+    /// level renders every icon of the frame at the same depth, so one probe
+    /// covers the whole frame — and the ladder it replaced is what walked
+    /// rung 18 (z = 1050) to the stored depth −0.025, past the near plane.
     #[test]
-    fn the_z_level_ladder_steps_by_fifty_from_the_first_icon() {
-        assert_eq!(icon_z_level(0), 50.0);
-        assert_eq!(icon_z_level(1), 100.0);
-        assert_eq!(icon_z_level(2), 150.0);
+    fn every_icon_of_a_full_frame_keeps_its_depth_inside_the_clip_range() {
+        let z = GUI_Z_BASE + icon_z_level();
+        let depth = 0.5 - z / 2000.0;
+        assert!(
+            (0.0..=1.0).contains(&depth),
+            "the frame's level stores its depth inside [0, 1]: z = {z}, depth = {depth}"
+        );
+    }
+
+    /// The balanced level: every icon of a frame sits at 50 — the source's
+    /// raise-then-lower around each `renderItemAndEffectIntoGUI` call
+    /// (`RenderItem`:402/`:443`) — and the composed matrix carries the level
+    /// in its own z.
+    #[test]
+    fn the_z_level_stays_at_fifty_for_every_icon() {
+        assert_eq!(icon_z_level(), 50.0);
         let first = icon_matrix(
             0.0,
             0.0,
-            icon_z_level(0),
+            icon_z_level(),
             IconShape::Flat,
             Transform::DEFAULT,
         );
         let second = icon_matrix(
             0.0,
             0.0,
-            icon_z_level(1),
+            icon_z_level(),
             IconShape::Flat,
             Transform::DEFAULT,
         );
         let centre = |matrix: Mat4| matrix.project_point3(Vec3::new(8.0, 8.0, 8.0)).z;
         assert_eq!(centre(first), 150.0);
-        assert_eq!(centre(second), 200.0);
+        assert_eq!(centre(second), 150.0);
     }
 
     /// The GUI projection: the source's own composition of

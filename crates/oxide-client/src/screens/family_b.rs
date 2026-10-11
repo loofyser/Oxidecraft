@@ -139,8 +139,8 @@ pub static BEACON: ContainerLayout = ContainerLayout {
     sheet: "gui/container/beacon",
     slots: &BEACON_SLOTS,
     title: TitleKind::Beacon {
-        primary: TitleSource::Fixed("Primary Effect"),
-        secondary: TitleSource::Fixed("Secondary Effect"),
+        primary: TitleSource::Fixed("Primary Power"),
+        secondary: TitleSource::Fixed("Secondary Power"),
     },
     background: BackgroundKind::Full,
 };
@@ -1464,6 +1464,24 @@ mod tables {
     //! rule, three coordinates per table, and the horse's chest pick.
 
     use super::*;
+
+    /// Fix round 7's beacon-label pin (RED): the pair reads `Primary Power` /
+    /// `Secondary Power` — the stock strings (`tile.beacon.primary`,
+    /// `tile.beacon.secondary` in `en_US.lang`, drawn at `GuiBeacon.java`
+    /// :178-179) — not `Primary/Secondary Effect`.
+    #[test]
+    fn the_beacon_labels_read_the_stock_power_strings() {
+        match BEACON.title {
+            TitleKind::Beacon {
+                primary: TitleSource::Fixed(primary),
+                secondary: TitleSource::Fixed(secondary),
+            } => {
+                assert_eq!(primary, "Primary Power", "the primary label");
+                assert_eq!(secondary, "Secondary Power", "the secondary label");
+            }
+            ref other => panic!("the beacon keeps its centred pair: {other:?}"),
+        }
+    }
 
     #[test]
     fn the_beacon_lays_out_the_payment_and_the_shifted_player_block() {

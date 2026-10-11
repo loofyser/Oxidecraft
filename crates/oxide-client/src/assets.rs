@@ -1207,8 +1207,10 @@ mod tests {
         // trio's icon sheets are not stitched.
         assert!(!sprites.contains("blocks/stone"));
         assert!(!sprites.contains("entity/chest/normal"));
-        // Every entry is a sheet of the tree, sorted by the set.
-        assert_eq!(sprites.len(), 214, "the registry's distinct layer sheets");
+        // Every entry is a sheet of the tree, sorted by the set: 216 since fix
+        // round 7 bound the compass and the clock to their own generated
+        // layers (`items/compass`, `items/clock`).
+        assert_eq!(sprites.len(), 216, "the registry's distinct layer sheets");
         let mut sorted: Vec<&String> = sprites.iter().collect();
         sorted.sort();
         assert_eq!(sorted, sprites.iter().collect::<Vec<_>>());

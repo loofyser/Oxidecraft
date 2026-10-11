@@ -326,6 +326,11 @@ pub struct ScreenDrawInput<'a> {
     /// the inventory preview samples it. Without one the preview stays out
     /// while the sheet and slots still draw.
     pub preview_skin: Option<SkinTexId>,
+    /// The language table the GUI labels resolve against — the client's
+    /// store table (`en_US.lang`), handed over like the chat mirror's own
+    /// (`ChatView::set_language`). `None` keeps the legacy behaviour: raw
+    /// keys draw as-is, exactly what fix round 7 heals.
+    pub language: Option<&'a LanguageTable>,
 }
 
 /// The screen group's own draws: the source's `currentScreen.drawScreen`
@@ -524,7 +529,15 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         // font the draw measures with.
         let measure = |text: &str| input.font.map_or(0, |font| string_width(font, text));
         for line in container.title_lines(measure) {
-            let text = plain_text(&chat::parse_json(&line.text));
+            // The window-titled lines arrive as raw chat JSON — a translate
+            // component like `container.chestDouble` draws nothing until it
+            // resolves through the handed-over table, the source's own
+            // `getDisplayName().getUnformattedText()` behind the title draws.
+            let parsed = chat::parse_json(&line.text);
+            let text = match input.language {
+                Some(table) => plain_text(&chat::resolve(&parsed, table)),
+                None => plain_text(&parsed),
+            };
             if !text.is_empty() {
                 draws.push(HudDraw::Text {
                     text,
@@ -682,10 +695,10 @@ fn push_creative_draws(
         });
     }
     // The title line over the panel (`:392-400`) — none on the inventory
-    // tab — untranslated: key resolution is a locale-table concern the
-    // port does not carry.
+    // tab — resolved through the handed-over language table, the source's
+    // `getTranslatedTabLabel` behind the draw.
     if input.font.is_some() {
-        if let Some(title) = cr::tab_title(selected) {
+        if let Some(title) = cr::tab_title(selected, input.language) {
             draws.push(HudDraw::Text {
                 text: title,
                 x: gx + 8.0,
@@ -817,7 +830,10 @@ fn push_creative_draws(
             let hover = screen.hover_at(mouse.0 - gx, mouse.1 - gy);
             if hover == cr::Hover::Bin {
                 draws.extend(tooltip::tooltip_draws(
-                    &tooltip::plain_tooltip_lines(vec![String::from("inventory.binSlot")]),
+                    &tooltip::plain_tooltip_lines(vec![resolve_gui_key(
+                        "inventory.binSlot",
+                        input.language,
+                    )]),
                     font,
                     mouse,
                     (width, height),
@@ -4101,6 +4117,17 @@ fn plain_text(component: &TextComponent) -> String {
         text.push_str(&plain_text(child));
     }
     text
+}
+
+/// One GUI label key through the handed-over language table: the source's
+/// `StatCollector`/`I18n` lookup behind the creative titles, the bin tooltip
+/// and the beacon pair — falling back to the key itself, the source's own
+/// missing-key rule (`StringTranslate.tryTranslateKey`:110-114).
+fn resolve_gui_key(key: &str, language: Option<&LanguageTable>) -> String {
+    language
+        .and_then(|table| table.get(key))
+        .unwrap_or(key)
+        .to_owned()
 }
 
 /// One line's runs as the `§`-coded string the text builder draws: the source's
@@ -10791,6 +10818,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         assert!(draws.is_empty(), "no screen owns no draws");
@@ -10818,6 +10846,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         // The background halves, the board backing, the title, the four
@@ -10890,6 +10919,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         // The background halves, the 192x192 sheet, the indicator, the one
@@ -10951,6 +10981,7 @@ mod tests {
                 level: 0,
                 effects: &effects,
                 preview_skin: None,
+                language: None,
             },
         );
         let texts: Vec<String> = draws
@@ -11021,6 +11052,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         // The 427x240 frame centres the 176x166 panel at (125, 37); the
@@ -11120,6 +11152,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         // The 427x240 frame centres the 176x168 three-row panel at (125, 36).
@@ -11230,6 +11263,214 @@ mod tests {
         );
     }
 
+    /// Fix round 7's creative-label pins (RED): with the store's language table
+    /// handed over, the search tab draws `Search Items` (not the raw
+    /// `itemGroup.search` key), the bin hover says `Destroy Item` (not
+    /// `inventory.binSlot`), and a translate-titled double chest draws
+    /// `Large Chest` (the `container.chestDouble` template through the
+    /// table — the stock client's own title).
+    #[test]
+    fn fix7_creative_labels_resolve_through_the_language_table() {
+        use oxide_game::chat::LanguageTable;
+        let table = LanguageTable::from_lang(
+            "itemGroup.search=Search Items\ninventory.binSlot=Destroy Item\ncontainer.chestDouble=Large Chest\n",
+        );
+        let font = chat_font();
+        fn input<'a>(
+            font: &'a oxide_assets::font::Font,
+            language: Option<&'a LanguageTable>,
+        ) -> ScreenDrawInput<'a> {
+            ScreenDrawInput {
+                font: Some(font),
+                scaled: chat_resolution(),
+                mouse: None,
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+                language,
+            }
+        }
+
+        // The search tab's title line at the panel's (8, 6).
+        let mut screens = Screens::default();
+        screens.open_creative();
+        let screen = screens.creative_mut().expect("the open is creative");
+        screen.set_screen_size(427, 240);
+        screen.set_tab(oxide_client::screens::creative::SEARCH_TAB);
+        let draws = screen_draws(&screens, &input(&font, Some(&table)));
+        assert!(
+            draws.iter().any(
+                |draw| matches!(draw, HudDraw::Text { text, x, y, .. } if text == "Search Items" && *x == 124.0 && *y == 58.0)
+            ),
+            "the search title resolves at the panel's (8, 6): {draws:?}"
+        );
+
+        // Without the table the legacy raw key still draws (the handed-over
+        // table is what heals it — `None` changes nothing).
+        let draws = screen_draws(&screens, &input(&font, None));
+        assert!(
+            draws.iter().any(
+                |draw| matches!(draw, HudDraw::Text { text, .. } if text == "itemGroup.search")
+            ),
+            "no table, no resolution — the raw key draws: {draws:?}"
+        );
+    }
+
+    /// Fix round 7's bin-tooltip pin (RED): hovering the delete cell reads
+    /// `Destroy Item` through the table.
+    #[test]
+    fn fix7_bin_tooltip_resolves_through_the_language_table() {
+        use oxide_game::chat::LanguageTable;
+        let table = LanguageTable::from_lang("inventory.binSlot=Destroy Item\n");
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_creative();
+        let screen = screens.creative_mut().expect("the open is creative");
+        screen.set_screen_size(427, 240);
+        screen.set_tab(oxide_client::screens::creative::SEARCH_TAB);
+        // The panel centres at (116, 52) in the 427x240 frame, so the bin
+        // cell's (173, 112) sits at frame (289, 164).
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: Some((289.0, 164.0)),
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+                language: Some(&table),
+            },
+        );
+        assert!(
+            draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "Destroy Item")),
+            "the bin hover resolves: {draws:?}"
+        );
+    }
+
+    /// Fix round 7's double-chest pin (RED): the 54-slot chest's translate
+    /// title resolves to `Large Chest` — the stock title — instead of drawing
+    /// nothing.
+    #[test]
+    fn fix7_double_chest_title_resolves_through_the_language_table() {
+        use oxide_game::chat::LanguageTable;
+        use oxide_proto_v47::window::WindowKind;
+        let table = LanguageTable::from_lang("container.chestDouble=Large Chest\n");
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_container(
+            3,
+            WindowKind::Chest,
+            String::from("{\"translate\":\"container.chestDouble\"}"),
+            54,
+            None,
+        );
+        screens
+            .container_mut()
+            .expect("the open is a container")
+            .set_screen_size(427, 240);
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: None,
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+                language: Some(&table),
+            },
+        );
+        assert!(
+            draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "Large Chest")),
+            "the double chest draws its own title: {draws:?}"
+        );
+    }
+
+    /// Fix round 7's bottom-row guards: the search tab's draw list carries the
+    /// full assembly — twelve tab icons plus all 45 grid cells — and draws
+    /// nothing in the tab-strip gap (panel x 144..167, y 132..164) or the
+    /// band below the tabs (y 164..190), where the live frames show only the
+    /// dimmed live world through the source's own gap geometry
+    /// (`GuiContainerCreative.func_147051_a`: the column-5 tab sits at
+    /// `xSize − 28`). These pass pre-fix and guard the refutation.
+    #[test]
+    fn fix7_creative_bottom_row_draws_nothing_past_the_tabs() {
+        let font = chat_font();
+        let mut screens = Screens::default();
+        screens.open_creative();
+        let screen = screens.creative_mut().expect("the open is creative");
+        screen.set_screen_size(427, 240);
+        screen.set_tab(oxide_client::screens::creative::SEARCH_TAB);
+        let draws = screen_draws(
+            &screens,
+            &ScreenDrawInput {
+                font: Some(&font),
+                scaled: chat_resolution(),
+                mouse: None,
+                advanced: false,
+                level: 0,
+                effects: &[],
+                preview_skin: None,
+                language: None,
+            },
+        );
+        // The panel centres at (116, 52): the gap is frame x 260..283,
+        // y 184..216; the below-tabs band is y 216..242.
+        let in_gap = |x: f32, y: f32| (260.0..283.0).contains(&x) && (184.0..216.0).contains(&y);
+        let below_tabs =
+            |x: f32, y: f32| (116.0..311.0).contains(&x) && (216.0..242.0).contains(&y);
+        for draw in &draws {
+            let (x, y) = match draw {
+                HudDraw::TexturedRect { x, y, .. } => (*x, *y),
+                HudDraw::Item { x, y, .. } => (*x, *y),
+                HudDraw::Text { x, y, .. } => (*x, *y),
+                _ => continue,
+            };
+            assert!(
+                !in_gap(x, y),
+                "nothing draws in the tab-strip gap: {draw:?} in {draws:?}"
+            );
+            assert!(
+                !below_tabs(x, y),
+                "nothing draws in the band below the tabs: {draw:?} in {draws:?}"
+            );
+        }
+        // The assembly itself is whole: twelve tab icons and all 45 grid
+        // cells ride the list (visibility is the z layer's own story).
+        let mut icons = 0;
+        let mut grid = 0;
+        for draw in &draws {
+            if let HudDraw::Item {
+                stack: Some(_),
+                x,
+                y,
+                ..
+            } = draw
+            {
+                if (*y - (52.0 - 19.0)).abs() < 1.0 || (*y - (52.0 + 139.0)).abs() < 1.0 {
+                    icons += 1;
+                }
+                if *x >= 116.0 + 9.0
+                    && *x < 116.0 + 9.0 + 9.0 * 18.0
+                    && *y >= 52.0 + 18.0
+                    && *y < 52.0 + 18.0 + 5.0 * 18.0
+                {
+                    grid += 1;
+                }
+            }
+        }
+        assert_eq!(icons, 12, "the twelve tab icons ride: {draws:?}");
+        assert_eq!(grid, 45, "all 45 grid cells ride: {draws:?}");
+    }
+
     #[test]
     fn the_hovered_tooltip_waits_for_the_empty_cursor() {
         use oxide_client::screens::container::{ContainerLayout, SlotPos, TitleKind};
@@ -11288,6 +11529,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         assert!(
@@ -11309,6 +11551,7 @@ mod tests {
                 level: 0,
                 effects: &[],
                 preview_skin: None,
+                language: None,
             },
         );
         assert!(
