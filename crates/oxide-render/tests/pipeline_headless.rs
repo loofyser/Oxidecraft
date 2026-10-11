@@ -919,8 +919,9 @@ fn the_frames_water_fog_falls_off_exponentially() {
     // reads neither of them. At four blocks the factor is `exp(-0.16)` and the
     // lit `(252, 252, 252)` surface reads `(215, 215, 222)`; at eight it is
     // `exp(-0.64)` for `(135, 135, 157)`. A linear frame with this degenerate
-    // range would draw both unfogged.
-    let water = water_fog(0, false);
+    // range would draw both unfogged. Full light keeps the still-water colour,
+    // so the pinned pixels do not move under fix10's eye-light scale.
+    let water = water_fog(0, false, 15, 8);
     assert_eq!(water.mode, FogMode::Exp);
     let fog = FogParams {
         colour: water.colour,
@@ -972,7 +973,8 @@ fn the_submerged_clouds_fall_off_exponentially() {
     // celestial frame is turned a quarter turn so the sun and the moon sit on the horizon,
     // clear of the frame. The white clouds over the black band then read the water fog
     // colour `(0.02, 0.02, 0.2)` = `(5, 5, 51)` at 0.8 alpha over the fogged band `(5, 5, 47)`.
-    let water = water_fog(0, false);
+    // Full light keeps that colour, so fix10's eye-light scale does not move the pins.
+    let water = water_fog(0, false, 15, 8);
     assert_eq!(water.mode, FogMode::Exp);
     let fog = FogParams {
         colour: water.colour,

@@ -1341,7 +1341,9 @@ fn camera_pose(pose: Pose) -> CameraPose {
 /// material read as a bool — and answers the water branch ([`water_fog_for_eye`]) instead of
 /// the linear chain: EXP at its density over its colour, while the range still spans the far
 /// plane. `respiration` and `water_breathing` are that branch's own adjustments; the session
-/// feeds neither yet, so the frame reads them as still, unpotioned water (recorded).
+/// feeds neither yet, so the frame reads them as still, unpotioned water (recorded). The
+/// branch's eye-light scale reads the frame's own `values.light_level` and render distance,
+/// exactly like the air chain's (`EntityRenderer.java:1856-1859`).
 #[allow(clippy::too_many_arguments)]
 fn frame_params(
     time_of_day: i64,
@@ -1357,7 +1359,13 @@ fn frame_params(
 ) -> (FogParams, SkyParams) {
     let far_plane = f32::from(render_distance) * 16.0;
     let (start, end) = linear_params(far_plane);
-    let (mode, density, colour) = match water_fog_for_eye(submerged, respiration, water_breathing) {
+    let (mode, density, colour) = match water_fog_for_eye(
+        submerged,
+        respiration,
+        water_breathing,
+        values.light_level,
+        render_distance,
+    ) {
         Some(water) => (water.mode, water.density, water.colour),
         None => (
             FogMode::Linear,
@@ -5142,6 +5150,33 @@ mod tests {
             sky.fog_colour, fog.colour,
             "the clear follows the water colour"
         );
+    }
+
+    #[test]
+    fn the_submerged_frames_water_colour_scales_with_the_eye_light() {
+        // Fix10's RED pin (fails before the fix): S2's view block reads light 3,
+        // and vanilla multiplies the water colour by the f13 factor converging to
+        // `light_factor(3, 8) = 0.29411765` (`EntityRenderer.java:362-365`,
+        // `:1856-1859`) — `(0.02, 0.02, 0.2)` becomes `(0.00588, 0.00588, 0.05882)`.
+        // Full light leaves the colour alone.
+        let values = SkyValues {
+            celestial_angle: 0.25,
+            colour: [0.5, 0.6, 0.7],
+            sun_brightness: 0.9,
+            star_brightness: 0.1,
+            cloud_colour: [1.0, 0.5, 0.25],
+            moon_phase: 5,
+            light_level: 3,
+        };
+        let (fog, _) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false);
+        assert_eq!(fog.mode, FogMode::Exp);
+        for (channel, expected) in fog.colour.iter().zip([0.00588235, 0.00588235, 0.05882353]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the dim-water colour is (0.00588, 0.00588, 0.05882); got {:?}",
+                fog.colour
+            );
+        }
     }
 
     #[test]

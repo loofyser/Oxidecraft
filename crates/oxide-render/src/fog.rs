@@ -71,7 +71,8 @@ pub struct WaterFog {
     pub colour: [f32; 3],
 }
 
-/// The water fog for a respiration level and the water-breathing potion.
+/// The water fog for a respiration level, the water-breathing potion, the view
+/// block's light level, and the render distance.
 ///
 /// `respiration` is `EnchantmentHelper.getRespiration(entity)`'s level and
 /// `water_breathing` whether `Potion.waterBreathing` is active on the view entity.
@@ -79,17 +80,32 @@ pub struct WaterFog {
 /// base, folded to `0.3x + 0.6` while the potion holds (`EntityRenderer.java:1845-1847`);
 /// the density is `0.1` less `0.03` a level, pinned at `0.01` while the potion holds
 /// (`:1985-1995`).
-pub fn water_fog(respiration: u8, water_breathing: bool) -> WaterFog {
+///
+/// `light_level` and `render_distance_chunks` are the f13 brightness factor's own
+/// inputs (`:362-365`): the colour the water branch answers is multiplied by it
+/// exactly like the air chain's (`:1856-1859`), so a dim eye darkens the fog instead
+/// of leaving the full `(0.02, 0.02, 0.2)` standing.
+pub fn water_fog(
+    respiration: u8,
+    water_breathing: bool,
+    light_level: u8,
+    render_distance_chunks: u8,
+) -> WaterFog {
     let level = f32::from(respiration);
     let (density, lift) = if water_breathing {
         (0.01, level * 0.2 * 0.3 + 0.6)
     } else {
         (0.1 - level * 0.03, level * 0.2)
     };
+    let light = light_factor(light_level, render_distance_chunks);
     WaterFog {
         mode: FogMode::Exp,
         density,
-        colour: [0.02 + lift, 0.02 + lift, 0.2 + lift],
+        colour: [
+            (0.02 + lift) * light,
+            (0.02 + lift) * light,
+            (0.2 + lift) * light,
+        ],
     }
 }
 
@@ -101,9 +117,16 @@ pub fn water_fog_for_eye(
     submerged: bool,
     respiration: u8,
     water_breathing: bool,
+    light_level: u8,
+    render_distance_chunks: u8,
 ) -> Option<WaterFog> {
     if submerged {
-        Some(water_fog(respiration, water_breathing))
+        Some(water_fog(
+            respiration,
+            water_breathing,
+            light_level,
+            render_distance_chunks,
+        ))
     } else {
         None
     }
@@ -367,15 +390,17 @@ mod tests {
     }
 
     /// The submerged eye's branch (`EntityRenderer.java:1985-1995` for the mode
-    /// and density, `:1845-1847` for the colour): EXP at density 0.1 over
-    /// (0.02, 0.02, 0.2) with no respiration and no potion; respiration
-    /// thins the density `0.03` a level and lifts every colour channel `0.2`
-    /// a level, while water breathing pins the density at `0.01` and folds
-    /// the lift to `0.3x + 0.6`. Dry eyes take no branch.
+    /// and density, `:1845-1847` for the colour, `:1856-1859` for the eye-light
+    /// scale): EXP at density 0.1 over `(0.02, 0.02, 0.2)` with no respiration and
+    /// no potion at full light; respiration thins the density `0.03` a level and
+    /// lifts every colour channel `0.2` a level, while water breathing pins the
+    /// density at `0.01` and folds the lift to `0.3x + 0.6`. A dim eye (light 3 at
+    /// the eight-chunk distance: factor `0.29411765`) scales the still-water triple
+    /// to `(0.00588, 0.00588, 0.05882)`. Dry eyes take no branch.
     #[test]
     fn the_submerged_eye_selects_the_exp_water_branch() {
-        let water =
-            water_fog_for_eye(true, 0, false).expect("a submerged eye takes the water branch");
+        let water = water_fog_for_eye(true, 0, false, 15, 8)
+            .expect("a submerged eye takes the water branch");
         assert_eq!(water.mode, FogMode::Exp);
         assert!(
             (water.density - 0.1).abs() < 1e-6,
@@ -390,7 +415,8 @@ mod tests {
             );
         }
         // Respiration III, no potion: `0.1 - 3 * 0.03` over the lifted triple.
-        let skilled = water_fog_for_eye(true, 3, false).expect("respiration keeps the branch");
+        let skilled =
+            water_fog_for_eye(true, 3, false, 15, 8).expect("respiration keeps the branch");
         assert!(
             (skilled.density - 0.01).abs() < 1e-6,
             "respiration III thins the density to 0.01; got {}",
@@ -405,7 +431,7 @@ mod tests {
         }
         // Water breathing, no respiration: the density pins at `0.01` and the
         // lift folds to `0.6`.
-        let potion = water_fog_for_eye(true, 0, true).expect("the potion keeps the branch");
+        let potion = water_fog_for_eye(true, 0, true, 15, 8).expect("the potion keeps the branch");
         assert!(
             (potion.density - 0.01).abs() < 1e-6,
             "water breathing pins the density at 0.01; got {}",
@@ -419,15 +445,36 @@ mod tests {
             );
         }
         assert_eq!(
-            water_fog_for_eye(false, 0, false),
+            water_fog_for_eye(false, 0, false, 15, 8),
             None,
             "a dry eye takes no branch"
         );
         assert_eq!(
-            water_fog_for_eye(false, 3, true),
+            water_fog_for_eye(false, 3, true, 15, 8),
             None,
             "respiration and potion are dry-eyed no-ops"
         );
+    }
+
+    #[test]
+    fn the_dim_eye_scales_the_water_colour_by_the_light_factor() {
+        // Fix10's layer pin: the session reports the S2 view block's own light (3),
+        // and the colour the branch answers is the still-water triple scaled by
+        // `light_factor(3, 8) = 0.29411765` (`EntityRenderer.java:362-365`,
+        // `:1856-1859`).
+        let water = water_fog_for_eye(true, 0, false, 3, 8)
+            .expect("a submerged eye takes the water branch");
+        for (channel, expected) in water
+            .colour
+            .iter()
+            .zip([0.00588235, 0.00588235, 0.05882353])
+        {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the dim-water colour is (0.00588, 0.00588, 0.05882); got {:?}",
+                water.colour
+            );
+        }
     }
 
     #[test]
