@@ -860,6 +860,9 @@ fn plugin_message_frame(channel: &str, data: &[u8]) -> Vec<u8> {
 /// Stone, id 1, meta 0: the packed value `1 << 4 | 0`.
 const STONE: u16 = 0x0010;
 
+/// Still water, id 9, meta 0: the packed value `9 << 4 | 0`.
+const WATER: u16 = 0x0090;
+
 /// One Block Change frame (0x23): the Location Position and the block value.
 ///
 /// The literal-level pinning of the packing lives in the decoder's own
@@ -8463,6 +8466,153 @@ fn a_level_gain_past_the_cooldown_stages_the_level_sound() {
         "level 5 stages a twelfth of full: {volume}"
     );
     assert_eq!(*pitch, 1.0);
+}
+
+/// Runs one movement session: the scripted `head`, a quiet stretch of
+/// `stalls` idle windows with `inputs` already queued, then the end of the
+/// stream — the shape `a_held_key_walks_the_player_over_the_floor` walks in,
+/// returning every event the session reported.
+fn run_movement_session(head: Vec<u8>, stalls: usize, inputs: Vec<InputEvent>) -> Vec<ClientEvent> {
+    let outgoing = Arc::new(Mutex::new(Vec::new()));
+    let stream = GappedDuplex {
+        head: std::io::Cursor::new(head),
+        tail: std::io::Cursor::new(Vec::new()),
+        stalls,
+        tail_stalls: 0,
+        outgoing,
+    };
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
+    for input in inputs {
+        input_tx.send(input).expect("the input channel is open");
+    }
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, input_rx)
+        .expect("the session runs to the end of the stream");
+    receiver.try_iter().collect()
+}
+
+/// A join carrying the stone floor with the player teleported onto its
+/// surface at (0.5, 64, 0.5), facing south.
+fn step_head() -> Vec<u8> {
+    let mut head = Vec::new();
+    login_sequence(&mut head);
+    frame(&mut head, &join_game_frame(), SERVER_FRAMING);
+    frame(&mut head, &floor_column_frame(0, 0), SERVER_FRAMING);
+    frame(
+        &mut head,
+        &position_frame(0.5, 64.0, 0.5, 0.0, 0.0, 0),
+        SERVER_FRAMING,
+    );
+    head
+}
+
+#[test]
+fn walking_past_the_threshold_stages_the_stood_blocks_step() {
+    // The forward key walks the player south over the stone floor. Past the
+    // walk threshold (`distance_walked > next`, `next = dist + 1`) the
+    // stood-on block's step event stages at the feet: stone's `step.stone`
+    // at `1.0 * 0.15`, pitch `1.0`. The flat walk accrues `0.6` per block,
+    // so the first step lands past `5/3` blocks of walking.
+    let events = run_movement_session(
+        step_head(),
+        100,
+        vec![InputEvent::Key {
+            key: Key::W,
+            pressed: true,
+        }],
+    );
+    let sounds = local_sounds(&events);
+    let steps: Vec<&(String, [f32; 3], f32, f32)> = sounds
+        .iter()
+        .filter(|(name, _, _, _)| name == "step.stone")
+        .collect();
+    assert!(!steps.is_empty(), "the walk stages a step: {events:?}");
+    let (_, pos, volume, pitch) = steps[0];
+    assert!(
+        (pos[0] - 0.5).abs() < 1e-6 && (pos[1] - 64.0).abs() < f32::EPSILON,
+        "the step plays at the feet: {pos:?}"
+    );
+    assert!(
+        pos[2] > 0.5 + 5.0 / 3.0,
+        "the first step lands past the threshold: {pos:?}"
+    );
+    assert!(
+        (volume - 0.15).abs() < 1e-6,
+        "the step volume is volume * 0.15: {volume}"
+    );
+    assert_eq!(*pitch, 1.0, "the step pitch is the group's own frequency");
+}
+
+#[test]
+fn entering_water_stages_the_splash() {
+    // The player idles dry on the stone floor; then still water arrives at
+    // the feet cell. The dry-to-wet transition stages the splash once, at
+    // the feet, with the swim pitch spread.
+    let tail = framed(&[block_change_frame(0, 64, 0, WATER), keep_alive_frame(96)]);
+    let (events, _) = run_feed_session(step_head(), tail, 2, 10);
+    let sounds = local_sounds(&events);
+    let splashes: Vec<&(String, [f32; 3], f32, f32)> = sounds
+        .iter()
+        .filter(|(name, _, _, _)| name == "game.player.swim.splash")
+        .collect();
+    assert_eq!(
+        splashes.len(),
+        1,
+        "one splash on the dry-to-wet transition: {events:?}"
+    );
+    let (_, pos, _, pitch) = splashes[0];
+    assert_eq!(*pos, [0.5, 64.0, 0.5], "the splash plays at the feet");
+    assert!(
+        (0.6..=1.4).contains(pitch),
+        "the splash pitch carries the swim spread: {pitch}"
+    );
+}
+
+#[test]
+fn walking_while_submerged_stages_the_swim() {
+    // The stone floor with a still-water trench along the walk line: the
+    // player teleports onto the floor inside the water and walks south
+    // through it. Past the walk threshold the submerged walk stages the
+    // swim with the swim pitch spread.
+    let mut head = step_head();
+    for z in 0..16 {
+        frame(
+            &mut head,
+            &block_change_frame(0, 64, z, WATER),
+            SERVER_FRAMING,
+        );
+    }
+    let events = run_movement_session(
+        head,
+        200,
+        vec![InputEvent::Key {
+            key: Key::W,
+            pressed: true,
+        }],
+    );
+    let sounds = local_sounds(&events);
+    let swims: Vec<&(String, [f32; 3], f32, f32)> = sounds
+        .iter()
+        .filter(|(name, _, _, _)| name == "game.player.swim")
+        .collect();
+    assert!(
+        !swims.is_empty(),
+        "the submerged walk stages a swim: {events:?}"
+    );
+    let (_, pos, volume, pitch) = swims[0];
+    assert!(
+        (pos[0] - 0.5).abs() < 1e-6,
+        "the swim plays at the player's feet line: {pos:?}"
+    );
+    assert!(
+        *volume > 0.0 && *volume <= 1.0,
+        "the swim volume is the capped motion term: {volume}"
+    );
+    assert!(
+        (0.6..=1.4).contains(pitch),
+        "the swim pitch carries the spread: {pitch}"
+    );
 }
 
 #[test]

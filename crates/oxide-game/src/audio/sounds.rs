@@ -84,28 +84,41 @@ impl SoundGroup {
     /// crops, stems, flowers, mushrooms, reeds, vines, lilies, mycelium,
     /// double plants, tall grass and dead bushes sound grass, stairs copy
     /// their model block (`BlockStairs.java:47` — oak stair 53 sounds wood
-    /// off planks, stone stair 67 sounds piston off cobblestone), and
-    /// everything unnamed — water and lava, pumpkins, the enchanting table,
-    /// the cauldron, the beacon, the barrier — keeps the constructor's
-    /// stone.
+    /// off planks, stone stair 67 sounds piston off cobblestone), the wall
+    /// copies its model the same way (`BlockWall.java:37`), the daylight
+    /// detectors sound wood out of their own constructor
+    /// (`BlockDaylightDetector.java:37`), the piston bases and heads sound
+    /// piston out of theirs (`BlockPistonBase.java:38`,
+    /// `BlockPistonExtension.java:33`), and everything unnamed — water and
+    /// lava, the note block, webs, the moving piston, monster eggs, warts,
+    /// the enchanting table, the brewing stand, the cauldron, the end
+    /// portal, tripwire and its hooks, the command block, the beacon, the
+    /// flower pot, the barrier — keeps the constructor's stone.
     #[must_use]
     pub fn of_block(id: u16) -> SoundGroup {
         match id {
-            2 | 18 | 31 | 32 | 37 | 38 | 39 | 40 | 46 | 59 | 83 | 106 | 110 | 111 | 141 | 142
-            | 161 | 175 => SoundGroup::Grass,
+            2 | 6 | 18 | 19 | 31 | 32 | 37 | 38 | 39 | 40 | 46 | 59 | 83 | 106 | 110 | 111
+            | 141 | 142 | 161 | 170 | 175 => SoundGroup::Grass,
             3 | 13 | 60 | 82 => SoundGroup::Gravel,
-            5 | 17 | 47 | 50 | 53 | 54 | 58 | 63 | 64 | 68 | 72 | 75 | 76 | 85 | 93 | 94 | 96
-            | 99 | 100 | 104 | 105 | 107 | 162 => SoundGroup::Wood,
-            1 | 4 | 7 | 14 | 15 | 16 | 21 | 22 | 23 | 24 | 43 | 44 | 45 | 48 | 49 | 56 | 61
-            | 62 | 67 | 70 | 73 | 74 | 77 | 84 | 87 | 97 | 98 | 113 | 121 | 129 | 130 | 144
-            | 153 | 155 | 156 | 158 | 159 | 168 => SoundGroup::Piston,
-            41 | 42 | 52 | 57 | 101 | 133 | 154 | 157 | 167 => SoundGroup::Metal,
-            20 | 79 | 89 | 90 | 95 | 102 | 120 | 123 | 124 | 160 | 169 => SoundGroup::Glass,
-            35 | 51 | 81 | 92 => SoundGroup::Cloth,
+            5 | 17 | 26 | 47 | 50 | 53 | 54 | 58 | 63 | 64 | 68 | 69 | 72 | 75 | 76 | 85 | 86
+            | 91 | 93 | 94 | 96 | 99 | 100 | 103 | 104 | 105 | 107 | 125 | 126 | 127 | 134
+            | 135 | 136 | 143 | 146 | 147 | 148 | 149 | 150 | 151 | 162 | 163 | 164 | 176 | 177
+            | 178 | 183 | 184 | 185 | 186 | 187 | 188 | 189 | 190 | 191 | 192 | 193 | 194 | 195
+            | 196 | 197 => SoundGroup::Wood,
+            1 | 4 | 7 | 14 | 15 | 16 | 21 | 22 | 23 | 24 | 29 | 33 | 34 | 43 | 44 | 45 | 48
+            | 49 | 56 | 61 | 62 | 67 | 70 | 73 | 74 | 77 | 84 | 87 | 98 | 108 | 109 | 112 | 113
+            | 114 | 121 | 122 | 128 | 129 | 130 | 139 | 144 | 153 | 155 | 156 | 158 | 159 | 168
+            | 172 | 173 | 179 | 180 | 181 | 182 => SoundGroup::Piston,
+            27 | 28 | 41 | 42 | 52 | 57 | 66 | 71 | 101 | 133 | 152 | 154 | 157 | 167 => {
+                SoundGroup::Metal
+            }
+            20 | 79 | 89 | 90 | 95 | 102 | 120 | 123 | 124 | 160 | 169 | 174 => SoundGroup::Glass,
+            35 | 51 | 81 | 92 | 171 => SoundGroup::Cloth,
             12 | 88 => SoundGroup::Sand,
             78 | 80 => SoundGroup::Snow,
             65 => SoundGroup::Ladder,
             145 => SoundGroup::Anvil,
+            165 => SoundGroup::Slime,
             _ => SoundGroup::Stone,
         }
     }
@@ -150,14 +163,15 @@ impl SoundGroup {
     }
 
     /// The place event: `getPlaceSound` (`Block.java:1548-1551` plus the
-    /// glass, anvil and slime overrides).
+    /// glass, anvil and slime overrides; the ladder inherits the break
+    /// sound, `dig.wood`, since only `getBreakSound` is overridden,
+    /// `Block.java:67-73`).
     #[must_use]
     pub fn place_sound(&self) -> &'static str {
         match self {
             SoundGroup::Glass => "step.stone",
             SoundGroup::Anvil => "random.anvil_land",
             SoundGroup::Slime => "mob.slime.big",
-            SoundGroup::Ladder => "dig.ladder",
             other => other.break_sound(),
         }
     }

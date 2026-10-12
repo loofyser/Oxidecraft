@@ -327,9 +327,44 @@ fn the_block_group_map_samples() {
             SoundGroup::Ladder,
             "dig.wood",
             "step.ladder",
-            "dig.ladder",
+            "dig.wood",
         ),
         (78, SoundGroup::Snow, "dig.snow", "step.snow", "dig.snow"),
+        // The newly covered group paths: the melon block and the wooden
+        // slab sound wood, the rail sounds metal, the carpet sounds cloth,
+        // the packed ice sounds glass, the slime block sounds slime, and
+        // the daylight detector sounds wood.
+        (103, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
+        (126, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
+        (
+            66,
+            SoundGroup::Metal,
+            "dig.stone",
+            "step.stone",
+            "dig.stone",
+        ),
+        (
+            171,
+            SoundGroup::Cloth,
+            "dig.cloth",
+            "step.cloth",
+            "dig.cloth",
+        ),
+        (
+            174,
+            SoundGroup::Glass,
+            "dig.glass",
+            "step.stone",
+            "step.stone",
+        ),
+        (
+            165,
+            SoundGroup::Slime,
+            "mob.slime.big",
+            "mob.slime.small",
+            "mob.slime.big",
+        ),
+        (151, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
         (
             145,
             SoundGroup::Anvil,
@@ -339,13 +374,7 @@ fn the_block_group_map_samples() {
         ),
         // The leftovers the table never names fall back to stone.
         (8, SoundGroup::Stone, "dig.stone", "step.stone", "dig.stone"),
-        (
-            86,
-            SoundGroup::Stone,
-            "dig.stone",
-            "step.stone",
-            "dig.stone",
-        ),
+        (86, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
         (17, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
         (
             18,

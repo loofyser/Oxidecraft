@@ -3466,6 +3466,55 @@ fn listener_of(player: &PlayerState) -> ListenerPose {
     }
 }
 
+/// The pump's wire conversion, extracted so the call site is unit-pinned:
+/// a `SoundEffect` event's 1/8-block integer position becomes blocks
+/// (÷ 8.0) and its pitch byte becomes a factor (63 → 1.0); the volume
+/// already rides normalised. The wire names no category, so the event's
+/// own resolves it and the hint stays master.
+fn wire_sound_play(
+    name: String,
+    pos: [i32; 3],
+    volume: f32,
+    pitch: u8,
+    listener: ListenerPose,
+) -> PlaySound {
+    PlaySound {
+        name,
+        category_hint: SoundCategory::Master,
+        pos: Some([
+            read_effect_position(pos[0]) as f32,
+            read_effect_position(pos[1]) as f32,
+            read_effect_position(pos[2]) as f32,
+        ]),
+        volume,
+        pitch: read_sound_pitch(pitch),
+        listener: listener.pos,
+        yaw: listener.yaw,
+    }
+}
+
+/// The pump's local conversion, extracted beside the wire one: the call
+/// sites stage blocks and factors already, so the pump only lends the
+/// listener.
+fn local_sound_play(
+    name: String,
+    pos: [f32; 3],
+    volume: f32,
+    pitch: f32,
+    category_hint: SoundCategory,
+    listener: ListenerPose,
+) -> PlaySound {
+    PlaySound {
+        name,
+        category_hint,
+        pos: Some(pos),
+        volume,
+        pitch,
+        listener: listener.pos,
+        yaw: listener.yaw,
+    }
+}
+
 /// Opens a session on its own thread and returns the link the window drains.
 ///
 /// The thread owns the connection, because the session blocks on reads and the
@@ -3936,19 +3985,9 @@ fn apply_session_event(
             // own resolves it and the hint stays master.
             if let Some(audio) = audio.as_mut() {
                 let listener = listener_of(player);
-                audio.engine.play(PlaySound {
-                    name,
-                    category_hint: SoundCategory::Master,
-                    pos: Some([
-                        read_effect_position(pos[0]) as f32,
-                        read_effect_position(pos[1]) as f32,
-                        read_effect_position(pos[2]) as f32,
-                    ]),
-                    volume,
-                    pitch: read_sound_pitch(pitch),
-                    listener: listener.pos,
-                    yaw: listener.yaw,
-                });
+                audio
+                    .engine
+                    .play(wire_sound_play(name, pos, volume, pitch, listener));
             }
             false
         }
@@ -3963,15 +4002,14 @@ fn apply_session_event(
             // already, so the pump only lends the listener.
             if let Some(audio) = audio.as_mut() {
                 let listener = listener_of(player);
-                audio.engine.play(PlaySound {
+                audio.engine.play(local_sound_play(
                     name,
-                    category_hint,
-                    pos: Some(pos),
+                    pos,
                     volume,
                     pitch,
-                    listener: listener.pos,
-                    yaw: listener.yaw,
-                });
+                    category_hint,
+                    listener,
+                ));
             }
             false
         }
@@ -5022,15 +5060,16 @@ mod tests {
         chat_opener, chat_wheel_lines, clear_break_stage, command_text, cracks_in_view,
         creative_wheel_notch, escape_route, f3_hold_step, frame_params, gameplay_key,
         hotbar_select, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
-        is_f3_press, is_h_press, number_key_index, parse_script, parse_server_address,
-        scaled_cursor, screen_button_events, screen_click_button, scripted_chat_click,
-        skin_requests, store_aim, store_break_stage, store_skins, tab_held, tooltip_point,
-        void_y_factor, wheel_held_step,
+        is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, number_key_index,
+        parse_script, parse_server_address, scaled_cursor, screen_button_events,
+        screen_click_button, scripted_chat_click, skin_requests, store_aim, store_break_stage,
+        store_skins, tab_held, tooltip_point, void_y_factor, wheel_held_step, wire_sound_play,
     };
     use clap::Parser;
     use crossbeam_channel::unbounded;
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
+    use oxide_game::audio::{ListenerPose, PlaySound, SoundCategory};
     use oxide_game::chat::{ClickAction, ClickEvent};
     use oxide_game::container::{CLICK_MODE_DRAG, CLICK_MODE_PICKUP, CLICK_MODE_SWAP, drag_button};
     use oxide_game::entity_view::{EntityExtra, EntityFrame, PlayerListRecord};
@@ -8406,5 +8445,85 @@ mod tests {
             None,
         )
         .expect("the synthetic sheet loads")
+    }
+
+    #[test]
+    fn the_pump_converts_a_wire_sound_to_blocks_and_full_pitch() {
+        // A synthetic `SoundEffect`: the 1/8-block ints become blocks
+        // (÷ 8.0), the pitch byte 63 becomes 1.0, the volume passes
+        // through, and the listener rides along with the master hint.
+        let listener = ListenerPose {
+            pos: [1.0, 2.0, 3.0],
+            yaw: 0.5,
+        };
+        assert_eq!(
+            wire_sound_play(
+                "random.explode".to_string(),
+                [80, -16, 512],
+                0.7,
+                63,
+                listener
+            ),
+            PlaySound {
+                name: "random.explode".to_string(),
+                category_hint: SoundCategory::Master,
+                pos: Some([10.0, -2.0, 64.0]),
+                volume: 0.7,
+                pitch: 1.0,
+                listener: [1.0, 2.0, 3.0],
+                yaw: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn the_pump_passes_a_local_sound_through_with_the_listener() {
+        // A synthetic `LocalSound`: blocks and factors already staged, so
+        // the pump only lends the listener.
+        let listener = ListenerPose {
+            pos: [4.0, 64.0, 6.0],
+            yaw: 1.0,
+        };
+        assert_eq!(
+            local_sound_play(
+                "step.stone".to_string(),
+                [4.0, 64.0, 6.5],
+                0.15,
+                1.0,
+                SoundCategory::Blocks,
+                listener,
+            ),
+            PlaySound {
+                name: "step.stone".to_string(),
+                category_hint: SoundCategory::Blocks,
+                pos: Some([4.0, 64.0, 6.5]),
+                volume: 0.15,
+                pitch: 1.0,
+                listener: [4.0, 64.0, 6.0],
+                yaw: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn load_sounds_bytes_reads_the_extracted_tree_first() {
+        // A synthetic store root carrying the extracted tree's
+        // `sounds.json`: the primary branch returns its bytes.
+        let root =
+            std::env::temp_dir().join(format!("oxide-load-sounds-{}-primary", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = root
+            .join("extracted")
+            .join("1.8.9")
+            .join("assets")
+            .join("minecraft");
+        std::fs::create_dir_all(&tree).expect("the synthetic tree");
+        let bytes = br#"{"random.explode": {"sounds": ["random/explode"]}}"#;
+        std::fs::write(tree.join("sounds.json"), bytes).expect("the synthetic sounds.json");
+        assert_eq!(
+            load_sounds_bytes(&root).expect("the primary branch reads"),
+            bytes
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -22,9 +22,11 @@ use crate::audio::{AudioEngine, PlaySound, SoundCategory};
 pub const INITIAL_DELAY: i32 = 100;
 
 /// The music kind: the dimension and mode reduced to the four events this
-/// client plays (`MusicTicker.java:66-74` lists seven; credits, the nether
-/// and the dragon fight have no screen or dimension behind them here yet —
-/// the nether rides [`MusicKind::Game`]).
+/// client plays (`MusicTicker.java:66-74` lists seven; credits and the
+/// dragon fight have no screen behind them here yet, and the nether — which
+/// vanilla scores on its own (`NETHER`, `music.game.nether`, 1200–3600,
+/// picked by `getAmbientMusicType`, `Minecraft.java:3112`) — has no
+/// dimension machine behind it here yet, so it rides [`MusicKind::Game`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MusicKind {
     /// No world: the menu event.
