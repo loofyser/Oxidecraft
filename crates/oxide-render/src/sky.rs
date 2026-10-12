@@ -23,7 +23,7 @@
 //!   the transparent edge the source fades at sunset is the sunset disc below.
 //! * The sunset disc is the source's 16-segment triangle fan (`:1253-1291`), drawn when the
 //!   provider's sunrise/sunset quad answers and skipped when it is `None`. The centre rides at
-//!   `(0, 100, 0)` in the quad's pass-adjusted colour at the quad's full alpha, the seventeen
+//!   `(0, 100, 0)` in the raw quad colour at the quad's full alpha, the seventeen
 //!   rim vertices ring `(sin * 120, cos * 120, -cos * 40 * alpha)` in the raw quad at zero
 //!   alpha (`:1277-1288`), so the smooth shading (`shadeModel(7425)`, `:1258`, restored to flat
 //!   `:1291`) fades the disc out. Both ride the three fixed rotations (`:1260-1262`), never the
@@ -1279,9 +1279,10 @@ pub const FAN_HEIGHT: f32 = 100.0;
 /// The sunset disc's vertices for the frame's `[r, g, b, alpha]` quad and celestial angle:
 /// the source's 16-segment triangle fan (`RenderGlobal.java:1277-1288`), forty-eight vertices.
 ///
-/// The centre rides at `(0, 100, 0)` in the quad's pass-adjusted colour at the quad's full
-/// alpha (`:1264-1278` — the anaglyph pass-2 greyscale never runs here, so the centre always
-/// takes the adjusted triple); the seventeen rim vertices ring
+/// The centre rides at `(0, 100, 0)` in the raw quad at the quad's full
+/// alpha (`:1264-1278` — the source's anaglyph remap runs only on passes 0/1,
+/// and every normal render is pass 2, so this port's only mode takes the raw
+/// triple); the seventeen rim vertices ring
 /// `(sin * 120, cos * 120, -cos * 40 * alpha)` in the raw quad at zero alpha (`:1279-1288`),
 /// and the smooth shading fades between them. Both ride the source's three fixed rotations —
 /// `rotate(90, X)`, the `rotate(180, Z)` the half of the cycle whose angle sine is negative
@@ -1289,12 +1290,7 @@ pub const FAN_HEIGHT: f32 = 100.0;
 /// so the disc sits over the rising or setting sun on its own.
 fn sunset_fan_vertices(colours: [f32; 4], celestial_angle: f32) -> Vec<SkyVertex> {
     let (red, green, blue, alpha) = (colours[0], colours[1], colours[2], colours[3]);
-    let centre = [
-        (red * 30.0 + green * 59.0 + blue * 11.0) / 100.0,
-        (red * 30.0 + green * 70.0) / 100.0,
-        (red * 30.0 + blue * 70.0) / 100.0,
-        alpha,
-    ];
+    let centre = [red, green, blue, alpha];
     let flip: f32 = if (f64::from(celestial_angle) * std::f64::consts::PI * 2.0).sin() < 0.0 {
         180.0
     } else {
@@ -2201,8 +2197,9 @@ mod tests {
         assert_eq!(fan.len(), 48, "sixteen triangles of three");
         assert!(fan.iter().all(|v| v.kind == KIND_FAN));
         // The centre at the setting sun: the fixed rotations carry `(0, 100, 0)` to
-        // `(-100, 0, 0)`, in the pass-adjusted colour at full alpha —
-        // `(0.49825, 0.5175, 0.395, 1.0)` is `(127, 132, 101, 255)`. The rotations run in
+        // `(-100, 0, 0)`, in the raw quad colour at full alpha — the source
+        // applies its anaglyph remap only on passes 0/1, and every normal
+        // render is pass 2, so `[0.85, 0.375, 0.2, 1.0]` stays `(217, 96, 51, 255)`. The rotations run in
         // `f32`, so the positions read within a thousandth.
         let near = |got: [f32; 3], want: [f32; 3]| {
             for axis in 0..3 {
@@ -2213,7 +2210,7 @@ mod tests {
             }
         };
         near(fan[0].position, [-100.0, 0.0, 0.0]);
-        assert_eq!(fan[0].colour, [127, 132, 101, 255]);
+        assert_eq!(fan[0].colour, [217, 96, 51, 255]);
         // The first rim vertex rings `(0, 120, -40)` in the raw quad at zero alpha —
         // `(217, 96, 51, 0)` — and the closer returns to it.
         assert_eq!(fan[1].colour, [217, 96, 51, 0]);
