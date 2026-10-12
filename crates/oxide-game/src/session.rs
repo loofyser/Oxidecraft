@@ -83,8 +83,10 @@ use oxide_proto_v47::window::{
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
-use oxide_world::behaviour::{Material, RenderKind, behaviour, liquid_height_percent, liquid_kind};
-use oxide_world::biome::{ColorMap, TintMaps};
+use oxide_world::behaviour::{
+    Material, RenderKind, TintKind, behaviour, liquid_height_percent, liquid_kind,
+};
+use oxide_world::biome::{ColorMap, TintMaps, tint_at_9_biome};
 use oxide_world::chunk::SECTION_SIZE;
 use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
 use oxide_world::light::{self, view_light_level};
@@ -108,6 +110,10 @@ use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
     mode_from_value, pick_entity_target, placement, raycast, reach, spectator, tool_not_required,
+};
+use crate::local_particles::{
+    FULL_CUBE_BOUNDS, crit_burst, crit_id_for_animation, dig_destroy, dig_hit, dig_tint,
+    sprint_spawn, water_spawns,
 };
 use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
@@ -1654,6 +1660,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         player.entity_id,
                                         &mut conn,
                                         events,
+                                        &mut particles,
+                                        &mesh.tint_maps,
                                     )?;
                                 }
                             }
@@ -1768,6 +1776,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     player.entity_id,
                                     &mut conn,
                                     events,
+                                    &mut particles,
+                                    &mesh.tint_maps,
                                 )?;
                             }
                             if aim.take().is_some() {
@@ -2172,8 +2182,10 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         }
                         Animation::ID => {
                             let animation = decoded(id, entity::decode_animation(body))?;
-                            // Only the swing (byte 0) moves an arm the source's
-                            // handler answers (`NetHandlerPlayClient.handleAnimation`);
+                            // The swing (byte 0) moves an arm the source's
+                            // handler answers, and the crits (bytes 4 and 5)
+                            // run the shared emitter
+                            // (`NetHandlerPlayClient.handleAnimation:867-894`);
                             // the other animations are dropped there and here.
                             if animation.animation == 0 {
                                 // The id names a tracked entity or nothing:
@@ -2181,6 +2193,51 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // lookup.
                                 if let Some(entity) = entities.get_mut(animation.entity_id) {
                                     entity.swing();
+                                }
+                            } else if let Some(particle) =
+                                crit_id_for_animation(animation.animation)
+                            {
+                                // The wire twin of the local crit path: one
+                                // emitter round at the entity's mid-height
+                                // (`EntityParticleEmitter`), through the
+                                // engine's own dice. The local attack path
+                                // has no port yet
+                                // (`EntityPlayerSP.onCriticalHit:671-674`
+                                // awaits the attack action), so this arm is
+                                // the only emitter.
+                                match entities.get(animation.entity_id) {
+                                    Some(entity) => match entity.kind.hitbox() {
+                                        Some((width, height)) => {
+                                            let centre = [
+                                                entity.position[0],
+                                                entity.position[1] + height / 2.0,
+                                                entity.position[2],
+                                            ];
+                                            let (_, spawns) = crit_burst(
+                                                &mut particles,
+                                                centre,
+                                                width,
+                                                height,
+                                                particle,
+                                            );
+                                            for spawn in spawns {
+                                                particles.spawn_local(spawn);
+                                            }
+                                        }
+                                        None => {
+                                            debug!(
+                                                entity_id = animation.entity_id,
+                                                "a crit for an entity with no hitbox"
+                                            );
+                                        }
+                                    },
+                                    None => {
+                                        debug!(
+                                            entity_id = animation.entity_id,
+                                            animation = animation.animation,
+                                            "a crit for an unknown entity"
+                                        );
+                                    }
                                 }
                             } else {
                                 debug!(
@@ -2970,8 +3027,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 }
                 // The step's own sounds: the splash on water entry and the
                 // swim or footstep past the walk threshold, staged from the
-                // move the step just ran.
-                stage_step_sounds(
+                // move the step just ran. The edge it answers stages the
+                // stride's own particles beside it.
+                let entered_water = stage_step_sounds(
                     &player,
                     world.as_ref(),
                     &mut distance_walked,
@@ -2980,6 +3038,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     &mut sound_rng,
                     events,
                 );
+                stage_stride_particles(&player, world.as_ref(), entered_water, &mut particles);
                 // The weather eases once per tick and reports while it moves:
                 // one event per tick that changed a strength, none for a
                 // settled tick. The ease ran before the step above, so this
@@ -3112,6 +3171,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             player.entity_id,
                             &mut conn,
                             events,
+                            &mut particles,
+                            &mesh.tint_maps,
                         )?;
                     }
                 }
@@ -3413,17 +3474,18 @@ fn stage_step_sounds(
     was_in_water: &mut bool,
     sound_rng: &mut StdRng,
     events: &Sender<ClientEvent>,
-) {
+) -> bool {
     let Some(world) = world else {
         *was_in_water = player.in_water;
-        return;
+        return false;
     };
     let feet = [
         player.position[0] as f32,
         player.position[1] as f32,
         player.position[2] as f32,
     ];
-    if !*was_in_water && player.in_water {
+    let entered_water = !*was_in_water && player.in_water;
+    if entered_water {
         report(
             events,
             ClientEvent::LocalSound {
@@ -3450,7 +3512,7 @@ fn stage_step_sounds(
     }
     *distance_walked += ((dx * dx + dy * dy + dz * dz) as f32).sqrt() * 0.6;
     if *distance_walked <= *next_step_distance as f32 || stood == 0 {
-        return;
+        return entered_water;
     }
     *next_step_distance = *distance_walked as i32 + 1;
     if player.in_water {
@@ -3478,7 +3540,7 @@ fn stage_step_sounds(
         SoundGroup::of_block(stood)
     };
     if behaviour(stood).is_some_and(|row| row.material == Material::Liquid) {
-        return;
+        return entered_water;
     }
     report(
         events,
@@ -3490,6 +3552,50 @@ fn stage_step_sounds(
             category_hint: SoundCategory::Blocks,
         },
     );
+    entered_water
+}
+
+/// One tick of the stride's local particles, beside the step sounds: the
+/// water-entry fan-outs on the dry-to-wet edge the sounds just read, and the
+/// sprint crumb every sprinting dry tick (`Entity.spawnRunningParticles:1165`
+/// gates the same two flags before `createRunningParticles:1172-1188`).
+fn stage_stride_particles(
+    player: &Player,
+    world: Option<&World>,
+    entered_water: bool,
+    particles: &mut ParticleEngine,
+) {
+    let Some(world) = world else {
+        return;
+    };
+    for spawn in water_spawns(
+        particles,
+        player.position,
+        player.motion,
+        PLAYER_WIDTH,
+        entered_water,
+    ) {
+        particles.spawn_local(spawn);
+    }
+    // The stood-on cell, read as the full state value: the crumb's data is
+    // the state's own id, where the sounds above read only the block id.
+    let stood = world.block(
+        player.position[0].floor() as i32,
+        (player.position[1] - 0.2).floor() as i32,
+        player.position[2].floor() as i32,
+    );
+    if let Some(spawn) = sprint_spawn(
+        particles,
+        player.position,
+        player.motion,
+        PLAYER_WIDTH,
+        stood,
+        renderable_id(stood >> 4),
+        player.sprinting,
+        player.in_water,
+    ) {
+        particles.spawn_local(spawn);
+    }
 }
 
 /// Applies one mouse button edge to the interaction input.
@@ -4507,6 +4613,32 @@ fn step_dig(
     actions
 }
 
+/// The digging tint at a cell: the block's tint kind sampled over its own
+/// nine-biome average, then the `setBlockPos` rule
+/// (`EntityDiggingFX.setBlockPos` — the grass exception, not the
+/// render-colour path).
+fn dig_tint_at(store: &World, tint_maps: &TintMaps, x: i32, y: i32, z: i32, id: u16) -> [f32; 3] {
+    let kind = behaviour(id).map(|row| row.tint).unwrap_or(TintKind::None);
+    let sample = match kind {
+        TintKind::None => [255, 255, 255],
+        _ => tint_at_9_biome(tint_maps, x, y, z, kind, |bx, bz| {
+            store
+                .chunk(
+                    bx.div_euclid(SECTION_SIZE as i32),
+                    bz.div_euclid(SECTION_SIZE as i32),
+                )
+                .map(|column| {
+                    column.biome(
+                        bx.rem_euclid(SECTION_SIZE as i32) as usize,
+                        bz.rem_euclid(SECTION_SIZE as i32) as usize,
+                    )
+                })
+                .unwrap_or(0)
+        }),
+    };
+    dig_tint(id, kind, sample)
+}
+
 /// Performs one dig action: its packet goes out, or its local effect lands,
 /// in the order the machine produced them.
 ///
@@ -4530,6 +4662,8 @@ fn apply_dig_action<S: Read + Write>(
     breaker: Option<i32>,
     conn: &mut Conn<S>,
     events: &Sender<ClientEvent>,
+    particles: &mut ParticleEngine,
+    tint_maps: &TintMaps,
 ) -> Result<(), SessionError> {
     match *action {
         DigAction::Start { x, y, z, face } => send_reply(
@@ -4559,12 +4693,28 @@ fn apply_dig_action<S: Read + Write>(
             }),
         ),
         DigAction::Swing => send_reply(conn, &tick_payload(|out| write_animation(out))),
+        DigAction::Hit { x, y, z, face } => {
+            if let Some(store) = world {
+                // The caller's own gates (`sendClickBlockToController:1506-1516`
+                // over `addBlockHitEffects:395-442`): air never scatters, and
+                // a block that draws nothing scatters nothing.
+                let value = store.block(x, y, z);
+                let id = value >> 4;
+                if id != 0 && renderable_id(id) {
+                    let tint = dig_tint_at(store, tint_maps, x, y, z, id);
+                    let spawn = dig_hit(particles, [x, y, z], face, value, tint, FULL_CUBE_BOUNDS);
+                    particles.spawn_local(spawn);
+                }
+            }
+            Ok(())
+        }
         DigAction::Destroy { x, y, z } => {
             if let Some(store) = world {
                 // The break sound: the broken block's own break event at its
                 // centre, ahead of the removal that carries the id away
                 // (`RenderGlobal.playAuxSFX 2001:2275-2282`).
-                let group = SoundGroup::of_block(store.block(x, y, z) >> 4);
+                let value = store.block(x, y, z);
+                let group = SoundGroup::of_block(value >> 4);
                 report(
                     events,
                     ClientEvent::LocalSound {
@@ -4575,6 +4725,12 @@ fn apply_dig_action<S: Read + Write>(
                         category_hint: SoundCategory::Blocks,
                     },
                 );
+                // The destroy fan-out beside the staged sound half, from the
+                // same pre-removal read (`addBlockDestroyEffects:369-393`).
+                let tint = dig_tint_at(store, tint_maps, x, y, z, value >> 4);
+                for spawn in dig_destroy([x, y, z], value, tint) {
+                    particles.spawn_local(spawn);
+                }
                 apply_block_change(store, queue, x, y, z, AIR);
             }
             Ok(())

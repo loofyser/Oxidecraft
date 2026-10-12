@@ -1729,6 +1729,10 @@ pub struct ParticleSpawn {
     pub atlas_sprite: Option<u16>,
     /// An item-icon override: the item id and its metadata (item break).
     pub item: Option<(u32, u32)>,
+    /// A per-spawn size multiplier on the row's drawn size: the dig hit's
+    /// `multipleParticleScaleBy(0.6F)` (`EffectRenderer.addBlockHitEffects`),
+    /// 1.0 everywhere else.
+    pub scale: f32,
 }
 
 /// One live particle.
@@ -1858,7 +1862,9 @@ impl ParticleEngine {
     /// Builds a live particle, drawing lifetime, scale, colour and cells.
     ///
     /// `vel` is the pre-transform velocity the pitch/speed-tinted rows
-    /// read; `colour` overrides the row default (the dig tint).
+    /// read; `colour` overrides the row default (the dig tint); `scale`
+    /// multiplies the drawn size (the dig hit's 0.6).
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &mut self,
         row: &'static ParticleBehaviour,
@@ -1867,9 +1873,10 @@ impl ParticleEngine {
         vel: [f32; 3],
         tex: ParticleTex,
         colour: Option<[f32; 3]>,
+        scale: f32,
     ) -> LiveParticle {
         let max_age = draw_max_age(&mut self.rng, row.max_age);
-        let base_size = draw_size(&mut self.rng, row.size_draw);
+        let base_size = draw_size(&mut self.rng, row.size_draw) * scale;
         let spawn_colour = colour.unwrap_or_else(|| draw_colour(&mut self.rng, row.colour, vel));
         let mut p = pos;
         match row.pos_adjust {
@@ -1996,7 +2003,7 @@ impl ParticleEngine {
             if !self.admit(row, pos, Some(viewer), long_distance) {
                 return 0;
             }
-            let particle = self.build(row, id, pos, vel, tex, None);
+            let particle = self.build(row, id, pos, vel, tex, None, 1.0);
             self.push(particle);
             return 1;
         }
@@ -2018,7 +2025,7 @@ impl ParticleEngine {
             if !self.admit(row, p, Some(viewer), long_distance) {
                 continue;
             }
-            let particle = self.build(row, id, p, v, tex, None);
+            let particle = self.build(row, id, p, v, tex, None, 1.0);
             self.push(particle);
             added += 1;
         }
@@ -2048,9 +2055,25 @@ impl ParticleEngine {
             }
             TexKind::ItemFixed(item, meta) => ParticleTex::ItemAtlas(item, meta),
         };
-        let particle = self.build(row, spawn.id, spawn.pos, spawn.vel, tex, spawn.colour);
+        let particle = self.build(
+            row,
+            spawn.id,
+            spawn.pos,
+            spawn.vel,
+            tex,
+            spawn.colour,
+            spawn.scale,
+        );
         self.push(particle);
         true
+    }
+
+    /// One deterministic unit draw from the engine's own dice, for the
+    /// session-side taps' scatter (`EffectRenderer`'s `rand`, the emitter's
+    /// and the running/splash spreads): callers draw before they spawn, so
+    /// a seeded engine replays the same sites.
+    pub fn next_unit(&mut self) -> f32 {
+        self.rng.random::<f32>()
     }
 
     /// Steps every live particle once.
@@ -2515,6 +2538,7 @@ mod tests {
             colour: None,
             atlas_sprite: None,
             item: None,
+            scale: 1.0,
         }
     }
 
@@ -2645,6 +2669,7 @@ mod tests {
             colour: Some([0.2, 0.5, 0.9]),
             atlas_sprite: None,
             item: None,
+            scale: 1.0,
         }));
         engine.tick(&world);
         assert_eq!(engine.snapshot()[0].colour, [0.2, 0.5, 0.9, 1.0]);

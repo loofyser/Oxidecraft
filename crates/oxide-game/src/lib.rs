@@ -7,6 +7,7 @@ pub mod entity_view;
 pub mod hud;
 pub mod input;
 pub mod interaction;
+pub mod local_particles;
 pub mod mesh_queue;
 pub mod mesher;
 pub mod palette;

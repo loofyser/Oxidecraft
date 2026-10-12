@@ -251,6 +251,7 @@ pub fn splash_spawns(
                 colour: None,
                 atlas_sprite: None,
                 item: None,
+                scale: 1.0,
             });
         } else if floor != 0 {
             spawns.push(ParticleSpawn {
@@ -264,6 +265,7 @@ pub fn splash_spawns(
                 colour: None,
                 atlas_sprite: None,
                 item: None,
+                scale: 1.0,
             });
         }
     }

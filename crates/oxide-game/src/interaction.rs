@@ -877,6 +877,22 @@ pub enum DigAction {
     },
     /// Send Animation — one swing (`EntityPlayerSP.swingItem`, `:304-308`).
     Swing,
+    /// Land one dig-hit particle at the block and face the held tick hit
+    /// (`Minecraft.sendClickBlockToController:1506-1516` reads
+    /// `onPlayerDamageBlock`'s true arms and fires
+    /// `effectRenderer.addBlockHitEffects` there, including the hit-delay
+    /// ticks whose arm returns true at `:289-292`). The caller's material
+    /// and render-type gates stay session-side, beside the world read.
+    Hit {
+        /// The block's x.
+        x: i32,
+        /// The block's y.
+        y: i32,
+        /// The block's z.
+        z: i32,
+        /// The face the ray entered through (`sideHit`).
+        face: Face,
+    },
     /// Remove the block locally: the completion's prediction
     /// (`onPlayerDestroyBlock`, `:123-193`, through the session's
     /// block-change pipeline).
@@ -1083,16 +1099,26 @@ impl DigState {
 
     /// `onPlayerDamageBlock` (`PlayerControllerMP.java:285-339`): the hit
     /// delay, the creative branch, one progress step with its stage, the
-    /// completion, or a fresh click for a block the dig is not hitting.
+    /// completion, or a fresh click for a block the dig is not hitting. Every
+    /// arm that answers true also leaves the held tick's hit particle.
     fn damage_block(&mut self, aim: DigAim, creative: bool, actions: &mut Vec<DigAction>) {
         if self.hit_delay > 0 {
-            // The delay's ticks skip progress (`:289-293`).
+            // The delay's ticks skip progress (`:289-293`) but still answer
+            // true, so the held tick still lands its hit particle.
             self.hit_delay -= 1;
+            actions.push(DigAction::Hit {
+                x: aim.x,
+                y: aim.y,
+                z: aim.z,
+                face: aim.face,
+            });
             return;
         }
         if creative {
             // The creative branch (`:294-300`): a start and an instant
-            // destroy every five ticks.
+            // destroy every five ticks, and the true answer's hit lands
+            // behind the removal — the caller drops it against the aired
+            // cell, as the source's own render-type gate does.
             self.hit_delay = 5;
             actions.push(DigAction::Start {
                 x: aim.x,
@@ -1104,6 +1130,12 @@ impl DigState {
                 x: aim.x,
                 y: aim.y,
                 z: aim.z,
+            });
+            actions.push(DigAction::Hit {
+                x: aim.x,
+                y: aim.y,
+                z: aim.z,
+                face: aim.face,
             });
             return;
         }
@@ -1140,6 +1172,15 @@ impl DigState {
                 z: aim.z,
                 index: stage_index(self.progress),
             });
+            // The completion answers true too, so its hit fires behind the
+            // removal and the stage — the caller drops it against the aired
+            // cell, as the source's own render-type gate does.
+            actions.push(DigAction::Hit {
+                x: aim.x,
+                y: aim.y,
+                z: aim.z,
+                face: aim.face,
+            });
             actions.push(DigAction::Swing);
             return;
         }
@@ -1148,6 +1189,14 @@ impl DigState {
             y: aim.y,
             z: aim.z,
             index: stage_index(self.progress),
+        });
+        // The progress step answers true, so the held tick lands its hit
+        // behind the stage.
+        actions.push(DigAction::Hit {
+            x: aim.x,
+            y: aim.y,
+            z: aim.z,
+            face: aim.face,
         });
     }
 
@@ -2382,13 +2431,19 @@ mod tests {
         );
         assert!(!dig.hitting(), "no dig runs in creative");
 
-        // The delay's five ticks only count down (`:289-293`); the sixth held
-        // tick starts and destroys again (`:294-300`).
+        // The delay's five ticks only count down (`:289-293`); each still
+        // answers true, so each lands its hit — and the sixth held tick
+        // starts and destroys again (`:294-300`).
         for tick in 1..=5 {
-            assert!(
-                dig.on_player_damage_block(Some(dig_aim(0.0)), true)
-                    .is_empty(),
-                "delay tick {tick} sends nothing"
+            assert_eq!(
+                dig.on_player_damage_block(Some(dig_aim(0.0)), true),
+                vec![DigAction::Hit {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                }],
+                "delay tick {tick} lands its hit and nothing else"
             );
         }
         assert_eq!(
@@ -2401,6 +2456,12 @@ mod tests {
                     face: Face::North
                 },
                 DigAction::Destroy { x: 0, y: 65, z: 2 },
+                DigAction::Hit {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                },
             ],
             "the five-tick creative break"
         );
@@ -2543,9 +2604,15 @@ mod tests {
                     z: 2,
                     index: -1
                 },
+                DigAction::Hit {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                },
                 DigAction::Swing,
             ],
-            "finish, then the removal, then the stage, then the swing"
+            "finish, then the removal, then the stage, then the true answer's hit, then the swing"
         );
         assert!(!dig.hitting(), "the dig completed");
     }
@@ -2569,9 +2636,15 @@ mod tests {
             rate: hand_rate(0.5, true),
         };
         for tick in 1..=5 {
-            assert!(
-                dig.on_player_damage_block(Some(next), false).is_empty(),
-                "delay tick {tick} sends nothing"
+            assert_eq!(
+                dig.on_player_damage_block(Some(next), false),
+                vec![DigAction::Hit {
+                    x: 1,
+                    y: 65,
+                    z: 2,
+                    face: Face::West
+                }],
+                "delay tick {tick} lands its hit and takes no progress"
             );
         }
         let started = dig.on_player_damage_block(Some(next), false);
