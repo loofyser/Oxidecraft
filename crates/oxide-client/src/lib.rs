@@ -8,4 +8,5 @@
 pub mod enchants;
 pub mod items;
 pub mod screens;
+pub mod settings_state;
 pub mod tooltip;

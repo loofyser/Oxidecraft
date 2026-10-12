@@ -106,7 +106,7 @@ use crate::audio::sounds::{
     swim_volume,
 };
 use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
-use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
+use crate::input::{InputEvent, Intent, Key, MouseButton, SessionPush, look_delta};
 use crate::interaction::{
     Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
     mode_from_value, pick_entity_target, placement, raycast, reach, spectator, tool_not_required,
@@ -124,7 +124,7 @@ use crate::particles::{PER_LIST_CAP, ParticleEngine, ParticleFrame};
 use crate::physics;
 use crate::player::{Abilities, Player};
 use crate::scoreboard::{Scoreboard, colour_from_wire};
-use crate::settings::{ParticleSetting, VIEW_DISTANCE_RANGE};
+use crate::settings::{CHAT_MODE_RANGE, ParticleSetting, VIEW_DISTANCE_RANGE};
 use crate::ticker::Ticker;
 use crate::weather::{WeatherColumn, splash_spawns, weather_columns};
 use crate::windows::{CURSOR_WINDOW_ID, HOTBAR_SIZE, OpenWindowState, Windows};
@@ -203,11 +203,11 @@ const SNOW_LAYER_ID: u16 = 78;
 /// outruns the session.
 const INPUTS_PER_PASS: usize = 32;
 
-/// The mouse sensitivity the look mapping runs with.
+/// The mouse sensitivity the look mapping runs with until the client pushes
+/// the store's value over [`InputEvent::PushSettings`].
 ///
 /// `GameSettings.mouseSensitivity`'s own default, 0.5
-/// (`GameSettings.java:65`); the options screen that would change it arrives
-/// with M6.
+/// (`GameSettings.java:65`).
 const MOUSE_SENSITIVITY: f32 = 0.5;
 
 /// The pitch clamp, in degrees: `MathHelper.clamp_float(this.rotationPitch,
@@ -319,6 +319,49 @@ const GRAPHICS_FAST: bool = true;
 /// The smooth-lighting setting: `GameSettings.ambientOcclusion`'s own default,
 /// 2 (`client/settings/GameSettings.java:78`).
 const SMOOTH_LIGHTING: SmoothLighting = SmoothLighting::Maximum;
+
+/// Maps a stored smooth-lighting setting to the mesher's regime: 0 is Off,
+/// 1 Minimum, 2 Maximum (`AMBIENT_OCCLUSIONS`, `GameSettings.java:59`);
+/// past-the-end values clamp to Maximum, the renderer's own
+/// [`oxide_render::renderer::Renderer::set_smooth_lighting`] rule.
+fn smooth_lighting_of(mode: u8) -> SmoothLighting {
+    match mode {
+        0 => SmoothLighting::Off,
+        1 => SmoothLighting::Minimum,
+        _ => SmoothLighting::Maximum,
+    }
+}
+
+/// Applies one settings push to the session-held state: the wire fields,
+/// the mesh settings, the look sensitivity and the live particle regime.
+///
+/// The wire payload is clamped into the store's ranges and compared whole:
+/// a changed payload returns true and the caller re-sends C15 with every
+/// field current, an identical one returns false and nothing is sent. The
+/// mesh settings, the sensitivity and the particle regime apply regardless.
+fn apply_session_push(
+    settings: &mut ClientSettings,
+    graphics_fast: &mut bool,
+    smooth_lighting: &mut SmoothLighting,
+    sensitivity: &mut f32,
+    particles: &mut ParticleEngine,
+    push: &SessionPush,
+) -> bool {
+    let mut next = push.settings.clone();
+    next.view_distance = next
+        .view_distance
+        .clamp(VIEW_DISTANCE_RANGE.0, VIEW_DISTANCE_RANGE.1);
+    next.chat_mode = next.chat_mode.min(CHAT_MODE_RANGE.1);
+    *graphics_fast = push.graphics_fast;
+    *smooth_lighting = smooth_lighting_of(push.smooth_lighting);
+    *sensitivity = push.sensitivity.clamp(0.0, 1.0);
+    particles.set_limit(push.particles);
+    if next == *settings {
+        return false;
+    }
+    *settings = next;
+    true
+}
 
 /// The context a column build reads: the session's assets and its held
 /// graphics settings.
@@ -1284,8 +1327,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut columns_live = false;
         // The graphics settings the column meshes build with: the store's
         // values once the client pushes them, the two defaults until then.
-        let graphics_fast = GRAPHICS_FAST;
-        let smooth_lighting = SMOOTH_LIGHTING;
+        let mut graphics_fast = GRAPHICS_FAST;
+        let mut smooth_lighting = SMOOTH_LIGHTING;
+        // The mouse sensitivity the look mapping runs with: the store's
+        // value once the client pushes it, the option's own default until
+        // then (`MOUSE_SENSITIVITY`).
+        let mut sensitivity = MOUSE_SENSITIVITY;
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -1297,6 +1344,30 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             for _ in 0..INPUTS_PER_PASS {
                 match inputs.try_recv() {
                     Ok(event) => {
+                        // The settings pushes are not gameplay input: they
+                        // land whether the player is dead or alive, so a
+                        // change from the pause menu always reaches the state
+                        // it owns. A changed wire payload re-sends C15 with
+                        // every field current, the way the view-distance
+                        // arm below does.
+                        if let InputEvent::PushSettings(push) = &event {
+                            if apply_session_push(
+                                &mut settings,
+                                &mut graphics_fast,
+                                &mut smooth_lighting,
+                                &mut sensitivity,
+                                &mut particles,
+                                push,
+                            ) {
+                                let echo = payload_of(|out| write_client_settings(out, &settings))?;
+                                send_reply(&mut conn, &echo)?;
+                            }
+                            continue;
+                        }
+                        if let InputEvent::SetParticleSetting { setting } = event {
+                            particles.set_limit(setting);
+                            continue;
+                        }
                         if player.dead {
                             // While dead the window's input is the death
                             // view's: a click or Space asks for the respawn —
@@ -1472,7 +1543,10 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         send_reply(&mut conn, &echo)?;
                                     }
                                 }
-                                other => looked |= apply_input(other, &mut intent, &mut player),
+                                other => {
+                                    looked |=
+                                        apply_input(other, &mut intent, &mut player, sensitivity);
+                                }
                             }
                         }
                     }
@@ -3434,14 +3508,19 @@ fn close_window(windows: &mut Windows, window_id: u8) -> bool {
 /// The chat send and the click machine's actions have no arm here to reach:
 /// every one of them is applied — and its packet written — by the play loop's
 /// drain before this sees it, and their arm below is match completeness only.
-fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> bool {
+fn apply_input(
+    event: InputEvent,
+    intent: &mut Intent,
+    player: &mut Player,
+    sensitivity: f32,
+) -> bool {
     match event {
         InputEvent::Key { key, pressed } => {
             intent.apply_key(key, pressed);
             false
         }
         InputEvent::MouseDelta { dx, dy } => {
-            let (d_yaw, d_pitch) = look_delta(dx, dy, MOUSE_SENSITIVITY);
+            let (d_yaw, d_pitch) = look_delta(dx, dy, sensitivity);
             player.yaw += d_yaw;
             player.pitch = (player.pitch + d_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
             true
@@ -3467,6 +3546,8 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
         | InputEvent::HeldItemChange { .. }
         | InputEvent::OpenInventory
         | InputEvent::SetViewDistance { .. }
+        | InputEvent::PushSettings(_)
+        | InputEvent::SetParticleSetting { .. }
         | InputEvent::DropItem { .. } => false,
     }
 }
@@ -5298,15 +5379,19 @@ mod tests {
 
     use super::{
         ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT, GRAPHICS_FAST,
-        INPUTS_PER_PASS, MeshAssets, MeshQueue, PORTAL_BLOCK_ID, SMOOTH_LIGHTING, TICK_PERIOD,
-        WEATHER_EASE_RATE, WeatherState, chat_over_cap, eye_block_event, finish_meshes, gate_cell,
-        hand_cell, mesh_pool, renderable_id, step_tick, visually_opaque_id,
+        INPUTS_PER_PASS, MOUSE_SENSITIVITY, MeshAssets, MeshQueue, PORTAL_BLOCK_ID,
+        SMOOTH_LIGHTING, SmoothLighting, TICK_PERIOD, WEATHER_EASE_RATE, WeatherState, apply_input,
+        apply_session_push, chat_over_cap, eye_block_event, finish_meshes, gate_cell, hand_cell,
+        mesh_pool, renderable_id, smooth_lighting_of, step_tick, visually_opaque_id,
     };
     use crate::entity_view::PlayerList;
-    use crate::input::Intent;
+    use crate::input::{InputEvent, Intent, SessionPush};
+    use crate::particles::ParticleEngine;
     use crate::player::{MAX_HURT_TIME, Player};
     use crate::scoreboard::Scoreboard;
+    use crate::settings::{CHAT_MODE_RANGE, ParticleSetting, VIEW_DISTANCE_RANGE};
     use crate::ticker::Ticker;
+    use oxide_proto_v47::serverbound::ClientSettings;
     use std::sync::Arc;
 
     #[test]
@@ -5338,6 +5423,142 @@ mod tests {
             ticker.due(start + TICK_PERIOD + Duration::from_millis(5)),
             1
         );
+    }
+
+    /// A held settings push and the mapping it runs through.
+    fn held_push() -> (ClientSettings, bool, SmoothLighting, f32, ParticleEngine) {
+        (
+            ClientSettings::default(),
+            GRAPHICS_FAST,
+            SMOOTH_LIGHTING,
+            MOUSE_SENSITIVITY,
+            ParticleEngine::seeded(0x9E37_79B9_7F4A_7C15, 8),
+        )
+    }
+
+    fn full_push() -> SessionPush {
+        SessionPush {
+            settings: ClientSettings {
+                locale: "de_DE".to_string(),
+                view_distance: 10,
+                chat_mode: 1,
+                chat_colors: false,
+                skin_parts: 0x01,
+            },
+            graphics_fast: false,
+            smooth_lighting: 0,
+            sensitivity: 1.0,
+            particles: ParticleSetting::Minimal,
+        }
+    }
+
+    #[test]
+    fn the_smooth_lighting_mapping_matches_the_option_order() {
+        // `AMBIENT_OCCLUSIONS` (`GameSettings.java:59`): off, minimum,
+        // maximum; past-the-end values clamp to Maximum, the renderer's own
+        // `set_smooth_lighting` rule.
+        assert_eq!(smooth_lighting_of(0), SmoothLighting::Off);
+        assert_eq!(smooth_lighting_of(1), SmoothLighting::Minimum);
+        assert_eq!(smooth_lighting_of(2), SmoothLighting::Maximum);
+        assert_eq!(smooth_lighting_of(9), SmoothLighting::Maximum);
+    }
+
+    #[test]
+    fn a_settings_push_moves_every_session_held_value() {
+        let (mut settings, mut graphics_fast, mut smooth_lighting, mut sensitivity, mut particles) =
+            held_push();
+        let changed = apply_session_push(
+            &mut settings,
+            &mut graphics_fast,
+            &mut smooth_lighting,
+            &mut sensitivity,
+            &mut particles,
+            &full_push(),
+        );
+        assert!(
+            changed,
+            "a changed wire payload reports back for the C15 re-send"
+        );
+        assert_eq!(settings.view_distance, 10);
+        assert_eq!(settings.locale, "de_DE");
+        assert_eq!(settings.chat_mode, 1);
+        assert!(!settings.chat_colors);
+        assert_eq!(settings.skin_parts, 0x01);
+        assert!(!graphics_fast, "the mesher leaves the Fast path");
+        assert_eq!(smooth_lighting, SmoothLighting::Off);
+        assert_eq!(sensitivity, 1.0, "the look mapping runs the pushed value");
+        assert_eq!(particles.setting(), ParticleSetting::Minimal);
+    }
+
+    #[test]
+    fn an_identical_settings_push_sends_nothing_but_still_applies() {
+        let (mut settings, mut graphics_fast, mut smooth_lighting, mut sensitivity, mut particles) =
+            held_push();
+        let push = SessionPush {
+            settings: settings.clone(),
+            graphics_fast,
+            smooth_lighting: 2,
+            sensitivity,
+            particles: ParticleSetting::All,
+        };
+        let changed = apply_session_push(
+            &mut settings,
+            &mut graphics_fast,
+            &mut smooth_lighting,
+            &mut sensitivity,
+            &mut particles,
+            &push,
+        );
+        assert!(!changed, "an identical wire payload sends no C15");
+    }
+
+    #[test]
+    fn a_settings_push_clamps_into_the_store_ranges() {
+        let (mut settings, mut graphics_fast, mut smooth_lighting, mut sensitivity, mut particles) =
+            held_push();
+        let mut push = full_push();
+        push.settings.view_distance = 99;
+        push.settings.chat_mode = 7;
+        push.smooth_lighting = 9;
+        push.sensitivity = 9.0;
+        let changed = apply_session_push(
+            &mut settings,
+            &mut graphics_fast,
+            &mut smooth_lighting,
+            &mut sensitivity,
+            &mut particles,
+            &push,
+        );
+        assert!(changed);
+        assert_eq!(settings.view_distance, VIEW_DISTANCE_RANGE.1);
+        assert_eq!(settings.chat_mode, CHAT_MODE_RANGE.1);
+        assert_eq!(smooth_lighting, SmoothLighting::Maximum);
+        assert_eq!(sensitivity, 1.0);
+    }
+
+    #[test]
+    fn the_look_runs_the_pushed_sensitivity() {
+        // The `f³ × 8` law (`input.rs:524+`): at the 0.5 default ten pixels
+        // turn 1.5°, at 1.0 they turn 6.144°.
+        let mut intent = Intent::neutral();
+        let mut player = Player::new();
+        let looked = apply_input(
+            InputEvent::MouseDelta { dx: 10.0, dy: 0.0 },
+            &mut intent,
+            &mut player,
+            1.0,
+        );
+        assert!(looked, "a look asks for the aim to be recomputed");
+        assert!((player.yaw - 6.144).abs() < 1e-4, "yaw {}", player.yaw);
+        let mut intent = Intent::neutral();
+        let mut player = Player::new();
+        apply_input(
+            InputEvent::MouseDelta { dx: 10.0, dy: 0.0 },
+            &mut intent,
+            &mut player,
+            0.5,
+        );
+        assert!((player.yaw - 1.5).abs() < 1e-4, "yaw {}", player.yaw);
     }
 
     #[test]

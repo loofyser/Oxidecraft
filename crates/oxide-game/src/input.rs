@@ -19,6 +19,9 @@
 //! direction test below pins the whole chain.
 
 use oxide_proto_v47::entity::MetadataItem;
+use oxide_proto_v47::serverbound::ClientSettings;
+
+use crate::settings::ParticleSetting;
 
 /// One physical key the client binds.
 ///
@@ -250,6 +253,47 @@ pub enum InputEvent {
         /// The new view distance in chunks.
         chunks: u8,
     },
+    /// The settings screen applied its store: the wire fields, the mesh
+    /// settings, the mouse sensitivity and the particle regime, all current.
+    ///
+    /// The source applies every option locally at once and the server hears
+    /// the wire ones at the next options save (`sendSettingsToServer`,
+    /// `GameSettings.java:1203-1216`); this port sends on the push itself,
+    /// which the client's apply path routes through. An unchanged wire
+    /// payload sends nothing. The keymap has no binding store for a push to
+    /// carry (Task 19 owns the `Binding` list), so no key fields ride here.
+    PushSettings(SessionPush),
+    /// The settings screen applied its particle regime: the session's live
+    /// engine takes the setting at once.
+    ///
+    /// The regime rides beside [`InputEvent::PushSettings`] rather than in
+    /// it so the client's apply path can push the particle engine through
+    /// the same shape it pushes the local one: one setting, one consumer.
+    SetParticleSetting {
+        /// The new particle regime.
+        setting: ParticleSetting,
+    },
+}
+
+/// The settings values one [`InputEvent::PushSettings`] carries to the
+/// session: everything the session holds that the settings store owns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPush {
+    /// The wire fields: locale, view distance, chat mode, chat colours and
+    /// skin parts. A changed payload re-sends C15 with every field current.
+    pub settings: ClientSettings,
+    /// Whether the mesher builds the Fast path (`fancyGraphics`,
+    /// `GameSettings.java:75`; set means Fast).
+    pub graphics_fast: bool,
+    /// The smooth-lighting setting: 0 Off, 1 Minimum, 2 Maximum
+    /// (`AMBIENT_OCCLUSIONS`, `GameSettings.java:59`); past-the-end values
+    /// clamp to Maximum.
+    pub smooth_lighting: u8,
+    /// The mouse sensitivity the look mapping runs with
+    /// (`GameSettings.java:65`); clamped to 0-1.
+    pub sensitivity: f32,
+    /// The particle regime the live engine takes.
+    pub particles: ParticleSetting,
 }
 
 /// How many physical keys the intent tracks.

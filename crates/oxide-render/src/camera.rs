@@ -83,6 +83,9 @@ pub const EYE_HEIGHT: f32 = 1.62;
 pub const EYE_HEIGHT_SNEAK: f32 = 1.54;
 /// Vanilla's default vertical field of view.
 pub const DEFAULT_FOV: f32 = 70.0;
+/// The field-of-view slider range in degrees (`FOV`, `GameSettings.java`:
+/// `30.0F, 110.0F`); the port's settings store carries the same range.
+pub const FOV_RANGE: (u8, u8) = (30, 110);
 /// Vanilla's near plane.
 pub const NEAR_PLANE: f32 = 0.05;
 /// The first-person camera's backward offset along the view axis, in blocks.

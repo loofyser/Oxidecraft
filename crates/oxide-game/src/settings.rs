@@ -85,8 +85,9 @@ pub const CATEGORY_AMBIENT: usize = 8;
 /// The `max_framerate` value meaning unlimited.
 ///
 /// The source's `FRAMERATE_LIMIT` slider spans 10-260 in steps of 10 with the
-/// top step reading as the max label (`GameSettings.java`:71 and the
-/// `FRAMERATE_LIMIT` display rule); 260 does not fit in a `u8`, so the numeric
+/// top step (260) displaying `options.framerateLimit.max` = Unlimited and
+/// skipping the frame sync (`GameSettings.java`:71, `:623`, `en_US.lang`:340,
+/// `Minecraft.java`:1209-1213); 260 does not fit in a `u8`, so the numeric
 /// range stops at the step-aligned 250 and the top folds into this sentinel.
 pub const FRAMERATE_UNLIMITED: u8 = 255;
 
@@ -745,6 +746,10 @@ impl GameSettings {
 
     /// Saves the settings in the file's own format: sorted keys, one per
     /// line. Writing the same settings twice yields identical bytes.
+    ///
+    /// The write is atomic: the bytes land in a sibling temporary file first
+    /// and the rename publishes them, so a crash never leaves a half-written
+    /// file behind.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -759,7 +764,13 @@ impl GameSettings {
             text.push_str(&value);
             text.push('\n');
         }
-        fs::write(path, text)
+        let staged = path.with_extension("tmp");
+        fs::write(&staged, text)?;
+        if let Err(error) = fs::rename(&staged, path) {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The effective view distance: the stored value clamped into
@@ -1006,6 +1017,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("test scratch dir");
         let loaded = GameSettings::load(dir.path().join("no-such-file.toml"));
         assert_eq!(loaded, GameSettings::default());
+    }
+
+    #[test]
+    fn save_publishes_atomically_with_no_staging_left_behind() {
+        let dir = tempfile::tempdir().expect("test scratch dir");
+        let path = dir.path().join("options.toml");
+        let before = non_default();
+        before.save(&path).expect("save works");
+        assert!(
+            !dir.path().join("options.tmp").exists(),
+            "the staging file renames away"
+        );
+        let after = GameSettings::load(&path);
+        assert_eq!(before, after);
     }
 
     #[test]

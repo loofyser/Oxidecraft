@@ -61,6 +61,10 @@ use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
 use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
+use oxide_client::settings_state::{
+    KeymapPass, NoAudio, ParticleSink, SettingsState, WindowSink, cursor_to_gui, framerate_gate,
+    options_path,
+};
 use oxide_game::audio::music::{MusicKind, MusicTicker};
 use oxide_game::audio::{
     AudioDevice, AudioEngine, CpalDevice, ListenerPose, PlaySound, SoundCategory,
@@ -75,13 +79,14 @@ use oxide_game::particles::{ParticleFrame, ParticleTex};
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
+use oxide_game::settings::{FRAMERATE_RANGE, ParticleSetting};
 use oxide_game::weather::WeatherColumn;
 use oxide_proto_v47::effects_wire::{read_effect_position, read_sound_pitch};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{
-    Camera, CameraPose, CameraSensor, DEFAULT_FOV, FovInputs, FovSmoother, NEAR_PLANE,
-    WalkDistance, bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll,
-    interpolate_pose, nausea_wobble, render_eye,
+    Camera, CameraPose, CameraSensor, FovInputs, FovSmoother, NEAR_PLANE, WalkDistance,
+    bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll, interpolate_pose,
+    nausea_wobble, render_eye,
 };
 use oxide_render::entity_pass::{SkinLookup, SkinTexId, TextureRegistry};
 use oxide_render::fog::{
@@ -104,7 +109,7 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop};
 use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 /// The frame count that bounds a smoke run, read from the environment.
 const MAX_FRAMES_VAR: &str = "OXIDECRAFT_MAX_FRAMES";
@@ -149,9 +154,11 @@ struct Cli {
     #[arg(long)]
     no_overlay: bool,
     /// The render distance in chunks: the camera's far plane, the fog distance and the view
-    /// distance sent to the server.
-    #[arg(long, default_value_t = 8)]
-    render_distance: u8,
+    /// distance sent to the server. Seeds the options file's view distance when the file is
+    /// missing; a present file's value governs and this overrides it in memory for this run
+    /// only.
+    #[arg(long)]
+    render_distance: Option<u8>,
     /// Replay a tick-indexed input script (see [`ScriptDriver`]) and log one CSV line per
     /// session tick, each tick's tracked-entity section behind it, to `<path>.log`. Needs
     /// `--server`: the script is injected into the session's input channel.
@@ -973,9 +980,13 @@ struct ClientApp {
     /// The client's assets, when `--server` was given: the mesh inputs the session shares,
     /// the font and the sky textures the renderer uploads.
     assets: Option<ClientAssets>,
-    /// The render distance in chunks: the camera's far plane, the fog's far plane and the
-    /// view distance sent to the server.
-    render_distance: u8,
+    /// The client's settings owner: the store's values, the save-on-change
+    /// writer and the apply path. The frame reads the view distance, the
+    /// framerate cap and the volumes from it; the window pushes every change
+    /// through it.
+    settings: SettingsState,
+    /// When the last frame presented: the framerate limiter's gate reads it.
+    last_frame: Option<Instant>,
     /// What the debug overlay reports, updated from the session's events.
     hud: HudState,
     /// The clock and the sky the session last reported.
@@ -999,7 +1010,7 @@ struct ClientApp {
     /// Whether F3+H has the advanced tooltips showing
     /// (`gameSettings.advancedItemTooltips`, toggled at :2000-2004): the
     /// flag the screen frame hands the tooltip builder. Session-only, like
-    /// the overlay — the port keeps no options file.
+    /// Session-only, like the overlay.
     advanced_tooltips: bool,
     /// Whether the session last reported the player dead.
     ///
@@ -1515,6 +1526,24 @@ impl ClientApp {
         // takes the command line's username for its own handshake, so the window
         // keeps its copy first.
         let own_name = cli.username.clone();
+        // The settings load before the first frame: a missing file seeds from
+        // the `--render-distance` flag (its absence seeds the store default),
+        // a present file loads with the flag overriding the view distance in
+        // memory only. A seed saves at once so it persists. Without a store
+        // root the settings run session-only: nothing persists.
+        let (mut settings, seeded) = match assets::default_store_root() {
+            Ok(root) => SettingsState::load(options_path(&root), cli.render_distance),
+            Err(error) => {
+                tracing::warn!(%error, "the store root is unavailable, settings run session-only");
+                let (state, _) = SettingsState::load(PathBuf::new(), cli.render_distance);
+                (state, false)
+            }
+        };
+        if seeded {
+            if let Err(error) = settings.save_now() {
+                tracing::warn!(%error, "the seeded settings could not be saved");
+            }
+        }
         // `--audio-dump` captures the session's engine: without a session it
         // is refused like `--input-script`, before the window opens.
         let audio_dump = cli.audio_dump;
@@ -1544,10 +1573,14 @@ impl ClientApp {
                     port,
                     cli.username,
                     address,
-                    cli.render_distance,
+                    settings.wire_settings(),
                     Arc::clone(&loaded.mesh),
                 );
                 assets = Some(loaded);
+                // The session-held values push through its input channel from
+                // here on; the first full push lands with the window, once the
+                // renderer and the audio engine exist to take their own fields.
+                settings.set_session(session.input_tx.clone());
                 Some(session)
             }
             None => None,
@@ -1592,7 +1625,8 @@ impl ClientApp {
             music: None,
             joined: false,
             assets,
-            render_distance: cli.render_distance,
+            settings,
+            last_frame: None,
             hud: HudState {
                 fps: 0.0,
                 position: [0.0; 3],
@@ -1671,6 +1705,31 @@ impl ClientApp {
     /// is reconfigured before the frame is retried once. Any other failure
     /// stops the client.
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
+        // The framerate limiter's sleep, the source's `Display.sync` shape: a
+        // gated frame waits out the cap period rather than skipping, so the
+        // redraw loop never spins at full rate under a cap.
+        if !framerate_gate(
+            Instant::now(),
+            self.last_frame,
+            self.settings.max_framerate(),
+        ) {
+            if let Some(last) = self.last_frame {
+                let capped = self
+                    .settings
+                    .max_framerate()
+                    .clamp(FRAMERATE_RANGE.0, FRAMERATE_RANGE.1);
+                let period = Duration::from_secs_f64(1.0 / f64::from(capped));
+                std::thread::sleep(
+                    period.saturating_sub(Instant::now().saturating_duration_since(last)),
+                );
+            }
+        }
+        self.last_frame = Some(Instant::now());
+        // The save-on-change writer's poll: a debounced save lands here, on
+        // the frame after its trailing edge.
+        if let Err(error) = self.settings.poll_save(Instant::now()) {
+            tracing::warn!(%error, "the settings could not be saved");
+        }
         // Drained into a list first, so the rest of the frame works from owned
         // events and holds no borrow of the session.
         let events: Vec<ClientEvent> = match self.session.as_ref() {
@@ -1849,7 +1908,9 @@ impl ClientApp {
                 // frame.
                 let kind = music_kind(self.joined, self.hud.dimension, self.creative);
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.ticker.tick(kind, MUSIC_VOLUME, &audio.engine);
+                    audio
+                        .ticker
+                        .tick(kind, self.settings.settings().music_volume, &audio.engine);
                     audio.engine.tick(ListenerPose {
                         pos: [*x as f32, *y as f32, *z as f32],
                         yaw: (*yaw).to_radians(),
@@ -1928,7 +1989,7 @@ impl ClientApp {
             // death terms, and the hurt roll over the view bob (`EntityRenderer.java:551-629`,
             // `:585-609`, `:615-629`), all at this frame's fraction.
             let frame_fov = fov(
-                DEFAULT_FOV,
+                renderer.fov_degrees(),
                 &self.camera.smoother,
                 partial,
                 self.camera.in_water,
@@ -1962,7 +2023,7 @@ impl ClientApp {
                 pose,
                 fov_degrees: frame_fov,
                 near: NEAR_PLANE,
-                far_chunks: self.render_distance as f32,
+                far_chunks: self.settings.view_distance() as f32,
                 // The nausea wobble over the hurt roll and the view bob
                 // (`EntityRenderer.setupCameraTransform`, `EntityRenderer.java:782-796`):
                 // the rotate/scale/rotate about (0, 1, 1), identity at no
@@ -1981,7 +2042,7 @@ impl ClientApp {
             renderer.set_cracks(cracks_in_view(
                 &self.world_overlay.break_stages,
                 self.player.current.position,
-                self.render_distance,
+                self.settings.view_distance(),
             ));
             if let (Some(time_of_day), Some(values)) = (self.sky.time_of_day, self.sky.sky) {
                 let (fog, sky) = frame_params(
@@ -1989,7 +2050,7 @@ impl ClientApp {
                     self.hud.dimension,
                     self.player.current.position[1],
                     self.sky.void_y_factor,
-                    self.render_distance,
+                    self.settings.view_distance(),
                     values,
                     self.player.tick as i64,
                     // The eye's own water test: the tick's in-water flag, the same
@@ -3487,11 +3548,6 @@ struct SessionLink {
 /// The music schedule's seed: one fixed seed replays one schedule every run.
 const MUSIC_SEED: u64 = 1;
 
-/// The music gain the ticker plays at: the default music level. The client
-/// keeps no options file, so the category volumes stay at the engine's own
-/// 1.0 defaults; client settings ownership is a later task.
-const MUSIC_VOLUME: f32 = 1.0;
-
 /// The client's sound pump: the engine the session's sound events play
 /// through and the music schedule, owned only with a session.
 struct ClientAudio {
@@ -3640,12 +3696,47 @@ fn local_sound_play(
 /// command line's view distance, and the `mesh` assets are the bootstrap's. The
 /// input channel is opened here too: the thread drains the receiver, the link
 /// keeps the sender.
+/// The session's particle engine over its input channel: the client's
+/// particle engine is the session's, so the regime pushes as
+/// [`InputEvent::SetParticleSetting`]. Without a session the push lands
+/// nowhere. The apply path's own [`InputEvent::PushSettings`] carries the
+/// same regime beside it; the double delivery is idempotent.
+struct SessionParticles {
+    /// The session's input channel, when one exists.
+    tx: Option<Sender<InputEvent>>,
+}
+
+impl ParticleSink for SessionParticles {
+    fn set_limit(&mut self, setting: ParticleSetting) {
+        if let Some(tx) = self.tx.as_ref() {
+            if tx.send(InputEvent::SetParticleSetting { setting }).is_err() {
+                tracing::warn!("the session's input channel is closed");
+            }
+        }
+    }
+}
+
+/// The window's fullscreen switch: set means winit borderless fullscreen
+/// (the source toggles its exclusive mode, `GameSettings.java:479-487`).
+/// The key that toggles it stays Task 25's.
+struct ClientWindow {
+    /// The window the switch drives.
+    window: Arc<Window>,
+}
+
+impl WindowSink for ClientWindow {
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.window
+            .set_fullscreen(fullscreen.then(|| Fullscreen::Borderless(None)));
+    }
+}
+
 fn spawn_session(
     host: String,
     port: u16,
     username: String,
     server: String,
-    render_distance: u8,
+    initial: ClientSettings,
     mesh: Arc<MeshAssets>,
 ) -> SessionLink {
     let (sender, receiver) = unbounded();
@@ -3655,10 +3746,7 @@ fn spawn_session(
             host,
             port,
             username,
-            settings: ClientSettings {
-                view_distance: render_distance,
-                ..Default::default()
-            },
+            settings: initial,
             mesh: Some(mesh),
         };
         match Session::connect(&config) {
@@ -4594,14 +4682,7 @@ fn command_text(value: &str) -> String {
 /// (`GuiNewChat.getChatComponent`:256-257 — `(int)(mouseX / f)` and the same
 /// for y). A zero factor is no division at all.
 fn scaled_cursor(position: PhysicalPosition<f64>, scale: u32) -> (f32, f32) {
-    if scale == 0 {
-        return (position.x as f32, position.y as f32);
-    }
-    let factor = f64::from(scale);
-    (
-        (position.x / factor).floor() as f32,
-        (position.y / factor).floor() as f32,
-    )
+    cursor_to_gui(position.x, position.y, scale)
 }
 
 /// A scripted look delta in the frame's GUI units: one mouse delta in screen
@@ -4942,6 +5023,35 @@ impl ApplicationHandler for ClientApp {
                 }
             }
         }
+        // The settings apply lands with the window, before the first frame:
+        // every field pushes to its consumer — the renderer, the audio engine
+        // (silent without one), the session's particle engine over its input
+        // channel, the window's fullscreen switch and the keymap pass-through.
+        // The session held the wire values from startup; this push carries the
+        // rest beside them.
+        if let Some(renderer) = self.renderer.as_mut() {
+            let mut win = ClientWindow {
+                window: Arc::clone(&window),
+            };
+            let mut parts = SessionParticles {
+                tx: self.session.as_ref().map(|link| link.input_tx.clone()),
+            };
+            let mut keymap = KeymapPass;
+            match self.audio.as_mut() {
+                Some(audio) => self.settings.apply(
+                    renderer,
+                    &mut audio.engine,
+                    &mut parts,
+                    &mut win,
+                    &mut keymap,
+                ),
+                None => {
+                    let mut silent = NoAudio;
+                    self.settings
+                        .apply(renderer, &mut silent, &mut parts, &mut win, &mut keymap);
+                }
+            }
+        }
         self.window = Some(window);
     }
 
@@ -5034,6 +5144,10 @@ impl ApplicationHandler for ClientApp {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The exit save: whatever the run changed persists for the restart.
+        if let Err(error) = self.settings.save_now() {
+            tracing::warn!(%error, "the settings could not be saved on exit");
+        }
         tracing::info!(frames = self.frames, "client exiting");
     }
 }
@@ -5510,7 +5624,7 @@ mod tests {
         assert!(cli.server.is_none());
         assert_eq!(cli.frames, None);
         assert!(!cli.no_overlay);
-        assert_eq!(cli.render_distance, 8);
+        assert_eq!(cli.render_distance, None, "the flag is absent by default");
     }
 
     #[test]
@@ -5518,7 +5632,19 @@ mod tests {
         let cli = Cli::try_parse_from(["oxide-client", "--no-overlay", "--render-distance", "12"])
             .expect("the flags parse");
         assert!(cli.no_overlay);
-        assert_eq!(cli.render_distance, 12);
+        assert_eq!(cli.render_distance, Some(12));
+    }
+
+    #[test]
+    fn the_flag_override_applies_only_to_the_run() {
+        // The precedence pin's parser half: the flag parses to `Some`, so the
+        // startup resolution can tell a given flag from a missing one; the
+        // absent flag parses to `None` (pinned above). The resolution itself —
+        // missing file seeds from the flag, a present file's flag overrides in
+        // memory only — is pinned by the settings-state integration tests.
+        let cli = Cli::try_parse_from(["oxide-client", "--render-distance", "6"])
+            .expect("the flag parses");
+        assert_eq!(cli.render_distance, Some(6));
     }
 
     #[test]

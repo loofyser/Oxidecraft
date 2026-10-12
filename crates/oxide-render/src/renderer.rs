@@ -11,6 +11,7 @@ use oxide_assets::font::FontError;
 use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
+use crate::camera::{DEFAULT_FOV, FOV_RANGE};
 use crate::dim_pass::DimPass;
 use crate::entity_pass::{BossStatus, EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
@@ -174,6 +175,12 @@ pub fn present_mode_for_vsync(on: bool, offered: &[wgpu::PresentMode]) -> wgpu::
     wgpu::PresentMode::Fifo
 }
 
+/// The stored field-of-view for a setting in degrees: clamped into
+/// [`FOV_RANGE`], the projection base [`Renderer::set_fov`] keeps.
+fn clamp_fov(degrees: u8) -> f32 {
+    f32::from(degrees.clamp(FOV_RANGE.0, FOV_RANGE.1))
+}
+
 /// The hud/screen projection for a surface size and a gui-scale setting.
 ///
 /// The one re-derive the resize path, the reconfigure path and [`Renderer::set_gui_scale`]
@@ -269,6 +276,11 @@ pub struct Renderer {
     /// The mesher owns the flag's effect — its ambient-occlusion path — which the client
     /// feeds at its next mesh build; the renderer only carries the value.
     smooth_lighting: u8,
+    /// The field-of-view setting in degrees: the frame's projection base
+    /// (`FOV`, `GameSettings.java`), default [`DEFAULT_FOV`](crate::camera::DEFAULT_FOV).
+    /// The client reads it back for the frame's smoothed FOV, so the stored
+    /// setting governs the projection the next frame builds.
+    fov_degrees: f32,
     /// Whether vertical sync is on (`enableVsync`, `GameSettings.java:88`; the field
     /// default is on). The surface runs [`wgpu::PresentMode::Fifo`] while this is set.
     vsync: bool,
@@ -478,6 +490,7 @@ impl Renderer {
             clouds: CLOUD_FANCY,
             graphics_fast: false,
             smooth_lighting: 2,
+            fov_degrees: DEFAULT_FOV,
             vsync: true,
             supported_present_modes,
             entity_pass,
@@ -706,6 +719,21 @@ impl Renderer {
     /// The smooth-lighting setting, as [`Renderer::set_smooth_lighting`] last set it.
     pub fn smooth_lighting(&self) -> u8 {
         self.smooth_lighting
+    }
+
+    /// Sets the field-of-view setting in degrees: the frame's projection base.
+    ///
+    /// The value clamps into [`FOV_RANGE`]. The client reads the stored
+    /// setting back for the frame's smoothed FOV, so the next frame's
+    /// projection builds from it.
+    pub fn set_fov(&mut self, degrees: u8) {
+        self.fov_degrees = clamp_fov(degrees);
+    }
+
+    /// The field-of-view setting in degrees, as [`Renderer::set_fov`] last
+    /// set it.
+    pub fn fov_degrees(&self) -> f32 {
+        self.fov_degrees
     }
 
     /// Switches vertical sync: on runs the surface at `Fifo`, off at the no-vsync
@@ -1355,7 +1383,7 @@ mod tests {
     use wgpu::SurfaceError;
 
     use super::{
-        CLOUD_FANCY, SKY_COLOR, SceneDraw, SurfaceAction, block_on, boss_status_step,
+        CLOUD_FANCY, SKY_COLOR, SceneDraw, SurfaceAction, block_on, boss_status_step, clamp_fov,
         classify_surface_error, clear_colour, hud_projection_size, present_mode_for_vsync,
         scene_draws,
     };
@@ -1519,6 +1547,17 @@ mod tests {
             scene_draws(&scene_camera(150.0), CLOUD_FANCY).contains(&SceneDraw::CloudsAtOrAbove),
             "Fancy keeps the at-or-above arm at the layer"
         );
+    }
+
+    #[test]
+    fn the_stored_fov_clamps_into_the_slider_range() {
+        // `FOV` (`GameSettings.java`: `30.0F, 110.0F`): the ends pin, the
+        // out-of-range ends clamp, and the middle passes through.
+        assert_eq!(clamp_fov(30), 30.0, "the low end pins");
+        assert_eq!(clamp_fov(110), 110.0, "the high end pins");
+        assert_eq!(clamp_fov(70), 70.0, "the default passes through");
+        assert_eq!(clamp_fov(5), 30.0, "below the range clamps up");
+        assert_eq!(clamp_fov(200), 110.0, "above the range clamps down");
     }
 
     #[test]
