@@ -1,5 +1,6 @@
 //! Tick loop, physics, input, interaction, screens, HUD, chat, sound playback, session join for online mode.
 
+pub mod audio;
 pub mod chat;
 pub mod container;
 pub mod entity_view;

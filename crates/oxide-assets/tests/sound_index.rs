@@ -237,5 +237,36 @@ fn the_real_sound_index_parses() {
         "records.13 streams"
     );
 
+    let creative = &index.events["music.game.creative"];
+    assert_eq!(
+        creative.sounds.len(),
+        7,
+        "the real file still carries one redirect ahead of six files"
+    );
+    assert_eq!(
+        creative.sounds[0].redirect.as_deref(),
+        Some("music.game"),
+        "the first sound of music.game.creative redirects at music.game"
+    );
+    assert_eq!(
+        index.total_weight("music.game.creative"),
+        18.0,
+        "the redirect lends music.game's 12 over the six plain files"
+    );
+    let delegated = index
+        .pick("music.game.creative", 0.0)
+        .expect("a roll inside the lent span delegates");
+    assert!(
+        delegated.redirect.is_none(),
+        "a delegated pick returns the target's own file, never the redirect"
+    );
+    assert!(
+        music
+            .sounds
+            .iter()
+            .any(|sound| sound.name == delegated.name),
+        "the delegated file is one of music.game's own files"
+    );
+
     assert!(MAX_SOUND_EVENTS >= index.events.len());
 }

@@ -9,10 +9,15 @@
 //! Each event states a `category` and a `sounds` list whose entries are
 //! either a bare path or an object with a `name` and optional `volume`,
 //! `pitch`, `weight`, `stream` and `attenuation_distance` keys. Any other
-//! key is ignored: the store's copy carries one `{"type": "event", ...}`
-//! entry (under `music.game.creative`), and future keys must not break the
-//! read. The `type` value itself is not kept: the audio engine resolves the
-//! kept `name` against loaded events.
+//! key is ignored, except `type`: an object entry with `"type": "event"`
+//! is a redirect to another event (the store's copy carries one, as the
+//! first sound of `music.game.creative`, naming `music.game`), kept as a
+//! [`SoundFile`] with [`SoundFile::redirect`] set. A redirect lends its
+//! weight from its target's own total at pick time and a winning redirect
+//! delegates to the target's own weighted pick, so the odds match the
+//! source's two-stage draw; a missing target lends zero and is never
+//! picked. An absent `category` defaults to `master`, as the source's
+//! deserialiser does.
 
 use std::collections::BTreeMap;
 
@@ -58,10 +63,16 @@ pub struct SoundDef {
 }
 
 /// One sound file within an event.
+///
+/// A file is either a playable entry (its `name` resolves to the
+/// store-relative path of the `.ogg`, without extension or namespace
+/// prefix) or a redirect: an entry the file wrote with `"type": "event"`,
+/// whose `name` is the target event and whose weight is lent from the
+/// target's own total at pick time (see [`SoundIndex::pick`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SoundFile {
     /// The store-relative path of the `.ogg`, without extension or
-    /// namespace prefix.
+    /// namespace prefix — or, for a redirect, the target event's name.
     pub name: String,
     /// The volume multiplier, as the file states it, or 1.0 when it states
     /// none. Playback clamps this to `[0.0, 1.0]`; the parse keeps it.
@@ -70,13 +81,18 @@ pub struct SoundFile {
     /// none. Playback clamps this to `[0.5, 2.0]`; the parse keeps it.
     pub pitch: f32,
     /// The selection weight: the file's `weight`, or 1 when the file states
-    /// none. A stated weight below 1 clamps to 1, so the total is never
-    /// zero and [`SoundIndex::pick`] always resolves.
+    /// none. A stated weight below 1 clamps to 1, so a plain file's total
+    /// is never zero. A redirect ignores this field at pick time and lends
+    /// its target's total instead (zero when the target is missing).
     pub weight: i32,
     /// The file-level `stream` flag, when the file states one.
     pub stream: Option<bool>,
     /// The attenuation distance override, when the file states one.
     pub attenuation_distance: Option<i32>,
+    /// The redirect target: `Some` event name when the file wrote
+    /// `"type": "event"`, else `None`. A delegated pick returns the
+    /// target's own file with the target's own flags.
+    pub redirect: Option<String>,
 }
 
 /// Errors from parsing a sound index.
@@ -174,26 +190,104 @@ impl SoundIndex {
     /// second at roll 0.34 (1.02 past 1). A roll at or past 1 resolves to
     /// the last file rather than nothing; an unknown event, or one with no
     /// files, resolves to nothing.
+    ///
+    /// A redirect entry (see [`SoundFile::redirect`]) lends its weight from
+    /// its target's own total — zero when the target is missing, so a
+    /// missing target is never picked — and a winning redirect delegates
+    /// to the target's own weighted pick, returning the target's own file
+    /// with the target's own flags. The second draw reuses the roll's
+    /// position inside the redirect's span, so one roll stays
+    /// deterministic. Redirect cycles resolve to nothing, never a loop.
     #[must_use]
     pub fn pick(&self, name: &str, roll: f32) -> Option<&SoundFile> {
-        let event = self.events.get(name)?;
-        if event.sounds.is_empty() {
-            return None;
-        }
-        let total: f64 = event
-            .sounds
-            .iter()
-            .map(|sound| f64::from(sound.weight))
-            .sum();
-        let scaled = f64::from(roll) * total;
-        let mut cumulative = 0.0;
-        for sound in &event.sounds {
-            cumulative += f64::from(sound.weight);
-            if cumulative > scaled {
-                return Some(sound);
+        let mut current = name.to_string();
+        let mut roll = roll;
+        let mut visited = vec![current.clone()];
+        loop {
+            let event = self.events.get(current.as_str())?;
+            let total: f64 = event
+                .sounds
+                .iter()
+                .map(|sound| self.effective_weight(&visited, sound))
+                .sum();
+            if total <= 0.0 {
+                return None;
+            }
+            let scaled = f64::from(roll) * total;
+            let mut cursor = 0.0;
+            let mut span_start = 0.0;
+            let mut span_width = 0.0;
+            let mut winner: Option<&SoundFile> = None;
+            for sound in &event.sounds {
+                let weight = self.effective_weight(&visited, sound);
+                span_start = cursor;
+                span_width = weight;
+                cursor += weight;
+                if cursor > scaled {
+                    winner = Some(sound);
+                    break;
+                }
+            }
+            let won = winner.or(event.sounds.last())?;
+            match won.redirect.as_deref() {
+                None => return Some(won),
+                Some(target) => {
+                    if visited.iter().any(|seen| seen == target)
+                        || !self.events.contains_key(target)
+                    {
+                        return None;
+                    }
+                    let sub = if span_width > 0.0 {
+                        ((scaled - span_start) / span_width).clamp(0.0, 0.999_999_9)
+                    } else {
+                        0.0
+                    };
+                    visited.push(target.to_string());
+                    current = target.to_string();
+                    roll = sub as f32;
+                }
             }
         }
-        event.sounds.last()
+    }
+
+    /// The weights' total a [`SoundIndex::pick`] scales by: plain files
+    /// count their clamped weight, redirects count their target's own
+    /// total (zero when the target is missing). Unknown events total zero.
+    #[must_use]
+    pub fn total_weight(&self, name: &str) -> f64 {
+        let mut visited = vec![name.to_string()];
+        self.total_weight_in(&mut visited, name)
+    }
+
+    /// Sums one event's effective weights under the visited chain, so a
+    /// redirect cycle lends zero instead of recursing forever.
+    fn total_weight_in(&self, visited: &mut [String], name: &str) -> f64 {
+        match self.events.get(name) {
+            None => 0.0,
+            Some(event) => event
+                .sounds
+                .iter()
+                .map(|sound| self.effective_weight(visited, sound))
+                .sum(),
+        }
+    }
+
+    /// One entry's weight at pick time: the clamped weight for a plain
+    /// file, the target's own total for a redirect (zero when the target
+    /// is missing or already on the chain).
+    fn effective_weight(&self, visited: &[String], sound: &SoundFile) -> f64 {
+        match sound.redirect.as_deref() {
+            None => f64::from(sound.weight),
+            Some(target) => {
+                if visited.iter().any(|seen| seen == target) {
+                    0.0
+                } else {
+                    let mut chain = visited.to_vec();
+                    chain.push(target.to_string());
+                    self.total_weight_in(&mut chain, target)
+                }
+            }
+        }
     }
 }
 
@@ -210,9 +304,14 @@ impl SoundDef {
 
 impl SoundFile {
     /// Converts one raw entry, enforcing the path cap and the weight clamp.
+    ///
+    /// An object entry with `"type": "event"` becomes a redirect: its name
+    /// is the target event and its weight is lent at pick time, so the
+    /// stored weight is kept but unused. Any other `type` value reads as a
+    /// plain file; the parse never fails on it.
     fn from_raw(raw: &RawSound) -> Result<Self, SoundError> {
-        let (name, volume, pitch, weight, stream, attenuation_distance) = match raw {
-            RawSound::Path(path) => (path.clone(), 1.0, 1.0, 1, None, None),
+        let (name, volume, pitch, weight, stream, attenuation_distance, redirect) = match raw {
+            RawSound::Path(path) => (path.clone(), 1.0, 1.0, 1, None, None, None),
             RawSound::Full {
                 name,
                 volume,
@@ -220,6 +319,7 @@ impl SoundFile {
                 weight,
                 stream,
                 attenuation_distance,
+                sound_type,
             } => (
                 name.clone(),
                 volume.unwrap_or(1.0),
@@ -227,11 +327,19 @@ impl SoundFile {
                 weight.unwrap_or(1),
                 *stream,
                 *attenuation_distance,
+                sound_type
+                    .as_deref()
+                    .and_then(|kind| (kind == "event").then(|| strip_namespace(name))),
             ),
         };
         let name = strip_namespace(&name);
         if name.len() > MAX_SOUND_NAME_BYTES {
             return Err(SoundError::SoundNameTooLong { len: name.len() });
+        }
+        if let Some(target) = redirect.as_deref() {
+            if target.len() > MAX_SOUND_NAME_BYTES {
+                return Err(SoundError::SoundNameTooLong { len: target.len() });
+            }
         }
         Ok(Self {
             name,
@@ -240,15 +348,22 @@ impl SoundFile {
             weight: weight.max(1),
             stream,
             attenuation_distance,
+            redirect,
         })
     }
 }
 
 /// One raw event, as the file writes it: unknown keys fail nothing, so a
 /// future key cannot break the read.
+///
+/// An absent `category` defaults to `master`, as the source's deserialiser
+/// does (`SoundListSerializer.java:20` falls back to
+/// `SoundCategory.MASTER.getCategoryName()`, which is `"master"`
+/// (`SoundCategory.java:8`)).
 #[derive(Deserialize)]
 struct RawEvent {
-    /// The sound category.
+    /// The sound category; `master` when the file states none.
+    #[serde(default = "default_category")]
     category: String,
     /// The event-level stream flag, when the file states one.
     #[serde(default)]
@@ -257,17 +372,26 @@ struct RawEvent {
     sounds: Vec<RawSound>,
 }
 
+/// The category an event without one plays under.
+fn default_category() -> String {
+    "master".to_string()
+}
+
 /// One raw sound entry: a bare path, or the object form.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawSound {
     /// The bare-path form.
     Path(String),
-    /// The object form; any other key (the store's copy carries one
-    /// `"type": "event"` entry) is ignored.
+    /// The object form; any other key is ignored, but `type` is kept: an
+    /// entry with `"type": "event"` names another event and becomes a
+    /// redirect (see [`SoundFile::redirect`]).
     Full {
-        /// The sound path.
+        /// The sound path — or the target event, for a redirect.
         name: String,
+        /// The entry kind (`"file"` or `"event"`), when the file states one.
+        #[serde(rename = "type", default)]
+        sound_type: Option<String>,
         /// The volume multiplier, when the file states one.
         #[serde(default)]
         volume: Option<f32>,
@@ -358,6 +482,136 @@ mod tests {
         let event = &index.events["music.game.creative"];
         assert_eq!(event.sounds.len(), 2);
         assert_eq!(event.sounds[0].name, "music.game");
+        assert_eq!(
+            event.sounds[0].redirect.as_deref(),
+            Some("music.game"),
+            "the event entry is kept as a redirect"
+        );
+        assert_eq!(event.sounds[1].redirect, None);
+    }
+
+    #[test]
+    fn a_missing_category_defaults_to_master() {
+        let bytes = br#"{ "lonely": { "sounds": ["random/click"] } }"#;
+        let index = SoundIndex::parse(bytes).expect("a category-less event parses");
+        assert_eq!(index.events["lonely"].category, "master");
+    }
+
+    /// The redirect shape: one redirect at `music.game` (twelve files,
+    /// weight 1 each) ahead of six plain files.
+    fn redirect_index() -> SoundIndex {
+        let mut document = String::from(
+            "{\"music.game.creative\": {\"category\": \"music\", \"sounds\": [{\"type\": \"event\", \"name\": \"music.game\"},",
+        );
+        for n in 1..=6 {
+            document.push_str(&format!(
+                "{{\"name\": \"music/game/creative/creative{n}\", \"stream\": true}},"
+            ));
+        }
+        document.pop();
+        document.push_str("]}, \"music.game\": {\"category\": \"music\", \"sounds\": [");
+        for n in 1..=12 {
+            document.push_str(&format!("\"music/game/calm{n}\","));
+        }
+        document.pop();
+        document.push_str("]}}");
+        SoundIndex::parse(document.as_bytes()).expect("the redirect fixture parses")
+    }
+
+    #[test]
+    fn the_redirect_lends_the_target_total() {
+        let index = redirect_index();
+        assert_eq!(index.total_weight("music.game"), 12.0);
+        assert_eq!(
+            index.total_weight("music.game.creative"),
+            18.0,
+            "the redirect lends 12 and the six files add 6"
+        );
+    }
+
+    #[test]
+    fn the_redirect_span_boundary_pins() {
+        let index = redirect_index();
+        let name = |roll: f32| {
+            index
+                .pick("music.game.creative", roll)
+                .map(|sound| sound.name.clone())
+        };
+        // The redirect spans the leading 12/18: a roll below 12/18 lands
+        // inside it and delegates into the target's files, a roll above
+        // lands on the plain files.
+        let first = name(0.0).expect("roll 0 resolves");
+        assert!(
+            first.starts_with("music/game/calm"),
+            "a redirect win resolves into the target's files, not the redirect: {first}"
+        );
+        let last = name(0.999).expect("a late roll resolves");
+        assert!(
+            last.starts_with("music/game/creative/creative"),
+            "a roll past the span lands on the plain files: {last}"
+        );
+        let edge = name(12.0 / 18.0).expect("the boundary resolves");
+        assert!(
+            edge.starts_with("music/game/creative/creative"),
+            "at 12/18 the redirect's span is spent: {edge}"
+        );
+    }
+
+    #[test]
+    fn a_redirect_win_keeps_the_target_flags() {
+        let bytes = br#"{
+            "target": {
+                "category": "music",
+                "sounds": [{ "name": "music/game/calm1", "stream": true, "volume": 0.5 }]
+            },
+            "holder": {
+                "category": "master",
+                "sounds": [{ "type": "event", "name": "target" }]
+            }
+        }"#;
+        let index = SoundIndex::parse(bytes).expect("the fixture parses");
+        assert_eq!(index.total_weight("holder"), 1.0);
+        let file = index.pick("holder", 0.0).expect("the lent span resolves");
+        assert_eq!(file.name, "music/game/calm1");
+        assert_eq!(file.stream, Some(true));
+        assert_eq!(file.volume, 0.5);
+    }
+
+    #[test]
+    fn a_missing_target_lends_zero_and_is_never_picked() {
+        let bytes = br#"{
+            "holder": {
+                "category": "master",
+                "sounds": [
+                    { "type": "event", "name": "gone" },
+                    "random/click"
+                ]
+            }
+        }"#;
+        let index = SoundIndex::parse(bytes).expect("the fixture parses");
+        assert_eq!(
+            index.total_weight("holder"),
+            1.0,
+            "the missing target lends zero"
+        );
+        for roll in [0.0, 0.25, 0.5, 0.75, 0.999] {
+            let file = index.pick("holder", roll).expect("a roll resolves");
+            assert_eq!(
+                file.redirect, None,
+                "the missing target is never picked (roll {roll})"
+            );
+            assert_eq!(file.name, "random/click");
+        }
+    }
+
+    #[test]
+    fn a_redirect_cycle_resolves_to_nothing() {
+        let bytes = br#"{
+            "loop": { "category": "master", "sounds": [{ "type": "event", "name": "loop" }] }
+        }"#;
+        let index = SoundIndex::parse(bytes).expect("the fixture parses");
+        assert_eq!(index.total_weight("loop"), 0.0);
+        assert_eq!(index.pick("loop", 0.5), None);
     }
 
     #[test]
