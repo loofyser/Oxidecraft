@@ -885,14 +885,15 @@ impl Renderer {
         self.particles.upload(&self.device, &self.queue, draws);
     }
 
-    /// Sets the weather columns the next frames draw, scrolled by `tick`; an
-    /// empty slice draws nothing.
+    /// Sets the weather columns the next frames draw, scrolled by `tick` and
+    /// oriented around `viewer` — the floored feet block the session boxed
+    /// the columns around.
     ///
     /// The ribbons are built and uploaded on the call, so a frame draws
     /// exactly the columns the caller last set.
-    pub fn set_weather(&mut self, columns: &[WeatherColumn], tick: u32) {
+    pub fn set_weather(&mut self, columns: &[WeatherColumn], tick: u32, viewer: [i32; 2]) {
         self.weather
-            .upload(&self.device, &self.queue, columns, tick);
+            .upload(&self.device, &self.queue, columns, tick, viewer);
     }
 
     /// Uploads the `particles.png` cells sheet the particle pass's cell quads

@@ -1121,8 +1121,6 @@ struct WeatherParticleFeeds {
     columns_tick: u32,
     /// The latest snapshot, in draw order; empty draws no quads.
     frames: Vec<ParticleFrame>,
-    /// The session tick the snapshot rode in on.
-    frames_tick: u32,
 }
 
 /// One live destroy stage the window holds for the crack pass.
@@ -1994,8 +1992,14 @@ impl ClientApp {
             // and the overlay.
             renderer.set_held_item(&self.view.held_frame(Instant::now()));
             // The weather columns: the kept report, fed every frame; the tick
-            // scrolls the pass's sheets.
-            renderer.set_weather(&weather_draws(&self.feeds.columns), self.feeds.columns_tick);
+            // scrolls the pass's sheets, the floored feet orient the ribbons
+            // around the block the session boxed them around.
+            let feet = self.player.current.position;
+            renderer.set_weather(
+                &weather_draws(&self.feeds.columns),
+                self.feeds.columns_tick,
+                [feet[0].floor() as i32, feet[2].floor() as i32],
+            );
             // The particle quads: the kept snapshot interpolated at this
             // frame's fraction, the atlas and icon rects resolved against the
             // loaded assets. Without assets the pass keeps its empty upload
@@ -4153,11 +4157,12 @@ fn apply_session_event(
             feeds.columns_tick = tick;
             false
         }
-        ClientEvent::Particles { frames, tick } => {
+        ClientEvent::Particles { frames, .. } => {
             // The frame maps the kept snapshot into the particle pass's
-            // draws every frame, interpolated at its fraction.
+            // draws every frame, interpolated at its fraction; the report's
+            // tick only names the snapshot and feeds no clock, so the frames
+            // alone are kept.
             feeds.frames = frames;
-            feeds.frames_tick = tick;
             false
         }
         // The window's own three ride here unconsumed: the screens fold above

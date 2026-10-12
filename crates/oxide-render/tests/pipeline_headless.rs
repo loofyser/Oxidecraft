@@ -12095,6 +12095,27 @@ fn weather_column(y0: i32, y1: i32) -> WeatherColumn {
     }
 }
 
+/// Renders `columns` through the weather pass at `tick` under `camera`,
+/// oriented around `viewer`, and reads the frame back: the sky-clear colour
+/// behind, the pass's ribbons over it.
+fn render_weather_at(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: Camera,
+    columns: &[WeatherColumn],
+    tick: u32,
+    viewer: [i32; 2],
+) -> Vec<u8> {
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(device, format);
+    let depth = create_depth(device);
+    let mut weather = WeatherPass::new(device, queue, format);
+    weather.set_camera(queue, camera, 1.0);
+    weather.set_sheets(device, queue, &weather_sheet(), &weather_sheet());
+    weather.upload(device, queue, columns, tick, viewer);
+    render_scene(device, queue, &target, &depth, |pass| weather.draw(pass))
+}
+
 /// Renders `columns` through the weather pass at `tick` and reads the frame
 /// back: the sky-clear colour behind, the pass's ribbons over it.
 fn render_weather(
@@ -12103,14 +12124,23 @@ fn render_weather(
     columns: &[WeatherColumn],
     tick: u32,
 ) -> Vec<u8> {
-    let format = wgpu::TextureFormat::Rgba8Unorm;
-    let target = create_target(device, format);
-    let depth = create_depth(device);
-    let mut weather = WeatherPass::new(device, queue, format);
-    weather.set_camera(queue, weather_camera(), 1.0);
-    weather.set_sheets(device, queue, &weather_sheet(), &weather_sheet());
-    weather.upload(device, queue, columns, tick);
-    render_scene(device, queue, &target, &depth, |pass| weather.draw(pass))
+    render_weather_at(device, queue, weather_camera(), columns, tick, [0, -4])
+}
+
+/// A camera at `feet` looking along `yaw`, level.
+fn weather_yaw(feet: [f64; 3], yaw: f32) -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: feet,
+            yaw,
+            pitch: 0.0,
+            sneak: false,
+        },
+        fov_degrees: DEFAULT_FOV,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
 }
 
 /// The streak colour a fully lit white sheet reads back as: the sheet times
@@ -12172,6 +12202,77 @@ fn the_weather_pass_draws_rain_columns_over_a_clear_frame() {
     assert!(
         narrowed < tall,
         "the shorter quad inks fewer rows: {narrowed} vs {tall}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_ribbons_hold_still_across_yaw() {
+    // The source's quads are fixed-orientation — the per-column `(±d3, ±d4)`
+    // offsets under a pure translation — so its streaks hold still while the
+    // camera turns. The same two columns render under two yaws from one spot.
+    //
+    // Against the session viewer (0, -4) the (4, -4) column's table entry is
+    // `(0, 0.5)`: its ribbon lies in the x = 4.5 plane. A camera at
+    // (4.5, 2.5, -8) facing +z looks straight down that plane — edge-on —
+    // while a billboarded ribbon stands across the view and inks the centre.
+    let (device, queue) = headless_device();
+    let edge = WeatherColumn {
+        x: 4,
+        z: -4,
+        y0: 1,
+        y1: 4,
+        snow: false,
+        alpha: 1.0,
+        block_light: 15,
+        sky_light: 15,
+    };
+    // The (0, -1) column's ribbon lies in the z = -0.5 plane, across the
+    // second yaw below: it proves the pass draws (the edge-on pin is not
+    // vacuous).
+    let face = WeatherColumn {
+        x: 0,
+        z: -1,
+        y0: 1,
+        y1: 4,
+        snow: false,
+        alpha: 1.0,
+        block_light: 15,
+        sky_light: 15,
+    };
+    let columns = [edge, face];
+    let eye = 2.5 - f64::from(EYE_HEIGHT);
+    let along = render_weather_at(
+        &device,
+        &queue,
+        weather_yaw([4.5, eye, -8.0], 0.0),
+        &columns,
+        7,
+        [0, -4],
+    );
+    expect_pixel(
+        &along,
+        SIZE / 2,
+        SIZE / 2,
+        SKY,
+        "the edge-on ribbon inks nothing at the centre",
+    );
+    // Turned to face the second column dead on — its centre sits 8.5 blocks
+    // out at `asin(4/8.5)` — the centre ray meets a full streak.
+    let facing = render_weather_at(
+        &device,
+        &queue,
+        weather_yaw([4.5, eye, -8.0], 28.07),
+        &columns,
+        7,
+        [0, -4],
+    );
+    expect_pixel(
+        &facing,
+        SIZE / 2,
+        SIZE / 2,
+        streak_colour(),
+        "the faced ribbon meets the centre ray",
     );
 }
 

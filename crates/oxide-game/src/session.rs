@@ -936,8 +936,9 @@ pub enum ClientEvent {
     ///
     /// Reported once per tick while the pool holds a visible particle, plus
     /// the first empty tick after — never for a settled empty pool. The
-    /// window keeps the last report and feeds it to the pass every frame;
-    /// the tick is the weather scroll's clock for the pass's sheets.
+    /// window keeps the last report's frames and feeds them to the pass every
+    /// frame, interpolated at the frame's own fraction; the tick only names
+    /// the snapshot — the particle pass takes no scroll clock.
     Particles {
         /// The snapshot's frames, in draw order.
         frames: Vec<ParticleFrame>,

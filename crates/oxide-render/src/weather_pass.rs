@@ -24,11 +24,12 @@
 //! * Thunder has no visual in the rain pass — only the fog dim (landed) and
 //!   the lightning entity (recorded) — so the params carry no thunder.
 //!
-//! The ribbon is the source's quad extent: the column's centre ± a quarter
-//! block along the camera's horizontal axis, spanning `y0..y1`, with
-//! `v = y * 0.25 + scroll` down the sheet. The state around the draw is the
-//! source's: `SRC_ALPHA/ONE_MINUS_SRC_ALPHA`, the 0.1 alpha test, no culling
-//! and the depth test left writing.
+//! The ribbon is the source's quad: the column's centre ± the table's
+//! per-column `(d3, d4)` offsets, spanning `y0..y1`, with `v = y * 0.25 +
+//! scroll` down the sheet — fixed-orientation under the pass's translation,
+//! never turned toward the camera. Snow packs the brightened light. The
+//! state around the draw is the source's: `SRC_ALPHA/ONE_MINUS_SRC_ALPHA`,
+//! the 0.1 alpha test, no culling and the depth test left writing.
 
 use glam::Vec3;
 
@@ -151,9 +152,36 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 /// per-second rate.
 const SCROLL_FRAMES_PER_TICK: f32 = 3.0;
 
-/// The ribbon's half width in blocks: the source's quad spans the column's
-/// centre ± its `d3/d4` offsets, a quarter block each way.
-const RIBBON_HALF_WIDTH: f32 = 0.25;
+/// The source's per-column direction table: `rainXCoords` beside
+/// `rainYCoords`, 1024 entries over the 32×32 box (`EntityRenderer.java:195-203`).
+/// Row `i` is the z step, column `j` the x step; each entry is the unit
+/// circle `(-(i-16), j-16) / len`, the offsets the quads read halved as
+/// `(d3, d4)`.
+fn rain_table() -> [[f32; 2]; 1024] {
+    let mut table = [[0.0f32; 2]; 1024];
+    for i in 0..32i32 {
+        for j in 0..32i32 {
+            let f = (j - 16) as f32;
+            let f1 = (i - 16) as f32;
+            let f2 = (f * f + f1 * f1).sqrt();
+            table[(i * 32 + j) as usize] = [-f1 / f2, f / f2];
+        }
+    }
+    table
+}
+
+/// The ribbon's half offsets for the column `(dx, dz)` steps from the
+/// viewer: the table entry halved, the source's `(d3, d4)`
+/// (`EntityRenderer.java:1635-1636`). `None` past the table's box — the
+/// session's radius never reaches there, so such a column draws nothing.
+fn ribbon_half(table: &[[f32; 2]; 1024], dx: i32, dz: i32) -> Option<[f32; 2]> {
+    let (ix, iz) = (dx + 16, dz + 16);
+    if !(0..32).contains(&ix) || !(0..32).contains(&iz) {
+        return None;
+    }
+    let entry = table[(iz * 32 + ix) as usize];
+    Some([entry[0] * 0.5, entry[1] * 0.5])
+}
 
 /// The sheet v one block of streak covers: the source's `y * 0.25`.
 const V_PER_BLOCK: f32 = 0.25;
@@ -239,7 +267,7 @@ fn snow_scroll(tick: u32) -> f32 {
 
 /// The snow ribbon's static sideways offset in blocks: the source drifts
 /// the snow quads per tick (`d9/d10`); this port holds the drift still at
-/// the hash's own fraction, ± half a block.
+/// the hash's own fraction, ± half a block along the ribbon.
 fn snow_offset(hash: i32) -> f32 {
     f32::from((hash & 0xFF) as u8) / 255.0 - 0.5
 }
@@ -251,39 +279,45 @@ fn pack_light(level: u8) -> u16 {
     u16::from(level.min(15)) * 16 + 8
 }
 
-/// The ribbon's horizontal axis for a camera looking along `forward`: the
-/// unit vector across the view, falling back to +x when the view is straight
-/// down.
-fn ribbon_axis(forward: Vec3) -> Vec3 {
-    let flat = Vec3::new(forward.x, 0.0, forward.z);
-    if flat.length_squared() < 1e-6 {
-        Vec3::X
-    } else {
-        Vec3::new(-flat.z, 0.0, flat.x).normalize()
-    }
+/// The snow arm's brightened light for one `0-15` level: the source lights
+/// `(combined*3+15728880)/4` (`EntityRenderer.java:1719`), where `15728880`
+/// is the packed full bright `(15 << 20) | (15 << 4)` and each channel rides
+/// four bits up — so per channel `(3·level+15)·4` in the packed units the
+/// rain arm reads as `level·16`, plus the texel-centre eight this pass packs
+/// with. The arithmetic is exact (no rounding); full bright stays full
+/// bright, zero light reads over a quarter.
+fn snow_light(level: u8) -> u16 {
+    (u16::from(level.min(15)) * 16 * 3 + 240) / 4 + 8
 }
 
-/// One column's ribbon vertices: the centre ± [`RIBBON_HALF_WIDTH`] along
-/// `axis` (plus the snow's static `offset`), spanning `y0..y1`, with `v`
-/// running `y * 0.25 + scroll` down the sheet.
+/// One column's ribbon vertices: the centre ± the table's `half` offsets
+/// (plus the snow's static `offset` along the ribbon), spanning `y0..y1`,
+/// with `v` running `y * 0.25 + scroll` down the sheet. Snow columns pack
+/// the brightened light ([`snow_light`]); rain columns the plain pair.
 fn ribbon_vertices(
     column: &WeatherColumn,
-    axis: Vec3,
+    half: [f32; 2],
     scroll: f32,
     offset: f32,
 ) -> [WeatherVertex; 4] {
-    let centre = Vec3::new(
-        column.x as f32 + 0.5 + offset * axis.x,
-        0.0,
-        column.z as f32 + 0.5 + offset * axis.z,
-    );
-    let half = axis * RIBBON_HALF_WIDTH;
-    let light = [pack_light(column.block_light), pack_light(column.sky_light)];
+    // The ribbon's unit direction carries the snow's hold-still offset; over
+    // the table's NaN centre entry the length is NaN and the corners stay
+    // NaN, exactly as the source's 0/0 entry holds.
+    let len = (half[0] * half[0] + half[1] * half[1]).sqrt();
+    let centre = [
+        column.x as f32 + 0.5 + offset * half[0] / len,
+        column.z as f32 + 0.5 + offset * half[1] / len,
+    ];
+    let light = if column.snow {
+        [snow_light(column.block_light), snow_light(column.sky_light)]
+    } else {
+        [pack_light(column.block_light), pack_light(column.sky_light)]
+    };
     let alpha = column.alpha.clamp(0.0, 1.0);
     let y0 = column.y0 as f32;
     let y1 = column.y1 as f32;
     let corner = |side: f32, y: f32| WeatherVertex {
-        position: (centre + half * side).with_y(y).to_array(),
+        position: [centre[0] + half[0] * side, y, centre[1] + half[1] * side],
         uv: [if side < 0.0 { 0.0 } else { 1.0 }, y * V_PER_BLOCK + scroll],
         light,
         alpha,
@@ -437,9 +471,10 @@ pub struct WeatherPass {
     rain_mesh: Option<SheetMesh>,
     /// The snow ribbons the last upload built.
     snow_mesh: Option<SheetMesh>,
-    /// The camera's forward at the last [`WeatherPass::set_camera`]: the
-    /// axis the next upload billboards around.
-    forward: Vec3,
+    /// The source's per-column direction table ([`rain_table`]), built with
+    /// the pass: the next upload indexes it per column, so the ribbons never
+    /// depend on the camera.
+    rain_table: [[f32; 2]; 1024],
 }
 
 impl WeatherPass {
@@ -650,12 +685,11 @@ impl WeatherPass {
             snow: None,
             rain_mesh: None,
             snow_mesh: None,
-            forward: Vec3::NEG_Z,
+            rain_table: rain_table(),
         }
     }
 
-    /// Writes the camera's view-projection matrix and keeps its forward for
-    /// the next upload's billboard axis.
+    /// Writes the camera's view-projection matrix.
     ///
     /// The renderer calls this once per frame with the surface's current
     /// aspect ratio, so a resize cannot leave a stale projection behind.
@@ -663,7 +697,6 @@ impl WeatherPass {
         let view_projection = camera.view_projection(aspect);
         let eye = camera.eye() - FIRST_PERSON_OFFSET * camera.forward();
         queue.write_buffer(&self.camera_buffer, 0, &camera_bytes(view_projection, eye));
-        self.forward = camera.forward();
     }
 
     /// Uploads the rain and snow sheets the columns draw through.
@@ -724,20 +757,21 @@ impl WeatherPass {
     }
 
     /// Replaces the columns the next draw builds, scrolling the sheets by
-    /// `tick`.
+    /// `tick` and orienting each ribbon from `viewer` — the floored feet
+    /// block the session boxed the columns around, which the table indexes
+    /// by.
     ///
-    /// Each column becomes one ribbon billboarded around the camera's
-    /// forward at the last [`WeatherPass::set_camera`]; an empty slice
-    /// clears both arms, so a settled tick draws nothing until the next
-    /// upload.
+    /// Each column becomes one fixed-orientation ribbon from the table's
+    /// per-column offsets; an empty slice clears both arms, so a settled
+    /// tick draws nothing until the next upload.
     pub fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         columns: &[WeatherColumn],
         tick: u32,
+        viewer: [i32; 2],
     ) {
-        let axis = ribbon_axis(self.forward);
         let mut rain_vertices = Vec::new();
         let mut snow_vertices = Vec::new();
         for column in columns {
@@ -745,17 +779,22 @@ impl WeatherPass {
                 continue;
             }
             let hash = column_hash(column.x, column.z);
+            let Some(half) =
+                ribbon_half(&self.rain_table, column.x - viewer[0], column.z - viewer[1])
+            else {
+                continue;
+            };
             if column.snow {
                 snow_vertices.extend_from_slice(&ribbon_vertices(
                     column,
-                    axis,
+                    half,
                     snow_scroll(tick),
                     snow_offset(hash),
                 ));
             } else {
                 rain_vertices.extend_from_slice(&ribbon_vertices(
                     column,
-                    axis,
+                    half,
                     rain_scroll(tick, hash),
                     0.0,
                 ));
@@ -935,6 +974,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_direction_table_matches_the_source_circle() {
+        // Spot entries of `rainXCoords/rainYCoords`: (dx, dz) -> the unit
+        // circle (-dz, dx) / len, row i the z step and column j the x step.
+        let table = rain_table();
+        let at = |dx: i32, dz: i32| table[((dz + 16) * 32 + (dx + 16)) as usize];
+        let entry = at(4, 0);
+        assert!(
+            entry[0].abs() < 1e-6 && (entry[1] - 1.0).abs() < 1e-6,
+            "straight east reads (0, 1): {entry:?}"
+        );
+        let entry = at(0, 3);
+        assert!(
+            (entry[0] + 1.0).abs() < 1e-6 && entry[1].abs() < 1e-6,
+            "straight south reads (-1, 0): {entry:?}"
+        );
+        let entry = at(2, 2);
+        let quarter = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (entry[0] + quarter).abs() < 1e-6 && (entry[1] - quarter).abs() < 1e-6,
+            "the diagonal reads (-1, 1) / sqrt(8): {entry:?}"
+        );
+        let centre = at(0, 0);
+        assert!(
+            centre[0].is_nan() && centre[1].is_nan(),
+            "the source divides 0/0 at its own feet, and so does the table: {centre:?}"
+        );
+        assert_eq!(
+            ribbon_half(&table, 4, 0),
+            Some([0.0, 0.5]),
+            "the quads read the entry halved"
+        );
+        assert_eq!(
+            ribbon_half(&table, 20, 0),
+            None,
+            "past the table's box no ribbon builds"
+        );
+    }
+
+    #[test]
     fn the_column_hash_is_deterministic_and_spreads() {
         assert_eq!(column_hash(3, -2), column_hash(3, -2));
         assert_ne!(column_hash(3, -2), column_hash(-2, 3));
@@ -974,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ribbon_spans_the_extent_at_a_quarter_block_each_way() {
+    fn the_ribbon_spans_the_table_offsets_each_way() {
         let column = WeatherColumn {
             x: 0,
             z: 0,
@@ -985,13 +1063,14 @@ mod tests {
             block_light: 15,
             sky_light: 15,
         };
-        let corners = ribbon_vertices(&column, Vec3::X, 0.0, 0.0);
+        let corners = ribbon_vertices(&column, [0.5, 0.0], 0.0, 0.0);
         let xs: Vec<f32> = corners.iter().map(|corner| corner.position[0]).collect();
-        assert_eq!(xs, [0.25, 0.75, 0.75, 0.25]);
+        assert_eq!(xs, [0.0, 1.0, 1.0, 0.0]);
         assert_eq!(
             corners.map(|corner| corner.position[1]),
             [1.0, 1.0, 4.0, 4.0]
         );
+        assert_eq!(corners.map(|corner| corner.position[2]), [0.5; 4]);
         assert_eq!(corners.map(|corner| corner.uv[0]), [0.0, 1.0, 1.0, 0.0]);
         assert_eq!(corners[0].uv[1], 1.0 * V_PER_BLOCK);
         assert_eq!(corners[2].uv[1], 4.0 * V_PER_BLOCK);
@@ -1000,12 +1079,42 @@ mod tests {
     }
 
     #[test]
-    fn the_ribbon_axis_falls_back_straight_down() {
-        assert_eq!(ribbon_axis(Vec3::NEG_Y), Vec3::X);
-        let axis = ribbon_axis(Vec3::Z);
-        assert!(
-            (axis - Vec3::X).length() < 1e-6 || (axis + Vec3::X).length() < 1e-6,
-            "across a +z view: {axis:?}"
+    fn snow_brightens_the_light_over_rain() {
+        // The source's snow arm lights `(combined*3+15728880)/4` against the
+        // rain arm's plain combined light, so a snow column packs a brighter
+        // pair than a rain column under the same levels.
+        let rain = WeatherColumn {
+            x: 0,
+            z: 0,
+            y0: 1,
+            y1: 4,
+            snow: false,
+            alpha: 1.0,
+            block_light: 0,
+            sky_light: 0,
+        };
+        let snow = WeatherColumn { snow: true, ..rain };
+        let rain_light = ribbon_vertices(&rain, [0.5, 0.0], 0.0, 0.0)[0].light;
+        let snow_light = ribbon_vertices(&snow, [0.5, 0.0], 0.0, 0.0)[0].light;
+        assert_eq!(rain_light, [8, 8], "the rain pair at zero light");
+        assert_eq!(
+            snow_light,
+            [68, 68],
+            "zero light reads over a quarter: (0·3+15)·4+8"
+        );
+        let bright = WeatherColumn {
+            block_light: 15,
+            sky_light: 15,
+            ..rain
+        };
+        let bright_snow = WeatherColumn {
+            snow: true,
+            ..bright
+        };
+        assert_eq!(
+            ribbon_vertices(&bright_snow, [0.5, 0.0], 0.0, 0.0)[0].light,
+            ribbon_vertices(&bright, [0.5, 0.0], 0.0, 0.0)[0].light,
+            "full bright stays full bright"
         );
     }
 }

@@ -17,9 +17,13 @@
 //!   interpolates each quad's position between its previous and current tick
 //!   at feed time (the source's `interpPos`), but the sheets themselves have
 //!   no per-frame clock here.
-//! * The layer-3 entity-particle batch never renders in the source either
-//!   (the loop runs `i < 3` over layers 0-2 with only 0 and 1 bound), so the
-//!   pass draws the cells then the atlas and nothing else.
+//! * Layer 3 renders in the source through its own lit path
+//!   (`renderLitParticles` at `EntityRenderer.java:1443`, drawing
+//!   `fxLayers[3]` — the footstep, large-explosion, emitter, pickup and
+//!   mob-appearance rows), but the engine hides every layer-3 row today, so
+//!   the pass draws the cells then the atlas and nothing else. Unhiding any
+//!   of those rows needs the lit variant first (the yaw/pitch basis, without
+//!   the billboard vectors — `EffectRenderer.java:327+`).
 
 use glam::Vec3;
 
