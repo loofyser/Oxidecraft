@@ -443,13 +443,13 @@ feat: the pumpkin, portal and block-in-hand overlays (render)
 
 ### Task 13: The combat, digging and sprint particle taps
 
-**Goal:** The local particle spawn sites land: block-break and digging particles from the dig path, footstep/land clouds while sprinting and on landing, bubbles and splash on water entry — each at the source's own spawn rule.
+**Goal:** The local particle spawn sites land: block-break and digging particles from the dig path, block-crack crumbs while sprinting, bubbles and splash on water entry, and the crit emitters on combat — each at the source's own spawn rule. (Landing dust has no local spawn site — `EntityLivingBase.updateFallState:233-253` is server-side and arrives via the wire; and placing spawns nothing — sound only.)
 
 **Files:**
-- Modify: `crates/oxide-game/src/interaction.rs` — the dig progress/completion taps (`spawnBlockParticles`-shaped calls: position, the block's sprite, the face — derive the source's rule), the place tap, the water-entry tap (`splash` + `bubble`).
-- Modify: `crates/oxide-game/src/session.rs` — the sprint/land footprint tap (the `run-particle` rule: `FOOTSTEP`/`footprint` per the source's per-tick condition).
-- Modify: `crates/oxide-game/src/player.rs` or the physics edge — the landing event's tap.
-- Test: `crates/oxide-game/tests/particles.rs` — extension: a dig tick spawns the pinned count/direction; a landing spawns the pinned rule; the sprint rule's tick gating.
+- Modify: `crates/oxide-game/src/interaction.rs` and the session-side staging points — the dig hit tap (one `EntityDiggingFX`-shaped spawn at the 0.1-inset face cell, velocity ×0.2, scale ×0.6; `EffectRenderer.addBlockHitEffects:395-442`) and the destroy tap (64 spores at `(j/k/l + 0.5)/4` per cell, non-air only; `addBlockDestroyEffects:369-393`); the water-entry fan-outs (`1 + width*20` each of bubble and splash; `Entity.handleWaterMovement:1111-1129`). Placing spawns nothing — record-nothing with the source cited.
+- Modify: `crates/oxide-game/src/session.rs` — the sprint crumbs (one `BLOCK_CRACK` per tick while sprinting and dry at `(posX ± rand·width/2, minY + 0.1, posZ ± rand·width/2)`, velocity `(-motionX·4, 1.5, -motionZ·4)`, data = the stood-on cell's state id; `Entity.createRunningParticles:1172-1188`) and the crit emitters (the S0B 4/5 animation arm plus the local attack path; 16 tries in a unit sphere, ids 9/10; `EntityParticleEmitter`). `FOOTSTEP` (id 28) has no spawn site in the source — it is registration-only (`EffectRenderer.java:90`).
+- Landing needs no tap: the own-player local dust site does not exist (the `fallDistance` arm is `!isRemote`-gated) — the wire path is Task 7's.
+- Test: `crates/oxide-game/tests/particles.rs` — extension: a dig tick spawns the pinned count/direction; the destroy fan-out's 64 non-air spores; the sprint gating (sprinting and dry only, one per tick); the water-entry counts; the crit emitter's 16 tries and ids (landing excluded — server-side).
 
 **Interfaces:**
 - Produces: the spawn call sites against Task 7's `spawn_local`; each rule's constants (counts, half-block spread) derive in-task and pin.
@@ -460,7 +460,7 @@ feat: the pumpkin, portal and block-in-hand overlays (render)
 - [ ] **Step 3: Gate and commit.** Run the full gate. Commit:
 
 ```
-feat: the digging, landing and sprint particle taps (game)
+feat: the digging, combat and sprint particle taps (game)
 ```
 
 **Verification:** the new cases; the dig/world suites re-run green; the full gate.
