@@ -1511,7 +1511,7 @@ mod tests {
         // The Overworld's colour at noon, the eye on the ground and the render distance at its
         // thirty-two-chunk maximum, where the sky mix contributes nothing and the full-light
         // brightness factor is one (`fog_colour`'s own tests pin the steps).
-        let colour = fog_colour(0, 6000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
+        let colour = fog_colour(0, 6000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15, 0.0, 0.0);
         let clear = clear_colour(Some(FogParams {
             colour,
             start: 24.0,

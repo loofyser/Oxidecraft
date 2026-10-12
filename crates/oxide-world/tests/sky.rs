@@ -13,7 +13,7 @@
 use oxide_proto_v47::column::{ColumnData, SectionData};
 use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, sky_colour_at_temperature,
-    star_brightness, sun_brightness,
+    star_brightness, sun_brightness, sunrise_sunset_colours,
 };
 use oxide_world::world::World;
 
@@ -74,14 +74,14 @@ fn the_sun_brightness_reaches_its_noon_and_midnight_values() {
 }
 
 /// The stars' brightness: `clamp(1 - (cos * 2 + 0.25))`, squared and halved
-/// (`World.java:1596-1603`), times the rain factor `1 - rain` `RenderGlobal` multiplies in
-/// (`RenderGlobal.java:1325`) — zero through the day, half at midnight, and dimmed by rain.
+/// (`World.java:1596-1603`) — zero through the day, half at midnight. The rain dim lives at
+/// the draw (`RenderGlobal.java:1325` multiplies by `1 - rain`), so this value is pure: the
+/// pass owns the weather read.
 #[test]
 fn the_star_brightness_is_zero_by_day_and_half_at_midnight() {
-    assert_eq!(star_brightness(6000, 0.0, 0.0), 0.0, "noon");
-    assert_eq!(star_brightness(18000, 0.0, 0.0), 0.5, "midnight");
-    assert_eq!(star_brightness(18000, 0.0, 1.0), 0.0, "rained out");
-    assert_eq!(star_brightness(18000, 0.0, 0.5), 0.25, "half the rain");
+    assert_eq!(star_brightness(6000, 0.0), 0.0, "noon");
+    assert_eq!(star_brightness(18000, 0.0), 0.5, "midnight");
+    assert_eq!(star_brightness(0, 0.0), 0.0, "sunrise is still dark");
 }
 
 /// The biome temperature ramp's two ends and the middle, at the noon angle: the byte
@@ -188,7 +188,7 @@ fn the_moon_phase_steps_once_a_day() {
 fn the_sky_colour_samples_the_view_blocks_biome() {
     let empty = World::new(true);
     assert_eq!(
-        sky_colour(&empty, 12, 70, -3, 0.0),
+        sky_colour(&empty, 12, 70, -3, 0.0, 0.0),
         [123.0 / 255.0, 164.0 / 255.0, 1.0],
         "with no column loaded the fallback biome answers"
     );
@@ -198,12 +198,12 @@ fn the_sky_colour_samples_the_view_blocks_biome() {
     // adjustment only bites above y = 64.
     let plains = world_of(1);
     assert_eq!(
-        sky_colour(&plains, 12, 64, -3, 0.0),
+        sky_colour(&plains, 12, 64, -3, 0.0, 0.0),
         [120.0 / 255.0, 167.0 / 255.0, 1.0],
         "plains at sea level"
     );
     assert_eq!(
-        sky_colour(&plains, -20, 3, 30, 0.0),
+        sky_colour(&plains, -20, 3, 30, 0.0, 0.0),
         [120.0 / 255.0, 167.0 / 255.0, 1.0],
         "the same column, another block"
     );
@@ -211,7 +211,7 @@ fn the_sky_colour_samples_the_view_blocks_biome() {
     // A desert column answers the hot end.
     let desert = world_of(2);
     assert_eq!(
-        sky_colour(&desert, 12, 64, -3, 0.0),
+        sky_colour(&desert, 12, 64, -3, 0.0, 0.0),
         [110.0 / 255.0, 177.0 / 255.0, 1.0],
         "desert at sea level"
     );
@@ -245,4 +245,61 @@ fn world_of(id: u8) -> World {
         }
     }
     world
+}
+
+/// The sky's rain blend at the plains column (`World.java:1450-1459`): full rain mixes each
+/// channel toward the grey `0.6` of its own luminance at `1 - rain * 0.75` — the noon plains
+/// triple `[0.47058824, 0.654902, 1.0]` greys to `[0.40455295, 0.45063139, 0.53690589]`.
+/// Clear skies read the ramp untouched (every pin above passes `0.0`).
+#[test]
+fn the_sky_colour_greys_with_the_rain() {
+    let plains = world_of(1);
+    let rained = sky_colour(&plains, 12, 64, -3, 0.0, 1.0);
+    let want = [0.40455295, 0.45063139, 0.536_905_9];
+    for axis in 0..3 {
+        assert!(
+            (rained[axis] - want[axis]).abs() < 1e-6,
+            "the rained plains triple, axis {axis}: got {}, want {}",
+            rained[axis],
+            want[axis]
+        );
+    }
+}
+
+/// The sunset disc's quad (`WorldProvider.java:151-175`): `None` at noon and midnight, the
+/// full-fade `[0.85, 0.375, 0.2, 1.0]` at the band's centre (angle `0.25`, where
+/// `cos(angle * 2pi)` is zero), and the falling fade off-centre — angle `0.2` reads
+/// `[0.96588137, 0.7498337, 0.2, 0.12690606]`, dimmer and paler toward the day.
+#[test]
+fn the_sunrise_colours_fade_outside_the_band() {
+    assert_eq!(
+        sunrise_sunset_colours(0.0),
+        None,
+        "noon is outside the band"
+    );
+    assert_eq!(
+        sunrise_sunset_colours(0.5),
+        None,
+        "midnight is outside the band"
+    );
+    let centre = sunrise_sunset_colours(0.25).expect("the band's centre answers");
+    for (axis, want) in centre.iter().zip([0.85, 0.375, 0.2, 1.0]) {
+        assert!(
+            (axis - want).abs() < 1e-6,
+            "the centre quad: got {centre:?}, want [0.85, 0.375, 0.2, 1.0]"
+        );
+    }
+    let edge = sunrise_sunset_colours(0.2).expect("inside the band");
+    for (axis, want) in edge.iter().zip([0.96588137, 0.7498337, 0.2, 0.12690606]) {
+        assert!(
+            (axis - want).abs() < 1e-6,
+            "the off-centre quad: got {edge:?}, want [0.96588137, 0.7498337, 0.2, 0.12690606]"
+        );
+    }
+    assert!(
+        edge[3] < centre[3],
+        "the fade falls toward the day: {} < {}",
+        edge[3],
+        centre[3]
+    );
 }

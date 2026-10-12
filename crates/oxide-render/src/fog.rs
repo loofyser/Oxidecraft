@@ -1,17 +1,18 @@
 //! The frame's fog: the colour the world fades to and the linear range the terrain fades over.
 //!
 //! The colour chain is `EntityRenderer.updateFogColor` (`EntityRenderer.java:1763-1928`), of
-//! which M2 lands four steps, in the source's order: the per-dimension base with the day-night
+//! which this module lands six steps, in the source's order: the per-dimension base with the day-night
 //! factor (`WorldProvider.getFogColor`, `WorldProvider.java:177-188`), the sky-colour mix whose
 //! strength comes from the render distance (`EntityRenderer.java:1767-1768`, `:1803-1805`), the
-//! light-brightness factor the render loop's `fogColor1` converges to (`:362-365`, `:1856-1859`)
+//! rain darkening (`:1809-1816`: red and green by `1 - rain * 0.5`, blue by `1 - rain * 0.4`)
+//! and the thunder darkening (`:1818-1825`: every channel by `1 - thunder * 0.5`), the light-brightness
+//! factor the render loop's `fogColor1` converges to (`:362-365`, `:1856-1859`)
 //! and the void-fog altitude factor (`:1860-1887`) — plus the default linear range `setupFog`
 //! installs for terrain (`:2002-2016`), and the water arm the eye's own block
 //! selects when it is water ([`water_fog_for_eye`]: EXP at density 0.1 over
 //! (0.02, 0.02, 0.2), `setupFog`'s `:1985-1995` with `updateFogColor`'s
-//! `:1845-1847`). The rain and thunder blends, the sunset band, the boss
-//! tint, the night-vision term and the remaining per-block overrides are the
-//! later scene work's.
+//! `:1845-1847`). The sunset tint, the cloud-fog branch, the lava eye, blindness, the boss
+//! tint and the night-vision term are the later scene work's.
 //!
 //! The colour is also the window's clear colour: the source ends `updateFogColor` by handing it
 //! to `glClearColor` with an alpha of zero (`:1927`), which is how the horizon and the fog meet
@@ -183,6 +184,11 @@ const END_FOG: [f32; 3] = [
 /// that fraction of the way to the sky colour (`:1803-1805`) — the step that makes the horizon
 /// meet the sky instead of leaving the provider's pale base standing against a deeper one.
 ///
+/// `rain_strength` and `thunder_strength` are the world's eased weather (`World.getRainStrength`
+/// and `getThunderStrength`): past the sky mix the colour darkens by `1 - rain * 0.5` on red and
+/// green and `1 - rain * 0.4` on blue (`:1809-1816`), then by `1 - thunder * 0.5` on every
+/// channel (`:1818-1825`). Clear weather reads both as zero and the chain is the old one.
+///
 /// `light_level` is the light `World.getLightBrightness` reads at the same block, 0..15
 /// (`EntityRenderer.java:362`, `World.java:845-848`), and `render_distance_chunks` the client's
 /// own distance setting. The provider's brightness table value is scaled by
@@ -204,6 +210,7 @@ const END_FOG: [f32; 3] = [
 /// brightness factor are the source's for every dimension and read the Overworld's table. Any
 /// other id, which vanilla's `getProviderForDimension` answers with no provider at all, takes
 /// the Overworld's chain.
+#[allow(clippy::too_many_arguments)]
 pub fn fog_colour(
     dimension: i8,
     time_of_day: f32,
@@ -212,20 +219,35 @@ pub fn fog_colour(
     sky_colour: [f32; 3],
     render_distance_chunks: u8,
     light_level: u8,
+    rain_strength: f32,
+    thunder_strength: f32,
 ) -> [f32; 3] {
     let base = match dimension {
         -1 => NETHER_FOG,
         1 => END_FOG,
         _ => surface_fog(celestial_angle(time_of_day)),
     };
-    // The sky mix, then the light factor, per channel in the source's own order
-    // (`EntityRenderer.java:1803-1805`, `:1856-1859`).
+    // The sky mix, the weather darkening, then the light factor, per channel in the source's
+    // own order (`EntityRenderer.java:1803-1805`, `:1809-1826`, `:1856-1859`).
     let mix = sky_mix_strength(render_distance_chunks);
     let light = light_factor(light_level, render_distance_chunks);
     let mixed: [f32; 3] =
         std::array::from_fn(|channel| base[channel] + (sky_colour[channel] - base[channel]) * mix);
+    // Past the sky mix the colour darkens by `1 - rain * 0.5` on red and green and
+    // `1 - rain * 0.4` on blue (`:1809-1816`), then by `1 - thunder * 0.5` on every channel
+    // (`:1818-1825`). Clear weather reads both strengths as zero and the chain is the old one.
+    let darkened: [f32; 3] = std::array::from_fn(|channel| {
+        let mut value = mixed[channel];
+        if rain_strength > 0.0 {
+            value *= 1.0 - rain_strength * if channel == 2 { 0.4 } else { 0.5 };
+        }
+        if thunder_strength > 0.0 {
+            value *= 1.0 - thunder_strength * 0.5;
+        }
+        value
+    });
     let colour: [f32; 3] =
-        std::array::from_fn(|channel| (f64::from(mixed[channel]) * f64::from(light)) as f32);
+        std::array::from_fn(|channel| (f64::from(darkened[channel]) * f64::from(light)) as f32);
     // The void factor closes the chain, in the source's double arithmetic
     // (`EntityRenderer.java:1860-1887`).
     let mut factor = eye_y * f64::from(void_y_factor);
@@ -379,7 +401,7 @@ mod tests {
     fn the_linear_range_reaches_the_far_plane() {
         assert_eq!(linear_params(128.0), (96.0, 128.0));
         let params = FogParams {
-            colour: fog_colour(0, 6000.0, 64.0, 0.03125, SKY, 8, 15),
+            colour: fog_colour(0, 6000.0, 64.0, 0.03125, SKY, 8, 15, 0.0, 0.0),
             start: linear_params(128.0).0,
             end: linear_params(128.0).1,
             far_plane: 128.0,
@@ -510,5 +532,50 @@ mod tests {
         assert!((exp_fog_factor(0.1, 20.0) - 0.018_316).abs() < 1e-5);
         assert!(exp_fog_factor(0.1, 57.0) < 1e-6);
         assert!(exp_fog_factor(0.0, 57.0) - 1.0 < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod weather_tests {
+    use super::fog_colour;
+
+    /// The sky the ladder mixes towards, as the chain's own tests read it.
+    const SKY: [f32; 3] = [0.4, 0.6, 0.8];
+
+    /// The weather darkening's ladder (`EntityRenderer.java:1809-1826`): past the sky mix the
+    /// noon chain stands at `[0.68704278, 0.80093011, 0.96265765]` (light 15, void inert at
+    /// the eye on the ground); full rain takes red and green by `1 - rain * 0.5` and blue by
+    /// `1 - rain * 0.4`, full thunder takes every channel by `1 - thunder * 0.5`, and the two
+    /// compose in the source's order.
+    #[test]
+    fn the_weather_darkens_the_fog_past_the_sky_mix() {
+        let clear = fog_colour(0, 6000.0, 64.0, 0.03125, SKY, 8, 15, 0.0, 0.0);
+        for (channel, expected) in clear.iter().zip([0.687_042_8, 0.800_930_1, 0.96265765]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the clear noon chain is [0.68704278, 0.80093011, 0.96265765]; got {clear:?}"
+            );
+        }
+        let rain = fog_colour(0, 6000.0, 64.0, 0.03125, SKY, 8, 15, 1.0, 0.0);
+        for (channel, expected) in rain.iter().zip([0.343_521_4, 0.40046506, 0.577_594_6]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "full rain is [0.34352139, 0.40046506, 0.57759459]; got {rain:?}"
+            );
+        }
+        let thunder = fog_colour(0, 6000.0, 64.0, 0.03125, SKY, 8, 15, 0.0, 1.0);
+        for (channel, expected) in thunder.iter().zip([0.343_521_4, 0.40046506, 0.48132883]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "full thunder is [0.34352139, 0.40046506, 0.48132883]; got {thunder:?}"
+            );
+        }
+        let both = fog_colour(0, 6000.0, 64.0, 0.03125, SKY, 8, 15, 1.0, 1.0);
+        for (channel, expected) in both.iter().zip([0.1717607, 0.20023253, 0.2887973]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "rain and thunder compose to [0.1717607, 0.20023253, 0.2887973]; got {both:?}"
+            );
+        }
     }
 }

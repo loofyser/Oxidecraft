@@ -90,6 +90,7 @@ use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
 use oxide_world::light::{self, view_light_level};
 use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
+    sunrise_sunset_colours,
 };
 use oxide_world::world::World;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -604,8 +605,8 @@ pub enum ClientEvent {
     ///
     /// The session computes these because its client may not: `oxide-client` has no edge to
     /// `oxide-world`, and `oxide-render` may not reach it at all, so the world-derived values
-    /// travel with the event. `partial_ticks` is zero (M2 has no tick loop) and the rain
-    /// strength is zero (no weather packets are decoded yet).
+    /// travel with the event. `partial_ticks` is zero (the session reports whole ticks;
+    /// interpolation is the renderer's) and the strengths are the session's live eased weather.
     Sky {
         /// The celestial angle in `0..1`, from the world time.
         celestial_angle: f32,
@@ -613,7 +614,7 @@ pub enum ClientEvent {
         colour: [f32; 3],
         /// The sun's brightness.
         sun_brightness: f32,
-        /// The stars' brightness, the rain already folded in.
+        /// The stars' brightness before the rain dim; the sky pass applies `1 - rain`.
         star_brightness: f32,
         /// The clouds' tint.
         cloud_colour: [f32; 3],
@@ -623,6 +624,9 @@ pub enum ClientEvent {
         /// it (`EntityRenderer.java:362`), and the client's renderer builds the table
         /// (`oxide-world`'s `light::view_light_level`).
         light_level: u8,
+        /// The sunset disc's `[r, g, b, alpha]` quad, or `None` outside the band
+        /// (`WorldProvider.calcSunriseSunsetColors`, `WorldProvider.java:151-175`).
+        horizon: Option<[f32; 4]>,
     },
     /// The world was rebuilt: every column the window holds is stale.
     ///
@@ -1762,7 +1766,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             );
                             // The view block moved: the sky's colour is sampled at the player's own
                             // block, so a correction can change it without a new clock.
-                            report_sky(world.as_ref(), player.position, clock.as_ref(), events);
+                            report_sky(
+                                world.as_ref(),
+                                player.position,
+                                clock.as_ref(),
+                                &weather,
+                                events,
+                            );
                         }
                         ChangeGameState::ID => {
                             let change = decoded(id, decode_change_game_state(body))?;
@@ -1870,7 +1880,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     time_of_day,
                                 },
                             );
-                            report_sky(world.as_ref(), player.position, clock.as_ref(), events);
+                            report_sky(
+                                world.as_ref(),
+                                player.position,
+                                clock.as_ref(),
+                                &weather,
+                                events,
+                            );
                         }
                         ChunkData::ID => match world.as_mut() {
                             Some(store) => {
@@ -2831,6 +2847,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // body settle and the death clock advance.
                 let dead = player.dead;
                 let tick_intent = if dead { Intent::neutral() } else { intent };
+                // The weather eases once per tick, before the step reads it: the sky's
+                // re-report at the step's tail then carries the tick's own strengths, so a
+                // frozen-clock scene still tracks the rain. The report below stays where it
+                // was, behind the step's sounds, so the event stream keeps its order.
+                let weather_moved = weather.tick();
                 for payload in step_tick(
                     &mut player,
                     &tick_intent,
@@ -2841,6 +2862,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     &board,
                     events,
                     !awaiting_respawn_position,
+                    &weather,
+                    weather_moved,
                 ) {
                     send_reply(&mut conn, &payload)?;
                 }
@@ -2858,8 +2881,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 );
                 // The weather eases once per tick and reports while it moves:
                 // one event per tick that changed a strength, none for a
-                // settled tick.
-                if weather.tick() {
+                // settled tick. The ease ran before the step above, so this
+                // reports the same movement the sky already re-reported on.
+                if weather_moved {
                     report(
                         events,
                         ClientEvent::WeatherChanged {
@@ -3583,6 +3607,8 @@ fn step_tick(
     board: &Scoreboard,
     events: &Sender<ClientEvent>,
     movement_reports: bool,
+    weather: &WeatherState,
+    weather_moved: bool,
 ) -> Vec<Vec<u8>> {
     player.last_tick_position = player.position;
     player.tick += 1;
@@ -3716,8 +3742,8 @@ fn step_tick(
             advanced = true;
         }
     }
-    if advanced {
-        report_sky(world, player.position, clock.as_deref(), events);
+    if advanced || weather_moved {
+        report_sky(world, player.position, clock.as_deref(), weather, events);
     }
     report(events, player_tick(player, false));
     // The feed sits immediately behind the player's own event: one
@@ -4013,13 +4039,14 @@ fn received_time_of_day(time_of_day: i64) -> i64 {
 /// light level is that same block's (`EntityRenderer.java:362` reads
 /// `World.getLightBrightness(new BlockPos(viewEntity))`). The frame fraction is the renderer's
 /// own concern — the session reports whole ticks, and the window interpolates between them —
-/// so the partial tick is zero, and no weather is decoded, so the rain strength is zero; both
-/// are recorded in the module docs and the report. A session with no clock yet — or no world,
-/// as before Join Game — has no sky to report.
+/// so the partial tick is zero, while the strengths are the session's live eased weather, and
+/// the disc quad is the provider's answer for the frame's angle. A session with no clock yet —
+/// or no world, as before Join Game — has no sky to report.
 fn report_sky(
     world: Option<&World>,
     view: [f64; 3],
     clock: Option<&Clock>,
+    weather: &WeatherState,
     events: &Sender<ClientEvent>,
 ) {
     let (Some(world), Some(clock)) = (world, clock) else {
@@ -4028,13 +4055,11 @@ fn report_sky(
     let time_of_day = clock.time_of_day;
     /// The session reports whole ticks; interpolation is the renderer's.
     const PARTIAL_TICKS: f32 = 0.0;
-    /// No weather packets are decoded yet, so the rain strength is zero.
-    const RAIN_STRENGTH: f32 = 0.0;
     let angle = celestial_angle(time_of_day, PARTIAL_TICKS);
     let x = view[0].floor() as i32;
     let y = view[1].floor() as i32;
     let z = view[2].floor() as i32;
-    let colour = sky_colour(world, x, y, z, angle);
+    let colour = sky_colour(world, x, y, z, angle, weather.rain);
     // The fog's brightness factor reads the view block's own light, with the source's
     // defaults for a position no column holds (`EntityRenderer.java:362-365`).
     let light_level = view_light_level(world, x, y, z);
@@ -4043,12 +4068,13 @@ fn report_sky(
         ClientEvent::Sky {
             celestial_angle: angle,
             colour,
-            sun_brightness: sun_brightness(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
-            star_brightness: star_brightness(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
-            cloud_colour: cloud_colour(time_of_day, PARTIAL_TICKS, RAIN_STRENGTH),
+            sun_brightness: sun_brightness(time_of_day, PARTIAL_TICKS, weather.rain),
+            star_brightness: star_brightness(time_of_day, PARTIAL_TICKS),
+            cloud_colour: cloud_colour(time_of_day, PARTIAL_TICKS, weather.rain),
             // `moon_phase` answers `0..8`, so the narrowing cannot lose a case.
             moon_phase: moon_phase(time_of_day) as u8,
             light_level,
+            horizon: sunrise_sunset_colours(angle),
         },
     );
 }
@@ -4875,6 +4901,8 @@ mod tests {
             &Scoreboard::new(),
             &sender,
             true,
+            &WeatherState::default(),
+            false,
         );
         assert_eq!(frozen.world_age, 48_001, "the age advances every tick");
         assert_eq!(frozen.time_of_day, 6000, "the frozen time of day holds");
@@ -4916,6 +4944,8 @@ mod tests {
             &Scoreboard::new(),
             &sender,
             true,
+            &WeatherState::default(),
+            false,
         );
         assert_eq!(running.world_age, 48_001);
         assert_eq!(running.time_of_day, 6001, "a running time of day advances");
@@ -4927,6 +4957,79 @@ mod tests {
                 .count(),
             1,
             "the running step reports the sky it moved: {running_events:?}"
+        );
+    }
+
+    #[test]
+    fn a_frozen_step_re_reports_the_sky_while_the_weather_moves() {
+        // The Sky re-fires when the weather eases even though the clock stands still, so a
+        // frozen-clock scene still tracks the rain — and the re-report carries the tick's own
+        // strengths: the sun dims by `1 - rain * 5 / 16` and the clouds take the rain blend,
+        // while the stars stay pure (the pass owns the dim).
+        let intent = Intent::neutral();
+        let (sender, receiver) = crossbeam_channel::unbounded::<ClientEvent>();
+        let world = World::new(true);
+        let mut player = Player::new();
+        let mut frozen = Clock {
+            world_age: 48_000,
+            time_of_day: 6000,
+            frozen: true,
+        };
+        let weather = WeatherState {
+            rain: 0.5,
+            thunder: 0.0,
+            target_rain: 1.0,
+            target_thunder: 0.0,
+        };
+        step_tick(
+            &mut player,
+            &intent,
+            Some(&mut frozen),
+            Some(&world),
+            &mut Entities::new(),
+            &PlayerList::new(),
+            &Scoreboard::new(),
+            &sender,
+            true,
+            &weather,
+            true,
+        );
+        assert_eq!(frozen.time_of_day, 6000, "the clock never moved");
+        let events: Vec<ClientEvent> = receiver.try_iter().collect();
+        let skies: Vec<&ClientEvent> = events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::Sky { .. }))
+            .collect();
+        assert_eq!(
+            skies.len(),
+            1,
+            "the moving weather re-reports the sky on a frozen step: {events:?}"
+        );
+        let &ClientEvent::Sky {
+            sun_brightness,
+            star_brightness,
+            cloud_colour,
+            horizon,
+            ..
+        } = skies[0]
+        else {
+            unreachable!("filtered above");
+        };
+        assert!(
+            (sun_brightness - 0.875).abs() < 1e-6,
+            "the noon sun dims by half rain's 1 - 0.5 * 5 / 16: {sun_brightness}"
+        );
+        assert_eq!(
+            star_brightness, 0.0,
+            "noon stars stay dark and pure: {star_brightness}"
+        );
+        assert!(
+            cloud_colour[0] < 1.0,
+            "the clouds take the rain blend: {cloud_colour:?}"
+        );
+        assert_eq!(
+            horizon, None,
+            "noon is outside the sunset band: {horizon:?}"
         );
     }
 
@@ -4956,6 +5059,8 @@ mod tests {
                 &Scoreboard::new(),
                 &sender,
                 true,
+                &WeatherState::default(),
+                false,
             );
             assert_eq!(
                 player.death_time, expected,
@@ -4978,6 +5083,8 @@ mod tests {
                 &Scoreboard::new(),
                 &sender,
                 true,
+                &WeatherState::default(),
+                false,
             );
         }
         assert_eq!(player.hurt_time, 0, "the flash stops at zero");
@@ -5011,6 +5118,8 @@ mod tests {
             &Scoreboard::new(),
             &sender,
             false,
+            &WeatherState::default(),
+            false,
         );
         assert!(held.is_empty(), "a held step sends nothing: {held:?}");
         assert_eq!(player.tick, 1, "the step still ran");
@@ -5033,6 +5142,8 @@ mod tests {
             &Scoreboard::new(),
             &sender,
             true,
+            &WeatherState::default(),
+            false,
         );
         assert_eq!(sent.len(), 1, "one walking report per step: {sent:?}");
     }

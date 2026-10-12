@@ -929,6 +929,8 @@ struct SkyReport {
     cloud_colour: [f32; 3],
     /// The moon's phase.
     moon_phase: u8,
+    /// The sunset disc's quad, `None` outside the band.
+    horizon: Option<[f32; 4]>,
     /// The view block's light level, which the fog colour's brightness factor reads.
     light_level: u8,
 }
@@ -943,6 +945,7 @@ fn sky_report(event: &ClientEvent) -> Option<SkyReport> {
             star_brightness,
             cloud_colour,
             moon_phase,
+            horizon,
             light_level,
         } => Some(SkyReport {
             celestial_angle: *celestial_angle,
@@ -951,6 +954,7 @@ fn sky_report(event: &ClientEvent) -> Option<SkyReport> {
             star_brightness: *star_brightness,
             cloud_colour: *cloud_colour,
             moon_phase: *moon_phase,
+            horizon: *horizon,
             light_level: *light_level,
         }),
         _ => None,
@@ -2864,6 +2868,8 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
         star_brightness: 0.0,
         cloud_colour: [1.0, 1.0, 1.0],
         moon_phase: 0,
+        // Noon stands outside the sunset band, so the session sends no disc.
+        horizon: None,
         // The script's column carries full sky light at the view block, the value the fog's
         // brightness factor reads as one.
         light_level: 15,
@@ -2884,6 +2890,8 @@ fn the_session_reports_the_clock_and_the_sky_it_moves() {
                 star_brightness: 0.0,
                 cloud_colour: [1.0, 1.0, 1.0],
                 moon_phase: 3,
+                // Past the band's edge (`cos(angle * 2pi) = 0.61`), so no disc.
+                horizon: None,
                 light_level: 15,
             },
         ],

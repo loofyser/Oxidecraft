@@ -811,7 +811,7 @@ fn the_frames_fog_fades_the_terrain_towards_its_colour() {
     // render distance sits at its thirty-two-chunk maximum so the colour is the dusk base
     // itself, with no sky mix or brightness factor in the way (`EntityRenderer.java:1767-1768`,
     // `:363-364`).
-    let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
+    let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15, 0.0, 0.0);
     let fog = FogParams {
         colour,
         start: 2.0,
@@ -884,7 +884,7 @@ fn the_frames_fog_measures_the_radial_distance_from_the_eye() {
     // four would read the exact half mix. The expected bytes below are the radial mix of the
     // lit `(252, 252, 252)` surface into the dusk fog colour `(102, 114, 139)`; the planar mix
     // reads `(177, 183, 195)`, twenty to twenty-seven bytes away.
-    let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15);
+    let colour = fog_colour(0, 14000.0, 64.0, 0.03125, [0.4, 0.6, 0.8], 32, 15, 0.0, 0.0);
     let fog = FogParams {
         colour,
         start: 2.0,
@@ -1008,6 +1008,9 @@ fn the_submerged_clouds_fall_off_exponentially() {
                 sky_colour: [0.0, 0.0, 0.0],
                 sun_brightness: 1.0,
                 star_brightness: 0.0,
+                rain_strength: 0.0,
+                thunder_strength: 0.0,
+                horizon: None,
                 fog_colour: water.colour,
                 far_plane: 128.0,
                 cloud_offset_ticks: 0,
@@ -1055,6 +1058,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         sky_colour: noon,
         sun_brightness: 1.0,
         star_brightness: 0.0,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: noon,
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -1098,6 +1104,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         sky_colour: [0.0, 0.0, 0.0],
         sun_brightness: 1.0,
         star_brightness: 0.5,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: [0.0, 0.0, 0.0],
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -1155,6 +1164,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         sky_colour: [0.0, 0.0, 0.0],
         sun_brightness: 1.0,
         star_brightness: 0.0,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: [0.0, 0.0, 0.0],
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -1200,6 +1212,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         sky_colour: below_sky,
         sun_brightness: 1.0,
         star_brightness: 0.0,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: [1.0, 1.0, 1.0],
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -1254,6 +1269,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         sky_colour: below_sky,
         sun_brightness: 1.0,
         star_brightness: 0.0,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: [1.0, 1.0, 1.0],
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -1306,6 +1324,9 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         SkyRequest {
             params: SkyParams {
                 star_brightness: 0.0,
+                rain_strength: 0.0,
+                thunder_strength: 0.0,
+                horizon: None,
                 ..night
             },
             camera: sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV),
@@ -1341,6 +1362,9 @@ fn the_cloud_setting_off_removes_the_layer() {
         sky_colour: [0.0, 0.0, 0.0],
         sun_brightness: 1.0,
         star_brightness: 0.0,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: [0.0, 0.0, 0.0],
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -1394,6 +1418,9 @@ fn the_cloud_setting_fast_shows_the_flat_layer() {
         sky_colour: [0.0, 0.0, 0.0],
         sun_brightness: 1.0,
         star_brightness: 0.0,
+        rain_strength: 0.0,
+        thunder_strength: 0.0,
+        horizon: None,
         fog_colour: [0.0, 0.0, 0.0],
         far_plane: 128.0,
         cloud_offset_ticks: 0,
@@ -11774,5 +11801,253 @@ fn fix3c_hud_draws_the_hotbar_item_it_names() {
     assert!(
         own > 200,
         "the icon's own pixel count: the flat checker's cell, got {own}"
+    );
+}
+
+/// The sunset disc: the source's 16-segment fan (`RenderGlobal.java:1253-1292`), drawn when the
+/// provider's quad answers and skipped when it is `None`. The frame is at the sunset angle
+/// (0.25) with the sky and the fog black and full rain — so the sun, the moon and the stars
+/// are all out (the rain dim kills them) and only the disc can light a pixel. The quad is the
+/// band's centre the world side pins (`sunrise_sunset_colours(0.25)` is `[0.85, 0.375, 0.2,
+/// 1.0]`); the spoke-mid aim lands halfway along the fan's fourth spoke, where the fade is
+/// half spent.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_sky_pass_draws_the_sunset_disc_with_its_fade() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let textures = synthetic_sky_textures();
+    let mut sky = SkyPass::new(&device, &queue, format);
+    sky.set_textures(&device, &queue, &textures.sun, &textures.moon_phases);
+    let mut cloud = CloudPass::new(&device, &queue, format);
+    cloud.set_texture(&device, &queue, &textures.clouds);
+    let sunset = SkyParams {
+        celestial_angle: 0.25,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        rain_strength: 1.0,
+        thunder_strength: 0.0,
+        horizon: Some([0.85, 0.375, 0.2, 1.0]),
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    // Halfway along the fourth spoke: the rim vertex `l = 4` sits at local `(120, 0, 0)`,
+    // which the disc's fixed rotations carry to `(0, 0, 120)`, and the centre to `(-100, 0,
+    // 0)` — the midpoint `(-50, 0, 60)` is clear of the dimmed sun by ~78 blocks.
+    let spoke = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: sunset,
+            camera: sky_camera(
+                65.0,
+                aim_at(Vec3::new(-50.0, 0.0, 60.0)).0,
+                aim_at(Vec3::new(-50.0, 0.0, 60.0)).1,
+                0.5,
+            ),
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    let spoke_brightest = brightest(&spoke);
+    assert!(
+        spoke_brightest >= 16,
+        "the half-spent spoke lights pixels: {spoke_brightest}"
+    );
+    // The same frame with no quad draws no disc: the background stays black.
+    let none = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: SkyParams {
+                horizon: None,
+                ..sunset
+            },
+            camera: sky_camera(
+                65.0,
+                aim_at(Vec3::new(-50.0, 0.0, 60.0)).0,
+                aim_at(Vec3::new(-50.0, 0.0, 60.0)).1,
+                0.5,
+            ),
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    assert!(
+        brightest(&none) <= 2,
+        "no quad draws no disc: {}",
+        brightest(&none)
+    );
+    // The fade's direction: the disc's centre (full alpha) reads brighter than the
+    // half-spent spoke — the dimmed sun is out, so only the disc is in the frame.
+    let centre = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: sunset,
+            camera: sky_camera(
+                65.0,
+                aim_at(Vec3::new(-100.0, 0.0, 0.0)).0,
+                aim_at(Vec3::new(-100.0, 0.0, 0.0)).1,
+                0.5,
+            ),
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    let centre_brightest = brightest(&centre);
+    assert!(
+        centre_brightest >= 100,
+        "the disc's centre reads near its full colour: {centre_brightest}"
+    );
+    assert!(
+        spoke_brightest < centre_brightest,
+        "the fade falls toward the rim: spoke {spoke_brightest} < centre {centre_brightest}"
+    );
+}
+
+/// The rain dim at the pass: the sun's alpha and the stars' brightness both multiply by
+/// `1 - rain_strength` (`RenderGlobal.java:1294`, `:1325`). Full rain doses the noon sun
+/// aimed straight at and the bright star to black; the clear controls read them back.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_rain_dims_the_sun_and_douses_the_stars() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let textures = synthetic_sky_textures();
+    let mut sky = SkyPass::new(&device, &queue, format);
+    sky.set_textures(&device, &queue, &textures.sun, &textures.moon_phases);
+    let mut cloud = CloudPass::new(&device, &queue, format);
+    cloud.set_texture(&device, &queue, &textures.clouds);
+    // The noon sun, aimed straight at: the celestial frame leaves `(0, 100, 0)` overhead.
+    let noon = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        rain_strength: 1.0,
+        thunder_strength: 0.0,
+        horizon: None,
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    let (sun_yaw, sun_pitch) = aim_at(Vec3::new(0.0, 100.0, 0.0));
+    let rained = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: noon,
+            camera: sky_camera(65.0, sun_yaw, sun_pitch, 0.5),
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    assert!(
+        brightest(&rained) <= 2,
+        "full rain doses the noon sun: {}",
+        brightest(&rained)
+    );
+    let clear = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: SkyParams {
+                rain_strength: 0.0,
+                ..noon
+            },
+            camera: sky_camera(65.0, sun_yaw, sun_pitch, 0.5),
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    assert!(
+        brightest(&clear) >= 200,
+        "the clear control reads the white sun back: {}",
+        brightest(&clear)
+    );
+    // The bright star, aimed at through the narrow camera: full rain takes the pass's
+    // `0.5 * (1 - rain)` to zero and the pass skips the field.
+    let star = star_field()[0];
+    let target = celestial_rotation(0.0).transform_point3(Vec3::new(
+        star.centre[0] as f32,
+        star.centre[1] as f32,
+        star.centre[2] as f32,
+    ));
+    let (yaw, pitch) = aim_at(target);
+    let night = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.5,
+        rain_strength: 1.0,
+        thunder_strength: 0.0,
+        horizon: None,
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    let camera = sky_camera(65.0, yaw, pitch, 0.5);
+    let doused = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: night,
+            camera,
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    assert!(
+        brightest(&doused) <= 2,
+        "full rain douses the bright star: {}",
+        brightest(&doused)
+    );
+    let lit = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: SkyParams {
+                rain_strength: 0.0,
+                ..night
+            },
+            camera,
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    assert!(
+        brightest(&lit) >= 16,
+        "the clear control reads the aimed star back: {}",
+        brightest(&lit)
     );
 }

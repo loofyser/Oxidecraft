@@ -40,6 +40,14 @@ const WATER: u16 = 9 << 4;
 const LEAVES: u16 = 18 << 4;
 /// A torch, id 50: emission 14, opacity 0.
 const TORCH: u16 = 50 << 4;
+/// Glass, id 20: opacity 0, no emission.
+const GLASS: u16 = 20 << 4;
+/// Oak stairs, id 53: a stair instance.
+const STAIRS: u16 = 53 << 4;
+/// Farmland, id 60: the explicit census member.
+const FARMLAND: u16 = 60 << 4;
+/// A snow layer, id 78: opacity 0, no emission.
+const SNOW: u16 = 78 << 4;
 /// Glowstone, id 89: opaque (opacity 255) and luminous (emission 15).
 const GLOWSTONE: u16 = 89 << 4;
 
@@ -1196,4 +1204,131 @@ fn the_view_level_clamps_the_build_height_and_the_floor() {
         0,
         "below the world, dark"
     );
+}
+
+/// A world of one chunk column whose section 4 (y 64..79) carries per-cell values:
+/// `cell_at(x, y, z)` answers each cell's `(packed block, block light, sky light)` with
+/// `y` the world height, every other section air with zeroed nibbles. The nibble packing
+/// mirrors the store's (`column::block_index` order, an even index in the low nibble).
+fn cells_world(cell_at: impl Fn(usize, usize, usize) -> (u16, u8, u8)) -> World {
+    fn nibble(array: &mut [u8; 2048], index: usize, level: u8) {
+        let byte = &mut array[index >> 1];
+        *byte = if index & 1 == 0 {
+            (*byte & 0xF0) | (level & 0x0F)
+        } else {
+            (*byte & 0x0F) | (level << 4)
+        };
+    }
+    let mut data = ColumnData::empty();
+    for sy in 0..SECTION_COUNT {
+        let mut section = section_of(true, 0, 0, |_, _, _| AIR);
+        if sy == 4 {
+            for ly in 0..SECTION_SIZE {
+                for lz in 0..SECTION_SIZE {
+                    for lx in 0..SECTION_SIZE {
+                        let (block, lamp, sky) = cell_at(lx, sy * SECTION_SIZE + ly, lz);
+                        let index = block_index(lx, ly, lz);
+                        section.blocks[index] = block;
+                        nibble(&mut section.block_light, index, lamp);
+                        nibble(
+                            section.sky_light.as_mut().expect("a sky section"),
+                            index,
+                            sky,
+                        );
+                    }
+                }
+            }
+        }
+        data.sections[sy] = Some(section);
+        data.mask |= 1u16 << sy;
+    }
+    world_of(1, |_, _| data.clone())
+}
+
+#[test]
+fn the_view_level_reads_the_neighbour_max_for_neighbor_brightness_blocks() {
+    // `World.getLight(pos, true)` (`World.java:621-660`): a feet block whose
+    // `getUseNeighborBrightness` is true (torch id 50, opacity 0) reads the max of the
+    // five neighbours up/east/west/south/north — each its own cell, never the centre
+    // cell and never down. The fixture gives the centre its own dim pair (2, 2), the
+    // east neighbour the winning 9, and the cell below a 12 that must not answer.
+    let world = cells_world(|x, y, z| {
+        let centre = (x, y, z) == (8, 71, 8);
+        let block = if centre { TORCH } else { AIR };
+        let sky = match (x, y, z) {
+            (8, 72, 8) => 5,
+            (9, 71, 8) => 9,
+            (8, 71, 8) => 2,
+            (8, 70, 8) => 12,
+            _ => 0,
+        };
+        let lamp = match (x, y, z) {
+            (7, 71, 8) => 4,
+            (8, 71, 9) => 3,
+            (8, 71, 7) => 1,
+            (8, 71, 8) => 2,
+            (8, 70, 8) => 12,
+            _ => 0,
+        };
+        (block, lamp, sky)
+    });
+    assert_eq!(
+        view_light_level(&world, 8, 71, 8),
+        9,
+        "the torch feet read the neighbour max, not their own 2 and not the 12 below"
+    );
+}
+
+#[test]
+fn the_view_level_reads_the_own_cell_where_the_census_answers_false() {
+    // The census (`Block.java:1464-1485`): air is explicit-false, water (opacity 3,
+    // non-translucent) and leaves (opacity 1) are false too — all three read the own
+    // cell even against brighter neighbours. Each probe's neighbours carry 15.
+    for (block, name) in [(AIR, "air"), (WATER, "water"), (LEAVES, "leaves")] {
+        let world = cells_world(|x, y, z| {
+            let centre = (x, y, z) == (8, 71, 8);
+            (
+                if centre { block } else { AIR },
+                if centre { 6 } else { 15 },
+                if centre { 6 } else { 15 },
+            )
+        });
+        assert_eq!(
+            view_light_level(&world, 8, 71, 8),
+            6,
+            "the {name} feet read their own 6 against 15-valued neighbours"
+        );
+    }
+}
+
+#[test]
+fn the_view_level_covers_the_census_glass_stairs_farmland_and_snow() {
+    // The remaining census arms through the same window: glass and snow (opacity 0),
+    // a stair instance and the explicit farmland read the neighbour max.
+    for (block, name) in [
+        (GLASS, "glass"),
+        (STAIRS, "stairs"),
+        (FARMLAND, "farmland"),
+        (SNOW, "snow"),
+    ] {
+        let world = cells_world(|x, y, z| {
+            let centre = (x, y, z) == (8, 71, 8);
+            (
+                if centre { block } else { AIR },
+                if centre { 1 } else { 0 },
+                if (x, y, z) == (9, 71, 8) {
+                    11
+                } else if centre {
+                    1
+                } else {
+                    0
+                },
+            )
+        });
+        assert_eq!(
+            view_light_level(&world, 8, 71, 8),
+            11,
+            "the {name} feet read the eastern neighbour's 11, not their own 1"
+        );
+    }
 }

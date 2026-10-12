@@ -1115,6 +1115,10 @@ struct SkyState {
     time_of_day: Option<i64>,
     /// The sky the last Time Update or teleport produced.
     sky: Option<SkyValues>,
+    /// The eased rain strength, from the last weather report.
+    rain: f32,
+    /// The eased thunder strength, from the last weather report.
+    thunder: f32,
     /// The void-fog factor the last Join Game's level type asks for.
     void_y_factor: f32,
 }
@@ -1134,6 +1138,8 @@ struct SkyValues {
     cloud_colour: [f32; 3],
     /// The moon's phase in `0..8`.
     moon_phase: u8,
+    /// The sunset disc's `[r, g, b, alpha]` quad, `None` outside the band.
+    horizon: Option<[f32; 4]>,
     /// The light level at the view block, `0..15`: the chain's brightness factor reads it
     /// (`EntityRenderer.java:362`).
     light_level: u8,
@@ -1365,6 +1371,11 @@ fn camera_pose(pose: Pose) -> CameraPose {
 /// feeds neither yet, so the frame reads them as still, unpotioned water (recorded). The
 /// branch's eye-light scale reads the frame's own `values.light_level` and render distance,
 /// exactly like the air chain's (`EntityRenderer.java:1856-1859`).
+///
+/// `rain_strength` and `thunder_strength` are the client's stored eased weather, from the last
+/// `WeatherChanged`: the air chain darkens by both past the sky mix
+/// (`EntityRenderer.java:1809-1825`), and the sky parameters carry the rain on to the pass —
+/// the thunder rides stored-only here, its consumer the weather draw of the later milestone.
 #[allow(clippy::too_many_arguments)]
 fn frame_params(
     time_of_day: i64,
@@ -1377,6 +1388,8 @@ fn frame_params(
     submerged: bool,
     respiration: u8,
     water_breathing: bool,
+    rain_strength: f32,
+    thunder_strength: f32,
 ) -> (FogParams, SkyParams) {
     let far_plane = f32::from(render_distance) * 16.0;
     let (start, end) = linear_params(far_plane);
@@ -1399,6 +1412,8 @@ fn frame_params(
                 values.colour,
                 render_distance,
                 values.light_level,
+                rain_strength,
+                thunder_strength,
             ),
         ),
     };
@@ -1420,6 +1435,9 @@ fn frame_params(
         cloud_offset_ticks: cloud_ticks,
         cloud_colour: values.cloud_colour,
         moon_phase: values.moon_phase,
+        horizon: values.horizon,
+        rain_strength,
+        thunder_strength,
     };
     (fog, sky)
 }
@@ -1930,6 +1948,8 @@ impl ClientApp {
                     self.camera.in_water,
                     0,
                     false,
+                    self.sky.rain,
+                    self.sky.thunder,
                 );
                 renderer.set_fog(fog);
                 renderer.set_sky(sky);
@@ -3886,6 +3906,7 @@ fn apply_session_event(
             star_brightness,
             cloud_colour,
             moon_phase,
+            horizon,
             light_level,
         } => {
             // The terrain lightmap follows the clock's own sun brightness.
@@ -3897,6 +3918,7 @@ fn apply_session_event(
                 star_brightness,
                 cloud_colour,
                 moon_phase,
+                horizon,
                 light_level,
             });
             false
@@ -3949,6 +3971,13 @@ fn apply_session_event(
             tracing::debug!(id, "keepalive answered");
             false
         }
+        ClientEvent::WeatherChanged { rain, thunder } => {
+            // The frame reads the eased pair: the fog darkens by both, the sky pass dims by
+            // the rain. Stored here because neither the Sky event nor the clock carries them.
+            sky.rain = rain;
+            sky.thunder = thunder;
+            false
+        }
         // The window's own three ride here unconsumed: the screens fold above
         // owns them (open, server close, snapshot), and the HUD reads the
         // rest.
@@ -3965,9 +3994,7 @@ fn apply_session_event(
         | ClientEvent::SignTextCleared { .. }
         | ClientEvent::BookOpen { .. }
         | ClientEvent::MerchantOffers { .. } => false,
-        ClientEvent::WeatherChanged { .. }
-        | ClientEvent::Particle { .. }
-        | ClientEvent::GlobalEntity { .. } => {
+        ClientEvent::Particle { .. } | ClientEvent::GlobalEntity { .. } => {
             // The effect legs' remaining events; their sky, particle and
             // lightning consumers arrive with their own milestones, and the
             // feed is accepted here so the session's event stream stays total.
@@ -5328,6 +5355,7 @@ mod tests {
             star_brightness: 0.1,
             cloud_colour: [1.0, 0.5, 0.25],
             moon_phase: 5,
+            horizon: None,
             light_level: 15,
         };
         let (_, sky) = frame_params(
@@ -5341,6 +5369,8 @@ mod tests {
             false,
             0,
             false,
+            0.0,
+            0.0,
         );
         assert_eq!(sky.cloud_offset_ticks, 41);
     }
@@ -5354,9 +5384,12 @@ mod tests {
             star_brightness: 0.1,
             cloud_colour: [1.0, 0.5, 0.25],
             moon_phase: 5,
+            horizon: None,
             light_level: 15,
         };
-        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false);
+        let (fog, sky) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 0.0, 0.0,
+        );
         // The Overworld's noon fog at the eye on the ground starts from the provider's base
         // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`) and takes the render
         // distance's sky mix: 0.186711... of the way to the frame's own sky colour
@@ -5381,6 +5414,67 @@ mod tests {
     }
 
     #[test]
+    fn the_weathered_frame_darkens_the_fog_and_feeds_the_sky_pass() {
+        // The same noon frame under full rain: the fog darkens past the sky mix on every
+        // channel (`EntityRenderer.java:1809-1816`), while the sky parameters carry the disc,
+        // the rain and the stored-only thunder on to the pass.
+        let quad = Some([0.85, 0.375, 0.2, 1.0]);
+        let values = SkyValues {
+            celestial_angle: 0.25,
+            colour: [0.5, 0.6, 0.7],
+            sun_brightness: 0.9,
+            star_brightness: 0.1,
+            cloud_colour: [1.0, 0.5, 0.25],
+            moon_phase: 5,
+            horizon: quad,
+            light_level: 15,
+        };
+        let (clear_fog, _) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 0.0, 0.0,
+        );
+        let (fog, sky) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 1.0, 0.0,
+        );
+        for channel in 0..3 {
+            assert!(
+                fog.colour[channel] < clear_fog.colour[channel],
+                "full rain darkens channel {channel}: {:?} vs {:?}",
+                fog.colour,
+                clear_fog.colour
+            );
+        }
+        assert!(
+            (fog.colour[0] / clear_fog.colour[0] - 0.5).abs() < 1e-6
+                && (fog.colour[1] / clear_fog.colour[1] - 0.5).abs() < 1e-6
+                && (fog.colour[2] / clear_fog.colour[2] - 0.6).abs() < 1e-6,
+            "red and green halve, blue takes 0.6: {:?} vs {:?}",
+            fog.colour,
+            clear_fog.colour
+        );
+        assert_eq!(sky.horizon, quad, "the disc rides through to the pass");
+        assert_eq!(sky.rain_strength, 1.0, "the pass dims by the rain");
+        assert_eq!(
+            sky.thunder_strength, 0.0,
+            "the thunder rides stored-only for the later weather draw"
+        );
+        let (thunder_fog, thunder_sky) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 0.0, 1.0,
+        );
+        for channel in 0..3 {
+            assert!(
+                (thunder_fog.colour[channel] / clear_fog.colour[channel] - 0.5).abs() < 1e-6,
+                "full thunder halves channel {channel}: {:?} vs {:?}",
+                thunder_fog.colour,
+                clear_fog.colour
+            );
+        }
+        assert_eq!(
+            thunder_sky.thunder_strength, 1.0,
+            "the stored thunder still reaches the parameters"
+        );
+    }
+
+    #[test]
     fn the_submerged_eye_takes_the_water_fog_branch() {
         let values = SkyValues {
             celestial_angle: 0.25,
@@ -5389,12 +5483,15 @@ mod tests {
             star_brightness: 0.1,
             cloud_colour: [1.0, 0.5, 0.25],
             moon_phase: 5,
+            horizon: None,
             light_level: 15,
         };
         // The same noon frame with the eye submerged: the linear sky chain
         // drops out and the water branch answers — EXP at density 0.1 over
         // (0.02, 0.02, 0.2) — while the range still spans the far plane.
-        let (fog, sky) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false);
+        let (fog, sky) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false, 0.0, 0.0,
+        );
         assert_eq!(fog.mode, FogMode::Exp);
         assert!(
             (fog.density - 0.1).abs() < 1e-6,
@@ -5429,9 +5526,12 @@ mod tests {
             star_brightness: 0.1,
             cloud_colour: [1.0, 0.5, 0.25],
             moon_phase: 5,
+            horizon: None,
             light_level: 3,
         };
-        let (fog, _) = frame_params(6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false);
+        let (fog, _) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false, 0.0, 0.0,
+        );
         assert_eq!(fog.mode, FogMode::Exp);
         for (channel, expected) in fog.colour.iter().zip([0.00588235, 0.00588235, 0.05882353]) {
             assert!(

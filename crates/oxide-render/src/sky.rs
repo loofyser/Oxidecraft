@@ -3,9 +3,10 @@
 //!
 //! # What the passes draw
 //!
-//! [`SkyPass`] draws, in the source's order, the horizon band, the sun, the moon and the stars
-//! in the celestial frame, then the void the source fills in under the horizon and the
-//! below-horizon plane (`RenderGlobal.renderSky`, `RenderGlobal.java:1213-1417`):
+//! [`SkyPass`] draws, in the source's order, the horizon band, the sunset disc, the sun, the
+//! moon and the stars in the celestial frame, then the void the source fills in under the
+//! horizon and the below-horizon plane (`RenderGlobal.renderSky`,
+//! `RenderGlobal.java:1213-1417`):
 //!
 //! * The band is the source's generated 64-unit grid spanning `-384..=384` on both axes
 //!   (`RenderGlobal.java:340-365`) at `y = +16` (`:325`), flat in the frame's sky colour. The
@@ -19,7 +20,15 @@
 //!   the source translates it by `16 - (eyeY - 63)` `RenderGlobal.java`:1412, reaching
 //!   `y = -(eyeY - 63)`, and tints it `(c * 0.2 + 0.04, c * 0.2 + 0.04, c * 0.6 + 0.1)`
 //!   (`:1402-1409`). It is fogged (`:1349`). There is no alpha fade in the band or the plane;
-//!   the transparent edge the source fades at sunset is the deferred sunset fan (`:1243-1288`).
+//!   the transparent edge the source fades at sunset is the sunset disc below.
+//! * The sunset disc is the source's 16-segment triangle fan (`:1253-1291`), drawn when the
+//!   provider's sunrise/sunset quad answers and skipped when it is `None`. The centre rides at
+//!   `(0, 100, 0)` in the quad's pass-adjusted colour at the quad's full alpha, the seventeen
+//!   rim vertices ring `(sin * 120, cos * 120, -cos * 40 * alpha)` in the raw quad at zero
+//!   alpha (`:1277-1288`), so the smooth shading (`shadeModel(7425)`, `:1258`, restored to flat
+//!   `:1291`) fades the disc out. Both ride the three fixed rotations (`:1260-1262`), never the
+//!   celestial frame's — [`sunset_fan_vertices`] bakes them — and the draw is unfogged under the
+//!   alpha `(SRC_ALPHA, ONE_MINUS_SRC_ALPHA)` blend (`:1248`, `:1251`).
 //! * The void is the source's black box (`:1375-1399`): a `±1` column hanging from one unit under
 //!   the eye down to `-(d0 + 65)` with `d0 = eyeY - 63`, drawn only while the eye is below the
 //!   horizon (`d0 < 0`), together with the same reversed grid lifted to `y = -4`
@@ -27,12 +36,14 @@
 //! * The sun is a 60 by 60 quad at `y = +100`, textured by `environment/sun` with uvs `0..1`
 //!   (`:1301-1308`); the moon a 40 by 40 quad at `y = -100` whose uv picks the phase's cell from
 //!   the 128x64 4x2 `environment/moon_phases` sheet (`:1309-1323`, [`moon_uv`]). Both are drawn
-//!   with the additive `(SRC_ALPHA, ONE)` blend the source installs (`:1295`), alpha
-//!   `1 - rain` (`:1294`; M2 has no weather and uses one), and no fog.
+//!   with the additive `(SRC_ALPHA, ONE)` blend the source installs (`:1294-1295`), alpha
+//!   `1 - rain_strength` (`:1297`, baked into the quads' vertex colours at the refresh), and no
+//!   fog.
 //! * The stars are one sphere of quads at radius 100, generated once from
 //!   `java.util.Random(10842L)` by the source's own loop (`:367-451`, [`star_field`]), drawn
-//!   position-only in `(b, b, b, b)` with `b` the frame's star brightness and skipped entirely
-//!   when `b <= 0` (`:1325-1345`). The blend is the same additive pair.
+//!   position-only in `(b, b, b, b)` with `b` the frame's star brightness times
+//!   `1 - rain_strength` and skipped entirely when `b <= 0` (`:1325-1345`). The blend is the
+//!   same additive pair.
 //!
 //! # The celestial rotation
 //!
@@ -483,6 +494,11 @@ impl FloatRandom {
 /// `sun_brightness` is carried for the lightmap's later live clock (M6); the sky pass itself does
 /// not read it, because the source's sky does not either — the sun quad's tint is a round one.
 /// `cloud_offset_ticks` is the client-local counter [`cloud_uv_x`] consumes.
+/// `rain_strength` dims the celestial draws at the pass (`RenderGlobal.java:1294-1345`);
+/// `thunder_strength` rides stored-only until the weather draw reads it (Task 11).
+/// `horizon` is the sunset disc's `[r, g, b, alpha]` quad
+/// (`WorldProvider.calcSunriseSunsetColors`, `WorldProvider.java:151-175`), or `None` outside
+/// the band — and the pass then draws no disc.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SkyParams {
     /// The celestial angle in `0..1`, from the world time.
@@ -491,8 +507,17 @@ pub struct SkyParams {
     pub sky_colour: [f32; 3],
     /// The sun's brightness.
     pub sun_brightness: f32,
-    /// The stars' brightness, the rain already folded in.
+    /// The stars' brightness before the rain dim; the pass applies `1 - rain_strength` at the
+    /// draw (`RenderGlobal.java:1325`).
     pub star_brightness: f32,
+    /// The frame's rain strength, in `0..1`: the sun, the moon and the stars draw dimmed by
+    /// `1 - rain_strength` (`RenderGlobal.java:1294`, `:1325`).
+    pub rain_strength: f32,
+    /// The frame's thunder strength, in `0..1`: stored-only until the weather draw reads it.
+    pub thunder_strength: f32,
+    /// The sunset disc's `[r, g, b, alpha]` quad, or `None` outside the band — and the pass
+    /// then draws no disc.
+    pub horizon: Option<[f32; 4]>,
     /// The frame's fog colour, the band fades towards it.
     pub fog_colour: [f32; 3],
     /// The frame's far plane: the source's `farPlaneDistance`, the render distance in blocks.
@@ -552,6 +577,8 @@ const KIND_VOID_PLANE: u32 = 3;
 const KIND_TEXTURED: u32 = 4;
 /// A star: its colour is the frame's star brightness.
 const KIND_STAR: u32 = 5;
+/// The sunset disc: its colour is the vertex's own, the fade baked in.
+const KIND_FAN: u32 = 6;
 
 /// The sky vertex attributes: a position at offset 0, the kind at 12, the uv at 16 and the
 /// colour at 24.
@@ -630,8 +657,9 @@ fn vs_main(input: VertexInput) -> VertexOutput {
         local.y = local.y + sky.fog_range.z;
     }
     var position = vec4<f32>(local, 1.0);
-    // The sun, the moon and the stars ride the celestial rotation; the planes do not.
-    if (input.kind >= 4u) {
+    // The sun, the moon and the stars ride the celestial rotation; the planes and the sunset
+    // disc do not — the disc's orientation is baked into its vertices.
+    if (input.kind == 4u || input.kind == 5u) {
         position = sky.celestial * position;
     }
     output.clip_position = sky.view_projection * position;
@@ -659,6 +687,9 @@ fn base(input: VertexOutput) -> vec4<f32> {
         }
         case 4u: {
             return textureSample(sky_texture, sky_sampler, input.uv) * input.colour;
+        }
+        case 6u: {
+            return input.colour;
         }
         default: {
             return vec4<f32>(vec3<f32>(sky.params.x), sky.params.x);
@@ -690,8 +721,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let colour = base(input);
     // The band, the void and the below-horizon plane are fogged: the source enables fog for the
     // band (`RenderGlobal.java:1231`) and, after the celestial quads, for the under-horizon
-    // geometry (`:1349`). The sun, the moon and the stars draw between those two with fog
-    // disabled (`:1248`), so kinds 4 and 5 are left alone.
+    // geometry (`:1349`). The sunset disc, the sun, the moon and the stars draw with fog
+    // disabled (`:1248`), so kinds 4, 5 and 6 are left alone.
     if (input.kind <= 3u) {
         return fogged(colour, input.distance);
     }
@@ -809,6 +840,22 @@ fn celestial_blend() -> wgpu::BlendState {
     }
 }
 
+/// The sunset disc's blend (`GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0)`,
+/// `RenderGlobal.java:1251`): the source over one minus it, the destination's alpha kept.
+fn fan_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
 /// The cloud layer's blend (`GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0)`,
 /// `RenderGlobal.java:1438`): the source over one minus it, the destination's alpha kept.
 fn cloud_blend() -> wgpu::BlendState {
@@ -1216,6 +1263,100 @@ fn quad_vertices(positions: [[f32; 3]; 4], uvs: [[f32; 2]; 4]) -> Vec<SkyVertex>
     vec![a, b, c, a, c, d]
 }
 
+/// The sunset disc's segment count (`RenderGlobal.java:1279-1288`): sixteen rim steps, the
+/// closer returning to the first.
+pub const FAN_SEGMENTS: u32 = 16;
+
+/// The disc's radius (`RenderGlobal.java:1284`).
+pub const FAN_RADIUS: f32 = 120.0;
+
+/// The rim's depth scale, times the quad's alpha (`RenderGlobal.java:1284`).
+pub const FAN_DEPTH: f32 = 40.0;
+
+/// The disc's centre height (`RenderGlobal.java:1278`).
+pub const FAN_HEIGHT: f32 = 100.0;
+
+/// The sunset disc's vertices for the frame's `[r, g, b, alpha]` quad and celestial angle:
+/// the source's 16-segment triangle fan (`RenderGlobal.java:1277-1288`), forty-eight vertices.
+///
+/// The centre rides at `(0, 100, 0)` in the quad's pass-adjusted colour at the quad's full
+/// alpha (`:1264-1278` — the anaglyph pass-2 greyscale never runs here, so the centre always
+/// takes the adjusted triple); the seventeen rim vertices ring
+/// `(sin * 120, cos * 120, -cos * 40 * alpha)` in the raw quad at zero alpha (`:1279-1288`),
+/// and the smooth shading fades between them. Both ride the source's three fixed rotations —
+/// `rotate(90, X)`, the `rotate(180, Z)` the half of the cycle whose angle sine is negative
+/// takes, `rotate(90, Z)` (`:1260-1262`) — baked here, never the frame's celestial rotation,
+/// so the disc sits over the rising or setting sun on its own.
+fn sunset_fan_vertices(colours: [f32; 4], celestial_angle: f32) -> Vec<SkyVertex> {
+    let (red, green, blue, alpha) = (colours[0], colours[1], colours[2], colours[3]);
+    let centre = [
+        (red * 30.0 + green * 59.0 + blue * 11.0) / 100.0,
+        (red * 30.0 + green * 70.0) / 100.0,
+        (red * 30.0 + blue * 70.0) / 100.0,
+        alpha,
+    ];
+    let flip: f32 = if (f64::from(celestial_angle) * std::f64::consts::PI * 2.0).sin() < 0.0 {
+        180.0
+    } else {
+        0.0
+    };
+    let rotation = Mat4::from_rotation_x(90.0f32.to_radians())
+        * Mat4::from_rotation_z(flip.to_radians())
+        * Mat4::from_rotation_z(90.0f32.to_radians());
+    let placed = |position: [f32; 3]| {
+        let point = rotation.transform_point3(Vec3::from(position));
+        [point.x, point.y, point.z]
+    };
+    let byte = |value: f32| (value * 255.0).round() as u8;
+    let centre = SkyVertex {
+        position: placed([0.0, FAN_HEIGHT, 0.0]),
+        kind: KIND_FAN,
+        uv: [0.0, 0.0],
+        colour: [
+            byte(centre[0]),
+            byte(centre[1]),
+            byte(centre[2]),
+            byte(centre[3]),
+        ],
+    };
+    let rim_colour = [byte(red), byte(green), byte(blue), 0];
+    let mut rim = Vec::with_capacity(FAN_SEGMENTS as usize + 1);
+    for segment in 0..=FAN_SEGMENTS {
+        let theta = segment as f32 * std::f32::consts::PI * 2.0 / FAN_SEGMENTS as f32;
+        rim.push(SkyVertex {
+            position: placed([
+                theta.sin() * FAN_RADIUS,
+                theta.cos() * FAN_RADIUS,
+                -theta.cos() * FAN_DEPTH * alpha,
+            ]),
+            kind: KIND_FAN,
+            uv: [0.0, 0.0],
+            colour: rim_colour,
+        });
+    }
+    let mut vertices = Vec::with_capacity(3 * FAN_SEGMENTS as usize);
+    for segment in 0..FAN_SEGMENTS as usize {
+        vertices.push(centre);
+        vertices.push(rim[segment]);
+        vertices.push(rim[segment + 1]);
+    }
+    vertices
+}
+
+/// The sun and the moon's vertex alpha for a frame's rain strength: the source's global
+/// `color(1, 1, 1, 1 - rain)` (`RenderGlobal.java:1297-1298`), baked into the quads' own
+/// colours because the pass has no global colour register.
+fn celestial_dim_byte(rain_strength: f32) -> u8 {
+    ((1.0 - rain_strength) * 255.0).round() as u8
+}
+
+/// The stars' draw brightness for the frame's brightness and rain strength:
+/// `getStarBrightness * (1 - rain)` (`RenderGlobal.java:1325`), the value the pass gates and
+/// draws with.
+fn dimmed_star_brightness(star_brightness: f32, rain_strength: f32) -> f32 {
+    star_brightness * (1.0 - rain_strength)
+}
+
 /// The star field as one position-only vertex list, each star a quad from [`star_field`].
 fn star_vertices() -> Vec<SkyVertex> {
     let mut vertices = Vec::new();
@@ -1280,6 +1421,8 @@ pub struct SkyPass {
     background_pipeline: wgpu::RenderPipeline,
     /// The sun, the moon and the stars, additive.
     celestial_pipeline: wgpu::RenderPipeline,
+    /// The sunset disc, alpha-blended.
+    fan_pipeline: wgpu::RenderPipeline,
     /// The frame uniform buffer.
     frame_buffer: wgpu::Buffer,
     /// The bind group for the frame uniform.
@@ -1308,6 +1451,13 @@ pub struct SkyPass {
     sun_quad: wgpu::Buffer,
     /// The moon's eight phase quads, indexed by the phase.
     moon_quads: [wgpu::Buffer; 8],
+    /// The sunset disc's vertices, rewritten by the refresh while the frame carries a quad.
+    fan: wgpu::Buffer,
+    /// How many of the fan's vertices draw this frame; zero when the quad is `None`.
+    fan_vertices: u32,
+    /// The celestial dim byte the sun and moon quads carry, so the refresh rewrites them
+    /// only when the rain moves it.
+    dim_alpha: u8,
     /// The star field.
     stars: wgpu::Buffer,
     /// How many vertices the star field holds.
@@ -1396,6 +1546,7 @@ impl SkyPass {
         };
         let background_pipeline = pipeline("oxide sky background pipeline", None);
         let celestial_pipeline = pipeline("oxide sky celestial pipeline", Some(celestial_blend()));
+        let fan_pipeline = pipeline("oxide sky fan pipeline", Some(fan_blend()));
 
         let fallback = GpuTexture::upload_placeholder(device, queue);
         let fallback_bind_group = fallback.bind_group(device, &texture_layout);
@@ -1425,10 +1576,27 @@ impl SkyPass {
             .0
         });
         let stars = vertex_buffer(device, queue, "oxide sky stars", &star_vertices());
+        // The fan's forty-eight vertices, rewritten by the refresh while the frame carries a
+        // quad; degenerate until then, and the draw count stays zero without one.
+        let fan = vertex_buffer(
+            device,
+            queue,
+            "oxide sky fan",
+            &vec![
+                SkyVertex {
+                    position: [0.0, 0.0, 0.0],
+                    kind: KIND_FAN,
+                    uv: [0.0, 0.0],
+                    colour: [0, 0, 0, 0],
+                };
+                3 * FAN_SEGMENTS as usize
+            ],
+        );
 
         Self {
             background_pipeline,
             celestial_pipeline,
+            fan_pipeline,
             frame_buffer,
             frame_bind_group,
             texture_layout,
@@ -1442,6 +1610,9 @@ impl SkyPass {
             void_vertices: void.1,
             sun_quad: sun.0,
             moon_quads,
+            fan: fan.0,
+            fan_vertices: 0,
+            dim_alpha: 255,
             stars: stars.0,
             star_vertices: stars.1,
             params: None,
@@ -1527,6 +1698,37 @@ impl SkyPass {
         let below_lift = 16.0 - (eye_y - HORIZON);
         self.below_horizon = eye_y < HORIZON;
 
+        // The rain dim on the sun and the moon: the source's global colour register has no
+        // counterpart here, so the refresh bakes the byte into the quads' own colours — only
+        // when the rain moves it.
+        let dim = celestial_dim_byte(params.rain_strength);
+        if dim != self.dim_alpha {
+            self.dim_alpha = dim;
+            let mut sun = sun_quad_vertices();
+            for vertex in &mut sun {
+                vertex.colour[3] = dim;
+            }
+            queue.write_buffer(&self.sun_quad, 0, &sky_vertex_bytes(&sun));
+            for (phase, buffer) in self.moon_quads.iter().enumerate() {
+                let mut quad = moon_quad_vertices(phase as i32);
+                for vertex in &mut quad {
+                    vertex.colour[3] = dim;
+                }
+                queue.write_buffer(buffer, 0, &sky_vertex_bytes(&quad));
+            }
+        }
+        // The sunset disc: rewritten while the frame carries a quad, drawn not at all without
+        // one (`RenderGlobal.java:1253-1291`).
+        self.fan_vertices = match params.horizon {
+            Some(quad) => {
+                let fan = sunset_fan_vertices(quad, params.celestial_angle);
+                let count = fan.len() as u32;
+                queue.write_buffer(&self.fan, 0, &sky_vertex_bytes(&fan));
+                count
+            }
+            None => 0,
+        };
+
         let mut values: Vec<f32> = Vec::with_capacity(SKY_UNIFORM_BYTES / 4);
         values.extend_from_slice(&view_projection.to_cols_array());
         values.extend_from_slice(&celestial.to_cols_array());
@@ -1549,23 +1751,28 @@ impl SkyPass {
             1.0,
         ]);
         values.extend_from_slice(&[0.0, params.far_plane, below_lift, void_box_low(eye_y)]);
-        values.extend_from_slice(&[params.star_brightness, eye.x, eye.y, eye.z]);
+        values.extend_from_slice(&[
+            dimmed_star_brightness(params.star_brightness, params.rain_strength),
+            eye.x,
+            eye.y,
+            eye.z,
+        ]);
         values.extend_from_slice(&sky_fog_density(&self.fog));
         let mut bytes = [0u8; SKY_UNIFORM_BYTES];
         f32_bytes(&values, &mut bytes);
         queue.write_buffer(&self.frame_buffer, 0, &bytes);
     }
 
-    /// Draws the sky in the source's own order: the band, the sun, the moon and the stars, then
-    /// — while the eye is below the horizon — the void, and last the below-horizon plane
-    /// (`RenderGlobal.java:1231-1414`). The order decides occlusion, because the sky writes no
-    /// depth: the celestial quads paint over the band, the void over both, and the plane over
-    /// everything before it.
+    /// Draws the sky in the source's own order: the band, the sunset disc, the sun, the moon
+    /// and the stars, then — while the eye is below the horizon — the void, and last the
+    /// below-horizon plane (`RenderGlobal.java:1231-1414`). The order decides occlusion, because
+    /// the sky writes no depth: the disc paints over the band, the celestial quads over the
+    /// disc, the void over all three, and the plane over everything before it.
     ///
     /// Nothing draws until both parameters and a camera have been set; the sun and the moon are
-    /// skipped until their textures land, the moon's quad is the frame's phase cell, and the
-    /// stars are skipped when the frame's brightness is not above zero
-    /// (`RenderGlobal.java:1327`).
+    /// skipped until their textures land, the moon's quad is the frame's phase cell, the disc
+    /// draws only while the frame carries a quad, and the stars are skipped when the frame's
+    /// rain-dimmed brightness is not above zero (`RenderGlobal.java:1327`).
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         let (Some(params), Some(_)) = (self.params.as_ref(), self.camera.as_ref()) else {
             return;
@@ -1576,6 +1783,12 @@ impl SkyPass {
         pass.set_pipeline(&self.background_pipeline);
         pass.set_vertex_buffer(0, self.background.slice(..));
         pass.draw(0..self.band_vertices, 0..1);
+
+        if self.fan_vertices > 0 {
+            pass.set_pipeline(&self.fan_pipeline);
+            pass.set_vertex_buffer(0, self.fan.slice(..));
+            pass.draw(0..self.fan_vertices, 0..1);
+        }
 
         if self.sun.is_some() || self.moon.is_some() {
             pass.set_pipeline(&self.celestial_pipeline);
@@ -1591,7 +1804,7 @@ impl SkyPass {
                 pass.draw(0..6, 0..1);
             }
         }
-        if params.star_brightness > 0.0 {
+        if dimmed_star_brightness(params.star_brightness, params.rain_strength) > 0.0 {
             pass.set_pipeline(&self.celestial_pipeline);
             pass.set_bind_group(1, &self.fallback_bind_group, &[]);
             pass.set_vertex_buffer(0, self.stars.slice(..));
@@ -1857,12 +2070,12 @@ mod tests {
     use wgpu::{BlendFactor, CompareFunction, Face, FrontFace};
 
     use super::{
-        CLOUD_DRIFT_PER_TICK, CLOUD_FANCY, CLOUD_FAST, CLOUD_OFF, CLOUD_UV_PER_BLOCK,
-        KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend, celestial_rotation,
+        CLOUD_DRIFT_PER_TICK, CLOUD_FANCY, CLOUD_FAST, CLOUD_OFF, CLOUD_UV_PER_BLOCK, KIND_FAN,
+        KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend, celestial_dim_byte, celestial_rotation,
         cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_fog_words, cloud_layer_draws,
-        cloud_layer_y, cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv,
-        sky_depth_state, sky_eye, sky_fog_density, sky_vertex_layout, star_field,
-        sun_quad_vertices, void_box_low,
+        cloud_layer_y, cloud_under_layer, cloud_uv_x, cloud_uv_z, dimmed_star_brightness,
+        grid_cell, moon_uv, sky_depth_state, sky_eye, sky_fog_density, sky_vertex_layout,
+        star_field, sun_quad_vertices, sunset_fan_vertices, void_box_low,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
     use crate::fog::{FogMode, FogParams};
@@ -1979,6 +2192,52 @@ mod tests {
         let stars = star_field();
         assert_eq!(stars.len(), 780);
         assert!((stars[0].centre[0] - -53.24686660681045).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_sunset_disc_is_sixteen_triangles_with_the_fade_baked_in() {
+        // The band's centre quad at sunset: `[0.85, 0.375, 0.2, 1.0]`, the world's own pin.
+        let fan = sunset_fan_vertices([0.85, 0.375, 0.2, 1.0], 0.25);
+        assert_eq!(fan.len(), 48, "sixteen triangles of three");
+        assert!(fan.iter().all(|v| v.kind == KIND_FAN));
+        // The centre at the setting sun: the fixed rotations carry `(0, 100, 0)` to
+        // `(-100, 0, 0)`, in the pass-adjusted colour at full alpha —
+        // `(0.49825, 0.5175, 0.395, 1.0)` is `(127, 132, 101, 255)`. The rotations run in
+        // `f32`, so the positions read within a thousandth.
+        let near = |got: [f32; 3], want: [f32; 3]| {
+            for axis in 0..3 {
+                assert!(
+                    (got[axis] - want[axis]).abs() < 1e-3,
+                    "got {got:?}, want {want:?}"
+                );
+            }
+        };
+        near(fan[0].position, [-100.0, 0.0, 0.0]);
+        assert_eq!(fan[0].colour, [127, 132, 101, 255]);
+        // The first rim vertex rings `(0, 120, -40)` in the raw quad at zero alpha —
+        // `(217, 96, 51, 0)` — and the closer returns to it.
+        assert_eq!(fan[1].colour, [217, 96, 51, 0]);
+        near(fan[1].position, fan[47].position);
+        assert_eq!(fan[2].colour, [217, 96, 51, 0]);
+        // The rim's depth rides the quad's alpha: a half-faded quad pulls the ring halfway
+        // in — the `l = 0` vertex sits at `(0, 120, -20)` before the rotations.
+        let half = sunset_fan_vertices([0.85, 0.375, 0.2, 0.5], 0.25);
+        assert_eq!(half[0].colour[3], 128, "the centre fades with the quad");
+        assert_eq!(half[1].colour[3], 0, "the rim stays transparent");
+        // The rising sun takes the half-turn: at angle 0.75 the sine is negative and the
+        // centre lands on the opposite horizon.
+        let sunrise = sunset_fan_vertices([0.85, 0.375, 0.2, 1.0], 0.75);
+        near(sunrise[0].position, [100.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_celestial_dim_runs_one_minus_rain() {
+        assert_eq!(celestial_dim_byte(0.0), 255);
+        assert_eq!(celestial_dim_byte(1.0), 0);
+        assert_eq!(celestial_dim_byte(0.5), 128);
+        assert_eq!(dimmed_star_brightness(0.5, 0.0), 0.5);
+        assert_eq!(dimmed_star_brightness(0.5, 1.0), 0.0);
+        assert_eq!(dimmed_star_brightness(0.5, 0.5), 0.25);
     }
 
     #[test]

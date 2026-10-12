@@ -188,7 +188,7 @@ fn the_overworld_fog_at_noon_is_the_providers_base() {
     // thirty-two-chunk maximum the sky mix's strength is zero and the level-15 light factor is
     // one, so the chain leaves the base exactly as it stands.
     assert_eq!(
-        fog_colour(0, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         NOON
     );
 }
@@ -198,7 +198,7 @@ fn the_overworld_fog_at_midnight_is_the_darkened_base() {
     // Midnight is 18000 ticks: the angle is 0.5, whose cosine is -1, so the factor clamps to
     // zero and only the `(0.06, 0.06, 0.09)` terms remain.
     assert_eq!(
-        fog_colour(0, 18000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 18000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         MIDNIGHT
     );
 }
@@ -208,7 +208,7 @@ fn the_dusk_angle_gives_the_day_night_factor_the_cosine_says() {
     // 14000 ticks is the angle 0.25, whose cosine is zero: the factor is the raw 0.5, so the
     // first two channels take `0.5 * 0.94 + 0.06` and the third `0.5 * 0.91 + 0.09`.
     assert_eq!(
-        fog_colour(0, 14000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 14000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.39905876, 0.4489411, 0.54499996]
     );
 }
@@ -222,7 +222,7 @@ fn the_sky_mix_carries_the_fog_towards_the_biomes_sky_colour() {
     // (`EntityRenderer.java:1767-1768`, `:1803-1805`), and the level-15 light factor is one
     // (`:362-365`). Before this step the client handed the frame the raw base, whose bytes are
     // `(192, 216, 255)` — the band's uniform nine-to-fourteen count difference.
-    let band = fog_colour(0, 6000.0, 150.0, 0.03125, SAVANNA_SKY, 8, 15);
+    let band = fog_colour(0, 6000.0, 150.0, 0.03125, SAVANNA_SKY, 8, 15, 0.0, 0.0);
     assert_eq!(bytes(band), [178, 207, 255]);
     // The mixed value itself, to a float: 0.18671173 of the way from `(0.7529412, ...)` to
     // `(117/255, 170/255, 255/255)`.
@@ -236,12 +236,12 @@ fn the_ground_frames_fog_plane_takes_the_light_brightness_factor() {
     // `0.75 * 0.2222... + 0.25` = 0.416666... at render distance 8 (`EntityRenderer.java:363-365`,
     // `:1856-1859`). The plane reads `(74, 86, 106)` in the reference frame (acceptance notes,
     // the ground sky rows); the plains sky is that pose's own biome (id 1).
-    let plane = fog_colour(0, 6000.0, 71.0, 0.03125, PLAINS_SKY, 8, 8);
+    let plane = fog_colour(0, 6000.0, 71.0, 0.03125, PLAINS_SKY, 8, 8, 0.0, 0.0);
     assert_eq!(bytes(plane), [74, 86, 106]);
     // The pose's mix is the mark's own; the light factor is the whole difference between the
     // two frames' fog.
-    let lit = fog_colour(0, 6000.0, 71.0, 0.03125, PLAINS_SKY, 8, 15);
-    let full = fog_colour(0, 6000.0, 150.0, 0.03125, PLAINS_SKY, 8, 15);
+    let lit = fog_colour(0, 6000.0, 71.0, 0.03125, PLAINS_SKY, 8, 15, 0.0, 0.0);
+    let full = fog_colour(0, 6000.0, 150.0, 0.03125, PLAINS_SKY, 8, 15, 0.0, 0.0);
     assert_eq!(
         lit, full,
         "away from the cube's shade the ground pose reads the same fog the mark does"
@@ -255,19 +255,19 @@ fn the_void_factor_darkens_below_the_threshold_and_clamps_at_zero() {
     // 0.03125, `d1` is 0.5 and the colour takes a quarter of itself; at height zero, and
     // below it, `d1` clamps to zero and the fog goes black.
     assert_eq!(
-        fog_colour(0, 6000.0, 16.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 6000.0, 16.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.1882353, 0.21176471, 0.25]
     );
     assert_eq!(
-        fog_colour(0, 18000.0, 16.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 18000.0, 16.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.011294117, 0.012705882, 0.0225]
     );
     assert_eq!(
-        fog_colour(0, 6000.0, 0.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 6000.0, 0.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.0, 0.0, 0.0]
     );
     assert_eq!(
-        fog_colour(0, 6000.0, -5.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 6000.0, -5.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.0, 0.0, 0.0]
     );
 }
@@ -277,15 +277,18 @@ fn the_void_factor_leaves_the_colour_above_the_threshold() {
     // At eye height 32 the product is exactly 1, which is not below the threshold: the colour
     // is left as the base produced it.
     assert_eq!(
-        fog_colour(0, 6000.0, 32.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 6000.0, 32.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         NOON
     );
     assert_eq!(
-        fog_colour(0, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(0, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         NOON
     );
     // A flat world's factor of 1 takes even a low camera above the threshold.
-    assert_eq!(fog_colour(0, 6000.0, 4.0, 1.0, PLAINS_SKY, 32, 15), NOON);
+    assert_eq!(
+        fog_colour(0, 6000.0, 4.0, 1.0, PLAINS_SKY, 32, 15, 0.0, 0.0),
+        NOON
+    );
 }
 
 #[test]
@@ -295,16 +298,16 @@ fn the_other_dimensions_keep_their_providers_fixed_bases() {
     // 0.15 because the celestial-angle term carries a zero factor (`WorldProviderEnd.java:50-62`).
     // At the thirty-two-chunk maximum the mix's strength is zero, so the fixed bases show.
     assert_eq!(
-        fog_colour(-1, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(-1, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.2, 0.03, 0.03]
     );
     assert_eq!(
-        fog_colour(1, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(1, 6000.0, 64.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.09411766, 0.07529412, 0.09411766]
     );
     // The same fixed bases still take the void factor below the threshold.
     assert_eq!(
-        fog_colour(-1, 6000.0, 16.0, 0.03125, PLAINS_SKY, 32, 15),
+        fog_colour(-1, 6000.0, 16.0, 0.03125, PLAINS_SKY, 32, 15, 0.0, 0.0),
         [0.05, 0.0075, 0.0075]
     );
 }

@@ -72,7 +72,7 @@ use std::collections::VecDeque;
 
 use oxide_proto_v47::column::{ColumnData, SectionData, block_index};
 
-use crate::behaviour::behaviour;
+use crate::behaviour::{CollisionShape, behaviour};
 use crate::chunk::{SECTION_COUNT, SECTION_SIZE, pack_nibble};
 use crate::world::World;
 
@@ -119,12 +119,15 @@ pub fn light_at(world: &World, x: i32, y: i32, z: i32) -> u8 {
 /// `World.getLight` (`:626-679`). The neighbour-brightness term (`:630-657`) fires for blocks
 /// whose `getUseNeighborBrightness` is true — set by `Block.registerBlocks()`'s bootstrap
 /// loop (`Block.java`:1464-1485, live via `Bootstrap.java`:517) for stairs, slabs, farmland,
-/// translucent blocks and zero-light-opacity blocks. This model reads the direct rule only
-/// (the term is not modelled): a y below zero answers zero (`:660-663`),
-/// a y at or above the build height reads the topmost cell (`:662-670`), and the cell's own
-/// value is the sky kind's nibble against the block kind's, greater one wins
-/// (`Chunk.getLightSubtracted`, `Chunk.java:818-841`, with the day-night sky subtraction at
-/// zero for the noon clock the acceptance captured).
+/// translucent blocks and zero-light-opacity blocks — and reads the greater of the
+/// up/east/west/south/north neighbours' own cells, never the centre and never down.
+/// Air is explicit-false, and an id outside the behaviour table reads as air's false, the
+/// rule that keeps an uncovered id on the direct read.
+///
+/// A y below zero answers zero (`:660-663`), a y at or above the build height reads the
+/// topmost cell (`:662-670`), and one cell's own value is the sky kind's nibble against the
+/// block kind's, greater one wins (`Chunk.getLightSubtracted`, `Chunk.java:818-841`, with the
+/// day-night sky subtraction at zero for the noon clock the acceptance captured).
 ///
 /// A position no column holds answers the sky kind's default of 15
 /// (`World.getLightFor`, `World.java:789-803`, `EnumSkyBlock.SKY` at `EnumSkyBlock.java:5-12`),
@@ -132,6 +135,48 @@ pub fn light_at(world: &World, x: i32, y: i32, z: i32) -> u8 {
 /// (`Chunk.getLightSubtracted`'s absent-array arm, `Chunk.java:825-828`) — our store keeps the
 /// two apart and both answer 15 at noon.
 pub fn view_light_level(world: &World, x: i32, y: i32, z: i32) -> u8 {
+    if uses_neighbor_brightness(world.block(x, y, z) >> 4) {
+        own_light_level(world, x, y + 1, z)
+            .max(own_light_level(world, x + 1, y, z))
+            .max(own_light_level(world, x - 1, y, z))
+            .max(own_light_level(world, x, y, z + 1))
+            .max(own_light_level(world, x, y, z - 1))
+    } else {
+        own_light_level(world, x, y, z)
+    }
+}
+
+/// Whether a block id reads its light from its neighbours: the source's
+/// `getUseNeighborBrightness` (`Block.java:1464-1485`).
+///
+/// Air (id 0, and any id outside the behaviour table, which the store reads as air)
+/// is explicit-false; stairs and slabs ride the collision-shape column, farmland is the
+/// bootstrap's explicit member (`registerBlock(60, "farmland")`, `Block.java:1317-1318`),
+/// and the translucent and zero-light-opacity arms read the behaviour table's own columns —
+/// the same field the ambient-occlusion corner substitution reads, and the same opacity the
+/// light engine attenuates by.
+fn uses_neighbor_brightness(id: u16) -> bool {
+    /// Farmland, the bootstrap's explicit member beside the stairs and slabs.
+    const FARMLAND_ID: u16 = 60;
+    if id == 0 || id == FARMLAND_ID {
+        return id == FARMLAND_ID;
+    }
+    let Some(row) = behaviour(id) else {
+        return false;
+    };
+    if matches!(
+        row.collision,
+        CollisionShape::Stairs | CollisionShape::Slab { .. }
+    ) {
+        return true;
+    }
+    row.translucent || row.light_opacity == 0
+}
+
+/// One cell's own combined level with the source's guards: below zero is zero, at or above
+/// the build height the topmost cell answers, and a column no store holds answers the sky
+/// default of 15 (`World.java:604-679`).
+fn own_light_level(world: &World, x: i32, y: i32, z: i32) -> u8 {
     let y = if y >= HEIGHT as i32 {
         HEIGHT as i32 - 1
     } else {

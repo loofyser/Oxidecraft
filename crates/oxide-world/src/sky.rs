@@ -23,8 +23,13 @@
 //! * [`celestial_angle`] — `WorldProvider.calculateCelestialAngle` (`WorldProvider.java:115-133`).
 //! * [`moon_phase`] — `WorldProvider.getMoonPhase` (`:135-138`).
 //! * [`sun_brightness`] — `World.getSunBrightness` (`World.java:1418-1427`).
-//! * [`star_brightness`] — `World.getStarBrightness` (`:1596-1603`) times the rain factor
-//!   `RenderGlobal` multiplies in at the star draw (`RenderGlobal.java:1325`).
+//! * [`star_brightness`] — `World.getStarBrightness` (`:1596-1603`), the pure
+//!   value: the rain factor is the sky pass's own multiply at the star draw
+//!   (`RenderGlobal.java:1325`, `f15 = getStarBrightness * (1 - rain)`), applied
+//!   from the pass's rain strength.
+//! * [`sunrise_sunset_colours`] — `WorldProvider.calcSunriseSunsetColors`
+//!   (`WorldProvider.java:151-175`): the sunset disc's `[r, g, b, alpha]` quad,
+//!   or `None` outside the band.
 //! * [`sky_colour`] and [`sky_colour_at_temperature`] — `World.getSkyColor` (`:1432-1488`) over
 //!   `BiomeGenBase.getSkyColorByTemp` (`BiomeGenBase.java:328-333`) and `MathHelper.hsvToRGB`
 //!   (`MathHelper.java:485-543`).
@@ -32,8 +37,9 @@
 //!   `cloudColour` base (`:73`).
 //!
 //! The rain blends are ported where the interface carries a rain strength; the thunder and
-//! lightning blends (`World.java:1459-1485`, `:1542-1551`) have no parameter to reach them and are
-//! deferred with the weather. M2 sends `rain_strength = 0.0` throughout.
+//! lightning blends (`World.java:1425`, `:1461-1485`, `:1542-1551`) have no reader this
+//! milestone and stay deferred to the weather draw, which owns them. The fog's own thunder
+//! term is the exception: it lands with the fog colour, which reads both strengths.
 //!
 //! The source feeds the brightness and colour factors through `MathHelper.cos`, whose 65536-entry
 //! table (`MathHelper.java:30-41`) quantises the angle: the lookup truncates to a table step, so a
@@ -128,18 +134,18 @@ pub fn sun_brightness(time_of_day: i64, partial_ticks: f32, rain_strength: f32) 
     f * 0.8 + 0.2
 }
 
-/// The stars' brightness for a world time, a partial tick and a rain strength:
-/// `World.getStarBrightness` (`World.java:1596-1603`) times the rain factor `RenderGlobal`
-/// multiplies in at the star draw (`RenderGlobal.java:1325`, `f15 = getStarBrightness * (1 - rain)`).
+/// The stars' brightness for a world time and a partial tick:
+/// `World.getStarBrightness` (`World.java:1596-1603`), the pure value.
 ///
 /// The factor is `1 - (cos(angle * 2pi) * 2 + 0.25)` clamped, squared and halved: zero through the
-/// day, one half at midnight, then dimmed by rain. The renderer skips the stars when this is not
-/// above zero.
-pub fn star_brightness(time_of_day: i64, partial_ticks: f32, rain_strength: f32) -> f32 {
+/// day, one half at midnight. The rain dim is NOT folded here: the sky pass multiplies by
+/// `1 - rain_strength` at the draw (`RenderGlobal.java:1325`), which owns the weather read.
+/// The source's thunder plays no part in either term.
+pub fn star_brightness(time_of_day: i64, partial_ticks: f32) -> f32 {
     let angle = celestial_angle(time_of_day, partial_ticks);
     let mut f = 1.0 - (plain_cos(angle) * 2.0 + 0.25);
     f = clamp_01(f);
-    f * f * 0.5 * (1.0 - rain_strength)
+    f * f * 0.5
 }
 
 /// One channel of `MathHelper.hsvToRGB`'s conversion: the value times 255, truncated towards
@@ -190,13 +196,51 @@ pub fn sky_colour_at_temperature(temperature: f32, celestial_angle: f32) -> [f32
 ///
 /// One position is sampled: the given block, whose column's biome supplies the height-adjusted
 /// temperature for [`sky_colour_at_temperature`]. A block with no column loaded answers the
-/// fallback biome, ocean (`BiomeGenBase.getBiome`, `BiomeGenBase.java:584-600`). The source's
-/// rain, thunder and lightning blends (`:1450-1485`) are the weather's: M2 has none and the
-/// function stops before them.
-pub fn sky_colour(world: &World, x: i32, y: i32, z: i32, celestial_angle: f32) -> [f32; 3] {
+/// fallback biome, ocean (`BiomeGenBase.getBiome`, `BiomeGenBase.java:584-600`). The rain blend
+/// (`:1450-1459`) mixes each channel toward the grey `0.6` of its own luminance at
+/// `1 - rain * 0.75`; the thunder and lightning blends (`:1461-1485`) stay deferred to the
+/// weather draw, which owns them.
+pub fn sky_colour(
+    world: &World,
+    x: i32,
+    y: i32,
+    z: i32,
+    celestial_angle: f32,
+    rain_strength: f32,
+) -> [f32; 3] {
     let data = biome(biome_id_at(world, x, z));
     let temperature = height_adjusted_temperature(data.temperature, x, y, z);
-    sky_colour_at_temperature(temperature, celestial_angle)
+    let mut channels = sky_colour_at_temperature(temperature, celestial_angle);
+    if rain_strength > 0.0 {
+        let grey = (channels[0] * 0.3 + channels[1] * 0.59 + channels[2] * 0.11) * 0.6;
+        let keep = 1.0 - rain_strength * 0.75;
+        for channel in &mut channels {
+            *channel = *channel * keep + grey * (1.0 - keep);
+        }
+    }
+    channels
+}
+
+/// The sunrise/sunset disc's colours for a celestial angle:
+/// `WorldProvider.calcSunriseSunsetColors` (`WorldProvider.java:151-175`).
+///
+/// While `cos(angle * 2pi)` stays within `±0.4` of the day the answer is the `[r, g, b, alpha]`
+/// quad the sky pass fans: `f3 = cos * 1.25 + 0.5` drives
+/// `[f3 * 0.3 + 0.7, f3 * f3 * 0.7 + 0.2, 0.2]` — the blue channel is the constant `0.2` —
+/// and `f4 = (1 - (1 - sin(f3 * pi)) * 0.99)^2` is the fade. Outside the band the answer is
+/// `None` and the pass draws no disc.
+///
+/// The source reads the cosine and sine through `MathHelper`'s table; this port reads the
+/// plain functions (the module comment's declared divergence), so the band's edges can move
+/// by a table step.
+pub fn sunrise_sunset_colours(celestial_angle: f32) -> Option<[f32; 4]> {
+    let cosine = (f64::from(celestial_angle) * std::f64::consts::PI * 2.0).cos() as f32;
+    if cosine < -0.4 || cosine > 0.4 {
+        return None;
+    }
+    let f3 = cosine / 0.4 * 0.5 + 0.5;
+    let f4 = 1.0 - (1.0 - (f64::from(f3) * std::f64::consts::PI).sin() as f32) * 0.99;
+    Some([f3 * 0.3 + 0.7, f3 * f3 * 0.7 + 0.2, 0.2, f4 * f4])
 }
 
 /// The clouds' tint for a world time, a partial tick and a rain strength: `World.getCloudColour`
@@ -204,8 +248,8 @@ pub fn sky_colour(world: &World, x: i32, y: i32, z: i32, celestial_angle: f32) -
 ///
 /// Each channel starts at one, the rain blend mixes in the grey `0.6` of the colour's own
 /// luminance, the day factor scales the first two channels by `f * 0.9 + 0.1` and the last by
-/// `f * 0.85 + 0.15`. The source's thunder blend (`:1542-1551`) has no parameter here and is
-/// deferred with the weather, as `sky_colour`'s heavier blends are.
+/// `f * 0.85 + 0.15`. The source's thunder blend (`:1542-1551`) has no parameter here and
+/// stays deferred to the weather draw, which owns it.
 pub fn cloud_colour(time_of_day: i64, partial_ticks: f32, rain_strength: f32) -> [f32; 3] {
     let angle = celestial_angle(time_of_day, partial_ticks);
     let factor = day_factor(angle);
