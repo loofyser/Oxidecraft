@@ -13,6 +13,7 @@ pub mod physics;
 pub mod player;
 pub mod scoreboard;
 pub mod session;
+pub mod settings;
 pub mod ticker;
 pub mod windows;
 pub mod world_view;
