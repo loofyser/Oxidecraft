@@ -8,6 +8,20 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
+- **2026-10-12 update — milestone M6: Task 10 is closed, reviewed and pushed.** T10 the sky,
+  weather and fog carries (`6cc7df0`, fix `cead1f6`): the sunrise/sunset disc (the raw-centre
+  fan), the `1 − rain` dim on the sun/moon alpha and the stars (the star brightness un-baked in
+  `oxide-world`; the sky pass folds the rain), the sky-colour rain blend, the fog's rain and
+  thunder branch (`EntityRenderer:1809-1825`), the water-fog light read fixed to the source's
+  neighbour-brightness census (with the fix10 attribution correction), and the session's Sky
+  re-report on weather movement — frozen-clock scenes track the weather. The first review
+  returned fix-first (one important: the disc's centre baked the anaglyph greyscale in normal
+  renders — fixed to the raw triple and re-reviewed approved, 0/0/0). The Step-1 carry rulings
+  (the fog time term present, the horizon disambiguation, the void closure, the light-read fix)
+  are recorded in `refs/m6-task-10/step1-rulings.md`. The next task is T11, the weather draw and
+  the particle pass (plan line 386). HEAD `cead1f6` plus this update's docs commit. Carries: the
+  light-census rows the behaviour table cannot express ride the next `behaviour.rs` touch. The
+  full stop handoff is `docs/handoff/2026-10-12-m6-task-10-closed.md`.
 - **2026-10-12 update — milestone M6: Tasks 8 and 9 are closed, reviewed and pushed.** T8 the
   audio engine, mixer and registry (`6354f51`) — reviewed approved, six minors deferred. T9 the
   music ticker and the local sound sites, with the client pump and the `--audio-dump` flag
