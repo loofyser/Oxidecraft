@@ -109,7 +109,7 @@ fix(render): update the overlap pins and the compass display poses
 
 **Interfaces:**
 - Produces (all `oxide_proto_v47::effects_wire`):
-  - `SoundEffect { name: String, x: i32, y: i32, z: i32, volume: f32, pitch: u8 }` — 0x29; the name length-capped (the crate's string cap), the fixed-point ×8 rule derives from the source's read (volume/pitch are the source's own scales — derive and pin: `S29PacketSoundEffect`'s constructor divides what `handleSoundEffect` multiplies in; pin the pass-through pair once).
+  - `SoundEffect { name: String, x: i32, y: i32, z: i32, volume: f32, pitch: u8 }` — 0x29; the name length-capped (the crate's string cap), the fixed-point ×8 rule derives from the source's read (volume/pitch are the source's own scales — derive and pin: `S29PacketSoundEffect`'s constructor multiplies — the three axes ×8 at `:27-29`, the pitch ×63 at `:31`; the getters divide back at `:66-79` and `:86-89`; `handleSoundEffect` passes through unchanged (`NetHandlerPlayClient.java:1695-1699`); pin the pass-through pair once).
   - `Particle { particle_id: i32, long_distance: bool, x: f32, y: f32, z: f32, offset_x: f32, offset_y: f32, offset_z: f32, speed: f32, count: i32, data: Vec<i32> }` — 0x2A; the data run reads exactly the table's argument count per id (no wire length prefix exists — `ITEM_CRACK` 2, `BLOCK_CRACK`/`BLOCK_DUST` 1, else 0; the run is capped at `MAX_PARTICLE_DATA = 4`), the id mapped into 0–41 at decode (unknown → `BARRIER`), `count` clamped to a sane ceiling (`MAX_PARTICLE_COUNT = 512` — round-trip decides; a count past the cap is refused, test-pinned).
   - `ChangeGameState { reason: u8, value: f32 }` — 0x2B; every reason decodes (0–10), semantics per-destination, none written for 9 (no vanilla handler — `NetHandlerPlayClient` covers 1–8 and 10, 0 via the message table, 9 ignored).
   - `SpawnGlobalEntity { entity_id: i32, kind: u8, x: i32, y: i32, z: i32 }` — 0x2C (kind 1 = lightning; the entity id registers in the session's entity store for 0x13 removal — kind other than 1 keeps the entity record and draws nothing, recorded).
@@ -167,7 +167,7 @@ feat: the game settings store (game)
 
 **Files:**
 - Modify: `crates/oxide-render/src/renderer.rs` — the settings setters (`set_brightness`, `set_cloud_setting`, `set_graphics`, `set_smooth_lighting` beside `set_gui_scale`), the resize path's scale re-derive.
-- Modify: `crates/oxide-render/src/lightmap.rs` — the brightness/gamma input (`Brightness.GAMMA_TABLE` derives from the source — `EntityRenderer`/`GameSettings` gamma table, cite in-task), replacing the fixed curve.
+- Modify: `crates/oxide-render/src/lightmap.rs` — the brightness/gamma input (the gamma term derives from the source's own setting — `GameSettings.gammaSetting` at `GameSettings.java:171`, consumed in `EntityRenderer`'s lightmap update at `:1005-1047`; cite in-task), replacing the fixed curve.
 - Modify: `crates/oxide-render/src/sky.rs` — the cloud setting's arms (Off/Fast/Fancy around the existing fast path).
 - Modify: `crates/oxide-render/src/gui/*` (the text/sprite passes — wherever the current fixed scale factor lives, `hud.rs`'s `scaled_resolution` callers) — the scale-factor plumbing for brightness-free GUI (none expected; verify) and the pointer-scaling hook the client consumes.
 - Test: `crates/oxide-render/src/renderer.rs` / `lightmap.rs` — unit pins (gamma ladder, scale re-derive at a resize).
