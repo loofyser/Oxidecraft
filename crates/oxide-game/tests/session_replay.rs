@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use oxide_game::entity_view::{EntityExtra, EntityFrame, PlayerListRecord, display_name};
 use oxide_game::input::{InputEvent, Key, MouseButton};
 use oxide_game::interaction::{Aim, Face};
+use oxide_game::particles::ParticleTex;
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::{Objective, Scoreboard, Team, entry_colour};
 use oxide_game::session::{
@@ -8676,4 +8677,61 @@ fn set_view_distance_resends_client_settings_on_change_only() {
         vec![&view_distance_echo(32)],
         "64 clamps to the 32-chunk max: {frames:?}"
     );
+}
+
+#[test]
+fn an_s0b_crit_runs_three_emitter_rounds() {
+    // `EntityParticleEmitter`: the constructor's own `onUpdate` plus one
+    // round per tick until `age >= lifetime (3)`, ticked by
+    // `EffectRenderer.updateEffects:159-178` — three 16-try rounds per
+    // trigger, 48 tries against the engine's dice. One S0B 4 on a spawned
+    // player therefore stages three rounds' kept spawns (more than one
+    // round's 16-try maximum) at the entity's mid-height with the crit
+    // row's smoke-family cell.
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            spawn_player_frame(30, [0x4a; 16], 10.5, 64.0, 2.5, 0, 0),
+            animation_frame(30, 4),
+        ]),
+        framed(&[keep_alive_frame(91)]),
+        16,
+        0,
+    );
+    let first: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Particles { frames, .. } => Some(frames.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("the crit trigger publishes a particle snapshot: {events:?}");
+    assert_eq!(
+        first.len(),
+        26,
+        "the seeded engine keeps 26 of the three rounds' 48 tries"
+    );
+    assert!(
+        first.len() > 16,
+        "three 16-try rounds keep more than one round's maximum: {}",
+        first.len()
+    );
+    assert!(
+        first.len() <= 48,
+        "three rounds spend 48 tries at most: {}",
+        first.len()
+    );
+    for frame in &first {
+        assert!(
+            matches!(frame.tex, ParticleTex::Cell(6) | ParticleTex::Cell(7)),
+            "the crit row's smoke-family cell: {frame:?}"
+        );
+        // `prev_pos` is the spawn site even after the tick's own motion
+        // step: the quarter-box scatter around the mid-height centre.
+        assert!(
+            (frame.prev_pos[0] - 10.5).abs() <= 0.15 + 1e-3
+                && (frame.prev_pos[1] - 64.9).abs() <= 0.45 + 1e-3
+                && (frame.prev_pos[2] - 2.5).abs() <= 0.15 + 1e-3,
+            "inside the quarter-box at mid-height: {frame:?}"
+        );
+    }
 }

@@ -1078,11 +1078,20 @@ impl DigState {
         });
         if aim.rate >= 1.0 {
             // The instant branch (`:252-255`): a block the hand completes in
-            // one step is destroyed without a running dig.
+            // one step is destroyed without a running dig. The arm answers
+            // true, so the fresh tick's hit fires behind the removal — the
+            // caller drops it against the aired cell, as the source's own
+            // render-type gate does.
             actions.push(DigAction::Destroy {
                 x: aim.x,
                 y: aim.y,
                 z: aim.z,
+            });
+            actions.push(DigAction::Hit {
+                x: aim.x,
+                y: aim.y,
+                z: aim.z,
+                face: aim.face,
             });
         } else {
             self.hitting = true;
@@ -1093,6 +1102,15 @@ impl DigState {
                 y: aim.y,
                 z: aim.z,
                 index: stage_index(0.0),
+            });
+            // The running-dig start answers true too (`clickBlock:198-266`
+            // falls to `return true`), so the fresh tick lands its hit
+            // behind the stage (`sendClickBlockToController:1506-1516`).
+            actions.push(DigAction::Hit {
+                x: aim.x,
+                y: aim.y,
+                z: aim.z,
+                face: aim.face,
             });
         }
     }
@@ -2468,6 +2486,65 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_survival_click_lands_its_hit() {
+        // `clickBlock` answers true on both survival arms
+        // (`PlayerControllerMP.java:198-266`), so `sendClickBlockToController`
+        // (`Minecraft.java:1506-1516`) fires the hit particle on the
+        // fresh-click tick too: the running-dig start carries the hit behind
+        // the stage, and the instant destroy carries it behind the removal —
+        // dropped against the aired cell, like the creative and completion
+        // arms.
+        let mut dig = DigState::new();
+        let aim = dig_aim(hand_rate(0.5, true));
+        assert_eq!(
+            dig.click(Some(aim), false),
+            vec![
+                DigAction::Swing,
+                DigAction::Start {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                },
+                DigAction::Stage {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    index: -1
+                },
+                DigAction::Hit {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                },
+            ],
+            "the fresh running-dig click starts, stages and hits"
+        );
+        let mut instant = DigState::new();
+        assert_eq!(
+            instant.click(Some(dig_aim(1.0)), false),
+            vec![
+                DigAction::Swing,
+                DigAction::Start {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                },
+                DigAction::Destroy { x: 0, y: 65, z: 2 },
+                DigAction::Hit {
+                    x: 0,
+                    y: 65,
+                    z: 2,
+                    face: Face::North
+                },
+            ],
+            "the instant click destroys and still lands its hit"
+        );
+    }
+
+    #[test]
     fn bedrock_never_completes() {
         // A negative hardness answers rate 0 (`block/Block.java:590-594`), so
         // no number of held ticks completes it: the dig stays running and
@@ -2536,6 +2613,12 @@ mod tests {
                     y: 65,
                     z: 2,
                     index: -1
+                },
+                DigAction::Hit {
+                    x: 1,
+                    y: 65,
+                    z: 2,
+                    face: Face::West
                 },
             ],
             "the cancel and the new start"

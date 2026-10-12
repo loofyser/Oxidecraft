@@ -2183,10 +2183,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         Animation::ID => {
                             let animation = decoded(id, entity::decode_animation(body))?;
                             // The swing (byte 0) moves an arm the source's
-                            // handler answers, and the crits (bytes 4 and 5)
-                            // run the shared emitter
-                            // (`NetHandlerPlayClient.handleAnimation:867-894`);
-                            // the other animations are dropped there and here.
+                            // handler answers; bytes 1 and 2 are answered
+                            // source-side (hurt, wake) but unmodeled here —
+                            // owned elsewhere — byte 3 is dropped on both
+                            // sides, and the crits (bytes 4 and 5) run the
+                            // shared emitter below
+                            // (`NetHandlerPlayClient.handleAnimation:867-894`).
                             if animation.animation == 0 {
                                 // The id names a tracked entity or nothing:
                                 // the swing lands through the store's own
@@ -2197,11 +2199,15 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             } else if let Some(particle) =
                                 crit_id_for_animation(animation.animation)
                             {
-                                // The wire twin of the local crit path: one
-                                // emitter round at the entity's mid-height
-                                // (`EntityParticleEmitter`), through the
-                                // engine's own dice. The local attack path
-                                // has no port yet
+                                // The wire twin of the local crit path: three
+                                // emitter rounds at the entity's mid-height —
+                                // the constructor's own `onUpdate` plus one
+                                // per tick until `age >= lifetime (3)`,
+                                // ticked by `updateEffects:159-178`
+                                // (`EntityParticleEmitter`) — through the
+                                // engine's own dice, so the trigger spends
+                                // three rounds' sixteen tries. The local
+                                // attack path has no port yet
                                 // (`EntityPlayerSP.onCriticalHit:671-674`
                                 // awaits the attack action), so this arm is
                                 // the only emitter.
@@ -2213,6 +2219,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                                 entity.position[1] + height / 2.0,
                                                 entity.position[2],
                                             ];
+                                            // The constructor round.
                                             let (_, spawns) = crit_burst(
                                                 &mut particles,
                                                 centre,
@@ -2222,6 +2229,19 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                             );
                                             for spawn in spawns {
                                                 particles.spawn_local(spawn);
+                                            }
+                                            // The two tick rounds.
+                                            for _ in 0..2 {
+                                                let (_, spawns) = crit_burst(
+                                                    &mut particles,
+                                                    centre,
+                                                    width,
+                                                    height,
+                                                    particle,
+                                                );
+                                                for spawn in spawns {
+                                                    particles.spawn_local(spawn);
+                                                }
                                             }
                                         }
                                         None => {
