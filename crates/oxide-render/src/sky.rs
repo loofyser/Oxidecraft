@@ -205,6 +205,28 @@ pub const CLOUD_UV_PER_BLOCK: f64 = 4.8828125E-4;
 /// One tick is therefore `0.03 * 4.8828125E-4 = 1.46484375E-5` of uv, not one uv per tick.
 pub const CLOUD_DRIFT_PER_TICK: f64 = 0.029999999329447746;
 
+/// The cloud setting's off step: no layer draws (`CLOUDS_TYPES`,
+/// `GameSettings.java:64`: off, fast, fancy; the source's field default is 2, fancy, `:74`).
+pub const CLOUD_OFF: u8 = 0;
+
+/// The cloud setting's fast step: the flat layer draws.
+pub const CLOUD_FAST: u8 = 1;
+
+/// The cloud setting's fancy step: the source's volumetric layer would draw
+/// (`RenderGlobal.renderCloudsFancy`, `RenderGlobal.java:1494+`).
+pub const CLOUD_FANCY: u8 = 2;
+
+/// Whether the cloud layer draws for a cloud setting.
+///
+/// Both of the source's cloud arms gate on `shouldRenderClouds() != 0`
+/// (`EntityRenderer.java:1490-1493`): Off draws nothing, Fast draws the flat layer
+/// (`RenderGlobal.renderClouds`, `RenderGlobal.java:1420-1481`, which [`CloudPass`]
+/// draws) and Fancy the volumetric one (`:1424-1426`). The volumetric geometry is
+/// unported, so both non-off modes share the flat layer here.
+pub fn cloud_layer_draws(setting: u8) -> bool {
+    setting != CLOUD_OFF
+}
+
 /// The lift that puts the below-horizon grid at the world horizon: the source's
 /// `translate(0, 12, 0)` over the generated `-16` `RenderGlobal.java`:1358, `RenderGlobal.java`:291.
 const BELOW_LIFT: f32 = 12.0;
@@ -1835,8 +1857,9 @@ mod tests {
     use wgpu::{BlendFactor, CompareFunction, Face, FrontFace};
 
     use super::{
-        CLOUD_DRIFT_PER_TICK, CLOUD_UV_PER_BLOCK, KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend,
-        celestial_rotation, cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_fog_words,
+        CLOUD_DRIFT_PER_TICK, CLOUD_FANCY, CLOUD_FAST, CLOUD_OFF, CLOUD_UV_PER_BLOCK,
+        KIND_TEXTURED, SKY_VERTEX_BYTES, celestial_blend, celestial_rotation,
+        cloud_at_or_above_layer, cloud_blend, cloud_drift, cloud_fog_words, cloud_layer_draws,
         cloud_layer_y, cloud_under_layer, cloud_uv_x, cloud_uv_z, grid_cell, moon_uv,
         sky_depth_state, sky_eye, sky_fog_density, sky_vertex_layout, star_field,
         sun_quad_vertices, void_box_low,
@@ -1868,6 +1891,18 @@ mod tests {
         assert_eq!(blend.color.dst_factor, BlendFactor::OneMinusSrcAlpha);
         assert_eq!(blend.alpha.src_factor, BlendFactor::One);
         assert_eq!(blend.alpha.dst_factor, BlendFactor::Zero);
+    }
+
+    #[test]
+    fn the_cloud_setting_gates_the_layer() {
+        // Both source arms gate on the setting being non-zero
+        // (`EntityRenderer.java:1490-1493`); only Off removes the layer.
+        assert!(!cloud_layer_draws(CLOUD_OFF), "Off draws no clouds");
+        assert!(cloud_layer_draws(CLOUD_FAST), "Fast draws the flat layer");
+        assert!(
+            cloud_layer_draws(CLOUD_FANCY),
+            "Fancy shares the flat layer until its geometry lands"
+        );
     }
 
     #[test]

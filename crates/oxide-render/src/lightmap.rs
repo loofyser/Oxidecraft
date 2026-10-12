@@ -57,6 +57,23 @@ impl BrightnessTable {
     }
 }
 
+/// The brightness setting's range top, in percent of the source's gamma slider.
+///
+/// `gammaSetting` is a 0..1 float slider (`GameSettings.Options.GAMMA`,
+/// `GameSettings.java:1272`); the settings store carries it as 0..=100 percent,
+/// mapping as-is over 100.
+pub const BRIGHTNESS_MAX: u8 = 100;
+
+/// The gamma `EntityRenderer.updateLightmap` blends with for a brightness setting.
+///
+/// The source reads the slider float straight (`EntityRenderer.java:1005`) and blends
+/// each channel towards `1 - (1 - c)^4` by it (`:1005-1016`, which [`lightmap_image`]
+/// performs); the percent setting maps as-is over 100, past-the-end values clamping
+/// to the slider top.
+pub fn gamma_for_brightness(mode: u8) -> f32 {
+    f32::from(mode.min(BRIGHTNESS_MAX)) / f32::from(BRIGHTNESS_MAX)
+}
+
 /// The factor the block term's torch-flicker expression carries at rest:
 /// `torchFlickerX * 0.1 + 1.5` with `torchFlickerX` at its initial zero
 /// (`EntityRenderer.java:150`, `:937`; the flicker's own update is `:914-920`).
@@ -131,6 +148,7 @@ pub fn sample_index(sky: u8, block: u8) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::gamma_for_brightness;
     use super::{BrightnessTable, lightmap_image, sample_index};
 
     #[test]
@@ -155,5 +173,23 @@ mod tests {
         // level picks. A transposed index would read the two cells the other way round.
         assert!(at(15, 0)[0] > at(0, 0)[0], "the sky axis lifts a cell");
         assert!(at(0, 15)[0] > at(0, 0)[0], "the block axis lifts a cell");
+    }
+
+    #[test]
+    fn the_brightness_ladder_maps_percent_to_the_sources_gamma_slider() {
+        // The store carries brightness as percent; the source's slider is the same
+        // value over 100 (`GameSettings.java:171`, `:1272`).
+        assert_eq!(gamma_for_brightness(0), 0.0, "Moody is the slider bottom");
+        assert_eq!(gamma_for_brightness(50), 0.5, "half percent is half gamma");
+        assert_eq!(
+            gamma_for_brightness(100),
+            1.0,
+            "full percent is the slider top"
+        );
+        assert_eq!(
+            gamma_for_brightness(255),
+            1.0,
+            "past-the-end clamps to the slider top"
+        );
     }
 }

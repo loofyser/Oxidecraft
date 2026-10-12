@@ -71,12 +71,12 @@ use oxide_render::fog::{FogMode, FogParams, fog_colour, water_fog};
 use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
 use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
-use oxide_render::lightmap::{BrightnessTable, lightmap_image, sample_index};
+use oxide_render::lightmap::{BrightnessTable, gamma_for_brightness, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::renderer::{SKY_COLOR, bind_gui_atlas, bind_gui_sheet, boss_status_step};
 use oxide_render::sky::{
-    CloudPass, HORIZON, MOON_HEIGHT, SkyParams, SkyPass, SkyTextures, celestial_rotation,
-    star_field,
+    CLOUD_FAST, CLOUD_OFF, CloudPass, HORIZON, MOON_HEIGHT, SkyParams, SkyPass, SkyTextures,
+    celestial_rotation, cloud_layer_draws, star_field,
 };
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
@@ -741,8 +741,15 @@ fn light_cell(block: u8, sky: u8) -> [u8; 4] {
 /// `set_lightmap` rewrites the texture with, `lightmap_image` of the same table at
 /// `sun_brightness` and the default gamma.
 fn light_cell_with(sun_brightness: f32, block: u8, sky: u8) -> [u8; 4] {
+    light_texel(sun_brightness, 0.0, block, sky)
+}
+
+/// One cell of the lightmap a sky brightness and a gamma build: `lightmap_image` of the
+/// Overworld's table at both, the image `set_lightmap` rewrites the texture with when the
+/// brightness setting carries `gamma`.
+fn light_texel(sun_brightness: f32, gamma: f32, block: u8, sky: u8) -> [u8; 4] {
     let (u, v) = sample_index(sky, block);
-    let image = lightmap_image(&BrightnessTable::overworld(), sun_brightness, 0.0);
+    let image = lightmap_image(&BrightnessTable::overworld(), sun_brightness, gamma);
     let index = ((v * 16 + u) * 4) as usize;
     [
         image[index],
@@ -1313,6 +1320,105 @@ fn the_sky_pass_draws_its_band_and_only_draws_stars_when_they_are_bright() {
         SIZE / 2,
         [204, 204, 204],
         "the cloud layer over the band",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_cloud_setting_off_removes_the_layer() {
+    // Off must draw exactly the sky-only frame: the same request with the layer gated out
+    // through the production gate reads back byte for byte. The camera looks 30 degrees up,
+    // clear of the noon sun, where the Fast layer would cover the centre.
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let textures = synthetic_sky_textures();
+    let mut sky = SkyPass::new(&device, &queue, format);
+    sky.set_textures(&device, &queue, &textures.sun, &textures.moon_phases);
+    let mut cloud = CloudPass::new(&device, &queue, format);
+    cloud.set_texture(&device, &queue, &textures.clouds);
+    let night = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    let camera = sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV);
+    let sky_only = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: night,
+            camera,
+            clear: [0.0, 0.0, 0.0],
+            clouds: false,
+            fog: None,
+        },
+    );
+    let gated = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: night,
+            camera,
+            clear: [0.0, 0.0, 0.0],
+            clouds: cloud_layer_draws(CLOUD_OFF),
+            fog: None,
+        },
+    );
+    assert_eq!(gated, sky_only, "the Off setting draws no cloud layer");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_cloud_setting_fast_shows_the_flat_layer() {
+    // Fast draws the flat layer through the production gate: a white texel at the source's
+    // 0.8 alpha over the black night band reads 204 at the centre, the standing recipe.
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let textures = synthetic_sky_textures();
+    let mut sky = SkyPass::new(&device, &queue, format);
+    sky.set_textures(&device, &queue, &textures.sun, &textures.moon_phases);
+    let mut cloud = CloudPass::new(&device, &queue, format);
+    cloud.set_texture(&device, &queue, &textures.clouds);
+    let night = SkyParams {
+        celestial_angle: 0.0,
+        sky_colour: [0.0, 0.0, 0.0],
+        sun_brightness: 1.0,
+        star_brightness: 0.0,
+        fog_colour: [0.0, 0.0, 0.0],
+        far_plane: 128.0,
+        cloud_offset_ticks: 0,
+        cloud_colour: [1.0, 1.0, 1.0],
+        moon_phase: 0,
+    };
+    let pixels = render_sky(
+        &device,
+        &queue,
+        &mut sky,
+        &mut cloud,
+        SkyRequest {
+            params: night,
+            camera: sky_camera(65.0, 0.0, -30.0, DEFAULT_FOV),
+            clear: [0.0, 0.0, 0.0],
+            clouds: cloud_layer_draws(CLOUD_FAST),
+            fog: None,
+        },
+    );
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        [204, 204, 204],
+        "the Fast cloud layer over the band",
     );
 }
 
@@ -2267,11 +2373,11 @@ fn a_lightmap_change_mid_frame_rewrites_the_lightmap() {
         "the lightmap the pass was built with",
     );
 
-    terrain.set_lightmap(&queue, 0.2);
+    terrain.set_lightmap(&queue, 0.2, 0.0);
     let second = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
     expect_texel(&second, SIZE / 2, SIZE / 2, dusk, "the rewritten lightmap");
 
-    terrain.set_lightmap(&queue, 1.0);
+    terrain.set_lightmap(&queue, 1.0, 0.0);
     let third = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
     expect_texel(
         &third,
@@ -2279,6 +2385,125 @@ fn a_lightmap_change_mid_frame_rewrites_the_lightmap() {
         SIZE / 2,
         noon,
         "the lightmap rewritten back to noon",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_brightness_setting_moves_the_sampled_lightmap_texel() {
+    // The slider's gamma reaches the sampled texel: the same dark cell reads brighter once
+    // the brightness setting carries full gamma, and reads dark again when it is reset. The
+    // sun stays at noon throughout, so only the gamma moves.
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, frame_camera(), 1.0);
+    let mut mesh = ChunkMesh::default();
+    // `[8, 8]`: both light levels dark, the cell the gamma lift moves most.
+    push_quad_with_light(
+        &mut mesh,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
+        WHITE,
+        [8, 8],
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &mesh);
+
+    let dim = light_texel(1.0, gamma_for_brightness(0), 0, 0);
+    let bright = light_texel(1.0, gamma_for_brightness(100), 0, 0);
+    assert_ne!(
+        dim, bright,
+        "the cell this test reads must move with the brightness setting"
+    );
+
+    let first = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(&first, SIZE / 2, SIZE / 2, dim, "the lightmap at Moody");
+
+    terrain.set_lightmap(&queue, 1.0, gamma_for_brightness(100));
+    let second = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(
+        &second,
+        SIZE / 2,
+        SIZE / 2,
+        bright,
+        "the lightmap at full brightness",
+    );
+
+    terrain.set_lightmap(&queue, 1.0, gamma_for_brightness(0));
+    let third = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(
+        &third,
+        SIZE / 2,
+        SIZE / 2,
+        dim,
+        "the lightmap back at Moody",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_smooth_lighting_multiplier_reaches_the_composed_texel() {
+    // The mesher bakes ambient occlusion into the vertex colour; the render side carries
+    // that channel into the composed texel. Two frames differ only in the vertex colour —
+    // flat white, as the standard path emits, against the halved multiplier, as the
+    // ambient-occlusion path bakes for a half-occluded corner — and read back apart.
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, frame_camera(), 1.0);
+
+    let light = light_cell(15, 15);
+    let white = [255, 255, 255, 255];
+    let occluded_colour = [128, 128, 128, 255];
+    let want_flat = shaded(white, WHITE, light);
+    let want_occluded = shaded(white, occluded_colour, light);
+    assert_ne!(
+        want_flat, want_occluded,
+        "the multiplier this test reads must move the composed texel"
+    );
+
+    let mut flat = ChunkMesh::default();
+    push_quad_with_light(
+        &mut flat,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
+        WHITE,
+        [FULL_LIGHT; 2],
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &flat);
+    let first = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(
+        &first,
+        SIZE / 2,
+        SIZE / 2,
+        want_flat,
+        "the flat vertex colour composes whole",
+    );
+
+    let mut occluded = ChunkMesh::default();
+    push_quad_with_light(
+        &mut occluded,
+        Layer::Opaque,
+        covering_quad(2.0, [[0.0, 0.0], [1.0, 1.0]]),
+        occluded_colour,
+        [FULL_LIGHT; 2],
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &occluded);
+    let second = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_texel(
+        &second,
+        SIZE / 2,
+        SIZE / 2,
+        want_occluded,
+        "the occluded multiplier darkens the composed texel",
     );
 }
 

@@ -653,14 +653,14 @@ impl TerrainPass {
         queue.write_buffer(&self.fog_buffer, 0, &fog_bytes(params));
     }
 
-    /// Rewrites the lightmap for a sky brightness.
+    /// Rewrites the lightmap for a sky brightness and a gamma.
     ///
     /// The image is [`lightmap_image`] of the Overworld's brightness table at `sun_brightness`
-    /// and [`GAMMA_DEFAULT`], the same call the pass was built with at
-    /// [`SUN_BRIGHTNESS_NOON`]: the client calls this from every sky event, so the terrain's
-    /// light follows the clock's sun. The bind group is untouched, because it holds a view of
-    /// the same texture.
-    pub fn set_lightmap(&mut self, queue: &wgpu::Queue, sun_brightness: f32) {
+    /// and `gamma`, the blend `EntityRenderer.updateLightmap` performs with `gammaSetting`
+    /// (`EntityRenderer.java:1005-1016`): the client calls this from every sky event and every
+    /// brightness change, so the terrain's light follows the clock's sun and the slider. The
+    /// bind group is untouched, because it holds a view of the same texture.
+    pub fn set_lightmap(&mut self, queue: &wgpu::Queue, sun_brightness: f32, gamma: f32) {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.lightmap_texture,
@@ -668,7 +668,7 @@ impl TerrainPass {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &lightmap_image(&BrightnessTable::overworld(), sun_brightness, GAMMA_DEFAULT),
+            &lightmap_image(&BrightnessTable::overworld(), sun_brightness, gamma),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(LIGHTMAP_SIZE * 4),

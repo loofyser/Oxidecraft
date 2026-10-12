@@ -17,10 +17,12 @@ use crate::fog::FogParams;
 use crate::gui_item::ItemIconSource;
 use crate::held_item::{HeldItemFrame, HeldItemPass};
 use crate::hud::{HudDraw, HudPass, ScaledResolution, projection_size, scaled_resolution};
+use crate::lightmap::gamma_for_brightness;
 use crate::overlay::OverlayPass;
 use crate::sign_text::{SignTextEntry, SignTextPass};
 use crate::sky::{
-    CloudPass, SkyParams, SkyPass, SkyTextures, cloud_at_or_above_layer, cloud_under_layer,
+    CLOUD_FANCY, CloudPass, SkyParams, SkyPass, SkyTextures, cloud_at_or_above_layer,
+    cloud_layer_draws, cloud_under_layer,
 };
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
@@ -54,18 +56,21 @@ enum SceneDraw {
     CloudsAtOrAbove,
 }
 
-/// The scene pass's draws for a camera, in the order the source issues them.
+/// The scene pass's draws for a camera and a cloud setting, in the order the source
+/// issues them.
 ///
 /// The sky draws first (`EntityRenderer.java:1351-1354`), then the terrain's layers
 /// (`:1385-1396`), then the world overlay — the outline and the damage texture, the source's
 /// `"outline"` and `"destroyProgress"` sections (`:1412-1416`, `:1431-1437`). The cloud layer
-/// draws exactly once; the entity eye's height picks the arm and with it the cloud's place in
-/// the order — the under-arm before the terrain while the eye is under the layer
-/// (`:1364-1367`), the at-or-above arm after the overlay once it is at or above it
-/// (`:1474-1478`).
-fn scene_draws(camera: &Camera) -> Vec<SceneDraw> {
+/// draws exactly once when the setting keeps it — both of the source's arms gate on
+/// `shouldRenderClouds() != 0` (`:1490-1493`) — and the entity eye's height picks the arm
+/// and with it the cloud's place in the order — the under-arm before the terrain while
+/// the eye is under the layer (`:1364-1367`), the at-or-above arm after the overlay once
+/// it is at or above it (`:1474-1478`).
+fn scene_draws(camera: &Camera, clouds: u8) -> Vec<SceneDraw> {
+    let draw_clouds = cloud_layer_draws(clouds);
     let mut draws = vec![SceneDraw::Sky];
-    if cloud_under_layer(camera) {
+    if draw_clouds && cloud_under_layer(camera) {
         draws.push(SceneDraw::CloudsUnder);
     }
     draws.push(SceneDraw::Terrain);
@@ -73,7 +78,7 @@ fn scene_draws(camera: &Camera) -> Vec<SceneDraw> {
     draws.push(SceneDraw::SignText);
     draws.push(SceneDraw::TerrainTranslucent);
     draws.push(SceneDraw::WorldOverlay);
-    if cloud_at_or_above_layer(camera) {
+    if draw_clouds && cloud_at_or_above_layer(camera) {
         draws.push(SceneDraw::CloudsAtOrAbove);
     }
     draws
@@ -135,6 +140,35 @@ pub fn classify_surface_error(error: &wgpu::SurfaceError) -> SurfaceAction {
         wgpu::SurfaceError::Timeout => SurfaceAction::SkipFrame,
         _ => SurfaceAction::Fatal,
     }
+}
+
+/// The surface present mode for a vertical-sync switch.
+///
+/// On means the source's `Display.setVSyncEnabled(true)` (`GameSettings.java:491-492`):
+/// `Fifo`, which every surface supports. Off means the no-vsync fallback — the first
+/// mode the surface offers of the (`Mailbox`, `Immediate`) pair, `Fifo` when it offers
+/// neither.
+pub fn present_mode_for_vsync(on: bool, offered: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if on {
+        return wgpu::PresentMode::Fifo;
+    }
+    for mode in [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] {
+        if offered.contains(&mode) {
+            return mode;
+        }
+    }
+    wgpu::PresentMode::Fifo
+}
+
+/// The hud/screen projection for a surface size and a gui-scale setting.
+///
+/// The one re-derive the resize path, the reconfigure path and [`Renderer::set_gui_scale`]
+/// share: the scaled resolution of [`scaled_resolution`] for the size and setting, and the
+/// fractional projection of [`projection_size`] for its factor — the doubles the HUD/screen
+/// ortho builds on, not the ceil ints the draw lists lay out in.
+fn hud_projection_size(display_width: u32, display_height: u32, gui_scale: u8) -> (f64, f64) {
+    let scaled = scaled_resolution(display_width, display_height, gui_scale);
+    projection_size(display_width, display_height, scaled.scale_factor)
 }
 
 /// Owns the GPU objects for one window: the surface, the device, the queue, the depth texture
@@ -199,6 +233,34 @@ pub struct Renderer {
     /// auto scale (`ScaledResolution.java`:22-25). The settings screen that owns the
     /// option is a later milestone's, so the default stands.
     gui_scale: u8,
+    /// The brightness setting in percent of the source's gamma slider: zero is Moody,
+    /// the field's own default (`GameSettings.java:171`). The terrain lightmap is built
+    /// with [`gamma_for_brightness`](crate::lightmap::gamma_for_brightness) of this.
+    brightness: u8,
+    /// The sun brightness the lightmap was last rewritten for: `World.getSunBrightness`
+    /// at the frame's celestial angle, noon's 1.0 until the clock moves it. Kept so a
+    /// brightness change rewrites the same sun, and a clock change the same gamma.
+    sun_brightness: f32,
+    /// The cloud setting: 0 is Off, 1 Fast, 2 Fancy (`CLOUDS_TYPES`,
+    /// `GameSettings.java:64`; the field default is 2, `:74`). The scene pass draws no
+    /// cloud arm while this is Off.
+    clouds: u8,
+    /// Whether the graphics setting is Fast (`fancyGraphics`, `GameSettings.java:75`;
+    /// the field default is fancy, so this starts false). The mesher owns the flag's
+    /// effect — its leaves' layer and occlusion read it — which the client feeds at its
+    /// next mesh build; the renderer only carries the value.
+    graphics_fast: bool,
+    /// The smooth-lighting setting: 0 is Off, 1 Minimum, 2 Maximum
+    /// (`AMBIENT_OCCLUSIONS`, `GameSettings.java:59`; the field default is 2, `:78`).
+    /// The mesher owns the flag's effect — its ambient-occlusion path — which the client
+    /// feeds at its next mesh build; the renderer only carries the value.
+    smooth_lighting: u8,
+    /// Whether vertical sync is on (`enableVsync`, `GameSettings.java:88`; the field
+    /// default is on). The surface runs [`wgpu::PresentMode::Fifo`] while this is set.
+    vsync: bool,
+    /// The present modes the surface offers, kept so [`Renderer::set_vsync`] can pick
+    /// the no-vsync fallback without asking the adapter again.
+    supported_present_modes: Vec<wgpu::PresentMode>,
     /// The entity pass: the boxes and the shadows drawn between the terrain's solid and
     /// translucent layers.
     entity_pass: EntityPass,
@@ -298,6 +360,7 @@ impl Renderer {
         .map_err(RendererError::NoDevice)?;
 
         let capabilities = surface.get_capabilities(&adapter);
+        let supported_present_modes = capabilities.present_modes.clone();
         // The surface is configured with a format that is *not* sRGB. The client's whole
         // fragment chain — the atlas texels, the vertex colours and the lightmap — is written
         // in the space its bytes describe, with no transfer function anywhere
@@ -360,9 +423,8 @@ impl Renderer {
         overlay.set_size(&queue, config.width as f32, config.height as f32);
         let dim = DimPass::new(&device, format);
         let mut hud = HudPass::new(&device, &queue, format);
-        let scaled = scaled_resolution(config.width, config.height, 0);
         let (projection_width, projection_height) =
-            projection_size(config.width, config.height, scaled.scale_factor);
+            hud_projection_size(config.width, config.height, 0);
         hud.set_resolution(&queue, projection_width as f32, projection_height as f32);
         let mut screen = HudPass::new(&device, &queue, format);
         screen.set_resolution(&queue, projection_width as f32, projection_height as f32);
@@ -389,6 +451,13 @@ impl Renderer {
             screen,
             held_item,
             gui_scale: 0,
+            brightness: 0,
+            sun_brightness: 1.0,
+            clouds: CLOUD_FANCY,
+            graphics_fast: false,
+            smooth_lighting: 2,
+            vsync: true,
+            supported_present_modes,
             entity_pass,
             entity_textures,
             entities: Vec::new(),
@@ -404,17 +473,21 @@ impl Renderer {
         &self.adapter_info.name
     }
 
-    /// Reconfigures the surface after the window changed size.
+    /// Reconfigures the surface after the window changed size, emitting the recomputed
+    /// scaled resolution.
     ///
     /// A zero size, as a hidden or minimised window reports, is ignored: a surface cannot be
-    /// configured with one.
-    pub fn resize(&mut self, size: PhysicalSize<u32>) {
+    /// configured with one, and the current resolution is emitted unchanged. The caller —
+    /// the client's pointer scaling reads [`Renderer::scaled_resolution`] — lays its GUI
+    /// draws out in the emitted units.
+    pub fn resize(&mut self, size: PhysicalSize<u32>) -> ScaledResolution {
         if size.width == 0 || size.height == 0 {
-            return;
+            return self.scaled_resolution();
         }
         self.config.width = size.width;
         self.config.height = size.height;
         self.reconfigure();
+        self.scaled_resolution()
     }
 
     /// Reconfigures the surface from the stored configuration.
@@ -433,9 +506,8 @@ impl Renderer {
                 self.config.width as f32,
                 self.config.height as f32,
             );
-            let scaled = self.scaled_resolution();
             let (projection_width, projection_height) =
-                projection_size(self.config.width, self.config.height, scaled.scale_factor);
+                hud_projection_size(self.config.width, self.config.height, self.gui_scale);
             self.hud.set_resolution(
                 &self.queue,
                 projection_width as f32,
@@ -513,9 +585,8 @@ impl Renderer {
     /// so the next frame's draw list lays out against it.
     pub fn set_gui_scale(&mut self, gui_scale: u8) {
         self.gui_scale = gui_scale;
-        let scaled = self.scaled_resolution();
         let (projection_width, projection_height) =
-            projection_size(self.config.width, self.config.height, scaled.scale_factor);
+            hud_projection_size(self.config.width, self.config.height, self.gui_scale);
         self.hud.set_resolution(
             &self.queue,
             projection_width as f32,
@@ -540,10 +611,84 @@ impl Renderer {
     ///
     /// The terrain pass is built with the lightmap at the noon brightness and the default
     /// gamma ([`crate::lightmap::lightmap_image`]); a live client calls this when the
-    /// session's clock moves the sun, so the terrain's light follows it. M6 owns the
-    /// brightness interpolation between the clock's two samples.
+    /// session's clock moves the sun, so the terrain's light follows it. The rewrite keeps
+    /// the stored brightness setting's gamma, so a clock change never resets the slider.
     pub fn set_lightmap(&mut self, sun_brightness: f32) {
-        self.terrain.set_lightmap(&self.queue, sun_brightness);
+        self.sun_brightness = sun_brightness;
+        self.terrain.set_lightmap(
+            &self.queue,
+            sun_brightness,
+            gamma_for_brightness(self.brightness),
+        );
+    }
+
+    /// Sets the brightness setting and rewrites the terrain lightmap for it.
+    ///
+    /// `mode` is percent of the source's gamma slider, 0 Moody to 100 bright
+    /// (`GameSettings.java:171`; past-the-end values clamp to the top). The rewrite keeps
+    /// the stored sun brightness, so a slider change never resets the clock.
+    pub fn set_brightness(&mut self, mode: u8) {
+        self.brightness = mode.min(crate::lightmap::BRIGHTNESS_MAX);
+        self.terrain.set_lightmap(
+            &self.queue,
+            self.sun_brightness,
+            gamma_for_brightness(self.brightness),
+        );
+    }
+
+    /// Sets the cloud setting: 0 is Off, 1 Fast, 2 Fancy (`CLOUDS_TYPES`,
+    /// `GameSettings.java:64`; past-the-end values clamp to Fancy).
+    ///
+    /// The parameter is the primitive the client maps its `CloudSetting` through
+    /// (`as_u8`), so this crate takes no edge on `oxide-game`. Off drops both cloud arms
+    /// from the scene pass ([`scene_draws`]); Fast and Fancy share the flat layer until
+    /// the fancy geometry lands.
+    pub fn set_clouds(&mut self, setting: u8) {
+        self.clouds = setting.min(CLOUD_FANCY);
+    }
+
+    /// Sets the graphics setting: set means the Fast path.
+    ///
+    /// The parameter is the primitive the client maps its `GraphicsSetting` through, so
+    /// this crate takes no edge on `oxide-game`. The source rebuilds its renderers on the
+    /// toggle (`GameSettings.java:412-416`); here the flag is carried for the mesher,
+    /// which the client feeds at its next mesh build.
+    pub fn set_graphics(&mut self, fast: bool) {
+        self.graphics_fast = fast;
+    }
+
+    /// Whether the graphics setting is Fast, as [`Renderer::set_graphics`] last set it.
+    pub fn graphics_fast(&self) -> bool {
+        self.graphics_fast
+    }
+
+    /// Sets the smooth-lighting setting: 0 is Off, 1 Minimum, 2 Maximum
+    /// (`AMBIENT_OCCLUSIONS`, `GameSettings.java:59`; past-the-end values clamp to
+    /// Maximum).
+    ///
+    /// The parameter is the primitive the client maps its stored value through, so this
+    /// crate takes no edge on `oxide-game`. The source rebuilds its renderers on the
+    /// toggle (`GameSettings.java:418-422`); here the value is carried for the mesher's
+    /// ambient-occlusion path, which the client feeds at its next mesh build.
+    pub fn set_smooth_lighting(&mut self, mode: u8) {
+        self.smooth_lighting = mode.min(2);
+    }
+
+    /// The smooth-lighting setting, as [`Renderer::set_smooth_lighting`] last set it.
+    pub fn smooth_lighting(&self) -> u8 {
+        self.smooth_lighting
+    }
+
+    /// Switches vertical sync: on runs the surface at `Fifo`, off at the no-vsync
+    /// fallback ([`present_mode_for_vsync`]).
+    ///
+    /// The source flips `enableVsync` straight onto the display
+    /// (`GameSettings.java:491-492`); here the pick reconfigures the surface from its
+    /// stored configuration, so the next frame presents under the new mode.
+    pub fn set_vsync(&mut self, on: bool) {
+        self.vsync = on;
+        self.config.present_mode = present_mode_for_vsync(on, &self.supported_present_modes);
+        self.surface.configure(&self.device, &self.config);
     }
 
     /// Sets the entities the following frames draw; empty draws none.
@@ -916,7 +1061,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             if let Some(camera) = self.camera {
-                for draw in scene_draws(&camera) {
+                for draw in scene_draws(&camera, self.clouds) {
                     match draw {
                         SceneDraw::Sky => self.sky.draw(&mut pass),
                         SceneDraw::CloudsUnder | SceneDraw::CloudsAtOrAbove => {
@@ -1137,12 +1282,14 @@ mod tests {
     use wgpu::SurfaceError;
 
     use super::{
-        SKY_COLOR, SceneDraw, SurfaceAction, block_on, boss_status_step, classify_surface_error,
-        clear_colour, scene_draws,
+        CLOUD_FANCY, SKY_COLOR, SceneDraw, SurfaceAction, block_on, boss_status_step,
+        classify_surface_error, clear_colour, hud_projection_size, present_mode_for_vsync,
+        scene_draws,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
     use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
     use crate::fog::{FogMode, FogParams, fog_colour};
+    use crate::sky::{CLOUD_FAST, CLOUD_OFF};
 
     /// A raised status at `fraction`, for the countdown's own tests.
     fn raised_boss(fraction: f32) -> BossStatus {
@@ -1246,7 +1393,7 @@ mod tests {
         // draw between the solid and translucent terrain layers (`:1402` vs `:1386-1390` and
         // `:1467`).
         assert_eq!(
-            scene_draws(&scene_camera(57.0)),
+            scene_draws(&scene_camera(57.0), CLOUD_FAST),
             [
                 SceneDraw::Sky,
                 SceneDraw::CloudsUnder,
@@ -1258,7 +1405,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            scene_draws(&scene_camera(150.0)),
+            scene_draws(&scene_camera(150.0), CLOUD_FAST),
             [
                 SceneDraw::Sky,
                 SceneDraw::Terrain,
@@ -1268,6 +1415,84 @@ mod tests {
                 SceneDraw::WorldOverlay,
                 SceneDraw::CloudsAtOrAbove
             ]
+        );
+    }
+
+    #[test]
+    fn the_scene_pass_draws_no_cloud_arm_when_the_setting_is_off() {
+        // Both source arms gate on the setting being non-zero
+        // (`EntityRenderer.java:1490-1493`): Off leaves neither arm, whatever the eye
+        // height, while Fancy keeps the eye-selected one like Fast.
+        for feet_y in [57.0, 150.0] {
+            let draws = scene_draws(&scene_camera(feet_y), CLOUD_OFF);
+            assert!(
+                !draws.contains(&SceneDraw::CloudsUnder),
+                "no under-arm at feet {feet_y} while Off"
+            );
+            assert!(
+                !draws.contains(&SceneDraw::CloudsAtOrAbove),
+                "no at-or-above arm at feet {feet_y} while Off"
+            );
+        }
+        assert!(
+            scene_draws(&scene_camera(57.0), CLOUD_FANCY).contains(&SceneDraw::CloudsUnder),
+            "Fancy keeps the under-arm under the layer"
+        );
+        assert!(
+            scene_draws(&scene_camera(150.0), CLOUD_FANCY).contains(&SceneDraw::CloudsAtOrAbove),
+            "Fancy keeps the at-or-above arm at the layer"
+        );
+    }
+
+    #[test]
+    fn the_present_mode_table_pins_the_vsync_switch() {
+        // On is Fifo whatever the surface offers; off takes the fallback pair in order.
+        let offered = [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate];
+        assert_eq!(
+            present_mode_for_vsync(true, &offered),
+            wgpu::PresentMode::Fifo,
+            "vsync on is Fifo"
+        );
+        assert_eq!(
+            present_mode_for_vsync(true, &[]),
+            wgpu::PresentMode::Fifo,
+            "vsync on is Fifo with no offer"
+        );
+        assert_eq!(
+            present_mode_for_vsync(false, &offered),
+            wgpu::PresentMode::Mailbox,
+            "vsync off prefers Mailbox"
+        );
+        assert_eq!(
+            present_mode_for_vsync(false, &[wgpu::PresentMode::Immediate]),
+            wgpu::PresentMode::Immediate,
+            "vsync off falls back to Immediate"
+        );
+        assert_eq!(
+            present_mode_for_vsync(false, &[wgpu::PresentMode::AutoVsync]),
+            wgpu::PresentMode::Fifo,
+            "vsync off with no fallback stays Fifo"
+        );
+    }
+
+    #[test]
+    fn the_resize_re_derive_matches_the_scaled_resolution() {
+        // The one re-derive the resize, reconfigure and gui-scale paths share: the
+        // fractional projection of the scaled resolution's own factor.
+        let (width, height) = hud_projection_size(1280, 720, 0);
+        assert!(
+            (width - 1280.0 / 3.0).abs() < 1e-9,
+            "the auto factor at 1280x720 is three, so the width is {width}"
+        );
+        assert!(
+            (height - 240.0).abs() < 1e-9,
+            "the auto factor at 1280x720 is three, so the height is {height}"
+        );
+        let (width, height) = hud_projection_size(1920, 1080, 2);
+        assert_eq!(
+            (width, height),
+            (960.0, 540.0),
+            "a fixed scale of two halves the display"
         );
     }
 
