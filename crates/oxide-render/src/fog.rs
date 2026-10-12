@@ -290,6 +290,40 @@ fn light_factor(light_level: u8, render_distance_chunks: u8) -> f32 {
     brightness * (1.0 - f) + f
 }
 
+/// The lava eye's fog colour (`updateFogColor`'s lava arm,
+/// `EntityRenderer.java:1849-1852`): `(0.6, 0.1, 0.0)`, read before the light
+/// factor like the water arm's own base.
+pub const LAVA_FOG_COLOUR: [f32; 3] = [0.6, 0.1, 0.0];
+
+/// The lava arm's EXP density (`setupFog`'s lava arm, `:1997-2000`).
+pub const LAVA_FOG_DENSITY: f32 = 2.0;
+
+/// The lava fog for an eye: the lava base through the light factor and the
+/// void factor that close the air chain (`:1856-1859`, `:1860-1887`) — the
+/// lava arm sets the colour early, and the tail applies to it exactly as to
+/// air. `light_level`, `render_distance_chunks`, `eye_y` and `void_y_factor`
+/// read as [`fog_colour`]'s do.
+pub fn lava_fog_colour(
+    light_level: u8,
+    render_distance_chunks: u8,
+    eye_y: f64,
+    void_y_factor: f32,
+) -> [f32; 3] {
+    let light = light_factor(light_level, render_distance_chunks);
+    let colour: [f32; 3] = std::array::from_fn(|channel| LAVA_FOG_COLOUR[channel] * light);
+    // The void factor closes the chain, in the source's double arithmetic
+    // (`EntityRenderer.java:1860-1887`) — exactly as over air.
+    let mut factor = eye_y * f64::from(void_y_factor);
+    if factor < 1.0 {
+        if factor < 0.0 {
+            factor = 0.0;
+        }
+        factor *= factor;
+        return std::array::from_fn(|channel| (f64::from(colour[channel]) * factor) as f32);
+    }
+    colour
+}
+
 /// The default linear fog's start and end for a far plane: three quarters of the way out, to
 /// the far plane itself (`EntityRenderer.setupFog`, `EntityRenderer.java:2014-2015`).
 ///
@@ -342,8 +376,9 @@ fn celestial_angle(time_of_day: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FogMode, FogParams, celestial_angle, exp_fog_density, exp_fog_factor, fog_colour,
-        light_factor, linear_params, sky_mix_strength, surface_fog, water_fog_for_eye,
+        FogMode, FogParams, LAVA_FOG_COLOUR, LAVA_FOG_DENSITY, celestial_angle, exp_fog_density,
+        exp_fog_factor, fog_colour, lava_fog_colour, light_factor, linear_params, sky_mix_strength,
+        surface_fog, water_fog_for_eye,
     };
 
     /// The sky the chain's tests mix towards: the same flat triple every time, so a failure
@@ -495,6 +530,32 @@ mod tests {
                 (channel - expected).abs() < 1e-6,
                 "the dim-water colour is (0.00588, 0.00588, 0.05882); got {:?}",
                 water.colour
+            );
+        }
+    }
+
+    #[test]
+    fn the_lava_eye_reads_the_red_arm_at_density_two() {
+        // `updateFogColor`'s lava arm (`EntityRenderer.java:1849-1852`) sets
+        // (0.6, 0.1, 0.0) before the light factor, and `setupFog`'s
+        // (`:1997-2000`) fogs EXP at 2.0. At full light above the void the
+        // colour stands as set.
+        assert_eq!(LAVA_FOG_COLOUR, [0.6, 0.1, 0.0]);
+        assert_eq!(LAVA_FOG_DENSITY, 2.0);
+        let colour = lava_fog_colour(15, 8, 64.0, 0.03125);
+        for (channel, expected) in colour.iter().zip([0.6, 0.1, 0.0]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the lit lava colour is (0.6, 0.1, 0.0); got {colour:?}"
+            );
+        }
+        // Deep down the void factor closes over it like over air
+        // (`:1860-1887`): 8 × 0.03125 = 0.25, squared 0.0625.
+        let deep = lava_fog_colour(15, 8, 8.0, 0.03125);
+        for (channel, expected) in deep.iter().zip([0.0375, 0.00625, 0.0]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the deep lava colour folds by 0.0625; got {deep:?}"
             );
         }
     }

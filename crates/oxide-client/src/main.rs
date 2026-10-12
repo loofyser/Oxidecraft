@@ -81,10 +81,13 @@ use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{
     Camera, CameraPose, CameraSensor, DEFAULT_FOV, FovInputs, FovSmoother, NEAR_PLANE,
     WalkDistance, bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll,
-    interpolate_pose, render_eye,
+    interpolate_pose, nausea_wobble, render_eye,
 };
 use oxide_render::entity_pass::{SkinLookup, SkinTexId, TextureRegistry};
-use oxide_render::fog::{FogMode, FogParams, fog_colour, linear_params, water_fog_for_eye};
+use oxide_render::fog::{
+    FogMode, FogParams, LAVA_FOG_DENSITY, fog_colour, lava_fog_colour, linear_params,
+    water_fog_for_eye,
+};
 use oxide_render::fps::FpsCounter;
 use oxide_render::gui_item::ItemIconSource;
 use oxide_render::lightmap::BrightnessTable;
@@ -1397,6 +1400,11 @@ fn camera_pose(pose: Pose) -> CameraPose {
 /// branch's eye-light scale reads the frame's own `values.light_level` and render distance,
 /// exactly like the air chain's (`EntityRenderer.java:1856-1859`).
 ///
+/// `eye_lava` is the same viewpoint read for lava (`updateFogColor`'s lava arm,
+/// `EntityRenderer.java:1849-1852`): EXP at [`LAVA_FOG_DENSITY`] over the lava base through
+/// the light factor ([`lava_fog_colour`]). Water wins over lava when both read true, as the
+/// source's `if/else-if` does (`:1840-1852`).
+///
 /// `rain_strength` and `thunder_strength` are the client's stored eased weather, from the last
 /// `WeatherChanged`: the air chain darkens by both past the sky mix
 /// (`EntityRenderer.java:1809-1825`), and the sky parameters carry the rain on to the pass —
@@ -1411,6 +1419,7 @@ fn frame_params(
     values: SkyValues,
     cloud_ticks: i64,
     submerged: bool,
+    eye_lava: bool,
     respiration: u8,
     water_breathing: bool,
     rain_strength: f32,
@@ -1426,6 +1435,11 @@ fn frame_params(
         render_distance,
     ) {
         Some(water) => (water.mode, water.density, water.colour),
+        None if eye_lava => (
+            FogMode::Exp,
+            LAVA_FOG_DENSITY,
+            lava_fog_colour(values.light_level, render_distance, eye_y, void_y_factor),
+        ),
         None => (
             FogMode::Linear,
             0.0,
@@ -1949,7 +1963,17 @@ impl ClientApp {
                 fov_degrees: frame_fov,
                 near: NEAR_PLANE,
                 far_chunks: self.render_distance as f32,
-                view_effect: camera_effect(bob_offset, &bob_turns, &hurt_turns),
+                // The nausea wobble over the hurt roll and the view bob
+                // (`EntityRenderer.setupCameraTransform`, `EntityRenderer.java:782-796`):
+                // the rotate/scale/rotate about (0, 1, 1), identity at no
+                // portal time. Its counter is the session tick the sky scroll
+                // consumes, plus the frame fraction (R4, R2).
+                view_effect: camera_effect(bob_offset, &bob_turns, &hurt_turns)
+                    * nausea_wobble(
+                        self.view.portal_time(partial),
+                        self.player.tick as f32 + partial,
+                        self.view.confusion_active(),
+                    ),
             });
             // The world overlay's own inputs: the aim's block for the outline, and every
             // destroy stage the render distance can show for the crack.
@@ -1973,6 +1997,8 @@ impl ClientApp {
                     // feeds no respiration level and no potion state yet, so the
                     // branch reads still, unpotioned water (recorded).
                     self.camera.in_water,
+                    // The lava eye: the session's viewpoint cell read as lava.
+                    self.view.eye_in_lava(),
                     0,
                     false,
                     self.sky.rain,
@@ -2090,13 +2116,34 @@ impl ClientApp {
                 BrightnessTable::overworld().levels()[usize::from(values.light_level).min(15)]
             })
             .unwrap_or(1.0);
-        let mut hud_draws = view::water_overlay_draws(
+        let mut hud_draws = Vec::new();
+        // The hand pass's overlay first: the winning block's sprite at the
+        // grey half tint when the eye sits inside an opaque block
+        // (`ItemRenderer.renderOverlays`'s opaque-block arm,
+        // `ItemRenderer.java:424-447`). Without assets there is no atlas to
+        // resolve the sprite through, so the quad is skipped.
+        if let Some(assets) = self.assets.as_ref() {
+            hud_draws.extend(self.view.hand_overlay_draw(&assets.mesh, &scaled));
+        }
+        hud_draws.extend(view::water_overlay_draws(
             self.camera.in_water,
             water_brightness,
             self.player.current.yaw,
             self.player.current.pitch,
             &scaled,
-        );
+        ));
+        // The GUI's overlays between the water and the hotbar, in the source's
+        // own order: the pumpkin blur, then the portal (`GuiIngame.java:145-160`).
+        // The lerp reads the frame fraction (R2); the port tracks no
+        // third-person view, so first person reads true (R3).
+        if let Some(assets) = self.assets.as_ref() {
+            hud_draws.extend(self.view.gui_overlay_draws(
+                self.camera.partial(Instant::now()),
+                true,
+                &scaled,
+                &assets.mesh,
+            ));
+        }
         hud_draws.extend(self.view.hotbar_draws(
             Instant::now(),
             &view::HotbarInput {
@@ -4176,6 +4223,7 @@ fn apply_session_event(
         | ClientEvent::Absorption { .. }
         | ClientEvent::Air { .. }
         | ClientEvent::Effects { .. }
+        | ClientEvent::EyeBlock { .. }
         | ClientEvent::SignEditorOpen { .. }
         | ClientEvent::SignTextChanged { .. }
         | ClientEvent::SignTextCleared { .. }
@@ -4860,6 +4908,9 @@ impl ApplicationHandler for ClientApp {
             // The underwater sheet: the first-person water overlay samples it
             // under the name its draw carries.
             renderer.set_hud_texture(assets::UNDERWATER_OVERLAY, &assets.underwater);
+            // The pumpkin blur: the worn-pumpkin overlay samples it under the
+            // name its draw carries.
+            renderer.set_hud_texture(assets::PUMPKIN_BLUR, &assets.pumpkin_blur);
             // The GUI sheets: the widgets, the container family, the book sheets,
             // the SGA glyph sheet and the chest trio's icon sheets, under the keys
             // the screens and the chest item model name them — on both GUI
@@ -5568,6 +5619,7 @@ mod tests {
             values,
             player.tick as i64,
             false,
+            false,
             0,
             false,
             0.0,
@@ -5589,7 +5641,7 @@ mod tests {
             light_level: 15,
         };
         let (fog, sky) = frame_params(
-            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 0.0, 0.0,
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, false, 0, false, 0.0, 0.0,
         );
         // The Overworld's noon fog at the eye on the ground starts from the provider's base
         // (`WorldProvider.getFogColor`, `WorldProvider.java:181-183`) and takes the render
@@ -5631,10 +5683,10 @@ mod tests {
             light_level: 15,
         };
         let (clear_fog, _) = frame_params(
-            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 0.0, 0.0,
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, false, 0, false, 0.0, 0.0,
         );
         let (fog, sky) = frame_params(
-            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 1.0, 0.0,
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, false, 0, false, 1.0, 0.0,
         );
         for channel in 0..3 {
             assert!(
@@ -5659,7 +5711,7 @@ mod tests {
             "the thunder rides stored-only for the later weather draw"
         );
         let (thunder_fog, thunder_sky) = frame_params(
-            6000, 0, 64.0, 0.03125, 8, values, 7, false, 0, false, 0.0, 1.0,
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, false, 0, false, 0.0, 1.0,
         );
         for channel in 0..3 {
             assert!(
@@ -5691,7 +5743,7 @@ mod tests {
         // drops out and the water branch answers — EXP at density 0.1 over
         // (0.02, 0.02, 0.2) — while the range still spans the far plane.
         let (fog, sky) = frame_params(
-            6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false, 0.0, 0.0,
+            6000, 0, 64.0, 0.03125, 8, values, 7, true, false, 0, false, 0.0, 0.0,
         );
         assert_eq!(fog.mode, FogMode::Exp);
         assert!(
@@ -5714,6 +5766,41 @@ mod tests {
     }
 
     #[test]
+    fn the_lava_eye_takes_the_red_fog_branch() {
+        // The genuine miss R6 sent this round to verify: the lava eye answers
+        // EXP at density 2.0 over (0.6, 0.1, 0.0) at full light above the void
+        // (`updateFogColor`'s lava arm, `EntityRenderer.java:1849-1852`, and
+        // `setupFog`'s, `:1997-2000`) — while the range still spans the far plane.
+        let values = SkyValues {
+            celestial_angle: 0.25,
+            colour: [0.5, 0.6, 0.7],
+            sun_brightness: 0.9,
+            star_brightness: 0.1,
+            cloud_colour: [1.0, 0.5, 0.25],
+            moon_phase: 5,
+            horizon: None,
+            light_level: 15,
+        };
+        let (fog, _) = frame_params(
+            6000, 0, 64.0, 0.03125, 8, values, 7, false, true, 0, false, 0.0, 0.0,
+        );
+        assert_eq!(fog.mode, FogMode::Exp);
+        assert!(
+            (fog.density - 2.0).abs() < 1e-6,
+            "the lava density is 2.0; got {}",
+            fog.density
+        );
+        for (channel, expected) in fog.colour.iter().zip([0.6, 0.1, 0.0]) {
+            assert!(
+                (channel - expected).abs() < 1e-6,
+                "the lava colour is (0.6, 0.1, 0.0); got {:?}",
+                fog.colour
+            );
+        }
+        assert_eq!((fog.start, fog.end, fog.far_plane), (96.0, 128.0, 128.0));
+    }
+
+    #[test]
     fn the_submerged_frames_water_colour_scales_with_the_eye_light() {
         // Fix10's RED pin (fails before the fix): S2's view block reads light 3,
         // and vanilla multiplies the water colour by the f13 factor converging to
@@ -5731,7 +5818,7 @@ mod tests {
             light_level: 3,
         };
         let (fog, _) = frame_params(
-            6000, 0, 64.0, 0.03125, 8, values, 7, true, 0, false, 0.0, 0.0,
+            6000, 0, 64.0, 0.03125, 8, values, 7, true, false, 0, false, 0.0, 0.0,
         );
         assert_eq!(fog.mode, FogMode::Exp);
         for (channel, expected) in fog.colour.iter().zip([0.00588235, 0.00588235, 0.05882353]) {

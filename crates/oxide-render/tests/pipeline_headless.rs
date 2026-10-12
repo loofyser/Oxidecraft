@@ -1034,6 +1034,121 @@ fn the_submerged_clouds_fall_off_exponentially() {
     );
 }
 
+/// The hud draws the portal tint at a quarter of the clock: the source's ramp
+/// (`GuiIngame.java:164-174`) at `timeInPortal = 0.25` reads `0.25² × 0.6 + 0.2 × 0.25 =
+/// 0.0875` alpha — the draw `portal_overlay_draws` pins at unit level, mirrored here over
+/// the solid white atlas so the pass's own blending is what the pixels prove. The white
+/// texel times the tint covers the frame at alpha 0.0875: the sky `[158, 194, 250]` reads
+/// back `[166, 199, 250]`.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_ramps_the_portal_tint_from_a_quarter() {
+    let (device, queue, target, mut hud) = rows_scene();
+    hud.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::TexturedRect {
+            texture: HudTexture::Atlas,
+            x: 0.0,
+            y: 0.0,
+            width: ROWS_WIDE as f32,
+            height: ROWS_TALL as f32,
+            uv: [0.0, 0.0, 1.0, 1.0],
+            colour: [1.0, 1.0, 1.0, 0.0875],
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_pixel(
+        &pixels,
+        ROWS_WIDE / 2,
+        ROWS_TALL / 2,
+        [166, 199, 250],
+        "the portal tint at a quarter of the clock",
+    );
+    expect_pixel(
+        &pixels,
+        0,
+        0,
+        [166, 199, 250],
+        "the tint covers the frame's corner too",
+    );
+}
+
+/// The hud holds the portal tint at a full clock: `timeInPortal = 1.0` ramps to `0.8`
+/// alpha — the same draw, the same white atlas, the sky reading back `[236, 243, 254]`.
+/// The pair with the quarter-clock case pins the ramp's two ends through the pass.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_holds_the_portal_tint_at_a_full_clock() {
+    let (device, queue, target, mut hud) = rows_scene();
+    hud.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::TexturedRect {
+            texture: HudTexture::Atlas,
+            x: 0.0,
+            y: 0.0,
+            width: ROWS_WIDE as f32,
+            height: ROWS_TALL as f32,
+            uv: [0.0, 0.0, 1.0, 1.0],
+            colour: [1.0, 1.0, 1.0, 0.8],
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_pixel(
+        &pixels,
+        ROWS_WIDE / 2,
+        ROWS_TALL / 2,
+        [236, 243, 254],
+        "the portal tint at a full clock",
+    );
+    expect_pixel(
+        &pixels,
+        ROWS_WIDE - 1,
+        ROWS_TALL - 1,
+        [236, 243, 254],
+        "the tint covers the frame's far corner too",
+    );
+}
+
+/// The hud greys the block in hand: the source's `color(0.1, 0.1, 0.1, 0.5)` tint
+/// (`ItemRenderer.java:478`) over the winning block's sprite — the draw
+/// `block_in_hand_draw` pins at unit level, mirrored here over the solid white atlas with
+/// the mirrored U the source's winding carries. The grey half tint over the sky reads
+/// back `[92, 110, 138]`.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hud_pass_greys_the_block_in_hand() {
+    let (device, queue, target, mut hud) = rows_scene();
+    hud.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    hud.set_draws(
+        &device,
+        &queue,
+        &[HudDraw::TexturedRect {
+            texture: HudTexture::Atlas,
+            x: 0.0,
+            y: 0.0,
+            width: ROWS_WIDE as f32,
+            height: ROWS_TALL as f32,
+            uv: [1.0, 0.0, 0.0, 1.0],
+            colour: [0.1, 0.1, 0.1, 0.5],
+        }],
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_pixel(
+        &pixels,
+        ROWS_WIDE / 2,
+        ROWS_TALL / 2,
+        [92, 110, 138],
+        "the block in hand under the grey half tint",
+    );
+}
+
 /// The sky and cloud passes: the band's read-back over a contrasting clear, the star brightness
 /// gate, the moon's phase cell, the under-horizon plane's fog and the layer's blend.
 #[test]

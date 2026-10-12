@@ -27,8 +27,9 @@ use oxide_game::chat::{
     STYLE_STRIKETHROUGH, STYLE_UNDERLINED, TextComponent,
 };
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, PlayerListRecord};
+use oxide_game::mesher::ModelChoice;
 use oxide_game::scoreboard::{Objective, Scoreboard, format_entry};
-use oxide_game::session::{ClientEvent, StatusEffect};
+use oxide_game::session::{ClientEvent, MeshAssets, StatusEffect};
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::nbt::NbtValue;
 use oxide_render::entity_models::player::PlayerExtra;
@@ -46,6 +47,7 @@ use oxide_world::entity::EntityKind;
 
 use crate::CHAT_TEXT_CAP;
 use crate::ChatInput;
+use crate::assets::PUMPKIN_BLUR;
 use crate::assets::UNDERWATER_OVERLAY;
 use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
@@ -91,6 +93,10 @@ pub struct View {
     held: HeldItem,
     /// The survival rows' own state: the feeds `stat_rows_draws` reads.
     rows: StatRows,
+    /// The frame's overlay state: the portal clock and the session's
+    /// eye-block read, for the pumpkin, portal and block-in-hand draws and
+    /// the nausea wobble.
+    overlay: OverlayState,
 }
 
 /// The window's held-item state: the source's own `ItemRenderer` fields the hand draws
@@ -1658,6 +1664,7 @@ impl View {
             own: None,
             held: HeldItem::new(),
             rows: StatRows::new(),
+            overlay: OverlayState::new(),
         }
     }
 
@@ -1732,6 +1739,19 @@ impl View {
             ClientEvent::Experience { bar, level, .. } => {
                 self.rows.bar = *bar;
                 self.rows.level = *level;
+            }
+            ClientEvent::EyeBlock {
+                eye,
+                in_portal,
+                inside,
+            } => {
+                self.overlay.eye_block = *eye;
+                self.overlay.inside_block = *inside;
+                self.overlay.step(
+                    *in_portal,
+                    confusion_long(&self.rows.effects, CONFUSION_EFFECT_ID),
+                );
+                self.overlay.in_portal = *in_portal;
             }
             _ => {}
         }
@@ -2209,6 +2229,266 @@ pub(crate) fn water_overlay_draws(
         }
     }
     draws
+}
+
+/// The pumpkin item's id: `Item.getItemFromBlock(Blocks.pumpkin)` answers the
+/// block's own id, 86 — the lit pumpkin (91) is a different block and does
+/// not count (`GuiIngame.java:145-150`).
+pub(crate) const PUMPKIN_ITEM_ID: i16 = 86;
+
+/// The confusion effect's id (`Potion.confusion`, `Potion.java:34`).
+pub(crate) const CONFUSION_EFFECT_ID: u8 = 9;
+
+/// The portal block's default state, packed: id 90 at metadata 0 — the sprite
+/// `renderPortal` samples (`GuiIngame.java:1019`).
+pub(crate) const PORTAL_BLOCK_STATE: u16 = 90 << 4;
+
+/// The block-in-hand tint: the source's `color(0.1F, 0.1F, 0.1F, 0.5F)`
+/// (`ItemRenderer.java:478`).
+pub(crate) const BLOCK_IN_HAND_TINT: [f32; 4] = [0.1, 0.1, 0.1, 0.5];
+
+/// The frame's overlay state: the portal clock and the session's eye-block
+/// read, the shape the hud and camera consumers share.
+#[derive(Debug, Clone)]
+pub(crate) struct OverlayState {
+    /// The previous tick's `timeInPortal` (`EntityPlayerSP.java:732`).
+    pub prev_time_in_portal: f32,
+    /// This tick's `timeInPortal`.
+    pub time_in_portal: f32,
+    /// Whether the tick overlapped a portal block (`inPortal`).
+    pub in_portal: bool,
+    /// The packed eye-viewpoint block the session read.
+    pub eye_block: u16,
+    /// The block-in-hand probe's winning packed state, if any.
+    pub inside_block: Option<u16>,
+}
+
+impl OverlayState {
+    /// The resting state: no portal time, the eye in air, nothing in hand.
+    fn new() -> Self {
+        Self {
+            prev_time_in_portal: 0.0,
+            time_in_portal: 0.0,
+            in_portal: false,
+            eye_block: 0,
+            inside_block: None,
+        }
+    }
+
+    /// Steps the portal clock one tick (`EntityPlayerSP.java:732-774`): the
+    /// previous takes the current, then `+0.0125` (clamped to 1) inside a
+    /// portal, `+1/150` (clamped past 1) under long confusion, `-0.05`
+    /// (clamped to 0) otherwise. (The `portal.trigger` sound at the ramp's
+    /// start, `:741-744`, belongs to the sound work, not to this clock.)
+    fn step(&mut self, in_portal: bool, confusion_long: bool) {
+        self.prev_time_in_portal = self.time_in_portal;
+        if in_portal {
+            self.time_in_portal += 0.0125;
+            if self.time_in_portal >= 1.0 {
+                self.time_in_portal = 1.0;
+            }
+        } else if confusion_long {
+            self.time_in_portal += 1.0 / 150.0;
+            if self.time_in_portal > 1.0 {
+                self.time_in_portal = 1.0;
+            }
+        } else {
+            if self.time_in_portal > 0.0 {
+                self.time_in_portal -= 0.05;
+            }
+            if self.time_in_portal < 0.0 {
+                self.time_in_portal = 0.0;
+            }
+        }
+    }
+
+    /// The frame's portal time: the previous-to-current lerp at the frame
+    /// fraction (`GuiIngame.java:153`, `EntityRenderer.java:782`).
+    pub(crate) fn lerped(&self, partial: f32) -> f32 {
+        self.prev_time_in_portal + (self.time_in_portal - self.prev_time_in_portal) * partial
+    }
+}
+
+/// Whether confusion held past a minute: the effect active with a duration
+/// past 60 ticks (`EntityPlayerSP.java:756`).
+fn confusion_long(effects: &[StatusEffect], confusion: u8) -> bool {
+    effects
+        .iter()
+        .any(|effect| effect.effect_id == confusion && effect.duration > 60)
+}
+
+/// Whether the worn helmet is a pumpkin: armour slot 3 (window-0 slot 8)
+/// carries the pumpkin block's item (`GuiIngame.java:145-150`).
+pub(crate) fn pumpkin_worn(armour: &[Option<MetadataItem>; 4]) -> bool {
+    armour[3]
+        .as_ref()
+        .is_some_and(|item| item.id == PUMPKIN_ITEM_ID)
+}
+
+/// The pumpkin blur's draws: the fullscreen `misc/pumpkinblur` quad, white,
+/// at z-depth nothing (`GuiIngame.renderPumpkinOverlay`, `:928-953`) — drawn
+/// when the helmet is a pumpkin and the view is first person (`:145-150`;
+/// the port tracks no third-person view, so the call site passes first
+/// person true and the gate stays explicit).
+pub(crate) fn pumpkin_overlay_draws(
+    worn: bool,
+    first_person: bool,
+    scaled: &ScaledResolution,
+) -> Vec<HudDraw> {
+    if !(worn && first_person) {
+        return Vec::new();
+    }
+    vec![HudDraw::TexturedRect {
+        texture: HudTexture::Named(PUMPKIN_BLUR),
+        x: 0.0,
+        y: 0.0,
+        width: scaled.width as f32,
+        height: scaled.height as f32,
+        uv: [0.0, 0.0, 1.0, 1.0],
+        colour: [1.0, 1.0, 1.0, 1.0],
+    }]
+}
+
+/// The portal overlay's alpha ramp (`GuiIngame.renderPortal`, `:1003-1011`):
+/// quartic below one, folded to `0.8f + 0.2`; one and past read straight.
+pub(crate) fn portal_alpha(time_in_portal: f32) -> f32 {
+    if time_in_portal < 1.0 {
+        let quartic = time_in_portal * time_in_portal * time_in_portal * time_in_portal;
+        quartic * 0.8 + 0.2
+    } else {
+        time_in_portal
+    }
+}
+
+/// The portal quad: the fullscreen portal-sprite draw at the ramped alpha
+/// (`GuiIngame.java:1012-1031`) — nothing while confusion holds or the
+/// lerped time is zero (`:152-160`). `uv` is the sprite's atlas rect
+/// `[u0, v0, u1, v1]`; the frame fraction lerps the clock (R2).
+pub(crate) fn portal_overlay_draws(
+    prev: f32,
+    current: f32,
+    partial: f32,
+    confusion_active: bool,
+    uv: [f32; 4],
+    scaled: &ScaledResolution,
+) -> Option<HudDraw> {
+    if confusion_active {
+        return None;
+    }
+    let lerped = prev + (current - prev) * partial;
+    if lerped <= 0.0 {
+        return None;
+    }
+    Some(HudDraw::TexturedRect {
+        texture: HudTexture::Atlas,
+        x: 0.0,
+        y: 0.0,
+        width: scaled.width as f32,
+        height: scaled.height as f32,
+        uv,
+        colour: [1.0, 1.0, 1.0, portal_alpha(lerped)],
+    })
+}
+
+/// The block-in-hand tint quad: the fullscreen draw of the winning block's
+/// sprite at the grey half tint (`ItemRenderer.renderBlockInHand`,
+/// `:472-495`), its U mirrored (the left edge samples `maxU`, `:488-491`).
+/// `uv` is the sprite's atlas rect `[u0, v0, u1, v1]`.
+pub(crate) fn block_in_hand_draw(uv: [f32; 4], scaled: &ScaledResolution) -> HudDraw {
+    HudDraw::TexturedRect {
+        texture: HudTexture::Atlas,
+        x: 0.0,
+        y: 0.0,
+        width: scaled.width as f32,
+        height: scaled.height as f32,
+        uv: [uv[2], uv[1], uv[0], uv[3]],
+        colour: BLOCK_IN_HAND_TINT,
+    }
+}
+
+/// One overlay block state's atlas rect, `[u0, v0, u1, v1]`: the baked
+/// model's particle texture at the origin — the same resolution the crack
+/// pass reads (`particle_uv`'s Atlas arm) — or the fallback sprite when the
+/// state resolves nothing. The wire packs `Block.getStateId`
+/// (`Block.java:174-178`), so the id rides high and the metadata low.
+pub(crate) fn overlay_sprite_uv(state: u16, mesh: &MeshAssets) -> [f32; 4] {
+    let particle = match mesh.models.model(state >> 4, (state & 15) as u8, 0, 0, 0) {
+        ModelChoice::Model(model) => model.particle.clone(),
+        ModelChoice::Missing => None,
+    };
+    let sprite = match particle.as_deref() {
+        Some(path) => mesh.atlas.drawn(path),
+        None => &mesh.atlas.missing,
+    };
+    let [[u0, v0], [u1, v1]] = mesh.atlas.uv(sprite);
+    [u0, v0, u1, v1]
+}
+
+impl View {
+    /// Whether confusion is active at all: the portal quad's own gate
+    /// (`GuiIngame.java:152`) — any live effect, not the clock creep's
+    /// past-a-minute rule (`EntityPlayerSP.java:756`).
+    pub(crate) fn confusion_active(&self) -> bool {
+        self.rows
+            .effects
+            .iter()
+            .any(|effect| effect.effect_id == CONFUSION_EFFECT_ID)
+    }
+
+    /// The frame's portal time at its fraction: the clock's lerp (R2).
+    pub(crate) fn portal_time(&self, partial: f32) -> f32 {
+        self.overlay.lerped(partial)
+    }
+
+    /// Whether the eye sits in lava: the viewpoint cell's behaviour-table
+    /// liquid is lava (`Blocks.flowing_lava`/`Blocks.lava`, ids 10-11) — the
+    /// lava fog arm's own material read (`EntityRenderer.java:1849`).
+    pub(crate) fn eye_in_lava(&self) -> bool {
+        behaviour::behaviour(self.overlay.eye_block >> 4)
+            .is_some_and(|row| matches!(row.liquid, Some(behaviour::LiquidKind::Lava)))
+    }
+
+    /// The hand pass's overlay quad: the winning block's sprite at the grey
+    /// half tint (`ItemRenderer.renderOverlays`'s opaque-block arm,
+    /// `ItemRenderer.java:424-447`) — nothing when the gate is shut or the
+    /// winner's render type is `-1`, which the session already folded into
+    /// the read.
+    pub(crate) fn hand_overlay_draw(
+        &self,
+        mesh: &MeshAssets,
+        scaled: &ScaledResolution,
+    ) -> Option<HudDraw> {
+        self.overlay
+            .inside_block
+            .map(|state| block_in_hand_draw(overlay_sprite_uv(state, mesh), scaled))
+    }
+
+    /// The GUI's overlay quads in the source's own order: the pumpkin blur,
+    /// then the portal (`GuiIngame.renderGameOverlay`, `GuiIngame.java:145-160`
+    /// — vignette, which the port does not draw yet, runs ahead of both).
+    /// The port tracks no third-person view, so the call site passes first
+    /// person true (R3).
+    pub(crate) fn gui_overlay_draws(
+        &self,
+        partial: f32,
+        first_person: bool,
+        scaled: &ScaledResolution,
+        mesh: &MeshAssets,
+    ) -> Vec<HudDraw> {
+        let mut draws =
+            pumpkin_overlay_draws(pumpkin_worn(&self.rows.armour), first_person, scaled);
+        if let Some(quad) = portal_overlay_draws(
+            self.overlay.prev_time_in_portal,
+            self.overlay.time_in_portal,
+            partial,
+            self.confusion_active(),
+            overlay_sprite_uv(PORTAL_BLOCK_STATE, mesh),
+            scaled,
+        ) {
+            draws.push(quad);
+        }
+        draws
+    }
 }
 
 /// The experience fill's width: the truncated `bar × 183`
@@ -10373,6 +10653,219 @@ mod tests {
                 .any(|(_, _, uv)| (uv[1] - 18.0 / 256.0).abs() < 1e-9),
             "no bubbles out of water: {draws:?}"
         );
+    }
+
+    /// The pumpkin blur (`GuiIngame.renderPumpkinOverlay`,
+    /// `GuiIngame.java:928-953`): the worn helmet (armour slot 3) carrying the
+    /// pumpkin block's item draws one fullscreen `misc/pumpkinblur` quad,
+    /// white — and nothing draws bare-headed, lit-pumpkin-headed, or out of
+    /// first person (`:145-150`; the port tracks no third-person view, so the
+    /// call site passes first person true and the gate stays explicit here).
+    #[test]
+    fn the_worn_pumpkin_draws_the_blur() {
+        let scaled = chat_resolution();
+        let helmet = |id: i16| {
+            Some(MetadataItem {
+                id,
+                count: 1,
+                damage: 0,
+                nbt: None,
+            })
+        };
+        let mut armour: [Option<MetadataItem>; 4] = [None, None, None, None];
+        armour[3] = helmet(PUMPKIN_ITEM_ID);
+        assert!(pumpkin_worn(&armour), "the pumpkin helmet counts");
+        let draws = pumpkin_overlay_draws(true, true, &scaled);
+        assert_eq!(draws.len(), 1, "one fullscreen quad: {draws:?}");
+        match &draws[0] {
+            HudDraw::TexturedRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv,
+                colour,
+            } => {
+                assert_eq!(
+                    *texture,
+                    HudTexture::Named(PUMPKIN_BLUR),
+                    "the blur samples pumpkinblur"
+                );
+                assert_eq!(
+                    (*x, *y, *width, *height),
+                    (0.0, 0.0, scaled.width as f32, scaled.height as f32),
+                    "the quad covers the screen"
+                );
+                assert_eq!(*uv, [0.0, 0.0, 1.0, 1.0], "the uv spans the sheet");
+                assert_eq!(*colour, [1.0, 1.0, 1.0, 1.0], "the tint is white");
+            }
+            other => panic!("the blur is a textured quad: {other:?}"),
+        }
+        assert!(
+            pumpkin_overlay_draws(false, true, &scaled).is_empty(),
+            "bare-headed draws nothing"
+        );
+        assert!(
+            pumpkin_overlay_draws(true, false, &scaled).is_empty(),
+            "third person draws nothing"
+        );
+        armour[3] = None;
+        assert!(!pumpkin_worn(&armour), "bare-headed is not worn");
+        armour[3] = helmet(91);
+        assert!(!pumpkin_worn(&armour), "the lit pumpkin is another block");
+    }
+
+    /// The portal ramp (`GuiIngame.renderPortal`, `GuiIngame.java:1003-1011`):
+    /// quartic below one folded to `0.8f + 0.2`, straight at one and past.
+    #[test]
+    fn the_portal_ramp_folds_below_one() {
+        assert!(
+            (portal_alpha(0.25) - 0.203125).abs() < 1e-6,
+            "a quarter ramps to 0.203125"
+        );
+        assert!(
+            (portal_alpha(0.5) - 0.25).abs() < 1e-6,
+            "a half ramps to a quarter"
+        );
+        assert_eq!(portal_alpha(1.0), 1.0, "one reads straight");
+    }
+
+    /// The portal quad (`GuiIngame.java:1012-1031`): nothing while confusion
+    /// holds or the lerped time is zero (`:152-160`); otherwise the fullscreen
+    /// sprite draw at the ramped alpha, lerped at the frame fraction.
+    #[test]
+    fn the_portal_quad_gates_on_confusion_and_zero() {
+        let scaled = chat_resolution();
+        let uv = [0.0, 0.0, 1.0, 1.0];
+        assert!(
+            portal_overlay_draws(0.5, 0.5, 0.0, true, uv, &scaled).is_none(),
+            "confusion skips the quad"
+        );
+        assert!(
+            portal_overlay_draws(0.0, 0.0, 0.0, false, uv, &scaled).is_none(),
+            "zero time draws nothing"
+        );
+        let quad =
+            portal_overlay_draws(0.2, 0.4, 0.5, false, uv, &scaled).expect("a positive lerp draws");
+        match quad {
+            HudDraw::TexturedRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv: drawn,
+                colour,
+            } => {
+                assert_eq!(texture, HudTexture::Atlas, "the quad samples the atlas");
+                assert_eq!(
+                    (x, y, width, height),
+                    (0.0, 0.0, scaled.width as f32, scaled.height as f32),
+                    "the quad covers the screen"
+                );
+                assert_eq!(drawn, uv, "the sprite rect rides through");
+                assert_eq!((colour[0], colour[1], colour[2]), (1.0, 1.0, 1.0));
+                assert!(
+                    (colour[3] - 0.20648).abs() < 1e-5,
+                    "f = 0.3 ramps to 0.20648, got {}",
+                    colour[3]
+                );
+            }
+            other => panic!("the portal is a textured quad: {other:?}"),
+        }
+    }
+
+    /// The portal clock (`EntityPlayerSP.java:732-774`): the previous takes
+    /// the current, then `+0.0125` in a portal, `-0.05` out of one, each
+    /// clamped into `0..=1`.
+    #[test]
+    fn the_portal_clock_ramps_in_a_portal_and_decays_out() {
+        let mut overlay = OverlayState::new();
+        overlay.step(true, false);
+        assert!(
+            (overlay.time_in_portal - 0.0125).abs() < 1e-6,
+            "one portal tick ramps"
+        );
+        assert_eq!(overlay.prev_time_in_portal, 0.0, "the previous held zero");
+        overlay.step(false, false);
+        assert_eq!(overlay.time_in_portal, 0.0, "the decay clamps at zero");
+        assert!(
+            (overlay.prev_time_in_portal - 0.0125).abs() < 1e-6,
+            "the previous takes the ramp"
+        );
+    }
+
+    /// The clock's clamps: the portal ramp pins at one, and long confusion
+    /// creeps `+1/150` a tick (`:743-749`).
+    #[test]
+    fn the_portal_clock_clamps_at_one_and_creeps_under_confusion() {
+        let mut overlay = OverlayState::new();
+        overlay.time_in_portal = 0.999;
+        overlay.step(true, false);
+        assert_eq!(overlay.time_in_portal, 1.0, "the ramp pins at one");
+        let mut overlay = OverlayState::new();
+        overlay.step(false, true);
+        assert!(
+            (overlay.time_in_portal - 1.0 / 150.0).abs() < 1e-7,
+            "confusion creeps a hundred-fiftieth"
+        );
+    }
+
+    /// The confusion minute gate (`EntityPlayerSP.java:756`): confusion (id 9)
+    /// counts only past 60 ticks of duration.
+    #[test]
+    fn the_confusion_minute_gate_reads_duration() {
+        assert_eq!(CONFUSION_EFFECT_ID, 9, "confusion is effect 9");
+        let effect = |id: u8, duration: i32| {
+            vec![oxide_game::session::StatusEffect {
+                effect_id: id,
+                amplifier: 0,
+                duration,
+            }]
+        };
+        assert!(
+            confusion_long(&effect(9, 61), CONFUSION_EFFECT_ID),
+            "61 ticks counts"
+        );
+        assert!(
+            !confusion_long(&effect(9, 60), CONFUSION_EFFECT_ID),
+            "60 ticks does not"
+        );
+        assert!(
+            !confusion_long(&effect(1, 200), CONFUSION_EFFECT_ID),
+            "another effect does not"
+        );
+    }
+
+    /// The block-in-hand tint (`ItemRenderer.renderBlockInHand`,
+    /// `:472-495`): the fullscreen atlas draw of the winning sprite at the
+    /// grey half tint, its U mirrored (the left edge samples `maxU`,
+    /// `:488-491`).
+    #[test]
+    fn the_block_in_hand_mirrors_u_at_the_grey_half_tint() {
+        let scaled = chat_resolution();
+        match block_in_hand_draw([0.1, 0.2, 0.3, 0.4], &scaled) {
+            HudDraw::TexturedRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv,
+                colour,
+            } => {
+                assert_eq!(texture, HudTexture::Atlas, "the hand samples the atlas");
+                assert_eq!(
+                    (x, y, width, height),
+                    (0.0, 0.0, scaled.width as f32, scaled.height as f32),
+                    "the quad covers the screen"
+                );
+                assert_eq!(uv, [0.3, 0.2, 0.1, 0.4], "U mirrored, V straight");
+                assert_eq!(colour, BLOCK_IN_HAND_TINT, "the grey half tint");
+            }
+            other => panic!("the hand is a textured quad: {other:?}"),
+        }
     }
 
     /// The first-person water overlay (`ItemRenderer.renderWaterOverlayTexture`,

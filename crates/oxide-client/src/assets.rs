@@ -206,6 +206,11 @@ pub const HUD_ICONS: &str = "gui/icons";
 /// source's `RES_UNDERWATER_OVERLAY` file (`ItemRenderer.java:33`).
 pub const UNDERWATER_OVERLAY: &str = "misc/underwater";
 
+/// The pumpkin blur's key, the extraction tree's `misc/pumpkinblur.png`: the
+/// worn-pumpkin overlay samples it under the name its draw carries — the
+/// source's `pumpkinBlurTexPath` file (`GuiIngame.java:49`).
+pub const PUMPKIN_BLUR: &str = "misc/pumpkinblur";
+
 /// The enchanted glint's sheet, the extraction tree's `misc/enchanted_item_glint.png`:
 /// the glint passes of an enchanted icon sample it, the source's own
 /// `RenderItem.RES_ITEM_GLINT` file (`RenderItem.java`:63).
@@ -353,6 +358,9 @@ pub struct ClientAssets {
     /// The underwater sheet, under [`UNDERWATER_OVERLAY`]: the first-person water
     /// overlay samples it.
     pub underwater: Texture,
+    /// The pumpkin blur, under [`PUMPKIN_BLUR`]: the worn-pumpkin overlay
+    /// samples it.
+    pub pumpkin_blur: Texture,
     /// The enchanted glint's sheet, under [`GLINT_SHEET`]: the glint passes of an
     /// enchanted icon sample it.
     pub glint_sheet: Texture,
@@ -460,6 +468,9 @@ impl ClientAssets {
         // The underwater sheet: the first-person water overlay samples it under
         // the name its draw carries.
         let underwater = texture(&textures, UNDERWATER_OVERLAY)?.clone();
+        // The pumpkin blur: the worn-pumpkin overlay samples it under the
+        // name its draw carries.
+        let pumpkin_blur = texture(&textures, PUMPKIN_BLUR)?.clone();
         // The enchanted glint's sheet: the glint passes of an enchanted icon sample
         // it, under the name the hud's glint registration carries.
         let glint_sheet = texture(&textures, GLINT_SHEET)?.clone();
@@ -520,6 +531,7 @@ impl ClientAssets {
             skin_slim,
             hud_icons,
             underwater,
+            pumpkin_blur,
             glint_sheet,
             gui_sheets,
             item_meshes,

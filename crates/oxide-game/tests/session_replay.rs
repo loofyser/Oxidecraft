@@ -963,20 +963,24 @@ fn sky_report(event: &ClientEvent) -> Option<SkyReport> {
 
 /// The skies the frames themselves report: each `Sky` preceded by the Time
 /// Update or the snapped tick that produced it, with the snapped tick's own
-/// entity feed between them. A tick that advances a running clock adds skies
-/// of its own between the frames — the sun travels at the tick rate — so the
-/// frame-driven reports are identified by their marker, not by position.
+/// feed and eye-block read between them. A tick that advances a running clock
+/// adds skies of its own between the frames — the sun travels at the tick
+/// rate — so the frame-driven reports are identified by their marker, not by
+/// position.
 fn frame_skies(events: &[ClientEvent]) -> Vec<SkyReport> {
     let mut skies = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let Some(report) = sky_report(event) else {
             continue;
         };
-        // The marker is the nearest event behind the sky, looking one step
-        // further back through a snapped tick's own feed.
+        // The marker is the nearest event behind the sky, looking back through
+        // a snapped tick's own feed and eye-block read.
         let mut behind = events[..index].iter().rev();
         let mut marker = behind.next();
-        if matches!(marker, Some(ClientEvent::EntitiesTick { .. })) {
+        while matches!(
+            marker,
+            Some(ClientEvent::EntitiesTick { .. } | ClientEvent::EyeBlock { .. })
+        ) {
             marker = behind.next();
         }
         if matches!(
@@ -1059,14 +1063,16 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
         .expect("the session runs to the end of the stream");
 
     // The ticks the session's own clock adds are its own business here; the
-    // unsnapped ticks and the per-tick entity feeds are dropped so the
-    // frame-driven story reads as before.
+    // unsnapped ticks and the per-tick reads (the entity feed, the eye-block
+    // read behind it) are dropped so the frame-driven story reads as before.
     let events: Vec<ClientEvent> = receiver
         .try_iter()
         .filter(|event| {
             !matches!(
                 event,
-                ClientEvent::PlayerTick { snapped: false, .. } | ClientEvent::EntitiesTick { .. }
+                ClientEvent::PlayerTick { snapped: false, .. }
+                    | ClientEvent::EntitiesTick { .. }
+                    | ClientEvent::EyeBlock { .. }
             )
         })
         .collect();
@@ -4104,13 +4110,14 @@ fn a_tick_over_a_changed_world_re_emits_the_aim() {
         events[last]
     );
     assert!(
-        matches!(events[last - 1], ClientEvent::EntitiesTick { .. })
+        matches!(events[last - 1], ClientEvent::EyeBlock { .. })
+            && matches!(events[last - 2], ClientEvent::EntitiesTick { .. })
             && matches!(
-                events[last - 2],
+                events[last - 3],
                 ClientEvent::PlayerTick { snapped: false, .. }
             ),
-        "the tick that stepped the changed world re-emitted the aim, its feed between: {:?}",
-        &events[last - 2..=last]
+        "the tick that stepped the changed world re-emitted the aim, its feed and eye-block read between: {:?}",
+        &events[last - 3..=last]
     );
 }
 

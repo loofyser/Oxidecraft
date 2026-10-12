@@ -83,7 +83,7 @@ use oxide_proto_v47::window::{
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
-use oxide_world::behaviour::{Material, behaviour};
+use oxide_world::behaviour::{Material, RenderKind, behaviour};
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::SECTION_SIZE;
 use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
@@ -477,6 +477,28 @@ pub enum ClientEvent {
     EntitiesTick {
         /// One frame per tracked entity.
         entities: Vec<EntityFrame>,
+    },
+    /// The eye-block read for one tick: the viewpoint cell, the portal
+    /// overlap and the block-in-hand probe's winner, from the world data the
+    /// session owns.
+    ///
+    /// Reported every tick immediately behind the tick's `EntitiesTick` — a
+    /// tick that changed nothing is still reported, like that feed — and on
+    /// the snapped correction's pair too. The window keeps the values for
+    /// the overlay draws, the portal clock and the lava fog arm; it derives
+    /// no world reads of its own.
+    EyeBlock {
+        /// The packed eye-viewpoint block (`World::block` packing, the id in
+        /// the high bits): `ActiveRenderInfo.getBlockAtEntityViewpoint`'s
+        /// cell read as data (`ActiveRenderInfo.java:84-107`).
+        eye: u16,
+        /// Whether the tick's box overlaps a portal block: the collision's
+        /// `setPortal` read as a bool (`BlockPortal.java:197-204`).
+        in_portal: bool,
+        /// The block-in-hand probe's winning packed state, or `None` when the
+        /// gate is shut or its render type is `-1`
+        /// (`ItemRenderer.java:424-447`).
+        inside: Option<u16>,
     },
     /// The player list's whole entry set, from clientbound 0x38.
     ///
@@ -1819,6 +1841,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 events,
                                 entities_tick(&entities, world.as_ref(), &player_list, &board),
                             );
+                            report(events, eye_block_event(&player, world.as_ref()));
                             // The view block moved: the sky's colour is sampled at the player's own
                             // block, so a correction can change it without a new clock.
                             report_sky(
@@ -3543,6 +3566,135 @@ fn apply_correction(player: &mut Player, teleport: &PlayerPositionAndLook) {
     ) as f32;
 }
 
+/// The portal block's numeric id (`Blocks.portal`, `Blocks.java:358`): 90, the
+/// nether-portal block the behaviour table carries no row for.
+const PORTAL_BLOCK_ID: u16 = 90;
+
+/// The player's width in blocks: the source's 0.6 (`EntityPlayer`'s own
+/// width, carried by `Entity.width`), the span the probes read `0.8` of.
+const PLAYER_WIDTH: f64 = 0.6;
+
+/// The player's height in blocks for the portal scan: 1.8 standing (the
+/// source's `EntityPlayer` height).
+const PLAYER_HEIGHT: f64 = 1.8;
+
+/// One gate probe's cell (`Entity.isEntityInsideOpaqueBlock`,
+/// `Entity.java:1838-1840`): the Y cell from `(index >> 0)`, X from
+/// `(index >> 1)`, Z from `(index >> 2)` — the `±0.05` vertical taps at the
+/// eye, the `±0.4·width` horizontal ones.
+fn gate_cell(index: u32, feet: [f64; 3], eye_height: f64) -> (i32, i32, i32) {
+    let tap = |bit: u32| f64::from((index >> bit) % 2) - 0.5;
+    (
+        (feet[0] + tap(1) * PLAYER_WIDTH * 0.8).floor() as i32,
+        (feet[1] + tap(0) * 0.1 + eye_height).floor() as i32,
+        (feet[2] + tap(2) * PLAYER_WIDTH * 0.8).floor() as i32,
+    )
+}
+
+/// One winner probe's cell (`ItemRenderer.renderOverlays`,
+/// `ItemRenderer.java:429-431`): X from `(index >> 0)`, Y from `(index >>
+/// 1)`, Z from `(index >> 2)` — the other swizzle, floored at the eye.
+fn hand_cell(index: u32, feet: [f64; 3], eye_height: f64) -> (i32, i32, i32) {
+    let tap = |bit: u32| f64::from((index >> bit) % 2) - 0.5;
+    (
+        (feet[0] + tap(0) * PLAYER_WIDTH * 0.8).floor() as i32,
+        (feet[1] + tap(1) * 0.1 + eye_height).floor() as i32,
+        (feet[2] + tap(2) * PLAYER_WIDTH * 0.8).floor() as i32,
+    )
+}
+
+/// Whether a block id is visually opaque (`Block.isVisuallyOpaque`,
+/// `Block.java:361-364`): the material's `blocksMovement` and a full cube.
+/// An id the table carries no row for (air, the portal) is not opaque.
+fn visually_opaque_id(id: u16) -> bool {
+    behaviour(id).is_some_and(|row| row.material.blocks_movement() && row.full_cube)
+}
+
+/// Whether a block id draws in the hand (`getRenderType() != -1`,
+/// `ItemRenderer.java:445`): air (`BlockAir.java:19-22`) and the barrier
+/// (`BlockBarrier.java:22-25`) answer -1; every other id reads the
+/// dispatcher's default 3 (`Block.java:379-382`), including the ids the
+/// table carries no row for.
+fn renderable_id(id: u16) -> bool {
+    id != 0 && behaviour(id).is_none_or(|row| !matches!(row.render, RenderKind::Invisible))
+}
+
+/// Whether the tick's box overlaps a portal block: the collision's
+/// `setPortal` read as a bool (`BlockPortal.onEntityCollidedWithBlock`,
+/// `BlockPortal.java:197-204` — the riding checks have no carrier here; the
+/// port never rides). The scan covers the standing box; the cooldown
+/// (`timeUntilPortal`) and the pattern teleport belong to the travel work,
+/// not to this read.
+fn portal_overlap(feet: [f64; 3], world: &World) -> bool {
+    let min = [
+        (feet[0] - PLAYER_WIDTH / 2.0).floor() as i32,
+        feet[1].floor() as i32,
+        (feet[2] - PLAYER_WIDTH / 2.0).floor() as i32,
+    ];
+    let max = [
+        (feet[0] + PLAYER_WIDTH / 2.0).floor() as i32,
+        (feet[1] + PLAYER_HEIGHT).floor() as i32,
+        (feet[2] + PLAYER_WIDTH / 2.0).floor() as i32,
+    ];
+    for x in min[0]..=max[0] {
+        for y in min[1]..=max[1] {
+            for z in min[2]..=max[2] {
+                if world.block(x, y, z) >> 4 == PORTAL_BLOCK_ID {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The eye-block read for one tick: the viewpoint cell, the portal overlap
+/// and the block-in-hand probe's winner, from the world data the session
+/// owns (`Entity.java:1829-1856`, `ItemRenderer.java:424-447`,
+/// `BlockPortal.java:197-204`). Before Join Game there is no world to read
+/// and the answer is empty: air at the eye, no portal, the gate shut.
+fn eye_block_event(player: &Player, world: Option<&World>) -> ClientEvent {
+    let Some(world) = world else {
+        return ClientEvent::EyeBlock {
+            eye: 0,
+            in_portal: false,
+            inside: None,
+        };
+    };
+    let feet = player.position;
+    let eye_height = player.eye_height();
+    let eye = world.block(
+        feet[0].floor() as i32,
+        (feet[1] + eye_height).floor() as i32,
+        feet[2].floor() as i32,
+    );
+    let in_portal = portal_overlap(feet, world);
+    // The gate (`Entity.isEntityInsideOpaqueBlock`, `Entity.java:1829-1856`):
+    // any visually-opaque probe opens it.
+    let gate_open = (0..8u32).any(|index| {
+        let (x, y, z) = gate_cell(index, feet, eye_height);
+        visually_opaque_id(world.block(x, y, z) >> 4)
+    });
+    // The winner probe (`ItemRenderer.java:424-447`): the last opaque probe's
+    // packed state — or nothing when the gate is shut or its render type is
+    // `-1` (`:445`).
+    let mut inside = None;
+    if gate_open {
+        for index in 0..8u32 {
+            let (x, y, z) = hand_cell(index, feet, eye_height);
+            let state = world.block(x, y, z);
+            if visually_opaque_id(state >> 4) && renderable_id(state >> 4) {
+                inside = Some(state);
+            }
+        }
+    }
+    ClientEvent::EyeBlock {
+        eye,
+        in_portal,
+        inside,
+    }
+}
+
 /// The player's current state as the window's per-tick event.
 fn player_tick(player: &Player, snapped: bool) -> ClientEvent {
     ClientEvent::PlayerTick {
@@ -3878,8 +4030,11 @@ fn step_tick(
     }
     report(events, player_tick(player, false));
     // The feed sits immediately behind the player's own event: one
-    // `EntitiesTick` per tick, carrying every tracked entity's frame.
+    // `EntitiesTick` per tick, carrying every tracked entity's frame, and the
+    // eye-block read behind that — the window keeps the values for the
+    // overlay draws, the portal clock and the lava fog arm.
     report(events, entities_tick(entities, world, player_list, board));
+    report(events, eye_block_event(player, world));
     sends
 }
 
@@ -4953,8 +5108,9 @@ mod tests {
 
     use super::{
         ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT, GRAPHICS_FAST,
-        INPUTS_PER_PASS, MeshAssets, MeshQueue, SMOOTH_LIGHTING, TICK_PERIOD, WEATHER_EASE_RATE,
-        WeatherState, chat_over_cap, finish_meshes, mesh_pool, step_tick,
+        INPUTS_PER_PASS, MeshAssets, MeshQueue, PORTAL_BLOCK_ID, SMOOTH_LIGHTING, TICK_PERIOD,
+        WEATHER_EASE_RATE, WeatherState, chat_over_cap, eye_block_event, finish_meshes, gate_cell,
+        hand_cell, mesh_pool, renderable_id, step_tick, visually_opaque_id,
     };
     use crate::entity_view::PlayerList;
     use crate::input::Intent;
@@ -5002,6 +5158,163 @@ mod tests {
         // `:582`), which the acceptance rig arranges as plain stone — id 1,
         // metadata 0 (`Blocks.stone`'s one variant).
         assert_eq!(ASSUMED_HELD_BLOCK, 1 << 4, "stone: id 1 at metadata 0");
+    }
+
+    /// One column holding exactly `blocks` (`(x, y, z, packed)` in world
+    /// coordinates) for the eye-block probe tests.
+    fn probe_world(blocks: &[(i32, i32, i32, u16)]) -> World {
+        use oxide_proto_v47::column::{ColumnData, SectionData, block_index};
+        let mut sections: [Option<SectionData>; 16] = std::array::from_fn(|_| None);
+        for (x, y, z, value) in blocks {
+            let section = (y >> 4) as usize;
+            let slot = sections[section].get_or_insert(SectionData {
+                blocks: Box::new([0u16; 4096]),
+                block_light: Box::new([0u8; 2048]),
+                sky_light: Some(Box::new([0u8; 2048])),
+            });
+            let local = block_index(
+                x.rem_euclid(16) as usize,
+                (y & 15) as usize,
+                z.rem_euclid(16) as usize,
+            );
+            slot.blocks[local] = *value;
+        }
+        let mut world = World::new(true);
+        assert!(
+            world.apply_column(
+                0,
+                0,
+                &ColumnData {
+                    mask: 0xFFFF,
+                    sections,
+                    biomes: None,
+                },
+                true,
+            ),
+            "the probe column loads"
+        );
+        world
+    }
+
+    #[test]
+    fn the_gate_probe_reads_y_from_the_low_bit() {
+        // `Entity.isEntityInsideOpaqueBlock` (`Entity.java:1838-1840`): the Y
+        // cell from `(i >> 0)`, X from `(i >> 1)`, Z from `(i >> 2)`. Feet
+        // (8.0, 63.38, 8.0) with the standing eye (1.62) puts the low-bit
+        // pair either side of cell 65, and the ±0.24 X/Z taps either side of
+        // cell 8.
+        let feet = [8.0, 63.38, 8.0];
+        assert_eq!(
+            gate_cell(0, feet, 1.62),
+            (7, 64, 7),
+            "index 0 taps the low corner"
+        );
+        assert_eq!(
+            gate_cell(1, feet, 1.62),
+            (7, 65, 7),
+            "the low bit moves Y alone"
+        );
+        assert_eq!(gate_cell(2, feet, 1.62), (8, 64, 7), "bit 1 moves X alone");
+        assert_eq!(gate_cell(4, feet, 1.62), (7, 64, 8), "bit 2 moves Z alone");
+    }
+
+    #[test]
+    fn the_hand_probe_reads_x_from_the_low_bit() {
+        // `ItemRenderer.renderOverlays` (`ItemRenderer.java:429-431`) swizzles
+        // the other way: X from `(i >> 0)`, Y from `(i >> 1)`, Z from
+        // `(i >> 2)`. Index 1 lands (8, 64, 7) here where the gate's lands
+        // (7, 65, 7) — the two sites differ, and the port pins both.
+        let feet = [8.0, 63.38, 8.0];
+        assert_eq!(
+            hand_cell(0, feet, 1.62),
+            (7, 64, 7),
+            "index 0 taps the low corner"
+        );
+        assert_eq!(
+            hand_cell(1, feet, 1.62),
+            (8, 64, 7),
+            "the low bit moves X alone"
+        );
+        assert_eq!(hand_cell(2, feet, 1.62), (7, 65, 7), "bit 1 moves Y alone");
+        assert_eq!(hand_cell(4, feet, 1.62), (7, 64, 8), "bit 2 moves Z alone");
+    }
+
+    #[test]
+    fn the_opaque_rule_is_movement_and_a_full_cube() {
+        // `Block.isVisuallyOpaque` (`Block.java:361-364`): the material's
+        // `blocksMovement` and `isFullCube`. Stone (1) passes; air (0) and
+        // the portal (90, no table row) fail; glass (20) fails on the cube.
+        assert!(visually_opaque_id(1), "stone is visually opaque");
+        assert!(!visually_opaque_id(0), "air is not");
+        assert!(!visually_opaque_id(90), "the portal is not");
+        assert!(!visually_opaque_id(20), "glass is not a full cube");
+    }
+
+    #[test]
+    fn the_render_type_skip_is_air_and_the_barrier() {
+        // `getRenderType() != -1` (`ItemRenderer.java:445`): air
+        // (`BlockAir.java:19-22`) and the barrier (`BlockBarrier.java:22-25`)
+        // answer -1; stone draws, and an untabled id like the portal (90)
+        // reads the default 3 (`Block.java:379-382`).
+        assert!(!renderable_id(0), "air is skipped");
+        assert!(!renderable_id(166), "the barrier is skipped");
+        assert!(renderable_id(1), "stone draws");
+        assert!(renderable_id(90), "the portal reads the default type");
+    }
+
+    #[test]
+    fn the_eye_read_reports_the_viewpoint_cell() {
+        // The eye at feet (8.5, 65.0, 8.5) plus the standing 1.62 reads cell
+        // (8, 66, 8); water there answers packed 128 with the gate shut and
+        // no portal overlap.
+        let mut player = Player::new();
+        player.position = [8.5, 65.0, 8.5];
+        let world = probe_world(&[(8, 66, 8, 8 << 4)]);
+        let ClientEvent::EyeBlock {
+            eye,
+            in_portal,
+            inside,
+        } = eye_block_event(&player, Some(&world))
+        else {
+            panic!("the read reports EyeBlock");
+        };
+        assert_eq!(eye, 8 << 4, "the viewpoint cell's packed water");
+        assert!(!in_portal, "no portal overlaps the box");
+        assert_eq!(inside, None, "water is not visually opaque");
+    }
+
+    #[test]
+    fn the_portal_overlap_reads_the_tick_box() {
+        // A portal cell at the feet (8, 65, 8) overlaps the standing box, so
+        // the tick reports `in_portal`; one cell over it does not.
+        let mut player = Player::new();
+        player.position = [8.5, 65.0, 8.5];
+        let world = probe_world(&[(8, 65, 8, PORTAL_BLOCK_ID << 4)]);
+        let ClientEvent::EyeBlock { in_portal, .. } = eye_block_event(&player, Some(&world)) else {
+            panic!("the read reports EyeBlock");
+        };
+        assert!(in_portal, "the feet portal cell overlaps the box");
+        let clear = probe_world(&[(9, 65, 8, PORTAL_BLOCK_ID << 4)]);
+        let ClientEvent::EyeBlock {
+            in_portal: absent, ..
+        } = eye_block_event(&player, Some(&clear))
+        else {
+            panic!("the read reports EyeBlock");
+        };
+        assert!(!absent, "the neighbouring portal cell misses the box");
+    }
+
+    #[test]
+    fn the_hand_probe_answers_the_last_opaque_state() {
+        // Feet air, the eye-height ring stone: the gate opens and the last
+        // opaque probe wins, packed 16.
+        let mut player = Player::new();
+        player.position = [8.5, 65.0, 8.5];
+        let world = probe_world(&[(8, 66, 8, 1 << 4), (7, 66, 8, 1 << 4), (8, 66, 7, 1 << 4)]);
+        let ClientEvent::EyeBlock { inside, .. } = eye_block_event(&player, Some(&world)) else {
+            panic!("the read reports EyeBlock");
+        };
+        assert_eq!(inside, Some(1 << 4), "the last opaque state wins");
     }
 
     #[test]

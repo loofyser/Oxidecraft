@@ -478,15 +478,43 @@ pub fn camera_effect(
     view_transform([0.0; 3], hurt) * view_transform(translate, rotations)
 }
 
+/// The nausea wobble's divisor: `f2 = 5 / (f1² + 5) − f1 × 0.04`, squared
+/// (`EntityRenderer.java:790-791`). The x-scale reads `1 / f2`.
+pub fn nausea_factor(time_in_portal: f32) -> f32 {
+    let f2 = 5.0 / (time_in_portal * time_in_portal + 5.0) - time_in_portal * 0.04;
+    f2 * f2
+}
+
+/// The nausea wobble's view-space matrix: the rotate/scale/rotate about
+/// `(0, 1, 1)` at `(counter + partial) × i` degrees (`EntityRenderer.java:782-796`),
+/// with `i = 7` under confusion and `20` otherwise — identity at no portal
+/// time. `counter_plus_partial` is the session tick plus the frame fraction
+/// (`rendererUpdateCount + partialTicks`, `:792`/`:794`).
+pub fn nausea_wobble(
+    time_in_portal: f32,
+    counter_plus_partial: f32,
+    confusion_active: bool,
+) -> Mat4 {
+    if time_in_portal <= 0.0 {
+        return Mat4::IDENTITY;
+    }
+    let spins = if confusion_active { 7.0 } else { 20.0 };
+    let angle = (counter_plus_partial * spins).to_radians();
+    let axis = Vec3::new(0.0, 1.0, 1.0).normalize();
+    Mat4::from_axis_angle(axis, angle)
+        * Mat4::from_scale(Vec3::new(1.0 / nausea_factor(time_in_portal), 1.0, 1.0))
+        * Mat4::from_axis_angle(axis, -angle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Camera, CameraPose, CameraSensor, DEFAULT_FOV, EYE_HEIGHT, EYE_HEIGHT_SNEAK,
         FIRST_PERSON_OFFSET, FovInputs, FovSmoother, NEAR_PLANE, NO_VIEW_EFFECT, ViewRotation,
         WalkDistance, bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll,
-        interpolate_pose, render_eye,
+        interpolate_pose, nausea_factor, nausea_wobble, render_eye,
     };
-    use glam::{Vec3, Vec4};
+    use glam::{Mat4, Vec3, Vec4};
 
     /// The sample wall's face plane: the wall occupies z = 164, so the face the
     /// camera sees is at z = 165.
@@ -833,6 +861,46 @@ mod tests {
             (rotations[2].degrees - 0.025).abs() < 1e-4,
             "the pitch sensor's frame value, got {}",
             rotations[2].degrees
+        );
+    }
+
+    /// The nausea divisor (`EntityRenderer.java:790-791`): `5 / (f1² + 5) −
+    /// f1 × 0.04`, squared — at f1 = 1, `(5/6 − 0.04)² ≈ 0.62938`, so the
+    /// x-scale reads `1 / 0.62938 ≈ 1.5889`.
+    #[test]
+    fn the_nausea_divisor_is_the_sources_pair() {
+        let factor = nausea_factor(1.0);
+        assert!(
+            (factor - 0.62938).abs() < 1e-4,
+            "f2(1.0) ≈ 0.62938, got {factor}"
+        );
+        let still = nausea_factor(0.0);
+        assert!(
+            (still - 1.0).abs() < 1e-6,
+            "f2(0.0) is 1: no scale at rest, got {still}"
+        );
+    }
+
+    /// The wobble's spin (`EntityRenderer.java:785-794`): `i = 20`, or 7
+    /// under confusion — and no portal time is the identity, the `f1 ≤ 0`
+    /// no-op (`:784`).
+    #[test]
+    fn the_nausea_spin_reads_seven_under_confusion() {
+        let sober = nausea_wobble(1.0, 9.0, false);
+        let dizzy = nausea_wobble(1.0, 9.0, true);
+        assert_ne!(
+            sober, dizzy,
+            "the confusion spin (7/tick) differs from the sober one (20/tick)"
+        );
+        assert_eq!(
+            nausea_wobble(0.0, 9.0, false),
+            Mat4::IDENTITY,
+            "no portal time is the identity"
+        );
+        assert_eq!(
+            nausea_wobble(0.0, 9.0, true),
+            Mat4::IDENTITY,
+            "no portal time is the identity under confusion too"
         );
     }
 
