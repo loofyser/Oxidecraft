@@ -673,21 +673,25 @@ impl ClientItemIcons {
                         // over `items/wood_sword`), so the file is resolved by
                         // matching that full layer list against the store's `item/`
                         // tree (`ModelSource::generated_item_file`; the layer0
-                        // basename alone misses 86 of the 208 rows — 85 resolve no
-                        // file at all). A row that resolves no file leaves the
-                        // source's default, which `applyTransform` no-ops
+                        // basename alone misses 86 of the 210 rows — 85 resolve no
+                        // file at all). The slots read through the chain's own
+                        // completed display (`ModelSource::item_display`), not the
+                        // geometry bake: the compass/clock files state the item pose
+                        // over their geometry-less `builtin/compass|clock` parents,
+                        // which the bake refuses. A row that resolves no file leaves
+                        // the source's default, which `applyTransform` no-ops
                         // (`ItemCameraTransforms.java`:59).
                         first_person: models
                             .generated_item_file(layers)
-                            .and_then(|file| models.bake_item(&file).ok())
-                            .map(|baked| baked.display.first_person)
+                            .and_then(|file| models.item_display(&file))
+                            .map(|display| display.first_person)
                             .unwrap_or(Transform::DEFAULT),
                         // The third-person slot is the same lookup's own
                         // (`LayerHeldItem.java`:66).
                         third_person: models
                             .generated_item_file(layers)
-                            .and_then(|file| models.bake_item(&file).ok())
-                            .map(|baked| baked.display.third_person)
+                            .and_then(|file| models.item_display(&file))
+                            .map(|display| display.third_person)
                             .unwrap_or(Transform::DEFAULT),
                         shape: IconShape::Flat,
                     })
@@ -1478,7 +1482,7 @@ mod tests {
             "the full layer list disambiguates the potion overlay's tie"
         );
         // The generated rows' own first-person slots, resolved by the full layer
-        // list: the sweep pins the whole class — every one of the table's 208
+        // list: the sweep pins the whole class — every one of the table's 210
         // generated rows carries its file's stated pose.
         let mut rows = 0;
         let mut resolved = 0;

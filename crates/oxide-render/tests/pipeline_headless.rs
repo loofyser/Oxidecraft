@@ -8042,19 +8042,22 @@ fn the_hud_pass_draws_the_glint_over_an_enchanted_icon() {
     expect_pixel(&pixels, 27, 37, [48, 24, 239], "the lower face's blend");
 }
 
-/// The hud draws the later icon over the earlier one: the list's own order is the source's
-/// z ladder (`renderItemAndEffectIntoGUI`:402 — each icon's `zLevel` is the rung
-/// `50 * (index + 1)`), so a second draw's geometry sits nearer and wins where the two
-/// overlap, while the first icon's own pixels outside it stand.
+/// The hud draws two overlapping icons at one shared depth: the balanced level is the
+/// source's own (`RenderItem`:402/`:443` raise and lower `zLevel` around each
+/// `renderItemAndEffectIntoGUI` call, so every icon of a frame renders at the first
+/// icon's 50), and the item pass resolves the tie by depth (`GL_LEQUAL` with writes on).
 ///
-/// The first icon is the block cube at its first rung, the second the generated quad one
-/// rung deeper. Without the ladder both would share a z, and the cube's own front faces —
-/// half a block, five pixels, in front of its centre — would win the overlap against a
-/// later draw.
+/// The first icon is the block cube, the second the generated green quad at the model's
+/// own z 8 — half a block behind the cube's front faces. At the shared level the nearer
+/// geometry wins whatever the list order: the cube's faces cover the quad where they
+/// overlap, while each icon's own pixels outside the overlap stand. (The port's old
+/// ladder, `50 * (index + 1)` per list position, set the later draw a rung nearer, so
+/// the quad won this pixel; the ladder walked late cells past the near plane and the
+/// balanced level replaced it.)
 ///
-/// The pinning run measured the bytes: the overlap's pixel the second icon's own [0, 255,
-/// 0], the first icon's pixel outside it its right face's [0, 0, 111], and the second
-/// icon's own [0, 255, 0] where it stands alone.
+/// The pinning run measured the bytes: the overlap's pixel the first icon's own [255, 0,
+/// 0], the first icon's pixel outside the later draw's cell its right face's [0, 0, 111],
+/// and the second icon's own [0, 255, 0] where it stands alone.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn the_hud_pass_draws_the_later_icon_over_the_earlier_one() {
@@ -8101,13 +8104,15 @@ fn the_hud_pass_draws_the_later_icon_over_the_earlier_one() {
     );
 
     let pixels = item_frame(&device, &queue, &target, &hud);
-    // The overlap: the later draw's own quad, one rung nearer.
+    // The overlap: the same-z tie-break — the earlier cube's nearer faces cover the
+    // later quad (`GL_LEQUAL` depth with writes on; the quad sits half a block behind
+    // the cube's front).
     expect_pixel(
         &pixels,
         32,
         27,
-        [0, 255, 0],
-        "the later icon over the earlier one's face",
+        [255, 0, 0],
+        "the earlier icon's face over the later quad at one shared depth",
     );
     // The earlier icon's own pixel outside the later draw's cell.
     expect_pixel(
@@ -10630,9 +10635,13 @@ fn t21_creative_pixels(
 /// The geometry mirrors `view.rs`'s creative draws at the centred origin
 /// (126, 52) with the search tab selected, which the render crate cannot
 /// import. The pins: an unselected tab's red, the selected tab's yellow past
-/// its icon, the panel's green/blue, a grid item's black cell, the thumb's
-/// white, the search ink, the delete cell's magenta and the sky past the
-/// frame.
+/// its icon, the panel's green/blue on bare panel, a grid item's black cell,
+/// a covered cell's checker white, the thumb's white, the search ink, the
+/// delete cell's magenta and the sky past the frame.
+///
+/// Every icon shares the balanced level now, so no cell walks past the near
+/// plane: the page cell at screen (150, 150) covers the panel there with its
+/// own checker white, and the panel's green is pinned left of the grid instead.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn t21_creative_draws_strip_grid_thumb_search_and_bin() {
@@ -10706,9 +10715,19 @@ fn t21_creative_draws_strip_grid_thumb_search_and_bin() {
     let pixels = t21_creative_pixels(PANEL, &panel, STRIP, &strip, &draws);
     expect_rows(&pixels, 150, 36, [255, 0, 0], "unselected tab 0's red");
     expect_rows(&pixels, 296, 36, [255, 255, 0], "the selected tab's yellow");
-    expect_rows(&pixels, 150, 150, [0, 255, 0], "the panel's green");
+    // The panel's green on bare panel left of the grid: (150, 150) sits inside a
+    // page cell's icon now that every icon shares the balanced level.
+    expect_rows(&pixels, 130, 100, [0, 255, 0], "the panel's green");
     expect_rows(&pixels, 300, 150, [0, 0, 255], "the panel's blue");
     expect_rows(&pixels, 135, 70, [0, 0, 0], "grid cell 0's item");
+    // The page cell covering (150, 150): its own checker white, not the panel.
+    expect_rows(
+        &pixels,
+        150,
+        150,
+        [255, 255, 255],
+        "the covering cell's checker white",
+    );
     expect_rows(&pixels, 307, 77, [255, 255, 255], "the thumb's white");
     expect_rows(&pixels, 208, 58, [255, 255, 255], "the search ink");
     expect_rows(

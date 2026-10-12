@@ -1117,6 +1117,21 @@ impl ModelSource {
         }
     }
 
+    /// The completed display transforms of one item model name, with no geometry.
+    ///
+    /// The same chain [`ModelSource::bake_item`] walks, resolved the same way
+    /// ([`Chain::display`]: each slot the first model that states it, walking from
+    /// the leaf) — but a chain that ends at a geometry-less `builtin/*` parent
+    /// answers its file's stated slots instead of [`ModelError::NoItemGeometry`]:
+    /// the compass/clock files state the item pose over `builtin/compass|clock`,
+    /// and the icon bake reads those slots for rows whose geometry comes from the
+    /// atlas rather than the bake. A name the chain cannot resolve answers `None`.
+    pub fn item_display(&self, name: &str) -> Option<Display> {
+        let resource = item_model_resource(name).ok()?;
+        let chain = self.chain_for_resource(&resource).ok()?;
+        Some(chain.display())
+    }
+
     /// Every texture path the tree's blockstate files resolve, for the atlas.
     ///
     /// The set is the resolved texture of every face of every element of every
