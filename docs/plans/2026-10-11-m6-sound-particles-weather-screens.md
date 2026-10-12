@@ -415,17 +415,17 @@ feat: the weather columns and the particle pass (render)
 
 ### Task 12: The overlays
 
-**Goal:** The overlay set completes: the pumpkin blur when worn in first person, the portal overlay with its alpha ramp and the nausea wobble, the weather-darkened fog path integrated with the overlay draws, and the block-in-hand tint when the camera is inside an opaque block — the carried watch item (the rows-440+ R/G lift) is re-measured on the current frames and ruled.
+**Goal:** The overlay set completes: the pumpkin blur when worn in first person, the portal overlay with its alpha ramp and the nausea wobble, the fog leg verified and recorded (the source couples no fog to the overlay draws; the rain/thunder fog landed with the sky band — the lava-eye arm verified), and the block-in-hand tint when the camera is inside an opaque block — the carried watch item (the rows-440+ R/G lift) is re-measured on the current frames and ruled.
 
 **Files:**
-- Modify: `crates/oxide-render/src/overlay.rs` — the pumpkin blur quad (the worn condition + `thirdPersonView == 0`), the portal quad with `timeInPortal` alpha and the confusion wobble.
-- Modify: `crates/oxide-render/src/world_overlay.rs` — the block-in-hand tint (the opaque-block-inside camera condition; the source's tint `0.1,0.1,0.1,0.5`), folded with the standing outline/crack draws.
-- Modify: `crates/oxide-client/src/main.rs` — the state feed: the held-item kind (pumpkin), the portal/confusion counters from the own entity's effect set (the M5 `Effects` event carries them), the `timeInPortal` accumulation (derive the source's rule), the block-in-hand condition.
-- Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: pumpkin worn/not; the portal alpha at two `timeInPortal` values; the block-in-hand tint's pixel.
-- Test: `crates/oxide-render/src/overlay.rs` — the timeInPortal accumulation unit (a portal entry ramps it; leaving decays it — derive the source's rule and pin).
+- Modify: `crates/oxide-client/src/view.rs` (+ the hud draws, `HudPass::TexturedRect`, following the water-overlay precedent) — the pumpkin blur quad (the worn helmet `armorItemInSlot(3)` is the pumpkin block and `thirdPersonView == 0`; `GuiIngame.java:145-150`) and the portal quad with its `timeInPortal` alpha ramp (`GuiIngame.java:152-160`, `:1003-1031`). The confusion wobble is not a quad: it is the camera's rotate/scale/rotate (`EntityRenderer.java:782-796`) on the camera-transform path.
+- Modify: the first-person/hud draw path (`ItemRenderer.renderOverlays` order — before the water and fire overlays; `ItemRenderer.java:421-459`, `:472-495`) — the block-in-hand tint (the eye-inside-opaque-block condition; the source's tint `0.1,0.1,0.1,0.5`, mirrored U), not folded with `world_overlay.rs`'s scene-pass outline/crack draws.
+- Modify: `crates/oxide-client/src/main.rs` — the state feed: the worn helmet kind (pumpkin block), the portal/confusion counters from the own entity's effect set (the M5 `Effects` event carries them), the `timeInPortal` accumulation (the source's rule: `+0.0125` while in a portal, `+1/150` under confusion beyond 60 ticks, `−0.05` otherwise; `EntityPlayerSP.java:732-774`), the block-in-hand condition.
+- Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: pumpkin worn/not (+ the third-person gate); the portal alpha at two `timeInPortal` values; the block-in-hand tint's pixel.
+- Test: the `timeInPortal` accumulation unit beside its implementation (a portal entry ramps it; leaving decays it — the source's rule above, with the seam ruling in the dispatch).
 
 **Interfaces:**
-- Produces: the overlay state struct the client feeds (`OverlayState { pumpkin: bool, portal_time: f32, confusion: f32, inside_block: bool, lava_fog: …, … }` — the shape the pass consumes; the fractal wobble's formula derives from the source's `timeInPortal`-driven per-frame seed).
+- Produces: the overlay state struct the client feeds (`OverlayState { pumpkin: bool, portal_time: f32, confusion: f32, inside_block: bool, … }` — the shape the hud and camera consumers share; the wobble's values are the source's rotate/scale pair (`EntityRenderer.java:782-796`), driven by the frame counter and `partialTicks`).
 - Consumes: the M5 effect state; the standing overlay pass.
 
 - [ ] **Step 1: Cases (RED).** Each new draw's case red first. Run the `overlay`-prefixed ignored cases.
