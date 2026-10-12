@@ -83,7 +83,7 @@ use oxide_proto_v47::window::{
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
-use oxide_world::behaviour::{Material, RenderKind, behaviour};
+use oxide_world::behaviour::{Material, RenderKind, behaviour, liquid_height_percent, liquid_kind};
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::SECTION_SIZE;
 use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
@@ -3663,11 +3663,25 @@ fn eye_block_event(player: &Player, world: Option<&World>) -> ClientEvent {
     };
     let feet = player.position;
     let eye_height = player.eye_height();
-    let eye = world.block(
+    let eye_y = feet[1] + eye_height;
+    let eye_cell = (
         feet[0].floor() as i32,
-        (feet[1] + eye_height).floor() as i32,
+        eye_y.floor() as i32,
         feet[2].floor() as i32,
     );
+    let mut eye = world.block(eye_cell.0, eye_cell.1, eye_cell.2);
+    // The liquid-surface plane (`ActiveRenderInfo.getBlockAtEntityViewpoint`,
+    // `ActiveRenderInfo.java:84-107`): a liquid eye cell whose surface stands
+    // below the viewpoint reads the block above. The plane sits a ninth past
+    // the surface the level carries (`BlockLiquid.java:48-56`), which a source
+    // (level 0) places exactly at the cell's top.
+    if liquid_kind(eye >> 4).is_some() {
+        let level = (eye & 15) as u8;
+        let plane = f64::from(eye_cell.1) + f64::from(liquid_height_percent(level)) + 1.0 / 9.0;
+        if eye_y >= plane {
+            eye = world.block(eye_cell.0, eye_cell.1 + 1, eye_cell.2);
+        }
+    }
     let in_portal = portal_overlap(feet, world);
     // The gate (`Entity.isEntityInsideOpaqueBlock`, `Entity.java:1829-1856`):
     // any visually-opaque probe opens it.
@@ -5281,6 +5295,27 @@ mod tests {
         assert_eq!(eye, 8 << 4, "the viewpoint cell's packed water");
         assert!(!in_portal, "no portal overlaps the box");
         assert_eq!(inside, None, "water is not visually opaque");
+    }
+
+    #[test]
+    fn the_eye_read_steps_above_a_liquid_surface() {
+        // The surface-plane rule (`ActiveRenderInfo.getBlockAtEntityViewpoint`,
+        // `ActiveRenderInfo.java:84-107`): a level-6 water cell stands its
+        // surface a third of the way up, so an eye just below the plane reads
+        // the water and an eye just above it reads the air above.
+        let mut player = Player::new();
+        player.position = [8.5, 64.68, 8.5];
+        let world = probe_world(&[(8, 66, 8, (8 << 4) | 6)]);
+        let ClientEvent::EyeBlock { eye, .. } = eye_block_event(&player, Some(&world)) else {
+            panic!("the read reports EyeBlock");
+        };
+        assert_eq!(eye, (8 << 4) | 6, "the eye below the plane reads the water");
+        player.position = [8.5, 64.78, 8.5];
+        let ClientEvent::EyeBlock { eye: above, .. } = eye_block_event(&player, Some(&world))
+        else {
+            panic!("the read reports EyeBlock");
+        };
+        assert_eq!(above, 0, "the eye past the plane reads the block above");
     }
 
     #[test]

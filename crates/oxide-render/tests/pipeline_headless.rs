@@ -1035,11 +1035,12 @@ fn the_submerged_clouds_fall_off_exponentially() {
 }
 
 /// The hud draws the portal tint at a quarter of the clock: the source's ramp
-/// (`GuiIngame.java:164-174`) at `timeInPortal = 0.25` reads `0.25² × 0.6 + 0.2 × 0.25 =
-/// 0.0875` alpha — the draw `portal_overlay_draws` pins at unit level, mirrored here over
-/// the solid white atlas so the pass's own blending is what the pixels prove. The white
-/// texel times the tint covers the frame at alpha 0.0875: the sky `[158, 194, 250]` reads
-/// back `[166, 199, 250]`.
+/// (`GuiIngame.java:1003-1011`, `f²; f²; f·0.8+0.2`) at `timeInPortal = 0.25`
+/// reads `0.25⁴ × 0.8 + 0.2 = 0.203125` alpha — the draw `portal_overlay_draws`
+/// pins at unit level, mirrored here over the solid white atlas so the pass's
+/// own blending is what the pixels prove. The white texel times the tint covers
+/// the frame at alpha 0.203125: the sky `[158, 194, 250]` reads back
+/// `[178, 206, 251]`.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
 fn the_hud_pass_ramps_the_portal_tint_from_a_quarter() {
@@ -1055,7 +1056,7 @@ fn the_hud_pass_ramps_the_portal_tint_from_a_quarter() {
             width: ROWS_WIDE as f32,
             height: ROWS_TALL as f32,
             uv: [0.0, 0.0, 1.0, 1.0],
-            colour: [1.0, 1.0, 1.0, 0.0875],
+            colour: [1.0, 1.0, 1.0, 0.203125],
         }],
         &TextureRegistry::new(&device, &queue),
     );
@@ -1064,20 +1065,22 @@ fn the_hud_pass_ramps_the_portal_tint_from_a_quarter() {
         &pixels,
         ROWS_WIDE / 2,
         ROWS_TALL / 2,
-        [166, 199, 250],
+        [178, 206, 251],
         "the portal tint at a quarter of the clock",
     );
     expect_pixel(
         &pixels,
         0,
         0,
-        [166, 199, 250],
+        [178, 206, 251],
         "the tint covers the frame's corner too",
     );
 }
 
-/// The hud holds the portal tint at a full clock: `timeInPortal = 1.0` ramps to `0.8`
-/// alpha — the same draw, the same white atlas, the sky reading back `[236, 243, 254]`.
+/// The hud holds the portal tint at a full clock: `timeInPortal = 1.0` reads straight
+/// `1.0` alpha — the ramp's fold runs only below one (`GuiIngame.java:1003-1011`)
+/// — the same draw, the same white atlas, the sky covered opaque white
+/// `[255, 255, 255]`.
 /// The pair with the quarter-clock case pins the ramp's two ends through the pass.
 #[test]
 #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
@@ -1094,7 +1097,7 @@ fn the_hud_pass_holds_the_portal_tint_at_a_full_clock() {
             width: ROWS_WIDE as f32,
             height: ROWS_TALL as f32,
             uv: [0.0, 0.0, 1.0, 1.0],
-            colour: [1.0, 1.0, 1.0, 0.8],
+            colour: [1.0, 1.0, 1.0, 1.0],
         }],
         &TextureRegistry::new(&device, &queue),
     );
@@ -1103,14 +1106,14 @@ fn the_hud_pass_holds_the_portal_tint_at_a_full_clock() {
         &pixels,
         ROWS_WIDE / 2,
         ROWS_TALL / 2,
-        [236, 243, 254],
+        [255, 255, 255],
         "the portal tint at a full clock",
     );
     expect_pixel(
         &pixels,
         ROWS_WIDE - 1,
         ROWS_TALL - 1,
-        [236, 243, 254],
+        [255, 255, 255],
         "the tint covers the frame's far corner too",
     );
 }
