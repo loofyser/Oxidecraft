@@ -70,9 +70,12 @@ use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton, drop_item, hotbar_step};
 use oxide_game::interaction::Aim;
+use oxide_game::mesher::ModelChoice;
+use oxide_game::particles::{ParticleFrame, ParticleTex};
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
+use oxide_game::weather::WeatherColumn;
 use oxide_proto_v47::effects_wire::{read_effect_position, read_sound_pitch};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{
@@ -83,7 +86,9 @@ use oxide_render::camera::{
 use oxide_render::entity_pass::{SkinLookup, SkinTexId, TextureRegistry};
 use oxide_render::fog::{FogMode, FogParams, fog_colour, linear_params, water_fog_for_eye};
 use oxide_render::fps::FpsCounter;
+use oxide_render::gui_item::ItemIconSource;
 use oxide_render::lightmap::BrightnessTable;
+use oxide_render::particle_pass::{ParticleDraw, ParticleUv};
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use oxide_render::sky::SkyParams;
 use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
@@ -1006,6 +1011,9 @@ struct ClientApp {
     /// and the crack every stage within the render distance, and the click
     /// paths can act on the aim.
     world_overlay: WorldOverlayState,
+    /// The weather columns and the particle snapshot the session last
+    /// reported: what the frame feeds the weather and particle passes.
+    feeds: WeatherParticleFeeds,
     /// The skins the worker resolved, keyed by the hyphenated UUID — the map
     /// the player renderer draws from.
     skins: BTreeMap<String, SkinUpdate>,
@@ -1096,6 +1104,25 @@ struct WorldOverlayState {
     /// and the window keeps the map so a frame can hand the pass every stage
     /// within the render distance.
     break_stages: BTreeMap<i32, WindowBreakEntry>,
+}
+
+/// The weather columns and the particle snapshot the session last reported,
+/// with the ticks they rode in on.
+///
+/// The window keeps the last report of each and feeds it to its pass every
+/// frame — the passes draw the kept inputs until the next report replaces
+/// them — so the event arms below only store, and the frame's feed beside
+/// `set_entities` maps and uploads.
+#[derive(Debug, Default)]
+struct WeatherParticleFeeds {
+    /// The latest columns, in draw order; empty draws no streaks.
+    columns: Vec<WeatherColumn>,
+    /// The session tick the columns rode in on: the sheets' scroll clock.
+    columns_tick: u32,
+    /// The latest snapshot, in draw order; empty draws no quads.
+    frames: Vec<ParticleFrame>,
+    /// The session tick the snapshot rode in on.
+    frames_tick: u32,
 }
 
 /// One live destroy stage the window holds for the crack pass.
@@ -1567,6 +1594,7 @@ impl ClientApp {
             player: PlayerState::default(),
             camera: CameraState::default(),
             world_overlay: WorldOverlayState::default(),
+            feeds: WeatherParticleFeeds::default(),
             skins: BTreeMap::new(),
             view: view::View::new(),
             chat: match &chat_font {
@@ -1847,6 +1875,7 @@ impl ClientApp {
                 &mut self.player,
                 &mut self.chat,
                 &mut self.world_overlay,
+                &mut self.feeds,
                 &mut self.dead,
                 event,
                 self.audio.as_mut(),
@@ -1964,6 +1993,21 @@ impl ClientApp {
             // rendered arguments at this frame's fraction, drawn between the scene
             // and the overlay.
             renderer.set_held_item(&self.view.held_frame(Instant::now()));
+            // The weather columns: the kept report, fed every frame; the tick
+            // scrolls the pass's sheets.
+            renderer.set_weather(&weather_draws(&self.feeds.columns), self.feeds.columns_tick);
+            // The particle quads: the kept snapshot interpolated at this
+            // frame's fraction, the atlas and icon rects resolved against the
+            // loaded assets. Without assets the pass keeps its empty upload
+            // and draws nothing.
+            if let Some(assets) = self.assets.as_ref() {
+                renderer.set_particles(&particle_draws(
+                    &self.feeds.frames,
+                    partial,
+                    &assets.mesh,
+                    &assets.item_icons,
+                ));
+            }
         }
         // The chat: the mirror ages to the session's tick, and the frame's draws —
         // bars, text and the record line at the scaled resolution — land in the hud
@@ -3789,6 +3833,129 @@ fn apply_overlay_event(world_overlay: &mut WorldOverlayState, event: &ClientEven
     }
 }
 
+/// Maps the session's columns into the weather pass's draws: field for field,
+/// in the session's draw order.
+///
+/// The two column types stay separate — the game side owns the simulation
+/// values, the pass owns its ribbon inputs — so the feed translates at the
+/// drain, like the entity draws do.
+fn weather_draws(columns: &[WeatherColumn]) -> Vec<oxide_render::weather_pass::WeatherColumn> {
+    columns
+        .iter()
+        .map(|column| oxide_render::weather_pass::WeatherColumn {
+            x: column.x,
+            z: column.z,
+            y0: column.y0,
+            y1: column.y1,
+            snow: column.snow,
+            alpha: column.alpha,
+            block_light: column.block_light,
+            sky_light: column.sky_light,
+        })
+        .collect()
+}
+
+/// Maps the session's snapshot into the particle pass's draws, in the
+/// snapshot's draw order.
+///
+/// Each quad is interpolated between its previous and current tick by the
+/// frame's fraction — the source's `interpPos` (`EntityFX.java:129-133`) —
+/// and the depth-write bin follows the current alpha, opaque at exactly
+/// `1.0`, like the pass's own tests pin.
+fn particle_draws(
+    frames: &[ParticleFrame],
+    partial: f32,
+    mesh: &MeshAssets,
+    icons: &dyn ItemIconSource,
+) -> Vec<ParticleDraw> {
+    let mix = partial.clamp(0.0, 1.0);
+    frames
+        .iter()
+        .map(|frame| {
+            let [px, py, pz] = frame.prev_pos;
+            let [x, y, z] = frame.pos;
+            ParticleDraw {
+                pos: [
+                    px + (x - px) * mix,
+                    py + (y - py) * mix,
+                    pz + (z - pz) * mix,
+                ],
+                size: frame.size,
+                colour: frame.colour,
+                light: frame.light,
+                tex: particle_uv(frame.tex, mesh, icons),
+                opaque: frame.colour[3] >= 1.0,
+            }
+        })
+        .collect()
+}
+
+/// Resolves one frame's sprite into the pass's uv space.
+///
+/// A cell rides straight through. A block state id splits into its block and
+/// metadata — the wire packs `Block.getStateId` (`Block.java:174-178`) — and
+/// reads the baked model's particle texture at the origin (a crack has no
+/// cell of its own, like the dropped items `block_item` resolves); an
+/// unresolved state draws the fallback sprite. An item id reads its baked
+/// icon's uv box over the blocks atlas; an icon bound to another sheet, or
+/// no icon at all, draws the fallback sprite.
+fn particle_uv(tex: ParticleTex, mesh: &MeshAssets, icons: &dyn ItemIconSource) -> ParticleUv {
+    match tex {
+        ParticleTex::Cell(cell) => ParticleUv::Cell(cell),
+        ParticleTex::Atlas(state) => {
+            let particle = match mesh.models.model(state >> 4, (state & 15) as u8, 0, 0, 0) {
+                ModelChoice::Model(model) => model.particle.clone(),
+                ModelChoice::Missing => None,
+            };
+            let sprite = match particle.as_deref() {
+                Some(path) => mesh.atlas.drawn(path),
+                None => &mesh.atlas.missing,
+            };
+            let [[u0, v0], [u1, v1]] = mesh.atlas.uv(sprite);
+            ParticleUv::Atlas {
+                min: [u0, v0],
+                max: [u1, v1],
+            }
+        }
+        ParticleTex::ItemAtlas(id, meta) => {
+            let icon = i16::try_from(id)
+                .ok()
+                .and_then(|item| icons.icon(item, i16::try_from(meta).unwrap_or(0)))
+                .or_else(|| icons.missing_icon());
+            let rect = icon
+                .filter(|icon| icon.mesh.texture == assets::BLOCKS_ATLAS_TEXTURE)
+                .map(|icon| uv_box(&icon.mesh.vertices.uvs))
+                .unwrap_or_else(|| missing_uv(mesh));
+            ParticleUv::Atlas {
+                min: rect[0],
+                max: rect[1],
+            }
+        }
+    }
+}
+
+/// The smallest rect holding every uv: the icon quad's draw extent in atlas
+/// space. An empty mesh holds nothing, so it draws the fallback sprite.
+fn uv_box(uvs: &[[f32; 2]]) -> [[f32; 2]; 2] {
+    let mut min = [f32::INFINITY, f32::INFINITY];
+    let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for [u, v] in uvs {
+        min[0] = min[0].min(*u);
+        min[1] = min[1].min(*v);
+        max[0] = max[0].max(*u);
+        max[1] = max[1].max(*v);
+    }
+    if min[0] > max[0] || min[1] > max[1] {
+        return [[0.0, 0.0], [0.0, 0.0]];
+    }
+    [min, max]
+}
+
+/// The fallback sprite's rect: what an unresolvable crack draws.
+fn missing_uv(mesh: &MeshAssets) -> [[f32; 2]; 2] {
+    mesh.atlas.uv(&mesh.atlas.missing)
+}
+
 /// Applies one event the session reported: meshes go to the renderer, the pose
 /// to the view state and the overlay, the join parameters to the overlay state,
 /// the clock and the sky to the frame's parameters, and the aim to the
@@ -3805,6 +3972,7 @@ fn apply_session_event(
     player: &mut PlayerState,
     chat: &mut view::ChatView,
     world_overlay: &mut WorldOverlayState,
+    feeds: &mut WeatherParticleFeeds,
     dead: &mut bool,
     event: ClientEvent,
     mut audio: Option<&mut ClientAudio>,
@@ -3976,6 +4144,20 @@ fn apply_session_event(
             // the rain. Stored here because neither the Sky event nor the clock carries them.
             sky.rain = rain;
             sky.thunder = thunder;
+            false
+        }
+        ClientEvent::WeatherColumns { columns, tick } => {
+            // The frame feeds the kept columns to the weather pass every
+            // frame; the tick scrolls the pass's sheets.
+            feeds.columns = columns;
+            feeds.columns_tick = tick;
+            false
+        }
+        ClientEvent::Particles { frames, tick } => {
+            // The frame maps the kept snapshot into the particle pass's
+            // draws every frame, interpolated at its fraction.
+            feeds.frames = frames;
+            feeds.frames_tick = tick;
             false
         }
         // The window's own three ride here unconsumed: the screens fold above
@@ -4649,6 +4831,11 @@ impl ApplicationHandler for ClientApp {
                 return;
             }
             renderer.set_sky_textures(assets.sky_textures.clone());
+            // The weather and particle sheets: the rain and snow arms' streaks
+            // and the particle pass's cells, uploaded once beside the sky.
+            // Until these land the arms whose sheet is missing draw nothing.
+            renderer.set_weather_sheets(&assets.rain_sheet, &assets.snow_sheet);
+            renderer.set_particle_cells(&assets.particle_cells);
             // The entity set: the shadow sprite and the two default skins, under the
             // keys the pass's draws and the resolver name.
             for (key, texture) in &assets.entity_textures {
@@ -5087,13 +5274,16 @@ mod tests {
         chat_opener, chat_wheel_lines, clear_break_stage, command_text, cracks_in_view,
         creative_wheel_notch, escape_route, f3_hold_step, frame_params, gameplay_key,
         hotbar_select, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
-        is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, number_key_index,
-        parse_script, parse_server_address, scaled_cursor, screen_button_events,
+        is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv, number_key_index,
+        parse_script, parse_server_address, particle_draws, scaled_cursor, screen_button_events,
         screen_click_button, scripted_chat_click, skin_requests, store_aim, store_break_stage,
-        store_skins, tab_held, tooltip_point, void_y_factor, wheel_held_step, wire_sound_play,
+        store_skins, tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step,
+        wire_sound_play,
     };
+    use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
     use crossbeam_channel::unbounded;
+    use oxide_assets::model::Transform;
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
     use oxide_game::audio::{ListenerPose, PlaySound, SoundCategory};
@@ -5102,9 +5292,15 @@ mod tests {
     use oxide_game::entity_view::{EntityExtra, EntityFrame, PlayerListRecord};
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
-    use oxide_game::session::ClientEvent;
+    use oxide_game::particles::{ParticleFrame, ParticleTex};
+    use oxide_game::session::{ClientEvent, MeshAssets};
+    use oxide_game::weather::WeatherColumn;
     use oxide_proto_v47::entity::MetadataItem;
     use oxide_proto_v47::window::WindowKind;
+    use oxide_render::entity_models::Vertices;
+    use oxide_render::entity_pass::ItemMesh;
+    use oxide_render::gui_item::{IconShape, ItemIconMesh, ItemIconSource};
+    use oxide_render::particle_pass::ParticleUv;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
     use oxide_world::entity::EntityKind;
     use std::cell::RefCell;
@@ -7116,6 +7312,230 @@ mod tests {
                 reason: "the session thread ended".into(),
             }
         ));
+    }
+
+    #[test]
+    fn weather_columns_map_field_for_field() {
+        // The feed translates the session's columns into the pass's draws
+        // without touching a value or the order: the pass owns the ribbon
+        // inputs, the session owns the simulation.
+        let columns = vec![
+            WeatherColumn {
+                x: 3,
+                z: -2,
+                y0: 60,
+                y1: 70,
+                snow: false,
+                alpha: 0.8,
+                block_light: 12,
+                sky_light: 15,
+            },
+            WeatherColumn {
+                x: 4,
+                z: -2,
+                y0: 61,
+                y1: 71,
+                snow: true,
+                alpha: 0.5,
+                block_light: 0,
+                sky_light: 15,
+            },
+        ];
+        let draws = weather_draws(&columns);
+        assert_eq!(draws.len(), 2, "one draw per column, in order");
+        assert_eq!(
+            draws[0],
+            oxide_render::weather_pass::WeatherColumn {
+                x: 3,
+                z: -2,
+                y0: 60,
+                y1: 70,
+                snow: false,
+                alpha: 0.8,
+                block_light: 12,
+                sky_light: 15,
+            },
+            "the rain column's fields ride through"
+        );
+        assert!(draws[1].snow, "the snow arm's flag rides through");
+        assert!(
+            weather_draws(&[]).is_empty(),
+            "a clear tick maps to no draws"
+        );
+    }
+
+    /// One snapshot frame: the previous and current position, the scale, the
+    /// colour with its alpha, the sprite and the light.
+    fn snapshot_frame(pos: [f32; 3], prev: [f32; 3], tex: ParticleTex) -> ParticleFrame {
+        ParticleFrame {
+            pos,
+            prev_pos: prev,
+            age: 3.0,
+            size: 0.5,
+            colour: [1.0, 0.0, 0.0, 1.0],
+            tex,
+            light: 15,
+        }
+    }
+
+    /// The icon source stub: one canned icon and one canned fallback.
+    struct StubIcons {
+        icon: Option<ItemIconMesh>,
+        missing: Option<ItemIconMesh>,
+    }
+
+    impl ItemIconSource for StubIcons {
+        fn icon(&self, _id: i16, _damage: i16) -> Option<ItemIconMesh> {
+            self.icon.clone()
+        }
+
+        fn missing_icon(&self) -> Option<ItemIconMesh> {
+            self.missing.clone()
+        }
+    }
+
+    /// One icon over a texture: the canned uvs through the pass's own shape.
+    fn stub_icon(uvs: Vec<[f32; 2]>, texture: &'static str) -> ItemIconMesh {
+        ItemIconMesh {
+            mesh: ItemMesh {
+                vertices: Arc::new(Vertices {
+                    positions: Vec::new(),
+                    uvs,
+                    normals: Vec::new(),
+                }),
+                texture,
+            },
+            transform: Transform::DEFAULT,
+            first_person: Transform::DEFAULT,
+            third_person: Transform::DEFAULT,
+            shape: IconShape::Flat,
+        }
+    }
+
+    /// The asset-less mesh: no models, so every state resolves missing, and
+    /// the fallback atlas, so the missing rect is pinned.
+    fn fallback_mesh() -> MeshAssets {
+        MeshAssets::fallback()
+    }
+
+    #[test]
+    fn particle_feed_interpolates_cells_at_the_frame_fraction() {
+        // A cell quad rides straight through, a quarter of the way from its
+        // previous tick to its current one at a quarter fraction — the
+        // source's `interpPos` — and the full alpha bins opaque.
+        let mesh = fallback_mesh();
+        let icons = StubIcons {
+            icon: None,
+            missing: None,
+        };
+        let frames = vec![snapshot_frame(
+            [1.0, 2.0, 3.0],
+            [-3.0, 2.0, 3.0],
+            ParticleTex::Cell(19),
+        )];
+        let draws = particle_draws(&frames, 0.25, &mesh, &icons);
+        assert_eq!(draws.len(), 1, "one draw per frame");
+        assert_eq!(
+            draws[0].pos,
+            [-2.0, 2.0, 3.0],
+            "a quarter of the way from the previous tick"
+        );
+        assert_eq!(
+            draws[0].tex,
+            ParticleUv::Cell(19),
+            "the cell rides straight through"
+        );
+        assert!(draws[0].opaque, "full alpha bins opaque");
+
+        // The faded bin draws too: the same quad at half alpha bins faded,
+        // and a fraction past the tick clamps to the current tick.
+        let mut faded = frames[0].clone();
+        faded.colour[3] = 0.5;
+        let draws = particle_draws(&[faded], 2.0, &mesh, &icons);
+        assert_eq!(
+            draws[0].pos,
+            [1.0, 2.0, 3.0],
+            "the fraction clamps to the current tick"
+        );
+        assert!(!draws[0].opaque, "half alpha bins faded");
+    }
+
+    #[test]
+    fn particle_feed_falls_back_to_missing_without_assets() {
+        // Over the asset-less mesh every state is missing and no icon
+        // resolves: both crack arms draw the fallback sprite's rect.
+        let mesh = fallback_mesh();
+        let icons = StubIcons {
+            icon: None,
+            missing: None,
+        };
+        let missing = missing_uv(&mesh);
+        let frames = vec![
+            snapshot_frame([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], ParticleTex::Atlas(0x1234)),
+            snapshot_frame(
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                ParticleTex::ItemAtlas(1, 0),
+            ),
+        ];
+        let draws = particle_draws(&frames, 0.0, &mesh, &icons);
+        for draw in &draws {
+            assert_eq!(
+                draw.tex,
+                ParticleUv::Atlas {
+                    min: missing[0],
+                    max: missing[1],
+                },
+                "an unresolvable crack draws the fallback sprite"
+            );
+        }
+    }
+
+    #[test]
+    fn particle_feed_reads_the_icon_uv_box_over_the_blocks_atlas() {
+        // The icon's own uvs bound the crack's rect when the icon samples the
+        // blocks atlas; an icon bound to another sheet draws the fallback
+        // sprite instead, since the pass only binds the atlas.
+        let mesh = fallback_mesh();
+        let icons = StubIcons {
+            icon: Some(stub_icon(
+                vec![[0.25, 0.25], [0.75, 0.25], [0.75, 0.5], [0.25, 0.5]],
+                BLOCKS_ATLAS_TEXTURE,
+            )),
+            missing: None,
+        };
+        let frames = vec![snapshot_frame(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            ParticleTex::ItemAtlas(280, 0),
+        )];
+        let draws = particle_draws(&frames, 0.0, &mesh, &icons);
+        assert_eq!(
+            draws[0].tex,
+            ParticleUv::Atlas {
+                min: [0.25, 0.25],
+                max: [0.75, 0.5],
+            },
+            "the crack samples the icon's own uv box"
+        );
+
+        let sheeted = StubIcons {
+            icon: Some(stub_icon(
+                vec![[0.0, 0.0], [1.0, 1.0]],
+                "textures/items/stick.png",
+            )),
+            missing: None,
+        };
+        let draws = particle_draws(&frames, 0.0, &mesh, &sheeted);
+        let missing = missing_uv(&mesh);
+        assert_eq!(
+            draws[0].tex,
+            ParticleUv::Atlas {
+                min: missing[0],
+                max: missing[1],
+            },
+            "a sheet-bound icon draws the fallback sprite"
+        );
     }
 
     #[test]

@@ -73,6 +73,7 @@ use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
 use oxide_render::lightmap::{BrightnessTable, gamma_for_brightness, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
+use oxide_render::particle_pass::{ParticleDraw, ParticlePass, ParticleUv};
 use oxide_render::renderer::{SKY_COLOR, bind_gui_atlas, bind_gui_sheet, boss_status_step};
 use oxide_render::sky::{
     CLOUD_FAST, CLOUD_OFF, CloudPass, HORIZON, MOON_HEIGHT, SkyParams, SkyPass, SkyTextures,
@@ -81,6 +82,7 @@ use oxide_render::sky::{
 use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 use oxide_render::text::string_width;
+use oxide_render::weather_pass::{WeatherColumn, WeatherPass};
 use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline, WorldOverlay};
 
 use glam::Vec3;
@@ -12049,5 +12051,345 @@ fn the_rain_dims_the_sun_and_douses_the_stars() {
         brightest(&lit) >= 16,
         "the clear control reads the aimed star back: {}",
         brightest(&lit)
+    );
+}
+
+/// The camera the weather cases look through: the eye at (0.5, 2.5, -4.0),
+/// facing +z level, so a column at the origin stands in the frame's centre.
+fn weather_camera() -> Camera {
+    Camera {
+        pose: CameraPose {
+            position: [0.5, 2.5 - f64::from(EYE_HEIGHT), -4.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            sneak: false,
+        },
+        fov_degrees: DEFAULT_FOV,
+        near: NEAR_PLANE,
+        far_chunks: 8.0,
+        view_effect: NO_VIEW_EFFECT,
+    }
+}
+
+/// A white 64x256 rain/snow sheet stand-in: the source sheets' own size, one
+/// colour, so the read-back is the vertex alpha times the lightmap alone.
+fn weather_sheet() -> Texture {
+    Texture {
+        width: 64,
+        height: 256,
+        rgba: vec![255u8; 64 * 256 * 4],
+    }
+}
+
+/// One fully lit column ahead of [`weather_camera`], spanning `y0..y1`.
+fn weather_column(y0: i32, y1: i32) -> WeatherColumn {
+    WeatherColumn {
+        x: 0,
+        z: 0,
+        y0,
+        y1,
+        snow: false,
+        alpha: 1.0,
+        block_light: 15,
+        sky_light: 15,
+    }
+}
+
+/// Renders `columns` through the weather pass at `tick` and reads the frame
+/// back: the sky-clear colour behind, the pass's ribbons over it.
+fn render_weather(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    columns: &[WeatherColumn],
+    tick: u32,
+) -> Vec<u8> {
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(device, format);
+    let depth = create_depth(device);
+    let mut weather = WeatherPass::new(device, queue, format);
+    weather.set_camera(queue, weather_camera(), 1.0);
+    weather.set_sheets(device, queue, &weather_sheet(), &weather_sheet());
+    weather.upload(device, queue, columns, tick);
+    render_scene(device, queue, &target, &depth, |pass| weather.draw(pass))
+}
+
+/// The streak colour a fully lit white sheet reads back as: the sheet times
+/// the lightmap's brightest cell, opaque over the sky.
+fn streak_colour() -> [u8; 3] {
+    let lit = shaded([255, 255, 255, 255], WHITE, light_cell(15, 15));
+    [lit[0], lit[1], lit[2]]
+}
+
+/// The count of non-sky pixels in the frame's centre column.
+fn streak_rows(pixels: &[u8]) -> u32 {
+    (0..SIZE)
+        .filter(|&y| pixel(pixels, SIZE / 2, y) != SKY)
+        .count() as u32
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_weather_pass_draws_rain_columns_over_a_clear_frame() {
+    let (device, queue) = headless_device();
+    // The clear frame draws no columns: every pixel stays the sky.
+    let clear = render_weather(&device, &queue, &[], 0);
+    assert_eq!(
+        streak_rows(&clear),
+        0,
+        "a clear frame inks no streak pixels"
+    );
+    expect_pixel(&clear, SIZE / 2, SIZE / 2, SKY, "the clear frame's centre");
+
+    // One column ahead of the eye, spanning y 1..4 around the eye's 2.5: the
+    // centre ray meets the ribbon, the frame's top and bottom stay sky.
+    let rainy = render_weather(&device, &queue, &[weather_column(1, 4)], 7);
+    expect_pixel(
+        &rainy,
+        SIZE / 2,
+        SIZE / 2,
+        streak_colour(),
+        "the ribbon at the frame's centre",
+    );
+    expect_pixel(&rainy, SIZE / 2, 4, SKY, "the sky above the streak");
+    expect_pixel(&rainy, SIZE / 2, SIZE - 4, SKY, "the sky below the streak");
+    let tall = streak_rows(&rainy);
+    assert!(
+        tall > 20,
+        "a three-block streak covers the centre rows: {tall}"
+    );
+
+    // The streak length follows the quad's extent: a one-block column covers
+    // fewer centre rows than the three-block one.
+    let short = render_weather(&device, &queue, &[weather_column(2, 3)], 7);
+    expect_pixel(
+        &short,
+        SIZE / 2,
+        SIZE / 2,
+        streak_colour(),
+        "the short ribbon still meets the centre ray",
+    );
+    let narrowed = streak_rows(&short);
+    assert!(
+        narrowed < tall,
+        "the shorter quad inks fewer rows: {narrowed} vs {tall}"
+    );
+}
+
+/// One particle quad ahead of [`weather_camera`]: the centre in blocks, the
+/// half extent, the colour, the light and the sampled sheet.
+fn particle_draw(pos: [f32; 3], size: f32, colour: [f32; 4], tex: ParticleUv) -> ParticleDraw {
+    ParticleDraw {
+        pos,
+        size,
+        colour,
+        light: 15,
+        tex,
+        opaque: colour[3] >= 1.0,
+    }
+}
+
+/// Renders `draws` through the particle pass and reads the frame back: the
+/// sky-clear colour behind, the pass's quads over it.
+fn render_particles(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    draws: &[ParticleDraw],
+    cells: Option<&Texture>,
+    atlas: Option<&Atlas>,
+) -> Vec<u8> {
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(device, format);
+    let depth = create_depth(device);
+    let mut particles = ParticlePass::new(device, queue, format);
+    particles.set_camera(queue, weather_camera(), 1.0);
+    if let Some(cells) = cells {
+        particles.set_cells(device, queue, cells);
+    }
+    if let Some(atlas) = atlas {
+        particles.set_atlas(device, queue, atlas);
+    }
+    particles.upload(device, queue, draws);
+    render_scene(device, queue, &target, &depth, |pass| particles.draw(pass))
+}
+
+/// The count of non-sky pixels in the whole frame.
+fn inked_pixels(pixels: &[u8]) -> u32 {
+    (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(pixels, x, y) != SKY)
+        .count() as u32
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_particle_pass_draws_a_splash_cell() {
+    let (device, queue) = headless_device();
+    // No quads, no sheets: every pixel stays the sky.
+    let clear = render_particles(&device, &queue, &[], None, None);
+    assert_eq!(inked_pixels(&clear), 0, "an empty upload inks nothing");
+
+    // One red cell quad ahead of the eye, over a white cells sheet: the
+    // centre ray meets the quad, the frame's corners stay sky.
+    let cells = flat_texture(128, 128);
+    let red = particle_draw(
+        [0.5, 2.5, 0.0],
+        0.5,
+        [1.0, 0.0, 0.0, 1.0],
+        ParticleUv::Cell(19),
+    );
+    let lit = render_particles(&device, &queue, &[red], Some(&cells), None);
+    let tinted = shaded([255, 255, 255, 255], [255, 0, 0, 255], light_cell(15, 15));
+    expect_pixel(
+        &lit,
+        SIZE / 2,
+        SIZE / 2,
+        [tinted[0], tinted[1], tinted[2]],
+        "the cell quad at the frame's centre",
+    );
+    expect_pixel(&lit, 2, 2, SKY, "the sky past the quad's corner");
+    assert!(
+        inked_pixels(&lit) > 20,
+        "a half-block quad covers the centre rows"
+    );
+
+    // The faded bin draws too: the same quad at half alpha still inks the
+    // centre through the no-depth-write pipeline, blended halfway toward
+    // the sky.
+    let faded = particle_draw(
+        [0.5, 2.5, 0.0],
+        0.5,
+        [1.0, 0.0, 0.0, 0.5],
+        ParticleUv::Cell(19),
+    );
+    let dimmed = render_particles(&device, &queue, &[faded], Some(&cells), None);
+    assert!(inked_pixels(&dimmed) > 20, "the faded bin inks its quad");
+    let full = pixel(&lit, SIZE / 2, SIZE / 2);
+    let half = pixel(&dimmed, SIZE / 2, SIZE / 2);
+    assert_ne!(full, half, "half alpha blends toward the sky");
+    // Red over the sky: the red channel falls from saturated toward the
+    // sky's, while green and blue rise from zero toward it.
+    assert!(
+        half[0] < full[0] && half[1] > full[1] && half[2] > full[2],
+        "the half-alpha centre sits between saturated and sky: {half:?} vs {full:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_particle_pass_draws_a_block_crack_in_its_atlas_colour() {
+    let (device, queue) = headless_device();
+    // A blue block atlas, no cells sheet: the atlas arm draws alone.
+    let atlas = solid_atlas(16, [0, 0, 255, 255]);
+    let crack = particle_draw(
+        [0.5, 2.5, 0.0],
+        0.5,
+        [1.0, 1.0, 1.0, 1.0],
+        ParticleUv::Atlas {
+            min: [0.0, 0.0],
+            max: [1.0, 1.0],
+        },
+    );
+    let lit = render_particles(&device, &queue, &[crack], None, Some(&atlas));
+    let tinted = shaded([0, 0, 255, 255], WHITE, light_cell(15, 15));
+    expect_pixel(
+        &lit,
+        SIZE / 2,
+        SIZE / 2,
+        [tinted[0], tinted[1], tinted[2]],
+        "the block crack at the frame's centre",
+    );
+    expect_pixel(&lit, 2, 2, SKY, "the sky past the quad's corner");
+
+    // The block's own tint rides the vertex colour: a green crack over the
+    // same blue atlas reads back teal.
+    let green = particle_draw(
+        [0.5, 2.5, 0.0],
+        0.5,
+        [0.0, 1.0, 0.0, 1.0],
+        ParticleUv::Atlas {
+            min: [0.0, 0.0],
+            max: [1.0, 1.0],
+        },
+    );
+    let tinted_quad = render_particles(&device, &queue, &[green], None, Some(&atlas));
+    let teal = shaded([0, 0, 255, 255], [0, 255, 0, 255], light_cell(15, 15));
+    expect_pixel(
+        &tinted_quad,
+        SIZE / 2,
+        SIZE / 2,
+        [teal[0], teal[1], teal[2]],
+        "the tinted crack at the frame's centre",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_particle_pass_draws_an_item_crack_through_its_icon_rect() {
+    let (device, queue) = headless_device();
+    // The quadrant atlas: red and green on the top row, blue and white
+    // below. The item's icon rect is the top-right quadrant alone, so a
+    // draw that ignored the rect could not read back pure green.
+    let atlas = atlas(2, 2, &FOUR_TEXELS);
+    let shard = particle_draw(
+        [0.5, 2.5, 0.0],
+        0.5,
+        [1.0, 1.0, 1.0, 1.0],
+        ParticleUv::Atlas {
+            min: [0.5, 0.0],
+            max: [1.0, 0.5],
+        },
+    );
+    let lit = render_particles(&device, &queue, &[shard], None, Some(&atlas));
+    let tinted = shaded([0, 255, 0, 255], WHITE, light_cell(15, 15));
+    expect_pixel(
+        &lit,
+        SIZE / 2,
+        SIZE / 2,
+        [tinted[0], tinted[1], tinted[2]],
+        "the item shard at the frame's centre",
+    );
+    expect_pixel(&lit, 2, 2, SKY, "the sky past the quad's corner");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_particle_pass_draws_the_capped_visible_set() {
+    let (device, queue) = headless_device();
+    // Four thousand white cell quads in a grid ahead of the eye — the
+    // engine's per-list cap as a draw list — plus one red quad at the
+    // centre: the whole visible set draws, and the centre ray still meets
+    // the middle quad.
+    let cells = flat_texture(128, 128);
+    let mut draws = Vec::with_capacity(4001);
+    for row in 0..80 {
+        for column in 0..50 {
+            draws.push(particle_draw(
+                [-9.5 + column as f32 * 0.4, -5.5 + row as f32 * 0.2, 0.0],
+                0.08,
+                [1.0, 1.0, 1.0, 1.0],
+                ParticleUv::Cell(0),
+            ));
+        }
+    }
+    draws.push(particle_draw(
+        [0.5, 2.5, 0.0],
+        0.5,
+        [1.0, 0.0, 0.0, 1.0],
+        ParticleUv::Cell(0),
+    ));
+    assert_eq!(draws.len(), 4001, "the grid plus the centre quad");
+    let lit = render_particles(&device, &queue, &draws, Some(&cells), None);
+    let tinted = shaded([255, 255, 255, 255], [255, 0, 0, 255], light_cell(15, 15));
+    expect_pixel(
+        &lit,
+        SIZE / 2,
+        SIZE / 2,
+        [tinted[0], tinted[1], tinted[2]],
+        "the centre quad over the capped set",
+    );
+    assert!(
+        inked_pixels(&lit) > 1000,
+        "the capped set inks the frame: {}",
+        inked_pixels(&lit)
     );
 }

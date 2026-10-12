@@ -19,6 +19,7 @@ use crate::held_item::{HeldItemFrame, HeldItemPass};
 use crate::hud::{HudDraw, HudPass, ScaledResolution, projection_size, scaled_resolution};
 use crate::lightmap::gamma_for_brightness;
 use crate::overlay::OverlayPass;
+use crate::particle_pass::{ParticleDraw, ParticlePass};
 use crate::sign_text::{SignTextEntry, SignTextPass};
 use crate::sky::{
     CLOUD_FANCY, CloudPass, SkyParams, SkyPass, SkyTextures, cloud_at_or_above_layer,
@@ -26,6 +27,7 @@ use crate::sky::{
 };
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
+use crate::weather_pass::{WeatherColumn, WeatherPass};
 use crate::world_overlay::{Crack, Outline, WorldOverlay};
 
 /// One draw of the scene pass, in the order the source issues it.
@@ -45,6 +47,13 @@ enum SceneDraw {
     /// The signs' front-face text, after the entities: the depth test hides
     /// text behind blocks, and the text itself writes no depth.
     SignText,
+    /// The particle quads, after the entities' text and before the weather:
+    /// the source's `renderParticles` arm between the two
+    /// (`EffectRenderer.java:222+`, `EntityRenderer.java:1594+`).
+    Particles,
+    /// The rain/snow ribbons, after the particles and before the translucent
+    /// terrain (`EntityRenderer.java:1594+`).
+    Weather,
     /// The terrain's translucent layer, after the entities (`EntityRenderer.java:1467`).
     TerrainTranslucent,
     /// The world overlay: the aimed block's outline and the destroy-stage crack, the source's
@@ -61,7 +70,10 @@ enum SceneDraw {
 ///
 /// The sky draws first (`EntityRenderer.java:1351-1354`), then the terrain's layers
 /// (`:1385-1396`), then the world overlay — the outline and the damage texture, the source's
-/// `"outline"` and `"destroyProgress"` sections (`:1412-1416`, `:1431-1437`). The cloud layer
+/// `"outline"` and `"destroyProgress"` sections (`:1412-1416`, `:1431-1437`). The particle
+/// quads draw after the entities' text and the weather ribbons after the particles, both
+/// before the translucent layer (`EffectRenderer.java:222+`, `EntityRenderer.java:1594+`).
+/// The cloud layer
 /// draws exactly once when the setting keeps it — both of the source's arms gate on
 /// `shouldRenderClouds() != 0` (`:1490-1493`) — and the entity eye's height picks the arm
 /// and with it the cloud's place in the order — the under-arm before the terrain while
@@ -76,6 +88,8 @@ fn scene_draws(camera: &Camera, clouds: u8) -> Vec<SceneDraw> {
     draws.push(SceneDraw::Terrain);
     draws.push(SceneDraw::Entities);
     draws.push(SceneDraw::SignText);
+    draws.push(SceneDraw::Particles);
+    draws.push(SceneDraw::Weather);
     draws.push(SceneDraw::TerrainTranslucent);
     draws.push(SceneDraw::WorldOverlay);
     if draw_clouds && cloud_at_or_above_layer(camera) {
@@ -272,6 +286,12 @@ pub struct Renderer {
     /// The sign-text pass: the map's entries as board-fixed quads, drawn
     /// after the entities.
     sign_pass: SignTextPass,
+    /// The weather pass: the session's rain/snow columns as camera-facing
+    /// ribbons, drawn after the particles and before the translucent terrain.
+    weather: WeatherPass,
+    /// The particle pass: the session's frames as camera-facing quads, drawn
+    /// after the entities' text and before the weather.
+    particles: ParticlePass,
     /// The boss bar's status cell: the last raised status and the frames left on it,
     /// `None` while the bar is hidden. A frame whose pass raises a wither's or a dragon's
     /// status overwrites it; every other frame's step spends one of its hundred frames
@@ -433,6 +453,8 @@ impl Renderer {
         let entity_textures = TextureRegistry::new(&device, &queue);
         let entity_pass = EntityPass::new(&device, &queue, format, entity_textures.layout());
         let sign_pass = SignTextPass::new(&device, format);
+        let weather = WeatherPass::new(&device, &queue, format);
+        let particles = ParticlePass::new(&device, &queue, format);
 
         Ok(Self {
             surface,
@@ -462,6 +484,8 @@ impl Renderer {
             entity_textures,
             entities: Vec::new(),
             sign_pass,
+            weather,
+            particles,
             boss_status: None,
             camera: None,
             fog: None,
@@ -551,6 +575,7 @@ impl Renderer {
     /// hud's and the screen's [`HudDraw::Item`] draws contribute nothing.
     pub fn set_atlas(&mut self, atlas: &Atlas) {
         self.terrain.set_atlas(&self.device, &self.queue, atlas);
+        self.particles.set_atlas(&self.device, &self.queue, atlas);
         self.world_overlay
             .set_atlas(&self.device, &self.queue, atlas);
         bind_gui_atlas(
@@ -615,11 +640,13 @@ impl Renderer {
     /// the stored brightness setting's gamma, so a clock change never resets the slider.
     pub fn set_lightmap(&mut self, sun_brightness: f32) {
         self.sun_brightness = sun_brightness;
-        self.terrain.set_lightmap(
-            &self.queue,
-            sun_brightness,
-            gamma_for_brightness(self.brightness),
-        );
+        let gamma = gamma_for_brightness(self.brightness);
+        self.terrain
+            .set_lightmap(&self.queue, sun_brightness, gamma);
+        self.weather
+            .set_lightmap(&self.queue, sun_brightness, gamma);
+        self.particles
+            .set_lightmap(&self.queue, sun_brightness, gamma);
     }
 
     /// Sets the brightness setting and rewrites the terrain lightmap for it.
@@ -629,11 +656,13 @@ impl Renderer {
     /// the stored sun brightness, so a slider change never resets the clock.
     pub fn set_brightness(&mut self, mode: u8) {
         self.brightness = mode.min(crate::lightmap::BRIGHTNESS_MAX);
-        self.terrain.set_lightmap(
-            &self.queue,
-            self.sun_brightness,
-            gamma_for_brightness(self.brightness),
-        );
+        let gamma = gamma_for_brightness(self.brightness);
+        self.terrain
+            .set_lightmap(&self.queue, self.sun_brightness, gamma);
+        self.weather
+            .set_lightmap(&self.queue, self.sun_brightness, gamma);
+        self.particles
+            .set_lightmap(&self.queue, self.sun_brightness, gamma);
     }
 
     /// Sets the cloud setting: 0 is Off, 1 Fast, 2 Fancy (`CLOUDS_TYPES`,
@@ -833,6 +862,8 @@ impl Renderer {
         self.terrain.set_fog(&self.queue, params);
         self.cloud.set_fog(&self.queue, params);
         self.sky.set_fog(&self.queue, params);
+        self.weather.set_fog(&self.queue, params);
+        self.particles.set_fog(&self.queue, params);
         self.entity_pass.set_fog(params);
         self.fog = Some(params);
     }
@@ -844,6 +875,43 @@ impl Renderer {
     /// outside the map draw no text (the port's no-text rule).
     pub fn set_sign_texts(&mut self, entries: Vec<SignTextEntry>) {
         self.sign_pass.upload(&self.device, &self.queue, &entries);
+    }
+
+    /// Sets the particle quads the next frames draw; empty draws nothing.
+    ///
+    /// The quads are built and uploaded on the call, so a frame draws exactly
+    /// the draws the caller last set.
+    pub fn set_particles(&mut self, draws: &[ParticleDraw]) {
+        self.particles.upload(&self.device, &self.queue, draws);
+    }
+
+    /// Sets the weather columns the next frames draw, scrolled by `tick`; an
+    /// empty slice draws nothing.
+    ///
+    /// The ribbons are built and uploaded on the call, so a frame draws
+    /// exactly the columns the caller last set.
+    pub fn set_weather(&mut self, columns: &[WeatherColumn], tick: u32) {
+        self.weather
+            .upload(&self.device, &self.queue, columns, tick);
+    }
+
+    /// Uploads the `particles.png` cells sheet the particle pass's cell quads
+    /// draw through.
+    ///
+    /// Until this has been called the cell batches draw nothing; a re-upload
+    /// replaces the sheet whole.
+    pub fn set_particle_cells(&mut self, cells: &Texture) {
+        self.particles.set_cells(&self.device, &self.queue, cells);
+    }
+
+    /// Uploads the rain and snow sheets the weather pass's columns draw
+    /// through.
+    ///
+    /// Until both have been set the arms whose sheet is missing draw nothing;
+    /// a re-upload replaces the sheets whole.
+    pub fn set_weather_sheets(&mut self, rain: &Texture, snow: &Texture) {
+        self.weather
+            .set_sheets(&self.device, &self.queue, rain, snow);
     }
 
     /// Sets the overlay lines drawn this frame; empty hides the overlay.
@@ -1015,6 +1083,8 @@ impl Renderer {
             self.cloud.set_camera(&self.queue, camera, aspect);
             self.entity_pass.set_camera(camera, aspect);
             self.sign_pass.set_camera(&self.queue, camera, aspect);
+            self.weather.set_camera(&self.queue, camera, aspect);
+            self.particles.set_camera(&self.queue, camera, aspect);
             // The held item's own camera: the hand's projection (`far * 2`, the view
             // effect alone) and the lights turned by the pose.
             self.held_item
@@ -1077,6 +1147,8 @@ impl Renderer {
                             );
                         }
                         SceneDraw::SignText => self.sign_pass.draw(&mut pass),
+                        SceneDraw::Particles => self.particles.draw(&mut pass),
+                        SceneDraw::Weather => self.weather.draw(&mut pass),
                         SceneDraw::TerrainTranslucent => self.terrain.draw_translucent(&mut pass),
                         SceneDraw::WorldOverlay => self.world_overlay.draw(&mut pass),
                     }
@@ -1400,6 +1472,8 @@ mod tests {
                 SceneDraw::Terrain,
                 SceneDraw::Entities,
                 SceneDraw::SignText,
+                SceneDraw::Particles,
+                SceneDraw::Weather,
                 SceneDraw::TerrainTranslucent,
                 SceneDraw::WorldOverlay
             ]
@@ -1411,6 +1485,8 @@ mod tests {
                 SceneDraw::Terrain,
                 SceneDraw::Entities,
                 SceneDraw::SignText,
+                SceneDraw::Particles,
+                SceneDraw::Weather,
                 SceneDraw::TerrainTranslucent,
                 SceneDraw::WorldOverlay,
                 SceneDraw::CloudsAtOrAbove

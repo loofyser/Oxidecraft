@@ -18,5 +18,6 @@ pub mod scoreboard;
 pub mod session;
 pub mod settings;
 pub mod ticker;
+pub mod weather;
 pub mod windows;
 pub mod world_view;

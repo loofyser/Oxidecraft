@@ -113,11 +113,14 @@ use crate::mesh_queue::{MeshJob, MeshQueue};
 use crate::mesher::{
     BlockModelSet, ColumnSnapshot, MeshContext, SmoothLighting, build_column_meshes,
 };
+use crate::particle_world::SessionParticleWorld;
+use crate::particles::{PER_LIST_CAP, ParticleEngine, ParticleFrame};
 use crate::physics;
 use crate::player::{Abilities, Player};
 use crate::scoreboard::{Scoreboard, colour_from_wire};
-use crate::settings::VIEW_DISTANCE_RANGE;
+use crate::settings::{ParticleSetting, VIEW_DISTANCE_RANGE};
 use crate::ticker::Ticker;
+use crate::weather::{WeatherColumn, splash_spawns, weather_columns};
 use crate::windows::{CURSOR_WINDOW_ID, HOTBAR_SIZE, OpenWindowState, Windows};
 use crate::world_view::WorldView;
 
@@ -176,6 +179,11 @@ const TICK_PERIOD: Duration = Duration::from_millis(50);
 /// The local sounds' dice seed: fixed, so a replayed stream stages the same
 /// pitches. Only the staging formulas carry parity, never the draws.
 const SOUND_DICE_SEED: u64 = 9;
+
+/// The particle pool's dice seed: fixed, so a replayed stream spawns the
+/// same wire fans and splash columns. Only the spawn formulas carry parity,
+/// never the draws.
+const PARTICLE_DICE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// The snow layer's block id: the sheet that lends its own step when it sits
 /// on the stood-on block (`Entity.playStepSound:988-993`).
@@ -850,6 +858,19 @@ pub enum ClientEvent {
         /// The eased thunder strength, in `[0, 1]`.
         thunder: f32,
     },
+    /// The rain/snow columns around the viewer for one tick: what the
+    /// window's weather pass draws.
+    ///
+    /// Reported once per tick while it rains, plus the first clear tick
+    /// after — never for a settled clear sky. The window keeps the last
+    /// report and feeds it to the pass every frame; the tick scrolls the
+    /// pass's sheets.
+    WeatherColumns {
+        /// The tick's columns, in draw order.
+        columns: Vec<WeatherColumn>,
+        /// The session tick the columns rode in on.
+        tick: u32,
+    },
     /// A sound effect played, from clientbound 0x29.
     ///
     /// Reported once per packet; the audio engine resolves the name. The
@@ -909,6 +930,19 @@ pub enum ClientEvent {
         count: i32,
         /// The trailing data run (block/item ids).
         data: Vec<i32>,
+    },
+    /// The live particles' draw-ready snapshot for one tick: what the
+    /// window's particle pass draws.
+    ///
+    /// Reported once per tick while the pool holds a visible particle, plus
+    /// the first empty tick after — never for a settled empty pool. The
+    /// window keeps the last report and feeds it to the pass every frame;
+    /// the tick is the weather scroll's clock for the pass's sheets.
+    Particles {
+        /// The snapshot's frames, in draw order.
+        frames: Vec<ParticleFrame>,
+        /// The session tick the snapshot rode in on.
+        tick: u32,
     },
     /// A global entity spawned, from clientbound 0x2C.
     ///
@@ -1199,6 +1233,26 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // The weather the 0x2B reasons steer: the targets the wire names,
         // eased once per tick and reported while the easing moves.
         let mut weather = WeatherState::default();
+        // The particle pool the wire and the weather feed: 0x2A spawns into
+        // it through the setting reduction, the tick steps it against the
+        // session's columns and rains the splashes into it, and the
+        // snapshot below reports it to the window's pass.
+        let mut particles = ParticleEngine::seeded(PARTICLE_DICE_SEED, PER_LIST_CAP);
+        // The store's particle amount reaches the pool through Task 14's
+        // apply chain; until that push lands the pool runs unreduced.
+        particles.set_limit(ParticleSetting::All);
+        // The splash sampler's dice: one seeded roll source for the column
+        // picks and the lava-or-drop arms. The seed is fixed, so a replayed
+        // stream samples the same columns — only the sampling formula
+        // carries parity, never the draws.
+        let mut splash_rng = StdRng::seed_from_u64(PARTICLE_DICE_SEED);
+        // The particle clock the columns and the snapshots ride in on, and
+        // the two liveness cells that keep the reports quiet on settled
+        // ticks: one event per tick that changed the pool or the sky, none
+        // for a settled one.
+        let mut particle_tick: u32 = 0;
+        let mut particles_live = false;
+        let mut columns_live = false;
         // The graphics settings the column meshes build with: the store's
         // values once the client pushes them, the two defaults until then.
         let graphics_fast = GRAPHICS_FAST;
@@ -1853,9 +1907,32 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     ],
                                     speed: particle.speed,
                                     count: particle.count,
-                                    data: particle.data,
+                                    data: particle.data.clone(),
                                 },
                             );
+                            // The pool spawns from the same packet, through
+                            // the setting reduction and past the range cull
+                            // from the viewer's feet. Without a world there
+                            // is no light or ground to step against, so the
+                            // spawn waits for the columns to arrive.
+                            if let Some(world) = world.as_ref() {
+                                let viewer = [
+                                    player.position[0] as f32,
+                                    player.position[1] as f32,
+                                    player.position[2] as f32,
+                                ];
+                                particles.spawn_wire(
+                                    particle.particle_id,
+                                    particle.long_distance,
+                                    [particle.x, particle.y, particle.z],
+                                    [particle.offset_x, particle.offset_y, particle.offset_z],
+                                    particle.speed,
+                                    particle.count,
+                                    &particle.data,
+                                    viewer,
+                                    &SessionParticleWorld::new(world),
+                                );
+                            }
                         }
                         TimeUpdate::ID => {
                             let update = decoded(id, TimeUpdate::decode(body))?;
@@ -2889,6 +2966,59 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         ClientEvent::WeatherChanged {
                             rain: weather.rain,
                             thunder: weather.thunder,
+                        },
+                    );
+                }
+                // The particle pool steps once per tick beside the weather:
+                // the engine ticks against the session's columns, the splash
+                // sampler rains its drops into the pool, and the snapshot
+                // and the columns ride to the window while either is live.
+                // Without a world the pool holds still: there is no light or
+                // ground to step against yet.
+                particle_tick = particle_tick.wrapping_add(1);
+                if let Some(world) = world.as_ref() {
+                    particles.tick(&SessionParticleWorld::new(world));
+                    let viewer_block = [
+                        player.position[0].floor() as i32,
+                        player.position[1].floor() as i32,
+                        player.position[2].floor() as i32,
+                    ];
+                    for spawn in splash_spawns(
+                        &mut splash_rng,
+                        world,
+                        viewer_block,
+                        weather.rain,
+                        !graphics_fast,
+                        ParticleSetting::All,
+                    ) {
+                        particles.spawn_local(spawn);
+                    }
+                    let columns = weather_columns(
+                        world,
+                        player.position,
+                        player.eye_height() as f32,
+                        weather.rain,
+                        !graphics_fast,
+                    );
+                    if !columns.is_empty() || columns_live {
+                        columns_live = !columns.is_empty();
+                        report(
+                            events,
+                            ClientEvent::WeatherColumns {
+                                columns,
+                                tick: particle_tick,
+                            },
+                        );
+                    }
+                }
+                let frames = particles.snapshot();
+                if !frames.is_empty() || particles_live {
+                    particles_live = !frames.is_empty();
+                    report(
+                        events,
+                        ClientEvent::Particles {
+                            frames,
+                            tick: particle_tick,
                         },
                     );
                 }

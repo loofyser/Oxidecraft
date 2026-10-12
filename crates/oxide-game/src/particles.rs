@@ -36,7 +36,11 @@
 //!   fanned-out wire velocity (or the local site's velocity) plus the row's
 //!   documented initial lift. Per-tick rules — rises, damps, gravity — are
 //!   exact. Residual: initial velocities differ from vanilla by the folded
-//!   jitter (order ±0.04 after the classes' ×0.1/×0.01 scalings).
+//!   jitter (order ±0.04 after the classes' ×0.1/×0.01 scalings), plus two
+//!   deliberate velocity scales the rows name instead: the smoke/cloud rows
+//!   fly `Passthrough` where vanilla flies `motion * 0.1 + speed` (≈9% slow),
+//!   and wire-spawned bubbles fly `Passthrough` where vanilla flies
+//!   `speed * 0.2 + jitter` (the rare wire-bubble path).
 //! * Motion collides against the [`ParticleWorld::ground_height`] plane, not
 //!   a swept box: wall intersections pass through. Trigger: a particle with
 //!   horizontal velocity inside solid geometry.
@@ -135,6 +139,8 @@ pub enum MaxAge {
     EightOver,
     /// `(int)(16.0 / (r * 0.8 + 0.2))`: suspended, lava, rain.
     SixteenOver,
+    /// `SixteenOver + 2`: the explode tail (`EntityExplodeFX.java:15`).
+    Explode,
     /// `(int)(20.0 / (r * 0.8 + 0.2))`: the auras.
     TwentyOver,
     /// `(int)(64.0 / (r * 0.8 + 0.2))`: the drips.
@@ -455,7 +461,7 @@ pub static BEHAVIOURS: [ParticleBehaviour; 42] = [
         },
         ignore_range: true,
         args: 0,
-        max_age: MaxAge::SixteenOver,
+        max_age: MaxAge::Explode,
         size_draw: SizeDraw::Explode,
         size_curve: SizeCurve::Constant,
         bright: Bright::Sampled,
@@ -2143,7 +2149,10 @@ impl ParticleEngine {
                 match row.fan_out {
                     FanOut::None => {}
                     FanOut::LavaSmoke => {
-                        let f = (p.age) as f32 / (p.max_age.max(1)) as f32;
+                        // `EntityLavaFX.onUpdate` increments the age first,
+                        // then emits against `age / maxAge`: the post-
+                        // increment age.
+                        let f = (p.age + 1) as f32 / (p.max_age.max(1)) as f32;
                         if rng.random::<f32>() > f {
                             pending.push((11, p.pos, p.vel));
                         }
@@ -2171,9 +2180,12 @@ impl ParticleEngine {
                 }
             }
         }
-        let mut effective = *setting;
         for (id, pos, vel) in pending {
             let row: &'static ParticleBehaviour = &BEHAVIOURS[usize::from(id)];
+            // `RenderGlobal.spawnEntityFX:2073-2092` reads the setting fresh
+            // and rolls per call: each fan-out child is admitted
+            // independently, so the degrade rolls inside the loop.
+            let mut effective = *setting;
             if effective == ParticleSetting::Decreased && rng.random_range(0..3) == 0 {
                 effective = ParticleSetting::Minimal;
             }
@@ -2374,6 +2386,7 @@ fn draw_max_age(rng: &mut StdRng, shape: MaxAge) -> u32 {
         MaxAge::Fixed(n) => n,
         MaxAge::EightOver => (8.0 / (unit() * 0.8 + 0.2)) as u32,
         MaxAge::SixteenOver => (16.0 / (unit() * 0.8 + 0.2)) as u32,
+        MaxAge::Explode => (16.0 / (unit() * 0.8 + 0.2)) as u32 + 2,
         MaxAge::TwentyOver => (20.0 / (unit() * 0.8 + 0.2)) as u32,
         MaxAge::SixtyFourOver => (64.0 / (unit() * 0.8 + 0.2)) as u32,
         MaxAge::FourOver => (4.0 / (unit() * 0.9 + 0.1)) as u32,
@@ -2667,6 +2680,36 @@ mod tests {
         let mut xs: Vec<f32> = engine.snapshot().iter().map(|f| f.pos[0]).collect();
         xs.sort_by(f32::total_cmp);
         assert_eq!(xs, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn the_snapshot_covers_the_visible_set_at_the_cap() {
+        // The F3 `P:` guarantee: the snapshot emits every live particle the
+        // stats call visible, and only those — past the per-list cap, with
+        // hidden rows in the mix.
+        let mut engine = ParticleEngine::seeded(13, PER_LIST_CAP);
+        for i in 0..PER_LIST_CAP + 100 {
+            let x = (i % 256) as f32;
+            assert!(engine.spawn_local(local(39, [x, 10.0, 0.0], [0.0, 0.0, 0.0])));
+        }
+        for i in 0..10 {
+            assert!(engine.spawn_local(local(40, [i as f32, 10.0, 0.0], [0.0, 0.0, 0.0])));
+        }
+        let stats = engine.stats();
+        assert_eq!(
+            stats.count,
+            PER_LIST_CAP + 10,
+            "the drops evict, the hidden rest"
+        );
+        assert_eq!(
+            stats.visible, PER_LIST_CAP,
+            "hidden rows never count as visible"
+        );
+        assert_eq!(
+            engine.snapshot().len(),
+            stats.visible,
+            "the snapshot is exactly the drawn set"
+        );
     }
 
     #[test]

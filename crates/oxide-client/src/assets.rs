@@ -57,6 +57,12 @@ const SUN: &str = "environment/sun";
 const MOON_PHASES: &str = "environment/moon_phases";
 /// The cloud layer's texture path.
 const CLOUDS: &str = "environment/clouds";
+/// The rain streaks' sheet path: the weather pass's rain arm samples it.
+const RAIN_SHEET: &str = "environment/rain";
+/// The snow flakes' sheet path: the weather pass's snow arm samples it.
+const SNOW_SHEET: &str = "environment/snow";
+/// The particle cells' sheet path: the particle pass's cell quads sample it.
+const PARTICLE_CELLS: &str = "particle/particles";
 
 /// The entity textures the window uploads once at startup: the entity pass's static
 /// set, keyed by its own names.
@@ -321,6 +327,15 @@ pub struct ClientAssets {
     pub sheet: Texture,
     /// The sun, the moon phase sheet and the cloud layer.
     pub sky_textures: SkyTextures,
+    /// The rain streaks' sheet, from the extraction tree's `environment/rain.png`: the
+    /// weather pass's rain arm samples it.
+    pub rain_sheet: Texture,
+    /// The snow flakes' sheet, from the extraction tree's `environment/snow.png`: the
+    /// weather pass's snow arm samples it.
+    pub snow_sheet: Texture,
+    /// The particle cells' sheet, from the extraction tree's `particle/particles.png`:
+    /// the particle pass's cell quads sample it.
+    pub particle_cells: Texture,
     /// The entity textures, keyed by the pass's names.
     pub entity_textures: Vec<(&'static str, Texture)>,
     /// The object set's own sheets, keyed as the object draws name them.
@@ -417,6 +432,12 @@ impl ClientAssets {
             moon_phases: texture(&textures, MOON_PHASES)?.clone(),
             clouds: texture(&textures, CLOUDS)?.clone(),
         };
+        // The weather and particle sheets: the rain and snow arms' streaks and the
+        // particle pass's cells, each refused (by name) rather than defaulted when
+        // the tree lacks it.
+        let rain_sheet = texture(&textures, RAIN_SHEET)?.clone();
+        let snow_sheet = texture(&textures, SNOW_SHEET)?.clone();
+        let particle_cells = texture(&textures, PARTICLE_CELLS)?.clone();
         // The entity set: the static list's keys, and the two default skins among
         // them, each refused (by name) rather than defaulted when the tree lacks it.
         let mut entity_textures = Vec::with_capacity(ENTITY_TEXTURES.len());
@@ -489,6 +510,9 @@ impl ClientAssets {
             lang,
             sheet,
             sky_textures,
+            rain_sheet,
+            snow_sheet,
+            particle_cells,
             entity_textures,
             object_textures,
             blocks_atlas,
