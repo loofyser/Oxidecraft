@@ -2,6 +2,7 @@
 
 pub mod clientbound;
 pub mod column;
+pub mod effects_wire;
 pub mod entity;
 pub mod handshake;
 pub mod nbt;
