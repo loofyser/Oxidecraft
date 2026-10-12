@@ -1,6 +1,6 @@
 # Oxidecraft — project state
 
-Updated: 2026-10-07
+Updated: 2026-10-12
 
 This file is the live state of the project. Keep it current before every handoff, long pause, and
 milestone boundary. Anyone picking the work up should be able to read this file plus the
@@ -8,6 +8,18 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
+- **2026-10-12 update — milestone M6 (sound, particles, weather, screens) is in progress.** Tasks
+  1–7 of the plan's thirty-one are closed, reviewed and pushed: T1 the carried GPU pins
+  (`d03596a`); T2 the effects codecs (`3158df6`); T3 the settings store (`2ef4d6b`); T4 the render
+  settings surfaces (`d9d6092`); T5 the session's weather, effect events and view distance
+  (`2eee366`, fix `46aff1a`); T6 the sounds index (`d0f74ab`); T7 the particle engine (`5b01136`).
+  Two plan-text corrections landed (`6f9f958`, `f0760dd`); the parallel wave's merged re-gate is
+  green and its CI run `38209472618` is green on every job. HEAD `5b01136` plus this update's
+  docs commit (workspace 2086 tests, 126 ignored). Carries bound for Task 8 (the audio engine):
+  the `sounds.json` redirect entry (lend the target's weight; resolve at pick time) and the
+  missing-`category` default; the particle engine's four minor findings ride the next task that
+  touches `crates/oxide-game/src/particles.rs`. The full stop handoff is
+  `docs/handoff/2026-10-12-m6-tasks-5-7-closed.md`.
 - Stage: **milestone M5 (HUD and inventory) is complete and tagged `m5`** — spec section 13 of
   `docs/specs/oxidecraft-v1-design.md` (v6), plan `docs/plans/2026-10-08-m5-hud-and-inventory.md`
   (twenty-eight tasks plus the acceptance run's fix chain; base `025a211`; all closed and
