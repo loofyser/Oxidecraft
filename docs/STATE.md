@@ -8,6 +8,16 @@ specification and continue without asking questions that are already answered he
 
 ## Where we are
 
+- **2026-10-12 update — milestone M6: Tasks 8 and 9 are closed, reviewed and pushed.** T8 the
+  audio engine, mixer and registry (`6354f51`) — reviewed approved, six minors deferred. T9 the
+  music ticker and the local sound sites, with the client pump and the `--audio-dump` flag
+  (`b9ddbd6`, fix `d0f9db5`: the first review's critical finding in the block sound groups, fixed
+  by re-deriving every id of the map and pinning the step, splash, swim and pump conversions, the
+  fix re-reviewed approved). Two plan-text pre-flight corrections landed (`b0febf0`, `4d04f41`);
+  a CI repair followed (`c36b8b9` — the building jobs install the ALSA headers the audio stack's
+  Linux backend needs). The next task is T10, the sky, weather and fog carries (plan line 354).
+  HEAD `c36b8b9` plus this update's docs commit. The full stop handoff is
+  `docs/handoff/2026-10-12-m6-tasks-8-9-closed.md`.
 - **2026-10-12 update — milestone M6 (sound, particles, weather, screens) is in progress.** Tasks
   1–7 of the plan's thirty-one are closed, reviewed and pushed: T1 the carried GPU pins
   (`d03596a`); T2 the effects codecs (`3158df6`); T3 the settings store (`2ef4d6b`); T4 the render
