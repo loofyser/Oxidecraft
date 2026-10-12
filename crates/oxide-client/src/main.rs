@@ -3751,6 +3751,15 @@ fn apply_session_event(
         | ClientEvent::SignTextCleared { .. }
         | ClientEvent::BookOpen { .. }
         | ClientEvent::MerchantOffers { .. } => false,
+        ClientEvent::WeatherChanged { .. }
+        | ClientEvent::SoundEffect { .. }
+        | ClientEvent::Particle { .. }
+        | ClientEvent::GlobalEntity { .. } => {
+            // The effect legs' events; their sky, audio, particle and
+            // lightning consumers arrive with their own milestones, and the
+            // feed is accepted here so the session's event stream stays total.
+            false
+        }
         ClientEvent::Disconnected { reason } => {
             tracing::info!(%reason, "the session ended");
             true

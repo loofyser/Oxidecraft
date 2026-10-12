@@ -237,6 +237,19 @@ pub enum InputEvent {
     /// send at :2100, screen display at :2101). The source guards nothing —
     /// every non-riding open sends exactly one — so two opens send two.
     OpenInventory,
+    /// The view-distance slider moved: the session clamps the value to the
+    /// store's range and, when it differs from the held settings, re-sends
+    /// the whole Client Settings payload (C15) beside the standing fields.
+    ///
+    /// The source's slider applies locally at once
+    /// (`GameSettings.setOptionFloatValue:328-331`) and the server hears it
+    /// at the next options save (`sendSettingsToServer`,
+    /// `GameSettings.java:1203-1216`); this port sends on the change itself,
+    /// which the options screen routes through.
+    SetViewDistance {
+        /// The new view distance in chunks.
+        chunks: u8,
+    },
 }
 
 /// How many physical keys the intent tracks.

@@ -47,16 +47,20 @@ use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::VarIntError;
 use oxide_proto_v47::PacketError;
 use oxide_proto_v47::clientbound::{
-    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChangeGameState, ChunkData, EntityStatus,
-    JoinGame, KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect,
-    PlayerAbilities, PlayerListItem, PlayerPositionAndLook, PluginMessage, Respawn, TimeUpdate,
-    UpdateHealth, read_packet_id,
+    self, BlockBreakAnimation, BlockChange, BlockUpdate, ChunkData, EntityStatus, JoinGame,
+    KeepAlive, LoginPacket, MapChunkBulk, MultiBlockChange, PlayDisconnect, PlayerAbilities,
+    PlayerListItem, PlayerPositionAndLook, PluginMessage, Respawn, TimeUpdate, UpdateHealth,
+    read_packet_id,
+};
+use oxide_proto_v47::effects_wire::{
+    ChangeGameState, Particle, SoundEffect, SpawnGlobalEntity, decode_change_game_state,
+    decode_particle, decode_sound_effect, decode_spawn_global_entity,
 };
 use oxide_proto_v47::entity::{
     self, Animation, AttachEntity, CollectItem, DestroyEntities, EntityEquipment, EntityHeadLook,
     EntityLook, EntityLookAndRelativeMove, EntityMetadata, EntityRelativeMove, EntityTeleport,
-    EntityVelocity, MetadataItem, MetadataValue, MobType, ObjectType, SpawnGlobal, SpawnMob,
-    SpawnObject, SpawnPainting, SpawnPlayer, SpawnXpOrb,
+    EntityVelocity, MetadataItem, MetadataValue, MobType, ObjectType, SpawnMob, SpawnObject,
+    SpawnPainting, SpawnPlayer, SpawnXpOrb,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -104,6 +108,7 @@ use crate::mesher::{
 use crate::physics;
 use crate::player::{Abilities, Player};
 use crate::scoreboard::{Scoreboard, colour_from_wire};
+use crate::settings::VIEW_DISTANCE_RANGE;
 use crate::ticker::Ticker;
 use crate::windows::{CURSOR_WINDOW_ID, HOTBAR_SIZE, OpenWindowState, Windows};
 use crate::world_view::WorldView;
@@ -285,15 +290,88 @@ const GRAPHICS_FAST: bool = true;
 /// 2 (`client/settings/GameSettings.java:78`).
 const SMOOTH_LIGHTING: SmoothLighting = SmoothLighting::Maximum;
 
-/// The context a column build reads: the session's assets and the settings
-/// above.
-fn mesh_context(assets: &MeshAssets) -> MeshContext<'_> {
+/// The context a column build reads: the session's assets and its held
+/// graphics settings.
+///
+/// The settings ride the session's own state: they start at the two defaults
+/// above, and the client's settings pushes move them from there.
+fn mesh_context(
+    assets: &MeshAssets,
+    graphics_fast: bool,
+    smooth_lighting: SmoothLighting,
+) -> MeshContext<'_> {
     MeshContext {
         models: &assets.models,
         atlas: &assets.atlas,
         tint_maps: &assets.tint_maps,
-        graphics_fast: GRAPHICS_FAST,
-        smooth_lighting: SMOOTH_LIGHTING,
+        graphics_fast,
+        smooth_lighting,
+    }
+}
+
+/// The per-tick easing rate of the weather strengths.
+///
+/// `World.updateWeather` moves each strength toward its rainy or thundery
+/// side by `0.01` a tick — `(float)((double)strength ± 0.01D)` — and clamps
+/// the result to `[0, 1]` (`World.java:2541-2553` for thunder, `:2576-2587`
+/// for rain). The source eases toward its raining/thundering flags; the
+/// session's targets stand in for those flags per the task's interface, so
+/// reasons 7/8 name fade targets where the source snaps the strength.
+pub const WEATHER_EASE_RATE: f32 = 0.01;
+
+/// The session's weather: the eased strengths the window reads and the
+/// targets the wire sets.
+///
+/// Clientbound 0x2B's weather reasons write the targets — 1 ends the rain
+/// (0.0), 2 begins it (1.0), 7 fades the rain to its value, 8 fades the
+/// thunder to its value
+/// (`NetHandlerPlayClient.handleChangeGameState:1371-1421`) — and [`Self::tick`]
+/// eases the strengths toward them once per tick. The window reads the eased
+/// pair through [`ClientEvent::WeatherChanged`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WeatherState {
+    /// The eased rain strength, in `[0, 1]`.
+    pub rain: f32,
+    /// The eased thunder strength, in `[0, 1]`.
+    pub thunder: f32,
+    /// The rain target the wire last named, in `[0, 1]`.
+    pub target_rain: f32,
+    /// The thunder target the wire last named, in `[0, 1]`.
+    pub target_thunder: f32,
+}
+
+impl WeatherState {
+    /// One tick of easing: each strength moves toward its target by
+    /// [`WEATHER_EASE_RATE`], snapping when it arrives, and the result stays
+    /// clamped to `[0, 1]`.
+    ///
+    /// Returns whether either strength moved: the session reports
+    /// [`ClientEvent::WeatherChanged`] exactly on the ticks that moved.
+    pub fn tick(&mut self) -> bool {
+        // One strength's step: within a rate step of the target it arrives
+        // instead of stepping, else it moves one rate toward it, and the
+        // result stays in `[0, 1]`. The arrival bound carries a thousandth of
+        // a step of slop so the float dust a full 0-to-1 ease accumulates
+        // (~7e-7 observed) cannot push an arrival one tick late; the snapped
+        // value is exact either way.
+        fn ease(current: f32, target: f32) -> (f32, bool) {
+            let arrived = (target - current).abs() <= WEATHER_EASE_RATE * 1.001;
+            let next = if arrived {
+                target
+            } else if target > current {
+                current + WEATHER_EASE_RATE
+            } else {
+                current - WEATHER_EASE_RATE
+            };
+            let next = next.clamp(0.0, 1.0);
+            let moved = next != current;
+            (next, moved)
+        }
+        let (rain, rain_moved) = ease(self.rain, self.target_rain);
+        let (thunder, thunder_moved) = ease(self.thunder, self.target_thunder);
+        self.rain = rain;
+        self.thunder = thunder;
+        rain_moved || thunder_moved
     }
 }
 
@@ -742,6 +820,72 @@ pub enum ClientEvent {
         /// The held stack, as the inventory held it at receive time.
         stack: MetadataItem,
     },
+    /// The eased weather strengths changed on a tick, from clientbound 0x2B's
+    /// weather reasons.
+    ///
+    /// Reported once per tick while the easing moves — never for a settled
+    /// tick. The window's sky and weather draws read the pair from here.
+    WeatherChanged {
+        /// The eased rain strength, in `[0, 1]`.
+        rain: f32,
+        /// The eased thunder strength, in `[0, 1]`.
+        thunder: f32,
+    },
+    /// A sound effect played, from clientbound 0x29.
+    ///
+    /// Reported once per packet; the audio engine resolves the name. The
+    /// position rides the wire's own 1/8-block ints
+    /// (`S29PacketSoundEffect.readPacketData`); divide by 8 for blocks
+    /// ([`oxide_proto_v47::effects_wire::read_effect_position`]). The pitch
+    /// is the wire's own byte, 63 for full pitch
+    /// ([`oxide_proto_v47::effects_wire::read_sound_pitch`]).
+    SoundEffect {
+        /// The sound to play, exactly as sent.
+        name: String,
+        /// The position in 1/8-block units: x, y, z.
+        pos: [i32; 3],
+        /// The volume, the source's own float scale.
+        volume: f32,
+        /// The pitch byte, 63 for full pitch.
+        pitch: u8,
+    },
+    /// A particle spawn, from clientbound 0x2A.
+    ///
+    /// Reported once per packet; the particle engine spawns from it. An id
+    /// outside the table already decodes as `BARRIER` (id 35), the source's
+    /// own fallback (`S2APacketParticles.readPacketData`).
+    Particle {
+        /// The particle id, mapped into 0-41 at decode.
+        particle_id: i32,
+        /// Whether the particle renders past the range cull.
+        long_distance: bool,
+        /// The spawn position: x, y, z.
+        pos: [f32; 3],
+        /// The per-axis spawn spread: x, y, z.
+        offset: [f32; 3],
+        /// The particle speed.
+        speed: f32,
+        /// The spawn count.
+        count: i32,
+        /// The trailing data run (block/item ids).
+        data: Vec<i32>,
+    },
+    /// A global entity spawned, from clientbound 0x2C.
+    ///
+    /// Reported once per packet; the entity registers for 0x13 removal under
+    /// the standing entity store path. The kind rides raw — 1 is lightning,
+    /// and any other kind keeps the record and draws nothing
+    /// (`NetHandlerPlayClient.handleSpawnGlobalEntity:463-486`). The
+    /// position rides the wire's own fixed-point ints; divide by 32 for
+    /// blocks.
+    GlobalEntity {
+        /// The entity id the server will use for this entity.
+        entity_id: i32,
+        /// The kind byte; 1 is lightning.
+        kind: u8,
+        /// The raw fixed-point position: x, y, z.
+        pos: [i32; 3],
+    },
 }
 
 /// One status effect the player holds.
@@ -902,6 +1046,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             config,
             mesh,
         } = self;
+        // The client settings the session holds: Join Game sends them, and
+        // the view-distance slider re-sends them on change.
+        let mut settings = config.settings;
 
         // The pool and the results channel live for the whole play loop; the
         // handshake and the login above mesh nothing.
@@ -991,6 +1138,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // The last text every sign carried, by position: what the view draws
         // the sign's front face from.
         let mut signs: BTreeMap<(i32, i32, i32), SignText> = BTreeMap::new();
+        // The weather the 0x2B reasons steer: the targets the wire names,
+        // eased once per tick and reported while the easing moves.
+        let mut weather = WeatherState::default();
+        // The graphics settings the column meshes build with: the store's
+        // values once the client pushes them, the two defaults until then.
+        let graphics_fast = GRAPHICS_FAST;
+        let smooth_lighting = SMOOTH_LIGHTING;
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -1151,6 +1305,32 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     })?;
                                     send_reply(&mut conn, &request)?;
                                 }
+                                InputEvent::SetViewDistance { chunks } => {
+                                    // The slider's own clamp is the store's
+                                    // range (`VIEW_DISTANCE_RANGE`); an
+                                    // unchanged value sends nothing.
+                                    let chunks =
+                                        chunks.clamp(VIEW_DISTANCE_RANGE.0, VIEW_DISTANCE_RANGE.1);
+                                    if chunks != settings.view_distance {
+                                        settings.view_distance = chunks;
+                                        // The slider commits here: the
+                                        // source's drag only sets the field
+                                        // and dirties the renderers
+                                        // (`setOptionValue` RENDER_DISTANCE,
+                                        // `GameSettings.java:328-332`, no
+                                        // packet), and the Done button's
+                                        // `saveOptions` sends the whole
+                                        // settings (`:1186`, via
+                                        // `sendSettingsToServer:1203-1216`).
+                                        // The session has no screen close, so
+                                        // the input event is the commit: one
+                                        // C15 with every field current.
+                                        let echo = payload_of(|out| {
+                                            write_client_settings(out, &settings)
+                                        })?;
+                                        send_reply(&mut conn, &echo)?;
+                                    }
+                                }
                                 other => looked |= apply_input(other, &mut intent, &mut player),
                             }
                         }
@@ -1239,8 +1419,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             // takes creative from the controller's game type
                             // (`PlayerControllerMP.java:344-346`).
                             gamemode = join.gamemode;
-                            let settings =
-                                payload_of(|out| write_client_settings(out, &config.settings))?;
+                            let settings = payload_of(|out| write_client_settings(out, &settings))?;
                             send_reply(&mut conn, &settings)?;
                             let brand = payload_of(|out| {
                                 write_plugin_message(out, BRAND_CHANNEL, BRAND_PAYLOAD)
@@ -1491,24 +1670,87 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             report_sky(world.as_ref(), player.position, clock.as_ref(), events);
                         }
                         ChangeGameState::ID => {
-                            let change = decoded(id, ChangeGameState::decode(body))?;
-                            if change.reason == ChangeGameState::REASON_CHANGE_GAME_MODE {
+                            let change = decoded(id, decode_change_game_state(body))?;
+                            // Reason 3 is the game-mode change; the value maps
+                            // as the source's handler maps it: floored and
+                            // matched against the enum, everything unknown
+                            // answering survival
+                            // (`NetHandlerPlayClient.java:1364`, `:1383`).
+                            if change.reason == 3 {
                                 // The mode the reach and the dig machine's creative
                                 // branch read. Both read it live — the aim recomputes
                                 // against this byte each tick, and the dig step takes
                                 // it per step — so the next recompute already uses the
-                                // new reach (`PlayerControllerMP.java:344-346`). The
-                                // value maps as the source's handler maps it: floored
-                                // and matched against the enum, everything unknown
-                                // answering survival (`NetHandlerPlayClient.java:1364`,
-                                // `:1383`).
+                                // new reach (`PlayerControllerMP.java:344-346`).
                                 gamemode = mode_from_value(change.value);
                                 debug!(
                                     gamemode,
                                     value = change.value,
                                     "the server changed the game mode"
                                 );
+                            } else if change.reason == 1 {
+                                // The rain eases out: its target falls to
+                                // clear (the task's weather interface; the
+                                // 1/2 begin/end mapping note rides the task
+                                // report).
+                                weather.target_rain = 0.0;
+                            } else if change.reason == 2 {
+                                // The rain eases in: its target rises to full
+                                // (same note as reason 1).
+                                weather.target_rain = 1.0;
+                            } else if change.reason == 7 {
+                                // The rain fade: the strength heads for the
+                                // value (`:1414-1417`).
+                                weather.target_rain = change.value.clamp(0.0, 1.0);
+                            } else if change.reason == 8 {
+                                // The thunder fade: the strength heads for the
+                                // value (`:1418-1421`).
+                                weather.target_thunder = change.value.clamp(0.0, 1.0);
+                            } else {
+                                // Reason 9 has no handler and anything above
+                                // 10 the source ignores
+                                // (`:1358-1427`) — the decoder keeps the raw
+                                // reason and the session does the same.
+                                debug!(
+                                    reason = change.reason,
+                                    "ignoring a game-state change with no handler"
+                                );
                             }
+                        }
+                        SoundEffect::ID => {
+                            let sound = decoded(id, decode_sound_effect(body))?;
+                            // One event per packet; the audio engine resolves
+                            // the name.
+                            report(
+                                events,
+                                ClientEvent::SoundEffect {
+                                    name: sound.name,
+                                    pos: [sound.x, sound.y, sound.z],
+                                    volume: sound.volume,
+                                    pitch: sound.pitch,
+                                },
+                            );
+                        }
+                        Particle::ID => {
+                            let particle = decoded(id, decode_particle(body))?;
+                            // One event per packet; the particle engine spawns
+                            // from it.
+                            report(
+                                events,
+                                ClientEvent::Particle {
+                                    particle_id: particle.particle_id,
+                                    long_distance: particle.long_distance,
+                                    pos: [particle.x, particle.y, particle.z],
+                                    offset: [
+                                        particle.offset_x,
+                                        particle.offset_y,
+                                        particle.offset_z,
+                                    ],
+                                    speed: particle.speed,
+                                    count: particle.count,
+                                    data: particle.data,
+                                },
+                            );
                         }
                         TimeUpdate::ID => {
                             let update = decoded(id, TimeUpdate::decode(body))?;
@@ -1812,12 +2054,29 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                             entity.data = KindData::XpOrb { count: spawn.count };
                             entities.insert(entity);
                         }
-                        SpawnGlobal::ID => {
-                            let spawn = decoded(id, entity::decode_spawn_global(body))?;
+                        SpawnGlobalEntity::ID => {
+                            let spawn = decoded(id, decode_spawn_global_entity(body))?;
                             let mut entity = Entity::new(spawn.entity_id, EntityKind::Global);
-                            entity.position = [spawn.x, spawn.y, spawn.z];
+                            entity.position = [
+                                entity::read_fixed_point(spawn.x),
+                                entity::read_fixed_point(spawn.y),
+                                entity::read_fixed_point(spawn.z),
+                            ];
                             entity.last_tick_position = entity.position;
                             entities.insert(entity);
+                            // One event per spawn with the raw kind and the
+                            // raw fixed-point position: kind 1 is lightning
+                            // and any other kind keeps the record and draws
+                            // nothing
+                            // (`NetHandlerPlayClient.handleSpawnGlobalEntity:463-486`).
+                            report(
+                                events,
+                                ClientEvent::GlobalEntity {
+                                    entity_id: spawn.entity_id,
+                                    kind: spawn.kind,
+                                    pos: [spawn.x, spawn.y, spawn.z],
+                                },
+                            );
                         }
                         CollectItem::ID => {
                             let collect = decoded(id, entity::decode_collect_item(body))?;
@@ -2367,6 +2626,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 &finished,
                                 &results,
                                 events,
+                                graphics_fast,
+                                smooth_lighting,
                             );
                             report(
                                 events,
@@ -2396,6 +2657,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         &finished,
                         &results,
                         events,
+                        graphics_fast,
+                        smooth_lighting,
                     );
                 }
                 Err(error) if is_stream_end(&error) => {
@@ -2430,6 +2693,18 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                     !awaiting_respawn_position,
                 ) {
                     send_reply(&mut conn, &payload)?;
+                }
+                // The weather eases once per tick and reports while it moves:
+                // one event per tick that changed a strength, none for a
+                // settled tick.
+                if weather.tick() {
+                    report(
+                        events,
+                        ClientEvent::WeatherChanged {
+                            rain: weather.rain,
+                            thunder: weather.thunder,
+                        },
+                    );
                 }
                 // The aim follows the tick's own state: a step that moved the
                 // player, and any world change behind it, is read here.
@@ -2518,6 +2793,8 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
             &finished,
             &results,
             events,
+            graphics_fast,
+            smooth_lighting,
         );
         Ok(())
     }
@@ -2767,6 +3044,7 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
         | InputEvent::UpdateSign { .. }
         | InputEvent::HeldItemChange { .. }
         | InputEvent::OpenInventory
+        | InputEvent::SetViewDistance { .. }
         | InputEvent::DropItem { .. } => false,
     }
 }
@@ -4110,6 +4388,9 @@ fn mesh_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
 /// snapshot and the shared assets. The results are then taken with a
 /// non-blocking receive: a build that is not finished yet is picked up by a
 /// later pass, never waited for.
+// One argument per owner of the pump's state; bundling them into a struct
+// would only move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 fn pump_meshes(
     world: Option<&World>,
     queue: &mut MeshQueue,
@@ -4118,6 +4399,8 @@ fn pump_meshes(
     finished: &Sender<MeshResult>,
     results: &Receiver<MeshResult>,
     events: &Sender<ClientEvent>,
+    graphics_fast: bool,
+    smooth_lighting: SmoothLighting,
 ) {
     if let Some(world) = world {
         for _ in 0..PENDING_JOBS_CAP {
@@ -4129,7 +4412,7 @@ fn pump_meshes(
             let assets = Arc::clone(mesh);
             let finished = finished.clone();
             pool.spawn(move || {
-                let ctx = mesh_context(&assets);
+                let ctx = mesh_context(&assets, graphics_fast, smooth_lighting);
                 let sections = build_column_meshes(&snapshot, &ctx);
                 let _ = finished.send((job, sections));
             });
@@ -4167,6 +4450,9 @@ fn drain_meshes(
 /// pool and the results are drained until nothing is outstanding or
 /// [`END_OF_SESSION_WAIT`] passes. The bound keeps a wedged build from holding
 /// the session's end forever; the pool is dropped when the session returns.
+/// One argument per owner of the finish's state; bundling them into a struct
+/// would only move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 fn finish_meshes(
     world: Option<&World>,
     queue: &mut MeshQueue,
@@ -4175,6 +4461,8 @@ fn finish_meshes(
     finished: &Sender<MeshResult>,
     results: &Receiver<MeshResult>,
     events: &Sender<ClientEvent>,
+    graphics_fast: bool,
+    smooth_lighting: SmoothLighting,
 ) {
     if world.is_none() {
         // No world was ever joined, so nothing can be queued for it.
@@ -4182,7 +4470,17 @@ fn finish_meshes(
     }
     let deadline = Instant::now() + END_OF_SESSION_WAIT;
     loop {
-        pump_meshes(world, queue, pool, mesh, finished, results, events);
+        pump_meshes(
+            world,
+            queue,
+            pool,
+            mesh,
+            finished,
+            results,
+            events,
+            graphics_fast,
+            smooth_lighting,
+        );
         if queue.pending() == 0 || Instant::now() >= deadline {
             return;
         }
@@ -4200,9 +4498,9 @@ mod tests {
     use oxide_world::world::World;
 
     use super::{
-        ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT,
-        INPUTS_PER_PASS, MeshAssets, MeshQueue, TICK_PERIOD, chat_over_cap, finish_meshes,
-        mesh_pool, step_tick,
+        ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT, GRAPHICS_FAST,
+        INPUTS_PER_PASS, MeshAssets, MeshQueue, SMOOTH_LIGHTING, TICK_PERIOD, WEATHER_EASE_RATE,
+        WeatherState, chat_over_cap, finish_meshes, mesh_pool, step_tick,
     };
     use crate::entity_view::PlayerList;
     use crate::input::Intent;
@@ -4470,6 +4768,8 @@ mod tests {
             &finished,
             &results,
             &events,
+            GRAPHICS_FAST,
+            SMOOTH_LIGHTING,
         );
         let elapsed = start.elapsed();
         assert!(
@@ -4767,6 +5067,91 @@ mod tests {
             book_open_stack("MC|Brand", &written),
             None,
             "another channel never opens the reader"
+        );
+    }
+
+    #[test]
+    fn weather_eases_clear_to_full_at_the_pinned_rate() {
+        // The source's own per-tick step (`World.updateWeather`,
+        // `World.java:2576-2587`): 0.01 a tick, so clear-to-full is exactly
+        // 100 ticks and the halfway point reads 0.5.
+        assert_eq!(
+            WEATHER_EASE_RATE, 0.01,
+            "the pinned per-tick rate: {WEATHER_EASE_RATE}"
+        );
+        let mut weather = WeatherState {
+            target_rain: 1.0,
+            ..WeatherState::default()
+        };
+        for _ in 0..50 {
+            assert!(weather.tick(), "every easing tick moves");
+        }
+        assert!(
+            (weather.rain - 0.5).abs() < 1e-6,
+            "fifty ticks ease halfway: {}",
+            weather.rain
+        );
+        for _ in 0..50 {
+            assert!(weather.tick(), "the second half moves too");
+        }
+        assert_eq!(weather.rain, 1.0, "a hundred ticks reach full");
+        assert_eq!(weather.thunder, 0.0, "the thunder side never moved");
+        assert!(!weather.tick(), "a settled tick reports no change");
+    }
+
+    #[test]
+    fn weather_thunder_fade_folds_down_and_snaps_on_arrival() {
+        // A fade pair below the target eases down at the same rate, and the
+        // arrival tick snaps exactly onto a target the rate would overshoot.
+        let mut weather = WeatherState {
+            thunder: 1.0,
+            target_thunder: 0.97,
+            ..WeatherState::default()
+        };
+        assert!(weather.tick(), "the first tick moves");
+        assert!(
+            (weather.thunder - 0.99).abs() < 1e-6,
+            "one tick down at the rate: {}",
+            weather.thunder
+        );
+        for _ in 0..2 {
+            assert!(weather.tick(), "the easing keeps moving");
+        }
+        assert_eq!(
+            weather.thunder, 0.97,
+            "the arrival snaps onto the target instead of overshooting"
+        );
+        assert!(!weather.tick(), "a settled tick reports no change");
+        assert_eq!(weather.rain, 0.0, "the rain side never moved");
+    }
+
+    #[test]
+    fn weather_end_rain_falls_while_a_thunder_fade_rises() {
+        // The two strengths ease independently: one falls from full while the
+        // other climbs toward its fade value.
+        let mut weather = WeatherState {
+            rain: 1.0,
+            target_rain: 0.0,
+            target_thunder: 0.05,
+            ..WeatherState::default()
+        };
+        for _ in 0..5 {
+            assert!(weather.tick(), "both sides move together");
+        }
+        assert!(
+            (weather.rain - 0.95).abs() < 1e-6,
+            "five ticks down at the rate: {}",
+            weather.rain
+        );
+        assert_eq!(
+            weather.thunder, 0.05,
+            "the thunder fade arrives exactly on its fifth tick"
+        );
+        assert!(weather.tick(), "the rain still falls");
+        assert!(
+            (weather.rain - 0.94).abs() < 1e-6,
+            "the rain keeps easing alone: {}",
+            weather.rain
         );
     }
 }

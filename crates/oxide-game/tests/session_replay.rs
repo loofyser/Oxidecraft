@@ -7988,3 +7988,309 @@ fn a_double_open_pickup_hold_publishes_the_carried_stack() {
         "the cursor carries stone 16 after the double open: {held:?}"
     );
 }
+
+/// One Sound Effect frame (0x29): the name, the 1/8-block position, the
+/// volume float and the pitch byte.
+fn sound_effect_frame(name: &str, x: i32, y: i32, z: i32, volume: f32, pitch: u8) -> Vec<u8> {
+    let mut payload = vec![0x29];
+    push_string(&mut payload, name);
+    for value in [x, y, z] {
+        payload.extend_from_slice(&value.to_be_bytes());
+    }
+    payload.extend_from_slice(&volume.to_be_bytes());
+    payload.push(pitch);
+    payload
+}
+
+/// One Particle frame (0x2A): the id, the long-distance flag, the position,
+/// spread and speed floats, the spawn count and the trailing data run.
+fn particle_frame(
+    id: i32,
+    long_distance: bool,
+    pos: [f32; 3],
+    offset: [f32; 3],
+    speed: f32,
+    count: i32,
+    data: &[i32],
+) -> Vec<u8> {
+    let mut payload = vec![0x2A];
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.push(long_distance as u8);
+    for value in pos.into_iter().chain(offset).chain([speed]) {
+        payload.extend_from_slice(&value.to_be_bytes());
+    }
+    payload.extend_from_slice(&count.to_be_bytes());
+    for value in data {
+        push_varint(&mut payload, *value);
+    }
+    payload
+}
+
+/// The Client Settings payload the session writes for `view_distance`: the
+/// standing locale, chat mode, colours and skin parts beside it — the byte
+/// shape the login test pins at the join.
+fn view_distance_echo(view_distance: u8) -> Vec<u8> {
+    vec![
+        0x15,
+        0x05,
+        b'e',
+        b'n',
+        b'_',
+        b'U',
+        b'S',
+        view_distance,
+        0x00,
+        0x01,
+        0x7F,
+    ]
+}
+
+/// The eased weather pairs every `WeatherChanged` in `events` carried, in
+/// report order.
+fn weather_reports(events: &[ClientEvent]) -> Vec<(f32, f32)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::WeatherChanged { rain, thunder } => Some((*rain, *thunder)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn begin_rain_eases_one_weather_event_per_tick() {
+    // 0x2B reason 2 names full rain; the session eases 0 toward 1 at the
+    // pinned 0.01-a-tick rate and reports exactly one event per tick that
+    // moved, with the thunder side silent throughout.
+    let (events, _) = run_feed_session(
+        feed_head(&[change_game_state_frame(2, 1.0)]),
+        framed(&[keep_alive_frame(81)]),
+        16,
+        0,
+    );
+    let ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    assert!(ticks >= 3, "the quiet stretch owes whole steps: {events:?}");
+    let weather = weather_reports(&events);
+    assert_eq!(
+        weather.len(),
+        ticks,
+        "every tick moved, so every tick reports exactly once: {events:?}"
+    );
+    assert!(
+        (weather[0].0 - 0.01).abs() < 1e-6,
+        "the first tick eases one rate step: {weather:?}"
+    );
+    for pair in weather.windows(2) {
+        assert!(
+            (pair[1].0 - pair[0].0 - 0.01).abs() < 1e-6,
+            "each tick steps the pinned rate: {weather:?}"
+        );
+        assert!(
+            pair[1].0 > pair[0].0,
+            "the easing climbs monotonically: {weather:?}"
+        );
+    }
+    assert!(
+        weather.iter().all(|(_, thunder)| *thunder == 0.0),
+        "no thunder was named, none eases: {weather:?}"
+    );
+}
+
+#[test]
+fn weather_fades_settle_and_fall_silent() {
+    // Reasons 7 and 8 fade to their values; once a strength arrives its
+    // ticks go quiet, so the run holds more player ticks than weather
+    // events and the last pair lands exactly on the named values.
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            change_game_state_frame(7, 0.02),
+            change_game_state_frame(8, 0.03),
+        ]),
+        framed(&[keep_alive_frame(82)]),
+        24,
+        0,
+    );
+    let ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    assert!(ticks >= 4, "the quiet stretch owes whole steps: {events:?}");
+    let weather = weather_reports(&events);
+    assert_eq!(
+        weather.len(),
+        3,
+        "two rain steps and three thunder steps, so three moving ticks: {weather:?}"
+    );
+    assert!(
+        ticks > weather.len(),
+        "the settled ticks report nothing: {events:?}"
+    );
+    assert!(
+        (weather[0].0 - 0.01).abs() < 1e-6 && (weather[0].1 - 0.01).abs() < 1e-6,
+        "both sides ease together from clear: {weather:?}"
+    );
+    let (rain, thunder) = weather.last().copied().expect("three reports");
+    assert_eq!(rain, 0.02, "the rain fade arrives exactly: {weather:?}");
+    assert_eq!(
+        thunder, 0.03,
+        "the thunder fade arrives exactly: {weather:?}"
+    );
+}
+
+#[test]
+fn sound_and_particle_packets_publish_their_events() {
+    // One 0x29 and two 0x2A (a count-3 smoke and an icon-crack with its two
+    // data args): each publishes exactly one event carrying its values.
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            sound_effect_frame("mob.creeper.say", 80, 520, -96, 1.0, 63),
+            particle_frame(11, false, [1.0, 65.0, 2.0], [0.5, 0.5, 0.5], 0.02, 3, &[]),
+            particle_frame(36, true, [3.0, 64.0, 3.0], [0.0, 0.0, 0.0], 0.0, 1, &[5, 0]),
+        ]),
+        framed(&[keep_alive_frame(83)]),
+        2,
+        0,
+    );
+    let sounds: Vec<&ClientEvent> = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::SoundEffect { .. }))
+        .collect();
+    assert_eq!(
+        sounds,
+        vec![&ClientEvent::SoundEffect {
+            name: "mob.creeper.say".into(),
+            pos: [80, 520, -96],
+            volume: 1.0,
+            pitch: 63,
+        }],
+        "one sound event with the wire's values: {events:?}"
+    );
+    let particles: Vec<&ClientEvent> = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::Particle { .. }))
+        .collect();
+    assert_eq!(
+        particles,
+        vec![
+            &ClientEvent::Particle {
+                particle_id: 11,
+                long_distance: false,
+                pos: [1.0, 65.0, 2.0],
+                offset: [0.5, 0.5, 0.5],
+                speed: 0.02,
+                count: 3,
+                data: Vec::new(),
+            },
+            &ClientEvent::Particle {
+                particle_id: 36,
+                long_distance: true,
+                pos: [3.0, 64.0, 3.0],
+                offset: [0.0, 0.0, 0.0],
+                speed: 0.0,
+                count: 1,
+                data: vec![5, 0],
+            },
+        ],
+        "one particle event per packet with values and data: {events:?}"
+    );
+}
+
+#[test]
+fn global_entities_of_any_kind_register_and_their_removal_lands() {
+    // Kind 1 is lightning and kind 2 is unknown to the source's handler —
+    // which draws nothing for it — but both keep their entity record for
+    // 0x13 removal, and both report their raw kind and raw fixed-point
+    // position.
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            spawn_global_frame(50, 1, 6.0, 64.0, 6.0),
+            spawn_global_frame(51, 2, 7.0, 65.0, 7.0),
+        ]),
+        framed(&[destroy_entities_frame(&[50, 51]), keep_alive_frame(84)]),
+        6,
+        6,
+    );
+    let globals: Vec<(i32, u8, [i32; 3])> = events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::GlobalEntity {
+                entity_id,
+                kind,
+                pos,
+            } => Some((*entity_id, *kind, *pos)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        globals,
+        vec![(50, 1, [192, 2048, 192]), (51, 2, [224, 2080, 224])],
+        "one event per spawn with the raw kind and position: {events:?}"
+    );
+    let all_feeds = feeds(&events);
+    assert!(
+        all_feeds.len() >= 2,
+        "both quiet stretches tick: {events:?}"
+    );
+    let early = &all_feeds[0];
+    for (id, pos) in [(50, [6.0, 64.0, 6.0]), (51, [7.0, 65.0, 7.0])] {
+        let frame = frame_of(early, id);
+        assert_eq!(frame.kind, EntityKind::Global, "entity {id} registers");
+        assert_eq!(frame.pos, pos, "entity {id} stands on its blocks");
+    }
+    let late = all_feeds.last().expect("a last feed");
+    assert!(
+        !late.iter().any(|frame| frame.id == 50 || frame.id == 51),
+        "the 0x13 removes both records: {late:?}"
+    );
+}
+
+#[test]
+fn set_view_distance_resends_client_settings_on_change_only() {
+    // A change to 12 re-sends the whole C15 beside the standing fields, and
+    // repeating 12 sends nothing more. (The join's own payload with view 8
+    // is pinned by the login test; `flip_session` returns only the flip
+    // phase's frames, so the join's send is not in this list.)
+    let flips = vec![
+        (2, InputEvent::SetViewDistance { chunks: 12 }),
+        (4, InputEvent::SetViewDistance { chunks: 12 }),
+    ];
+    let (_, frames) = flip_session(floor_head(), Vec::new(), 8, 0, flips);
+    let settings: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x15).collect();
+    assert_eq!(
+        settings,
+        vec![&view_distance_echo(12)],
+        "exactly one re-send on change: {frames:?}"
+    );
+
+    // The held value itself sends nothing.
+    let (_, frames) = flip_session(
+        floor_head(),
+        Vec::new(),
+        8,
+        0,
+        vec![(2, InputEvent::SetViewDistance { chunks: 8 })],
+    );
+    let settings: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x15).collect();
+    assert!(
+        settings.is_empty(),
+        "an unchanged slider sends nothing: {frames:?}"
+    );
+
+    // Past-the-end values clamp to the store's range before the change gate.
+    let (_, frames) = flip_session(
+        floor_head(),
+        Vec::new(),
+        8,
+        0,
+        vec![(2, InputEvent::SetViewDistance { chunks: 64 })],
+    );
+    let settings: Vec<&Vec<u8>> = frames.iter().filter(|frame| frame[0] == 0x15).collect();
+    assert_eq!(
+        settings,
+        vec![&view_distance_echo(32)],
+        "64 clamps to the 32-chunk max: {frames:?}"
+    );
+}
