@@ -11,6 +11,7 @@ pub mod mcmeta;
 pub mod model;
 pub mod resources;
 pub mod skins;
+pub mod sound;
 pub mod store;
 pub mod texture;
 pub mod version;
