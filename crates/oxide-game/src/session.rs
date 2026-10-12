@@ -83,7 +83,7 @@ use oxide_proto_v47::window::{
 };
 use oxide_proto_v47::{NEXT_STATE_LOGIN, PROTOCOL};
 use oxide_render::terrain::ChunkMesh;
-use oxide_world::behaviour::behaviour;
+use oxide_world::behaviour::{Material, behaviour};
 use oxide_world::biome::{ColorMap, TintMaps};
 use oxide_world::chunk::SECTION_SIZE;
 use oxide_world::entity::{Entities, Entity, EntityKind, KindData};
@@ -92,9 +92,16 @@ use oxide_world::sky::{
     celestial_angle, cloud_colour, moon_phase, sky_colour, star_brightness, sun_brightness,
 };
 use oxide_world::world::World;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use tracing::{debug, info, warn};
 
+use crate::audio::SoundCategory;
+use crate::audio::sounds::{
+    DEATH_SOUND, HURT_SOUND, LEVEL_SOUND, ORB_SOUND, PICKUP_SOUND, SPLASH_SOUND, SWIM_SOUND,
+    SoundGroup, hurt_pitch, level_sounds, level_volume, pickup_pitch, splash_volume, swim_pitch,
+    swim_volume,
+};
 use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
 use crate::input::{InputEvent, Intent, Key, MouseButton, look_delta};
 use crate::interaction::{
@@ -164,6 +171,14 @@ const MESH_TICK: Duration = Duration::from_millis(20);
 /// (`Minecraft.java:223`), one tick every 50 ms of real time while the window
 /// keeps up; the session schedules the same period.
 const TICK_PERIOD: Duration = Duration::from_millis(50);
+
+/// The local sounds' dice seed: fixed, so a replayed stream stages the same
+/// pitches. Only the staging formulas carry parity, never the draws.
+const SOUND_DICE_SEED: u64 = 9;
+
+/// The snow layer's block id: the sheet that lends its own step when it sits
+/// on the stood-on block (`Entity.playStepSound:988-993`).
+const SNOW_LAYER_ID: u16 = 78;
 
 /// How many of the window's input events one pass drains.
 ///
@@ -849,6 +864,27 @@ pub enum ClientEvent {
         /// The pitch byte, 63 for full pitch.
         pitch: u8,
     },
+    /// A local sound the client's own play staged: a block break or place,
+    /// a footstep, a swim or splash, the own player's hurt or death, an item
+    /// pickup, or a level-up.
+    ///
+    /// Reported once per staging; the client's pump plays it through the
+    /// audio engine as-is — the position already rides in blocks and the
+    /// pitch is already a factor, unlike [`ClientEvent::SoundEffect`]'s wire
+    /// units.
+    LocalSound {
+        /// The sound event to play, exactly as the call site names it.
+        name: String,
+        /// The position in blocks: x, y, z.
+        pos: [f32; 3],
+        /// The staged volume.
+        volume: f32,
+        /// The staged pitch factor.
+        pitch: f32,
+        /// The call site's category, used when the event's own category
+        /// string names nothing known.
+        category_hint: SoundCategory,
+    },
     /// A particle spawn, from clientbound 0x2A.
     ///
     /// Reported once per packet; the particle engine spawns from it. An id
@@ -1077,6 +1113,24 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut clock: Option<Clock> = None;
         let mut ticker = Ticker::new(TICK_PERIOD);
         let mut intent = Intent::neutral();
+        // The local sounds' dice: one seeded roll source for the hurt,
+        // pickup, swim and splash spreads. The seed is fixed, so a replayed
+        // stream stages the same pitches — only the staging formulas carry
+        // parity, never the draws.
+        let mut sound_rng = StdRng::seed_from_u64(SOUND_DICE_SEED);
+        // The experience level the last 0x1F carried, and the session tick
+        // of the last level-up sound: the level-up gate reads both
+        // (`EntityPlayer.addExperienceLevel:2037-2054`).
+        let mut xp_level: i32 = 0;
+        let mut last_xp_sound_tick: u64 = 0;
+        // The footstep walk and the water flag the step sounds read: the
+        // walked distance since the last step and the threshold past which
+        // the next one stages (`Entity.java:139-146, :271`, `:872-877`),
+        // and the water state the previous tick left
+        // (`handleWaterMovement:1111-1129`).
+        let mut distance_walked: f32 = 0.0;
+        let mut next_step_distance: i32 = 1;
+        let mut was_in_water: bool = false;
         // The gamemode the reach reads, from the last Join Game
         // (`PlayerControllerMP.getBlockReachDistance`, `:344-346`); the
         // controller's own default until one arrives is survival
@@ -1469,6 +1523,24 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 report(events, ClientEvent::Died);
                                 player.dead = true;
                                 player.death_time = 0;
+                                // The death sound: the `!isSilent` branch of
+                                // the same handler that stages the hurt
+                                // (`EntityLivingBase.java:755-758`), at the
+                                // player with the same spread.
+                                report(
+                                    events,
+                                    ClientEvent::LocalSound {
+                                        name: DEATH_SOUND.to_string(),
+                                        pos: [
+                                            player.position[0] as f32,
+                                            player.position[1] as f32,
+                                            player.position[2] as f32,
+                                        ],
+                                        volume: 1.0,
+                                        pitch: hurt_pitch(sound_rng.random(), sound_rng.random()),
+                                        category_hint: SoundCategory::Players,
+                                    },
+                                );
                                 // The death screen unpresses every key
                                 // (`Minecraft.setIngameNotInFocus:1469-1478`
                                 // through `KeyBinding.unPressAllKeys`), and
@@ -1519,6 +1591,29 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     // maximum, the attack yaw zeroed
                                     // (`EntityLivingBase.handleStatusUpdate:1362-1363`).
                                     player.apply_hurt_status();
+                                    // The own player's hurt sound: the
+                                    // handler is the `instanceof
+                                    // EntityPlayer` branch
+                                    // (`EntityLivingBase.java:747-750`),
+                                    // staged at the player with the hurt
+                                    // pitch spread.
+                                    report(
+                                        events,
+                                        ClientEvent::LocalSound {
+                                            name: HURT_SOUND.to_string(),
+                                            pos: [
+                                                player.position[0] as f32,
+                                                player.position[1] as f32,
+                                                player.position[2] as f32,
+                                            ],
+                                            volume: 1.0,
+                                            pitch: hurt_pitch(
+                                                sound_rng.random(),
+                                                sound_rng.random(),
+                                            ),
+                                            category_hint: SoundCategory::Players,
+                                        },
+                                    );
                                 } else {
                                     debug!(
                                         status = status.status,
@@ -2080,6 +2175,33 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         }
                         CollectItem::ID => {
                             let collect = decoded(id, entity::decode_collect_item(body))?;
+                            // The pickup sound: orbs orb and everything else
+                            // pops, at the drop's own position with the
+                            // pickup spread
+                            // (`NetHandlerPlayClient.handleCollectItem:819-844`).
+                            // The lookup runs ahead of the removal, which is
+                            // what carries the position away.
+                            if let Some(drop) = entities.get(collect.collected) {
+                                let name = if drop.kind == EntityKind::XpOrb {
+                                    ORB_SOUND
+                                } else {
+                                    PICKUP_SOUND
+                                };
+                                report(
+                                    events,
+                                    ClientEvent::LocalSound {
+                                        name: name.to_string(),
+                                        pos: [
+                                            drop.position[0] as f32,
+                                            drop.position[1] as f32,
+                                            drop.position[2] as f32,
+                                        ],
+                                        volume: 0.2,
+                                        pitch: pickup_pitch(sound_rng.random(), sound_rng.random()),
+                                        category_hint: SoundCategory::Players,
+                                    },
+                                );
+                            }
                             // The collected drop leaves the world
                             // (`NetHandlerPlayClient.handleCollectItem:819-844`).
                             entities.remove(&[collect.collected]);
@@ -2482,6 +2604,34 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         }
                         SetExperience::ID => {
                             let experience = decoded(id, SetExperience::decode(body))?;
+                            // The level-up sound: a gain that lands on five
+                            // past the cooldown, staged at the player
+                            // (`EntityPlayer.addExperienceLevel:2037-2054`).
+                            // The level tracks every packet; the gate reads
+                            // the session tick against the last sound.
+                            if level_sounds(
+                                xp_level,
+                                experience.level,
+                                player.tick,
+                                last_xp_sound_tick,
+                            ) {
+                                last_xp_sound_tick = player.tick;
+                                report(
+                                    events,
+                                    ClientEvent::LocalSound {
+                                        name: LEVEL_SOUND.to_string(),
+                                        pos: [
+                                            player.position[0] as f32,
+                                            player.position[1] as f32,
+                                            player.position[2] as f32,
+                                        ],
+                                        volume: level_volume(experience.level),
+                                        pitch: 1.0,
+                                        category_hint: SoundCategory::Players,
+                                    },
+                                );
+                            }
+                            xp_level = experience.level;
                             report(
                                 events,
                                 ClientEvent::Experience {
@@ -2694,6 +2844,18 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 ) {
                     send_reply(&mut conn, &payload)?;
                 }
+                // The step's own sounds: the splash on water entry and the
+                // swim or footstep past the walk threshold, staged from the
+                // move the step just ran.
+                stage_step_sounds(
+                    &player,
+                    world.as_ref(),
+                    &mut distance_walked,
+                    &mut next_step_distance,
+                    &mut was_in_water,
+                    &mut sound_rng,
+                    events,
+                );
                 // The weather eases once per tick and reports while it moves:
                 // one event per tick that changed a strength, none for a
                 // settled tick.
@@ -2749,6 +2911,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         &mut right_presses,
                         dig.hitting(),
                         &mut conn,
+                        events,
                     )?;
                     // The dig runs against that same aim, and its actions run in
                     // the order the machine produced them: the completion's finish
@@ -3047,6 +3210,108 @@ fn apply_input(event: InputEvent, intent: &mut Intent, player: &mut Player) -> b
         | InputEvent::SetViewDistance { .. }
         | InputEvent::DropItem { .. } => false,
     }
+}
+
+/// Stages one tick's step sounds: the splash on water entry, then the swim
+/// or the footstep past the walk threshold.
+///
+/// The splash is the dry-to-wet transition's `resetHeight`
+/// (`Entity.handleWaterMovement:1111-1129`, `:1135-1144`): the volume off the
+/// motion vector times `0.2`, capped at `1.0`, the pitch `1.0` plus the swim
+/// spread. The footstep is the move's own accounting (`Entity.java:852-900`):
+/// the horizontal walk — the vertical only on a climbable block — times `0.6`
+/// joins the walked distance, and past the threshold the water swims (the
+/// motion times `0.35`, capped) while the dry foot plays the stood-on block's
+/// step event at `volume * 0.15` (`playStepSound:986-998`), snow when a snow
+/// layer sits on top and nothing when the stood-on block is air or liquid.
+/// The position is the player's own feet in both cases
+/// (`playSoundAtEntity:1001-1005`).
+#[allow(clippy::too_many_arguments)]
+fn stage_step_sounds(
+    player: &Player,
+    world: Option<&World>,
+    distance_walked: &mut f32,
+    next_step_distance: &mut i32,
+    was_in_water: &mut bool,
+    sound_rng: &mut StdRng,
+    events: &Sender<ClientEvent>,
+) {
+    let Some(world) = world else {
+        *was_in_water = player.in_water;
+        return;
+    };
+    let feet = [
+        player.position[0] as f32,
+        player.position[1] as f32,
+        player.position[2] as f32,
+    ];
+    if !*was_in_water && player.in_water {
+        report(
+            events,
+            ClientEvent::LocalSound {
+                name: SPLASH_SOUND.to_string(),
+                pos: feet,
+                volume: splash_volume(player.motion),
+                pitch: swim_pitch(sound_rng.random(), sound_rng.random()),
+                category_hint: SoundCategory::Players,
+            },
+        );
+    }
+    *was_in_water = player.in_water;
+    // The stood-on block: the feet cell two-tenths down (`Entity.java:820`).
+    let stood = world.block(
+        player.position[0].floor() as i32,
+        (player.position[1] - 0.2).floor() as i32,
+        player.position[2].floor() as i32,
+    ) >> 4;
+    let dx = player.position[0] - player.last_tick_position[0];
+    let mut dy = player.position[1] - player.last_tick_position[1];
+    let dz = player.position[2] - player.last_tick_position[2];
+    if !behaviour(stood).is_some_and(|row| row.climbable) {
+        dy = 0.0;
+    }
+    *distance_walked += ((dx * dx + dy * dy + dz * dz) as f32).sqrt() * 0.6;
+    if *distance_walked <= *next_step_distance as f32 || stood == 0 {
+        return;
+    }
+    *next_step_distance = *distance_walked as i32 + 1;
+    if player.in_water {
+        report(
+            events,
+            ClientEvent::LocalSound {
+                name: SWIM_SOUND.to_string(),
+                pos: feet,
+                volume: swim_volume(player.motion),
+                pitch: swim_pitch(sound_rng.random(), sound_rng.random()),
+                category_hint: SoundCategory::Players,
+            },
+        );
+    }
+    // The snow layer on top lends its own step (`playStepSound:988-993`);
+    // a liquid stood-on block stays silent (`:994-997`).
+    let above = world.block(
+        player.position[0].floor() as i32,
+        (player.position[1] - 0.2).floor() as i32 + 1,
+        player.position[2].floor() as i32,
+    ) >> 4;
+    let group = if above == SNOW_LAYER_ID {
+        SoundGroup::Snow
+    } else {
+        SoundGroup::of_block(stood)
+    };
+    if behaviour(stood).is_some_and(|row| row.material == Material::Liquid) {
+        return;
+    }
+    report(
+        events,
+        ClientEvent::LocalSound {
+            name: group.step_sound().to_string(),
+            pos: feet,
+            volume: group.step_volume(),
+            pitch: group.frequency(),
+            category_hint: SoundCategory::Blocks,
+        },
+    );
 }
 
 /// Applies one mouse button edge to the interaction input.
@@ -3970,6 +4235,20 @@ fn apply_dig_action<S: Read + Write>(
         DigAction::Swing => send_reply(conn, &tick_payload(|out| write_animation(out))),
         DigAction::Destroy { x, y, z } => {
             if let Some(store) = world {
+                // The break sound: the broken block's own break event at its
+                // centre, ahead of the removal that carries the id away
+                // (`RenderGlobal.playAuxSFX 2001:2275-2282`).
+                let group = SoundGroup::of_block(store.block(x, y, z) >> 4);
+                report(
+                    events,
+                    ClientEvent::LocalSound {
+                        name: group.break_sound().to_string(),
+                        pos: [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
+                        volume: group.break_volume(),
+                        pitch: group.break_pitch(),
+                        category_hint: SoundCategory::Blocks,
+                    },
+                );
                 apply_block_change(store, queue, x, y, z, AIR);
             }
             Ok(())
@@ -4091,6 +4370,7 @@ fn step_place<S: Read + Write>(
     presses: &mut u32,
     hitting: bool,
     conn: &mut Conn<S>,
+    events: &Sender<ClientEvent>,
 ) -> Result<(), SessionError> {
     let presses = std::mem::take(presses);
     if hitting {
@@ -4135,6 +4415,23 @@ fn step_place<S: Read + Write>(
             placed.target[1],
             placed.target[2],
             ASSUMED_HELD_BLOCK,
+        );
+        // The place sound: the predicted block's own place event at its
+        // centre (`ItemBlock.onItemUse:71`).
+        let group = SoundGroup::of_block(ASSUMED_HELD_BLOCK >> 4);
+        report(
+            events,
+            ClientEvent::LocalSound {
+                name: group.place_sound().to_string(),
+                pos: [
+                    placed.target[0] as f32 + 0.5,
+                    placed.target[1] as f32 + 0.5,
+                    placed.target[2] as f32 + 0.5,
+                ],
+                volume: group.break_volume(),
+                pitch: group.break_pitch(),
+                category_hint: SoundCategory::Blocks,
+            },
         );
     }
     Ok(())
@@ -4875,6 +5172,7 @@ mod tests {
         let cursor = Cursor::new(Vec::new());
         let mut conn = Conn::new(cursor);
         let mut queue = MeshQueue::new();
+        let (events, _reported) = crossbeam_channel::unbounded();
         step_place(
             None,
             &mut queue,
@@ -4884,6 +5182,7 @@ mod tests {
             &mut presses,
             false,
             &mut conn,
+            &events,
         )
         .expect("a cursor send cannot fail");
         assert_eq!(presses, 0, "the press is consumed");
@@ -4926,6 +5225,7 @@ mod tests {
         let cursor = Cursor::new(Vec::new());
         let mut conn = Conn::new(cursor);
         let mut queue = MeshQueue::new();
+        let (events, _reported) = crossbeam_channel::unbounded();
         step_place(
             None,
             &mut queue,
@@ -4935,6 +5235,7 @@ mod tests {
             &mut presses,
             false,
             &mut conn,
+            &events,
         )
         .expect("a cursor send cannot fail");
         assert_eq!(presses, 0, "the press is consumed");
@@ -4962,6 +5263,7 @@ mod tests {
         let cursor = Cursor::new(Vec::new());
         let mut conn = Conn::new(cursor);
         let mut queue = MeshQueue::new();
+        let (events, _reported) = crossbeam_channel::unbounded();
         step_place(
             None,
             &mut queue,
@@ -4971,6 +5273,7 @@ mod tests {
             &mut presses,
             false,
             &mut conn,
+            &events,
         )
         .expect("a cursor send cannot fail");
         assert_eq!(presses, 0, "the press is consumed");
@@ -5003,6 +5306,7 @@ mod tests {
         let cursor = Cursor::new(Vec::new());
         let mut conn = Conn::new(cursor);
         let mut queue = MeshQueue::new();
+        let (events, _reported) = crossbeam_channel::unbounded();
         step_place(
             None,
             &mut queue,
@@ -5012,6 +5316,7 @@ mod tests {
             &mut presses,
             false,
             &mut conn,
+            &events,
         )
         .expect("a cursor send cannot fail");
         assert_eq!(presses, 0, "the press is consumed");

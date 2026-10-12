@@ -19,6 +19,8 @@
 
 pub mod decode;
 pub mod mixer;
+pub mod music;
+pub mod sounds;
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -165,6 +167,8 @@ pub struct PlaySound {
 enum AudioCommand {
     /// Plays one sound.
     Play(PlaySound),
+    /// Stops every voice and drops the queued plays.
+    StopAll,
 }
 
 /// The most commands the play channel holds; a send past the cap drops
@@ -506,6 +510,18 @@ impl AudioEngine {
         while self.receiver.try_recv().is_ok() {}
     }
 
+    /// Queues a stop: the next [`AudioEngine::tick`] (or
+    /// [`AudioEngine::render_into`]) clears every voice and drops the queued
+    /// plays, the channel-send form of [`AudioEngine::stop_all`] for owners
+    /// of a shared engine — the music ticker stops a finished kind through
+    /// it without a mutable borrow.
+    pub fn stop_async(&self) {
+        if self.sender.try_send(AudioCommand::StopAll).is_err() {
+            let _ = self.receiver.try_recv();
+            let _ = self.sender.try_send(AudioCommand::StopAll);
+        }
+    }
+
     /// Starts the `--audio-dump` capture: every rendered chunk appends to
     /// a 16-bit stereo WAV at `path` until [`AudioEngine::debug_dump_stop`].
     pub fn debug_dump_start(&mut self, path: &Path) {
@@ -563,8 +579,15 @@ impl AudioEngine {
 
     /// Drains the play channel into the mixer.
     fn drain(&mut self) {
-        while let Ok(AudioCommand::Play(play)) = self.receiver.try_recv() {
-            self.spawn(&play);
+        while let Ok(command) = self.receiver.try_recv() {
+            match command {
+                AudioCommand::Play(play) => self.spawn(&play),
+                AudioCommand::StopAll => {
+                    self.mixer.clear();
+                    while self.receiver.try_recv().is_ok() {}
+                    return;
+                }
+            }
         }
     }
 

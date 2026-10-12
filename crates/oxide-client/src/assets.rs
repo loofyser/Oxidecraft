@@ -33,7 +33,7 @@ use oxide_render::sky::SkyTextures;
 use oxide_world::biome::{ColorMap, ColorMapError, TintMaps};
 
 /// The version whose extraction tree the client loads.
-const VERSION: &str = "1.8.9";
+pub(crate) const VERSION: &str = "1.8.9";
 
 /// The environment variable that names the store root, when no argument is given: the
 /// launcher's own override.

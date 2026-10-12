@@ -8327,6 +8327,144 @@ fn global_entities_of_any_kind_register_and_their_removal_lands() {
     );
 }
 
+/// The local sounds a feed session stages: the collected sounds of every
+/// `LocalSound` it reported, in order.
+fn local_sounds(events: &[ClientEvent]) -> Vec<(String, [f32; 3], f32, f32)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::LocalSound {
+                name,
+                pos,
+                volume,
+                pitch,
+                ..
+            } => Some((name.clone(), *pos, *volume, *pitch)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_own_hurt_status_stages_the_hurt_sound() {
+    // Join Game names entity 20 as the own player; the hurt status on it is
+    // the damage signal, staged exactly once with the hurt pitch spread.
+    let (events, _) = run_feed_session(
+        feed_head(&[entity_status_frame(20, 2)]),
+        framed(&[keep_alive_frame(91)]),
+        2,
+        0,
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one hurt sound: {events:?}");
+    let (name, pos, volume, pitch) = &sounds[0];
+    assert_eq!(name, "game.player.hurt");
+    assert_eq!(*pos, [0.0, 0.0, 0.0], "the hurt plays at the player");
+    assert_eq!(*volume, 1.0);
+    assert!(
+        (0.8..=1.2).contains(pitch),
+        "the hurt pitch carries the spread: {pitch}"
+    );
+    // A foreign entity's hurt stages nothing local: only the own player
+    // speaks here.
+    let (foreign, _) = run_feed_session(
+        feed_head(&[entity_status_frame(31, 2)]),
+        framed(&[keep_alive_frame(92)]),
+        2,
+        0,
+    );
+    assert!(
+        local_sounds(&foreign).is_empty(),
+        "a foreign hurt stays silent: {foreign:?}"
+    );
+}
+
+#[test]
+fn death_at_zero_health_stages_the_death_sound() {
+    let (events, _) = run_feed_session(
+        feed_head(&[update_health_frame(0.0, 20, 5.0)]),
+        framed(&[keep_alive_frame(93)]),
+        2,
+        0,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Died)),
+        "zero health still reports the death: {events:?}"
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one death sound: {events:?}");
+    let (name, _, volume, pitch) = &sounds[0];
+    assert_eq!(name, "game.player.die");
+    assert_eq!(*volume, 1.0);
+    assert!(
+        (0.8..=1.2).contains(pitch),
+        "the death pitch carries the spread: {pitch}"
+    );
+}
+
+#[test]
+fn collecting_stages_the_pickup_sound_at_the_drop() {
+    // The item drop pops, the orb orbs, each at its own position with the
+    // pickup pitch spread.
+    let (events, _) = run_feed_session(
+        feed_head(&[
+            spawn_object_frame(33, 2, 6.0, 64.0, 6.0, 1),
+            spawn_xp_orb_frame(34, 7.0, 65.0, 7.0, 3),
+        ]),
+        framed(&[
+            collect_item_frame(33, 20),
+            collect_item_frame(34, 20),
+            keep_alive_frame(94),
+        ]),
+        2,
+        0,
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 2, "one sound per collect: {events:?}");
+    assert_eq!(sounds[0].0, "random.pop");
+    assert_eq!(sounds[0].1, [6.0, 64.0, 6.0]);
+    assert_eq!(sounds[1].0, "random.orb");
+    assert_eq!(sounds[1].1, [7.0, 65.0, 7.0]);
+    for (_, _, volume, pitch) in &sounds {
+        assert_eq!(*volume, 0.2);
+        assert!(
+            (0.6..=3.4).contains(pitch),
+            "the pickup pitch carries the spread: {pitch}"
+        );
+    }
+}
+
+#[test]
+fn a_level_gain_past_the_cooldown_stages_the_level_sound() {
+    // The session idles past the 100-tick level-up cooldown
+    // (`addExperienceLevel:2047`) before the 0x1F lands, so the five-level
+    // gain sounds at once. Each stall waits one mesh tick (20 ms) and a
+    // game tick comes due every 50 ms, so 300 stalls run well over a
+    // hundred ticks.
+    let (events, _) = run_quiet_session(
+        300,
+        framed(&[set_experience_frame(0.5, 5, 100), keep_alive_frame(95)]),
+        vec![],
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Experience { level: 5, .. })),
+        "the experience still reports: {events:?}"
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one level-up sound: {events:?}");
+    let (name, _, volume, pitch) = &sounds[0];
+    assert_eq!(name, "random.levelup");
+    assert!(
+        (volume - 0.125).abs() < 1e-6,
+        "level 5 stages a twelfth of full: {volume}"
+    );
+    assert_eq!(*pitch, 1.0);
+}
+
 #[test]
 fn set_view_distance_resends_client_settings_on_change_only() {
     // A change to 12 re-sends the whole C15 beside the standing fields, and

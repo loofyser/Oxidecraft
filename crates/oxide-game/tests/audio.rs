@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 use oxide_assets::sound::SoundIndex;
 use oxide_game::audio::decode::DecodedSound;
+use oxide_game::audio::sounds::{
+    SoundGroup, hurt_pitch, level_volume, pickup_pitch, splash_volume, swim_pitch, swim_volume,
+};
 use oxide_game::audio::{AudioEngine, ListenerPose, PlaySound, SilentDevice, SoundCategory};
 
 /// A one-second 440 Hz full-scale mono sine at 44100 Hz.
@@ -280,6 +283,193 @@ fn the_category_order_and_names_pin() {
     assert_eq!(SoundCategory::from_name("neutral"), SoundCategory::Animals);
     assert_eq!(SoundCategory::from_name("record"), SoundCategory::Records);
     assert_eq!(SoundCategory::from_name("bogus"), SoundCategory::Master);
+}
+
+/// The block group map's sample rows: each block's own `stepSound`
+/// assignment reduced to its group and events.
+#[test]
+fn the_block_group_map_samples() {
+    // (block id, group, break event, step event, place event)
+    let rows = [
+        (
+            1u16,
+            SoundGroup::Piston,
+            "dig.stone",
+            "step.stone",
+            "dig.stone",
+        ),
+        (2, SoundGroup::Grass, "dig.grass", "step.grass", "dig.grass"),
+        (
+            3,
+            SoundGroup::Gravel,
+            "dig.gravel",
+            "step.gravel",
+            "dig.gravel",
+        ),
+        (5, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
+        (12, SoundGroup::Sand, "dig.sand", "step.sand", "dig.sand"),
+        (
+            20,
+            SoundGroup::Glass,
+            "dig.glass",
+            "step.stone",
+            "step.stone",
+        ),
+        (
+            35,
+            SoundGroup::Cloth,
+            "dig.cloth",
+            "step.cloth",
+            "dig.cloth",
+        ),
+        (
+            65,
+            SoundGroup::Ladder,
+            "dig.wood",
+            "step.ladder",
+            "dig.ladder",
+        ),
+        (78, SoundGroup::Snow, "dig.snow", "step.snow", "dig.snow"),
+        (
+            145,
+            SoundGroup::Anvil,
+            "dig.stone",
+            "step.anvil",
+            "random.anvil_land",
+        ),
+        // The leftovers the table never names fall back to stone.
+        (8, SoundGroup::Stone, "dig.stone", "step.stone", "dig.stone"),
+        (
+            86,
+            SoundGroup::Stone,
+            "dig.stone",
+            "step.stone",
+            "dig.stone",
+        ),
+        (17, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
+        (
+            18,
+            SoundGroup::Grass,
+            "dig.grass",
+            "step.grass",
+            "dig.grass",
+        ),
+        (53, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
+        (
+            67,
+            SoundGroup::Piston,
+            "dig.stone",
+            "step.stone",
+            "dig.stone",
+        ),
+        (
+            141,
+            SoundGroup::Grass,
+            "dig.grass",
+            "step.grass",
+            "dig.grass",
+        ),
+        (162, SoundGroup::Wood, "dig.wood", "step.wood", "dig.wood"),
+    ];
+    for (id, group, break_sound, step_sound, place_sound) in rows {
+        assert_eq!(SoundGroup::of_block(id), group, "the group of block {id}");
+        assert_eq!(group.break_sound(), break_sound, "the break of block {id}");
+        assert_eq!(group.step_sound(), step_sound, "the step of block {id}");
+        assert_eq!(group.place_sound(), place_sound, "the place of block {id}");
+    }
+    // The metal group stages the stone events a half-step up.
+    assert_eq!(SoundGroup::Metal.break_sound(), "dig.stone");
+    assert_eq!(SoundGroup::Metal.step_sound(), "step.stone");
+    assert!((SoundGroup::Metal.frequency() - 1.5).abs() < f32::EPSILON);
+    // The anvil group is quiet: 0.3 volume into the break staging.
+    assert!((SoundGroup::Anvil.volume() - 0.3).abs() < f32::EPSILON);
+    assert!((SoundGroup::Anvil.break_volume() - 0.65).abs() < 1e-6);
+    // The break staging all other groups share: (volume + 1) / 2 at
+    // frequency * 0.8, the step staging volume * 0.15 at frequency.
+    let grass = SoundGroup::Grass;
+    assert!((grass.break_volume() - 1.0).abs() < f32::EPSILON);
+    assert!((grass.break_pitch() - 0.8).abs() < 1e-6);
+    assert!((grass.step_volume() - 0.15).abs() < 1e-6);
+    assert!((grass.frequency() - 1.0).abs() < f32::EPSILON);
+}
+
+/// The hurt randomisation range: `(first - second) * 0.2 + 1.0` over unit
+/// draws stays inside `[0.8, 1.2]` and reaches both ends.
+#[test]
+fn the_hurt_pitch_range() {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(9);
+    let mut lowest = f32::MAX;
+    let mut highest = f32::MIN;
+    for _ in 0..1000 {
+        let pitch = hurt_pitch(rng.random(), rng.random());
+        assert!(
+            (0.8..=1.2).contains(&pitch),
+            "the hurt pitch stays in range: {pitch}"
+        );
+        lowest = lowest.min(pitch);
+        highest = highest.max(pitch);
+    }
+    assert!(lowest < 0.9, "the range reaches its floor: {lowest}");
+    assert!(highest > 1.1, "the range reaches its ceiling: {highest}");
+    assert!((hurt_pitch(1.0, 0.0) - 1.2).abs() < 1e-6);
+    assert!((hurt_pitch(0.0, 1.0) - 0.8).abs() < 1e-6);
+}
+
+/// The pickup randomisation range: `((first - second) * 0.7 + 1.0) * 2.0`
+/// over unit draws stays inside `[0.6, 3.4]`.
+#[test]
+fn the_pickup_pitch_range() {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(13);
+    let mut lowest = f32::MAX;
+    let mut highest = f32::MIN;
+    for _ in 0..1000 {
+        let pitch = pickup_pitch(rng.random(), rng.random());
+        assert!(
+            (0.6..=3.4).contains(&pitch),
+            "the pickup pitch stays in range: {pitch}"
+        );
+        lowest = lowest.min(pitch);
+        highest = highest.max(pitch);
+    }
+    assert!(lowest < 0.8, "the range reaches its floor: {lowest}");
+    assert!(highest > 3.2, "the range reaches its ceiling: {highest}");
+    assert!((pickup_pitch(1.0, 0.0) - 3.4).abs() < 1e-6);
+}
+
+/// The step's own pitch rule: no randomisation — the group's frequency plays
+/// as-is — while the swim pitch spreads `1.0 +- 0.4`.
+#[test]
+fn the_step_pitch_rule() {
+    for group in [
+        SoundGroup::Stone,
+        SoundGroup::Wood,
+        SoundGroup::Metal,
+        SoundGroup::Glass,
+        SoundGroup::Sand,
+        SoundGroup::Snow,
+        SoundGroup::Ladder,
+        SoundGroup::Anvil,
+    ] {
+        assert_eq!(
+            group.break_pitch(),
+            group.frequency() * 0.8,
+            "the break pitch stages the frequency: {group:?}"
+        );
+    }
+    assert!((swim_pitch(1.0, 0.0) - 1.4).abs() < 1e-6);
+    assert!((swim_pitch(0.0, 1.0) - 0.6).abs() < 1e-6);
+    // The splash volume caps the motion term at 1.0; still water is silent.
+    assert!((splash_volume([0.0, 0.0, 0.0]) - 0.0).abs() < f32::EPSILON);
+    assert!(splash_volume([10.0, 10.0, 10.0]) <= 1.0);
+    assert!(swim_volume([10.0, 10.0, 10.0]) <= 1.0);
+    // The level-up volume climbs to 0.75 at level 30 and holds.
+    assert!((level_volume(30) - 0.75).abs() < 1e-6);
+    assert!((level_volume(60) - 0.75).abs() < 1e-6);
+    assert!((level_volume(15) - 0.375).abs() < 1e-6);
 }
 
 /// The store-gated leg: decodes one real store ogg through the

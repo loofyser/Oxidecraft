@@ -50,15 +50,21 @@ use anyhow::Context;
 use assets::ClientAssets;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use oxide_assets::extract::Extractor;
 use oxide_assets::font::Font;
 use oxide_assets::skins::SkinCache;
 use oxide_assets::skins::{DefaultModel, default_skin};
+use oxide_assets::sound::SoundIndex;
 use oxide_assets::store::Store;
 use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
 use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
+use oxide_game::audio::music::{MusicKind, MusicTicker};
+use oxide_game::audio::{
+    AudioDevice, AudioEngine, CpalDevice, ListenerPose, PlaySound, SoundCategory,
+};
 use oxide_game::chat::{ClickAction, ClickEvent};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
@@ -67,6 +73,7 @@ use oxide_game::interaction::Aim;
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
+use oxide_proto_v47::effects_wire::{read_effect_position, read_sound_pitch};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{
     Camera, CameraPose, CameraSensor, DEFAULT_FOV, FovInputs, FovSmoother, NEAR_PLANE,
@@ -142,6 +149,11 @@ struct Cli {
     /// `--server`: the script is injected into the session's input channel.
     #[arg(long)]
     input_script: Option<PathBuf>,
+    /// Capture the mixed output to a 16-bit stereo WAV at `<file>`: the engine starts the
+    /// capture once it opens and finalises it on the exit path. Needs `--server`: without
+    /// a session there is no engine to capture.
+    #[arg(long)]
+    audio_dump: Option<PathBuf>,
 }
 
 /// The frame count to stop after: the flag when given, the environment variable
@@ -941,6 +953,15 @@ struct ClientApp {
     stopped_on_error: bool,
     /// The session thread and the events it reports, when `--server` was given.
     session: Option<SessionLink>,
+    /// The sound pump — the engine and the music schedule — when `--server`
+    /// was given and the store's sounds read; `None` runs silent.
+    audio: Option<ClientAudio>,
+    /// The music the ticker last reported playing: the frame logs its
+    /// transitions, so a run's log names what started.
+    music: Option<MusicKind>,
+    /// Whether the session has joined a world yet: the music before it is the
+    /// menu event.
+    joined: bool,
     /// The client's assets, when `--server` was given: the mesh inputs the session shares,
     /// the font and the sky textures the renderer uploads.
     assets: Option<ClientAssets>,
@@ -1437,6 +1458,12 @@ impl ClientApp {
         // takes the command line's username for its own handshake, so the window
         // keeps its copy first.
         let own_name = cli.username.clone();
+        // `--audio-dump` captures the session's engine: without a session it
+        // is refused like `--input-script`, before the window opens.
+        let audio_dump = cli.audio_dump;
+        if audio_dump.is_some() && cli.server.is_none() {
+            anyhow::bail!("--audio-dump needs --server: there is no session to capture");
+        }
         let session = match cli.server {
             Some(address) => {
                 let (host, port) = parse_server_address(&address)?;
@@ -1449,7 +1476,8 @@ impl ClientApp {
                 chat_lang = Some(loaded.lang.clone());
                 // The skin worker opens the store the assets loaded from —
                 // the same root rule — and owns the cache on its own thread.
-                let store = Store::open(assets::default_store_root()?)?;
+                let store_root = assets::default_store_root()?;
+                let store = Store::open(store_root.clone())?;
                 let cache = Arc::new(SkinCache::new(&store));
                 let (requests, updates) = skin_worker::spawn(move |url| cache.fetch(url));
                 skin_requests_tx = Some(requests);
@@ -1467,6 +1495,16 @@ impl ClientApp {
             }
             None => None,
         };
+        // The sound pump opens beside the session: one line when the store's
+        // sounds do not read, then the client keeps running without it.
+        let mut audio = None;
+        if session.is_some() {
+            let store_root = assets::default_store_root()?;
+            match open_audio(&store_root, audio_dump) {
+                Ok(pump) => audio = Some(pump),
+                Err(error) => tracing::warn!(error = %error, "the client runs without sound"),
+            }
+        }
         // The script replay needs the session's own input channel: a script
         // with nowhere to inject is refused before the window opens, the same
         // way a bad `--server` is.
@@ -1493,6 +1531,9 @@ impl ClientApp {
             max_frames,
             stopped_on_error: false,
             session,
+            audio,
+            music: None,
+            joined: false,
             assets,
             render_distance: cli.render_distance,
             hud: HudState {
@@ -1610,6 +1651,7 @@ impl ClientApp {
             match &event {
                 ClientEvent::Joined { gamemode, .. } | ClientEvent::Respawned { gamemode, .. } => {
                     self.creative = oxide_game::interaction::creative(*gamemode);
+                    self.joined = true;
                     if self.creative {
                         self.screens.swap_to_creative();
                     }
@@ -1743,6 +1785,30 @@ impl ClientApp {
                     dead: self.dead,
                 });
                 self.camera.last_tick_arrival = Some(Instant::now());
+                // The sound pump's tick: the music schedule first (its pick
+                // queues through the channel), then the engine drain — the
+                // engine's own cadence, once per session tick, never per
+                // frame.
+                let kind = music_kind(self.joined, self.hud.dimension, self.creative);
+                if let Some(audio) = self.audio.as_mut() {
+                    audio.ticker.tick(kind, MUSIC_VOLUME, &audio.engine);
+                    audio.engine.tick(ListenerPose {
+                        pos: [*x as f32, *y as f32, *z as f32],
+                        yaw: (*yaw).to_radians(),
+                    });
+                    // The music's transitions land in the run log, so it names
+                    // what started.
+                    let playing = audio.ticker.current();
+                    if playing != self.music {
+                        self.music = playing;
+                        match playing {
+                            Some(kind) => {
+                                tracing::info!(event = kind.event(), "the music started");
+                            }
+                            None => tracing::info!("the music stopped"),
+                        }
+                    }
+                }
             }
             if let ClientEvent::EntitiesTick { entities } = &event {
                 if let Some(script) = self.script.as_mut() {
@@ -1765,6 +1831,7 @@ impl ClientApp {
                 &mut self.world_overlay,
                 &mut self.dead,
                 event,
+                self.audio.as_mut(),
             );
         }
         if session_ended {
@@ -3302,6 +3369,103 @@ struct SessionLink {
     input_tx: Sender<InputEvent>,
 }
 
+/// The music schedule's seed: one fixed seed replays one schedule every run.
+const MUSIC_SEED: u64 = 1;
+
+/// The music gain the ticker plays at: the default music level. The client
+/// keeps no options file, so the category volumes stay at the engine's own
+/// 1.0 defaults; client settings ownership is a later task.
+const MUSIC_VOLUME: f32 = 1.0;
+
+/// The client's sound pump: the engine the session's sound events play
+/// through and the music schedule, owned only with a session.
+struct ClientAudio {
+    /// The mixer the pump plays through and ticks once per session tick.
+    engine: AudioEngine,
+    /// The background-music schedule, driven on the same tick.
+    ticker: MusicTicker,
+}
+
+impl Drop for ClientAudio {
+    /// Finalises the `--audio-dump` capture on the exit path; a run without
+    /// the flag holds no dump and this no-ops.
+    fn drop(&mut self) {
+        self.engine.debug_dump_stop();
+    }
+}
+
+/// Reads the `sounds.json` bytes the engine resolves events through: the
+/// extraction tree's `assets/minecraft/sounds.json` when the fetch extracted
+/// it, else the `minecraft/sounds.json` object the `1.8` asset index names
+/// (the index-plus-objects recipe the sound decode pins for store reads).
+fn load_sounds_bytes(store_root: &Path) -> Option<Vec<u8>> {
+    let store = Store::open(store_root.to_path_buf()).ok()?;
+    let tree = Extractor::new(&store, assets::VERSION).root();
+    if let Ok(bytes) = std::fs::read(tree.join("assets/minecraft/sounds.json")) {
+        return Some(bytes);
+    }
+    let index_text = std::fs::read_to_string(store.index_path("1.8").ok()?).ok()?;
+    let index: serde_json::Value = serde_json::from_str(&index_text).ok()?;
+    let hash = index
+        .get("objects")?
+        .get("minecraft/sounds.json")?
+        .get("hash")?
+        .as_str()?;
+    std::fs::read(store.object_path(hash).ok()?).ok()
+}
+
+/// Opens the client's sound pump over the store's sounds: the parsed index,
+/// the store as the decode base, and the real output device when one opens
+/// (a missing device degrades to silence inside the engine, which logs its
+/// own line). The `--audio-dump` capture starts here when the flag names a
+/// file.
+fn open_audio(store_root: &Path, dump: Option<PathBuf>) -> anyhow::Result<ClientAudio> {
+    let bytes = load_sounds_bytes(store_root)
+        .ok_or_else(|| anyhow::anyhow!("no sounds.json under the store root"))?;
+    let index = SoundIndex::parse(&bytes)?;
+    let device = CpalDevice::open().map(|device| Box::new(device) as Box<dyn AudioDevice>);
+    let mut engine = AudioEngine::new(Arc::new(index), Some(store_root.to_path_buf()), device);
+    if let Some(path) = dump.as_ref() {
+        engine.debug_dump_start(path);
+    }
+    Ok(ClientAudio {
+        engine,
+        ticker: MusicTicker::new(MUSIC_SEED),
+    })
+}
+
+/// The music the ticker plays: no world yet is the menu event, the end
+/// dimension is the end event, creative mode is the creative event, and
+/// everything else (the nether included) is the game event.
+///
+/// A free function so the frame's drain can call it while the renderer stays
+/// borrowed: a method would borrow the whole app against it.
+fn music_kind(joined: bool, dimension: i8, creative: bool) -> MusicKind {
+    if !joined {
+        MusicKind::Menu
+    } else if dimension == 1 {
+        MusicKind::End
+    } else if creative {
+        MusicKind::Creative
+    } else {
+        MusicKind::Game
+    }
+}
+
+/// The listener a play lends: the latest reported pose — feet in blocks, the
+/// facing in radians. The mix centres positional sounds today; the yaw rides
+/// along for its pan stage.
+fn listener_of(player: &PlayerState) -> ListenerPose {
+    ListenerPose {
+        pos: [
+            player.current.position[0] as f32,
+            player.current.position[1] as f32,
+            player.current.position[2] as f32,
+        ],
+        yaw: player.current.yaw.to_radians(),
+    }
+}
+
 /// Opens a session on its own thread and returns the link the window drains.
 ///
 /// The thread owns the connection, because the session blocks on reads and the
@@ -3574,6 +3738,7 @@ fn apply_session_event(
     world_overlay: &mut WorldOverlayState,
     dead: &mut bool,
     event: ClientEvent,
+    mut audio: Option<&mut ClientAudio>,
 ) -> bool {
     match event {
         ClientEvent::LoggedIn { uuid, username } => {
@@ -3752,12 +3917,62 @@ fn apply_session_event(
         | ClientEvent::BookOpen { .. }
         | ClientEvent::MerchantOffers { .. } => false,
         ClientEvent::WeatherChanged { .. }
-        | ClientEvent::SoundEffect { .. }
         | ClientEvent::Particle { .. }
         | ClientEvent::GlobalEntity { .. } => {
-            // The effect legs' events; their sky, audio, particle and
+            // The effect legs' remaining events; their sky, particle and
             // lightning consumers arrive with their own milestones, and the
             // feed is accepted here so the session's event stream stays total.
+            false
+        }
+        ClientEvent::SoundEffect {
+            name,
+            pos,
+            volume,
+            pitch,
+        } => {
+            // The pump's wire input: the 1/8-block ints become blocks and the
+            // pitch byte becomes a factor at the pump — the volume already
+            // rides normalised. The wire names no category, so the event's
+            // own resolves it and the hint stays master.
+            if let Some(audio) = audio.as_mut() {
+                let listener = listener_of(player);
+                audio.engine.play(PlaySound {
+                    name,
+                    category_hint: SoundCategory::Master,
+                    pos: Some([
+                        read_effect_position(pos[0]) as f32,
+                        read_effect_position(pos[1]) as f32,
+                        read_effect_position(pos[2]) as f32,
+                    ]),
+                    volume,
+                    pitch: read_sound_pitch(pitch),
+                    listener: listener.pos,
+                    yaw: listener.yaw,
+                });
+            }
+            false
+        }
+        ClientEvent::LocalSound {
+            name,
+            pos,
+            volume,
+            pitch,
+            category_hint,
+        } => {
+            // The pump's local input: the call sites stage blocks and factors
+            // already, so the pump only lends the listener.
+            if let Some(audio) = audio.as_mut() {
+                let listener = listener_of(player);
+                audio.engine.play(PlaySound {
+                    name,
+                    category_hint,
+                    pos: Some(pos),
+                    volume,
+                    pitch,
+                    listener: listener.pos,
+                    yaw: listener.yaw,
+                });
+            }
             false
         }
         ClientEvent::Disconnected { reason } => {
