@@ -322,8 +322,8 @@ pub const WEATHER_EASE_RATE: f32 = 0.01;
 /// The session's weather: the eased strengths the window reads and the
 /// targets the wire sets.
 ///
-/// Clientbound 0x2B's weather reasons write the targets — 1 ends the rain
-/// (0.0), 2 begins it (1.0), 7 fades the rain to its value, 8 fades the
+/// Clientbound 0x2B's weather reasons write the targets — 1 begins the rain
+/// (1.0), 2 ends it (0.0), 7 fades the rain to its value, 8 fades the
 /// thunder to its value
 /// (`NetHandlerPlayClient.handleChangeGameState:1371-1421`) — and [`Self::tick`]
 /// eases the strengths toward them once per tick. The window reads the eased
@@ -1316,7 +1316,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         // The slider commits here: the
                                         // source's drag only sets the field
                                         // and dirties the renderers
-                                        // (`setOptionValue` RENDER_DISTANCE,
+                                        // (`setOptionFloatValue` RENDER_DISTANCE,
                                         // `GameSettings.java:328-332`, no
                                         // packet), and the Done button's
                                         // `saveOptions` sends the whole
@@ -1689,15 +1689,15 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     "the server changed the game mode"
                                 );
                             } else if change.reason == 1 {
-                                // The rain eases out: its target falls to
-                                // clear (the task's weather interface; the
+                                // The rain eases in: its target rises to
+                                // full (the task's weather interface; the
                                 // 1/2 begin/end mapping note rides the task
                                 // report).
-                                weather.target_rain = 0.0;
-                            } else if change.reason == 2 {
-                                // The rain eases in: its target rises to full
-                                // (same note as reason 1).
                                 weather.target_rain = 1.0;
+                            } else if change.reason == 2 {
+                                // The rain eases out: its target falls to
+                                // clear (same note as reason 1).
+                                weather.target_rain = 0.0;
                             } else if change.reason == 7 {
                                 // The rain fade: the strength heads for the
                                 // value (`:1414-1417`).

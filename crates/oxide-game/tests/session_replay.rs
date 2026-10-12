@@ -8059,11 +8059,11 @@ fn weather_reports(events: &[ClientEvent]) -> Vec<(f32, f32)> {
 
 #[test]
 fn begin_rain_eases_one_weather_event_per_tick() {
-    // 0x2B reason 2 names full rain; the session eases 0 toward 1 at the
+    // 0x2B reason 1 begins the rain; the session eases 0 toward 1 at the
     // pinned 0.01-a-tick rate and reports exactly one event per tick that
     // moved, with the thunder side silent throughout.
     let (events, _) = run_feed_session(
-        feed_head(&[change_game_state_frame(2, 1.0)]),
+        feed_head(&[change_game_state_frame(1, 1.0)]),
         framed(&[keep_alive_frame(81)]),
         16,
         0,
@@ -8096,6 +8096,86 @@ fn begin_rain_eases_one_weather_event_per_tick() {
     assert!(
         weather.iter().all(|(_, thunder)| *thunder == 0.0),
         "no thunder was named, none eases: {weather:?}"
+    );
+}
+
+#[test]
+fn end_rain_drains_one_weather_event_per_tick() {
+    // 0x2B reason 2 ends the rain: the reason-1 fill settles at full, then
+    // the drain eases 1 toward 0 at the pinned 0.01-a-tick rate and reports
+    // exactly one event per tick that moved, with the thunder side silent
+    // throughout and quiet ticks after the arrival.
+    let (events, _) = run_feed_session(
+        feed_head(&[change_game_state_frame(1, 1.0)]),
+        framed(&[change_game_state_frame(2, 0.0), keep_alive_frame(85)]),
+        300,
+        300,
+    );
+    let ticks = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    let weather = weather_reports(&events);
+    assert_eq!(
+        weather.len(),
+        200,
+        "a hundred easing ticks up and a hundred down, settled ticks silent: {events:?}"
+    );
+    assert!(
+        ticks > weather.len(),
+        "the settled stretch and the quiet tail owe ticks that moved nothing: {events:?}"
+    );
+    assert!(
+        (weather[0].0 - 0.01).abs() < 1e-6,
+        "the first tick eases one rate step: {weather:?}"
+    );
+    for pair in weather[..100].windows(2) {
+        assert!(
+            (pair[1].0 - pair[0].0 - 0.01).abs() < 1e-6,
+            "each fill tick steps the pinned rate: {weather:?}"
+        );
+        assert!(
+            pair[1].0 > pair[0].0,
+            "the fill climbs monotonically: {weather:?}"
+        );
+    }
+    assert_eq!(
+        weather[99].0, 1.0,
+        "the fill arrives exactly on its hundredth tick: {weather:?}"
+    );
+    assert!(
+        (weather[99].0 - weather[100].0 - 0.01).abs() < 1e-6,
+        "the first drain tick steps down at the rate: {weather:?}"
+    );
+    for pair in weather[100..].windows(2) {
+        assert!(
+            (pair[0].0 - pair[1].0 - 0.01).abs() < 1e-6,
+            "each drain tick steps the pinned rate: {weather:?}"
+        );
+        assert!(
+            pair[1].0 < pair[0].0,
+            "the drain falls monotonically: {weather:?}"
+        );
+    }
+    assert_eq!(
+        weather[199].0, 0.0,
+        "the drain arrives exactly on its hundredth tick: {weather:?}"
+    );
+    assert!(
+        weather.iter().all(|(_, thunder)| *thunder == 0.0),
+        "no thunder was named, none eases: {weather:?}"
+    );
+    let last_weather = events
+        .iter()
+        .rposition(|event| matches!(event, ClientEvent::WeatherChanged { .. }))
+        .expect("the drain reported");
+    let trailing_ticks = events[last_weather..]
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::PlayerTick { .. }))
+        .count();
+    assert!(
+        trailing_ticks >= 2,
+        "the tail holds quiet ticks after the arrival: {events:?}"
     );
 }
 
