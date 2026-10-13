@@ -9,6 +9,7 @@ pub mod font;
 pub mod http;
 pub mod mcmeta;
 pub mod model;
+pub mod png_write;
 pub mod resources;
 pub mod skins;
 pub mod sound;

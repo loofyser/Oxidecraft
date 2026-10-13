@@ -58,10 +58,12 @@ use std::task::{Context, Poll, Wake, Waker};
 use oxide_assets::atlas::{Atlas, AtlasLevel, AtlasSprite, SpriteRect};
 use oxide_assets::font::Font;
 use oxide_assets::model::Transform;
+use oxide_assets::png_write::write_png;
 use oxide_assets::texture::Texture;
 use oxide_render::camera::{
     Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
 };
+use oxide_render::capture::capture_texture;
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
 use oxide_render::entity_pass::{
     BOSS_STATUS_TIME, BossStatus, DrawExtra, EntityDraw, EntityPass, EquipmentDraw, ModelRef,
@@ -273,6 +275,84 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
         })
         .count();
     assert!(painted > 0, "the overlay left no pixels in the top-left");
+}
+
+/// The screenshot capture reads the finished frame back top-row-first: the
+/// capture of a rendered frame matches the direct readback byte for byte,
+/// and the bytes round-trip through the PNG writer and the crate's own
+/// decoder unchanged.
+///
+/// The fixture is the terrain-plus-overlay-text scene: the text sits at the
+/// top-left, so a capture that flipped its rows would ink the bottom-left
+/// instead and the top-left pins fail. The source reads the already-rendered
+/// frame back, never re-rendering (`ScreenShotHelper.java:60-83`).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_capture_round_trips_the_finished_frame_top_row_first() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, camera(), 1.0);
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let mut overlay = OverlayPass::new(&device, format);
+    overlay.set_size(&queue, SIZE as f32, SIZE as f32);
+    overlay
+        .set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    overlay.upload_text(&device, &queue, &["||||".to_string()], &[], SIZE as f32);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide pipeline headless encoder"),
+    });
+    with_terrain_pass(&mut encoder, &target.view, &depth, |pass| {
+        terrain.draw(pass)
+    });
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        overlay.draw(pass)
+    });
+    queue.submit(Some(encoder.finish()));
+
+    // The direct readback is the presented frame's own row order: the capture
+    // matches it byte for byte, top row first.
+    let reference = read_pixels(&device, &queue, &target);
+    let captured = capture_texture(&device, &queue, &target.texture, SIZE, SIZE, format)
+        .expect("the finished frame reads back");
+    assert_eq!(captured.width, SIZE);
+    assert_eq!(captured.height, SIZE);
+    assert_eq!(
+        captured.rgba, reference,
+        "the capture matches the presented frame byte for byte, top row first"
+    );
+
+    // The text sits at the top-left of the captured bytes under top-row-first
+    // indexing — a flipped capture would ink the bottom-left instead. The
+    // capture packs tightly at this size, so the file's own readback pins
+    // apply to it directly.
+    expect_pixel(
+        &captured.rgba,
+        4,
+        4,
+        DEBUG_TEXT,
+        "the first cell's first textured texel",
+    );
+    expect_pixel(&captured.rgba, 0, 0, SKY, "the corner above the text");
+    expect_pixel(&captured.rgba, SIZE / 2, SIZE / 2, STONE, "the top face");
+
+    // The captured bytes are the PNG writer's own layout: they round-trip
+    // through it and the crate's decoder unchanged.
+    let path = std::env::temp_dir().join("oxidecraft-capture-round-trip.png");
+    write_png(&path, SIZE, SIZE, &captured.rgba).expect("the capture writes as a PNG");
+    let bytes = std::fs::read(&path).expect("the PNG reads");
+    let _ = std::fs::remove_file(&path);
+    let back = Texture::from_png(&bytes).expect("the crate decodes its own encode");
+    assert_eq!(back.width, SIZE);
+    assert_eq!(back.height, SIZE);
+    assert_eq!(back.rgba, captured.rgba, "the texels come back byte-equal");
 }
 
 /// The overlay pass discards the sheet's below-threshold texels: the source's alpha test

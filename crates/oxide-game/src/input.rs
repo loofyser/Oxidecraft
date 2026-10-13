@@ -29,7 +29,7 @@ use crate::settings::ParticleSetting;
 /// the input surface names (`GameSettings.java:127-133`) plus the chat keys:
 /// the two openers (`keyBindChat`, `keyBindCommand` — `:139`, `:141`)
 /// and the editing keys the open chat field reads (`GuiChat.keyTyped`:87-138).
-/// Task 24 adds the inventory keys: E opens the inventory (`keyBindInventory`,
+/// The inventory keys: E opens the inventory (`keyBindInventory`,
 /// `:134`, key code 18), Q drops (`keyBindDrop`, `:136`, key code 16) and the
 /// digits 1–9 are the hotbar bindings (`keyBindsHotbar[0..8]`, `:151`, key
 /// codes 2–10). Escape is not here: the capture and chat rules route it before
@@ -104,6 +104,11 @@ pub enum Key {
     Digit8,
     /// Hotbar 9: `keyBindsHotbar[8]`, key code 10.
     Digit9,
+    /// The screenshot key: `keyBindScreenshot`, key code 60. A fresh press
+    /// captures the finished frame to the store's `screenshots/` directory
+    /// (`Minecraft.java`:3192-3194 over `ScreenShotHelper`); it drives no
+    /// movement and never reaches the session.
+    Screenshot,
 }
 
 /// One mouse button the client binds.
@@ -319,10 +324,11 @@ pub struct SessionPush {
 
 /// How many physical keys the intent tracks.
 ///
-/// The movement and sprint keys, the chat keys the field rides and the
-/// inventory keys Task 24 routes; the count is the [`Key`] variant count so
-/// [`Key::index`] stays total, but only the gameplay keys drive any intent.
-const KEY_COUNT: usize = 30;
+/// The movement and sprint keys, the chat keys the field rides, the inventory
+/// keys the router answers and the screenshot key; the count is the [`Key`]
+/// variant count so [`Key::index`] stays total, but only the gameplay keys
+/// drive any intent.
+const KEY_COUNT: usize = 31;
 
 /// The sneak input scale: `MovementInputFromOptions.java:42-46` multiplies
 /// both movement axes by 0.3 while sneak is held.
@@ -399,6 +405,7 @@ impl Key {
             Key::Delete => 27,
             Key::Home => 28,
             Key::End => 29,
+            Key::Screenshot => 30,
         }
     }
 
@@ -964,6 +971,7 @@ mod tests {
             Key::ArrowRight,
             Key::ArrowUp,
             Key::ArrowDown,
+            Key::Screenshot,
         ] {
             assert!(!key.is_gameplay(), "{key:?} is not gameplay input");
         }

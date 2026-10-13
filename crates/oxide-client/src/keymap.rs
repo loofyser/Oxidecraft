@@ -129,8 +129,8 @@ pub fn lwjgl_code(code: KeyCode) -> Option<i32> {
 }
 
 /// The game key a bound action name drives, or `None` for an action the
-/// client carries no key for (the mouse-button attacks, the screenshot and
-/// stream rows and their inert company).
+/// client carries no key for (the mouse-button attacks, the stream rows and
+/// their inert company).
 fn key_for_action(name: &str) -> Option<Key> {
     Some(match name {
         "forward" => Key::W,
@@ -142,6 +142,10 @@ fn key_for_action(name: &str) -> Option<Key> {
         "sprint" => Key::ControlLeft,
         "chat" => Key::T,
         "command" => Key::Slash,
+        // The screenshot row reads through the store's table like every other
+        // row, so the bindings list owns it: a later pass can drive every
+        // action from data without touching the call sites.
+        "screenshot" => Key::Screenshot,
         "inventory" => Key::E,
         "drop" => Key::Q,
         "hotbar.1" => Key::Digit1,
@@ -500,6 +504,22 @@ mod tests {
         assert_eq!(translate(KeyCode::Numpad1, &bindings), Some(Key::Digit1));
         assert_eq!(translate(KeyCode::Numpad5, &bindings), Some(Key::Digit5));
         assert_eq!(translate(KeyCode::Numpad9, &bindings), Some(Key::Digit9));
+    }
+
+    #[test]
+    fn the_screenshot_key_maps_through_its_binding() {
+        // F2 captures (`keyBindScreenshot`, `GameSettings.java:142`, code
+        // 60) through the store's table like every other row, so rebinding
+        // the row moves the capture key with it.
+        let bindings = default_bindings();
+        assert_eq!(translate(KeyCode::F2, &bindings), Some(Key::Screenshot));
+        let mut settings = oxide_game::settings::GameSettings::default();
+        assert!(rebind_key(&mut settings, "screenshot", 33));
+        assert_eq!(
+            translate(KeyCode::KeyF, &settings.bindings),
+            Some(Key::Screenshot)
+        );
+        assert_eq!(translate(KeyCode::F2, &settings.bindings), None);
     }
 
     #[test]

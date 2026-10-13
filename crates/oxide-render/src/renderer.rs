@@ -12,6 +12,7 @@ use oxide_assets::texture::Texture;
 
 use crate::camera::Camera;
 use crate::camera::{DEFAULT_FOV, FOV_RANGE};
+use crate::capture::{CapturedFrame, capture_texture};
 use crate::dim_pass::DimPass;
 use crate::entity_pass::{BossStatus, EntityDraw, EntityPass, ItemMeshSource, TextureRegistry};
 use crate::fog::FogParams;
@@ -313,6 +314,23 @@ pub struct Renderer {
     camera: Option<Camera>,
     /// The fog the next frames are drawn and cleared with, until a new one is set.
     fog: Option<FogParams>,
+    /// The finished frame, kept for the screenshot readback: every pass draws
+    /// into this texture and the present blits it to the surface, so the
+    /// capture reads the presented pixels without rendering twice — the
+    /// source's readback shape (`ScreenShotHelper.java:60-83`). Recreated
+    /// when the surface size moves; empty until the first frame.
+    retained: Option<RetainedFrame>,
+}
+
+/// The finished frame the screenshot readback copies from: the texture every
+/// pass draws into, at the surface size and format the present blits.
+struct RetainedFrame {
+    /// The texture itself.
+    texture: wgpu::Texture,
+    /// Its width in texels.
+    width: u32,
+    /// Its height in texels.
+    height: u32,
 }
 
 /// Registers one GUI sheet on the GUI pass pair: on both. The screen pass keeps its
@@ -424,7 +442,10 @@ impl Renderer {
         }
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // The present blits the retained frame into the surface texture
+            // with a plain copy, so the surface carries `COPY_DST` beside the
+            // render attachment bit.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -502,6 +523,7 @@ impl Renderer {
             boss_status: None,
             camera: None,
             fog: None,
+            retained: None,
         })
     }
 
@@ -1136,7 +1158,13 @@ impl Renderer {
     /// its hundred frames, and a spent one hides the bar ([`boss_status_step`]).
     pub fn render(&mut self) -> Result<(), RendererError> {
         let frame = self.surface.get_current_texture()?;
-        let view = frame
+        self.ensure_retained();
+        let Some(kept) = self.retained.as_ref() else {
+            // Unreachable: the ensure above fills the texture. The frame is
+            // skipped rather than presented without a captured twin.
+            return Ok(());
+        };
+        let view = kept
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1293,9 +1321,82 @@ impl Renderer {
             self.overlay.draw(&mut overlay_pass);
             self.screen.draw(&mut overlay_pass);
         }
+        // The present blits the retained frame to the surface: every pass drew
+        // into the retained texture, so the presented pixels and the capture's
+        // source are the same frame, rendered once.
+        if let Some(kept) = self.retained.as_ref() {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &kept.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+
+    /// Reads the last presented frame back to CPU bytes, top-row-first — the
+    /// PNG writer's own layout — or `None` before the first frame.
+    ///
+    /// The source is the retained texture the present blits from, never a
+    /// second render; the presented frame already holds the HUD and any open
+    /// screen, so the capture does too.
+    pub fn capture_frame(&self) -> Option<CapturedFrame> {
+        let kept = self.retained.as_ref()?;
+        capture_texture(
+            &self.device,
+            &self.queue,
+            &kept.texture,
+            kept.width,
+            kept.height,
+            self.config.format,
+        )
+    }
+
+    /// Creates the retained frame texture when it is missing or the surface
+    /// size moved under it.
+    fn ensure_retained(&mut self) {
+        let fresh = match &self.retained {
+            Some(kept) => kept.width != self.config.width || kept.height != self.config.height,
+            None => true,
+        };
+        if !fresh {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("oxide-render retained frame"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.retained = Some(RetainedFrame {
+            texture,
+            width: self.config.width,
+            height: self.config.height,
+        });
     }
 }
 

@@ -696,7 +696,7 @@ fn an_open_stands_the_resolved_table() {
     );
 }
 
-// ---- Task 24's routing table: the inventory keys and the wheel, per path ----
+// ---- The screens' routing table: the inventory keys and the wheel, per path ----
 //
 // The source's own key handling, derived per path (`Minecraft.java`
 // :1859-1892 for the wheel, :2076-2111 for the digits and the drop,

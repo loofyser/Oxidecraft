@@ -2,6 +2,7 @@
 
 pub mod atlas_texture;
 pub mod camera;
+pub mod capture;
 pub mod debug_text;
 pub mod dim_pass;
 pub mod entity_models;

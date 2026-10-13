@@ -51,6 +51,7 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use oxide_assets::extract::Extractor;
 use oxide_assets::font::Font;
+use oxide_assets::png_write::{next_screenshot_path, write_png};
 use oxide_assets::skins::SkinCache;
 use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_assets::sound::SoundIndex;
@@ -2827,6 +2828,43 @@ impl ClientApp {
         }
     }
 
+    /// Saves the finished frame as a PNG and prints the notice — success or
+    /// failure alike, unconditionally (`Minecraft.java`:3192-3194 prints
+    /// whatever `ScreenShotHelper.saveScreenshot` returns). The two lines are
+    /// the `en_US.lang` shapes (`screenshot.success` :1961,
+    /// `screenshot.failure` :1962) hard-coded until the language loader owns
+    /// them; the source's underline-and-click-to-open stays a recorded
+    /// divergence — no file-open handler exists to answer it.
+    fn take_screenshot(&mut self) {
+        let notice = match self.screenshot_result() {
+            Ok(name) => format!("Saved screenshot as {name}"),
+            Err(reason) => format!("Couldn't save screenshot: {reason}"),
+        };
+        tracing::info!(notice = notice.as_str(), "screenshot captured or refused");
+        self.chat.observe(&notice, 0, self.player.tick);
+    }
+
+    /// Captures the finished frame into the store's `screenshots/` directory
+    /// under the minted timestamp name. Answers the file name, or the reason
+    /// for the failure line.
+    fn screenshot_result(&self) -> Result<String, String> {
+        let captured = self
+            .renderer
+            .as_ref()
+            .and_then(Renderer::capture_frame)
+            .ok_or_else(|| String::from("no frame has been drawn yet"))?;
+        let root = assets::default_store_root().map_err(|error| error.to_string())?;
+        let dir = root.join("screenshots");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = next_screenshot_path(&dir, unix_now());
+        write_png(&path, captured.width, captured.height, &captured.rgba)
+            .map_err(|error| error.to_string())?;
+        Ok(path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default())
+    }
+
     /// Routes one keyboard event: the window's shortcuts, the chat's own
     /// routing, then the gameplay keys.
     ///
@@ -2906,6 +2944,20 @@ impl ClientApp {
         }
         // The F3 hold tracks every edge — the level read behind the chord.
         self.f3_held = f3_hold_step(self.f3_held, event.state, &event.logical_key);
+        // The screenshot key's capture path (the router seam — the binding
+        // itself reads through the store's table): a fresh press of the bound
+        // key captures the finished frame to the store's `screenshots/`
+        // directory and prints the notice, over any screen, like the source's
+        // own dispatch (`Minecraft.java`:3192-3194).
+        if screenshot_pressed(
+            event.state,
+            event.repeat,
+            event.physical_key,
+            &self.settings.settings().bindings,
+        ) {
+            self.take_screenshot();
+            return;
+        }
         // The H chord shares the F3 toggle's gate: the runTick keyboard loop
         // runs with no screen or an `allowUserInput` one (`Minecraft.java`
         // :1834, and the M4 seam above lets F3 through only there) — over a
@@ -4546,7 +4598,7 @@ impl ClientApp {
     /// next tick anyway (`GuiInventory.updateScreen`:34-42).
     /// The pointer frees like any other window open, with no hover until the
     /// mouse moves. (The riding branch is out of scope, recorded; the
-    /// keymap binding itself is Task 24's — this is the router seam.)
+    /// keymap binding itself is the router seam.)
     fn open_inventory(&mut self, event_loop: &ActiveEventLoop) {
         let event = self.inventory_open_event();
         if let Some(event) = event {
@@ -4692,7 +4744,7 @@ impl ClientApp {
         // (`GuiScreenBook.keyTyped` edits unsigned pages or nothing, and
         // Escape closes through the base rule) — and the read-only port
         // swallows every other key with no page-turn binding (a port
-        // choice; Task 24 owns key routing).
+        // choice; the key router owns key routing).
         if pressed == Some(Key::E)
             && self.screens.sign_mut().is_none()
             && self.screens.book_mut().is_none()
@@ -6636,6 +6688,36 @@ fn gameplay_key(
         })
 }
 
+/// Seconds since the Unix epoch in UTC for the screenshot mint; the epoch on
+/// clock failure, never a panic.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_secs())
+        .unwrap_or(0)
+}
+
+/// The screenshot key's own edge while the chat is closed: a fresh press of
+/// the bound screenshot key (`keyBindScreenshot`, `GameSettings.java:142`,
+/// code 60) captures the finished frame — over any screen, like the source's
+/// dispatch loop (`Minecraft.java`:3192-3194), so the menu-time capture works
+/// with no session. A repeat is not a fresh press and captures nothing; a
+/// release is no capture at all.
+fn screenshot_pressed(
+    state: ElementState,
+    repeat: bool,
+    physical_key: PhysicalKey,
+    bindings: &[Binding],
+) -> bool {
+    if state != ElementState::Pressed || repeat {
+        return false;
+    }
+    let PhysicalKey::Code(code) = physical_key else {
+        return false;
+    };
+    keymap::translate(code, bindings) == Some(Key::Screenshot)
+}
+
 /// The inventory's opener key while no screen is open: a fresh press of the
 /// bound inventory key stands the window-0 screen (`Minecraft.java`:2090-2103
 /// drains the `keyBindInventory` press queue; the binding reads through the
@@ -7837,9 +7919,10 @@ mod tests {
         frame_params, gameplay_key, interpolate_pose, inventory_opener, is_enter_press,
         is_escape_press, is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv,
         parse_script, parse_server_address, particle_draws, render_distance_step, scaled_cursor,
-        screen_button_events, screen_click_button, scripted_chat_click, skin_requests,
-        sleep_cover_dim, sleep_dim, sleep_pose, store_aim, store_break_stage, store_skins,
-        tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
+        screen_button_events, screen_click_button, screenshot_pressed, scripted_chat_click,
+        skin_requests, sleep_cover_dim, sleep_dim, sleep_pose, store_aim, store_break_stage,
+        store_skins, tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step,
+        wire_sound_play,
     };
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
@@ -8950,6 +9033,71 @@ mod tests {
     }
 
     #[test]
+    fn the_screenshot_key_captures_on_a_fresh_press() {
+        // The bound screenshot key (`keyBindScreenshot`, code 60) captures on
+        // a fresh press only — repeats and releases capture nothing, and no
+        // other key is the capture key.
+        let bindings = default_bindings();
+        assert!(screenshot_pressed(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::F2),
+            &bindings
+        ));
+        assert!(
+            !screenshot_pressed(
+                ElementState::Pressed,
+                true,
+                PhysicalKey::Code(KeyCode::F2),
+                &bindings
+            ),
+            "a repeat is not a fresh press"
+        );
+        assert!(
+            !screenshot_pressed(
+                ElementState::Released,
+                false,
+                PhysicalKey::Code(KeyCode::F2),
+                &bindings
+            ),
+            "a release captures nothing"
+        );
+        assert!(
+            !screenshot_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::KeyE),
+                &bindings
+            ),
+            "no other key is the capture key"
+        );
+    }
+
+    #[test]
+    fn the_screenshot_key_follows_the_rebound_table() {
+        // The capture reads through the store's table: moving the row off F2
+        // moves the capture key, and F2 captures nothing after.
+        let mut settings = GameSettings::default();
+        keymap::rebind_key(&mut settings, "screenshot", 33);
+        let bindings = &settings.bindings;
+        assert!(screenshot_pressed(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::KeyF),
+            bindings
+        ));
+        assert!(
+            !screenshot_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::F2),
+                bindings
+            ),
+            "F2 captures nothing once the row leaves it"
+        );
+    }
+
+    #[test]
     fn the_tab_key_holds_and_releases_the_player_list() {
         // The player list's binding is a held key state: the source sets
         // every keyboard edge's binding (`Minecraft.java`:1904-1912) and the
@@ -9145,7 +9293,7 @@ mod tests {
 
     #[test]
     fn the_gesture_directives_parse_beside_the_old_ones() {
-        // Task 24's additive syntax: the old `key <UPPER> down|up` lines keep
+        // The gestures' additive syntax: the old `key <UPPER> down|up` lines keep
         // parsing untouched, and the new gestures land beside them — `move`,
         // `click`, `drag`, `wheel` and the named-once `key <name>`, a press
         // edge only.
