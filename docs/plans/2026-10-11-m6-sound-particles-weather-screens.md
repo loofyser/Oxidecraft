@@ -607,12 +607,12 @@ feat: the options hub and the video screen (client)
 
 ### Task 19: The sound, controls, language, chat and skin screens
 
-**Goal:** The options hub's remaining sub-screens: the nine sound sliders (live to the engine), Controls (the keybind list with rebinding, sensitivity, invert, smooth camera), Language (the list + Force Unicode), Chat Settings (the opacity/scale/width/height controls + the recorded Tab behaviour note), Skin Customization (the part toggles + cape switch — writing the skin-parts byte the wire uses, the M4 limit-19 carry), and the Snooper record.
+**Goal:** The options hub's remaining sub-screens: the nine sound sliders (live to the engine), Controls (the keybind list with rebinding, sensitivity, invert, smooth camera), Language (the list + Force Unicode), Chat Settings (the opacity/scale/width/height controls + the recorded Tab behaviour note), Skin Customization (the seven part toggles — cape included as part 0 — writing the skin-parts byte the wire uses, the M4 limit-19 carry), and the Snooper record.
 
 **Files:**
 - Create: `crates/oxide-client/src/screens/options_sound.rs`, `options_controls.rs`, `options_language.rs`, `options_chat.rs`, `options_skin.rs` (one file per screen; the hub gains their opens).
 - Modify: `crates/oxide-client/src/keymap.rs` — the binding table becomes data-driven (`GameSettings`' bindings: the key names each action's default derives from `GameSettings.java`:127-151's own list; the physical-key translation stays winit-side; the rebinding state machine — the source's "press a key" flow — lands here).
-- Modify: `crates/oxide-client/src/chat.rs` + `screens/` — the chat options consumers (opacity/width/height/scale into the chat draws — the currently-hard-coded values re-read; the chat mirror's carried entry points (M4 rec 42) wired to the chat settings' open/scroll — the route lands wired and reachable, closing the carry).
+- Modify: `crates/oxide-game/src/chat.rs` + `crates/oxide-client/src/view.rs` + `screens/` — the chat options consumers (opacity/width/height/scale into the chat draws — the currently-hard-coded values re-read; the chat mirror's carried entry points (M4 rec 42) wired to the chat settings' scroll + the five settings — the open half closed by `reconcile_chat_open` per the recon's P3; the route lands wired and reachable, closing the carry).
 - Test: per screen's layout/behaviour pins in `tests/screens.rs`; the rebinding machine's tests (`keymap`).
 - Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: one frame per new screen.
 
