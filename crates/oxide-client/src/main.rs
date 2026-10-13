@@ -281,6 +281,9 @@ enum ScriptKey {
     /// `f1`: the HUD-suppression edge — the raw F1 press the window's own
     /// key flips the flag with, no binding row.
     F1,
+    /// `f2`: the screenshot edge — the bound screenshot key's press, the
+    /// capture the window's own F2 runs, over any screen.
+    F2,
     /// `f5`: the perspective step — the bound key whose press cycles the
     /// camera mode 0→1→2.
     F5,
@@ -801,6 +804,7 @@ fn parse_script_key(name: &str) -> anyhow::Result<ScriptKey> {
         "escape" => Ok(ScriptKey::Escape),
         "f3" => Ok(ScriptKey::F3),
         "f1" => Ok(ScriptKey::F1),
+        "f2" => Ok(ScriptKey::F2),
         "f5" => Ok(ScriptKey::F5),
         "h" => Ok(ScriptKey::H),
         "b" => Ok(ScriptKey::B),
@@ -5310,6 +5314,12 @@ impl ClientApp {
                 self.hide_gui = !self.hide_gui;
                 tracing::info!(hide_gui = self.hide_gui, "F1 flipped the HUD flag");
             }
+            ScriptKey::F2 => {
+                // The scripted F2 edge: the same capture the bound
+                // screenshot key runs (`Minecraft.java`:3192-3194), over
+                // any screen.
+                self.take_screenshot();
+            }
             ScriptKey::F5 => {
                 // The scripted F5 edge: the same 0→1→2 step the bound
                 // perspective key runs (`Minecraft.java`:2030-2049), with
@@ -5466,6 +5476,7 @@ impl ClientApp {
                         ScriptKey::Escape
                         | ScriptKey::F3
                         | ScriptKey::F1
+                        | ScriptKey::F2
                         | ScriptKey::F5
                         | ScriptKey::H
                         | ScriptKey::B => unreachable!("the window-level keys route above"),
@@ -9342,6 +9353,32 @@ mod tests {
                 &bindings
             ),
             "no other key is the capture key"
+        );
+    }
+
+    #[test]
+    fn the_f2_script_key_parses_onto_the_screenshot_capture() {
+        // `key f2` is the scripted form of the bound screenshot key
+        // (`keyBindScreenshot`, code 60): it parses to one named key's
+        // press edge, and the live F2 press it mirrors captures the
+        // finished frame.
+        let directives = parse_script("10 key f2").expect("key f2 parses");
+        assert_eq!(
+            directives,
+            [Directive {
+                tick: 10,
+                action: DirectiveAction::ScriptKey(ScriptKey::F2),
+            }],
+            "key f2 parses to the screenshot edge"
+        );
+        assert!(
+            screenshot_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::F2),
+                &default_bindings(),
+            ),
+            "the live F2 press it mirrors captures the frame"
         );
     }
 
