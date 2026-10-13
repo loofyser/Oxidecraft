@@ -979,9 +979,14 @@ struct ClientApp {
     /// Whether the session has joined a world yet: the music before it is the
     /// menu event.
     joined: bool,
-    /// The client's assets, when `--server` was given: the mesh inputs the session shares,
-    /// the font and the sky textures the renderer uploads.
+    /// The client's assets, once loaded: with `--server` they load at startup — the mesh
+    /// inputs the session shares, the font and the sky textures the renderer uploads —
+    /// and without one the first frame that needs them resolves them instead (see
+    /// [`ClientApp::ensure_presession_assets`).
     assets: Option<ClientAssets>,
+    /// The deferred pre-session load's failure, kept once the first frame reports it: a
+    /// missing tree stops the client there, with the fetch hint in the log.
+    assets_error: Option<String>,
     /// The client's settings owner: the store's values, the save-on-change
     /// writer and the apply path. The frame reads the view distance, the
     /// framerate cap and the volumes from it; the window pushes every change
@@ -1516,15 +1521,20 @@ fn system_time_ms() -> u64 {
 
 impl ClientApp {
     /// Builds the handler, reads the smoke-run frame limit, loads the assets when a session
-    /// was asked for, and opens the session.
+    /// was asked for, and opens the session. Without a server the pre-session load is
+    /// deferred: nothing is read here, and the first frame that needs the assets resolves
+    /// them (see [`ClientApp::ensure_presession_assets`]).
     fn new(cli: Cli) -> anyhow::Result<Self> {
         let max_frames = frame_limit(cli.frames);
         if let Some(limit) = max_frames {
             tracing::info!(frames = limit, "a frame limit is set, exiting after it");
         }
         // With a server the assets load before anything opens, so a store that is missing or
-        // malformed fails fast; without one the pre-session menu loads the same tree.
+        // malformed fails fast; without one nothing loads here — the first frame that needs
+        // the assets resolves them instead, so building the bare client never fails on a
+        // missing tree.
         let assets: Option<ClientAssets>;
+        let assets_error: Option<String>;
         let chat_font: Option<Font>;
         let chat_lang: Option<LanguageTable>;
         let mut skin_requests_tx = None;
@@ -1584,6 +1594,7 @@ impl ClientApp {
                     Arc::clone(&loaded.mesh),
                 );
                 assets = Some(loaded);
+                assets_error = None;
                 // The session-held values push through its input channel from
                 // here on; the first full push lands with the window, once the
                 // renderer and the audio engine exist to take their own fields.
@@ -1591,15 +1602,13 @@ impl ClientApp {
                 Some(session)
             }
             None => {
-                // No `--server` stands the pre-session menu at the first
-                // frame: the assets load here — the font, the language
-                // table, the splash lines and the sheets the menu samples
-                // — like the session branch, and a missing tree fails the
-                // same way. The chat mirror takes the same font and table.
-                let loaded = ClientAssets::load(None)?;
-                chat_font = Some(loaded.font.clone());
-                chat_lang = Some(loaded.lang.clone());
-                assets = Some(loaded);
+                // No `--server` defers the tree: the assets, the chat mirror's font and the
+                // table all resolve at the first frame that needs them, so a missing tree
+                // fails there — with the fetch hint in the log — and never here.
+                chat_font = None;
+                chat_lang = None;
+                assets = None;
+                assets_error = None;
                 None
             }
         };
@@ -1652,6 +1661,7 @@ impl ClientApp {
             music: None,
             joined: false,
             assets,
+            assets_error,
             settings,
             last_frame: None,
             hud: HudState {
@@ -1703,6 +1713,47 @@ impl ClientApp {
             opener: Box::new(spawn_url_opener),
             script,
         })
+    }
+
+    /// Resolves the deferred pre-session assets at the first frame that needs them:
+    /// without `--server` nothing loaded at startup, so the first menu standing loads
+    /// the tree here — the font, the language table, the splash lines and the sheets
+    /// the menu samples — hands the chat mirror the same font and table startup did,
+    /// and opens the sound pump beside them, so the menu's button press still plays.
+    /// A missing tree fails here instead, with the fetch hint in the log, and the
+    /// client stops: the message still reaches the run, one frame later. With a session
+    /// — or once resolved — this answers whether the assets stand and loads nothing.
+    fn ensure_presession_assets(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if self.session.is_some() || self.assets.is_some() {
+            return self.assets.is_some();
+        }
+        if self.assets_error.is_some() {
+            return false;
+        }
+        match ClientAssets::load(None) {
+            Ok(loaded) => {
+                self.chat.set_language(loaded.lang.clone());
+                self.chat.set_font(loaded.font.clone());
+                self.font = Some(loaded.font.clone());
+                self.assets = Some(loaded);
+                if let Ok(store_root) = assets::default_store_root() {
+                    match open_audio(&store_root, None) {
+                        Ok(pump) => self.audio = Some(pump),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "the client runs without sound");
+                        }
+                    }
+                }
+                true
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "the pre-session assets could not be loaded");
+                self.assets_error = Some(error.to_string());
+                self.stopped_on_error = true;
+                event_loop.exit();
+                false
+            }
+        }
     }
 
     /// Drains the skin worker's updates into [`ClientApp::skins`], and uploads each
@@ -1766,6 +1817,18 @@ impl ClientApp {
         };
         // The worker's updates land before the frame reads the map.
         self.drain_skins();
+        // The deferred pre-session load resolves at the first frame that needs it: with no
+        // session and no screen yet, the menu standing below is that consumer, so the tree
+        // loads here — ahead of the window and renderer borrows, which is why the resolve
+        // sits here rather than at the standing. A missing tree stops the client here, with
+        // the fetch hint in the log.
+        if self.session.is_none()
+            && !self.screens.is_open()
+            && self.assets.is_none()
+            && !self.ensure_presession_assets(event_loop)
+        {
+            return;
+        }
         // The queued container gestures, run once the frame's events are in —
         // each through the window's own path, in file order. The take ends
         // the driver's borrow before the run starts. This sits before the
@@ -5791,6 +5854,35 @@ mod tests {
         let app = ClientApp::new(cli).expect("the client builds without a server");
         assert!(app.session.is_none(), "no session is opened");
         assert!(!app.overlay_visible, "the overlay stays hidden");
+    }
+
+    #[test]
+    fn the_bare_client_builds_with_no_extraction_tree() {
+        // The pre-session load is deferred: building the bare client must succeed with an
+        // empty store, and the missing tree surfaces at the first frame instead. The probe
+        // runs in a child process — the store override rides the child's environment, so
+        // the parent's process-global environment is never swapped under parallel tests.
+        // The child re-enters this same test with the probe marker set and asserts the
+        // build directly.
+        if std::env::var_os("OXIDECRAFT_NO_TREE_PROBE").is_some() {
+            let cli = Cli::try_parse_from(["oxide-client"]).expect("a bare invocation parses");
+            let app = ClientApp::new(cli).expect("the client builds without a tree");
+            assert!(app.session.is_none(), "no session is opened");
+            assert!(app.assets.is_none(), "nothing loaded at startup");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oxide-no-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch store is created");
+        let exe = std::env::current_exe().expect("the test binary path");
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("tests::the_bare_client_builds_with_no_extraction_tree")
+            .env("OXIDECRAFT_STORE", &dir)
+            .env("OXIDECRAFT_NO_TREE_PROBE", "1")
+            .status()
+            .expect("the probe process runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "the bare client builds with no tree");
     }
 
     #[test]
