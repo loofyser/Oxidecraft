@@ -854,16 +854,16 @@ feat: the camera modes, F1 suppression and the spectator HUD state (client, rend
 
 ### Task 28: The window: resize and the scaled-resolution table
 
-**Goal:** The window's resize and display path is complete: the resize arm re-derives the scaled resolution and the projection at every GUI scale (the four-scale table's values pinned at the three reference resolutions), fullscreen's runtime behaviour is verified against the settings (the apply lives in Task 14; F11's route in Task 25), and the render-distance slider's chain applies live (the far plane, fog, mesher and the C15 re-send — the C15 half is Task 5's path, this task wires the slider to it).
+**Goal:** The window's resize and display path is complete: the resize arm re-derives the scaled resolution and the projection at every GUI scale (the four-scale table's values pinned at the three reference resolutions), fullscreen's runtime behaviour is verified against the settings (the apply lives in Task 14; F11's route in Task 25; the port's apply is winit BORDERLESS — the source's exclusive mode is not claimed, record), the render-distance slider's chain applies live (the far plane, fog, mesher and the C15 re-send — the C15 half is Task 5's path, this task wires the slider to it), and the T4 rider folds here: `render_distance < 4 → clouds Off` at the apply value.
 
 **Files:**
-- Modify: `crates/oxide-client/src/main.rs` — the resize arm's scale re-derive (verify the standing `renderer.resize` path covers it — extend where it does not); the render-distance slider's consumer chain (settings → far plane state → session C15); fullscreen's runtime verification hooks (the apply is Task 14's; this task owns the size/mode follow-up and the record).
-- Modify: `crates/oxide-render/src/renderer.rs` — the resize's full state re-derive (scaled resolution, projections, the HUD/screen resolutions).
-- Test: the resize unit (two sizes → the scaled resolutions + projections, per GUI scale 0–3 — the four-scale table's derived values pinned at 1280×720/1920×1080/2560×1440 per checklist 53's Gaps row: the table's values derive from `ScaledResolution`'s formula in-task and pin; the acceptance compares against vanilla).
+- Modify: `crates/oxide-client/src/main.rs` — the resize arm's scale re-derive (the winit `Resized` event is the source's `wasResized` poll's equivalent — no `Display.setResized` exists in the source; verify the standing `renderer.resize` path covers the re-derive — extend where it does not; the zero-size guard STAYS — a port addition for minimised windows, record); the render-distance slider's consumer chain (settings → far plane state → session C15); fullscreen's runtime verification hooks (the apply is Task 14's; this task owns the size/mode follow-up and the record).
+- Modify: `crates/oxide-render/src/renderer.rs` — the resize's full state re-derive (scaled resolution, projections, the HUD/screen resolutions; the camera projection is per-frame and aspect-driven — resize owes it nothing, verify don't rebuild).
+- Test: the resize unit (two sizes → the scaled resolutions + projections, per GUI scale 0–3 — the four-scale table's derived values pinned at 1280×720/1920×1080/2560×1440 per checklist 53's Gaps row: the table's values derive from `ScaledResolution`'s formula in-task and pin; NON-unicode column only — the port draws one font, so the unicode stepdown stays unported, recorded; the acceptance compares against vanilla).
 - Test: ignored GPU frames at two window sizes (a GUI frame's pixel geometry).
 
 **Interfaces:**
-- Produces: the resize/fullscreen behaviors on the standing winit arms; the render-distance apply chain's final wiring.
+- Produces: the resize/fullscreen behaviors on the standing winit arms; the render-distance apply chain's final wiring; the clouds fold value (resolved Off at the apply, never inside the renderer).
 - Consumes: Tasks 3, 4, 5, 14.
 
 - [ ] **Step 1: The scaled-resolution table (RED).** The three resolutions × four scale values pinned (the formula derivation is the source's own loop — re-derive in-task, cite). Run red.
