@@ -689,22 +689,22 @@ feat: the shared text field and the chat completion (client)
 
 ### Task 22: The F3 overlay rebuilt
 
-**Goal:** The F3 overlay carries the full field set — the left and right columns as the checklist's row 5 lists them, with the dynamic fields masked in the diff — and its key toggles: F3+P, F3+A, F3+F fold; F3+T and F3+N record as no-ops; F3+Q prints the binding help.
+**Goal:** The F3 overlay carries the full field set — the left and right columns as the checklist's row 5 lists them, with the dynamic fields masked in the diff — and its key toggles: F3+A and F3+F fold (F3+F steps ±1, Shift decrements); F3+T drives the refresh-equivalent (recorded divergence); F3+N, F3+Q and the empty W/E/V/L/U arms record as absent source no-ops.
 
 **Files:**
-- Modify: `crates/oxide-client/src/debug_overlay` (wherever the M5 overlay's builder lives — `main.rs`'s overlay path) — the field set: the standing rows plus `P:` (Task 7's stats), `Biome:` (the self-derived biome name per column — the session reports the view column's biome; the wire source: `0x21`'s data ends with the 256 biome bytes when GroundUpContinuous (protocol §3.1) and `0x26` always implies GroundUp (protocol §3.2) — the task re-derives the exact decode window from the protocol reference and the source's `Chunk.getBiome`; a column without a biome byte shows the fallback name — no invented values), `Light:` (the view block's sky/block nibbles — the standing light query), `Local Difficulty:` (day count from the Join/clock state + the difficulty byte — the derived formula), `Looking at:` + the block name at F3+H.
+- Modify: the overlay's real homes (`oxide-game/src/hud.rs`'s `debug_lines` builder, `main.rs`'s overlay arm, `oxide-render/src/overlay.rs`'s draw) — the field set: the standing rows plus `P:` (Task 7's stats), `Biome:` (the self-derived biome name per column — the session reports the view column's biome; the wire source: `0x21`'s data ends with the 256 biome bytes when GroundUpContinuous (protocol §3.1) and `0x26` always implies GroundUp (protocol §3.2) — the task re-derives the exact decode window from the protocol reference and the source's `Chunk.getBiome`; a column without a biome byte shows the fallback name — no invented values), `Light:` (the view block's sky/block nibbles — the standing light query), `Local Difficulty:` (day count from the Join/clock state + the difficulty byte — the derived formula), `Looking at:` + the block name whenever a block is targeted (no F3+H gate — the source gates nothing; H drives tooltips only).
 - Modify: `crates/oxide-client/src/main.rs` — the right column: `Java:` (our rustc + build id, recorded), `Mem:` (RSS from `/proc/self/statm` on Linux; recorded fallback `n/a` elsewhere), `CPU:` (`/proc/cpuinfo`'s model string, recorded fallback), `Display:` (the wgpu adapter name + the window's size).
-- Modify: `crates/oxide-client/src/main.rs` — the toggles: F3 held + key chords (P/A/F/T/N/Q; the H chord stands from M5), the advanced-tooltips flag from F3+H (the M5 appendix), F3+G's chunk-border state, F3+B's hitbox state, Shift+F3's lagometer state.
+- Modify: `crates/oxide-client/src/main.rs` — the toggles: F3 held + the P/A/F/T chords (each a recorded action; H stands from M5; N/Q and W/E/V/L/U recorded absent — no source arm exists), F3+G's chunk-border flag (a new v1 key, not a source chord), and F3+B's hitbox / Shift+F3's lagometer / Alt+F3's chart flag reads standing for Task 23.
 - Test: `crates/oxide-client/src/main.rs` — the field builder's deterministic rows (a fixture state → the exact line set; the dynamic values pinned where deterministic, masked otherwise), the chord routing table.
 - Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: the overlay frame at a fixture state (background quads 0.25 alpha, line height 9 + 1 px, right column at width−2).
 
 **Interfaces:**
 - Produces: `DebugFlags { visible, advanced_tooltips, hitboxes, chunk_borders, lagometer, pause_on_focus_lost }` in the client; the field builder reading the standing state sources.
-- Consumes: Task 7 (particle stats), Task 5 (difficulty/day state), the standing light/aim data.
+- Consumes: Task 7 (particle stats), the standing session state (the Join difficulty byte + the clock's day count), the standing light/aim data.
 
 - [ ] **Step 1: Builder tests (RED).** The fixture state's exact rows; red first.
 - [ ] **Step 2: Implement the field set.** Run — green.
-- [ ] **Step 3: The chord routing.** P/A/F/T/N/Q table (each a recorded action or no-op); F3+F cycles the render-distance setting (the slider chain — Tasks 3/18/28 — owns the wiring); F3+A asks the session for a rebuild (the standing mesh path's trigger). Run — green.
+- [ ] **Step 3: The chord routing.** P/A/F/T/N/Q table (each a recorded action or no-op); F3+F steps the render-distance setting by ±1 (Shift decrements; the slider chain — Tasks 3/18/28 — owns the wiring); F3+A asks the session for a rebuild (the standing mesh path's trigger). Run — green.
 - [ ] **Step 4: Gate and commit.** Run the full gate. Commit:
 
 ```
