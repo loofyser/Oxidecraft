@@ -2905,6 +2905,23 @@ fn the_death_buttons_stand_on_the_source_rects() {
 }
 
 #[test]
+fn the_death_buttons_hold_the_integer_row_off_the_quarter() {
+    // `GuiGameOver.initGui:38-39` divides integers: at a height past the
+    // quarter the pair sits on the truncated row, never the float one.
+    let scaled = ScaledResolution {
+        width: 427,
+        height: 241,
+        scale_factor: 2,
+    };
+    let mut screens = Screens::default();
+    screens.open_death(&scaled, &death_labels(None), 0);
+    let screen = screens.death_mut().expect("death stands");
+    let buttons = screen.buttons();
+    assert_eq!((buttons[0].x, buttons[0].y), (113.0, 132.0), "respawn row");
+    assert_eq!((buttons[1].x, buttons[1].y), (113.0, 156.0), "title row");
+}
+
+#[test]
 fn the_death_buttons_enable_on_the_twentieth_tick() {
     // `initGui:47-50` builds every button disabled; `updateScreen:135-147`
     // enables them all when the counter reaches exactly 20.

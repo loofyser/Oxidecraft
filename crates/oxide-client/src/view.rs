@@ -53,6 +53,7 @@ use crate::skin_worker::SkinUpdate;
 use oxide_client::items;
 use oxide_client::screens::container::{ContainerScreen, HOVER_COLOUR, title_rgba};
 use oxide_client::screens::creative::CreativeScreen;
+use oxide_client::screens::end_states::leave_bed_button;
 use oxide_client::screens::family_a;
 use oxide_client::screens::family_b;
 use oxide_client::screens::inventory;
@@ -342,6 +343,26 @@ pub struct ScreenDrawInput<'a> {
     /// bounce and panorama partial ride it (`Minecraft.getSystemTime`'s
     /// shape the source reads its own clock in).
     pub now_ms: u64,
+}
+
+/// The sleep cover's Leave Bed button draws over the chat while the cover
+/// stands (`GuiSleepMP` extends the chat screen: the chat draws, then the
+/// id-1 button 200x20 at `w/2-100, h-40`). With no cover, or with no
+/// measured font, nothing draws.
+pub fn sleep_cover_draws(
+    sleep_cover: bool,
+    font: Option<&Font>,
+    scaled: ScaledResolution,
+    mouse: Option<(f32, f32)>,
+    label: String,
+) -> Vec<HudDraw> {
+    if !sleep_cover {
+        return Vec::new();
+    }
+    let Some(font) = font else {
+        return Vec::new();
+    };
+    leave_bed_button(&scaled, label).draws(font, mouse)
 }
 
 /// The screen group's own draws: the source's `currentScreen.drawScreen`

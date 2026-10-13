@@ -187,13 +187,15 @@ pub struct DeathScreen {
 }
 
 /// The death button pair: Respawn (0) and Title (1) at `w/2-100, h/4+72`
-/// and `h/4+96`, standing disabled (`GuiGameOver.initGui:23-39`).
+/// and `h/4+96`, standing disabled (`GuiGameOver.initGui:23-39` divides
+/// integers, so the rows truncate before the offset lands).
 fn death_buttons(scaled: &ScaledResolution, top: &str, bottom: &str) -> [Button; 2] {
     let half = scaled.width / 2;
+    let row = scaled.height / 4;
     let mut respawn = Button::new(
         DEATH_RESPAWN_ID,
         half as f32 - 100.0,
-        scaled.height as f32 / 4.0 + 72.0,
+        row as f32 + 72.0,
         200.0,
         20.0,
         top.to_string(),
@@ -201,7 +203,7 @@ fn death_buttons(scaled: &ScaledResolution, top: &str, bottom: &str) -> [Button;
     let mut title = Button::new(
         DEATH_TITLE_ID,
         half as f32 - 100.0,
-        scaled.height as f32 / 4.0 + 96.0,
+        row as f32 + 96.0,
         200.0,
         20.0,
         bottom.to_string(),
@@ -242,8 +244,9 @@ impl DeathScreen {
     }
 
     /// One client tick on the death screen: the gate counts up, then both
-    /// buttons enable (`GuiYesNo.updateScreen:93-102`, armed by
-    /// `setButtonDelay(20)`).
+    /// buttons enable (`GuiGameOver.updateScreen:135-147` counts
+    /// `enableButtonsTimer` and enables the list at 20, through the
+    /// confirm's own delay the title button re-arms).
     pub fn tick(&mut self) {
         self.ticks = self.ticks.saturating_add(1);
         if self.ticks >= DEATH_ENABLE_TICKS {

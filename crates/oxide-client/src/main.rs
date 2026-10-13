@@ -60,8 +60,9 @@ use oxide_client::keymap;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::end_states::{
-    confirm_labels, death_labels, disconnect_button_label, disconnect_title, sleep_tick,
-    terrain_line,
+    ConfirmAction, DeathAction, DisconnectAction, confirm_labels, death_labels,
+    disconnect_button_label, disconnect_title, leave_bed_button, leave_bed_label, sleep_dim,
+    sleep_tick, sleep_yaw, terrain_line,
 };
 use oxide_client::screens::family_b;
 use oxide_client::screens::menu::{MenuAction, menu_labels};
@@ -1136,6 +1137,8 @@ struct ClientApp {
     menu_seed: u64,
     /// The link opener the confirm overlay's Enter runs.
     opener: UrlOpener,
+    /// The clipboard copy the confirm overlay's Copy button runs.
+    clipboard: ClipboardCopy,
     /// The `--input-script` replay, when the flag was given.
     script: Option<ScriptDriver>,
 }
@@ -1428,6 +1431,35 @@ fn camera_pose(pose: Pose) -> CameraPose {
         yaw: pose.yaw,
         pitch: pose.pitch,
         sneak: pose.sneaking,
+    }
+}
+
+/// The sleep cover's darkening for the HUD pass: no timer is no dim, else
+/// the ramp (`GuiIngame.java:197-212` via [`sleep_dim`]).
+fn sleep_cover_dim(timer: u32) -> Option<[f32; 4]> {
+    if timer == 0 {
+        None
+    } else {
+        Some(sleep_dim(timer))
+    }
+}
+
+/// The sleeping camera's pose: the eye rises one block plus the 0.3 lift
+/// and the yaw turns through the bed facing (`EntityRenderer.java:644-657`
+/// via [`sleep_yaw`]). Awake passes through untouched.
+fn sleep_pose(pose: CameraPose, sleeping: bool, facing: u8) -> CameraPose {
+    if !sleeping {
+        return pose;
+    }
+    CameraPose {
+        position: [
+            pose.position[0],
+            pose.position[1] + 1.0 + 0.3,
+            pose.position[2],
+        ],
+        yaw: sleep_yaw(pose.yaw, facing),
+        pitch: pose.pitch,
+        sneak: pose.sneak,
     }
 }
 
@@ -1790,6 +1822,7 @@ impl ClientApp {
             cursor: None,
             menu_seed,
             opener: Box::new(spawn_url_opener),
+            clipboard: Box::new(spawn_clipboard_copy),
             script,
         })
     }
@@ -2320,10 +2353,14 @@ impl ClientApp {
         // sky clear.
         if self.session.is_some() {
             let partial = self.camera.partial(Instant::now());
-            let pose = interpolate_pose(
-                camera_pose(self.player.previous),
-                camera_pose(self.player.current),
-                partial,
+            let pose = sleep_pose(
+                interpolate_pose(
+                    camera_pose(self.player.previous),
+                    camera_pose(self.player.current),
+                    partial,
+                ),
+                self.sleeping,
+                self.sleep_facing,
             );
             let walk = self.camera.walk;
             let yaw_sensor = self.camera.camera_yaw;
@@ -2607,6 +2644,19 @@ impl ClientApp {
             None => Vec::new(),
         });
         hud_draws.extend(self.chat.draws(scaled, &mut self.chat_input));
+        // The sleep cover's Leave Bed button over the chat: `GuiSleepMP`
+        // extends the chat screen, so the chat draws first and the id-1
+        // button lands on top while the cover stands.
+        {
+            let language = self.assets.as_ref().map(|assets| &assets.lang);
+            hud_draws.extend(view::sleep_cover_draws(
+                self.sleep_cover,
+                self.font.as_ref(),
+                scaled,
+                self.cursor,
+                leave_bed_label(language),
+            ));
+        }
         if self.tab.open {
             if let Some(font) = self.font.as_ref() {
                 hud_draws.extend(self.tab.tab_draws(
@@ -2650,9 +2700,10 @@ impl ClientApp {
         ));
         // The debug overlay's text goes while the player is alive. The dead
         // frame carries no overlay lines of its own: the death screen stands
-        // above it.
+        // above it. The sleep cover's darkening rides the same pass: the
+        // timer's ramp while it runs, none at rest.
         if !self.dead {
-            renderer.set_dim(None);
+            renderer.set_dim(sleep_cover_dim(self.sleep_timer));
             renderer.set_overlay_lines(if self.overlay_visible {
                 debug_lines(&self.hud)
             } else {
@@ -2721,6 +2772,18 @@ impl ClientApp {
     /// gameplay keys flow only while the pointer is grabbed.
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         if is_escape_press(event.state, event.repeat, &event.logical_key) {
+            // The death screen owns Escape as a no-op: the source's
+            // `keyTyped` is empty, so the press closes nothing and the
+            // gate keeps its count.
+            if self.death_escape() {
+                return;
+            }
+            // The sleep cover owns Escape as the leave: the press sends
+            // the leave and the cover stands until the server's wake —
+            // except under the confirm overlay, which cancels first.
+            if !self.screens.confirm_open() && self.sleep_escape() {
+                return;
+            }
             // Escape over the multiplayer screen never closes to the game:
             // a standing sub-screen cancels back to the list, and the list
             // backs to the main menu (`GuiMultiplayer`'s parent screen).
@@ -3966,6 +4029,151 @@ impl ClientApp {
         self.end_session_to_title(scaled);
     }
 
+    /// Runs one death press at the free pointer's point: the button under
+    /// it plays the press sound and answers its action. Respawn asks for
+    /// the respawn through the standing session gate; the title button
+    /// stands the quit-confirm inside the screen; the confirm's Yes ends
+    /// the session to the title and its cancel respawns
+    /// (`GuiGameOver.actionPerformed:60-84`, `confirmClicked:86-99`). A
+    /// gated or missed click answers nothing and never reaches the
+    /// session, so one press is one request.
+    fn death_click_at(&mut self, point: (f32, f32)) {
+        let action = self
+            .screens
+            .death_mut()
+            .and_then(|screen| screen.click_at(point));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        match action {
+            DeathAction::Respawn | DeathAction::ConfirmRespawn => {
+                self.send_input(InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                });
+            }
+            DeathAction::QuitToTitle => {}
+            DeathAction::ConfirmQuit => {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    let scaled = renderer.scaled_resolution();
+                    self.end_session_to_title(scaled);
+                } else {
+                    self.end_session_to_title_fallback();
+                }
+            }
+        }
+    }
+
+    /// Owns one Escape press over the death screen: the source's `keyTyped`
+    /// is empty (`GuiGameOver.java:57-59`), so the press closes nothing,
+    /// sends nothing, and keeps the gate's own count — never a close plus
+    /// a fresh re-stand. True when the death screen stands.
+    fn death_escape(&mut self) -> bool {
+        self.screens.death_mut().is_some()
+    }
+
+    /// Runs one disconnect press at the free pointer's point: the Back
+    /// button plays the press sound and stands the parent — the live
+    /// server list, else a fresh multiplayer screen over the main menu
+    /// (`GuiDisconnected.actionPerformed:50-56`). A miss keeps the
+    /// screen.
+    fn disconnect_click_at(&mut self, point: (f32, f32)) {
+        let action = self
+            .screens
+            .disconnected_mut()
+            .and_then(|screen| screen.click_at(point));
+        let Some(action) = action else {
+            return;
+        };
+        let DisconnectAction::ToParent = action;
+        self.play_press_sound();
+        self.open_multiplayer();
+        if self.screens.multiplayer_mut().is_none() {
+            // No store root to load the live list from: a fresh
+            // multiplayer screen over the main menu, standing on the
+            // labels with an empty list.
+            let language = self.assets.as_ref().map(|assets| &assets.lang);
+            self.screens.open_multiplayer(
+                ServerList::default(),
+                PathBuf::new(),
+                multiplayer_labels(language),
+            );
+        }
+    }
+
+    /// Runs one confirm press at the free pointer's point: the button under
+    /// it plays the press sound and answers its action. Confirm opens the
+    /// link through the standing opener and drops; copy copies through the
+    /// clipboard and falls through to the cancel path without opening;
+    /// cancel drops with the chat beneath left open
+    /// (`GuiConfirmOpenLink.actionPerformed:44-50`,
+    /// `GuiScreen.confirmClicked:713-725`). A miss keeps the overlay.
+    fn confirm_click_at(&mut self, point: (f32, f32)) {
+        let action = self
+            .screens
+            .confirm_mut()
+            .and_then(|screen| screen.click_at(point));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        match action {
+            ConfirmAction::Confirm => {
+                let link = self
+                    .screens
+                    .confirm_mut()
+                    .map(|screen| screen.link().to_owned());
+                self.screens.cancel_confirm();
+                if let Some(link) = link {
+                    (self.opener)(&link);
+                }
+            }
+            ConfirmAction::Copy => {
+                let link = self
+                    .screens
+                    .confirm_mut()
+                    .map(|screen| screen.link().to_owned());
+                if let Some(link) = link {
+                    (self.clipboard)(&link);
+                }
+                self.screens.cancel_confirm();
+            }
+            ConfirmAction::Cancel => {
+                self.screens.cancel_confirm();
+            }
+        }
+    }
+
+    /// Owns one Escape press over the sleep cover: Escape leaves the bed
+    /// (`GuiSleepMP.keyTyped:51-67` sends C0B carrying action 2) — the
+    /// cover never closes on the press, it drops on the server's wake.
+    /// True when the cover stands, sending the leave either way.
+    fn sleep_escape(&mut self) -> bool {
+        if !self.sleep_cover {
+            return false;
+        }
+        self.send_input(InputEvent::LeaveBed);
+        true
+    }
+
+    /// Runs one sleep-cover press at the free pointer's point: the Leave
+    /// Bed button plays the press sound and sends the leave
+    /// (`GuiSleepMP.actionPerformed` id 1 wakes the player). True when the
+    /// button answers. A miss, or no cover, answers nothing.
+    fn sleep_cover_click(&mut self, point: (f32, f32), scaled: ScaledResolution) -> bool {
+        if !self.sleep_cover {
+            return false;
+        }
+        let language = self.assets.as_ref().map(|assets| &assets.lang);
+        if !leave_bed_button(&scaled, leave_bed_label(language)).pressed(point) {
+            return false;
+        }
+        self.play_press_sound();
+        self.send_input(InputEvent::LeaveBed);
+        true
+    }
+
     /// The shared session-end fold: the link drops, the join flag clears,
     /// and the main menu stands on the standing rule. The wire's
     /// disconnect and the pause menu's Disconnect button land here alike.
@@ -4682,6 +4890,13 @@ impl ClientApp {
                     .is_some_and(|screen| screen.armed().is_some())
                 {
                     self.controls_key(KeyCode::Escape);
+                } else if self.death_escape() {
+                    // The death screen owns the edge as a no-op, arm for
+                    // arm with the live key.
+                } else if !self.screens.confirm_open() && self.sleep_escape() {
+                    // The sleep cover owns the edge as the leave, arm for
+                    // arm with the live key — except under the confirm
+                    // overlay, which cancels first.
                 } else {
                     match escape_route(
                         self.chat_input.open,
@@ -5066,17 +5281,62 @@ impl ClientApp {
             }
             return;
         }
+        // The death screen holds the click the same way: a left press on a
+        // button plays the press sound and runs its action — Respawn asks
+        // for the respawn through the standing gate, Title stands the
+        // quit-confirm inside the screen (`GuiGameOver.actionPerformed`).
+        // Any other click is the screen's to swallow — the pointer never
+        // grabs behind it.
+        if self.screens.death_mut().is_some() {
+            if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                if let Some(point) = self.cursor {
+                    self.death_click_at(point);
+                }
+            }
+            return;
+        }
+        // The disconnect screen holds the click the same way: a left press
+        // on Back stands the parent server list
+        // (`GuiDisconnected.actionPerformed`:50-56). Any other click is
+        // the screen's to swallow.
+        if self.screens.disconnected_mut().is_some() {
+            if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                if let Some(point) = self.cursor {
+                    self.disconnect_click_at(point);
+                }
+            }
+            return;
+        }
+        // The confirm overlay holds the click the same way: a left press on
+        // a button opens, copies, or cancels
+        // (`GuiConfirmOpenLink.actionPerformed`:44-50). Any other click is
+        // the overlay's to swallow — the chat beneath takes nothing.
+        if self.screens.confirm_open() {
+            if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                if let Some(point) = self.cursor {
+                    self.confirm_click_at(point);
+                }
+            }
+            return;
+        }
         if self.on_screen_button(state, button) {
             return;
         }
         if self.chat_input.open {
-            // The screen holds the click. A press with the confirm overlay up
-            // belongs to the overlay, whose own keys are the keyboard's in this
-            // milestone; otherwise the press hit-tests the box's runs —
-            // `GuiChat.mouseClicked`:172-186 — and acts on the one under the
-            // free pointer.
+            // The screen holds the click. The sleep cover's Leave Bed button
+            // owns the press first — `GuiSleepMP` extends the chat screen,
+            // so a miss falls through to the box's runs below
+            // (`GuiChat.mouseClicked`:172-186).
             if state == ElementState::Pressed && !self.screens.confirm_open() {
-                self.chat_click();
+                let bedded = self.cursor.is_some_and(|point| {
+                    self.renderer
+                        .as_ref()
+                        .map(|renderer| renderer.scaled_resolution())
+                        .is_some_and(|scaled| self.sleep_cover_click(point, scaled))
+                });
+                if !bedded {
+                    self.chat_click();
+                }
             }
             return;
         }
@@ -6252,6 +6512,25 @@ fn spawn_url_opener(url: &str) {
     }
 }
 
+/// The clipboard copy the confirm overlay's Copy button runs — `wl-copy`
+/// with the link, spawned and left alone, through the house
+/// external-command pattern: no new dependency, and a spawn failure is a
+/// recorded no-op, never fatal.
+///
+/// The seam is a box so the overlay's tests run with a recording copy and no
+/// process at all.
+type ClipboardCopy = Box<dyn Fn(&str)>;
+
+/// The interim copy: `wl-copy` with the link, spawned and left alone. A
+/// spawn failure is logged, never fatal — the copy is a side effect, not
+/// the frame's own work.
+fn spawn_clipboard_copy(text: &str) {
+    match Command::new("wl-copy").arg(text).spawn() {
+        Ok(child) => tracing::info!(pid = child.id(), "the clipboard copy was spawned"),
+        Err(error) => tracing::warn!(%error, "the clipboard copy could not be spawned"),
+    }
+}
+
 /// Whether a key event is a fresh press of Enter — the confirm overlay's open
 /// key.
 ///
@@ -7247,19 +7526,20 @@ mod tests {
     //! Key-routing and command-line tests.
 
     use super::{
-        Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClickButton,
-        ClientApp, Directive, DirectiveAction, EscapeRoute, FogMode, ItemTable, Key, MouseButton,
-        PlayerState, Screens, ScriptDriver, ScriptGesture, ScriptKey, SessionLink, SkinRequest,
-        SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
-        apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
-        chat_wheel_scrolls, clear_break_stage, command_text, confirm_labels, cracks_in_view,
-        creative_wheel_notch, death_labels, digit_slot, escape_route, f3_hold_step, frame_params,
+        Aim, CameraPose, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli,
+        ClickButton, ClientApp, ClipboardCopy, Directive, DirectiveAction, EscapeRoute, FogMode,
+        ItemTable, Key, MouseButton, PlayerState, Screens, ScriptDriver, ScriptGesture, ScriptKey,
+        SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
+        WorldOverlayState, aim_outline, apply_overlay_event, bound_mouse_button, camera_pose,
+        chat_opener, chat_wheel_lines, chat_wheel_scrolls, clear_break_stage, command_text,
+        confirm_labels, cracks_in_view, creative_wheel_notch, death_labels, digit_slot,
+        disconnect_button_label, disconnect_title, escape_route, f3_hold_step, frame_params,
         gameplay_key, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
         is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv, parse_script,
         parse_server_address, particle_draws, scaled_cursor, screen_button_events,
-        screen_click_button, scripted_chat_click, skin_requests, store_aim, store_break_stage,
-        store_skins, tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step,
-        wire_sound_play,
+        screen_click_button, scripted_chat_click, skin_requests, sleep_cover_dim, sleep_dim,
+        sleep_pose, store_aim, store_break_stage, store_skins, tab_held, tooltip_point,
+        void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
     };
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
@@ -7269,6 +7549,7 @@ mod tests {
     use oxide_assets::texture::Texture;
     use oxide_client::keymap;
     use oxide_client::screens::end_states::DEATH_GRADIENT_TOP;
+    use oxide_client::screens::end_states::disconnect_button_y;
     use oxide_game::audio::{ListenerPose, PlaySound, SoundCategory};
     use oxide_game::chat::{ClickAction, ClickEvent};
     use oxide_game::container::{CLICK_MODE_DRAG, CLICK_MODE_PICKUP, CLICK_MODE_SWAP, drag_button};
@@ -11094,6 +11375,331 @@ mod tests {
         assert!(!app.screens.confirm_open(), "taking it clears the overlay");
     }
 
+    /// Stands the death screen the window's own click would find: the gated
+    /// pair on the labels at the 427x240 frame the confirm pins use.
+    fn stand_test_death(app: &mut ClientApp) {
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 2,
+        };
+        app.screens.open_death(&scaled, &death_labels(None), 0);
+    }
+
+    /// Hands the bare app a live session link and returns the input reads:
+    /// the sends the click arms route leave through it.
+    fn live_inputs(app: &mut ClientApp) -> crossbeam_channel::Receiver<InputEvent> {
+        let (_events_tx, events_rx) = unbounded();
+        let (input_tx, input_rx) = unbounded();
+        app.session = Some(SessionLink {
+            server: "test".into(),
+            events: events_rx,
+            input_tx,
+        });
+        input_rx
+    }
+
+    /// A clipboard copy that records the text it is handed: the `wl-copy`
+    /// spawn replaced in every test that runs the copy button.
+    fn recording_clipboard() -> (ClipboardCopy, Rc<RefCell<Vec<String>>>) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&seen);
+        let copy: ClipboardCopy = Box::new(move |text: &str| {
+            recorder.borrow_mut().push(text.to_owned());
+        });
+        (copy, seen)
+    }
+
+    #[test]
+    fn the_death_clicks_reach_their_actions_and_misses_are_swallowed() {
+        // `GuiGameOver.actionPerformed`:64-84 with `confirmClicked`:87-100:
+        // Respawn asks for the respawn through the standing gate, the title
+        // button stands the quit-confirm inside the screen, and the
+        // confirm's own answers quit to the title or respawn. A gated or
+        // missed click answers nothing and never reaches the session. At
+        // 427x240 the pair stands at (113, 132) and (113, 156).
+        let mut app = test_app();
+        let input_rx = live_inputs(&mut app);
+        stand_test_death(&mut app);
+        app.death_click_at((213.0, 142.0));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the gate holds the early click"
+        );
+        for _ in 0..20 {
+            app.screens.tick_death();
+        }
+        app.death_click_at((0.0, 0.0));
+        assert!(input_rx.try_recv().is_err(), "a miss is swallowed");
+        app.death_click_at((213.0, 142.0));
+        assert_eq!(
+            input_rx.try_recv().expect("the respawn leaves"),
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true
+            }
+        );
+        assert!(input_rx.try_recv().is_err(), "one press is one request");
+        app.death_click_at((213.0, 166.0));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the title stands the confirm inside"
+        );
+        assert!(
+            app.screens
+                .death_mut()
+                .is_some_and(|screen| screen.confirming()),
+            "the quit-confirm stands"
+        );
+        for _ in 0..20 {
+            app.screens.tick_death();
+        }
+        app.death_click_at((213.0, 142.0));
+        assert!(app.session.is_none(), "the confirm's Yes ends the session");
+        assert!(input_rx.try_recv().is_err(), "quitting sends no respawn");
+    }
+
+    #[test]
+    fn the_death_confirms_cancel_respawns() {
+        // `confirmClicked` with false respawns (`GuiGameOver.java`:93-98):
+        // once the title button stands the confirm and its own delay runs
+        // out, the other button asks for the respawn through the gate.
+        let mut app = test_app();
+        let input_rx = live_inputs(&mut app);
+        stand_test_death(&mut app);
+        for _ in 0..20 {
+            app.screens.tick_death();
+        }
+        app.death_click_at((213.0, 166.0));
+        assert!(
+            app.screens
+                .death_mut()
+                .is_some_and(|screen| screen.confirming()),
+            "the quit-confirm stands"
+        );
+        for _ in 0..20 {
+            app.screens.tick_death();
+        }
+        app.death_click_at((213.0, 166.0));
+        assert_eq!(
+            input_rx.try_recv().expect("the cancel respawns"),
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true
+            }
+        );
+    }
+
+    #[test]
+    fn escape_over_the_death_screen_is_a_no_op() {
+        // The source's `keyTyped` is empty (`GuiGameOver.java`:57-59): one
+        // Escape press closes nothing, sends nothing, and keeps the gate's
+        // own count — never a close plus a fresh re-stand.
+        let mut app = test_app();
+        assert!(!app.death_escape(), "no death screen owns the press");
+        stand_test_death(&mut app);
+        for _ in 0..5 {
+            app.screens.tick_death();
+        }
+        assert!(app.death_escape(), "the standing death owns the press");
+        let mut dropped = None;
+        assert!(
+            app.screens.escape(&mut dropped).is_none(),
+            "the escape sends nothing"
+        );
+        assert!(dropped.is_none(), "the escape drops no cursor");
+        assert!(app.screens.death_mut().is_some(), "the screen stands");
+        assert!(
+            app.screens
+                .death_mut()
+                .is_some_and(|screen| !screen.buttons()[0].enabled),
+            "the gate keeps its count"
+        );
+    }
+
+    #[test]
+    fn the_disconnect_back_button_stands_the_server_list() {
+        // `GuiDisconnected.actionPerformed`:50-56 returns to the parent: the
+        // live server list, standing on the stored entries.
+        let mut app = test_app();
+        let font = click_font();
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 2,
+        };
+        app.screens.open_disconnected(
+            &scaled,
+            disconnect_title(None),
+            String::from("the server closed the connection"),
+            &font,
+            disconnect_button_label(None),
+        );
+        app.disconnect_click_at((0.0, 0.0));
+        assert!(
+            app.screens.disconnected_mut().is_some(),
+            "a miss keeps the screen"
+        );
+        let lines = app
+            .screens
+            .disconnected_mut()
+            .map(|screen| screen.lines().len())
+            .unwrap_or(1);
+        let y = disconnect_button_y(240, lines, font.height()) + 10.0;
+        app.disconnect_click_at((213.5, y));
+        assert!(
+            app.screens.multiplayer_mut().is_some(),
+            "Back stands the server list"
+        );
+        assert!(
+            app.screens.disconnected_mut().is_none(),
+            "the disconnect drops behind it"
+        );
+    }
+
+    #[test]
+    fn the_confirm_mouse_trio_opens_copies_and_cancels() {
+        // `GuiConfirmOpenLink.actionPerformed`:44-50 over
+        // `GuiScreen.confirmClicked`:713-725: confirm opens the link and
+        // drops, copy copies then falls through to the cancel path without
+        // opening, cancel drops with the chat beneath left open. At 427x240
+        // the row stands at y 136: (58, 136), (163, 136), (268, 136).
+        let mut app = test_app();
+        let (opener, opened) = recording_opener();
+        app.opener = opener;
+        let (clipboard, copied) = recording_clipboard();
+        app.clipboard = clipboard;
+        stand_test_confirm(&mut app, "https://a.example");
+        app.confirm_click_at((0.0, 0.0));
+        assert!(app.screens.confirm_open(), "a miss keeps the overlay");
+        app.confirm_click_at((108.0, 146.0));
+        assert_eq!(opened.borrow().as_slice(), ["https://a.example".to_owned()]);
+        assert!(!app.screens.confirm_open(), "the open drops the overlay");
+        stand_test_confirm(&mut app, "https://b.example");
+        app.confirm_click_at((213.0, 146.0));
+        assert_eq!(copied.borrow().as_slice(), ["https://b.example".to_owned()]);
+        assert_eq!(opened.borrow().len(), 1, "the copy opens nothing");
+        assert!(!app.screens.confirm_open(), "the copy drops the overlay");
+        stand_test_confirm(&mut app, "https://c.example");
+        app.confirm_click_at((318.0, 146.0));
+        assert!(!app.screens.confirm_open(), "the cancel drops the overlay");
+        assert_eq!(opened.borrow().len(), 1, "the cancel opens nothing");
+        assert_eq!(copied.borrow().len(), 1, "the cancel copies nothing");
+    }
+
+    #[test]
+    fn escape_and_the_leave_bed_button_both_send_the_sleep_leave() {
+        // `GuiSleepMP.keyTyped`:51-67: Escape and the Leave Bed button both
+        // send C0B carrying action 2 — the cover never closes on the press,
+        // it drops on the server's wake. At 427x240 the button stands at
+        // (113, 200), 200x20.
+        let mut app = test_app();
+        let input_rx = live_inputs(&mut app);
+        app.chat_input.open("");
+        assert!(!app.sleep_escape(), "no cover sends nothing");
+        assert!(input_rx.try_recv().is_err(), "no cover sends nothing");
+        app.sleep_cover = true;
+        assert!(app.sleep_escape(), "the cover's Escape leaves");
+        assert_eq!(
+            input_rx.try_recv().expect("the leave leaves"),
+            InputEvent::LeaveBed
+        );
+        assert!(app.chat_input.open, "the cover stands until the wake");
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 2,
+        };
+        assert!(
+            app.sleep_cover_click((213.0, 210.0), scaled),
+            "the button leaves"
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("the button's leave leaves"),
+            InputEvent::LeaveBed
+        );
+        assert!(
+            !app.sleep_cover_click((0.0, 0.0), scaled),
+            "a miss is no leave"
+        );
+        assert!(input_rx.try_recv().is_err(), "a miss sends nothing");
+        app.sleep_cover = false;
+        assert!(
+            !app.sleep_cover_click((213.0, 210.0), scaled),
+            "no cover is no leave"
+        );
+    }
+
+    #[test]
+    fn the_sleep_dim_and_rise_apply_as_their_pins() {
+        // The HUD darkening rides the timer (`GuiIngame.java`:197-212) and
+        // the camera the sleeping flag (`EntityRenderer.orientCamera`'s
+        // sleeping branch, `EntityRenderer.java`:644-657): no timer is no
+        // dim, and an awake pose passes through untouched.
+        assert_eq!(sleep_cover_dim(0), None, "no timer is no dim");
+        assert_eq!(sleep_cover_dim(50), Some(sleep_dim(50)), "the ramp draws");
+        let pose = CameraPose {
+            position: [1.0, 64.0, -5.0],
+            yaw: 30.0,
+            pitch: 0.0,
+            sneak: false,
+        };
+        assert_eq!(
+            sleep_pose(pose, false, 0),
+            pose,
+            "an awake pose passes through"
+        );
+        let risen = sleep_pose(pose, true, 0);
+        assert_eq!(
+            risen.position[1],
+            64.0 + 1.0 + 0.3,
+            "the eye rises by one block plus the lift"
+        );
+        assert_eq!(risen.yaw, 210.0, "south beds turn the yaw by 180");
+        assert_eq!(risen.pitch, pose.pitch, "the pitch passes through");
+        // The cover's button draws over the chat while the cover stands and
+        // nowhere else.
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 2,
+        };
+        let font = click_font();
+        assert!(
+            super::view::sleep_cover_draws(
+                false,
+                Some(&font),
+                scaled,
+                Some((213.0, 210.0)),
+                String::from("Leave Bed")
+            )
+            .is_empty(),
+            "no cover draws nothing"
+        );
+        assert!(
+            super::view::sleep_cover_draws(
+                true,
+                None,
+                scaled,
+                Some((213.0, 210.0)),
+                String::from("Leave Bed")
+            )
+            .is_empty(),
+            "no font draws nothing"
+        );
+        assert!(
+            !super::view::sleep_cover_draws(
+                true,
+                Some(&font),
+                scaled,
+                Some((213.0, 210.0)),
+                String::from("Leave Bed")
+            )
+            .is_empty(),
+            "the button draws over the cover"
+        );
+    }
+
     #[test]
     fn the_tooltip_point_follows_the_open_field_and_steps_aside_for_the_confirm() {
         // The hover is the chat screen's own (`GuiChat.drawScreen`:305-310
@@ -11134,10 +11740,11 @@ mod tests {
 
     #[test]
     fn a_click_on_the_confirm_overlay_acts_on_nothing() {
-        // While the overlay is up the click belongs to it, and the overlay has
-        // no mouse surface in this milestone: no run is acted on, the overlay
-        // stays, and above all no link opens (that is Enter's, and Enter's
-        // only).
+        // A chat-run click while the overlay stands still routes through
+        // the run's own action — the overlay's buttons belong to the
+        // window's own click path — so no run is acted on here, the
+        // overlay stays, and above all no link opens through the run
+        // (opening is the overlay's own confirm answer).
         let mut app = test_app();
         let (opener, seen) = recording_opener();
         app.opener = opener;
