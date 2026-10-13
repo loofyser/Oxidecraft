@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use oxide_game::input::InputEvent;
+use oxide_game::settings::GameSettings;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
 use oxide_render::hud::ScaledResolution;
@@ -46,6 +47,7 @@ use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
 use menu::MainMenuScreen;
 use multiplayer::{MultiplayerLabels, MultiplayerScreen, ServerList};
+use options::{OptionsLabels, OptionsScreen, VideoLabels, VideoScreen};
 use pause::{AchievementsScreen, PauseScreen, SnooperScreen, StatsScreen};
 use sign::{SignMapEntry, SignScreen};
 
@@ -57,6 +59,7 @@ pub mod family_b;
 pub mod inventory;
 pub mod menu;
 pub mod multiplayer;
+pub mod options;
 pub mod pause;
 pub mod sign;
 pub mod widgets;
@@ -106,6 +109,14 @@ pub enum ScreenState {
     /// recorded body, with its parent declared for the options hub (boxed
     /// like the container kinds).
     Snooper(Box<SnooperScreen>),
+    /// The options hub: the source's button grid over the settings, with
+    /// the FOV slider and the no-world realms toggle on row 0 (boxed like
+    /// the container kinds).
+    Options(Box<OptionsScreen>),
+    /// The video settings screen: the sixteen option rows (or fourteen
+    /// without VBO support) over the settings, standing from the hub's
+    /// video button (boxed like the container kinds).
+    VideoSettings(Box<VideoScreen>),
 }
 
 impl ScreenState {
@@ -126,7 +137,9 @@ impl ScreenState {
             | ScreenState::Pause(_)
             | ScreenState::Stats(_)
             | ScreenState::Achievements(_)
-            | ScreenState::Snooper(_) => None,
+            | ScreenState::Snooper(_)
+            | ScreenState::Options(_)
+            | ScreenState::VideoSettings(_) => None,
             ScreenState::Multiplayer(_) => None,
         }
     }
@@ -164,6 +177,15 @@ pub struct Screens {
     /// placeholder from the pause stashes it here; a direct open stashes
     /// nothing, and the return then follows the base rule instead.
     pause_parent: Option<PauseScreen>,
+    /// The pause menu beneath the options hub: the pause's options button
+    /// stands the hub, and the hub's Done returns here. A direct hub open
+    /// stashes nothing, and Done then follows the base rule instead.
+    options_parent: Option<PauseScreen>,
+    /// The options hub beneath the video screen or the hub-opened
+    /// snooper: their Done buttons and the snooper's Escape return here.
+    /// A direct open stashes nothing, and the return then follows the
+    /// base rule instead.
+    options_screen: Option<OptionsScreen>,
 }
 
 impl Screens {
@@ -494,6 +516,8 @@ impl Screens {
                     | ScreenState::Stats(_)
                     | ScreenState::Achievements(_)
                     | ScreenState::Snooper(_)
+                    | ScreenState::Options(_)
+                    | ScreenState::VideoSettings(_)
             )
         )
     }
@@ -542,15 +566,144 @@ impl Screens {
         ))));
     }
 
+    /// The open options hub, when the current screen is one: the frame's
+    /// pointer and the options keys drive this.
+    pub fn options_mut(&mut self) -> Option<&mut OptionsScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Options(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open video settings screen, when the current screen is one.
+    pub fn video_mut(&mut self) -> Option<&mut VideoScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::VideoSettings(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Stands the options hub at `scaled` on `settings` with `labels`:
+    /// the pause menu's options button stands it, stashing the pause as
+    /// the parent its Done button returns to (`GuiOptions`' `parentScreen`
+    /// is the pause in-session). A direct open stashes nothing.
+    pub fn open_options(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: OptionsLabels,
+    ) {
+        if let Some(ScreenState::Pause(screen)) = self.current.take() {
+            self.options_parent = Some(*screen);
+        }
+        self.current = Some(ScreenState::Options(Box::new(OptionsScreen::new(
+            &scaled, settings, labels,
+        ))));
+    }
+
+    /// Stands the video settings screen at `scaled` on `settings` with
+    /// `labels` (`vbo_supported` is the renderer's standing shape): the
+    /// hub's video button stands it, stashing the hub as the parent its
+    /// Done button returns to. A direct open stashes nothing.
+    pub fn open_video_settings(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: VideoLabels,
+        vbo_supported: bool,
+    ) {
+        if let Some(ScreenState::Options(screen)) = self.current.take() {
+            self.options_screen = Some(*screen);
+        }
+        self.current = Some(ScreenState::VideoSettings(Box::new(VideoScreen::new(
+            &scaled,
+            settings,
+            labels,
+            vbo_supported,
+        ))));
+    }
+
+    /// Stands the snooper placeholder from the options hub: the hub's
+    /// snooper button stands it on `done`, stashing the hub as the parent
+    /// its Done button and Escape return to (the declared slot wires here).
+    pub fn open_snooper_from_options(&mut self, scaled: ScaledResolution, done: String) {
+        if let Some(ScreenState::Options(screen)) = self.current.take() {
+            self.options_screen = Some(*screen);
+        }
+        self.current = Some(ScreenState::Snooper(Box::new(SnooperScreen::new(
+            &scaled, done,
+        ))));
+    }
+
+    /// Returns the video screen or the hub-opened snooper to its stashed
+    /// options hub. Answers whether a hub stood: with none stashed the
+    /// caller follows the base rule instead.
+    pub fn back_to_options(&mut self) -> bool {
+        let Some(parent) = self.options_screen.take() else {
+            return false;
+        };
+        self.current = Some(ScreenState::Options(Box::new(parent)));
+        true
+    }
+
     /// Returns the statistics or achievements placeholder to its stashed
     /// pause parent. Answers whether a parent stood: with none stashed
     /// the caller follows the base rule instead.
     pub fn back_to_pause(&mut self) -> bool {
+        if matches!(
+            self.current,
+            Some(ScreenState::Options(_) | ScreenState::VideoSettings(_))
+        ) {
+            // The hub's Done (and the video screen's, via the hub) returns
+            // to the pause it stood from — the video screen first answers
+            // its hub through `back_to_options`, so only the direct hub
+            // return lands here.
+            if self.current.as_ref().is_some_and(|screen| {
+                matches!(screen, ScreenState::VideoSettings(_)) && self.options_screen.is_some()
+            }) {
+                return false;
+            }
+            let Some(parent) = self.options_parent.take() else {
+                return false;
+            };
+            self.options_screen = None;
+            self.current = Some(ScreenState::Pause(Box::new(parent)));
+            return true;
+        }
         let Some(parent) = self.pause_parent.take() else {
             return false;
         };
         self.current = Some(ScreenState::Pause(Box::new(parent)));
         true
+    }
+
+    /// Re-lays the open options hub or video screen at the new scaled
+    /// size (`initGui` re-runs on resize): the hub on its labels, the
+    /// video screen on its own. Anything else stays put.
+    pub fn resize_options(
+        &mut self,
+        scaled: &ScaledResolution,
+        settings: &GameSettings,
+        options: OptionsLabels,
+        video: VideoLabels,
+        vbo_supported: bool,
+    ) {
+        match self.current.take() {
+            Some(ScreenState::Options(_)) => {
+                self.current = Some(ScreenState::Options(Box::new(OptionsScreen::new(
+                    scaled, settings, options,
+                ))));
+            }
+            Some(ScreenState::VideoSettings(_)) => {
+                self.current = Some(ScreenState::VideoSettings(Box::new(VideoScreen::new(
+                    scaled,
+                    settings,
+                    video,
+                    vbo_supported,
+                ))));
+            }
+            other => self.current = other,
+        }
     }
 
     /// Re-lays the open pause-family screen at the new scaled size
@@ -654,13 +807,18 @@ impl Screens {
     /// the screen gone, C0D sent. The statistics and achievements
     /// placeholders answer their pause parent instead — the plan's
     /// "screen → its parent" — and with no parent stashed they follow the
-    /// base rule. The chat above answers first and never reaches here.
+    /// base rule. The hub-opened snooper answers its hub the same way; a
+    /// directly opened snooper closes to the game. The chat above answers
+    /// first and never reaches here.
     pub fn escape(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
         if matches!(
             self.current,
             Some(ScreenState::Stats(_) | ScreenState::Achievements(_))
         ) && self.back_to_pause()
         {
+            return None;
+        }
+        if matches!(self.current, Some(ScreenState::Snooper(_))) && self.back_to_options() {
             return None;
         }
         self.close(cursor)

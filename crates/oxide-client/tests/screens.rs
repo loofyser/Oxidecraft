@@ -1861,3 +1861,555 @@ fn pause_probe_font() -> oxide_assets::font::Font {
     )
     .expect("the synthetic sheet loads")
 }
+
+// Task 18's options suite: the hub's source button grid, the video screen's
+// sixteen rows in source order, the option-slider laws and the cycle-button
+// widget, the toggle-now/slider-at-Done save split, and the routing into
+// and out of the pause menu's Options button.
+//
+// Layout pins mirror `GuiOptions.java:44-107` (FOV slider row 0; the
+// no-world REALMS_NOTIFICATIONS placement at `:81`; fixed 150x20 pairs at
+// `w/2-155`/`w/2+5`, rows `h/6+48k-6`; Done 200 at `w/2-100, h/6+168`;
+// title at y 15) and `GuiVideoSettings.java:16-51` (sixteen options in
+// fixed order; 150x20 pairs at `w/2-155`/`+160`, slot 25, list top 32 /
+// bottom h-32, width 400; Done 200 at `h-27`; the VBO-less break dropping
+// USE_VBO and ENTITY_SHADOWS). Every formula here is closed-form — no GPU
+// needed.
+
+use oxide_client::screens::options::{
+    OPTIONS_CHAT_ID, OPTIONS_CONTROLS_ID, OPTIONS_DONE_ID, OPTIONS_LANGUAGE_ID, OPTIONS_REALMS_ID,
+    OPTIONS_RESOURCEPACK_ID, OPTIONS_SKIN_ID, OPTIONS_SNOOPER_ID, OPTIONS_SOUNDS_ID,
+    OPTIONS_VIDEO_ID, OptionsAction, OptionsScreen, SaveKind, VIDEO_OPTIONS, VideoAction,
+    VideoOption, VideoScreen, ambient_occlusion_label, clouds_label, cycle_ambient_occlusion,
+    cycle_clouds, cycle_gui_scale, cycle_particles, denormalize_option, fov_label,
+    framerate_denormalize, framerate_label, framerate_normalize, gamma_denormalize, gamma_label,
+    gamma_normalize, graphics_label, gui_scale_label, mipmap_label, normalize_option,
+    options_labels, particles_label, render_distance_label, snap_to_step, toggle_label,
+    video_labels, video_row_options,
+};
+use oxide_client::screens::widgets::{OptionButton, OptionSlider};
+use oxide_game::settings::{CloudSetting, GameSettings, ParticleSetting};
+
+/// The hub over default settings with the store's English.
+fn options_english() -> OptionsScreen {
+    OptionsScreen::new(&wide(), &GameSettings::default(), options_labels(None))
+}
+
+/// The video screen over default settings with the store's English and VBOs
+/// present (the renderer's standing shape).
+fn video_english() -> VideoScreen {
+    VideoScreen::new(&wide(), &GameSettings::default(), video_labels(None), true)
+}
+
+#[test]
+fn the_option_slider_laws_snap_denormalize_and_normalize() {
+    // `GameSettings.java:1380-1404`: snap = step·round(v/step) (step 0
+    // passes through), denormalize = snap(min+(max-min)·clamp01(v)),
+    // normalize = clamp01((snap(v)-min)/(max-min)).
+    assert_eq!(snap_to_step(2.4, 1.0), 2.0);
+    assert_eq!(snap_to_step(2.5, 1.0), 3.0);
+    assert_eq!(snap_to_step(125.0, 10.0), 130.0);
+    assert_eq!(snap_to_step(0.37, 0.0), 0.37);
+    assert_eq!(denormalize_option(0.0, 2.0, 32.0, 1.0), 2.0);
+    assert_eq!(denormalize_option(1.0, 2.0, 32.0, 1.0), 32.0);
+    assert_eq!(denormalize_option(0.5, 2.0, 32.0, 1.0), 17.0);
+    assert_eq!(denormalize_option(-0.5, 2.0, 32.0, 1.0), 2.0);
+    assert_eq!(denormalize_option(1.5, 2.0, 32.0, 1.0), 32.0);
+    assert_eq!(denormalize_option(0.44, 10.0, 260.0, 10.0), 120.0);
+    assert_eq!(denormalize_option(0.37, 0.0, 1.0, 0.0), 0.37);
+    assert_eq!(normalize_option(2.0, 2.0, 32.0, 1.0), 0.0);
+    assert_eq!(normalize_option(32.0, 2.0, 32.0, 1.0), 1.0);
+    assert_eq!(normalize_option(17.0, 2.0, 32.0, 1.0), 0.5);
+    assert_eq!(normalize_option(120.0, 10.0, 260.0, 10.0), 0.44);
+    assert_eq!(normalize_option(0.0, 0.0, 1.0, 0.0), 0.0);
+}
+
+#[test]
+fn the_option_slider_press_and_drag_write_per_event() {
+    // `GuiOptionSlider.java:44-100`: press folds the pointer and latches,
+    // each drag motion writes again, release clears; the knob rides two
+    // 4x20 halves (u 0 / u 196, v 66) at `x+v*(w-8)`.
+    let mut slider = OptionSlider::new(
+        10.0,
+        10.0,
+        150.0,
+        20.0,
+        2.0,
+        32.0,
+        1.0,
+        12.0,
+        String::from("Render Distance: 12 chunks"),
+    );
+    assert_eq!(slider.value(), 12.0);
+    assert_eq!(slider.knob_x(), 10.0 + (10.0 / 30.0) * 142.0);
+    let write = slider.press((85.0, 20.0)).expect("the press lands");
+    assert_eq!(write, 17.0, "the press writes the denormalized value");
+    assert!(slider.dragging(), "the press latches the drag");
+    let write = slider.drag_to(156.0).expect("the latched drag writes");
+    assert_eq!(write, 32.0, "each drag motion writes per event");
+    slider.release();
+    assert!(!slider.dragging(), "release clears the latch");
+    assert_eq!(
+        slider.drag_to(10.0),
+        None,
+        "an unlatched drag writes nothing"
+    );
+    assert_eq!(
+        slider.press((500.0, 500.0)),
+        None,
+        "a press outside writes nothing"
+    );
+    let draws = slider.draws(&pause_probe_font(), None);
+    let knob: Vec<(f32, f32)> = draws
+        .iter()
+        .filter_map(|draw| match draw {
+            oxide_render::hud::HudDraw::TexturedRect { x, y, width, .. } if *width == 4.0 => {
+                Some((*x, *y))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(knob.len(), 2, "the knob draws its two 4-wide halves");
+    assert_eq!(knob[1].0 - knob[0].0, 4.0, "the halves sit side by side");
+}
+
+#[test]
+fn the_cycle_button_composes_label_and_value() {
+    // `GuiOptionButton.java` + `getKeyBinding`: the label carries the name
+    // and the value (`"Graphics: Fancy"`); a press answers the id.
+    let mut button = OptionButton::new(
+        101,
+        10.0,
+        10.0,
+        150.0,
+        20.0,
+        String::from("Graphics"),
+        String::from("Fancy"),
+    );
+    assert_eq!(button.label(), "Graphics: Fancy");
+    assert!(button.press((20.0, 15.0)), "a press on the rect answers");
+    assert!(!button.press((500.0, 500.0)), "empty space answers nothing");
+    button.set_value(String::from("Fast"));
+    assert_eq!(button.label(), "Graphics: Fast");
+    let draws = button.draws(&pause_probe_font(), None);
+    assert!(
+        draws.iter().any(|draw| matches!(draw,
+            oxide_render::hud::HudDraw::Text { text, .. } if text == "Graphics: Fast")),
+        "the composed label draws"
+    );
+}
+
+#[test]
+fn the_hub_pins_the_source_button_grid() {
+    // `GuiOptions.java:44-107` at the wide size (427x240: half 213):
+    // the FOV slider row 0 at `w/2-155, h/6-12`, the no-world realms
+    // toggle beside it, the fixed 150x20 pairs, Done 200 at `w/2-100,
+    // h/6+168`.
+    assert_eq!(OPTIONS_VIDEO_ID, 101);
+    assert_eq!(OPTIONS_DONE_ID, 200);
+    assert_eq!(OPTIONS_CONTROLS_ID, 100);
+    assert_eq!(OPTIONS_LANGUAGE_ID, 102);
+    assert_eq!(OPTIONS_CHAT_ID, 103);
+    assert_eq!(OPTIONS_SNOOPER_ID, 104);
+    assert_eq!(OPTIONS_RESOURCEPACK_ID, 105);
+    assert_eq!(OPTIONS_SOUNDS_ID, 106);
+    assert_eq!(OPTIONS_SKIN_ID, 110);
+    assert_eq!(
+        OPTIONS_REALMS_ID, 44,
+        "the realms toggle carries the REALMS_NOTIFICATIONS ordinal"
+    );
+    let screen = options_english();
+    assert_eq!(
+        (screen.fov_slider().x(), screen.fov_slider().y()),
+        (58.0, 28.0),
+        "the FOV slider stands row 0 left"
+    );
+    assert_eq!(
+        (screen.realms_button().x(), screen.realms_button().y()),
+        (218.0, 28.0),
+        "the no-world realms toggle stands row 0 right"
+    );
+    let rects: Vec<(i32, f32, f32, f32, f32)> = screen
+        .buttons()
+        .iter()
+        .map(|button| (button.id, button.x, button.y, button.w, button.h))
+        .collect();
+    assert_eq!(
+        rects,
+        vec![
+            (OPTIONS_SKIN_ID, 58.0, 82.0, 150.0, 20.0),
+            (OPTIONS_SOUNDS_ID, 58.0, 106.0, 150.0, 20.0),
+            (OPTIONS_VIDEO_ID, 58.0, 130.0, 150.0, 20.0),
+            (OPTIONS_LANGUAGE_ID, 58.0, 154.0, 150.0, 20.0),
+            (OPTIONS_RESOURCEPACK_ID, 58.0, 178.0, 150.0, 20.0),
+            (OPTIONS_DONE_ID, 113.0, 208.0, 200.0, 20.0),
+            (OPTIONS_CONTROLS_ID, 218.0, 130.0, 150.0, 20.0),
+            (OPTIONS_CHAT_ID, 218.0, 154.0, 150.0, 20.0),
+            (OPTIONS_SNOOPER_ID, 218.0, 178.0, 150.0, 20.0),
+        ],
+        "the fixed pairs stand at the source's coordinates"
+    );
+    for button in screen.buttons() {
+        assert!(
+            !screen
+                .buttons()
+                .iter()
+                .any(|other| other.id == 107 || other.id == 8675309),
+            "button {} is neither stream nor super-secret",
+            button.id
+        );
+    }
+}
+
+#[test]
+fn the_video_screen_lists_sixteen_rows_in_source_order() {
+    // `GuiVideoSettings.java:16`: GRAPHICS, RENDER_DISTANCE,
+    // AMBIENT_OCCLUSION, FRAMERATE_LIMIT, ANAGLYPH, VIEW_BOBBING,
+    // GUI_SCALE, GAMMA, RENDER_CLOUDS, PARTICLES, USE_FULLSCREEN,
+    // ENABLE_VSYNC, MIPMAP_LEVELS, BLOCK_ALTERNATIVES, USE_VBO,
+    // ENTITY_SHADOWS — eight rows of two 150x20 (`w/2-155`, `+160`),
+    // slot 25, list top 32 / bottom h-32, width 400; Done at `h-27`.
+    assert_eq!(
+        VIDEO_OPTIONS,
+        [
+            VideoOption::Graphics,
+            VideoOption::RenderDistance,
+            VideoOption::AmbientOcclusion,
+            VideoOption::FramerateLimit,
+            VideoOption::Anaglyph,
+            VideoOption::ViewBobbing,
+            VideoOption::GuiScale,
+            VideoOption::Gamma,
+            VideoOption::RenderClouds,
+            VideoOption::Particles,
+            VideoOption::UseFullscreen,
+            VideoOption::EnableVsync,
+            VideoOption::MipmapLevels,
+            VideoOption::BlockAlternatives,
+            VideoOption::UseVbo,
+            VideoOption::EntityShadows,
+        ]
+    );
+    assert_eq!(
+        video_row_options(true).len(),
+        16,
+        "VBOs present keeps every row"
+    );
+    let screen = video_english();
+    assert_eq!(screen.row_count(), 8, "sixteen rows pair into eight");
+    assert_eq!(screen.list_top(), 32.0);
+    assert_eq!(screen.list_bottom(&wide()), 208.0, "the list ends at h-32");
+    assert_eq!(screen.list_width(), 400.0);
+    assert_eq!(screen.row_height(), 25.0);
+    let (x, y, w, h) = screen.done_rect(&wide());
+    assert_eq!(
+        (x, y, w, h),
+        (113.0, 213.0, 200.0, 20.0),
+        "Done sits at h-27"
+    );
+    let (left, right) = screen.row_pair(0);
+    assert_eq!((left.x(), left.y(), left.w()), (58.0, 32.0, 150.0));
+    assert_eq!((right.x(), right.y(), right.w()), (218.0, 32.0, 150.0));
+}
+
+#[test]
+fn the_video_truncation_drops_vbo_and_entity_shadows() {
+    // `GuiVideoSettings.java:34-51`: without VBO support the copy loop
+    // breaks BEFORE USE_VBO, so ENTITY_SHADOWS drops with it.
+    let rows = video_row_options(false);
+    assert_eq!(rows.len(), 14, "the break drops two rows' worth");
+    assert_eq!(
+        *rows.last().expect("fourteen rows stand"),
+        VideoOption::BlockAlternatives
+    );
+    assert!(
+        !rows.contains(&VideoOption::UseVbo),
+        "USE_VBO drops at the break"
+    );
+    assert!(
+        !rows.contains(&VideoOption::EntityShadows),
+        "ENTITY_SHADOWS drops with it"
+    );
+}
+
+#[test]
+fn the_video_labels_read_min_mid_and_max() {
+    // `getKeyBinding:623` with the store's `en_US.lang` English: "N
+    // chunks", "N fps" / "Unlimited", Moody / "+N%" / Bright, "OFF" / N,
+    // Auto…Large, OFF/Minimum/Maximum, OFF/Fast/Fancy, All/Decreased /
+    // Minimal, Fancy/Fast, ON/OFF, Normal/N/Quake Pro.
+    assert_eq!(
+        render_distance_label("Render Distance", 2),
+        String::from("Render Distance: 2 chunks")
+    );
+    assert_eq!(
+        render_distance_label("Render Distance", 32),
+        String::from("Render Distance: 32 chunks")
+    );
+    assert_eq!(
+        framerate_label("Max Framerate", 10),
+        String::from("Max Framerate: 10 fps")
+    );
+    assert_eq!(
+        framerate_label("Max Framerate", 120),
+        String::from("Max Framerate: 120 fps")
+    );
+    assert_eq!(
+        framerate_label("Max Framerate", 255),
+        String::from("Max Framerate: Unlimited")
+    );
+    assert_eq!(
+        framerate_normalize(255),
+        1.0,
+        "the sentinel normalizes to the top"
+    );
+    assert_eq!(
+        framerate_denormalize(1.0),
+        255,
+        "the top step folds into the sentinel"
+    );
+    assert_eq!(framerate_denormalize(0.44), 120);
+    assert_eq!(
+        gamma_label("Brightness", 0),
+        String::from("Brightness: Moody")
+    );
+    assert_eq!(
+        gamma_label("Brightness", 100),
+        String::from("Brightness: Bright")
+    );
+    assert_eq!(
+        gamma_label("Brightness", 37),
+        String::from("Brightness: +37%")
+    );
+    assert!((gamma_normalize(37) - 0.37).abs() < 1e-6);
+    assert_eq!(gamma_denormalize(0.37), 37);
+    assert_eq!(
+        mipmap_label("Mipmap Levels", 0),
+        String::from("Mipmap Levels: OFF")
+    );
+    assert_eq!(
+        mipmap_label("Mipmap Levels", 4),
+        String::from("Mipmap Levels: 4")
+    );
+    assert_eq!(
+        gui_scale_label("GUI Scale", 0),
+        String::from("GUI Scale: Auto")
+    );
+    assert_eq!(
+        gui_scale_label("GUI Scale", 1),
+        String::from("GUI Scale: Small")
+    );
+    assert_eq!(
+        gui_scale_label("GUI Scale", 2),
+        String::from("GUI Scale: Normal")
+    );
+    assert_eq!(
+        gui_scale_label("GUI Scale", 3),
+        String::from("GUI Scale: Large")
+    );
+    assert_eq!(
+        ambient_occlusion_label("Smooth Lighting", 0),
+        String::from("Smooth Lighting: OFF")
+    );
+    assert_eq!(
+        ambient_occlusion_label("Smooth Lighting", 1),
+        String::from("Smooth Lighting: Minimum")
+    );
+    assert_eq!(
+        ambient_occlusion_label("Smooth Lighting", 2),
+        String::from("Smooth Lighting: Maximum")
+    );
+    assert_eq!(
+        clouds_label("Clouds", CloudSetting::Off),
+        String::from("Clouds: OFF")
+    );
+    assert_eq!(
+        clouds_label("Clouds", CloudSetting::Fast),
+        String::from("Clouds: Fast")
+    );
+    assert_eq!(
+        clouds_label("Clouds", CloudSetting::Fancy),
+        String::from("Clouds: Fancy")
+    );
+    assert_eq!(
+        particles_label("Particles", ParticleSetting::All),
+        String::from("Particles: All")
+    );
+    assert_eq!(
+        particles_label("Particles", ParticleSetting::Decreased),
+        String::from("Particles: Decreased")
+    );
+    assert_eq!(
+        particles_label("Particles", ParticleSetting::Minimal),
+        String::from("Particles: Minimal")
+    );
+    assert_eq!(
+        graphics_label("Graphics", true),
+        String::from("Graphics: Fancy")
+    );
+    assert_eq!(
+        graphics_label("Graphics", false),
+        String::from("Graphics: Fast")
+    );
+    assert_eq!(
+        toggle_label("View Bobbing", true),
+        String::from("View Bobbing: ON")
+    );
+    assert_eq!(
+        toggle_label("View Bobbing", false),
+        String::from("View Bobbing: OFF")
+    );
+    assert_eq!(fov_label("FOV", 70), String::from("FOV: Normal"));
+    assert_eq!(fov_label("FOV", 110), String::from("FOV: Quake Pro"));
+    assert_eq!(fov_label("FOV", 90), String::from("FOV: 90"));
+}
+
+#[test]
+fn the_cycle_orders_wrap_the_source_way() {
+    // `setOptionValue`: GUI_SCALE `+v & 3`, PARTICLES / RENDER_CLOUDS /
+    // AMBIENT_OCCLUSION `+v % 3`.
+    assert_eq!(cycle_gui_scale(3), 0);
+    assert_eq!(cycle_gui_scale(0), 1);
+    assert_eq!(cycle_clouds(CloudSetting::Fancy), CloudSetting::Off);
+    assert_eq!(cycle_clouds(CloudSetting::Off), CloudSetting::Fast);
+    assert_eq!(
+        cycle_particles(ParticleSetting::Minimal),
+        ParticleSetting::All
+    );
+    assert_eq!(cycle_ambient_occlusion(2), 0);
+    assert_eq!(cycle_ambient_occlusion(0), 1);
+}
+
+#[test]
+fn the_save_split_persists_toggles_now_and_sliders_at_done() {
+    // `setOptionValue:522` ends in `saveOptions` — every toggle persists
+    // at once — while `setOptionFloatValue:256-360` never saves, so
+    // sliders persist at the next Done/screen-switch save.
+    for action in [
+        OptionsAction::RealmsToggled,
+        OptionsAction::Video,
+        OptionsAction::Snooper,
+        OptionsAction::Done,
+    ] {
+        assert_eq!(
+            action.save_kind(),
+            SaveKind::Immediate,
+            "{action:?} saves at once"
+        );
+    }
+    assert_eq!(
+        OptionsAction::FovChanged.save_kind(),
+        SaveKind::Deferred,
+        "the hub slider defers to Done"
+    );
+    for action in [
+        VideoAction::GraphicsCycled,
+        VideoAction::AmbientOcclusionCycled,
+        VideoAction::AnaglyphToggled,
+        VideoAction::ViewBobbingToggled,
+        VideoAction::GuiScaleCycled,
+        VideoAction::CloudsCycled,
+        VideoAction::ParticlesCycled,
+        VideoAction::FullscreenToggled,
+        VideoAction::VsyncToggled,
+        VideoAction::BlockAlternativesToggled,
+        VideoAction::VboToggled,
+        VideoAction::EntityShadowsToggled,
+        VideoAction::Done,
+    ] {
+        assert_eq!(
+            action.save_kind(),
+            SaveKind::Immediate,
+            "{action:?} saves at once"
+        );
+    }
+    for action in [
+        VideoAction::RenderDistanceChanged,
+        VideoAction::FramerateChanged,
+        VideoAction::GammaChanged,
+        VideoAction::MipmapChanged,
+    ] {
+        assert_eq!(
+            action.save_kind(),
+            SaveKind::Deferred,
+            "{action:?} defers to Done"
+        );
+    }
+}
+
+#[test]
+fn the_gui_scale_change_asks_for_relayout() {
+    // `GuiVideoSettings.java:85-116`: a GUI-scale change re-runs
+    // `setWorldAndResolution` after click AND release — apply owns the
+    // re-layout, so the action carries the notice.
+    assert!(VideoAction::GuiScaleCycled.relayout());
+    for action in [
+        VideoAction::GraphicsCycled,
+        VideoAction::RenderDistanceChanged,
+        VideoAction::Done,
+    ] {
+        assert!(!action.relayout(), "{action:?} lays nothing out again");
+    }
+}
+
+#[test]
+fn the_video_press_writes_through_the_settings() {
+    // Press on a toggle cycles the store; press on a slider writes the
+    // denormalized value; empty space answers nothing.
+    let mut settings = GameSettings::default();
+    let mut screen = video_english();
+    let (left, _) = screen.row_pair(0);
+    let point = (left.x() + 10.0, left.y() + 10.0);
+    assert_eq!(
+        screen.click_at(point, &mut settings),
+        Some(VideoAction::GraphicsCycled)
+    );
+    assert!(
+        !settings.graphics.as_bool(),
+        "the graphics press cycles fancy away"
+    );
+    let mut settings = GameSettings::default();
+    let mut screen = video_english();
+    let (_, right) = screen.row_pair(0);
+    let point = (right.x() + 10.0, right.y() + 10.0);
+    assert_eq!(
+        screen.click_at(point, &mut settings),
+        Some(VideoAction::RenderDistanceChanged)
+    );
+    assert!(
+        (2..=32).contains(&settings.render_distance),
+        "the slider press writes a ranged distance"
+    );
+    assert_eq!(screen.click_at((0.0, 0.0), &mut settings), None);
+}
+
+#[test]
+fn the_options_routing_holds_pause_video_and_snooper() {
+    // Pause → hub (the pause parent stashes); hub → video; video Done
+    // answers the hub; hub → snooper (the declared slot wires); hub Done
+    // answers the pause; Escape on hub/video closes with no send.
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    screens.open_options(wide(), &GameSettings::default(), options_labels(None));
+    let mut cursor = None;
+    assert_eq!(screens.escape(&mut cursor), None);
+    assert!(!screens.is_open(), "hub Escape closes with no send");
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    screens.open_options(wide(), &GameSettings::default(), options_labels(None));
+    screens.open_video_settings(wide(), &GameSettings::default(), video_labels(None), true);
+    assert!(screens.video_mut().is_some(), "the video screen stands");
+    assert!(screens.back_to_options(), "video Done answers the hub");
+    assert!(screens.options_mut().is_some());
+    assert!(screens.back_to_pause(), "hub Done answers the pause");
+    assert!(screens.pause_mut().is_some());
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    screens.open_options(wide(), &GameSettings::default(), options_labels(None));
+    screens.open_snooper_from_options(wide(), String::from("Done"));
+    assert_eq!(screens.escape(&mut None), None);
+    assert!(
+        screens.options_mut().is_some(),
+        "snooper Escape answers the hub now"
+    );
+}

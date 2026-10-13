@@ -253,6 +253,9 @@ pub struct GameSettings {
     pub anaglyph: bool,
     /// Fullscreen; default false (no initialiser).
     pub fullscreen: bool,
+    /// Realms notifications; default true (`GameSettings.java`:126). The
+    /// options hub's no-world row-0 toggle writes it.
+    pub realms_notifications: bool,
     /// Music gain; default 1.0. The engine multiplies it over the music
     /// category level.
     pub music_volume: f32,
@@ -316,6 +319,7 @@ impl Default for GameSettings {
             smooth_lighting: 2,
             anaglyph: false,
             fullscreen: false,
+            realms_notifications: true,
             music_volume: 1.0,
             sound_volume: 1.0,
             category_volumes: [1.0; 9],
@@ -598,6 +602,11 @@ impl GameSettings {
                     self.fullscreen = flag;
                 }
             }
+            "realms_notifications" => {
+                if let Some(flag) = parse_bool(value) {
+                    self.realms_notifications = flag;
+                }
+            }
             "music_volume" => {
                 if let Some(level) = parse_float(value) {
                     self.music_volume = clamp_f32(level, 0.0, 1.0);
@@ -731,6 +740,10 @@ impl GameSettings {
             "render_distance".to_string(),
             self.render_distance.to_string(),
         );
+        map.insert(
+            "realms_notifications".to_string(),
+            self.realms_notifications.to_string(),
+        );
         map.insert("skin_parts".to_string(), self.skin_parts.to_string());
         map.insert("smooth_camera".to_string(), self.smooth_camera.to_string());
         map.insert(
@@ -844,6 +857,7 @@ mod tests {
             smooth_lighting: 1,
             anaglyph: true,
             fullscreen: true,
+            realms_notifications: false,
             music_volume: 0.25,
             sound_volume: 0.75,
             category_volumes: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
@@ -883,6 +897,7 @@ mod tests {
         assert_eq!(s.smooth_lighting, 2);
         assert!(!s.anaglyph);
         assert!(!s.fullscreen);
+        assert!(s.realms_notifications);
         assert_eq!(s.music_volume, 1.0);
         assert_eq!(s.sound_volume, 1.0);
         assert_eq!(s.category_volumes, [1.0; 9]);

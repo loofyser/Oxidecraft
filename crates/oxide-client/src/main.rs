@@ -64,8 +64,11 @@ use oxide_client::screens::menu::{MenuAction, menu_labels};
 use oxide_client::screens::multiplayer::{
     MultiAction, PING_TIMEOUT, ServerList, SubScreen, multiplayer_labels, servers_path,
 };
+use oxide_client::screens::options::{
+    OptionsAction, SaveKind, VideoAction, options_labels, video_labels,
+};
 use oxide_client::screens::pause::{
-    AchievementsAction, PauseAction, SnooperAction, StatsAction, done_label, pause_labels,
+    AchievementsAction, PauseAction, StatsAction, done_label, pause_labels,
 };
 use oxide_client::screens::widgets::BUTTON_PRESS_SOUND;
 use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
@@ -2989,9 +2992,8 @@ impl ClientApp {
     /// it plays the press sound and answers its action. Back to Game
     /// closes with the pointer recaptured and no send; statistics and
     /// achievements stand their placeholders in-client with no send; the
-    /// options press records its action and opens nothing yet (the hub is
-    /// later work); Disconnect ends the session to the title. Empty space
-    /// answers nothing.
+    /// options press stands the hub; Disconnect ends the session to the
+    /// title. Empty space answers nothing.
     fn pause_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
         let action = self
             .screens
@@ -3005,8 +3007,234 @@ impl ClientApp {
             PauseAction::BackToGame => self.close_screen(event_loop),
             PauseAction::Achievements => self.open_placeholder(true),
             PauseAction::Statistics => self.open_placeholder(false),
-            PauseAction::Options => {}
+            PauseAction::Options => self.open_options(),
             PauseAction::Disconnect => self.disconnect_to_title(),
+        }
+    }
+
+    /// Stands the options hub from the pause menu's options button: the
+    /// labels resolve through the assets' table at the renderer's scaled
+    /// size over the live settings (`GuiOptions.initGui`'s no-world
+    /// build). In-client, no send. Without a renderer or assets the pause
+    /// stays standing.
+    fn open_options(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = options_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        self.screens.open_options(scaled, &settings, labels);
+    }
+
+    /// Pushes the live settings through the apply path: every field to its
+    /// consumer — the renderer, the audio engine (silent without one), the
+    /// session's particle engine over its input channel, the window's
+    /// fullscreen switch and the keymap pass-through. No screen calls the
+    /// renderer itself; every widget write lands here.
+    fn push_settings(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let mut win = ClientWindow {
+            window: Arc::clone(window),
+        };
+        let mut parts = SessionParticles {
+            tx: self.session.as_ref().map(|link| link.input_tx.clone()),
+        };
+        let mut keymap = KeymapPass;
+        match self.audio.as_mut() {
+            Some(audio) => self.settings.apply(
+                renderer,
+                &mut audio.engine,
+                &mut parts,
+                &mut win,
+                &mut keymap,
+            ),
+            None => {
+                let mut silent = NoAudio;
+                self.settings
+                    .apply(renderer, &mut silent, &mut parts, &mut win, &mut keymap);
+            }
+        }
+    }
+
+    /// Folds one answered options press into the save rule: an immediate
+    /// write persists at once, a slider write rides the debounced mark
+    /// the per-frame poll flushes (`setOptionValue`'s trailing save
+    /// against the slider writes' none).
+    fn fold_options_save(&mut self, kind: SaveKind) {
+        match kind {
+            SaveKind::Immediate => {
+                if let Err(error) = self.settings.save_now() {
+                    tracing::warn!(%error, "the options press could not be saved");
+                }
+            }
+            SaveKind::Deferred => self.settings.mark_changed(Instant::now()),
+        }
+    }
+
+    /// Runs one hub press at the free pointer's point: the control under it
+    /// plays the press sound, writes the live settings, pushes them
+    /// through apply, and folds the save rule. The video button saves and
+    /// stands the video screen; the snooper button saves and stands the
+    /// snooper; Done saves and returns to the pause parent (or closes to
+    /// the game with no parent); the later screens' buttons record their
+    /// action and open nothing yet. Empty space answers nothing.
+    fn options_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .options_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        match action {
+            OptionsAction::Video => self.open_video_settings(),
+            OptionsAction::Snooper => self.open_snooper_from_options(),
+            OptionsAction::Done => {
+                if !self.screens.back_to_pause() {
+                    self.close_screen(event_loop);
+                }
+            }
+            OptionsAction::FovChanged
+            | OptionsAction::RealmsToggled
+            | OptionsAction::Skin
+            | OptionsAction::Sounds
+            | OptionsAction::Controls
+            | OptionsAction::Language
+            | OptionsAction::Chat
+            | OptionsAction::ResourcePacks => {}
+        }
+    }
+
+    /// Stands the video settings screen from the hub's video button: the
+    /// labels resolve through the assets' table at the renderer's scaled
+    /// size over the live settings, with VBOs present (the renderer's
+    /// standing shape). In-client, no send.
+    fn open_video_settings(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = video_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        self.screens
+            .open_video_settings(scaled, &settings, labels, true);
+    }
+
+    /// Stands the snooper placeholder from the hub's snooper button: the
+    /// Done label resolves through the assets' table at the renderer's
+    /// scaled size, and the hub stashes as the parent. In-client, no send.
+    fn open_snooper_from_options(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let done = done_label(Some(&assets.lang));
+        self.screens.open_snooper_from_options(scaled, done);
+    }
+
+    /// Runs one video press at the free pointer's point: the control under
+    /// it plays the press sound, writes the live settings, pushes them
+    /// through apply, and folds the save rule. A GUI-scale cycle applies
+    /// the re-layout after the push; Done saves and returns to the hub
+    /// (or closes to the game with no hub). Empty space answers nothing.
+    fn video_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .video_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action.relayout() {
+            self.relay_options_layout();
+        }
+        if action == VideoAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
+    /// Re-lays the open hub or video screen at the renderer's scaled size
+    /// after a GUI-scale apply: the push changed the resolution out from
+    /// under the standing screen, so its `initGui` build re-runs on the
+    /// live settings (`GuiVideoSettings`:85-116 re-runs
+    /// `setWorldAndResolution` after the click and the release alike).
+    fn relay_options_layout(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let settings = self.settings.settings().clone();
+        self.screens.resize_options(
+            &scaled,
+            &settings,
+            options_labels(Some(&assets.lang)),
+            video_labels(Some(&assets.lang)),
+            true,
+        );
+    }
+
+    /// Runs one latched-slider drag at the free pointer's x: the hub's FOV
+    /// slider or the video screen's latched slider writes again per event
+    /// through apply, with the slider's own save rule. An unlatched
+    /// pointer writes nothing.
+    fn options_drag(&mut self) {
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        let hub_action = self
+            .screens
+            .options_mut()
+            .and_then(|screen| screen.drag_to(cursor.0, self.settings.settings_mut()));
+        if let Some(action) = hub_action {
+            self.push_settings();
+            self.fold_options_save(action.save_kind());
+            return;
+        }
+        let video_action = self
+            .screens
+            .video_mut()
+            .and_then(|screen| screen.drag_to(cursor.0, self.settings.settings_mut()));
+        if let Some(action) = video_action {
+            self.push_settings();
+            self.fold_options_save(action.save_kind());
+            if action.relayout() {
+                self.relay_options_layout();
+            }
+        }
+    }
+
+    /// Releases every options slider latch (`mouseReleased` clears the
+    /// drag on any release).
+    fn options_release(&mut self) {
+        if let Some(screen) = self.screens.options_mut() {
+            screen.release();
+        }
+        if let Some(screen) = self.screens.video_mut() {
+            screen.release();
         }
     }
 
@@ -3059,16 +3287,20 @@ impl ClientApp {
     }
 
     /// Runs one snooper press at the free pointer's point: Done plays the
-    /// press sound and closes to the game with the pointer recaptured and
-    /// no send — the safe terminal until the options hub wires the return
-    /// to the declared parent. Empty space answers nothing.
+    /// press sound and returns to the stashed hub when the hub opened it,
+    /// closing to the game otherwise. In-client, no send. Empty space
+    /// answers nothing.
     fn snooper_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
-        let done = self
+        let pressed = self
             .screens
             .snooper_mut()
-            .and_then(|screen| screen.click_at(point));
-        if done == Some(SnooperAction::Done) {
-            self.play_press_sound();
+            .and_then(|snooper| snooper.click_at(point))
+            .is_some();
+        if !pressed {
+            return;
+        }
+        self.play_press_sound();
+        if !self.screens.back_to_options() {
             self.close_screen(event_loop);
         }
     }
@@ -3614,6 +3846,14 @@ impl ClientApp {
             }
         } else if let Some(screen) = self.screens.creative_mut() {
             screen.wheel(creative_wheel_notch(delta));
+        } else if let Some(screen) = self.screens.video_mut() {
+            let notch = creative_wheel_notch(delta);
+            if notch != 0.0 {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    let scaled = renderer.scaled_resolution();
+                    screen.wheel(&scaled, notch);
+                }
+            }
         }
         if let Some((slot, event)) = wheel_held_step(self.held, delta) {
             self.held = slot;
@@ -4073,10 +4313,16 @@ impl ClientApp {
                         self.stats_click(point);
                     } else if self.screens.achievements_mut().is_some() {
                         self.achievements_click(point);
+                    } else if self.screens.options_mut().is_some() {
+                        self.options_click(event_loop, point);
+                    } else if self.screens.video_mut().is_some() {
+                        self.video_click(event_loop, point);
                     } else if self.screens.snooper_mut().is_some() {
                         self.snooper_click(event_loop, point);
                     }
                 }
+            } else if state == ElementState::Released && button == WinitMouseButton::Left {
+                self.options_release();
             }
             return;
         }
@@ -5725,6 +5971,11 @@ impl ApplicationHandler for ClientApp {
                         .map_or(1, |renderer| renderer.scaled_resolution().scale_factor);
                     self.cursor = Some(scaled_cursor(position, scale));
                     self.feed_screen_mouse();
+                    // A latched options slider writes again per pointer
+                    // event, the way the source's slider writes per
+                    // `mouseClickMove` (`GuiOptionSlider`:95-105). An
+                    // unlatched pointer writes nothing.
+                    self.options_drag();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {

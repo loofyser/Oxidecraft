@@ -471,6 +471,26 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             }
             return draws;
         }
+        // The options hub stands over the pause: the dirt tiles lead under
+        // the gradient, and the centred title, the FOV slider, the realms
+        // toggle, the navigation pairs and Done ride on top.
+        ScreenState::Options(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The video settings screen stands over the hub: the dirt tiles
+        // lead under the gradient, and the centred title, the visible
+        // rows and Done ride on top.
+        ScreenState::VideoSettings(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
     };
     let layout = container.layout();
     let (gx, gy) = container.origin();
