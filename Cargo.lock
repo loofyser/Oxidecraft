@@ -1847,6 +1847,7 @@ version = "0.0.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
+ "glam",
  "lewton",
  "oxide-assets",
  "oxide-proto",

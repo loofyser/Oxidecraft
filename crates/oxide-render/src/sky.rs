@@ -2073,7 +2073,10 @@ mod tests {
         grid_cell, moon_uv, sky_depth_state, sky_eye, sky_fog_density, sky_vertex_layout,
         star_field, sun_quad_vertices, sunset_fan_vertices, void_box_low,
     };
-    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::camera::{
+        Camera, CameraMode, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT,
+        THIRD_PERSON_DISTANCE,
+    };
     use crate::fog::{FogMode, FogParams};
 
     #[test]
@@ -2259,6 +2262,8 @@ mod tests {
             near: NEAR_PLANE,
             far_chunks: 8.0,
             view_effect: NO_VIEW_EFFECT,
+            mode: CameraMode::First,
+            third_distance: THIRD_PERSON_DISTANCE,
         };
         assert!(cloud_under_layer(&under));
         assert_eq!(under.eye().y, 127.62);
@@ -2282,6 +2287,8 @@ mod tests {
             near: NEAR_PLANE,
             far_chunks: 8.0,
             view_effect: NO_VIEW_EFFECT,
+            mode: CameraMode::First,
+            third_distance: THIRD_PERSON_DISTANCE,
         };
         // The wall pose's feet 57.0: eye 58.62, under the layer.
         let wall = at(57.0, 0.0);

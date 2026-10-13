@@ -55,6 +55,8 @@
 
 use std::collections::BTreeMap;
 
+use glam::Vec3;
+use oxide_render::camera::{third_person_offset, third_person_pull_in};
 use oxide_world::behaviour::{CollisionShape, Material, behaviour};
 use oxide_world::chunk::{SECTION_COUNT, SECTION_SIZE};
 use oxide_world::collision::{CollisionBox, Facing, front_facing};
@@ -241,6 +243,42 @@ pub fn look_vector(yaw: f32, pitch: f32) -> [f64; 3] {
     let f2 = -(-pitch).cos();
     let f3 = (-pitch).sin();
     [f1 * f2, f3, f * f2]
+}
+
+/// The third-person camera's clipped distance for a pose eye and a look:
+/// the eight corner rays from the eye toward the wanted camera point run
+/// through the world's own raycast, and the shortest hit replaces the
+/// wanted distance (`EntityRenderer.java`:684-702).
+///
+/// The rays read the tick's pose, not the frame's interpolated one — the
+/// session owns no partial tick — and a world that meets no ray answers
+/// the wanted distance whole.
+pub fn camera_clip_distance(
+    view: &WorldView<'_>,
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    front_view: bool,
+    desired: f64,
+) -> f64 {
+    let origin = Vec3::new(eye[0] as f32, eye[1] as f32, eye[2] as f32);
+    let offset = third_person_offset(yaw, pitch, front_view);
+    let clipped = third_person_pull_in(desired as f32, origin, offset, |from, to| {
+        let span = to - from;
+        let reach = f64::from(span.length());
+        if reach <= 0.0 || !reach.is_finite() {
+            return None;
+        }
+        let dir = [
+            f64::from(span.x) / reach,
+            f64::from(span.y) / reach,
+            f64::from(span.z) / reach,
+        ];
+        let from = [f64::from(from.x), f64::from(from.y), f64::from(from.z)];
+        raycast(view, from, dir, reach)
+            .map(|aim| Vec3::new(aim.hit[0] as f32, aim.hit[1] as f32, aim.hit[2] as f32))
+    });
+    f64::from(clipped)
 }
 
 /// The block the ray from `eye` along `dir` meets within `reach`, or `None`.

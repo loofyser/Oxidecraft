@@ -61,7 +61,8 @@ use oxide_assets::model::Transform;
 use oxide_assets::png_write::write_png;
 use oxide_assets::texture::Texture;
 use oxide_render::camera::{
-    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE, NO_VIEW_EFFECT,
+    Camera, CameraMode, CameraPose, DEFAULT_FOV, EYE_HEIGHT, FIRST_PERSON_OFFSET, NEAR_PLANE,
+    NO_VIEW_EFFECT, THIRD_PERSON_DISTANCE,
 };
 use oxide_render::capture::capture_texture;
 use oxide_render::entity_models::{Pose, PoseExtra, objects};
@@ -197,6 +198,140 @@ fn the_terrain_pass_draws_the_block_and_keeps_the_buried_face_hidden() {
         "the buried face is drawn over the top face: the depth test, the depth write or the \
          depth attachment is off"
     );
+}
+
+/// The third-person back frame keeps the block centred: the back view only slides the camera
+/// along the look axis (`EntityRenderer.java`:684-702), four blocks out, so the aimed block
+/// stays on the axis and the centre still reads the stone top face — smaller, never gone.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_third_person_back_frame_keeps_the_block_centred() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(
+        &queue,
+        Camera {
+            mode: CameraMode::ThirdBack,
+            ..camera()
+        },
+        1.0,
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let pixels = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        STONE,
+        "the top face from the back view",
+    );
+    expect_pixel(&pixels, 0, 0, SKY, "the corner above the block");
+    // Smaller, never gone: the pulled-back block covers fewer non-sky
+    // pixels than the first-person frame of the same scene.
+    terrain.set_camera(&queue, camera(), 1.0);
+    let first = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    let coverage = |frame: &[u8]| frame.chunks_exact(4).filter(|p| p[..3] != SKY).count();
+    assert!(
+        coverage(&pixels) < coverage(&first),
+        "the pulled-back block reads smaller: back {} vs first {} non-sky pixels",
+        coverage(&pixels),
+        coverage(&first)
+    );
+}
+
+/// The third-person front frame looks back at the block: the front view steps four blocks
+/// along the look axis with the extra half turn (`EntityRenderer.java`:703-717), so the
+/// camera stands past the aimed block facing the player — the block sits between the camera
+/// and the player, on-axis, and the centre reads its unlit far side, never sky. Without the
+/// `+180` term the camera would sit behind looking away and the centre would read sky.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_third_person_front_frame_looks_back_at_the_block() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(
+        &queue,
+        Camera {
+            mode: CameraMode::ThirdFront,
+            ..camera()
+        },
+        1.0,
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let pixels = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        [101, 101, 101],
+        "the block's far side fills the front camera's centre",
+    );
+}
+
+/// The pulled-in camera keeps the block centred: a wall clips the third-person distance down
+/// (`EntityRenderer.java`:688-701) and the frame reads the caller's clipped distance — at a
+/// tenth of a block the view is first person in all but name and the centre still reads stone.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_pulled_in_camera_keeps_the_block_centred() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(
+        &queue,
+        Camera {
+            mode: CameraMode::ThirdBack,
+            third_distance: 0.1,
+            ..camera()
+        },
+        1.0,
+    );
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let pixels = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    expect_pixel(
+        &pixels,
+        SIZE / 2,
+        SIZE / 2,
+        STONE,
+        "the top face at the clipped distance",
+    );
+}
+
+/// The F1-hidden frame stays on the clear colour: under `hideGUI` the hotbar row draws nothing
+/// (the CPU suite pins the empty draw list), so the hud pass over the cleared frame inks no
+/// pixel and the centre and the corner both read the sky back.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hidden_hud_frame_stays_on_the_clear_colour() {
+    let (device, queue, target, mut hud) = rows_scene();
+    hud.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    hud.set_draws(&device, &queue, &[], &TextureRegistry::new(&device, &queue));
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+    expect_pixel(
+        &pixels,
+        ROWS_WIDE / 2,
+        ROWS_TALL / 2,
+        SKY,
+        "no hotbar entry under F1",
+    );
+    expect_pixel(&pixels, 0, 0, SKY, "the corner stays clear too");
 }
 
 #[test]
@@ -1813,6 +1948,8 @@ fn sky_camera(feet_y: f64, yaw: f32, pitch: f32, fov: f32) -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -2101,6 +2238,8 @@ fn frame_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 1.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -2379,6 +2518,8 @@ fn camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -3009,6 +3150,8 @@ fn entity_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -3327,6 +3470,8 @@ fn tag_camera(distance: f64) -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -3348,6 +3493,8 @@ fn below_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -8179,6 +8326,8 @@ fn held_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 1.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -11577,6 +11726,8 @@ fn t22_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -12504,6 +12655,8 @@ fn weather_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 
@@ -12576,6 +12729,8 @@ fn weather_yaw(feet: [f64; 3], yaw: f32) -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 

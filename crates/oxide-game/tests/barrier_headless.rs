@@ -33,7 +33,8 @@ use oxide_game::mesher::{
 };
 use oxide_proto_v47::column::{ColumnData, SectionData};
 use oxide_render::camera::{
-    Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT,
+    Camera, CameraMode, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT,
+    THIRD_PERSON_DISTANCE,
 };
 use oxide_render::renderer::SKY_COLOR;
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
@@ -319,6 +320,8 @@ fn stone_camera() -> Camera {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 

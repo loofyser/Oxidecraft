@@ -108,8 +108,9 @@ use crate::audio::sounds::{
 use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
 use crate::input::{InputEvent, Intent, Key, MouseButton, SessionPush, look_delta};
 use crate::interaction::{
-    Aim, BreakStages, DigAction, DigAim, DigState, creative, hand_rate, look_vector,
-    mode_from_value, pick_entity_target, placement, raycast, reach, spectator, tool_not_required,
+    Aim, BreakStages, DigAction, DigAim, DigState, camera_clip_distance, creative, hand_rate,
+    look_vector, mode_from_value, pick_entity_target, placement, raycast, reach, spectator,
+    tool_not_required,
 };
 use crate::local_particles::{
     FULL_CUBE_BOUNDS, crit_burst, crit_id_for_animation, dig_destroy, dig_hit, dig_tint,
@@ -656,6 +657,18 @@ pub enum ClientEvent {
         /// The gamemode, as Join Game carries it.
         gamemode: u8,
     },
+    /// The server changed the game mode mid-session (clientbound 0x2B
+    /// reason 3).
+    ///
+    /// Reported on every game-state packet naming reason 3, carrying the
+    /// byte the floored value names
+    /// (`NetHandlerPlayClient.handleChangeGameState:1364`, `:1381-1384`).
+    /// The window folds its spectator read from it at once; the creative
+    /// redirect keeps its join-only fold (recorded).
+    GameType {
+        /// Gamemode; the 0x08 bit means hardcore.
+        gamemode: u8,
+    },
     /// The own player fell asleep in a bed, from clientbound 0x0A.
     ///
     /// Reported once per sleep — a repeated bed packet for the already
@@ -696,6 +709,17 @@ pub enum ClientEvent {
         /// `None` when the ray meets none. The debug overlay's block section
         /// reads the registry name and the state properties from it.
         block: Option<u16>,
+    },
+    /// The third-person occlusion moved: the tick's corner rays from the
+    /// pose eye toward the wanted camera point shortened (or cleared) the
+    /// camera's distance (`EntityRenderer.java`:684-702).
+    ///
+    /// Reported only while a third-person mode holds, and only on a change;
+    /// leaving third person resets the window's read to the full distance
+    /// with no event. The window feeds the frame's camera from it.
+    CameraClip {
+        /// The clipped distance in blocks.
+        distance: f32,
     },
     /// A destroy stage landed on a block.
     ///
@@ -1327,6 +1351,14 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut gamemode: u8 = 0;
         // The aim the last recompute left; only a change is reported.
         let mut aim: Option<Aim> = None;
+        // The camera mode the frame last stepped to, from the perspective
+        // key's edge: the tick's occlusion rays read it, first person
+        // reading none.
+        let mut camera_mode: u8 = 0;
+        // The clipped third-person distance the last tick reported; only a
+        // change is reported, and leaving third person resets it with no
+        // event.
+        let mut camera_clip: f32 = oxide_render::camera::THIRD_PERSON_DISTANCE;
         // The dig machine and the destroy stages, and the left button they
         // read: the held flag and the presses queued since the last tick.
         let mut dig = DigState::new();
@@ -1651,6 +1683,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         })?;
                                         send_reply(&mut conn, &echo)?;
                                     }
+                                }
+                                InputEvent::Perspective { mode } => {
+                                    // The F5 edge stepped the camera mode:
+                                    // the tick's occlusion rays read it.
+                                    camera_mode = mode.min(2);
                                 }
                                 InputEvent::RebuildMeshes => {
                                     // The A chord's rebuild is the source's
@@ -2102,6 +2139,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     value = change.value,
                                     "the server changed the game mode"
                                 );
+                                report(events, ClientEvent::GameType { gamemode });
                             } else if change.reason == 1 {
                                 // The rain eases in: its target rises to
                                 // full (the task's weather interface; the
@@ -3397,6 +3435,32 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                 // The aim follows the tick's own state: a step that moved the
                 // player, and any world change behind it, is read here.
                 update_aim(world.as_ref(), &player, gamemode, &mut aim, events);
+                // The third-person occlusion reads the same state: in either
+                // third-person mode the eight corner rays run from the pose
+                // eye toward the wanted camera point, and only a changed
+                // clipped distance is reported. First person resets the
+                // read with no event.
+                if camera_mode == 0 {
+                    camera_clip = oxide_render::camera::THIRD_PERSON_DISTANCE;
+                } else if let Some(world) = world.as_ref() {
+                    let eye = [
+                        player.position[0],
+                        player.position[1] + player.eye_height(),
+                        player.position[2],
+                    ];
+                    let clipped = camera_clip_distance(
+                        &WorldView(world),
+                        eye,
+                        player.yaw,
+                        player.pitch,
+                        camera_mode == 2,
+                        f64::from(oxide_render::camera::THIRD_PERSON_DISTANCE),
+                    ) as f32;
+                    if clipped != camera_clip {
+                        camera_clip = clipped;
+                        report(events, ClientEvent::CameraClip { distance: clipped });
+                    }
+                }
                 // The hotbar's pop runs down with the player's own tick: the
                 // source decrements every main-inventory stack once per tick
                 // (`EntityPlayer.onLivingUpdate:617` through
@@ -3726,6 +3790,10 @@ fn apply_input(
             intent.apply_key(key, pressed);
             false
         }
+        // The F5 edge steps the camera mode session-side; the tick's own
+        // occlusion pass reads the stored mode, so this arm only keeps the
+        // match complete.
+        InputEvent::Perspective { .. } => false,
         InputEvent::MouseDelta { dx, dy } => {
             let (d_yaw, d_pitch) = look_delta(dx, dy, sensitivity);
             // The invert-mouse option flips the pitch sign

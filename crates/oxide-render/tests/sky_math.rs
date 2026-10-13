@@ -14,7 +14,9 @@
 //! built from, so a change to any of them moves the picture and fails here first.
 
 use glam::Vec3;
-use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NO_VIEW_EFFECT};
+use oxide_render::camera::{
+    Camera, CameraMode, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NO_VIEW_EFFECT, THIRD_PERSON_DISTANCE,
+};
 use oxide_render::sky::{
     BAND_CELL, BAND_EXTENT, BAND_HEIGHT, BELOW_HEIGHT, CLOUD_ALPHA, CLOUD_CELL,
     CLOUD_DRIFT_PER_TICK, CLOUD_EXTENT, CLOUD_HEIGHT, CLOUD_LIFT, CLOUD_UV_PER_BLOCK, CLOUD_WRAP,
@@ -292,6 +294,8 @@ fn camera_at(feet_y: f64) -> Camera {
         near: 0.05,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     }
 }
 

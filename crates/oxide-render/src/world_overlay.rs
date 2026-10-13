@@ -1206,7 +1206,10 @@ mod tests {
         hitboxes_for, look_vector, outline_blend, outline_box, outline_depth_stencil,
         outline_vertices, primitive_state, stage_uvs, within_view,
     };
-    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::camera::{
+        Camera, CameraMode, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT,
+        THIRD_PERSON_DISTANCE,
+    };
     use crate::entity_pass::{DrawExtra, EntityDraw, ModelRef, TextureRef};
     use crate::terrain_pass::DEPTH_FORMAT;
 
@@ -1224,6 +1227,8 @@ mod tests {
             near: NEAR_PLANE,
             far_chunks: 1.0,
             view_effect: NO_VIEW_EFFECT,
+            mode: CameraMode::First,
+            third_distance: THIRD_PERSON_DISTANCE,
         }
     }
 

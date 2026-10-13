@@ -736,6 +736,33 @@ pub fn billboard_angles(view_y: f32, view_x: f32, kind: Billboard) -> [f32; 2] {
     }
 }
 
+/// The camera's billboard angles with the mode and sleeping overrides:
+/// the source's `playerViewY`/`playerViewX` as the frame reads them
+/// (`RenderManager.java`:244-266).
+///
+/// A sleeping viewer reads the bed facing's quarter-turn plus half a turn
+/// with no pitch (`:246-256`); the plain rule is the interpolated yaw and
+/// pitch (`:260-261`); the front view then adds half a turn to the yaw
+/// (`:264-266`). Both consumers — the label chain and the projectile pairs
+/// above — read through this.
+pub fn billboard_view_angles(
+    view_yaw: f32,
+    view_pitch: f32,
+    front_view: bool,
+    sleeping: bool,
+    sleep_facing: u8,
+) -> (f32, f32) {
+    let (mut view_y, view_x) = if sleeping {
+        (f32::from(sleep_facing.min(3)) * 90.0 + 180.0, 0.0)
+    } else {
+        (view_yaw, view_pitch)
+    };
+    if front_view {
+        view_y += 180.0;
+    }
+    (view_y, view_x)
+}
+
 /// The pre-transform the transform path applies: the flat (generated) models double, the
 /// 3D block models not (`RenderItem.preTransform`:254-257, reached from
 /// `RenderItem.renderItemModelTransform`:316-320 — the drop loop's 2-arg `renderItem`
@@ -1698,6 +1725,48 @@ mod tests {
                 .iter()
                 .all(|uv| (0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1])),
             "the sheet's own 0..1 space"
+        );
+    }
+
+    /// The billboard view pair is the camera's own yaw and pitch — until
+    /// the two overrides (`RenderManager.java`:246-266): a sleeping viewer
+    /// reads the bed facing's quarter-turn plus half a turn with no pitch,
+    /// and the front view adds half a turn to the yaw after that.
+    #[test]
+    fn the_billboard_view_pair_carries_the_mode_and_sleeping_overrides() {
+        assert_eq!(
+            super::billboard_view_angles(30.0, 10.0, false, false, 0),
+            (30.0, 10.0)
+        );
+        assert_eq!(
+            super::billboard_view_angles(30.0, 10.0, true, false, 0),
+            (210.0, 10.0),
+            "the front view turns the pair half a turn"
+        );
+        assert_eq!(
+            super::billboard_view_angles(30.0, 10.0, false, true, 1),
+            (270.0, 0.0),
+            "sleeping reads facing × 90 + 180 with no pitch"
+        );
+        assert_eq!(
+            super::billboard_view_angles(30.0, 10.0, true, true, 1),
+            (450.0, 0.0),
+            "the front term composes after the sleeping one"
+        );
+    }
+
+    /// The overrides reach both consumers: the snowball pair negates the
+    /// front-turned yaw, the fireball keeps its own 180 beside it.
+    #[test]
+    fn the_billboard_overrides_reach_both_projectile_shapes() {
+        let (view_y, view_x) = super::billboard_view_angles(0.0, 0.0, true, false, 0);
+        assert_eq!(
+            super::billboard_angles(view_y, view_x, super::Billboard::Snowball),
+            [-180.0, 0.0]
+        );
+        assert_eq!(
+            super::billboard_angles(view_y, view_x, super::Billboard::Fireball),
+            [0.0, -0.0]
         );
     }
 }

@@ -1115,9 +1115,9 @@ fn nametag_anchor(draw: &EntityDraw) -> Vec3 {
 /// the scaled frame (`RendererLivingEntity.java`:516).
 ///
 /// `view_y` is the camera's yaw and `view_x` its pitch — the source's
-/// `playerViewY`/`playerViewX` (`RenderManager.java`:260-261); the source's `+180.0`
-/// applies only to its third-person front view (`:264-266`), a mode this pass does not
-/// have. The same pair [`entity_models::objects::billboard_angles`] takes.
+/// `playerViewY`/`playerViewX` (`RenderManager.java`:260-261), read through
+/// [`entity_models::objects::billboard_view_angles`](crate::entity_models::objects::billboard_view_angles),
+/// which carries the sleeping and front-view overrides (`:246-266`).
 fn nametag_chain(anchor: Vec3, view_y: f32, view_x: f32, sneaking: bool) -> Mat4 {
     let mut chain = Mat4::from_translation(anchor)
         * Mat4::from_rotation_y((-view_y).to_radians())
@@ -1410,6 +1410,14 @@ pub struct EntityPass {
     view_yaw: f32,
     /// The camera's pitch in degrees, the source's `playerViewX`.
     view_pitch: f32,
+    /// Whether the frame is the front third-person view: the billboard pair
+    /// turns half a yaw turn (`RenderManager.java`:264-266).
+    front_view: bool,
+    /// Whether the viewing player sleeps: the billboard pair reads the bed
+    /// facing instead of the camera (`:246-256`).
+    sleep_view: bool,
+    /// The bed's facing quarter-turn the sleeping billboard pair reads.
+    sleep_facing: u8,
     /// The camera's feet position, the render-view entity's origin for the nametag's
     /// distance rule.
     view_position: [f64; 3],
@@ -1648,6 +1656,9 @@ impl EntityPass {
             block_cache: BlockItemCache::new(),
             view_yaw: 0.0,
             view_pitch: 0.0,
+            front_view: false,
+            sleep_view: false,
+            sleep_facing: 0,
             view_position: [0.0; 3],
             system_time: 0,
             nametag_font: None,
@@ -1677,6 +1688,28 @@ impl EntityPass {
         self.view_yaw = camera.pose.yaw;
         self.view_pitch = camera.pose.pitch;
         self.view_position = camera.pose.position;
+    }
+
+    /// Gives the pass the frame's view mode for the billboard pair: the
+    /// front third-person view, and the sleeping read with the bed's
+    /// facing. Both default off, so a caller that never sets them keeps
+    /// the plain camera angles.
+    pub fn set_view_mode(&mut self, front_view: bool, sleeping: bool, sleep_facing: u8) {
+        self.front_view = front_view;
+        self.sleep_view = sleeping;
+        self.sleep_facing = sleep_facing;
+    }
+
+    /// The frame's billboard angles: the stored camera pair through the
+    /// front-view and sleeping overrides.
+    fn billboard_view(&self) -> (f32, f32) {
+        entity_models::objects::billboard_view_angles(
+            self.view_yaw,
+            self.view_pitch,
+            self.front_view,
+            self.sleep_view,
+            self.sleep_facing,
+        )
     }
 
     /// Gives the pass the item meshes its object draws read: the client's own atlas and
@@ -2254,13 +2287,14 @@ impl EntityPass {
         let Some(font) = &self.nametag_font else {
             return;
         };
+        let (view_yaw, view_pitch) = self.billboard_view();
         built.nametag = tag_runs(
             draw,
             &font.font,
             font.sheet_size,
             self.view_position,
-            self.view_yaw,
-            self.view_pitch,
+            view_yaw,
+            view_pitch,
             vertices,
         );
     }
@@ -2399,9 +2433,9 @@ impl EntityPass {
             draw.position[1] as f32,
             draw.position[2] as f32,
         );
-        // The source's `playerViewY` is the camera's yaw (`RenderManager.java`:260-261).
-        let view_y = self.view_yaw;
-        let view_x = self.view_pitch;
+        // The billboard pair is the camera's yaw and pitch through the
+        // front-view and sleeping overrides (`RenderManager.java`:246-266).
+        let (view_y, view_x) = self.billboard_view();
         match (draw.model, &draw.extra) {
             (ModelRef::Arrow, _) => {
                 let chain = Mat4::from_translation(position)
@@ -3390,7 +3424,10 @@ fn fs_tag_text(input: VertexOutput) -> @location(0) vec4<f32> {{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::camera::{CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::camera::{
+        Camera, CameraMode, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT,
+        THIRD_PERSON_DISTANCE,
+    };
     use glam::Vec3;
 
     /// A camera at the origin facing north (down -z), where the view rotation is the
@@ -3407,6 +3444,8 @@ mod tests {
             near: NEAR_PLANE,
             far_chunks: 8.0,
             view_effect: NO_VIEW_EFFECT,
+            mode: CameraMode::First,
+            third_distance: THIRD_PERSON_DISTANCE,
         }
     }
 

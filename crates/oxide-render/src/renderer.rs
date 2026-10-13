@@ -801,6 +801,14 @@ impl Renderer {
         self.entities = entities;
     }
 
+    /// Sets the frame's view mode for the entity pass's billboard pair: the
+    /// front third-person view, and the sleeping read with the bed's
+    /// facing. Both default off.
+    pub fn set_view_mode(&mut self, front_view: bool, sleeping: bool, sleep_facing: u8) {
+        self.entity_pass
+            .set_view_mode(front_view, sleeping, sleep_facing);
+    }
+
     /// Uploads a named entity texture, replacing whatever the key held.
     ///
     /// The client uploads an entity sprite under the key its draws name it by; a key no draw
@@ -1524,7 +1532,10 @@ mod tests {
         classify_surface_error, clear_colour, hud_projection_size, present_mode_for_vsync,
         scene_draws,
     };
-    use crate::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::camera::{
+        Camera, CameraMode, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT,
+        THIRD_PERSON_DISTANCE,
+    };
     use crate::entity_pass::{BOSS_STATUS_TIME, BossStatus};
     use crate::fog::{FogMode, FogParams, fog_colour};
     use crate::sky::{CLOUD_FAST, CLOUD_OFF};
@@ -1617,6 +1628,8 @@ mod tests {
             near: NEAR_PLANE,
             far_chunks: 8.0,
             view_effect: NO_VIEW_EFFECT,
+            mode: CameraMode::First,
+            third_distance: THIRD_PERSON_DISTANCE,
         }
     }
 

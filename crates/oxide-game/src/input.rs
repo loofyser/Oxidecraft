@@ -294,6 +294,14 @@ pub enum InputEvent {
     /// source's `loadRenderers` equivalent (`Minecraft.java`:1996-1998).
     /// No packet answers it; the mesh queue re-takes the loaded columns.
     RebuildMeshes,
+    /// The perspective key stepped the camera mode: the session keeps the
+    /// mode so its tick can run the third-person occlusion rays behind the
+    /// frame's clipped distance (`Minecraft.java`:2031-2048). Nothing goes
+    /// on the wire.
+    Perspective {
+        /// The new mode: 0 first person, 1 third back, 2 third front.
+        mode: u8,
+    },
 }
 
 /// The settings values one [`InputEvent::PushSettings`] carries to the

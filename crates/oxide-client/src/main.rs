@@ -115,9 +115,9 @@ use oxide_game::weather::WeatherColumn;
 use oxide_proto_v47::effects_wire::{read_effect_position, read_sound_pitch};
 use oxide_proto_v47::serverbound::ClientSettings;
 use oxide_render::camera::{
-    Camera, CameraPose, CameraSensor, FovInputs, FovSmoother, NEAR_PLANE, WalkDistance,
-    bob_rotations, bob_translate, camera_effect, fov, fov_modifier, hurt_roll, interpolate_pose,
-    nausea_wobble, render_eye,
+    Camera, CameraMode, CameraPose, CameraSensor, FovInputs, FovSmoother, NEAR_PLANE,
+    THIRD_PERSON_DISTANCE, WalkDistance, bob_rotations, bob_translate, camera_effect, fov,
+    fov_modifier, hurt_roll, interpolate_pose, nausea_wobble, render_eye,
 };
 use oxide_render::entity_pass::{SkinLookup, SkinTexId, TextureRegistry};
 use oxide_render::fog::{
@@ -278,6 +278,12 @@ enum ScriptKey {
     Escape,
     /// `f3`: the debug overlay toggle.
     F3,
+    /// `f1`: the HUD-suppression edge — the raw F1 press the window's own
+    /// key flips the flag with, no binding row.
+    F1,
+    /// `f5`: the perspective step — the bound key whose press cycles the
+    /// camera mode 0→1→2.
+    F5,
     /// `h`: the advanced-tooltips chord — live only with F3 held.
     H,
     /// `b`: the hitbox chord — live only with F3 held, like `h`.
@@ -794,6 +800,8 @@ fn parse_script_key(name: &str) -> anyhow::Result<ScriptKey> {
         "q" => Ok(ScriptKey::Drop),
         "escape" => Ok(ScriptKey::Escape),
         "f3" => Ok(ScriptKey::F3),
+        "f1" => Ok(ScriptKey::F1),
+        "f5" => Ok(ScriptKey::F5),
         "h" => Ok(ScriptKey::H),
         "b" => Ok(ScriptKey::B),
         other => anyhow::bail!("{other:?} is not a scripted key"),
@@ -1053,6 +1061,17 @@ struct ClientApp {
     /// own cycle (`Minecraft.java`:2030-2049). The modes' owner (Task 27)
     /// reads it; this edge only steps.
     perspective: u8,
+    /// Whether the Join/Respawn/GameType gamemode reads spectator: the
+    /// spectator strip and name replace the hotbar row, the survival rows
+    /// stay out, and the held hand stays out (`GuiIngame.java`:162-167,
+    /// `:187-189`; `EntityRenderer.java`:863-869). Set from the session's
+    /// Join, Respawn and GameType events, beside the creative fold.
+    spectator: bool,
+    /// The third-person camera's clipped distance in blocks, as the
+    /// session's occlusion rays last reported it: 4.0 in the open, pulled
+    /// in against walls (`EntityRenderer.java`:684-702). First person
+    /// ignores it.
+    camera_clip: f32,
     /// Whether the session last reported the player dead.
     ///
     /// While it holds, the death screen stands (re-raised every tick the
@@ -1838,6 +1857,8 @@ impl ClientApp {
             f3_held: false,
             hide_gui: false,
             perspective: 0,
+            spectator: false,
+            camera_clip: THIRD_PERSON_DISTANCE,
             dead: false,
             sleeping: false,
             sleep_timer: 0,
@@ -2005,10 +2026,31 @@ impl ClientApp {
             match &event {
                 ClientEvent::Joined { gamemode, .. } | ClientEvent::Respawned { gamemode, .. } => {
                     self.creative = oxide_game::interaction::creative(*gamemode);
+                    self.spectator = oxide_game::interaction::spectator(*gamemode);
                     self.joined = true;
                     if self.creative {
                         self.screens.swap_to_creative();
                     }
+                }
+                // The mid-session gamemode switch (`ChangeGameState` state 3,
+                // `NetHandlerPlayClient.handleChangeGameState`:1381-1384):
+                // the same fold as Join/Respawn, beside it.
+                ClientEvent::GameType { gamemode } => {
+                    self.creative = oxide_game::interaction::creative(*gamemode);
+                    self.spectator = oxide_game::interaction::spectator(*gamemode);
+                    tracing::info!(
+                        gamemode,
+                        spectator = self.spectator,
+                        "the gamemode switched"
+                    );
+                    if self.creative {
+                        self.screens.swap_to_creative();
+                    }
+                }
+                // The session's occlusion read for the third-person camera:
+                // the frame's camera consumes it, first person ignores it.
+                ClientEvent::CameraClip { distance } => {
+                    self.camera_clip = *distance;
                 }
                 // The session's held-slot echo folds into the live selection
                 // the wheel steps and the digits set chain from.
@@ -2432,6 +2474,16 @@ impl ClientApp {
             );
             renderer.set_camera(Camera {
                 pose,
+                // The forced first-person reset (`Minecraft.java`:1138-1141):
+                // inside an opaque block the mode snaps to first. Otherwise
+                // the stepped mode reads through, with the session's clipped
+                // distance behind it (`EntityRenderer.java`:684-702).
+                mode: CameraMode::from_u8(if self.view.eye_inside_opaque() {
+                    0
+                } else {
+                    self.perspective
+                }),
+                third_distance: self.camera_clip,
                 fov_degrees: frame_fov,
                 near: NEAR_PLANE,
                 far_chunks: self.settings.view_distance() as f32,
@@ -2447,6 +2499,10 @@ impl ClientApp {
                         self.view.confusion_active(),
                     ),
             });
+            // The entity pass's billboard read: the front view and the sleep state
+            // (`RenderManager.java`:244-266) — the label chain and the projectile
+            // pairs turn through it.
+            renderer.set_view_mode(self.perspective == 2, self.sleeping, self.sleep_facing);
             // The world overlay's own inputs: the aim's block for the outline, and every
             // destroy stage the render distance can show for the crack.
             renderer.set_outline(self.world_overlay.aim.map(aim_outline));
@@ -2491,8 +2547,19 @@ impl ClientApp {
             renderer.set_entities(entity_draws);
             // The held item's frame: the stack through the ease's swap rule and the
             // rendered arguments at this frame's fraction, drawn between the scene
-            // and the overlay.
-            renderer.set_held_item(&self.view.held_frame(Instant::now()));
+            // and the overlay. The hand's own gate (`EntityRenderer.java`:863-869)
+            // shuts the frame's stack outside first-person-awake-shown play —
+            // sleep already empties it through the frame's own read.
+            let mut held = self.view.held_frame(Instant::now(), self.sleeping);
+            if !view::hand_visible(
+                self.perspective,
+                self.sleeping,
+                self.hide_gui,
+                self.spectator,
+            ) {
+                held.stack = None;
+            }
+            renderer.set_held_item(&held);
             // The weather columns: the kept report, fed every frame; the tick
             // scrolls the pass's sheets, the floored feet orient the ribbons
             // around the block the session boxed them around.
@@ -2645,32 +2712,42 @@ impl ClientApp {
             &scaled,
         ));
         // The GUI's overlays between the water and the hotbar, in the source's
-        // own order: the pumpkin blur, then the portal (`GuiIngame.java:145-160`).
-        // The lerp reads the frame fraction (R2); the port tracks no
-        // third-person view, so first person reads true (R3).
+        // own order: the pumpkin blur, then the portal (`GuiIngame.java:145-160).
+        // The lerp reads the frame fraction (R2); the overlays read the mode
+        // and the sleep state — never the F1 flag (`:872-875`).
         if let Some(assets) = self.assets.as_ref() {
             hud_draws.extend(self.view.gui_overlay_draws(
                 self.camera.partial(Instant::now()),
-                true,
+                view::overlays_visible(self.perspective, self.sleeping),
                 &scaled,
                 &assets.mesh,
             ));
         }
+        // The F1 gate's three arms never share one flag: the hotbar and stat
+        // rows read the HUD conjunction (`GuiIngame.java`:54-60), the hand
+        // reads the full first-person conjunction (`EntityRenderer.java`:863-869),
+        // and the overlays above read mode-and-sleep only. Spectator folds out
+        // of survival (`GuiIngame.java`:152-158): its swap replaces the hotbar
+        // row, and the narrowed `showCrosshair` (`:513-544`) has no
+        // under-crosshair entity feed in the port, so the crosshair stays out
+        // there too (recorded).
+        let survival = !self.creative && !self.spectator;
         hud_draws.extend(self.view.hotbar_draws(
             Instant::now(),
             &view::HotbarInput {
                 font: self.font.as_ref(),
                 scaled,
-                show_crosshair: true,
+                show_crosshair: !self.spectator,
                 hide_gui: self.hide_gui,
                 screen_open,
-                survival: true,
+                survival,
+                spectator: self.spectator,
             },
         ));
         hud_draws.extend(self.view.stat_rows_draws(&view::RowsInput {
             font: self.font.as_ref(),
             scaled,
-            survival: true,
+            survival,
             hide_gui: self.hide_gui,
             screen_open,
             now_ms: system_time_ms(),
@@ -2992,6 +3069,12 @@ impl ClientApp {
         ) {
             self.perspective = (self.perspective + 1) % 3;
             tracing::info!(perspective = self.perspective, "the camera mode stepped");
+            // The session's occlusion pass reads the stepped mode: its clip
+            // tick follows the edge, so the frame's third-person distance
+            // tracks the key.
+            self.send_input(InputEvent::Perspective {
+                mode: self.perspective,
+            });
             return;
         }
         // The fullscreen key's flip (the row owns the key): a fresh press of
@@ -5219,6 +5302,22 @@ impl ClientApp {
             ScriptKey::F3 => {
                 self.on_script_f3();
             }
+            ScriptKey::F1 => {
+                // The scripted F1 edge: the same flip the window's raw F1
+                // press runs (`Minecraft.java`:2018-2021), over any screen.
+                self.hide_gui = !self.hide_gui;
+                tracing::info!(hide_gui = self.hide_gui, "F1 flipped the HUD flag");
+            }
+            ScriptKey::F5 => {
+                // The scripted F5 edge: the same 0→1→2 step the bound
+                // perspective key runs (`Minecraft.java`:2030-2049), with
+                // the session's clip tick following the edge.
+                self.perspective = (self.perspective + 1) % 3;
+                tracing::info!(perspective = self.perspective, "the camera mode stepped");
+                self.send_input(InputEvent::Perspective {
+                    mode: self.perspective,
+                });
+            }
             ScriptKey::H => {
                 if f3_chord_live(self.screens.is_open(), self.screens.allow_user_input())
                     && is_h_press(
@@ -5362,9 +5461,12 @@ impl ClientApp {
                             self.held = slot;
                             self.send_input(InputEvent::HeldItemChange { slot });
                         }
-                        ScriptKey::Escape | ScriptKey::F3 | ScriptKey::H | ScriptKey::B => {
-                            unreachable!("the window-level keys route above")
-                        }
+                        ScriptKey::Escape
+                        | ScriptKey::F3
+                        | ScriptKey::F1
+                        | ScriptKey::F5
+                        | ScriptKey::H
+                        | ScriptKey::B => unreachable!("the window-level keys route above"),
                     }
                 }
             }
@@ -6403,6 +6505,10 @@ fn apply_session_event(
             apply_overlay_event(world_overlay, &event);
             false
         }
+        // The window's own fold (the frame loop above) owns the gamemode and
+        // occlusion state; this arm only keeps the match complete so the
+        // session's event stream stays total.
+        ClientEvent::GameType { .. } | ClientEvent::CameraClip { .. } => false,
         ClientEvent::BreakStage { .. } | ClientEvent::BreakCleared { .. } => {
             // The overlay state's own events; the helper holds the stores the
             // frame's outline and crack reads consume.

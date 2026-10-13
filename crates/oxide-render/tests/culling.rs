@@ -13,7 +13,9 @@
 //! planes — so every boundary case here is "the box touches the plane and must still draw".
 
 use glam::{Mat4, Vec3};
-use oxide_render::camera::{Camera, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT};
+use oxide_render::camera::{
+    Camera, CameraMode, CameraPose, DEFAULT_FOV, NEAR_PLANE, NO_VIEW_EFFECT, THIRD_PERSON_DISTANCE,
+};
 use oxide_render::frustum::{Aabb3, Frustum, Plane};
 
 /// The far plane of the pinned test frame, in blocks.
@@ -248,6 +250,8 @@ fn the_frustum_matches_the_cameras_own_view_projection() {
         near: NEAR_PLANE,
         far_chunks: 8.0,
         view_effect: NO_VIEW_EFFECT,
+        mode: CameraMode::First,
+        third_distance: THIRD_PERSON_DISTANCE,
     };
     let frustum = Frustum::from_view_projection(camera.view_projection(16.0 / 9.0));
     assert!(

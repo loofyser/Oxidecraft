@@ -226,10 +226,10 @@ impl HeldItem {
     /// (`ItemRenderer.rotateWithPlayerRotations`:124-125) and the sway's arguments
     /// are the raw current rotation minus it. The raw previous-tick latches ride
     /// along for the record. The brightness stands at the full-bright equivalent and
-    /// the sleep state at false: the port has no own-player light channel (the
-    /// session's feed carries a brightness per tracked entity, and the window's own
-    /// player is not one) and no sleep state (recorded; the pass honours both).
-    fn frame(&self, partial: f32) -> HeldItemFrame {
+    /// the sleep state the window feeds it (recorded; the pass honours both).
+    /// Sleep empties the hand at the source (`EntityRenderer.java`:863-869):
+    /// the sleeping frame draws nothing.
+    fn frame(&self, partial: f32, sleeping: bool) -> HeldItemFrame {
         let (arm_pitch, arm_yaw) = self.arm.render(partial);
         HeldItemFrame {
             // The stack's own icon conversion, the draw-list seam's helper: the id,
@@ -245,7 +245,7 @@ impl HeldItem {
             sway_pitch: self.rotation_pitch - arm_pitch,
             sway_yaw: self.rotation_yaw - arm_yaw,
             brightness: 1.0,
-            sleeping: false,
+            sleeping,
         }
     }
 }
@@ -300,6 +300,10 @@ pub struct HotbarInput<'a> {
     /// Whether survival or adventure is in force (`shouldDrawHUD`,
     /// `PlayerControllerMP.java`:115-117).
     pub survival: bool,
+    /// Whether the gamemode byte names spectator: the hotbar row gives way
+    /// to the spectator strip and name (`GuiIngame.java`:162-167), while
+    /// the survival rows stay out through `survival` above.
+    pub spectator: bool,
 }
 
 /// Whether the HUD draws at all: the call site's own gate, not the overlay's —
@@ -309,6 +313,20 @@ pub struct HotbarInput<'a> {
 /// condition (`GuiIngame.java`:128-363). No per-entry screen suppression exists.
 pub(crate) fn hud_visible(hide_gui: bool, screen_open: bool) -> bool {
     !hide_gui || screen_open
+}
+
+/// Whether the held hand draws: first person, awake, HUD shown and no
+/// spectator — the hand's own gate (`EntityRenderer.java`:863-869), never
+/// the HUD flag fanned out to every draw.
+pub(crate) fn hand_visible(mode: u8, sleeping: bool, hide_gui: bool, spectator: bool) -> bool {
+    mode == 0 && !sleeping && !hide_gui && !spectator
+}
+
+/// Whether the first-person overlays draw: first person and awake, with NO
+/// hideGUI term (`EntityRenderer.java`:872-875) — F1 never shuts them, and
+/// the spectator water/fire skips live one level down instead.
+pub(crate) fn overlays_visible(mode: u8, sleeping: bool) -> bool {
+    mode == 0 && !sleeping
 }
 
 /// The screen frame's inputs beside the screens' own state: the font the
@@ -1964,9 +1982,10 @@ impl View {
     }
 
     /// The held item's frame at `now`: the stack through the swap rule and the rendered
-    /// arguments at the frame's own fraction.
-    pub fn held_frame(&self, now: Instant) -> HeldItemFrame {
-        self.held.frame(self.partial(now))
+    /// arguments at the frame's own fraction, with the window's sleep read — sleep
+    /// empties the hand (`EntityRenderer.java`:863-869).
+    pub fn held_frame(&self, now: Instant, sleeping: bool) -> HeldItemFrame {
+        self.held.frame(self.partial(now), sleeping)
     }
 
     /// The frame fraction: the elapsed time since the feed's arrival over the
@@ -2047,6 +2066,11 @@ impl View {
     pub fn hotbar_draws(&self, now: Instant, input: &HotbarInput<'_>) -> Vec<HudDraw> {
         if !hud_visible(input.hide_gui, input.screen_open) {
             return Vec::new();
+        }
+        // The spectator strip replaces the hotbar row (`GuiIngame.java`:162-167);
+        // the crosshair keeps its own gate below.
+        if input.spectator {
+            return self.spectator_draws(input);
         }
         // The source's own integer halves (`sr.getScaledWidth() / 2`).
         let half_w = (input.scaled.width / 2) as f32;
@@ -2175,9 +2199,77 @@ impl View {
         }
         draws
     }
-}
 
-/// The stat rows' draw inputs: the font the level needs, the layout's size, the
+    /// The spectator strip replacing the hotbar row (`GuiIngame.java`:162-167):
+    /// the widgets background and highlight slices, the nine hotbar key
+    /// labels, and the selected stack's name centred at `height − 35`
+    /// (`GuiSpectator.renderTooltip` + `renderSelectedItem`, `:118-140`).
+    /// No slot item draws; the crosshair stays out — the narrowed
+    /// `showCrosshair` (`:513-544`) needs the under-crosshair entity read the
+    /// port has no feed for (recorded).
+    fn spectator_draws(&self, input: &HotbarInput<'_>) -> Vec<HudDraw> {
+        let half_w = (input.scaled.width / 2) as f32;
+        let height = input.scaled.height as f32;
+        let mut draws = Vec::new();
+        // The strip's own frame: the same 182x22 background and 24x22
+        // highlight slices the hotbar row draws (`GuiSpectator.java`:118-126).
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(HOTBAR_WIDGETS),
+            x: half_w - 91.0,
+            y: height - 22.0,
+            width: 182.0,
+            height: 22.0,
+            uv: [0.0, 0.0, 182.0 / 256.0, 22.0 / 256.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+        draws.push(HudDraw::TexturedRect {
+            texture: HudTexture::Named(HOTBAR_WIDGETS),
+            x: half_w - 92.0 + self.held.selected as f32 * 20.0,
+            y: height - 23.0,
+            width: 24.0,
+            height: 22.0,
+            uv: [0.0, 22.0 / 256.0, 24.0 / 256.0, 44.0 / 256.0],
+            colour: [1.0, 1.0, 1.0, 1.0],
+        });
+        // The hotbar key labels over each cell (`:127-133`): the digit rows
+        // stand where the slot items would.
+        if input.font.is_some() {
+            for slot in 0..9 {
+                draws.push(HudDraw::Text {
+                    text: (slot + 1).to_string(),
+                    x: half_w - 88.0 + slot as f32 * 20.0 + 3.0,
+                    y: height - 19.0 + 1.0,
+                    scale: 1.0,
+                    colour: [1.0, 1.0, 1.0, 1.0],
+                    shadow: true,
+                    blend: false,
+                });
+            }
+        }
+        // The selected name (`renderSelectedItem`, `:134-140`): centred at
+        // `height − 35` on the shared highlight clock — the same popup clock
+        // the survival row's tooltip runs down, since the spectator swap
+        // replaces that tooltip outright (`GuiIngame.java`:226-232).
+        if self.held.popup_ticks > 0 {
+            if let (Some(font), Some(stack)) = (input.font, self.held.popup_stack.as_ref()) {
+                if let Some(name) = popup_text(stack) {
+                    let width = string_width(font, &name) as f32;
+                    let alpha = f32::from(popup_alpha(self.held.popup_ticks)) / 255.0;
+                    draws.push(HudDraw::Text {
+                        text: name,
+                        x: (input.scaled.width as f32 - width) / 2.0,
+                        y: height - 35.0,
+                        scale: 1.0,
+                        colour: [1.0, 1.0, 1.0, alpha],
+                        shadow: true,
+                        blend: true,
+                    });
+                }
+            }
+        }
+        draws
+    }
+}
 /// mode and F1 gates, and the wall clock in milliseconds — the blink's settle
 /// rule reads the same millisecond clock the source's `Minecraft.getSystemTime`
 /// returns (`GuiIngame.java`:630-634).
@@ -2636,6 +2728,14 @@ impl View {
         self.overlay.lerped(partial)
     }
 
+    /// Whether the eye sits inside an opaque block: the session's
+    /// block-in-hand read, which already folded render type −1 out
+    /// (`ItemRenderer.java`:424-447). The frame snaps the camera mode to
+    /// first on it (`Minecraft.java`:1138-1141).
+    pub(crate) fn eye_inside_opaque(&self) -> bool {
+        self.overlay.inside_block.is_some()
+    }
+
     /// Whether the eye sits in lava: the viewpoint cell's behaviour-table
     /// liquid is lava (`Blocks.flowing_lava`/`Blocks.lava`, ids 10-11) — the
     /// lava fog arm's own material read (`EntityRenderer.java:1849`).
@@ -2662,8 +2762,8 @@ impl View {
     /// The GUI's overlay quads in the source's own order: the pumpkin blur,
     /// then the portal (`GuiIngame.renderGameOverlay`, `GuiIngame.java:145-160`
     /// — vignette, which the port does not draw yet, runs ahead of both).
-    /// The port tracks no third-person view, so the call site passes first
-    /// person true (R3).
+    /// The call site feeds the mode and the sleep state — never a literal
+    /// (R7) and never the F1 flag (`GuiIngame.java`:872-875).
     pub(crate) fn gui_overlay_draws(
         &self,
         partial: f32,
@@ -9229,6 +9329,7 @@ mod tests {
             hide_gui: false,
             screen_open: false,
             survival: true,
+            spectator: false,
         }
     }
 
@@ -9730,6 +9831,115 @@ mod tests {
                 .iter()
                 .any(|draw| matches!(draw, HudDraw::InvertRect { .. })),
             "no crosshair while the gate says hide"
+        );
+    }
+
+    /// The hand's gate is the full `:863-869` conjunction — first person,
+    /// awake, HUD shown, no spectator — never the HUD flag alone.
+    #[test]
+    fn the_hand_gate_is_the_full_first_person_conjunction() {
+        assert!(
+            hand_visible(0, false, false, false),
+            "plain play draws the hand"
+        );
+        assert!(!hand_visible(0, false, true, false), "F1 hides the hand");
+        assert!(
+            !hand_visible(1, false, false, false),
+            "the back view hides the hand"
+        );
+        assert!(
+            !hand_visible(2, false, false, false),
+            "the front view hides the hand"
+        );
+        assert!(!hand_visible(0, true, false, false), "sleep hides the hand");
+        assert!(
+            !hand_visible(0, false, false, true),
+            "spectator hides the hand"
+        );
+    }
+
+    /// The sleeping frame carries the window's read (`EntityRenderer.java`:863-869):
+    /// sleep empties the hand at the pass.
+    #[test]
+    fn the_sleeping_frame_carries_the_sleep_read() {
+        let mut view = View::new();
+        view.apply(&held_snapshot(std::array::from_fn(|_| None)));
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        assert!(
+            !view.held_frame(t0, false).sleeping,
+            "awake frames read false"
+        );
+        assert!(
+            view.held_frame(t0, true).sleeping,
+            "sleeping frames read true"
+        );
+    }
+
+    /// The overlay gate has no hideGUI term (`:872-875`): third person and
+    /// sleep shut it, F1 never does — the over-suppression trap.
+    #[test]
+    fn the_overlay_gate_has_no_hide_gui_term() {
+        assert!(overlays_visible(0, false), "plain play draws the overlays");
+        assert!(
+            !overlays_visible(1, false),
+            "the back view hides the overlays"
+        );
+        assert!(
+            !overlays_visible(2, false),
+            "the front view hides the overlays"
+        );
+        assert!(!overlays_visible(0, true), "sleep hides the overlays");
+    }
+
+    /// The spectator strip replaces the hotbar row (`GuiIngame.java`:162-167):
+    /// no slot item draws, the digit labels stand, and the selected name
+    /// centres at `height − 35` on the shared highlight clock
+    /// (`GuiSpectator.java`:118-140).
+    #[test]
+    fn the_spectator_strip_replaces_the_hotbar_row() {
+        let mut slots: [Option<MetadataItem>; 9] = std::array::from_fn(|_| None);
+        slots[0] = hotbar_stack(276, 1, 0);
+        let mut view = View::new();
+        view.apply(&held_snapshot(slots));
+        view.apply(&held_tick(1));
+        let font = chat_font();
+        let t0 = Instant::now();
+        view.observe(Vec::new(), t0);
+        let input = HotbarInput {
+            spectator: true,
+            survival: false,
+            ..hotbar_input(Some(&font))
+        };
+        let draws = view.hotbar_draws(t0, &input);
+        assert!(
+            !draws
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Item { .. })),
+            "no hotbar slot draws in spectator: {draws:?}"
+        );
+        assert!(
+            draws.iter().any(|draw| matches!(
+                draw,
+                HudDraw::Text { text, .. } if text == "1"
+            )),
+            "the digit labels stand: {draws:?}"
+        );
+        let name = draws
+            .iter()
+            .find_map(|draw| match draw {
+                HudDraw::Text { text, y, .. } if text == "Diamond Sword" => Some(*y),
+                _ => None,
+            })
+            .expect("the selected name draws");
+        assert_eq!(name, 205.0, "height − 35 with no survival shift");
+        // The same frame without the spectator read keeps the hotbar row.
+        let plain = hotbar_at(&view, t0, Duration::ZERO, Some(&font));
+        assert!(
+            plain
+                .iter()
+                .any(|draw| matches!(draw, HudDraw::Item { .. })),
+            "survival keeps the slot items"
         );
     }
 
@@ -10853,11 +11063,13 @@ mod tests {
             other => panic!("the blur is a textured quad: {other:?}"),
         }
         assert!(
-            pumpkin_overlay_draws(false, true, &scaled).is_empty(),
+            pumpkin_overlay_draws(false, overlays_visible(0, false), &scaled).is_empty(),
             "bare-headed draws nothing"
         );
+        // The mode-fed expectation (R7): the call site passes
+        // `overlays_visible(mode, sleeping)` — never a literal.
         assert!(
-            pumpkin_overlay_draws(true, false, &scaled).is_empty(),
+            pumpkin_overlay_draws(true, overlays_visible(1, false), &scaled).is_empty(),
             "third person draws nothing"
         );
         armour[3] = None;
@@ -11324,7 +11536,7 @@ mod tests {
         assert_eq!(view.held.equip.progress(), 0.0, "two more steps down");
         assert_eq!(view.held.stack, None, "the swap lands at zero");
         // The frame at a partial of zero renders `1 - prev`: the pair's lower end.
-        let frame = view.held_frame(Instant::now());
+        let frame = view.held_frame(Instant::now(), false);
         assert!(
             (frame.equip - 0.8).abs() < 1e-6,
             "the frame's rendered ease: {}",
@@ -11356,9 +11568,9 @@ mod tests {
         // At the tick's own start (a partial of zero) the rendered swing reads the
         // pair's previous latch, and at its end the current value: the swing's second
         // tick covers zero to a sixth (the first lands on zero of six).
-        let frame = view.held_frame(t0);
+        let frame = view.held_frame(t0, false);
         assert_eq!(frame.swing, 0.0, "the swing starts at zero");
-        let frame = view.held_frame(t0 + Duration::from_millis(50));
+        let frame = view.held_frame(t0 + Duration::from_millis(50), false);
         assert!(
             (frame.swing - 1.0 / 6.0).abs() < 1e-6,
             "the swing's second tick renders a sixth: {}",
@@ -11387,7 +11599,7 @@ mod tests {
         view.apply(&held_tick_at(2, 20.0, 40.0));
         // At the tick's own start (a partial of zero) the pair's previous latch
         // renders: the sway's arguments are the camera minus (10, 20).
-        let frame = view.held_frame(t0);
+        let frame = view.held_frame(t0, false);
         assert!(
             (frame.sway_pitch - 10.0).abs() < 1e-6,
             "the sway's pitch argument: {}",
@@ -11399,7 +11611,7 @@ mod tests {
             frame.sway_yaw
         );
         // At the tick's end the current pair renders: the camera minus (15, 30).
-        let frame = view.held_frame(t0 + Duration::from_millis(50));
+        let frame = view.held_frame(t0 + Duration::from_millis(50), false);
         assert!(
             (frame.sway_pitch - 5.0).abs() < 1e-6,
             "the rendered current pair: {}",
@@ -11413,7 +11625,7 @@ mod tests {
         // A third tick boundary: the arm moves to (17.5, 35), halving the yaw term
         // again — the chase keeps closing on the camera.
         view.apply(&held_tick_at(3, 20.0, 40.0));
-        let frame = view.held_frame(t0 + Duration::from_millis(50));
+        let frame = view.held_frame(t0 + Duration::from_millis(50), false);
         assert!(
             (frame.sway_pitch - 2.5).abs() < 1e-6,
             "the third tick's pitch argument: {}",

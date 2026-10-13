@@ -60,6 +60,12 @@ impl CameraPose {
 pub struct Camera {
     /// Where the camera is.
     pub pose: CameraPose,
+    /// The camera mode: first person, or either third-person side.
+    pub mode: CameraMode,
+    /// The occlusion-clipped third-person distance for the frame: the
+    /// session-side ray read's answer, [`THIRD_PERSON_DISTANCE`] with no
+    /// wall behind the player. Read only outside first person.
+    pub third_distance: f32,
     /// Vertical field of view in degrees.
     pub fov_degrees: f32,
     /// The near plane.
@@ -113,6 +119,143 @@ pub fn render_eye(pose: &CameraPose) -> Vec3 {
     pose.eye() - FIRST_PERSON_OFFSET * pose.forward()
 }
 
+/// The camera mode: the source's `gameSettings.thirdPersonView` 0/1/2 —
+/// first person, third-person back, third-person front — stepped by the
+/// bound perspective key's press edge and snapped to first inside an opaque
+/// block (`Minecraft.java`:1138-1141, `:2031-2048`). Session-ephemeral, like
+/// the F1 flag: never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraMode {
+    /// First person (`thirdPersonView == 0`).
+    First,
+    /// Third person behind the player (`thirdPersonView == 1`).
+    ThirdBack,
+    /// Third person facing the player (`thirdPersonView == 2`).
+    ThirdFront,
+}
+
+impl CameraMode {
+    /// The mode a byte names; anything past front reads first, the way the
+    /// source's `> 2` wrap does.
+    pub fn from_u8(mode: u8) -> Self {
+        match mode {
+            1 => Self::ThirdBack,
+            2 => Self::ThirdFront,
+            _ => Self::First,
+        }
+    }
+
+    /// The byte a mode names.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::First => 0,
+            Self::ThirdBack => 1,
+            Self::ThirdFront => 2,
+        }
+    }
+
+    /// The F5 press-edge cycle 0 → 1 → 2 → 0 (`Minecraft.java`:2031-2048).
+    pub fn next(self) -> Self {
+        match self {
+            Self::First => Self::ThirdBack,
+            Self::ThirdBack => Self::ThirdFront,
+            Self::ThirdFront => Self::First,
+        }
+    }
+}
+
+/// The third-person camera's distance, in blocks: both source fields hold
+/// it (`thirdPersonDistance` and `thirdPersonDistanceTemp`,
+/// `EntityRenderer.java`:94,97) and no path in the tree ever assigns
+/// another value, so the lerp below always reads it back.
+pub const THIRD_PERSON_DISTANCE: f32 = 4.0;
+
+/// The frame's third-person distance: the temp field plus the
+/// current-minus-temp fraction (`EntityRenderer.java`:665), fed by the
+/// per-render copy of current into temp (`:337`).
+pub fn third_person_frame_distance(temp: f32, current: f32, partial: f32) -> f32 {
+    temp + (current - temp) * partial
+}
+
+/// The third-person offset direction for an entity yaw and pitch: the
+/// `(d4, d6, d5)` unit vector the camera stands off along
+/// (`EntityRenderer.java`:680-682). The front view adds 180 to the pitch
+/// term `f2` before the vector (`:676-678`).
+///
+/// The sines and cosines are the platform's own, not the source's
+/// lookup-table `MathHelper`: the pins below choose values the table
+/// cannot move.
+pub fn third_person_offset(yaw_degrees: f32, pitch_degrees: f32, front_view: bool) -> Vec3 {
+    let mut pitch = pitch_degrees;
+    if front_view {
+        pitch += 180.0;
+    }
+    let (sin_yaw, cos_yaw) = yaw_degrees.to_radians().sin_cos();
+    let (sin_pitch, cos_pitch) = pitch.to_radians().sin_cos();
+    let d4 = -sin_yaw * cos_pitch;
+    let d5 = cos_yaw * cos_pitch;
+    let d6 = -sin_pitch;
+    Vec3::new(d4, d6, d5)
+}
+
+/// The occlusion pull-in: eight rays from the eye toward the wanted camera
+/// point, one per corner of a 0.1 cube, and the shortest hit replaces the
+/// distance (`EntityRenderer.java`:684-702).
+///
+/// `clip` is the caller's ray read — this file keeps no world handle —
+/// answering each ray's hit point or `None`; a hit's reach is measured
+/// from the plain eye, as the source's `hitVec.distanceTo` does. The
+/// target carries the source's own shape, including its `+f5` x term.
+pub fn third_person_pull_in(
+    desired: f32,
+    eye: Vec3,
+    offset: Vec3,
+    clip: impl Fn(Vec3, Vec3) -> Option<Vec3>,
+) -> f32 {
+    let want = eye - offset * desired;
+    let mut distance = desired;
+    for i in 0..8 {
+        let corner = Vec3::new(
+            ((i & 1) * 2 - 1) as f32 * 0.1,
+            (((i >> 1) & 1) * 2 - 1) as f32 * 0.1,
+            (((i >> 2) & 1) * 2 - 1) as f32 * 0.1,
+        );
+        let origin = eye + corner;
+        let target = want + Vec3::new(corner.x + corner.z, corner.y, corner.z);
+        if let Some(hit) = clip(origin, target) {
+            let reached = hit.distance(eye);
+            if reached < distance {
+                distance = reached;
+            }
+        }
+    }
+    distance
+}
+
+/// The third-person frame for an eye, a yaw/pitch pair, a mode and the
+/// clipped distance: the camera's position, and the yaw and pitch the view
+/// rotates by — the front view's half-turn yaw with the unchanged pitch,
+/// the net of the source's rotate pair around the translate
+/// (`EntityRenderer.java`:704-716; the yaw pair reads the entity yaw both
+/// ways, so only the 180 survives it).
+pub fn third_person_frame(
+    eye: Vec3,
+    yaw_degrees: f32,
+    pitch_degrees: f32,
+    mode: CameraMode,
+    distance: f32,
+) -> (Vec3, f32, f32) {
+    let front_view = mode == CameraMode::ThirdFront;
+    let offset = third_person_offset(yaw_degrees, pitch_degrees, front_view);
+    let position = eye - offset * distance;
+    let yaw = if front_view {
+        yaw_degrees + 180.0
+    } else {
+        yaw_degrees
+    };
+    (position, yaw, pitch_degrees)
+}
+
 impl Camera {
     /// The eye position: the pose's eye, without the renderer's offset.
     pub fn eye(&self) -> Vec3 {
@@ -126,13 +269,30 @@ impl Camera {
 
     /// The view matrix.
     ///
-    /// The camera sits [`FIRST_PERSON_OFFSET`] blocks behind the eye on the view axis, as
-    /// the source's first-person camera does, and the frame's [`Self::view_effect`] is
-    /// composed in front of it.
+    /// First person sits [`FIRST_PERSON_OFFSET`] blocks behind the eye on
+    /// the view axis, as the source's first-person camera does; either
+    /// third-person mode stands the camera off at the clipped distance with
+    /// the front view's half-turn yaw (`EntityRenderer.orientCamera`'s
+    /// `thirdPersonView > 0` branch, `EntityRenderer.java`:663-718). The
+    /// frame's [`Self::view_effect`] is composed in front of both.
     pub fn view(&self) -> Mat4 {
-        self.view_effect
-            * view_rotation(self.pose.yaw, self.pose.pitch)
-            * Mat4::from_translation(-render_eye(&self.pose))
+        match self.mode {
+            CameraMode::First => {
+                self.view_effect
+                    * view_rotation(self.pose.yaw, self.pose.pitch)
+                    * Mat4::from_translation(-render_eye(&self.pose))
+            }
+            mode => {
+                let (position, yaw, pitch) = third_person_frame(
+                    self.pose.eye(),
+                    self.pose.yaw,
+                    self.pose.pitch,
+                    mode,
+                    self.third_distance,
+                );
+                self.view_effect * view_rotation(yaw, pitch) * Mat4::from_translation(-position)
+            }
+        }
     }
 
     /// The projection matrix for an aspect ratio. The far plane is
@@ -533,6 +693,8 @@ mod tests {
                 pitch: 0.0,
                 sneak: false,
             },
+            mode: super::CameraMode::First,
+            third_distance: super::THIRD_PERSON_DISTANCE,
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
@@ -577,6 +739,8 @@ mod tests {
         };
         let camera = Camera {
             pose,
+            mode: super::CameraMode::First,
+            third_distance: super::THIRD_PERSON_DISTANCE,
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
@@ -599,6 +763,8 @@ mod tests {
                 pitch,
                 sneak: false,
             },
+            mode: super::CameraMode::First,
+            third_distance: super::THIRD_PERSON_DISTANCE,
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
@@ -1127,6 +1293,8 @@ mod tests {
         };
         let camera = Camera {
             pose,
+            mode: super::CameraMode::First,
+            third_distance: super::THIRD_PERSON_DISTANCE,
             fov_degrees: DEFAULT_FOV,
             near: NEAR_PLANE,
             far_chunks: 8.0,
@@ -1148,5 +1316,136 @@ mod tests {
             plain.view().transform_point3(origin).length() < 1e-6,
             "without an effect the view origin is the render eye itself"
         );
+    }
+
+    /// The third-person distance is a constant four blocks: both source
+    /// fields hold 4.0 and no path ever assigns another value
+    /// (`EntityRenderer.java`:94,97).
+    #[test]
+    fn the_third_person_distance_is_four_blocks() {
+        assert_eq!(
+            super::THIRD_PERSON_DISTANCE,
+            4.0,
+            "the constant both fields carry"
+        );
+    }
+
+    /// The frame's distance keeps the temp/lerp shape: temp plus the
+    /// current-minus-temp fraction (`EntityRenderer.java`:665, fed by the
+    /// per-render copy at `:337`).
+    #[test]
+    fn the_third_person_distance_keeps_the_temp_lerp_shape() {
+        assert_eq!(super::third_person_frame_distance(4.0, 4.0, 0.3), 4.0);
+        assert!(
+            (super::third_person_frame_distance(3.0, 4.0, 0.5) - 3.5).abs() < 1e-6,
+            "temp + (current − temp) × partial"
+        );
+    }
+
+    /// The back-view offset sits behind the look: facing south level, the
+    /// camera stands four blocks north of the eye
+    /// (`EntityRenderer.java`:680-682).
+    #[test]
+    fn the_back_offset_points_behind_the_look() {
+        let offset = super::third_person_offset(0.0, 0.0, false);
+        assert!(
+            (offset - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-6,
+            "south level reads (0, 0, 1), got {offset:?}"
+        );
+    }
+
+    /// The front-view pitch term: mode 2 adds 180 to the pitch before the
+    /// offset vector (`EntityRenderer.java`:676-678), so the front offset
+    /// at a pose equals the back offset at that pose pitched half a turn
+    /// further — and level south it stands south of the eye.
+    #[test]
+    fn the_front_pitch_term_flips_the_offset() {
+        let front = super::third_person_offset(30.0, 10.0, true);
+        let flipped = super::third_person_offset(30.0, 10.0 + 180.0, false);
+        assert!(
+            (front - flipped).length() < 1e-5,
+            "the +180 pitch term, got {front:?} vs {flipped:?}"
+        );
+        let level = super::third_person_offset(0.0, 0.0, true);
+        assert!(
+            (level - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6,
+            "front level reads (0, 0, −1), got {level:?}"
+        );
+    }
+
+    /// The pull-in without a hit keeps the desired distance.
+    #[test]
+    fn the_pull_in_keeps_the_desired_distance_without_a_hit() {
+        let eye = Vec3::new(0.0, 64.0, 0.0);
+        let offset = super::third_person_offset(0.0, 0.0, false);
+        assert_eq!(
+            super::third_person_pull_in(4.0, eye, offset, |_, _| None),
+            4.0,
+            "no hit is no pull-in"
+        );
+    }
+
+    /// The pull-in takes the shortest of the eight corner rays: the clip
+    /// answers two blocks on the negative-x corners and three on the
+    /// positive ones, and the frame reads two.
+    #[test]
+    fn the_pull_in_takes_the_shortest_of_the_eight_rays() {
+        use std::cell::RefCell;
+        let eye = Vec3::new(0.0, 64.0, 0.0);
+        let offset = super::third_person_offset(0.0, 0.0, false);
+        let calls = RefCell::new(Vec::new());
+        let clipped = super::third_person_pull_in(4.0, eye, offset, |origin, target| {
+            calls.borrow_mut().push((origin, target));
+            let distance = if origin.x < 0.0 { 2.0 } else { 3.0 };
+            Some(Vec3::new(eye.x, eye.y, eye.z - distance))
+        });
+        assert_eq!(calls.borrow().len(), 8, "one ray per cube corner");
+        assert!(
+            (clipped - 2.0).abs() < 1e-6,
+            "the shortest hit replaces the distance, got {clipped}"
+        );
+    }
+
+    /// The eight rays leave from the 0.1 cube's corners: south level, the
+    /// first corner's origin and target pin the shape, including the
+    /// target's own `+f5` x term (`EntityRenderer.java`:684-702).
+    #[test]
+    fn the_pull_in_geometry_is_the_point_one_cube() {
+        use std::cell::RefCell;
+        let eye = Vec3::new(0.0, 64.0, 0.0);
+        let offset = super::third_person_offset(0.0, 0.0, false);
+        let calls = RefCell::new(Vec::new());
+        let _ = super::third_person_pull_in(4.0, eye, offset, |origin, target| {
+            calls.borrow_mut().push((origin, target));
+            None
+        });
+        let calls = calls.borrow();
+        assert!(
+            calls.iter().any(|(origin, target)| {
+                (origin - Vec3::new(-0.1, 63.9, -0.1)).length() < 1e-6
+                    && (target - Vec3::new(-0.2, 63.9, -4.1)).length() < 1e-5
+            }),
+            "corner zero reads eye − 0.1 aiming at the want − 0.1 (x carries both): {calls:?}"
+        );
+        let mut origins: Vec<[f32; 3]> =
+            calls.iter().map(|(origin, _)| origin.to_array()).collect();
+        origins.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        origins.dedup();
+        assert_eq!(origins.len(), 8, "eight distinct corners: {origins:?}");
+    }
+
+    /// The mode cycles first → back → front → first, and an unknown byte
+    /// reads first (`Minecraft.java`:2031-2048).
+    #[test]
+    fn the_camera_mode_cycles_back_front_and_wraps() {
+        use super::CameraMode;
+        assert_eq!(CameraMode::First.next(), CameraMode::ThirdBack);
+        assert_eq!(CameraMode::ThirdBack.next(), CameraMode::ThirdFront);
+        assert_eq!(CameraMode::ThirdFront.next(), CameraMode::First);
+        assert_eq!(CameraMode::from_u8(0), CameraMode::First);
+        assert_eq!(CameraMode::from_u8(1), CameraMode::ThirdBack);
+        assert_eq!(CameraMode::from_u8(2), CameraMode::ThirdFront);
+        assert_eq!(CameraMode::from_u8(9), CameraMode::First);
+        assert_eq!(CameraMode::ThirdFront.as_u8(), 2);
     }
 }
