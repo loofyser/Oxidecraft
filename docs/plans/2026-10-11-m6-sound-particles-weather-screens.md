@@ -635,16 +635,16 @@ feat: the remaining options screens and the rebindable controls (client)
 
 ### Task 20: The death, disconnect, terrain and sleep screens
 
-**Goal:** The remaining overlay/screen states: the death screen (with its Respawn/Title buttons and the existing death-camera roll intact), the disconnect screen with its reason, the "Downloading terrain" screen (shown while the join's chunks load — the client's own first-frame gate), the sleep overlay (the visual state + camera rise), and the open-link confirm overlay (`GuiConfirmOpenLink`).
+**Goal:** The remaining overlay/screen states: the death screen (with its Respawn/Title buttons and the existing death-camera roll intact), the disconnect screen with its reason, the "Downloading terrain" screen (shown at join over the fresh world — cleared by the first PlayerPosLook, `NetHandlerPlayClient.java:719-726`; the recon's correction), the sleep overlay (the chat cover + the HUD darkening + the camera rise), and the open-link confirm overlay (`GuiConfirmOpenLink`).
 
 **Files:**
 - Create: `crates/oxide-client/src/screens/end_states.rs` — the death/disconnect/terrain/sleep/confirm screens.
-- Modify: `crates/oxide-client/src/screens/mod.rs`, `crates/oxide-client/src/main.rs` — the state transitions (Joined→terrain→play; death→Respawn path; disconnect→the screen + Title; chat open-link → the confirm overlay; sleeping from the server's sleep packet path or the standing state source — derive which wire signal 1.8 uses for the own-player sleep overlay and pin).
+- Modify: `crates/oxide-client/src/screens/mod.rs`, `crates/oxide-client/src/main.rs` — the state transitions (Joined→terrain→play; death→Respawn path; disconnect→the screen + Title; chat open-link → the confirm overlay [promote-and-complete the interim; keep its Enter/Escape contract]; the polled sleeping flag — S0A sets it, S0B-2 wakes; the trigger is `isPlayerSleeping`, no wire signal of its own, `Minecraft.java:1777-1784`; surface the flag + its wake path).
 - Test: `tests/screens.rs` + ignored frames per screen.
-- Test: `crates/oxide-game` — the sleep-state source (whatever packet path is derived — a decode pin if new).
+- Test: `crates/oxide-game` — the sleeping-flag feed (S0A set / S0B-2 clear — pinned against `EntityPlayer.java:1568-1571` and `NetHandlerPlayClient.java:882-885`).
 
 **Interfaces:**
-- Produces: `ScreenState::{Death, Disconnected, DownloadTerrain, ConfirmOpenLink}` + the sleep overlay's draw state; the death screen's respawn action routes to the standing `ClientStatus::Respawn` path; the disconnect screen's text = the session's `Disconnected.reason`.
+- Produces: `ScreenState::{Death, Disconnected, DownloadTerrain, ConfirmOpenLink}` + the sleep chat-cover, the HUD sleep darkening and the camera sleeping branch (no sleep `ScreenState` variant — `GuiSleepMP` is a chat cover); the death screen's respawn action routes to the standing `ClientStatus::Respawn` path; the disconnect screen's body = the session's `Disconnected.reason`, under the fixed `disconnect.lost` title.
 - Consumes: Tasks 15–17; the M3 death camera.
 
 - [ ] **Step 1: Tests (RED).** Transitions + frames red first.
