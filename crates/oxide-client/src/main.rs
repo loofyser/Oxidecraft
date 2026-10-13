@@ -87,6 +87,10 @@ use oxide_client::settings_state::{
     KeymapPass, NoAudio, ParticleSink, SettingsState, WindowSink, cursor_to_gui, framerate_gate,
     options_path,
 };
+use oxide_client::text_field::{
+    ClipboardOp, FieldOutcome, TextField, clipboard_op, common_prefix, completion_matches,
+    completion_word_start, join_candidates, words_equal_fold,
+};
 use oxide_game::audio::music::{MusicKind, MusicTicker};
 use oxide_game::audio::{
     AudioDevice, AudioEngine, CpalDevice, ListenerPose, PlaySound, SoundCategory,
@@ -420,6 +424,7 @@ impl ScriptDriver {
         chat: &mut ChatInput,
         view: &mut view::ChatView,
         tab_open: &mut bool,
+        tab_names: &[String],
         cursor: &mut Option<(f32, f32)>,
     ) -> std::io::Result<()> {
         self.last_tick = Some(tick);
@@ -438,12 +443,21 @@ impl ScriptDriver {
                     match event {
                         InputEvent::Key { key, pressed } if chat.open => {
                             // The screen answers presses only; Enter is the
-                            // field's own send. Tab is consumed (its
-                            // completion is deferred) and every other key is
-                            // the character path's, which a scripted key
-                            // carries no text for.
+                            // field's own send, Tab runs the completion
+                            // cycle against the standing names, and every
+                            // other key is the character path's, which a
+                            // scripted key carries no text for. A print the
+                            // cycle left joins the log through the mirror.
+                            if *pressed && *key == Key::Tab {
+                                chat.tab_complete(tab_names);
+                                for line in chat.drain_prints() {
+                                    view.observe(&line, 0, tick);
+                                }
+                            }
                             if *pressed && *key == Key::Enter {
-                                if let ChatKey::Send(send) = chat.key(Key::Enter) {
+                                if let ChatKey::Send(send) =
+                                    chat.key(Key::Enter, false, false, tab_names)
+                                {
                                     if self.input_tx.send(send).is_err() {
                                         tracing::warn!(
                                             "the session's input channel is closed; the script stopped"
@@ -543,7 +557,7 @@ impl ScriptDriver {
                         // line's own tick.
                         chat.open("");
                         chat.type_text(text);
-                        if let ChatKey::Send(send) = chat.key(Key::Enter) {
+                        if let ChatKey::Send(send) = chat.key(Key::Enter, false, false, &[]) {
                             if self.input_tx.send(send).is_err() {
                                 tracing::warn!(
                                     "the session's input channel is closed; the script stopped"
@@ -2028,6 +2042,12 @@ impl ClientApp {
             {
                 if let Some(script) = self.script.as_mut() {
                     let scale = renderer.scaled_resolution().scale_factor;
+                    let tab_names: Vec<String> = self
+                        .tab
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect();
                     if let Err(error) = script.observe(
                         *tick,
                         *x,
@@ -2040,6 +2060,7 @@ impl ClientApp {
                         &mut self.chat_input,
                         &mut self.chat,
                         &mut self.tab.open,
+                        &tab_names,
                         &mut self.cursor,
                     ) {
                         // The record of the run is broken; stop rather than
@@ -2585,7 +2606,7 @@ impl ClientApp {
             Some(font) => view::sidebar_draws(&self.board, &self.own_name, font, scaled),
             None => Vec::new(),
         });
-        hud_draws.extend(self.chat.draws(scaled, &self.chat_input));
+        hud_draws.extend(self.chat.draws(scaled, &mut self.chat_input));
         if self.tab.open {
             if let Some(font) = self.font.as_ref() {
                 hud_draws.extend(self.tab.tab_draws(
@@ -2863,12 +2884,30 @@ impl ClientApp {
         if event.state != ElementState::Pressed {
             return;
         }
-        let pressed = match event.physical_key {
-            PhysicalKey::Code(code) => keymap::translate(code, &self.settings.settings().bindings),
+        let code = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
             PhysicalKey::Unidentified(_) => None,
         };
+        // The clipboard chords ride past the bindings: the source reads them
+        // straight off the device inside `textboxKeyTyped` (`:343-373`).
+        if self.ctrl {
+            if let Some(code) = code {
+                if let Some(op) = clipboard_op(true, code) {
+                    self.chat_input.clipboard(op);
+                    return;
+                }
+            }
+        }
+        let pressed =
+            code.and_then(|code| keymap::translate(code, &self.settings.settings().bindings));
+        let names: Vec<String> = self
+            .tab
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
         let consumed = match pressed {
-            Some(key) => match self.chat_input.key(key) {
+            Some(key) => match self.chat_input.key(key, self.ctrl, self.shift, &names) {
                 ChatKey::Send(send) => {
                     self.send_input(send);
                     true
@@ -2882,6 +2921,11 @@ impl ClientApp {
             if let Some(text) = event.text.as_deref() {
                 self.chat_input.type_text(text);
             }
+        }
+        // Tab's multi-candidate print leaves through the chat mirror — the
+        // port's own means for the source's deletion-id chat line (`:232-247`).
+        for line in self.chat_input.drain_prints() {
+            self.chat.observe(&line, 0, self.player.tick);
         }
         if !self.chat_input.open {
             self.close_chat(event_loop);
@@ -4465,7 +4509,7 @@ impl ClientApp {
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         if self.chat_input.open {
             let lines = chat_wheel_lines(delta);
-            if lines != 0 {
+            if chat_wheel_scrolls(lines) {
                 self.chat.scroll(lines);
             }
         } else if let Some(screen) = self.screens.creative_mut() {
@@ -6374,6 +6418,14 @@ enum EscapeRoute {
 /// computes `(int) dWheel`, clamps to ±1 and multiplies by seven at `:160-163`;
 /// its shift-flavoured second count needs a modifier state the window event
 /// does not carry, so the seven is the one rule).
+/// Whether one wheel event's line count reaches the log: the screen's own
+/// guard — `on_wheel` calls `ChatView::scroll` only past zero, so a
+/// zero-delta event sends nothing (`GuiChat.handleMouseInput`:143-167 answers
+/// every event; the port skips the no-op send).
+fn chat_wheel_scrolls(lines: i32) -> bool {
+    lines != 0
+}
+
 fn chat_wheel_lines(delta: MouseScrollDelta) -> i32 {
     let notches = match delta {
         MouseScrollDelta::LineDelta(_, y) => y,
@@ -6830,42 +6882,29 @@ fn is_h_press(state: ElementState, repeat: bool, key: PhysicalKey) -> bool {
 /// message that slipped past.
 const CHAT_TEXT_CAP: usize = 100;
 
-/// Whether the chat field accepts a character:
-/// `ChatAllowedCharacters.isAllowedCharacter`:10-13 refuses the format
-/// code `§` (167), everything below the space, and DEL (127), and
-/// `GuiTextField.writeText`:132 filters every append through it.
-fn chat_allowed(c: char) -> bool {
-    c != '\u{a7}' && c >= ' ' && c != '\u{7f}'
-}
-
-/// The chat field's state: the text, the cursor, whether it is open, and the
-/// blink counter — over the recall of the messages it sent.
+/// The chat field's state: the shared field over the recall of the messages
+/// it sent, plus the completion cycle.
 ///
 /// The field is the source's `GuiChat` over its `GuiTextField`
-/// (`GuiChat.java`:47-66 initialises both): the text is edited in place — a
-/// character appends at the cursor, Backspace removes the one before it, the
-/// arrows walk it (`GuiTextField.textboxKeyTyped`:337-494) — under the
-/// 100-character cap the source sets (`GuiChat.initGui`:59). Enter sends the trimmed
+/// (`GuiChat.java`:47-66 initialises both): the text is edited in place
+/// through [`TextField`] — a character appends at the cursor, Backspace
+/// removes the one before it, the arrows walk it
+/// (`GuiTextField.textboxKeyTyped`:337-494) — under the 100-character cap
+/// the source sets (`GuiChat.initGui`:59). Enter sends the trimmed
 /// text as one [`InputEvent::SendChat`] and closes (`GuiChat.keyTyped`:104-137);
 /// Escape closes without sending (`:100-103`); the up and down arrows recall
 /// the messages already sent (`getSentHistory`:272-296 over `GuiNewChat`'s
 /// list, `GuiNewChat.java`:190-206), buffering the draft while they walk.
+/// Tab completes against the session's standing names
+/// (`autocompletePlayerNames`:203-250 over the offline rule below).
 /// While the field is closed it carries no text.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ChatInput {
-    /// The text, edited in place.
-    text: String,
-    /// The cursor's byte index into `text`, always on a character boundary
-    /// (the source's cursor is a character index — `GuiTextField.setCursorPosition`:310-316
-    /// clamps it to the text's length — and the byte index is the port's
-    /// form of the same position).
-    cursor: usize,
+    /// The shared field: the text, cursor, selection, scroll, blink and
+    /// clipboard ops — capped at [`CHAT_TEXT_CAP`], never losing focus.
+    field: TextField,
     /// Whether the field is open. The closed field carries no text.
     open: bool,
-    /// The blink counter: steps once per session tick while open, and the
-    /// cursor draws while `blink / 6 % 2 == 0` (`GuiTextField.java`:540
-    /// divides its counter by six the same way).
-    blink: u64,
     /// The messages sent so far, oldest first: `GuiNewChat`'s own list
     /// (`GuiNewChat.java`:190-206), which the recall walks.
     sent: Vec<String>,
@@ -6876,6 +6915,124 @@ struct ChatInput {
     /// The draft the recall started from, buffered when it leaves the end and
     /// restored when it returns (`GuiChat.historyBuffer`, `:21-27`).
     history_buffer: String,
+    /// The completion cycle's state below.
+    complete: ChatComplete,
+    /// The completion prints waiting for the mirror: Tab's joined list
+    /// leaves through [`ChatInput::drain_prints`], never straight to a draw.
+    pending_prints: Vec<String>,
+}
+
+impl Default for ChatInput {
+    fn default() -> Self {
+        Self {
+            field: TextField::new(CHAT_TEXT_CAP),
+            open: false,
+            sent: Vec::new(),
+            recall: 0,
+            history_buffer: String::new(),
+            complete: ChatComplete::default(),
+            pending_prints: Vec::new(),
+        }
+    }
+}
+
+/// The chat completion's state: `GuiChat`'s `playerNamesFound` flag with its
+/// `autocompleteIndex` over the armed list (`GuiChat.java`:203-250).
+///
+/// The source's ladder past the word is server code — the request
+/// (`sendAutocompleteRequest`:252-266, C14 over the wire) and the answer
+/// (`onAutocompleteResponse`:315-344) have no port counterpart — so the
+/// request resolves at the same tick against the session's standing player
+/// list (the offline rule, recorded): the look-block argument the request
+/// carries (C14's position, or null) is dropped with the round trip, and
+/// with no client command table a `/`-leading input completes names only
+/// or nothing (recorded — nothing is invented).
+#[derive(Debug, Default)]
+struct ChatComplete {
+    /// Whether a cycle is armed: Tab keeps writing the stored candidates
+    /// (`playerNamesFound`).
+    found: bool,
+    /// The next candidate the cycle writes (`autocompleteIndex`).
+    index: usize,
+    /// The armed cycle's candidates, in the standing list's own order.
+    current: Vec<String>,
+}
+
+impl ChatComplete {
+    /// Drops the cycle: any key but Tab runs this (`keyTyped`:95-98), and
+    /// the field's open and close run it too.
+    fn clear(&mut self) {
+        self.found = false;
+        self.index = 0;
+        self.current.clear();
+    }
+
+    /// Deletes the word before the cursor and writes the candidate: the
+    /// cycle's own splice (`:205-213`, `:229`).
+    fn write_candidate(field: &mut TextField, candidate: &str) {
+        let cursor = field.cursor();
+        let before = field.text()[..cursor].to_owned();
+        let slash = usize::from(before.starts_with('/'));
+        let start = slash + completion_word_start(&before[slash..]);
+        field.delete_range(start, cursor);
+        field.write_text(candidate);
+    }
+
+    /// One Tab press against the session's standing names
+    /// (`autocompletePlayerNames`:203-250): an armed cycle wraps the index
+    /// and writes the next candidate (`:205-213`); a fresh Tab splits the
+    /// word (`func_146197_a`'s shape at `:216-221`), resolves the candidates
+    /// at the same tick and either writes the shared prefix
+    /// (`onAutocompleteResponse`:330-337) or arms the cycle, answers the
+    /// joined list past one candidate (`:232-247`) and writes the first
+    /// (`:249`). Answers the print line, if one left. An empty answer sets
+    /// no flag (`:223-226`).
+    fn tab(&mut self, field: &mut TextField, names: &[String]) -> Option<String> {
+        if self.found {
+            if self.current.is_empty() {
+                self.clear();
+                return None;
+            }
+            self.index %= self.current.len();
+            let candidate = self.current[self.index].clone();
+            self.index += 1;
+            Self::write_candidate(field, &candidate);
+            return None;
+        }
+        let cursor = field.cursor();
+        let before = field.text()[..cursor].to_owned();
+        if before.is_empty() {
+            return None;
+        }
+        let slash = usize::from(before.starts_with('/'));
+        let match_text = before[slash..].to_owned();
+        let start = slash + completion_word_start(&match_text);
+        let word = before[start..].to_owned();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let candidates = completion_matches(&word, &refs);
+        if candidates.is_empty() {
+            return None;
+        }
+        let prefix = common_prefix(&candidates);
+        if !prefix.is_empty() && !words_equal_fold(&prefix, &word) {
+            field.delete_range(start, cursor);
+            field.write_text(&prefix);
+            return None;
+        }
+        self.found = true;
+        self.index = 0;
+        self.current = candidates.iter().map(|name| (*name).to_owned()).collect();
+        field.delete_range(start, cursor);
+        let print = if self.current.len() > 1 {
+            Some(join_candidates(&candidates))
+        } else {
+            None
+        };
+        let first = self.current[0].clone();
+        field.write_text(&first);
+        self.index = 1;
+        print
+    }
 }
 
 /// What one field key did: the character path's next step, or the field's
@@ -6900,8 +7057,10 @@ impl ChatInput {
         self.open = true;
         self.recall = self.sent.len();
         self.history_buffer.clear();
+        self.field.set_focus(true, false);
         self.set_text(default);
-        self.blink = 0;
+        self.field.reset_blink();
+        self.complete.clear();
     }
 
     /// Closes the field and drops its text — the screen's own close; what
@@ -6909,20 +7068,19 @@ impl ChatInput {
     /// field, and the next open clears the field, `GuiChat.java`:47-66).
     fn close(&mut self) {
         self.open = false;
-        self.text.clear();
-        self.cursor = 0;
+        self.field.clear();
+        self.complete.clear();
     }
 
-    /// Replaces the text with the cursor at its end (`GuiTextField.setText`:86-101).
+    /// Replaces the text with the cursor at its end — the shared field's
+    /// silent set: no responder fires, which the recall's own jumps rely on.
     fn set_text(&mut self, text: &str) {
-        self.text.clear();
-        self.text.push_str(text);
-        self.cursor = self.text.len();
+        self.field.set_text(text);
     }
 
     /// One session tick of the blink counter (`GuiTextField.updateCursorCounter`:78-81).
     fn tick(&mut self) {
-        self.blink = self.blink.wrapping_add(1);
+        self.field.tick();
     }
 
     /// Whether the cursor is in its lit phase (`GuiTextField.java`:540).
@@ -6930,50 +7088,78 @@ impl ChatInput {
     /// The frame's draw consumes this ([`view::ChatView::input_draws`]): the
     /// caret draws only while the phase is lit.
     fn cursor_visible(&self) -> bool {
-        (self.blink / 6) % 2 == 0
+        self.field.cursor_visible()
     }
 
-    /// Appends text at the cursor — the character path `GuiTextField.writeText`
-    /// (`:129-169`) runs for any key that is not the field's own: every
-    /// character the filter refuses is dropped, and the append stops at the
-    /// field's cap.
+    /// The field's text — the frame's draw and the tests read through this.
+    pub(crate) fn text(&self) -> &str {
+        self.field.text()
+    }
+
+    /// The cursor's byte index into the text (tests only — the frame reads
+    /// the scrolled [`ChatInput::relative_cursor`]).
+    #[cfg(test)]
+    pub(crate) fn cursor(&self) -> usize {
+        self.field.cursor()
+    }
+
+    /// Scrolls the draw window so the cursor stays on screen, then the
+    /// window's slice: the frame's draw calls this before reading
+    /// [`ChatInput::visible_text`] and [`ChatInput::relative_cursor`]
+    /// (`GuiTextField.drawTextBox`:556-583 keeps `lineScrollOffset` while it
+    /// draws).
+    pub(crate) fn draw_window(&mut self, width_of: impl Fn(&str) -> i32, visible: i32) {
+        self.field.scroll_to_visible(width_of, visible);
+    }
+
+    /// The scrolled slice the frame draws — the source's trimmed
+    /// `text.substring(lineScrollOffset)` (`:556-583`).
+    pub(crate) fn visible_text(&self) -> &str {
+        self.field.visible_text()
+    }
+
+    /// The cursor relative to the drawn slice (`:559-560`).
+    pub(crate) fn relative_cursor(&self) -> usize {
+        self.field.relative_cursor()
+    }
+
+    /// The standing selection inside the drawn slice, if any — the frame
+    /// draws the source's XOR rect over it (`drawTextBox`:573-575).
+    pub(crate) fn relative_selection(&self) -> Option<(usize, usize)> {
+        self.field.relative_selection()
+    }
+
+    /// Appends text at the cursor — the character path: any other key's text
+    /// lands here, and the landing clears the completion cycle
+    /// (`GuiChat.keyTyped`:95-98 clears it on every non-Tab key).
     fn type_text(&mut self, text: &str) {
-        let kept: Vec<char> = text.chars().filter(|&c| chat_allowed(c)).collect();
-        let room = CHAT_TEXT_CAP.saturating_sub(self.text.chars().count());
-        let insert: String = kept.into_iter().take(room).collect();
-        if insert.is_empty() {
-            return;
-        }
-        self.text.insert_str(self.cursor, &insert);
-        self.cursor += insert.len();
+        self.complete.clear();
+        self.field.write_text(text);
     }
 
-    /// Backspace: removes the character before the cursor, if any
-    /// (`GuiTextField.textboxKeyTyped`:378-391's delete branch).
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.text[..self.cursor]
-            .chars()
-            .next_back()
-            .expect("a non-empty prefix has a last character");
-        self.text.drain(self.cursor - prev.len_utf8()..self.cursor);
-        self.cursor -= prev.len_utf8();
+    /// One window-edge clipboard chord (`textboxKeyTyped`:343-373 through the
+    /// shared field): any key but Tab clears the completion cycle first
+    /// (`GuiChat.keyTyped`:95-98).
+    fn clipboard(&mut self, op: ClipboardOp) -> ChatKey {
+        self.complete.clear();
+        self.field.apply_clipboard(op);
+        ChatKey::Consumed
     }
 
-    /// The left arrow: the cursor moves one character back (`:405-426`).
-    fn left(&mut self) {
-        if let Some(prev) = self.text[..self.cursor].chars().next_back() {
-            self.cursor -= prev.len_utf8();
+    /// One Tab press: the completion cycle against the session's standing
+    /// names (`autocompletePlayerNames`:203-250 over the offline rule). A
+    /// multi-candidate print waits in [`ChatInput::drain_prints`] for the
+    /// caller to mirror into the chat log.
+    fn tab_complete(&mut self, names: &[String]) {
+        if let Some(line) = self.complete.tab(&mut self.field, names) {
+            self.pending_prints.push(line);
         }
     }
 
-    /// The right arrow: the cursor moves one character on (`:428-449`).
-    fn right(&mut self) {
-        if let Some(next) = self.text[self.cursor..].chars().next() {
-            self.cursor += next.len_utf8();
-        }
+    /// The completion prints waiting for the chat mirror: Tab's joined list
+    /// leaves through here, never straight to a draw.
+    fn drain_prints(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_prints)
     }
 
     /// The recall (`GuiChat.getSentHistory`:272-296): `msg_pos` walks the
@@ -6991,7 +7177,7 @@ impl ChatInput {
             self.set_text(&draft);
         } else {
             if self.recall == self.sent.len() {
-                self.history_buffer = self.text.clone();
+                self.history_buffer = self.field.text().to_owned();
             }
             self.recall = next;
             let message = self.sent[next].clone();
@@ -7005,7 +7191,7 @@ impl ChatInput {
     /// `sendChatMessage` adds it (`GuiScreen.java`:481-493 over
     /// `GuiNewChat.addToSentMessages`, `:200-206`).
     fn enter(&mut self) -> Option<InputEvent> {
-        let message = self.text.trim().to_string();
+        let message = self.field.text().trim().to_owned();
         self.close();
         if message.is_empty() {
             return None;
@@ -7016,38 +7202,42 @@ impl ChatInput {
         Some(InputEvent::SendChat { text: message })
     }
 
-    /// One editing key, as `GuiChat.keyTyped`:87-138 reads it: the
-    /// field's own keys are consumed here — the source's Tab completion is
-    /// deferred, so Tab is consumed only — every other key is the character
-    /// path's, and Enter's send leaves as the event.
-    fn key(&mut self, key: Key) -> ChatKey {
+    /// One editing key, as `GuiChat.keyTyped`:87-138 reads it: Tab runs the
+    /// completion cycle against the session's standing names; Enter sends;
+    /// the recall arrows walk the sent list; every other key is the shared
+    /// field's own (Backspace/Delete/Home/End/arrows with their Shift/Ctrl
+    /// forms) or the character path's. Any key but Tab clears an armed
+    /// cycle first (`:95-98`).
+    fn key(&mut self, key: Key, ctrl: bool, shift: bool, names: &[String]) -> ChatKey {
         match key {
-            Key::Backspace => {
-                self.backspace();
+            Key::Tab => {
+                self.tab_complete(names);
                 ChatKey::Consumed
             }
-            Key::ArrowLeft => {
-                self.left();
-                ChatKey::Consumed
-            }
-            Key::ArrowRight => {
-                self.right();
-                ChatKey::Consumed
-            }
-            Key::ArrowUp => {
-                self.recall(-1);
-                ChatKey::Consumed
-            }
-            Key::ArrowDown => {
-                self.recall(1);
-                ChatKey::Consumed
-            }
-            Key::Tab => ChatKey::Consumed,
             Key::Enter => match self.enter() {
                 Some(event) => ChatKey::Send(event),
                 None => ChatKey::Consumed,
             },
-            _ => ChatKey::Character,
+            Key::ArrowUp => {
+                self.complete.clear();
+                self.recall(-1);
+                ChatKey::Consumed
+            }
+            Key::ArrowDown => {
+                self.complete.clear();
+                self.recall(1);
+                ChatKey::Consumed
+            }
+            _ => match self.field.key(key, ctrl, shift) {
+                FieldOutcome::Consumed => {
+                    self.complete.clear();
+                    ChatKey::Consumed
+                }
+                FieldOutcome::Character => ChatKey::Character,
+                // The open field never loses focus, so the shared machine
+                // always owns the key; this arm is unreachable.
+                FieldOutcome::Ignored => ChatKey::Consumed,
+            },
         }
     }
 }
@@ -7062,10 +7252,10 @@ mod tests {
         PlayerState, Screens, ScriptDriver, ScriptGesture, ScriptKey, SessionLink, SkinRequest,
         SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
         apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
-        clear_break_stage, command_text, confirm_labels, cracks_in_view, creative_wheel_notch,
-        death_labels, digit_slot, escape_route, f3_hold_step, frame_params, gameplay_key,
-        interpolate_pose, inventory_opener, is_enter_press, is_escape_press, is_f3_press,
-        is_h_press, load_sounds_bytes, local_sound_play, missing_uv, parse_script,
+        chat_wheel_scrolls, clear_break_stage, command_text, confirm_labels, cracks_in_view,
+        creative_wheel_notch, death_labels, digit_slot, escape_route, f3_hold_step, frame_params,
+        gameplay_key, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
+        is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv, parse_script,
         parse_server_address, particle_draws, scaled_cursor, screen_button_events,
         screen_click_button, scripted_chat_click, skin_requests, store_aim, store_break_stage,
         store_skins, tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step,
@@ -8403,6 +8593,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8719,6 +8910,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8747,6 +8939,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8779,6 +8972,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8796,6 +8990,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8881,6 +9076,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8904,6 +9100,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -8924,6 +9121,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -9659,29 +9857,32 @@ mod tests {
         // (`textboxKeyTyped` cases 203/205, `:405-449`).
         let mut chat = open_field("");
         chat.type_text("ac");
-        assert_eq!((chat.text.as_str(), chat.cursor), ("ac", 2));
-        assert_eq!(chat.key(Key::ArrowLeft), ChatKey::Consumed);
+        assert_eq!((chat.text(), chat.cursor()), ("ac", 2));
+        assert_eq!(
+            chat.key(Key::ArrowLeft, false, false, &[]),
+            ChatKey::Consumed
+        );
         chat.type_text("b");
         assert_eq!(
-            (chat.text.as_str(), chat.cursor),
+            (chat.text(), chat.cursor()),
             ("abc", 2),
             "the character lands at the cursor"
         );
-        chat.key(Key::ArrowRight);
+        chat.key(Key::ArrowRight, false, false, &[]);
         assert_eq!(
-            (chat.text.as_str(), chat.cursor),
+            (chat.text(), chat.cursor()),
             ("abc", 3),
             "the right arrow steps to the end"
         );
-        chat.key(Key::ArrowLeft);
+        chat.key(Key::ArrowLeft, false, false, &[]);
         assert_eq!(
-            (chat.text.as_str(), chat.cursor),
+            (chat.text(), chat.cursor()),
             ("abc", 2),
             "the left arrow steps back"
         );
-        chat.key(Key::Backspace);
+        chat.key(Key::Backspace, false, false, &[]);
         assert_eq!(
-            (chat.text.as_str(), chat.cursor),
+            (chat.text(), chat.cursor()),
             ("ac", 1),
             "backspace removes the character before the cursor"
         );
@@ -9694,16 +9895,16 @@ mod tests {
         // multi-byte character moves by its whole UTF-8 length.
         let mut chat = open_field("");
         chat.type_text("éa");
-        assert_eq!((chat.text.as_str(), chat.cursor), ("éa", 3));
-        chat.key(Key::ArrowLeft);
-        assert_eq!(chat.cursor, 2, "one character left, not one byte");
-        chat.key(Key::ArrowLeft);
-        assert_eq!(chat.cursor, 0);
-        chat.key(Key::ArrowRight);
-        assert_eq!(chat.cursor, 2);
-        chat.key(Key::Backspace);
+        assert_eq!((chat.text(), chat.cursor()), ("éa", 3));
+        chat.key(Key::ArrowLeft, false, false, &[]);
+        assert_eq!(chat.cursor(), 2, "one character left, not one byte");
+        chat.key(Key::ArrowLeft, false, false, &[]);
+        assert_eq!(chat.cursor(), 0);
+        chat.key(Key::ArrowRight, false, false, &[]);
+        assert_eq!(chat.cursor(), 2);
+        chat.key(Key::Backspace, false, false, &[]);
         assert_eq!(
-            (chat.text.as_str(), chat.cursor),
+            (chat.text(), chat.cursor()),
             ("a", 0),
             "backspace removes the two-byte character whole"
         );
@@ -9717,23 +9918,23 @@ mod tests {
         // (`GuiTextField.java`:135-152).
         let mut chat = open_field("");
         chat.type_text(&"a".repeat(100));
-        assert_eq!(chat.text.chars().count(), 100);
+        assert_eq!(chat.text().chars().count(), 100);
         chat.type_text("bc");
         assert_eq!(
-            chat.text,
+            chat.text(),
             "a".repeat(100),
             "a full field refuses every further character"
         );
-        assert_eq!(chat.cursor, 100, "and the cursor stays put");
+        assert_eq!(chat.cursor(), 100, "and the cursor stays put");
         let mut chat = open_field("");
         chat.type_text(&"a".repeat(99));
         chat.type_text("bc");
         assert_eq!(
-            chat.text,
+            chat.text(),
             format!("{}b", "a".repeat(99)),
             "an insertion fits only the room left under the cap"
         );
-        assert_eq!(chat.cursor, 100);
+        assert_eq!(chat.cursor(), 100);
     }
 
     #[test]
@@ -9743,15 +9944,15 @@ mod tests {
         // (`GuiTextField.setText`, `:86-101`).
         let chat = open_field("");
         assert!(chat.open);
-        assert_eq!((chat.text.as_str(), chat.cursor), ("", 0));
+        assert_eq!((chat.text(), chat.cursor()), ("", 0));
         let chat = open_field("/");
-        assert_eq!((chat.text.as_str(), chat.cursor), ("/", 1));
+        assert_eq!((chat.text(), chat.cursor()), ("/", 1));
         // A closed field carries no text: the next open starts fresh.
         let mut chat = open_field("");
         chat.type_text("draft");
         chat.close();
         assert!(!chat.open);
-        assert_eq!(chat.text, "");
+        assert_eq!(chat.text(), "");
     }
 
     #[test]
@@ -9761,7 +9962,7 @@ mod tests {
         let mut chat = open_field("");
         chat.type_text("say hi");
         assert_eq!(
-            chat.key(Key::Enter),
+            chat.key(Key::Enter, false, false, &[]),
             ChatKey::Send(InputEvent::SendChat {
                 text: "say hi".into()
             }),
@@ -9772,7 +9973,7 @@ mod tests {
         let mut chat = open_field("");
         chat.type_text("  spaced  ");
         assert_eq!(
-            chat.key(Key::Enter),
+            chat.key(Key::Enter, false, false, &[]),
             ChatKey::Send(InputEvent::SendChat {
                 text: "spaced".into()
             })
@@ -9781,7 +9982,7 @@ mod tests {
         // (`:131-136`).
         let mut chat = open_field("");
         chat.type_text("   ");
-        assert_eq!(chat.key(Key::Enter), ChatKey::Consumed);
+        assert_eq!(chat.key(Key::Enter, false, false, &[]), ChatKey::Consumed);
         assert!(!chat.open);
     }
 
@@ -9796,27 +9997,27 @@ mod tests {
         for message in ["first", "second", "third"] {
             chat.open("");
             chat.type_text(message);
-            chat.key(Key::Enter);
+            chat.key(Key::Enter, false, false, &[]);
         }
         chat.open("");
-        chat.key(Key::ArrowUp);
+        chat.key(Key::ArrowUp, false, false, &[]);
         assert_eq!(
-            (chat.text.as_str(), chat.cursor),
+            (chat.text(), chat.cursor()),
             ("third", 5),
             "the first Up is the newest message, cursor at its end"
         );
-        chat.key(Key::ArrowUp);
-        assert_eq!(chat.text, "second");
-        chat.key(Key::ArrowUp);
-        assert_eq!(chat.text, "first");
-        chat.key(Key::ArrowUp);
-        assert_eq!(chat.text, "first", "the oldest is the recall's end");
-        chat.key(Key::ArrowDown);
-        assert_eq!(chat.text, "second");
-        chat.key(Key::ArrowDown);
-        assert_eq!(chat.text, "third");
-        chat.key(Key::ArrowDown);
-        assert_eq!(chat.text, "", "the draft comes back");
+        chat.key(Key::ArrowUp, false, false, &[]);
+        assert_eq!(chat.text(), "second");
+        chat.key(Key::ArrowUp, false, false, &[]);
+        assert_eq!(chat.text(), "first");
+        chat.key(Key::ArrowUp, false, false, &[]);
+        assert_eq!(chat.text(), "first", "the oldest is the recall's end");
+        chat.key(Key::ArrowDown, false, false, &[]);
+        assert_eq!(chat.text(), "second");
+        chat.key(Key::ArrowDown, false, false, &[]);
+        assert_eq!(chat.text(), "third");
+        chat.key(Key::ArrowDown, false, false, &[]);
+        assert_eq!(chat.text(), "", "the draft comes back");
     }
 
     #[test]
@@ -9828,38 +10029,154 @@ mod tests {
         for message in ["dup", "dup", "next"] {
             chat.open("");
             chat.type_text(message);
-            chat.key(Key::Enter);
+            chat.key(Key::Enter, false, false, &[]);
         }
         chat.open("");
         chat.type_text("draft");
-        chat.key(Key::ArrowUp);
-        assert_eq!(chat.text, "next");
-        chat.key(Key::ArrowUp);
-        assert_eq!(chat.text, "dup");
-        chat.key(Key::ArrowDown);
-        assert_eq!(chat.text, "next");
-        chat.key(Key::ArrowDown);
-        assert_eq!(chat.text, "draft", "the draft the recall started from");
-        chat.key(Key::ArrowDown);
-        assert_eq!(chat.text, "draft", "and the end of the list holds it");
+        chat.key(Key::ArrowUp, false, false, &[]);
+        assert_eq!(chat.text(), "next");
+        chat.key(Key::ArrowUp, false, false, &[]);
+        assert_eq!(chat.text(), "dup");
+        chat.key(Key::ArrowDown, false, false, &[]);
+        assert_eq!(chat.text(), "next");
+        chat.key(Key::ArrowDown, false, false, &[]);
+        assert_eq!(chat.text(), "draft", "the draft the recall started from");
+        chat.key(Key::ArrowDown, false, false, &[]);
+        assert_eq!(chat.text(), "draft", "and the end of the list holds it");
     }
 
     #[test]
-    fn tab_while_open_is_swallowed_and_the_letter_keys_fall_through() {
-        // Completion is deferred (Known limits): Tab is consumed and does
-        // nothing (`GuiChat.keyTyped`:91-94 calls the autocomplete this
-        // milestone does not build). A letter key is not the field's to
-        // consume: its character text is what lands (`:122-125`).
+    fn tab_completes_against_the_standing_names_and_cycles() {
+        // `autocompletePlayerNames`:203-250 over the offline rule (the
+        // session's standing list): the first Tab writes the shared prefix,
+        // the next arms the cycle and prints the joined list, and further
+        // presses wrap through the candidates in the list's own order. This
+        // is the M4 row-4 carry's close: Tab completes, it is not swallowed.
+        let names = ["Alice", "Alicia", "Bob"].map(String::from);
         let mut chat = open_field("");
-        chat.type_text("ab");
-        assert_eq!(chat.key(Key::Tab), ChatKey::Consumed);
-        assert_eq!(
-            (chat.text.as_str(), chat.cursor, chat.open),
-            ("ab", 2, true)
+        chat.type_text("Al");
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Alic", "the shared prefix lands first");
+        assert!(
+            chat.drain_prints().is_empty(),
+            "a prefix step writes no print"
         );
-        assert_eq!(chat.key(Key::W), ChatKey::Character);
-        assert_eq!(chat.key(Key::T), ChatKey::Character);
-        assert_eq!(chat.key(Key::Space), ChatKey::Character);
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Alice");
+        assert_eq!(
+            chat.drain_prints(),
+            vec!["Alice, Alicia".to_owned()],
+            "the multi-candidate print joins with a comma and a space"
+        );
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Alicia");
+        assert!(chat.drain_prints().is_empty());
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Alice", "the cycle wraps");
+        assert_eq!(chat.key(Key::W, false, false, &names), ChatKey::Character);
+        assert_eq!(chat.key(Key::T, false, false, &names), ChatKey::Character);
+        assert_eq!(
+            chat.key(Key::Space, false, false, &names),
+            ChatKey::Character
+        );
+    }
+
+    #[test]
+    fn tab_with_no_answer_leaves_the_field_alone() {
+        // `:223-226`: an empty answer sets no flag — a further Tab starts
+        // fresh and still changes nothing.
+        let names = ["Alice".to_owned()];
+        let mut chat = open_field("");
+        chat.type_text("Zz");
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!((chat.text(), chat.cursor()), ("Zz", 2));
+        assert!(chat.drain_prints().is_empty());
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Zz");
+    }
+
+    #[test]
+    fn any_other_key_clears_the_armed_cycle() {
+        // `keyTyped`:95-98: the cycle flag drops on every non-Tab key, so
+        // the next Tab resolves fresh instead of cycling the old list.
+        let names = ["Alice", "Alicia", "Bob"].map(String::from);
+        let mut chat = open_field("");
+        chat.type_text("Al");
+        chat.key(Key::Tab, false, false, &names);
+        chat.key(Key::Tab, false, false, &names);
+        assert_eq!(chat.text(), "Alice", "the cycle stands armed");
+        assert_eq!(chat.drain_prints().len(), 1);
+        chat.type_text("x");
+        assert_eq!(
+            chat.key(Key::Tab, false, false, &names),
+            ChatKey::Consumed,
+            "the word no longer matches, so the old cycle is gone"
+        );
+        assert_eq!(chat.text(), "Alicex");
+        let mut chat = open_field("");
+        chat.type_text("Al");
+        chat.key(Key::Tab, false, false, &names);
+        chat.key(Key::Tab, false, false, &names);
+        assert_eq!(chat.text(), "Alice");
+        chat.key(Key::ArrowLeft, false, false, &names);
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(
+            chat.text(),
+            "Alicee",
+            "the arrow cleared the cycle, so Tab re-arms fresh instead of cycling to Alicia"
+        );
+    }
+
+    #[test]
+    fn tab_past_the_command_slash_completes_names_only() {
+        // Recorded: with no client command table a `/`-leading input
+        // completes names only or nothing — the one slash is stripped for
+        // the match and kept in the field.
+        let names = ["Alice", "Alicia", "Bob"].map(String::from);
+        let mut chat = open_field("/");
+        chat.type_text("Al");
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "/Alic");
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "/Alice");
+        assert_eq!(chat.drain_prints(), vec!["Alice, Alicia".to_owned()]);
+        let mut chat = open_field("/");
+        chat.type_text("Zz");
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "/Zz", "no names answer, nothing invented");
+    }
+
+    #[test]
+    fn a_single_candidate_writes_with_no_print() {
+        // One candidate arms the cycle and writes it with no joined list
+        // (`:232-247` prints past one candidate only).
+        let names = ["Alice", "Alicia", "Bob"].map(String::from);
+        let mut chat = open_field("");
+        chat.type_text("Bo");
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Bob", "the shared prefix is the name");
+        assert!(chat.drain_prints().is_empty());
+        assert_eq!(chat.key(Key::Tab, false, false, &names), ChatKey::Consumed);
+        assert_eq!(chat.text(), "Bob");
+        assert!(
+            chat.drain_prints().is_empty(),
+            "a lone candidate never prints"
+        );
+    }
+
+    #[test]
+    fn the_wheel_route_reaches_the_log_only_past_zero() {
+        // R4: the scroll callsite (`on_wheel` → `ChatView::scroll`) fires
+        // only for a non-zero notch — the event's own guard.
+        assert!(chat_wheel_scrolls(chat_wheel_lines(
+            MouseScrollDelta::LineDelta(0.0, 1.0)
+        )));
+        assert!(chat_wheel_scrolls(chat_wheel_lines(
+            MouseScrollDelta::LineDelta(0.0, -1.0)
+        )));
+        assert!(!chat_wheel_scrolls(chat_wheel_lines(
+            MouseScrollDelta::LineDelta(0.0, 0.0)
+        )));
     }
 
     #[test]
@@ -9869,8 +10186,8 @@ mod tests {
         // `writeText` filters through it (`GuiTextField.java`:132).
         let mut chat = open_field("");
         chat.type_text("a\u{1}b\tc\u{7f}d\u{a7}e");
-        assert_eq!(chat.text, "abcde");
-        assert_eq!(chat.cursor, 5);
+        assert_eq!(chat.text(), "abcde");
+        assert_eq!(chat.cursor(), 5);
     }
 
     #[test]
@@ -10148,6 +10465,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10192,12 +10510,13 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
         assert!(input_rx.try_recv().is_err(), "nothing left the field");
         assert_eq!(
-            (chat.text.as_str(), chat.open),
+            (chat.text(), chat.open),
             ("mine", true),
             "the open field is untouched"
         );
@@ -10233,6 +10552,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10256,6 +10576,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10301,6 +10622,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10324,6 +10646,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10344,6 +10667,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10387,6 +10711,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10404,6 +10729,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10422,6 +10748,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10439,6 +10766,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10479,6 +10807,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10496,6 +10825,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10518,6 +10848,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10555,6 +10886,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10580,6 +10912,7 @@ mod tests {
                 &mut chat,
                 &mut view,
                 &mut tab_open,
+                &[],
                 &mut cursor,
             )
             .expect("the log line writes");
@@ -10726,7 +11059,7 @@ mod tests {
             value: "say hi".into(),
         });
         assert_eq!(
-            (app.chat_input.text.as_str(), app.chat_input.cursor),
+            (app.chat_input.text(), app.chat_input.cursor()),
             ("say hi", 6)
         );
         assert!(app.chat_input.open, "the screen stays open");
@@ -10864,6 +11197,7 @@ mod tests {
                     &mut chat,
                     &mut view,
                     &mut tab_open,
+                    &[],
                     &mut cursor,
                 )
                 .expect("the log line writes");

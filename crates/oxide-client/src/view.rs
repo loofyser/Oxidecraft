@@ -3797,6 +3797,10 @@ const INPUT_TEXT_COLOUR: [f32; 4] = [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0
 /// The caret bar's colour: `-3092272` = 0xFFD0D0D0 (`GuiTextField.java`:578).
 const INPUT_CARET_COLOUR: [f32; 4] = [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0];
 
+/// The standing selection's fill: the source XORs the run (`drawTextBox`:573-575)
+/// and the port has no XOR, so a translucent white run stands in (recorded).
+const INPUT_SELECTION_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 0.4];
+
 /// The caret bar's height: the source draws `i1 - 1` to `i1 + 1 + 9`
 /// (`GuiTextField.java`:578) — eleven pixels at the nine-pixel font line.
 const INPUT_CARET_HEIGHT: f32 = 11.0;
@@ -3992,7 +3996,7 @@ impl ChatView {
     /// the confirm one, `Minecraft.java`:1010-1012). With no field line, no
     /// tooltip and no overlay the frame is the box's frame, unchanged. Empty until
     /// the font is set — nothing can be measured before it.
-    pub fn draws(&self, resolution: ScaledResolution, input: &ChatInput) -> Vec<HudDraw> {
+    pub fn draws(&self, resolution: ScaledResolution, input: &mut ChatInput) -> Vec<HudDraw> {
         let Some(font) = &self.font else {
             return Vec::new();
         };
@@ -4079,7 +4083,7 @@ impl ChatView {
         &self,
         font: &Font,
         resolution: ScaledResolution,
-        input: &ChatInput,
+        input: &mut ChatInput,
         draws: &mut Vec<HudDraw>,
     ) {
         let height = resolution.height as f32;
@@ -4091,8 +4095,7 @@ impl ChatView {
             colour: INPUT_SHADE,
         });
         let pen_y = height - INPUT_PEN_ABOVE;
-        let text = input.text.as_str();
-        if text.is_empty() {
+        if input.text().is_empty() {
             if input.cursor_visible() {
                 draws.push(HudDraw::Text {
                     text: "_".to_owned(),
@@ -4106,9 +4109,18 @@ impl ChatView {
             }
             return;
         }
+        // `drawTextBox`:556-583: the window scrolls so the cursor stays on
+        // screen — the field's (x=4, width-4) trims the text to screen-8
+        // (`GuiChat.initGui` over `:556-558`) — and only the window's slice
+        // draws, with the cursor relative to it (`:559-560`).
+        let room = resolution.width as i32 - 8;
+        let full_chars = input.text().chars().count();
+        input.draw_window(|slice| string_width(font, slice), room);
+        let text = input.visible_text();
+        let cursor = input.relative_cursor();
         // `:551-558`: the prefix up to the cursor draws first; the pen after it
         // is where the caret and the rest hang.
-        let prefix = &text[..input.cursor];
+        let prefix = &text[..cursor];
         let pen = INPUT_PEN_X + string_width(font, prefix) as f32;
         if !prefix.is_empty() {
             draws.push(HudDraw::Text {
@@ -4125,8 +4137,17 @@ impl ChatView {
         // source's own extra condition — the caret is the bar straddling
         // `pen - 1`, and the text after the cursor draws from that stepped-back
         // pen; otherwise the caret is the underscore at the pen.
-        let bar = input.cursor < text.len() || text.chars().count() >= CHAT_TEXT_CAP;
-        let tail = &text[input.cursor..];
+        let bar = cursor < text.len() || full_chars >= CHAT_TEXT_CAP;
+        let tail = &text[cursor..];
+        if let Some((lo, hi)) = input.relative_selection() {
+            draws.push(HudDraw::Rect {
+                x: INPUT_PEN_X + string_width(font, &text[..lo]) as f32,
+                y: pen_y - 1.0,
+                width: string_width(font, &text[lo..hi]) as f32,
+                height: INPUT_CARET_HEIGHT,
+                colour: INPUT_SELECTION_COLOUR,
+            });
+        }
         if bar {
             if !tail.is_empty() {
                 draws.push(HudDraw::Text {
@@ -5387,6 +5408,7 @@ mod tests {
     use oxide_assets::skins::DefaultModel;
 
     use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, display_name};
+    use oxide_game::input::Key;
     use oxide_proto_v47::entity::MetadataItem;
     use oxide_render::entity_models::PoseExtra;
     use oxide_render::entity_models::player::{PlayerExtra, cape_rotation};
@@ -7130,7 +7152,8 @@ mod tests {
     /// the tick the frame draws at.
     fn chat_draws(chat: &mut ChatView, tick: u64) -> Vec<HudDraw> {
         chat.update(tick);
-        chat.draws(chat_resolution(), &ChatInput::default())
+        let mut shut = ChatInput::default();
+        chat.draws(chat_resolution(), &mut shut)
     }
 
     /// A text draw's own fields, for the pins.
@@ -7402,8 +7425,8 @@ mod tests {
         let enabled = [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0];
 
         // The cursor at the end, the blink lit: the underscore at the pen.
-        let field = open_text("AA");
-        let draws = chat.draws(chat_resolution(), &field);
+        let mut field = open_text("AA");
+        let draws = chat.draws(chat_resolution(), &mut field);
         assert_eq!(draws.len(), 3, "the frame, the text and the caret");
         assert_eq!(
             chat_rect(&draws[0]),
@@ -7430,8 +7453,8 @@ mod tests {
         // The cursor mid-text, the blink lit: the bar straddles pen - 1, and the
         // text after the cursor draws from that stepped-back pen (`:571-575`).
         let mut field = open_text("AA");
-        field.left();
-        let draws = chat.draws(chat_resolution(), &field);
+        field.key(Key::ArrowLeft, false, false, &[]);
+        let draws = chat.draws(chat_resolution(), &mut field);
         assert_eq!(
             draws.len(),
             4,
@@ -7461,9 +7484,52 @@ mod tests {
         for _ in 0..6 {
             field.tick();
         }
-        let draws = chat.draws(chat_resolution(), &field);
+        let draws = chat.draws(chat_resolution(), &mut field);
         assert_eq!(draws.len(), 2, "the frame and the text, no caret");
         assert_eq!(chat_text(&draws[1]).0, "AA");
+    }
+
+    /// The over-long line scrolls: at the cap the text outruns the field's
+    /// screen-8 run, so the draw trims the head and keeps the cursor's tail
+    /// (`drawTextBox`:556-583).
+    #[test]
+    fn the_over_long_line_trims_its_head_and_keeps_the_tail() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        let mut field = open_text(&"A".repeat(CHAT_TEXT_CAP));
+        let draws = chat.draws(chat_resolution(), &mut field);
+        assert_eq!(draws.len(), 3, "the frame, the trimmed text and the bar");
+        let shown = chat_text(&draws[1]).0;
+        assert!(
+            shown.chars().count() < CHAT_TEXT_CAP,
+            "the head scrolls out of the run"
+        );
+        assert!(
+            "A".repeat(CHAT_TEXT_CAP).ends_with(&shown),
+            "the cursor's tail stays on screen"
+        );
+    }
+
+    /// The standing selection draws its rect over the selected run: with the
+    /// cursor shifted one back the frame draws the prefix, the tail, the
+    /// selection's fill and the bar (`drawTextBox`:573-578).
+    #[test]
+    fn the_standing_selection_draws_its_rect_over_the_run() {
+        let mut chat = ChatView::new();
+        chat.set_font(chat_font());
+        let mut field = open_text("AA");
+        field.key(Key::ArrowLeft, false, true, &[]);
+        let draws = chat.draws(chat_resolution(), &mut field);
+        assert_eq!(
+            draws.len(),
+            5,
+            "the frame, the prefix, the tail, the selection and the bar"
+        );
+        assert_eq!(
+            chat_rect(&draws[2]),
+            (4.0 + 6.0, 240.0 - 13.0, 6.0, 11.0, [1.0, 1.0, 1.0, 0.4]),
+            "the selected run's fill over the second character"
+        );
     }
 
     /// The hover tooltip (`GuiScreen.handleComponentHover`'s SHOW_TEXT branch
@@ -7493,7 +7559,8 @@ mod tests {
         );
         // The pointer sits on the run: the newest line's text row, at its left.
         chat.feed_hover(Some((2.0, 205.0)), chat_resolution());
-        let draws = chat.draws(chat_resolution(), &ChatInput::default());
+        let mut shut = ChatInput::default();
+        let draws = chat.draws(chat_resolution(), &mut shut);
         assert_eq!(
             draws.len(),
             2 + 7,
@@ -7587,10 +7654,8 @@ mod tests {
         // The pointer away from the run: the tooltip is gone again — the feed
         // overwrites it every frame, and there is no delay.
         chat.feed_hover(Some((2.0, 100.0)), chat_resolution());
-        assert_eq!(
-            chat.draws(chat_resolution(), &ChatInput::default()).len(),
-            2
-        );
+        let mut shut = ChatInput::default();
+        assert_eq!(chat.draws(chat_resolution(), &mut shut).len(), 2);
     }
 
     /// The scripted open reconciles the box open state: the frame puts the
@@ -7617,17 +7682,17 @@ mod tests {
         for line in &lines {
             scripted.observe(line, 1, 0);
         }
-        let closed = ChatInput::default();
+        let mut closed = ChatInput::default();
         assert_ne!(
-            scripted.draws(chat_resolution(), &closed),
-            windowed.draws(chat_resolution(), &closed),
+            scripted.draws(chat_resolution(), &mut closed),
+            windowed.draws(chat_resolution(), &mut closed),
             "the scripted open is not there yet"
         );
-        let field = open_text("");
+        let mut field = open_text("");
         reconcile_chat_open(&mut scripted, &field);
         assert_eq!(
-            scripted.draws(chat_resolution(), &field),
-            windowed.draws(chat_resolution(), &field),
+            scripted.draws(chat_resolution(), &mut field),
+            windowed.draws(chat_resolution(), &mut field),
             "the reconciliation brings the box up to the windowed open"
         );
         // And the close: the scripted send closes the field, and the frame
@@ -7639,8 +7704,8 @@ mod tests {
         }
         reconcile_chat_open(&mut scripted, &closed);
         assert_eq!(
-            scripted.draws(chat_resolution(), &closed),
-            closed_only.draws(chat_resolution(), &closed),
+            scripted.draws(chat_resolution(), &mut closed),
+            closed_only.draws(chat_resolution(), &mut closed),
             "the open reconcile comes back down with the field"
         );
     }
@@ -7694,7 +7759,8 @@ mod tests {
         let mut chat = ChatView::new();
         chat.set_font(chat_font());
         chat.observe("\"AA\"", 1, 0);
-        let draws = chat.draws(chat_resolution(), &ChatInput::default());
+        let mut shut = ChatInput::default();
+        let draws = chat.draws(chat_resolution(), &mut shut);
         assert_eq!(
             draws,
             vec![
@@ -7720,8 +7786,12 @@ mod tests {
 
         // A fontless mirror draws nothing even with the field open: nothing
         // measures before the sheet lands.
-        let field = open_text("AA");
-        assert!(ChatView::new().draws(chat_resolution(), &field).is_empty());
+        let mut field = open_text("AA");
+        assert!(
+            ChatView::new()
+                .draws(chat_resolution(), &mut field)
+                .is_empty()
+        );
     }
 
     /// The scripted `chat` drives the field machine directly — open, type and
@@ -7736,15 +7806,15 @@ mod tests {
             chat.observe(&format!("\"x{index}\""), 1, 0);
         }
         chat.set_open(true);
-        let closed = ChatInput::default();
-        let draws = chat.draws(chat_resolution(), &closed);
+        let mut closed = ChatInput::default();
+        let draws = chat.draws(chat_resolution(), &mut closed);
         assert_eq!(draws.len(), 30, "the open window draws the fifteen lines");
         reconcile_chat_open(&mut chat, &closed);
-        let draws = chat.draws(chat_resolution(), &closed);
+        let draws = chat.draws(chat_resolution(), &mut closed);
         assert_eq!(draws.len(), 20, "the closed field's ten-line window");
-        let field = open_text("");
+        let mut field = open_text("");
         reconcile_chat_open(&mut chat, &field);
-        let draws = chat.draws(chat_resolution(), &field);
+        let draws = chat.draws(chat_resolution(), &mut field);
         assert_eq!(
             draws.len(),
             30 + 2,

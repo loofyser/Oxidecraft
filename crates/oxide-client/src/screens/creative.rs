@@ -71,6 +71,7 @@ use super::container::{CURSOR_OFFSET, ClickButton, DOUBLE_CLICK_MS, ScreenKey};
 use crate::items::{
     CreativeTab, ItemTable, TabEntry, creative_tab_items, search_matches, stack_name,
 };
+use crate::text_field::{FieldOutcome, TextField};
 
 /// The frame width (`GuiContainerCreative.java`:65 — `xSize = 195`).
 pub const FRAME_W: i32 = 195;
@@ -437,10 +438,10 @@ pub struct CreativeScreen {
     selected_tab: u8,
     /// The scroll offset, 0..1 (`currentScroll`).
     scroll: f32,
-    /// The search query.
-    search: String,
-    /// The search field's cursor byte index, always on a boundary.
-    search_cursor: usize,
+    /// The search query: the shared field capped at [`SEARCH_MAX`], whose
+    /// default filter is the search's own rule under its own name (no `§`,
+    /// nothing below the space, no DEL — `keyTyped`:321-332).
+    search: TextField,
     /// Whether the search field shows (on the search tab only).
     search_visible: bool,
     /// Whether the search field holds focus (auto-set on entering).
@@ -493,8 +494,7 @@ impl CreativeScreen {
                 0
             },
             scroll: 0.0,
-            search: String::new(),
-            search_cursor: 0,
+            search: TextField::new(SEARCH_MAX),
             search_visible: false,
             search_focused: false,
             clear_armed: false,
@@ -517,6 +517,7 @@ impl CreativeScreen {
         let tab = screen.selected_tab;
         screen.search_visible = tab == SEARCH_TAB;
         screen.search_focused = tab == SEARCH_TAB;
+        screen.search.set_focus(tab == SEARCH_TAB, true);
         screen.rebuild_list();
         screen.refresh_grid();
         screen
@@ -534,7 +535,7 @@ impl CreativeScreen {
 
     /// The search query.
     pub fn search_text(&self) -> &str {
-        &self.search
+        self.search.text()
     }
 
     /// Whether the search field shows.
@@ -593,7 +594,7 @@ impl CreativeScreen {
     /// port's name-only [`search_matches`]).
     fn rebuild_list(&mut self) {
         if self.selected_tab == SEARCH_TAB {
-            let query = self.search.clone();
+            let query = self.search.text().to_owned();
             self.list = creative_tab_items(CreativeTab::Search)
                 .iter()
                 .copied()
@@ -630,12 +631,13 @@ impl CreativeScreen {
         self.scroll = 0.0;
         if index == SEARCH_TAB {
             self.search.clear();
-            self.search_cursor = 0;
             self.search_visible = true;
             self.search_focused = true;
+            self.search.set_focus(true, true);
         } else {
             self.search_visible = false;
             self.search_focused = false;
+            self.search.set_focus(false, true);
         }
         self.scrolling = false;
         self.pending_tab = None;
@@ -975,42 +977,25 @@ impl CreativeScreen {
     }
 
     /// One editing key for the search field. Answers whether the field
-    /// owned it.
+    /// owned it: the machine's handled keys (Backspace, Delete, Home, End,
+    /// the arrows) are owned, everything else is the character path's or the
+    /// container's. Only a changed query re-filters with its scroll reset —
+    /// a bare cursor move leaves the list alone, as before the move.
     pub fn field_key(&mut self, key: Key) -> bool {
         if !(self.search_visible && self.search_focused) {
             return false;
         }
-        match key {
-            Key::Backspace => {
-                if self.search_cursor == 0 {
-                    return true;
-                }
-                let prev = self.search[..self.search_cursor]
-                    .chars()
-                    .next_back()
-                    .expect("a non-empty prefix has a last character");
-                self.search
-                    .drain(self.search_cursor - prev.len_utf8()..self.search_cursor);
-                self.search_cursor -= prev.len_utf8();
-                self.rebuild_list();
-                self.scroll = 0.0;
-                self.refresh_grid();
-                true
-            }
-            Key::ArrowLeft => {
-                if let Some(prev) = self.search[..self.search_cursor].chars().next_back() {
-                    self.search_cursor -= prev.len_utf8();
-                }
-                true
-            }
-            Key::ArrowRight => {
-                if let Some(next) = self.search[self.search_cursor..].chars().next() {
-                    self.search_cursor += next.len_utf8();
-                }
-                true
-            }
-            _ => false,
+        let before = self.search.text().to_owned();
+        let owned = match self.search.key(key, false, false) {
+            FieldOutcome::Consumed => true,
+            FieldOutcome::Character | FieldOutcome::Ignored => false,
+        };
+        if owned && self.search.text() != before {
+            self.rebuild_list();
+            self.scroll = 0.0;
+            self.refresh_grid();
         }
+        owned
     }
 
     /// Types characters into the search field: the armed first-keystroke
@@ -1022,23 +1007,13 @@ impl CreativeScreen {
         }
         if self.clear_armed {
             self.search.clear();
-            self.search_cursor = 0;
             self.clear_armed = false;
         }
-        let room = SEARCH_MAX.saturating_sub(self.search.chars().count());
-        let insert: String = text
-            .chars()
-            .filter(|&c| c != '§' && c >= ' ' && c != '\u{7f}')
-            .take(room)
-            .collect();
-        if insert.is_empty() {
-            return;
+        if self.search.write_text(text) {
+            self.rebuild_list();
+            self.scroll = 0.0;
+            self.refresh_grid();
         }
-        self.search.insert_str(self.search_cursor, &insert);
-        self.search_cursor += insert.len();
-        self.rebuild_list();
-        self.scroll = 0.0;
-        self.refresh_grid();
     }
 
     /// Rolls the wheel: ignored unless the list scrolls (`handleMouseInput`
@@ -1134,9 +1109,7 @@ impl CreativeScreen {
     /// (test scaffolding for the no-clip spill pin).
     #[cfg(test)]
     pub fn type_text_for_test(&mut self, text: &str) {
-        self.search.clear();
-        self.search.push_str(text);
-        self.search_cursor = self.search.len();
+        self.search.set_text(text);
         self.rebuild_list();
         self.scroll = 0.0;
         self.refresh_grid();
@@ -1842,6 +1815,29 @@ mod tests {
         screen.press(ClickButton::Left, false, &ItemTable, 1_000);
         screen.type_text("x");
         assert_eq!(screen.search_text(), "x");
+    }
+
+    #[test]
+    fn the_search_field_owns_the_machine_keys_and_nothing_else() {
+        // The ownership law through the shared machine: Backspace and the
+        // arrows are owned (and only an edit re-filters); Enter and Tab are
+        // the container's; off the search tab nothing is owned.
+        let mut screen = screen_on(SEARCH_TAB);
+        screen.type_text("stone");
+        let filtered = screen.list_len_for_test();
+        assert!(screen.field_key(Key::ArrowLeft));
+        assert_eq!(
+            screen.list_len_for_test(),
+            filtered,
+            "a bare cursor move leaves the list alone"
+        );
+        assert!(screen.field_key(Key::Backspace));
+        assert_eq!(screen.search_text(), "stoe", "the cursor sat past the 'n'");
+        assert!(!screen.field_key(Key::Enter));
+        assert!(!screen.field_key(Key::Tab));
+        assert_eq!(screen.search_text(), "stoe");
+        screen.set_tab(0);
+        assert!(!screen.field_key(Key::Backspace));
     }
 
     #[test]

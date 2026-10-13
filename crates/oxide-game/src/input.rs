@@ -61,6 +61,12 @@ pub enum Key {
     Enter,
     /// Backspace: the field's delete key (`GuiTextField.textboxKeyTyped`:378-391).
     Backspace,
+    /// Delete: the field's forward-delete key (`GuiTextField.textboxKeyTyped`:463-476).
+    Delete,
+    /// Home: the field's jump-to-start key (`GuiTextField.textboxKeyTyped`:393-404).
+    Home,
+    /// End: the field's jump-to-end key (`GuiTextField.textboxKeyTyped`:393-404).
+    End,
     /// The left arrow: the field's cursor moves back (`GuiTextField.textboxKeyTyped`:405-426).
     ArrowLeft,
     /// The right arrow: the field's cursor moves on (`GuiTextField.textboxKeyTyped`:428-449).
@@ -312,7 +318,7 @@ pub struct SessionPush {
 /// The movement and sprint keys, the chat keys the field rides and the
 /// inventory keys Task 24 routes; the count is the [`Key`] variant count so
 /// [`Key::index`] stays total, but only the gameplay keys drive any intent.
-const KEY_COUNT: usize = 27;
+const KEY_COUNT: usize = 30;
 
 /// The sneak input scale: `MovementInputFromOptions.java:42-46` multiplies
 /// both movement axes by 0.3 while sneak is held.
@@ -386,6 +392,9 @@ impl Key {
             Key::Digit7 => 24,
             Key::Digit8 => 25,
             Key::Digit9 => 26,
+            Key::Delete => 27,
+            Key::Home => 28,
+            Key::End => 29,
         }
     }
 

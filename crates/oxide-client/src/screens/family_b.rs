@@ -43,6 +43,7 @@ use super::container::{
     SlotPos, TitleKind, TitleSource,
 };
 use crate::enchants::enchant_line;
+use crate::text_field::{FieldOutcome, TextField};
 use crate::tooltip::display_name;
 
 /// The beacon confirm's channel (`GuiBeacon.actionPerformed`:137-144).
@@ -1151,66 +1152,83 @@ pub enum FieldKey {
     Ignored,
 }
 
-/// The anvil's name field: the M4 chat field engine's subset — text, cursor,
-/// Backspace and the arrows plus the character path (`GuiTextField`'s full
-/// word ops and selection never run: `renameItem` only calls get/setText,
-/// `keyTyped` only `textboxKeyTyped`, plus `mouseClicked` focus and the draw).
-/// No recall and no history: the rename is a single line.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The anvil's name field: the shared [`TextField`] capped at
+/// [`NAME_FIELD_MAX`], answering the Backspace/sideways-arrow subset the
+/// screen's keys route (`GuiRepair.keyTyped`:117-134 over
+/// `textboxKeyTyped`:337-494). No recall and no history: the rename is a
+/// single line.
+#[derive(Debug, Clone)]
 pub struct NameField {
-    /// The text, edited in place.
-    text: String,
-    /// The cursor's byte index into `text`, always on a character boundary.
-    cursor: usize,
-    /// Whether the field holds focus (`setFocused` from `mouseClicked`).
-    focused: bool,
+    /// The shared editing machine.
+    field: TextField,
     /// Whether the input slot held a stack at the last sync: the slot-0 sync
     /// below only re-fires on a presence change.
     bound: bool,
-    /// The blink counter: steps once per session tick while open, and the
-    /// cursor draws while `blink / 6 % 2 == 0` (`GuiTextField.java`:540).
-    blink: u64,
 }
+
+impl Default for NameField {
+    fn default() -> Self {
+        // The anvil's own filter is the shared allowed rule under its own
+        // name (`ChatAllowedCharacters`:10-13, as the M4 field carried it).
+        let mut field = TextField::new(NAME_FIELD_MAX);
+        field.set_validator(name_allowed);
+        Self {
+            field,
+            bound: false,
+        }
+    }
+}
+
+impl PartialEq for NameField {
+    fn eq(&self, other: &Self) -> bool {
+        self.field.text() == other.field.text()
+            && self.field.cursor() == other.field.cursor()
+            && self.field.is_focused() == other.field.is_focused()
+            && self.bound == other.bound
+    }
+}
+
+impl Eq for NameField {}
 
 impl NameField {
     /// The field's text.
     pub fn text(&self) -> &str {
-        &self.text
+        self.field.text()
     }
 
     /// The cursor's byte index into the text.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.field.cursor()
     }
 
     /// Whether the field holds focus.
     pub fn is_focused(&self) -> bool {
-        self.focused
+        self.field.is_focused()
     }
 
-    /// Replaces the text with the cursor at its end (`setText`:86-101 — which,
-    /// unlike the character path, applies no length cap).
+    /// Replaces the text with the cursor at its end (`setText`:86-101,
+    /// which caps at the length like the character path — the M4 field's
+    /// no-cap read of this was wrong, and the move corrects it).
     pub fn set_text(&mut self, text: &str) {
-        self.text.clear();
-        self.text.push_str(text);
-        self.cursor = self.text.len();
+        self.field.set_text(text);
     }
 
     /// One session tick of the blink counter.
     pub fn tick(&mut self) {
-        self.blink = self.blink.wrapping_add(1);
+        self.field.tick();
     }
 
     /// Whether the cursor is in its lit phase (`GuiTextField.java`:540).
     pub fn cursor_visible(&self) -> bool {
-        (self.blink / 6) % 2 == 0
+        self.field.cursor_visible()
     }
 
     /// One click: focus lands exactly on the field's rect
     /// (`mouseClicked` → `GuiTextField.mouseClicked` → `setFocused`).
     pub fn click(&mut self, x: i32, y: i32) {
         let (rx, ry, w, h) = NAME_FIELD_RECT;
-        self.focused = x >= rx && x < rx + w && y >= ry && y < ry + h;
+        self.field
+            .click(x >= rx && x < rx + w && y >= ry && y < ry + h, None);
     }
 
     /// Appends text at the cursor — the character path `writeText` (`:129-169`)
@@ -1221,63 +1239,18 @@ impl NameField {
     /// the recorded divergence — the source answers true and re-fires, the
     /// port answers false and stays silent.
     pub fn type_text(&mut self, text: &str) -> bool {
-        let kept: Vec<char> = text.chars().filter(|&c| name_allowed(c)).collect();
-        let room = NAME_FIELD_MAX.saturating_sub(self.text.chars().count());
-        let insert: String = kept.into_iter().take(room).collect();
-        if insert.is_empty() {
-            return false;
-        }
-        self.text.insert_str(self.cursor, &insert);
-        self.cursor += insert.len();
-        true
-    }
-
-    /// Backspace: removes the character before the cursor, if any
-    /// (`textboxKeyTyped`:378-391's delete branch).
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.text[..self.cursor]
-            .chars()
-            .next_back()
-            .expect("a non-empty prefix has a last character");
-        self.text.drain(self.cursor - prev.len_utf8()..self.cursor);
-        self.cursor -= prev.len_utf8();
-    }
-
-    /// The left arrow: one character back (`:405-426`).
-    fn left(&mut self) {
-        if let Some(prev) = self.text[..self.cursor].chars().next_back() {
-            self.cursor -= prev.len_utf8();
-        }
-    }
-
-    /// The right arrow: one character on (`:428-449`).
-    fn right(&mut self) {
-        if let Some(next) = self.text[self.cursor..].chars().next() {
-            self.cursor += next.len_utf8();
-        }
+        self.field.write_text(text)
     }
 
     /// One editing key, as `GuiRepair.keyTyped`:117-134 reads it against
-    /// `textboxKeyTyped`:337-494: Backspace and the sideways arrows edit and
-    /// consume; every other key is the character path's or the container's.
+    /// `textboxKeyTyped`:337-494: the machine's handled keys edit and
+    /// consume; every other key is the character path's or the container's
+    /// (Enter included — the screen's own Enter/Tab pre-filter keeps those
+    /// for the container, and the pin below holds the answer).
     pub fn key(&mut self, key: Key) -> FieldKey {
-        match key {
-            Key::Backspace => {
-                self.backspace();
-                FieldKey::Consumed
-            }
-            Key::ArrowLeft => {
-                self.left();
-                FieldKey::Consumed
-            }
-            Key::ArrowRight => {
-                self.right();
-                FieldKey::Consumed
-            }
-            _ => FieldKey::Character,
+        match self.field.key(key, false, false) {
+            FieldOutcome::Consumed => FieldKey::Consumed,
+            FieldOutcome::Character | FieldOutcome::Ignored => FieldKey::Character,
         }
     }
 }
@@ -2071,6 +2044,46 @@ mod interactions {
         assert_eq!(sync.text(), "");
         assert!(name_enabled(true));
         assert!(!name_enabled(false));
+    }
+
+    #[test]
+    fn family_key_re_fires_the_rename_on_every_handled_keystroke() {
+        // The responder law through the shared machine: Backspace and the
+        // sideways arrows each re-fire `MC|ItemName` with the raw string;
+        // Enter and Tab fall through silent; a disabled or unfocused field
+        // answers nothing.
+        let mut screen = ContainerScreen::new(1, WindowKind::Anvil, String::new(), &ANVIL);
+        screen.set_family(FamilyState::Anvil(NameField::default()));
+        screen.apply_snapshot(vec![Some(stack(267, 1))], None, Vec::new());
+        assert!(
+            family_key(&mut screen, Key::ArrowLeft).is_empty(),
+            "an unfocused field answers nothing"
+        );
+        if let FamilyState::Anvil(field) = screen.family_mut() {
+            field.click(70, 26);
+            assert!(field.type_text("Sword"));
+        }
+        assert_eq!(
+            family_key(&mut screen, Key::ArrowLeft),
+            vec![item_name_event("Sword")],
+            "a bare arrow move still re-fires"
+        );
+        assert_eq!(
+            family_key(&mut screen, Key::Backspace),
+            vec![item_name_event("Swod")],
+            "the cursor sat past the 'r'"
+        );
+        assert!(family_key(&mut screen, Key::Enter).is_empty());
+        assert!(family_key(&mut screen, Key::Tab).is_empty());
+        assert_eq!(
+            family_type(&mut screen, "d"),
+            vec![item_name_event("Swodd")]
+        );
+        screen.apply_snapshot(Vec::new(), None, Vec::new());
+        assert!(
+            family_key(&mut screen, Key::Backspace).is_empty(),
+            "a slot-0-empty field answers nothing"
+        );
     }
 }
 

@@ -10,4 +10,5 @@ pub mod items;
 pub mod keymap;
 pub mod screens;
 pub mod settings_state;
+pub mod text_field;
 pub mod tooltip;
