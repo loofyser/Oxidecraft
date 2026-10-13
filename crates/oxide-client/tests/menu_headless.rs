@@ -25,7 +25,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use oxide_assets::font::Font;
 use oxide_assets::texture::Texture;
 use oxide_client::screens::menu::{
-    LOGO_SHEET, MainMenuScreen, PANORAMA_SHEETS, SPLASH_ANGLE_DEG, SPLASH_COLOUR, menu_labels,
+    LOGO_SHEET, MainMenuScreen, PANORAMA_SHEETS, SPLASH_COLOUR, menu_labels,
 };
 use oxide_client::screens::widgets::{Button, WIDGETS_SHEET};
 use oxide_render::entity_pass::TextureRegistry;
@@ -472,7 +472,7 @@ fn the_menu_draws_the_yellow_splash_at_minus_twenty() {
             _ => None,
         })
         .expect("the splash record");
-    assert_eq!(*angle, SPLASH_ANGLE_DEG, "minus twenty about Z");
+    assert_eq!(*angle, -20.0, "minus twenty about Z, not the const");
     assert_eq!(*colour, SPLASH_COLOUR, "yellow");
     assert_eq!(
         pivot,

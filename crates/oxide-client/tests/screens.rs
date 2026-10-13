@@ -1182,6 +1182,15 @@ fn the_splash_pick_trims_skips_defaults_and_rerolls() {
         "safe",
         "a lone survivor returns at once"
     );
+    // Seed 4096 draws index 0 (the exclusion) first, so this assert — and
+    // only this assert in the case — executes the re-roll branch: the
+    // 0..64 loop above never draws the exclusion first and passes even
+    // with the re-roll removed.
+    assert_eq!(
+        pick_splash(&exclusion, 4096),
+        "safe",
+        "seed 4096 draws the exclusion first, so the re-roll must fire"
+    );
 }
 
 #[test]
