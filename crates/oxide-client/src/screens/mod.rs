@@ -6,13 +6,15 @@
 //! :330-341) and the wire close (`NetHandlerPlayClient.handleCloseWindow`
 //! :1311-1315); no source text is copied.
 //!
-//! [`Screens`] holds the current screen. Seven variants are declared here;
+//! [`Screens`] holds the current screen. Eleven variants are declared here;
 //! Task 16 wires only the [`ScreenState::Container`] kind's `WindowOpened`
 //! path — the inventory open landed in Task 20, the creative open in Task
 //! 21, the sign open in Task 22; the book open lands in Task 23, and an
 //! open for a declared-but-unimplemented variant draws the generic frame
 //! (recorded). The main menu stands pre-session at startup and on
-//! disconnect-to-title (Task 15).
+//! disconnect-to-title (Task 15). The pause menu stands on Escape from
+//! play with the statistics, achievements and snooper placeholders beside
+//! it (Task 17).
 //!
 //! The close rule: every close sends
 //! [`InputEvent::CloseWindow`](oxide_game::input::InputEvent::CloseWindow)
@@ -44,6 +46,7 @@ use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
 use menu::MainMenuScreen;
 use multiplayer::{MultiplayerLabels, MultiplayerScreen, ServerList};
+use pause::{AchievementsScreen, PauseScreen, SnooperScreen, StatsScreen};
 use sign::{SignMapEntry, SignScreen};
 
 pub mod book;
@@ -54,6 +57,7 @@ pub mod family_b;
 pub mod inventory;
 pub mod menu;
 pub mod multiplayer;
+pub mod pause;
 pub mod sign;
 pub mod widgets;
 
@@ -85,6 +89,23 @@ pub enum ScreenState {
     /// back to the menu or forward into the join (boxed like the container
     /// kinds).
     Multiplayer(Box<MultiplayerScreen>),
+    /// The pause menu: the in-session screen standing on Escape from play,
+    /// with Back to Game, the statistics/achievements placeholders, the
+    /// options hub (later), the always-disabled LAN button and Disconnect
+    /// (boxed like the container kinds).
+    Pause(Box<PauseScreen>),
+    /// The statistics placeholder: the frame, the title, Done and the
+    /// recorded body, standing over the pause (boxed like the container
+    /// kinds).
+    Stats(Box<StatsScreen>),
+    /// The achievements placeholder: the frame, the title, Done and the
+    /// recorded body, standing over the pause (boxed like the container
+    /// kinds).
+    Achievements(Box<AchievementsScreen>),
+    /// The snooper placeholder: the frame, the title, Done and the
+    /// recorded body, with its parent declared for the options hub (boxed
+    /// like the container kinds).
+    Snooper(Box<SnooperScreen>),
 }
 
 impl ScreenState {
@@ -99,7 +120,13 @@ impl ScreenState {
                 Some(screen.window_id())
             }
             ScreenState::Creative(_) => Some(0),
-            ScreenState::Sign(_) | ScreenState::Book(_) | ScreenState::MainMenu(_) => None,
+            ScreenState::Sign(_)
+            | ScreenState::Book(_)
+            | ScreenState::MainMenu(_)
+            | ScreenState::Pause(_)
+            | ScreenState::Stats(_)
+            | ScreenState::Achievements(_)
+            | ScreenState::Snooper(_) => None,
             ScreenState::Multiplayer(_) => None,
         }
     }
@@ -132,6 +159,11 @@ pub struct Screens {
     /// the map's lines — four empty lines when the map holds none (the
     /// tile's own default). Cleared entries leave with the world.
     sign_texts: HashMap<(i32, i32, i32), SignMapEntry>,
+    /// The pause menu beneath the statistics or achievements placeholder:
+    /// the parent their Done buttons and Escape return to. Standing a
+    /// placeholder from the pause stashes it here; a direct open stashes
+    /// nothing, and the return then follows the base rule instead.
+    pause_parent: Option<PauseScreen>,
 }
 
 impl Screens {
@@ -418,6 +450,122 @@ impl Screens {
         ))));
     }
 
+    /// The open pause menu, when the current screen is one: the frame's
+    /// pointer and the pause keys drive this.
+    pub fn pause_mut(&mut self) -> Option<&mut PauseScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Pause(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open statistics placeholder, when the current screen is one.
+    pub fn stats_mut(&mut self) -> Option<&mut StatsScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Stats(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open achievements placeholder, when the current screen is one.
+    pub fn achievements_mut(&mut self) -> Option<&mut AchievementsScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Achievements(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open snooper placeholder, when the current screen is one.
+    pub fn snooper_mut(&mut self) -> Option<&mut SnooperScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Snooper(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Whether the pause family stands: the pause menu or one of the
+    /// three placeholders. The window owns the clicks and keys over them;
+    /// the container routing above never answers them.
+    pub fn pause_family_open(&self) -> bool {
+        matches!(
+            self.current,
+            Some(
+                ScreenState::Pause(_)
+                    | ScreenState::Stats(_)
+                    | ScreenState::Achievements(_)
+                    | ScreenState::Snooper(_)
+            )
+        )
+    }
+
+    /// Stands the pause menu: Escape from play stands it on `labels`
+    /// (back, achievements, statistics, options, LAN, disconnect) at
+    /// `scaled`. No guard exists: standing it replaces whatever screen is
+    /// open.
+    pub fn open_pause(&mut self, scaled: ScaledResolution, labels: [String; 6]) {
+        self.current = Some(ScreenState::Pause(Box::new(PauseScreen::new(
+            &scaled, labels,
+        ))));
+    }
+
+    /// Stands the statistics placeholder at `scaled` on the Done label:
+    /// the pause menu's statistics button stands it. The open pause
+    /// stashes as the parent its Done button and Escape return to.
+    pub fn open_stats(&mut self, scaled: ScaledResolution, done: String) {
+        if let Some(ScreenState::Pause(screen)) = self.current.take() {
+            self.pause_parent = Some(*screen);
+        }
+        self.current = Some(ScreenState::Stats(Box::new(StatsScreen::new(
+            &scaled, done,
+        ))));
+    }
+
+    /// Stands the achievements placeholder at `scaled` on the Done label:
+    /// the pause menu's achievements button stands it. The open pause
+    /// stashes as the parent its Done button and Escape return to.
+    pub fn open_achievements(&mut self, scaled: ScaledResolution, done: String) {
+        if let Some(ScreenState::Pause(screen)) = self.current.take() {
+            self.pause_parent = Some(*screen);
+        }
+        self.current = Some(ScreenState::Achievements(Box::new(
+            AchievementsScreen::new(&scaled, done),
+        )));
+    }
+
+    /// Stands the snooper placeholder at `scaled` on the Done label.
+    /// Unreachable until the options hub lands: no opener stands it yet,
+    /// so no parent stashes — the declared parent slot rides the screen
+    /// itself.
+    pub fn open_snooper(&mut self, scaled: ScaledResolution, done: String) {
+        self.current = Some(ScreenState::Snooper(Box::new(SnooperScreen::new(
+            &scaled, done,
+        ))));
+    }
+
+    /// Returns the statistics or achievements placeholder to its stashed
+    /// pause parent. Answers whether a parent stood: with none stashed
+    /// the caller follows the base rule instead.
+    pub fn back_to_pause(&mut self) -> bool {
+        let Some(parent) = self.pause_parent.take() else {
+            return false;
+        };
+        self.current = Some(ScreenState::Pause(Box::new(parent)));
+        true
+    }
+
+    /// Re-lays the open pause-family screen at the new scaled size
+    /// (`initGui` re-runs on resize): the pause menu on `labels`, the
+    /// placeholders on `done`. Anything else stays put.
+    pub fn resize_pause(&mut self, scaled: &ScaledResolution, labels: [String; 6], done: String) {
+        match self.current.as_mut() {
+            Some(ScreenState::Pause(screen)) => screen.set_screen_size(scaled, labels),
+            Some(ScreenState::Stats(screen)) => screen.set_screen_size(scaled, done),
+            Some(ScreenState::Achievements(screen)) => screen.set_screen_size(scaled, done),
+            Some(ScreenState::Snooper(screen)) => screen.set_screen_size(scaled, done),
+            _ => {}
+        }
+    }
+
     /// Stands the main menu: the pre-session screen at startup when no
     /// `--server` was given, and on disconnect-to-title. The splash
     /// lines are the store's `texts/splashes.txt` as read, `seed` the
@@ -503,9 +651,18 @@ impl Screens {
     /// One Escape press with the screen on top: the containers close through
     /// `closeScreen` (`GuiContainer.keyTyped`:692-696), and the base screen's
     /// own Escape (`GuiScreen.keyTyped`:104-115) lands in the same place —
-    /// the screen gone, C0D sent. The chat above answers first and never
-    /// reaches here.
+    /// the screen gone, C0D sent. The statistics and achievements
+    /// placeholders answer their pause parent instead — the plan's
+    /// "screen → its parent" — and with no parent stashed they follow the
+    /// base rule. The chat above answers first and never reaches here.
     pub fn escape(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
+        if matches!(
+            self.current,
+            Some(ScreenState::Stats(_) | ScreenState::Achievements(_))
+        ) && self.back_to_pause()
+        {
+            return None;
+        }
         self.close(cursor)
     }
 

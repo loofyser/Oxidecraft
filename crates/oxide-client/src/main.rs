@@ -64,6 +64,9 @@ use oxide_client::screens::menu::{MenuAction, menu_labels};
 use oxide_client::screens::multiplayer::{
     MultiAction, PING_TIMEOUT, ServerList, SubScreen, multiplayer_labels, servers_path,
 };
+use oxide_client::screens::pause::{
+    AchievementsAction, PauseAction, SnooperAction, StatsAction, done_label, pause_labels,
+};
 use oxide_client::screens::widgets::BUTTON_PRESS_SOUND;
 use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
 use oxide_client::settings_state::{
@@ -100,6 +103,7 @@ use oxide_render::fog::{
 };
 use oxide_render::fps::FpsCounter;
 use oxide_render::gui_item::ItemIconSource;
+use oxide_render::hud::ScaledResolution;
 use oxide_render::lightmap::BrightnessTable;
 use oxide_render::particle_pass::{ParticleDraw, ParticleUv};
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
@@ -2505,7 +2509,7 @@ impl ClientApp {
                 EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
                 EscapeRoute::CloseChat => self.close_chat(event_loop),
                 EscapeRoute::CloseScreen => self.close_screen(event_loop),
-                EscapeRoute::Capture(step) => self.apply_capture(event_loop, step),
+                EscapeRoute::Capture(step) => self.escape_capture(event_loop, step),
             }
             return;
         }
@@ -2856,17 +2860,38 @@ impl ClientApp {
     /// carrying the screen's window id leaves — window 0 included — the
     /// view's cursor copy drops with it, and the pointer recaptures
     /// (`GuiContainer.keyTyped`:692-696 through `EntityPlayerSP.closeScreen`
-    /// :330-341). With no screen there is nothing to close and the pointer
-    /// stays as it was.
+    /// :330-341). A windowless close sends nothing — the pause family
+    /// stands on no window — but still recaptures: the pause's Escape is
+    /// `displayGuiScreen(null)` + `setIngameFocus`. The statistics and
+    /// achievements placeholders answer their pause parent instead of the
+    /// game. With no screen there is nothing to close and the pointer
+    /// stays as it was; the main menu never closes this way and stays
+    /// standing.
     fn close_screen(&mut self, event_loop: &ActiveEventLoop) {
+        let was_open = self.screens.is_open();
         let mut dropped = None;
-        let Some(event) = self.screens.close(&mut dropped) else {
+        let event = self.screens.escape(&mut dropped);
+        if !was_open || self.screens.is_open() {
             return;
-        };
-        self.send_input(event);
+        }
+        if let Some(event) = event {
+            self.send_input(event);
+        }
         self.cursor = None;
         let step = self.capture.chat_close();
         self.apply_capture(event_loop, step);
+    }
+
+    /// Runs the capture arm of one Escape press: with a live session the
+    /// pause menu stands instead of the capture rule (`Minecraft.java`
+    /// :1944-1949 opens the in-game menu on key 1 with no screen); with
+    /// no session the M3 capture rule owns the arm unchanged.
+    fn escape_capture(&mut self, event_loop: &ActiveEventLoop, step: CaptureStep) {
+        if self.session.is_some() {
+            self.open_pause(event_loop);
+        } else {
+            self.apply_capture(event_loop, step);
+        }
     }
 
     /// Runs one main-menu press at the free pointer's point: the button
@@ -2922,6 +2947,169 @@ impl ClientApp {
         if let Some(screen) = self.screens.multiplayer_mut() {
             screen.refresh(PING_TIMEOUT);
         }
+    }
+
+    /// Stands the pause menu from the window's own Escape: the labels
+    /// resolve through the assets' table at the renderer's scaled size
+    /// (`GuiIngameMenu.initGui`). The pointer frees with the key-clearing
+    /// send like any other window open — the session keeps running behind
+    /// it (R9). Without a renderer or assets the game stays where it is.
+    fn open_pause(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        self.screens
+            .open_pause(scaled, pause_labels(Some(&assets.lang)));
+        self.cursor = None;
+        let step = self.capture.chat_open();
+        self.apply_capture(event_loop, step);
+    }
+
+    /// Plays the button press sound (`GuiButton.playPressSound`) at the
+    /// listener. Silent with no audio engine.
+    fn play_press_sound(&mut self) {
+        if let Some(audio) = self.audio.as_mut() {
+            let listener = listener_of(&self.player);
+            audio.engine.play(local_sound_play(
+                BUTTON_PRESS_SOUND.to_string(),
+                listener.pos,
+                1.0,
+                1.0,
+                SoundCategory::Master,
+                listener,
+            ));
+        }
+    }
+
+    /// Runs one pause press at the free pointer's point: the button under
+    /// it plays the press sound and answers its action. Back to Game
+    /// closes with the pointer recaptured and no send; statistics and
+    /// achievements stand their placeholders in-client with no send; the
+    /// options press records its action and opens nothing yet (the hub is
+    /// later work); Disconnect ends the session to the title. Empty space
+    /// answers nothing.
+    fn pause_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .pause_mut()
+            .and_then(|pause| pause.click_at(point));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        match action {
+            PauseAction::BackToGame => self.close_screen(event_loop),
+            PauseAction::Achievements => self.open_placeholder(true),
+            PauseAction::Statistics => self.open_placeholder(false),
+            PauseAction::Options => {}
+            PauseAction::Disconnect => self.disconnect_to_title(),
+        }
+    }
+
+    /// Stands one placeholder from the pause menu's buttons: the Done
+    /// label resolves through the assets' table at the renderer's scaled
+    /// size, and the open pause stashes as the parent. In-client, no
+    /// send. Without a renderer or assets the pause stays standing.
+    fn open_placeholder(&mut self, achievements: bool) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let done = done_label(Some(&assets.lang));
+        if achievements {
+            self.screens.open_achievements(scaled, done);
+        } else {
+            self.screens.open_stats(scaled, done);
+        }
+    }
+
+    /// Runs one statistics press at the free pointer's point: Done plays
+    /// the press sound and returns to the pause parent. Empty space
+    /// answers nothing.
+    fn stats_click(&mut self, point: (f32, f32)) {
+        let done = self
+            .screens
+            .stats_mut()
+            .and_then(|screen| screen.click_at(point));
+        if done == Some(StatsAction::Done) {
+            self.play_press_sound();
+            self.screens.back_to_pause();
+        }
+    }
+
+    /// Runs one achievements press at the free pointer's point: Done plays
+    /// the press sound and returns to the pause parent. Empty space
+    /// answers nothing.
+    fn achievements_click(&mut self, point: (f32, f32)) {
+        let done = self
+            .screens
+            .achievements_mut()
+            .and_then(|screen| screen.click_at(point));
+        if done == Some(AchievementsAction::Done) {
+            self.play_press_sound();
+            self.screens.back_to_pause();
+        }
+    }
+
+    /// Runs one snooper press at the free pointer's point: Done plays the
+    /// press sound and closes to the game with the pointer recaptured and
+    /// no send — the safe terminal until the options hub wires the return
+    /// to the declared parent. Empty space answers nothing.
+    fn snooper_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let done = self
+            .screens
+            .snooper_mut()
+            .and_then(|screen| screen.click_at(point));
+        if done == Some(SnooperAction::Done) {
+            self.play_press_sound();
+            self.close_screen(event_loop);
+        }
+    }
+
+    /// Ends the session to the title from the pause menu's Disconnect
+    /// button: the standing disconnect teardown. Without a renderer the
+    /// session still ends; the menu stands on the next frame's rule.
+    fn disconnect_to_title(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            self.end_session_to_title_fallback();
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        self.end_session_to_title(scaled);
+    }
+
+    /// The shared session-end fold: the link drops, the join flag clears,
+    /// and the main menu stands on the standing rule. The wire's
+    /// disconnect and the pause menu's Disconnect button land here alike.
+    fn end_session_to_title(&mut self, scaled: ScaledResolution) {
+        tracing::info!("the session ended, standing the main menu");
+        self.session = None;
+        self.joined = false;
+        self.dead = false;
+        if let Some(assets) = self.assets.as_ref() {
+            self.screens.on_disconnected(
+                scaled,
+                &assets.splash_lines,
+                self.menu_seed,
+                menu_labels(Some(&assets.lang)),
+            );
+        }
+    }
+
+    /// Ends the session with no renderer to read a size from: the link
+    /// still drops, and the menu stands on the next frame's rule.
+    fn end_session_to_title_fallback(&mut self) {
+        tracing::info!("the session ended, standing the main menu");
+        self.session = None;
+        self.joined = false;
+        self.dead = false;
     }
 
     /// Runs one multiplayer press at the free pointer's point: the button
@@ -3569,7 +3757,7 @@ impl ClientApp {
                     EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
                     EscapeRoute::CloseChat => self.close_chat(event_loop),
                     EscapeRoute::CloseScreen => self.close_screen(event_loop),
-                    EscapeRoute::Capture(step) => self.apply_capture(event_loop, step),
+                    EscapeRoute::Capture(step) => self.escape_capture(event_loop, step),
                 }
             }
             ScriptKey::F3 => {
@@ -3865,6 +4053,29 @@ impl ClientApp {
             if state == ElementState::Pressed && button == WinitMouseButton::Left {
                 if let Some(point) = self.cursor {
                     self.multiplayer_click(point);
+                }
+            }
+            return;
+        }
+        // The pause family holds the click the same way: a left press on a
+        // button plays the press sound and runs its action. Back to Game
+        // closes with the pointer recaptured; statistics and achievements
+        // stand their placeholders; Disconnect ends the session to the
+        // title; the placeholders' Done answers the pause parent. Any
+        // other click is the screen's to swallow — the pointer never grabs
+        // behind it.
+        if self.screens.pause_family_open() {
+            if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                if let Some(point) = self.cursor {
+                    if self.screens.pause_mut().is_some() {
+                        self.pause_click(event_loop, point);
+                    } else if self.screens.stats_mut().is_some() {
+                        self.stats_click(point);
+                    } else if self.screens.achievements_mut().is_some() {
+                        self.achievements_click(point);
+                    } else if self.screens.snooper_mut().is_some() {
+                        self.snooper_click(event_loop, point);
+                    }
                 }
             }
             return;

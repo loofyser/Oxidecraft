@@ -71,8 +71,9 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///
 /// The hud's icon sheet, `gui/icons`, already travels under its own
 /// client-side name and is not repeated here.
-pub const GUI_SHEETS: [&str; 30] = [
+pub const GUI_SHEETS: [&str; 31] = [
     "gui/widgets",
+    "gui/options_background",
     "gui/title/background/panorama_0",
     "gui/title/background/panorama_1",
     "gui/title/background/panorama_2",
@@ -401,6 +402,7 @@ mod tests {
             &GUI_SHEETS[..],
             [
                 "gui/widgets",
+                "gui/options_background",
                 "gui/title/background/panorama_0",
                 "gui/title/background/panorama_1",
                 "gui/title/background/panorama_2",

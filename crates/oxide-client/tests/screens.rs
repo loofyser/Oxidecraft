@@ -712,9 +712,9 @@ fn an_open_stands_the_resolved_table() {
 // - the digits set the slot directly everywhere the screen does not own the
 //   key, and swap inside a container on top;
 // - Q drops one item outside screens, the whole stack with Ctrl;
-// - Escape closes the current screen; with no screen the port runs the M3
-//   capture rule (release-while-grabbed, else exit) in place of the source's
-//   pause menu — the recorded substitution. The confirm → chat → screen order
+// - Escape closes the current screen; with no screen the client stands the
+//   pause menu while a session runs, and the M3 capture rule owns the arm
+//   otherwise (release-while-grabbed, else exit). The confirm → chat → screen order
 //   is port-new layering: the source has a single screen slot (chat IS a
 //   screen).
 
@@ -911,9 +911,8 @@ fn q_outside_screens_drops_one_and_ctrl_q_drops_the_whole_stack() {
 
 // Escape closes the current screen — the chest's own window id, window 0 for
 // the inventory — and with no screen the screens send nothing: the no-screen
-// arm is the M3 capture rule's (release-while-grabbed, else exit), the
-// recorded substitution for the source's pause menu
-// (`Minecraft.java`:1944-1949).
+// arm stands the pause menu while a session runs (`Minecraft.java`:1944-1949),
+// else the M3 capture rule owns it (release-while-grabbed, else exit).
 
 #[test]
 fn escape_closes_the_screen_and_sends_nothing_with_no_screen() {
@@ -935,7 +934,7 @@ fn escape_closes_the_screen_and_sends_nothing_with_no_screen() {
     assert_eq!(
         screens.escape(&mut None),
         None,
-        "no screen sends nothing: the capture rule owns the no-screen arm"
+        "no screen sends nothing: the pause menu stands above it at the client level"
     );
 }
 
@@ -1494,4 +1493,371 @@ fn the_population_and_version_lines_pin() {
         None,
         "no sample draws no tooltip"
     );
+}
+
+// Task 17's pause suite: the pause menu's six-button set and layout, the
+// placeholder statistics/achievements/snooper frames, and the Escape chain
+// (play → pause; pause → play by button and by Escape with no send;
+// pause ↔ statistics/achievements; the snooper stands with its declared
+// parent).
+//
+// The layout pins mirror `GuiIngameMenu.java:19-39` (`i = -16`): Back to
+// Game (4) 200 wide at `h/4+8`; Achievements (5) + Statistics (6) as the
+// 98-wide pair at `h/4+32`; Options (0) + Open to LAN (7) as the 98-wide
+// pair at `h/4+80`; Disconnect (1) 200 wide at `h/4+104`. LAN is always
+// disabled (R1 — no integrated server exists, so `:38` is permanently
+// false); Disconnect always reads "Disconnect" (R2). Every formula here is
+// closed-form — no GPU needed.
+
+use oxide_client::screens::pause::{
+    ACHIEVEMENTS_DONE_ID, DIRT_SPAN, PAUSE_ACHIEVEMENTS_ID, PAUSE_BACK_ID, PAUSE_DISCONNECT_ID,
+    PAUSE_LAN_ID, PAUSE_OPTIONS_ID, PAUSE_STATS_ID, SNOOPER_DONE_ID, STATS_DONE_ID, SnooperParent,
+    achievements_title, dirt_draws, done_label, pause_buttons, pause_labels, pause_title,
+    snooper_title, stats_title,
+};
+use oxide_client::screens::pause::{AchievementsAction, PauseAction, SnooperAction, StatsAction};
+
+/// The pause suite's English labels in button order: back, achievements,
+/// statistics, options, LAN, disconnect.
+fn pause_english() -> [String; 6] {
+    [
+        String::from("Back to Game"),
+        String::from("Achievements"),
+        String::from("Statistics"),
+        String::from("Options..."),
+        String::from("Open to LAN"),
+        String::from("Disconnect"),
+    ]
+}
+
+#[test]
+fn the_pause_menu_pins_the_six_button_set() {
+    // `GuiIngameMenu.java:19-39` at the wide size (427x240: half 213,
+    // quarter 60): the ids, the rects, the pair widths, and LAN disabled.
+    let buttons = pause_buttons(&wide(), pause_english());
+    let rects: Vec<(i32, f32, f32, f32, f32, bool)> = buttons
+        .iter()
+        .map(|button| {
+            (
+                button.id,
+                button.x,
+                button.y,
+                button.w,
+                button.h,
+                button.enabled,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rects,
+        vec![
+            (PAUSE_DISCONNECT_ID, 113.0, 164.0, 200.0, 20.0, true),
+            (PAUSE_BACK_ID, 113.0, 68.0, 200.0, 20.0, true),
+            (PAUSE_OPTIONS_ID, 113.0, 140.0, 98.0, 20.0, true),
+            (PAUSE_LAN_ID, 215.0, 140.0, 98.0, 20.0, false),
+            (PAUSE_ACHIEVEMENTS_ID, 113.0, 92.0, 98.0, 20.0, true),
+            (PAUSE_STATS_ID, 215.0, 92.0, 98.0, 20.0, true),
+        ],
+        "ids and rects match the source's button build; LAN alone is disabled"
+    );
+    assert_eq!(PAUSE_BACK_ID, 4);
+    assert_eq!(PAUSE_ACHIEVEMENTS_ID, 5);
+    assert_eq!(PAUSE_STATS_ID, 6);
+    assert_eq!(PAUSE_OPTIONS_ID, 0);
+    assert_eq!(PAUSE_LAN_ID, 7);
+    assert_eq!(PAUSE_DISCONNECT_ID, 1);
+}
+
+#[test]
+fn the_pause_menu_stays_on_screen_at_the_minimum() {
+    // 320x240 (half 160, quarter 60): every button keeps its row and sits
+    // fully inside the frame.
+    let buttons = pause_buttons(&minimum(), pause_english());
+    let rects: Vec<(i32, f32, f32, f32, f32)> = buttons
+        .iter()
+        .map(|button| (button.id, button.x, button.y, button.w, button.h))
+        .collect();
+    assert_eq!(
+        rects,
+        vec![
+            (PAUSE_DISCONNECT_ID, 60.0, 164.0, 200.0, 20.0),
+            (PAUSE_BACK_ID, 60.0, 68.0, 200.0, 20.0),
+            (PAUSE_OPTIONS_ID, 60.0, 140.0, 98.0, 20.0),
+            (PAUSE_LAN_ID, 162.0, 140.0, 98.0, 20.0),
+            (PAUSE_ACHIEVEMENTS_ID, 60.0, 92.0, 98.0, 20.0),
+            (PAUSE_STATS_ID, 162.0, 92.0, 98.0, 20.0),
+        ]
+    );
+    for button in &buttons {
+        assert!(
+            button.x >= 0.0 && button.x + button.w <= 320.0,
+            "button {} sits inside the width",
+            button.id
+        );
+        assert!(
+            button.y >= 0.0 && button.y + button.h <= 240.0,
+            "button {} sits inside the height",
+            button.id
+        );
+    }
+}
+
+#[test]
+fn the_pause_labels_resolve_english_without_a_table() {
+    // No table hands over: the store's `en_US.lang` English the pause menu
+    // and the placeholders stand on.
+    assert_eq!(
+        pause_labels(None),
+        [
+            String::from("Back to Game"),
+            String::from("Achievements"),
+            String::from("Statistics"),
+            String::from("Options..."),
+            String::from("Open to LAN"),
+            String::from("Disconnect"),
+        ]
+    );
+    assert_eq!(pause_title(None), String::from("Game menu"));
+    assert_eq!(stats_title(None), String::from("Statistics"));
+    assert_eq!(achievements_title(None), String::from("Achievements"));
+    assert_eq!(
+        snooper_title(None),
+        String::from("Machine Specs Collection")
+    );
+    assert_eq!(done_label(None), String::from("Done"));
+}
+
+#[test]
+fn the_pause_escape_chain_stands_and_returns() {
+    // Play → pause; pause → play by Escape with no send; the cursor copy
+    // drops with the close.
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    assert!(screens.is_open(), "the pause stands");
+    assert_eq!(
+        screens.current_window_id(),
+        None,
+        "the pause stands on no window"
+    );
+    assert!(!screens.allow_user_input(), "the pause gates input");
+    let mut cursor = Some(stack(1, 1));
+    assert_eq!(
+        screens.escape(&mut cursor),
+        None,
+        "pause Escape sends nothing"
+    );
+    assert!(!screens.is_open(), "pause Escape lands back in the game");
+    assert_eq!(cursor, None, "the close drops the cursor copy");
+}
+
+#[test]
+fn the_stats_and_achievements_escape_back_to_the_pause() {
+    // Pause ↔ statistics/achievements: Escape answers the parent, not the
+    // game; with no parent stashed the base rule closes instead.
+    for open in [
+        Screens::open_stats as fn(&mut Screens, ScaledResolution, String),
+        Screens::open_achievements as fn(&mut Screens, ScaledResolution, String),
+    ] {
+        let mut screens = Screens::default();
+        screens.open_pause(wide(), pause_english());
+        open(&mut screens, wide(), String::from("Done"));
+        let mut cursor = None;
+        assert_eq!(
+            screens.escape(&mut cursor),
+            None,
+            "the placeholder Escape sends nothing"
+        );
+        assert!(
+            screens.pause_mut().is_some(),
+            "Escape answers the pause parent"
+        );
+        assert_eq!(
+            screens.escape(&mut cursor),
+            None,
+            "a second Escape lands back in the game"
+        );
+        assert!(!screens.is_open());
+    }
+    // No parent stashed (a direct open): the base rule closes to the game.
+    let mut screens = Screens::default();
+    screens.open_stats(wide(), String::from("Done"));
+    assert_eq!(screens.escape(&mut None), None);
+    assert!(!screens.is_open());
+}
+
+#[test]
+fn the_snooper_stands_with_its_declared_parent() {
+    // R10: the snooper lands unreachable — its only opener is T18's hub —
+    // so T17 pins the declared parent only; Escape closes to the game with
+    // no send (the Done return wires with the hub).
+    let mut screens = Screens::default();
+    screens.open_snooper(wide(), String::from("Done"));
+    assert!(screens.is_open(), "the snooper stands");
+    assert_eq!(
+        screens.current_window_id(),
+        None,
+        "the snooper stands on no window"
+    );
+    assert_eq!(
+        screens.snooper_mut().expect("the snooper stands").parent(),
+        SnooperParent::Options,
+        "the declared parent is the options hub"
+    );
+    assert_eq!(
+        screens.escape(&mut None),
+        None,
+        "snooper Escape sends nothing"
+    );
+    assert!(!screens.is_open());
+}
+
+#[test]
+fn the_pause_clicks_pin_their_actions_and_the_lan_stays_inert() {
+    // The press fires on press (`mouseClicked`); the disabled LAN never
+    // presses, so it answers nothing; Disconnect pins the action id only —
+    // its teardown is the standing disconnect path.
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    let pause = screens.pause_mut().expect("the pause stands");
+    let press = |x: f32, y: f32| pause.click_at((x, y));
+    assert_eq!(press(213.0, 78.0), Some(PauseAction::BackToGame));
+    assert_eq!(press(162.0, 102.0), Some(PauseAction::Achievements));
+    assert_eq!(press(264.0, 102.0), Some(PauseAction::Statistics));
+    assert_eq!(press(162.0, 150.0), Some(PauseAction::Options));
+    assert_eq!(press(264.0, 150.0), None, "the disabled LAN records inert");
+    assert_eq!(press(213.0, 174.0), Some(PauseAction::Disconnect));
+    assert_eq!(press(0.0, 0.0), None, "empty space answers nothing");
+}
+
+#[test]
+fn the_placeholder_done_buttons_pin_their_ids() {
+    // Stats Done id0 150x20 at `w/2+4, h-28`; achievements Done id1 80x20
+    // at `w/2+24, h/2+74`; snooper Done id2 150x20 at `w/2+2, h-30` — all
+    // at the wide size.
+    assert_eq!(STATS_DONE_ID, 0);
+    assert_eq!(ACHIEVEMENTS_DONE_ID, 1);
+    assert_eq!(SNOOPER_DONE_ID, 2);
+    let mut screens = Screens::default();
+    screens.open_stats(wide(), String::from("Done"));
+    assert_eq!(
+        screens
+            .stats_mut()
+            .expect("the stats stand")
+            .click_at((217.0 + 1.0, 212.0 + 1.0)),
+        Some(StatsAction::Done)
+    );
+    let mut screens = Screens::default();
+    screens.open_achievements(wide(), String::from("Done"));
+    assert_eq!(
+        screens
+            .achievements_mut()
+            .expect("the achievements stand")
+            .click_at((237.0 + 1.0, 194.0 + 1.0)),
+        Some(AchievementsAction::Done)
+    );
+    let mut screens = Screens::default();
+    screens.open_snooper(wide(), String::from("Done"));
+    assert_eq!(
+        screens
+            .snooper_mut()
+            .expect("the snooper stands")
+            .click_at((215.0 + 1.0, 210.0 + 1.0)),
+        Some(SnooperAction::Done)
+    );
+}
+
+#[test]
+fn the_dirt_background_tiles_at_32_px() {
+    // `GuiScreen.java:688-703`: the `options_background` tile spans 32 px
+    // under the (64, 64, 64) tint.
+    use oxide_client::screens::pause::{DIRT_SHEET, DIRT_TINT};
+    use oxide_render::hud::{HudDraw, HudTexture};
+    assert_eq!(DIRT_SPAN, 32.0);
+    assert_eq!(DIRT_SHEET, "gui/options_background");
+    assert_eq!(DIRT_TINT, [64.0 / 255.0, 64.0 / 255.0, 64.0 / 255.0, 1.0]);
+    let draws = dirt_draws(&wide());
+    assert_eq!(
+        draws.len(),
+        14 * 8,
+        "427x240 tiles ceil(427/32) by ceil(240/32)"
+    );
+    for draw in &draws {
+        match draw {
+            HudDraw::TexturedRect {
+                texture: HudTexture::Named(name),
+                width,
+                height,
+                colour,
+                ..
+            } => {
+                assert_eq!(*name, DIRT_SHEET);
+                assert!(
+                    *width <= DIRT_SPAN && *height <= DIRT_SPAN,
+                    "no tile spans past 32 px"
+                );
+                assert_eq!(*colour, DIRT_TINT);
+            }
+            other => panic!("the dirt draws only tiles, got {other:?}"),
+        }
+    }
+    let covered: f32 = draws
+        .iter()
+        .filter_map(|draw| match draw {
+            HudDraw::TexturedRect { width, height, .. } => Some(width * height),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(covered, 427.0 * 240.0, "the tiles cover the frame exactly");
+}
+
+#[test]
+fn the_pause_draws_carry_the_title_over_six_buttons() {
+    // `GuiIngameMenu.drawScreen:108-113`: "Game menu" centred at `(w/2,
+    // 40)`, then the six buttons' draws.
+    use oxide_client::screens::pause::PauseScreen;
+    use oxide_render::hud::HudDraw;
+    let font = pause_probe_font();
+    let screen = PauseScreen::new(&wide(), pause_english());
+    let draws = screen.draws(&font, &wide(), None);
+    let title = draws
+        .iter()
+        .find_map(|draw| match draw {
+            HudDraw::Text { text, x, y, .. } if text == "Game menu" => Some((*x, *y)),
+            _ => None,
+        })
+        .expect("the centred title draws");
+    assert_eq!(title.1, 40.0, "the title sits at y 40 like the source");
+    assert_eq!(
+        title.0 + oxide_render::text::string_width(&font, "Game menu") as f32 / 2.0,
+        427.0 / 2.0,
+        "the title centres at w/2"
+    );
+    let buttons = pause_buttons(&wide(), pause_english());
+    for button in &buttons {
+        assert!(
+            draws.iter().any(|draw| match draw {
+                HudDraw::Text { text, .. } => text == &button.label,
+                _ => false,
+            }),
+            "the {} button's label draws",
+            button.label
+        );
+    }
+}
+
+/// The pause probe's synthetic font sheet: 128x128 fully inked white, so
+/// every printable cell spans its whole 8x8 and the title centres at a
+/// known advance.
+///
+/// Generated here; no asset store is read and no Mojang pixel is embedded.
+fn pause_probe_font() -> oxide_assets::font::Font {
+    oxide_assets::font::Font::load(
+        &oxide_assets::texture::Texture {
+            width: 128,
+            height: 128,
+            rgba: vec![255u8; 128 * 128 * 4],
+        },
+        None,
+    )
+    .expect("the synthetic sheet loads")
 }

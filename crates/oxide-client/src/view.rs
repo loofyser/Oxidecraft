@@ -56,6 +56,7 @@ use oxide_client::screens::creative::CreativeScreen;
 use oxide_client::screens::family_a;
 use oxide_client::screens::family_b;
 use oxide_client::screens::inventory;
+use oxide_client::screens::pause::dirt_draws;
 use oxide_client::screens::{ScreenState, Screens};
 use oxide_client::tooltip;
 
@@ -424,6 +425,49 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         ScreenState::Multiplayer(screen) => {
             if let Some(font) = input.font {
                 draws.extend(screen.draws(font, &input.scaled, input.mouse, input.now_ms));
+            }
+            return draws;
+        }
+        // The pause menu stands in-session: the dirt tiles lead so the
+        // frame's gradient pair falls over them
+        // (`GuiIngameMenu.drawScreen`:108-113 draws the default background,
+        // then the centred "Game menu" title, then the buttons), and the
+        // title + six buttons ride on top.
+        ScreenState::Pause(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The statistics placeholder stands over the pause: the dirt tiles
+        // lead under the gradient, and the centred title, the recorded
+        // body and Done ride on top (the full grids land after v1).
+        ScreenState::Stats(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The achievements placeholder stands over the pause: the dirt
+        // tiles lead under the gradient, and the centred title, the
+        // recorded body and Done ride on top (the full panel lands after
+        // v1).
+        ScreenState::Achievements(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The snooper placeholder stands parented at the options hub: the
+        // dirt tiles lead under the gradient, and the centred title, the
+        // recorded body and Done ride on top.
+        ScreenState::Snooper(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
             }
             return draws;
         }
