@@ -743,16 +743,16 @@ feat: the hitbox and lagometer overlays (render)
 
 ### Task 24: F2 screenshots
 
-**Goal:** F2 saves a PNG of the current frame to the store's `screenshots/` directory with the source's timestamp name, logs the path, and prints the chat notice if 1.8 does — the offscreen readback path lands with a pinned round trip.
+**Goal:** F2 saves a PNG of the current frame to the store's `screenshots/` directory with the source's timestamp name, logs the path, and prints the unconditional chat notice (success or failure alike) — the single-render readback path lands with a pinned round trip.
 
 **Files:**
-- Modify: `crates/oxide-render/src/renderer.rs` — the capture path: a `capture_frame()` that re-renders into an offscreen RGBA texture and reads it back (the same frame contents; the render-pass split reuses the frame builder — derive the seam).
+- Modify: `crates/oxide-render/src/renderer.rs` — the capture path: a `capture_frame()` that copies the FINISHED frame to a CPU-readable buffer before present (a readback of the presented frame — the source never re-renders; derive the exact copy site).
 - Modify: `crates/oxide-client/src/main.rs` — the F2 route (keymap → capture → PNG write): the PNG writer lands in `oxide-assets::png_write` (the assets crate owns texture-side PNG work and already carries the `png` dependency; the client → assets edge exists) and the client calls it — the client never grows its own encoder edge. The writer's round-trip decode test is in the assets crate; the client's test asserts the call path only.
 - Test: `crates/oxide-render/tests/pipeline_headless.rs` — a capture round trip: a known frame's readback pixels at pinned coordinates (ignored, GPU).
 - Test: `crates/oxide-assets` — the writer's round trip (encode → decode → equal).
 
 **Interfaces:**
-- Produces: `Renderer::capture_frame() -> Option<CapturedFrame { width, height, rgba }>`; `oxide_assets::png_write::write_png(path, w, h, rgba)`; the screenshot path `<data dir>/oxidecraft/screenshots/<timestamp>.png` (derive the source's name format, `ScreenShotHelper.java` — pin the format function's cases).
+- Produces: `Renderer::capture_frame() -> Option<CapturedFrame { width, height, rgba }>`; `oxide_assets::png_write::write_png(path, w, h, rgba)`; the screenshot path `<store root>/screenshots/<timestamp>.png` — the timestamp format is `yyyy-MM-dd_HH.mm.ss` (the middle field is MINUTES) with the `""`→`_2`→`_3`… collision suffix loop (`ScreenShotHelper.java:105-151`; pin the format function's cases).
 - Consumes: the standing frame builder.
 
 - [ ] **Step 1: Writer test (RED).** Round trip; red first.
@@ -764,7 +764,7 @@ feat: the hitbox and lagometer overlays (render)
 feat: the F2 screenshot capture (render, client)
 ```
 
-**Verification:** the round trip; the real screenshot receipt; the full gate.
+**Verification:** the round trip; the F2 route case; the real screenshot receipt; the full gate.
 
 ---
 
