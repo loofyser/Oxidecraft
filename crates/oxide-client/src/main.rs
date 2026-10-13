@@ -1043,6 +1043,15 @@ struct ClientApp {
     /// Whether F3 is held: the H chord's own read (`Keyboard.isKeyDown(61)`
     /// at `Minecraft.java`:2000-2004 — an edge either way lands here).
     f3_held: bool,
+    /// Whether F1 suppression holds: the raw F1 edge flips it
+    /// (`Minecraft.java`:2018-2021 — F1 is no binding, so the flag lives
+    /// beside the keys, not in the table). The frame's own gate reads it;
+    /// Task 27 owns the flag's wider reads.
+    hide_gui: bool,
+    /// The camera mode the bound perspective key steps, 0→1→2 — the source's
+    /// own cycle (`Minecraft.java`:2030-2049). The modes' owner (Task 27)
+    /// reads it; this edge only steps.
+    perspective: u8,
     /// Whether the session last reported the player dead.
     ///
     /// While it holds, the death screen stands (re-raised every tick the
@@ -1826,6 +1835,8 @@ impl ClientApp {
                 pause_on_focus_lost,
             },
             f3_held: false,
+            hide_gui: false,
+            perspective: 0,
             dead: false,
             sleeping: false,
             sleep_timer: 0,
@@ -2593,10 +2604,11 @@ impl ClientApp {
         // with the measured font; the list draws only while its key is held.
         // The survival rows land between the hotbar and the sidebar, in the
         // overlay's own order (`renderPlayerStats` then `renderExpBar`).
-        // The window carries no F1 key and no spectator/debug state yet, so the
-        // hotbar's gates rest at their playing defaults and the mode at
-        // survival (recorded; later tasks feed them) — but the open screen
-        // rides the frame's own state now.
+        // The window carries no spectator/debug state yet, so the hotbar's
+        // gates rest at their playing defaults and the mode at survival
+        // (recorded; later tasks feed them) — but the open screen rides the
+        // frame's own state now, and the raw F1 edge feeds the suppression
+        // flag below.
         // Ahead of all of it, the first-person water overlay when the eye is
         // submerged: the source draws it between the hand and the GUI
         // (`ItemRenderer.renderWaterOverlayTexture`, `ItemRenderer.java:505-532`),
@@ -2649,7 +2661,7 @@ impl ClientApp {
                 font: self.font.as_ref(),
                 scaled,
                 show_crosshair: true,
-                hide_gui: false,
+                hide_gui: self.hide_gui,
                 screen_open,
                 survival: true,
             },
@@ -2658,7 +2670,7 @@ impl ClientApp {
             font: self.font.as_ref(),
             scaled,
             survival: true,
-            hide_gui: false,
+            hide_gui: self.hide_gui,
             screen_open,
             now_ms: system_time_ms(),
         }));
@@ -2958,6 +2970,46 @@ impl ClientApp {
             self.take_screenshot();
             return;
         }
+        // The raw F1 edge (no table row): a fresh F1 press flips the
+        // HUD-suppression flag (`Minecraft.java`:2018-2021), over any
+        // screen — the frame's own gate reads it, and Task 27 owns the
+        // flag's wider reads.
+        if is_f1_press(event.state, event.repeat, event.physical_key) {
+            self.hide_gui = !self.hide_gui;
+            tracing::info!(hide_gui = self.hide_gui, "F1 flipped the HUD flag");
+            return;
+        }
+        // The perspective key's step (the row owns the key): a fresh press
+        // of the bound key cycles the camera mode 0→1→2, the source's own
+        // cycle (`Minecraft.java`:2030-2049) — the modes' owner (Task 27)
+        // reads the state this edge steps.
+        if perspective_pressed(
+            event.state,
+            event.repeat,
+            event.physical_key,
+            &self.settings.settings().bindings,
+        ) {
+            self.perspective = (self.perspective + 1) % 3;
+            tracing::info!(perspective = self.perspective, "the camera mode stepped");
+            return;
+        }
+        // The fullscreen key's flip (the row owns the key): a fresh press of
+        // the bound key flips the stored flag and saves at once
+        // (`Minecraft.java`:3188-3191) — the window apply is Task 28's.
+        if fullscreen_pressed(
+            event.state,
+            event.repeat,
+            event.physical_key,
+            &self.settings.settings().bindings,
+        ) {
+            let fullscreen = !self.settings.settings().fullscreen;
+            self.settings.settings_mut().fullscreen = fullscreen;
+            if let Err(error) = self.settings.save_now() {
+                tracing::warn!(%error, "the fullscreen flip could not be saved");
+            }
+            tracing::info!(fullscreen, "the fullscreen flag flipped");
+            return;
+        }
         // The H chord shares the F3 toggle's gate: the runTick keyboard loop
         // runs with no screen or an `allowUserInput` one (`Minecraft.java`
         // :1834, and the M4 seam above lets F3 through only there) — over a
@@ -3032,7 +3084,11 @@ impl ClientApp {
         // — the open chat above answers first — sets the held state the
         // frame's list draws gate on (`Minecraft.java`:1904-1912 sets every
         // keyboard edge's binding; `GuiIngame.java`:350 reads the held key).
-        if let Some(held) = tab_held(event.state, event.physical_key) {
+        if let Some(held) = tab_held(
+            event.state,
+            event.physical_key,
+            &self.settings.settings().bindings,
+        ) {
             self.tab.open = held;
             return;
         }
@@ -6762,20 +6818,74 @@ fn chat_opener(
     }
 }
 
-/// The player-list key's own edge: a Tab press holds the list and a release
-/// drops it, and no other key is this key at all.
+/// The binding name one physical key holds through the store's table, or
+/// `None` for a key the source's `Keyboard` never named and for a key no
+/// binding holds — the name-level half of the source's per-event feed
+/// (`Minecraft.java`:1904-1912 sets every edge's binding).
+fn bound_action(bindings: &[Binding], physical_key: PhysicalKey) -> Option<&str> {
+    let PhysicalKey::Code(code) = physical_key else {
+        return None;
+    };
+    let code = keymap::lwjgl_code(code)?;
+    keymap::action_for_code(bindings, code)
+}
+
+/// The player-list key's own edge through the store's table: a press of the
+/// bound player-list key holds the list and a release drops it, and no
+/// other key is this key at all.
 ///
 /// The source's binding is a held key state — the keyboard loop sets every
 /// edge (`Minecraft.java`:1904-1912) and the list's gate reads the held key
 /// (`GuiIngame.java`:350) — and the state drops when a screen opens or the
 /// focus goes, the source's own unpress of every held key
 /// (`Minecraft.java`:1470-1478).
-fn tab_held(state: ElementState, physical_key: PhysicalKey) -> Option<bool> {
-    if physical_key == PhysicalKey::Code(KeyCode::Tab) {
+fn tab_held(state: ElementState, physical_key: PhysicalKey, bindings: &[Binding]) -> Option<bool> {
+    if bound_action(bindings, physical_key) == Some("playerlist") {
         Some(state == ElementState::Pressed)
     } else {
         None
     }
+}
+
+/// Whether a key event is a fresh press of the raw F1 key: the HUD-suppression
+/// edge (`Minecraft.java`:2018-2021). F1 is no binding — the source reads the
+/// raw keycode past the table — so no rebind moves it and the flag's owner
+/// (Task 27) reads the state this edge flips.
+fn is_f1_press(state: ElementState, repeat: bool, physical_key: PhysicalKey) -> bool {
+    state == ElementState::Pressed && !repeat && physical_key == PhysicalKey::Code(KeyCode::F1)
+}
+
+/// The perspective key's own edge while the chat is closed: a fresh press of
+/// the bound perspective key (`keyBindTogglePerspective`,
+/// `GameSettings.java:143`, code 63) steps the camera mode. The cycle itself
+/// is the source's 0→1→2 (`Minecraft.java`:2030-2049); the modes' owner
+/// (Task 27) reads the state this edge steps.
+fn perspective_pressed(
+    state: ElementState,
+    repeat: bool,
+    physical_key: PhysicalKey,
+    bindings: &[Binding],
+) -> bool {
+    if state != ElementState::Pressed || repeat {
+        return false;
+    }
+    bound_action(bindings, physical_key) == Some("togglePerspective")
+}
+
+/// The fullscreen key's own edge: a fresh press of the bound fullscreen key
+/// (`keyBindFullscreen`, `GameSettings.java:145`, code 87) flips the stored
+/// flag (`Minecraft.java`:3188-3191). The window apply is Task 28's; this
+/// edge only owns the row and the bool.
+fn fullscreen_pressed(
+    state: ElementState,
+    repeat: bool,
+    physical_key: PhysicalKey,
+    bindings: &[Binding],
+) -> bool {
+    if state != ElementState::Pressed || repeat {
+        return false;
+    }
+    bound_action(bindings, physical_key) == Some("fullscreen")
 }
 
 /// The link opener the confirm overlay's Enter path runs — the source's
@@ -7916,13 +8026,13 @@ mod tests {
         chat_opener, chat_wheel_lines, chat_wheel_scrolls, clear_break_stage, command_text,
         confirm_labels, cracks_in_view, creative_wheel_notch, death_labels, digit_slot,
         disconnect_button_label, disconnect_title, escape_route, f3_chord, f3_hold_step,
-        frame_params, gameplay_key, interpolate_pose, inventory_opener, is_enter_press,
-        is_escape_press, is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv,
-        parse_script, parse_server_address, particle_draws, render_distance_step, scaled_cursor,
-        screen_button_events, screen_click_button, screenshot_pressed, scripted_chat_click,
-        skin_requests, sleep_cover_dim, sleep_dim, sleep_pose, store_aim, store_break_stage,
-        store_skins, tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step,
-        wire_sound_play,
+        frame_params, fullscreen_pressed, gameplay_key, interpolate_pose, inventory_opener,
+        is_enter_press, is_escape_press, is_f1_press, is_f3_press, is_h_press, load_sounds_bytes,
+        local_sound_play, missing_uv, parse_script, parse_server_address, particle_draws,
+        perspective_pressed, render_distance_step, scaled_cursor, screen_button_events,
+        screen_click_button, screenshot_pressed, scripted_chat_click, skin_requests,
+        sleep_cover_dim, sleep_dim, sleep_pose, store_aim, store_break_stage, store_skins,
+        tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
     };
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
@@ -9003,9 +9113,12 @@ mod tests {
     fn gameplay_keys_follow_the_rebound_table() {
         // The rebinding machine's write lands in the same store the router
         // reads: moving forward off W leaves the W press with no game key,
-        // and hands forward to the rebound physical key.
+        // and hands forward to the rebound physical key. The rebound lands
+        // on a free code: a code two rows share reads the later row (the
+        // source's per-code hash winner), so a conflict rebind is pinned
+        // beside the lookup, not here.
         let mut settings = GameSettings::default();
-        keymap::rebind_key(&mut settings, "forward", 30);
+        keymap::rebind_key(&mut settings, "forward", 33);
         let bindings = &settings.bindings;
         assert_eq!(
             gameplay_key(
@@ -9021,7 +9134,7 @@ mod tests {
             gameplay_key(
                 true,
                 ElementState::Pressed,
-                PhysicalKey::Code(KeyCode::KeyA),
+                PhysicalKey::Code(KeyCode::KeyF),
                 bindings
             ),
             Some(InputEvent::Key {
@@ -9101,22 +9214,215 @@ mod tests {
     fn the_tab_key_holds_and_releases_the_player_list() {
         // The player list's binding is a held key state: the source sets
         // every keyboard edge's binding (`Minecraft.java`:1904-1912) and the
-        // list's gate reads it (`GuiIngame.java`:350). Only Tab is this key.
+        // list's gate reads it (`GuiIngame.java`:350). By default only Tab
+        // is this key; the row reads through the store's table.
+        let bindings = default_bindings();
         let tab = PhysicalKey::Code(KeyCode::Tab);
         assert_eq!(
-            tab_held(ElementState::Pressed, tab),
+            tab_held(ElementState::Pressed, tab, &bindings),
             Some(true),
             "a press holds the list"
         );
         assert_eq!(
-            tab_held(ElementState::Released, tab),
+            tab_held(ElementState::Released, tab, &bindings),
             Some(false),
             "a release drops it"
         );
         assert_eq!(
-            tab_held(ElementState::Pressed, PhysicalKey::Code(KeyCode::KeyT)),
+            tab_held(
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::KeyT),
+                &bindings
+            ),
             None,
             "no other key is the list's"
+        );
+    }
+
+    #[test]
+    fn the_player_list_follows_the_rebound_table() {
+        // The held list reads through the same table: moving the row off Tab
+        // moves the hold with it, and Tab holds nothing after.
+        let mut settings = GameSettings::default();
+        keymap::rebind_key(&mut settings, "playerlist", 33);
+        let bindings = &settings.bindings;
+        assert_eq!(
+            tab_held(
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::KeyF),
+                bindings
+            ),
+            Some(true),
+            "the rebound key holds the list"
+        );
+        assert_eq!(
+            tab_held(
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::Tab),
+                bindings
+            ),
+            None,
+            "Tab holds nothing once the row leaves it"
+        );
+        keymap::rebind_key(&mut settings, "playerlist", 1);
+        assert_eq!(
+            tab_held(
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::Escape),
+                &settings.bindings
+            ),
+            None,
+            "an unbound row holds on no key"
+        );
+    }
+
+    #[test]
+    fn the_f1_edge_is_raw_and_stays_off_the_table() {
+        // F1 is no binding (`Minecraft.java`:2018-2021): only a fresh F1
+        // press flips the suppression flag, past the table — rebinding never
+        // moves it.
+        let bindings = default_bindings();
+        assert!(is_f1_press(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::F1)
+        ));
+        assert!(
+            !is_f1_press(ElementState::Pressed, true, PhysicalKey::Code(KeyCode::F1)),
+            "a repeat flips nothing"
+        );
+        assert!(
+            !is_f1_press(
+                ElementState::Released,
+                false,
+                PhysicalKey::Code(KeyCode::F1)
+            ),
+            "a release flips nothing"
+        );
+        assert!(
+            !is_f1_press(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::KeyH)
+            ),
+            "no other key is the edge"
+        );
+        let _ = bindings;
+    }
+
+    #[test]
+    fn the_perspective_key_steps_through_the_table() {
+        // The bound perspective key (`keyBindTogglePerspective`, code 63)
+        // steps the camera mode on a fresh press only — repeats and releases
+        // step nothing, and the rebound row moves the step with it.
+        let bindings = default_bindings();
+        assert!(perspective_pressed(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::F5),
+            &bindings
+        ));
+        assert!(
+            !perspective_pressed(
+                ElementState::Pressed,
+                true,
+                PhysicalKey::Code(KeyCode::F5),
+                &bindings
+            ),
+            "a repeat steps nothing"
+        );
+        assert!(
+            !perspective_pressed(
+                ElementState::Released,
+                false,
+                PhysicalKey::Code(KeyCode::F5),
+                &bindings
+            ),
+            "a release steps nothing"
+        );
+        assert!(
+            !perspective_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::KeyH),
+                &bindings
+            ),
+            "no other key is the step"
+        );
+        let mut settings = GameSettings::default();
+        keymap::rebind_key(&mut settings, "togglePerspective", 35);
+        assert!(perspective_pressed(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::KeyH),
+            &settings.bindings
+        ));
+        assert!(
+            !perspective_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::F5),
+                &settings.bindings
+            ),
+            "F5 steps nothing once the row leaves it"
+        );
+    }
+
+    #[test]
+    fn the_fullscreen_key_flips_through_the_table() {
+        // The bound fullscreen key (`keyBindFullscreen`, code 87) flips the
+        // stored flag on a fresh press only — repeats and releases flip
+        // nothing, and the rebound row moves the flip with it.
+        let bindings = default_bindings();
+        assert!(fullscreen_pressed(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::F11),
+            &bindings
+        ));
+        assert!(
+            !fullscreen_pressed(
+                ElementState::Pressed,
+                true,
+                PhysicalKey::Code(KeyCode::F11),
+                &bindings
+            ),
+            "a repeat flips nothing"
+        );
+        assert!(
+            !fullscreen_pressed(
+                ElementState::Released,
+                false,
+                PhysicalKey::Code(KeyCode::F11),
+                &bindings
+            ),
+            "a release flips nothing"
+        );
+        assert!(
+            !fullscreen_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::KeyH),
+                &bindings
+            ),
+            "no other key is the flip"
+        );
+        let mut settings = GameSettings::default();
+        keymap::rebind_key(&mut settings, "fullscreen", 35);
+        assert!(fullscreen_pressed(
+            ElementState::Pressed,
+            false,
+            PhysicalKey::Code(KeyCode::KeyH),
+            &settings.bindings
+        ));
+        assert!(
+            !fullscreen_pressed(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::F11),
+                &settings.bindings
+            ),
+            "F11 flips nothing once the row leaves it"
         );
     }
 

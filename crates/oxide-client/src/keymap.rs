@@ -190,12 +190,19 @@ fn fixed_key(code: KeyCode) -> Option<Key> {
     })
 }
 
-/// The first binding holding `code` in table order, or `None` when nothing
-/// does (a conflict reads the first row; the list paints every holder red).
+/// The binding holding `code`, or `None` when nothing does. Zero is unbound — never a row, however many rows hold it
+/// (`KeyBinding.isKeyDown` reads false at 0, `KeyBinding.java`:233-236). A
+/// code two rows share reads the later row: the source's hash keeps one
+/// binding per code with later array entries overwriting earlier ones
+/// (`KeyBinding.java`:58-66), so the press queue accrues to the hash winner
+/// while the list paints every holder red.
 pub fn action_for_code(bindings: &[Binding], code: i32) -> Option<&str> {
+    if code == 0 {
+        return None;
+    }
     bindings
         .iter()
-        .find(|binding| binding.code == code)
+        .rfind(|binding| binding.code == code)
         .map(|binding| binding.name)
 }
 
@@ -640,6 +647,38 @@ mod tests {
         assert_eq!(key_for_action("attack"), None);
         assert_eq!(fixed_key(KeyCode::Tab), Some(Key::Tab));
         assert_eq!(fixed_key(KeyCode::KeyW), None);
+    }
+
+    #[test]
+    fn the_lookup_resolves_keys_buttons_and_unbound() {
+        // The lookup runs on the source's code domain (`KeyBinding.java`):
+        // positive codes are keys, negative codes are mouse buttons
+        // (`getKeyDisplayString`:223-228, `isKeyDown`:233-236), and 0 is
+        // unbound — never a row, however many rows hold it.
+        let bindings = default_bindings();
+        assert_eq!(action_for_code(&bindings, 17), Some("forward"));
+        assert_eq!(action_for_code(&bindings, 63), Some("togglePerspective"));
+        assert_eq!(action_for_code(&bindings, 87), Some("fullscreen"));
+        assert_eq!(action_for_code(&bindings, -100), Some("attack"));
+        assert_eq!(action_for_code(&bindings, -99), Some("use"));
+        assert_eq!(action_for_code(&bindings, -98), Some("pickItem"));
+        assert_eq!(action_for_code(&bindings, 0), None);
+        assert_eq!(action_for_code(&bindings, 99), None);
+    }
+
+    #[test]
+    fn the_lookup_follows_rebinds_and_keeps_the_later_row() {
+        // A rebound row moves the lookup with it, and a code two rows share
+        // reads the later row — the source's hash keeps one binding per code
+        // with later array entries overwriting earlier ones
+        // (`KeyBinding.java`:58-66).
+        let mut settings = oxide_game::settings::GameSettings::default();
+        assert!(rebind_key(&mut settings, "forward", 33));
+        assert_eq!(action_for_code(&settings.bindings, 33), Some("forward"));
+        assert_eq!(action_for_code(&settings.bindings, 17), None);
+        assert!(rebind_key(&mut settings, "forward", 17));
+        assert!(rebind_key(&mut settings, "sprint", 17));
+        assert_eq!(action_for_code(&settings.bindings, 17), Some("sprint"));
     }
 
     #[test]
