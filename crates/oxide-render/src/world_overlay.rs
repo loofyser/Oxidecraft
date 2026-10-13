@@ -52,6 +52,28 @@
 //! consumes corner for corner. The crack's pipeline culls back faces: the damaged pass sets
 //! no cull state of its own and runs with the client's culling on (`RenderGlobal.java:1786`),
 //! under the same cube winding the terrain draws with.
+//!
+//! # The hitboxes
+//!
+//! F3+B's entity boxes (`RenderManager.renderDebugBoundingBox`,
+//! `RenderManager.java:438-468`, gated at `:396-406`): the white box from
+//! `getEntityBoundingBox`, and for living kinds the red ±0.01 eye box about
+//! `getEyeHeight()` plus the blue look line twice the look vector long.
+//! The box edges are the bottom/top rings and the four verticals — twelve
+//! edges, the [`box_edges`] table both boxes share.
+//!
+//! The hitboxes need a NEW world-space line path: the outline's pipeline is
+//! clip-space quads (wrong basis — the boxes live in the world and must
+//! depth-test against it). The pass state derives from the source's GL
+//! toggles, shaped for wgpu: `depthMask(false)` (`:442`) becomes depth
+//! writes off with the `LessEqual` test kept (the boxes hide behind terrain
+//! but never write depth); `disableTexture2D`/`disableLighting`/
+//! `disableCull` (`:443-445`) become an untextured, unlit pipeline with no
+//! culling; `disableBlend` (`:446`) becomes no blend state (opaque lines);
+//! the lines are 1 px — GL's default width, which wgpu's `LineList`
+//! topology draws natively, so no quad expansion is owed. The vertices stay
+//! world-space and the frame's view-projection moves them to clip in the
+//! vertex stage, reusing the crack's frame uniform.
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
@@ -59,6 +81,7 @@ use oxide_assets::atlas::Atlas;
 
 use crate::atlas_texture::AtlasTexture;
 use crate::camera::Camera;
+use crate::entity_pass::EntityDraw;
 use crate::terrain_pass::DEPTH_FORMAT;
 
 /// The outline's inflation per axis: `drawSelectionBox` expands the block's selection box by
@@ -95,6 +118,52 @@ const OUTLINE_VERTEX_BYTES: usize = 16;
 
 /// The full cube: the shape every full-block class's selection bounds report.
 pub const FULL_CUBE: [[f32; 3]; 2] = [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]];
+
+/// The hitbox's white: the entity box (`renderDebugBoundingBox`, `:449`).
+pub const HITBOX_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+/// The hitbox's red: the living kinds' eye box (`:454-460`).
+pub const HITBOX_RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+/// The hitbox's blue: the look line (`:461-467`).
+pub const HITBOX_BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// The eye box's half-height in blocks: ±0.01 about the eye
+/// (`renderDebugBoundingBox`, `:454-460`).
+pub const HITBOX_EYE_HALF_HEIGHT: f32 = 0.01;
+
+/// The look line's length in look vectors: twice the look
+/// (`renderDebugBoundingBox`, `:461-467`).
+pub const HITBOX_LOOK_SCALE: f32 = 2.0;
+
+/// The size of one hitbox vertex in the byte stream the GPU receives: a
+/// `Float32x3` world-space position and a `Float32x4` colour.
+const HITBOX_VERTEX_BYTES: usize = 28;
+
+/// One entity's hitbox frame: the world-space box, the eye it looks from,
+/// the eye box's half-width and the look it looks along.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hitbox {
+    /// The entity's box in world blocks, feet at the bottom.
+    pub bounds: [[f32; 3]; 2],
+    /// The eye's world position.
+    pub eye: [f32; 3],
+    /// The eye box's half-width: half the kind's width.
+    pub half_width: f32,
+    /// Whether the kind is living: only living kinds draw the eye box.
+    pub living: bool,
+    /// The unit look vector.
+    pub look: [f32; 3],
+}
+
+/// One coloured world-space line the hitbox path draws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HitSegment {
+    /// The line's start, in world blocks.
+    pub a: [f32; 3],
+    /// The line's end, in world blocks.
+    pub b: [f32; 3],
+    /// The line's opaque colour.
+    pub colour: [f32; 4],
+}
 
 /// The aimed block the outline draws.
 ///
@@ -143,6 +212,11 @@ static OUTLINE_ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array!
 static CRACK_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
 
+/// The hitbox's vertex attributes: the `Float32x3` world position at offset 0 and the
+/// `Float32x4` colour at 12.
+static HITBOX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
 /// The world-overlay pass: the pipelines, the frame's uniform, the stage lookups and the
 /// frame's vertex buffers.
 pub struct WorldOverlay {
@@ -150,6 +224,8 @@ pub struct WorldOverlay {
     outline_pipeline: wgpu::RenderPipeline,
     /// The crack's pipeline: world-space quads sampling the atlas's level-0 pair.
     crack_pipeline: wgpu::RenderPipeline,
+    /// The hitbox's pipeline: world-space lines through the frame uniform.
+    hitbox_pipeline: wgpu::RenderPipeline,
     /// The buffer the crack's view-projection matrix is written to each frame.
     frame_buffer: wgpu::Buffer,
     /// The bind group the crack reads its frame uniform through.
@@ -164,10 +240,14 @@ pub struct WorldOverlay {
     outline: Option<Outline>,
     /// The breaking blocks the crack draws.
     cracks: Vec<Crack>,
+    /// The hitboxes the line path draws.
+    hitboxes: Vec<Hitbox>,
     /// The outline's vertex buffer and the vertex count the draw reads.
     outline_vertices: Option<(wgpu::Buffer, u32)>,
     /// The crack's vertex buffer and the vertex count the draw reads.
     crack_vertices: Option<(wgpu::Buffer, u32)>,
+    /// The hitbox's vertex buffer and the vertex count the draw reads.
+    hitbox_vertices: Option<(wgpu::Buffer, u32)>,
 }
 
 impl WorldOverlay {
@@ -178,10 +258,14 @@ impl WorldOverlay {
     /// blending `(770, 771, 1, 0)`. The crack's pipeline reads the frame's view-projection at
     /// group 0 and the atlas at group 1 (through [`AtlasTexture::bind_group_layout`]'s layout),
     /// culls back faces and draws with the depth writes on, the source's polygon offset and
-    /// the `(774, 768, 1, 0)` blend. Both test [`DEPTH_FORMAT`] with `LessEqual`, so the pass
-    /// they draw in needs a depth attachment of that format and a colour attachment in
-    /// `format`. Until an atlas is set ([`WorldOverlay::set_atlas`]) the crack issues no draw;
-    /// the outline needs no atlas.
+    /// the `(774, 768, 1, 0)` blend. The hitbox's pipeline reads the frame's view-projection at
+    /// group 0 — the same uniform the crack reads — and draws `LineList` world-space lines
+    /// with the depth writes off, no culling and no blend (the source's `depthMask(false)` at
+    /// `RenderManager.java:442` with the depth test kept, and its `disableBlend` at `:446`).
+    /// All three test [`DEPTH_FORMAT`] with `LessEqual`, so the pass they draw in needs a depth
+    /// attachment of that format and a colour attachment in `format`. Until an atlas is set
+    /// ([`WorldOverlay::set_atlas`]) the crack issues no draw; the outline and the hitboxes
+    /// need no atlas.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxide world overlay shader"),
@@ -223,6 +307,11 @@ impl WorldOverlay {
         let crack_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("oxide crack pipeline layout"),
             bind_group_layouts: &[&frame_layout, &atlas_layout],
+            push_constant_ranges: &[],
+        });
+        let hitbox_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("oxide hitbox pipeline layout"),
+            bind_group_layouts: &[&frame_layout],
             push_constant_ranges: &[],
         });
         let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -267,9 +356,31 @@ impl WorldOverlay {
             multiview: None,
             cache: None,
         });
+        let hitbox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("oxide hitbox pipeline"),
+            layout: Some(&hitbox_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_hitbox"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[hitbox_vertex_layout()],
+            },
+            primitive: hitbox_primitive_state(),
+            depth_stencil: Some(hitbox_depth_stencil()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_hitbox"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[color_target(format, None)],
+            }),
+            multiview: None,
+            cache: None,
+        });
         Self {
             outline_pipeline,
             crack_pipeline,
+            hitbox_pipeline,
             frame_buffer,
             frame_bind_group,
             atlas_layout,
@@ -280,8 +391,10 @@ impl WorldOverlay {
             stage_uvs: [[[0.0, 0.0], [0.0, 0.0]]; 10],
             outline: None,
             cracks: Vec::new(),
+            hitboxes: Vec::new(),
             outline_vertices: None,
             crack_vertices: None,
+            hitbox_vertices: None,
         }
     }
 
@@ -310,14 +423,23 @@ impl WorldOverlay {
         self.cracks = cracks;
     }
 
-    /// Uploads the frame's geometry: the outline's screen-space quads and the crack's cube
-    /// quads for every entry the 32-block view keeps.
+    /// Sets the hitboxes the line path draws, replacing any earlier set.
+    ///
+    /// The caller hands over [`hitboxes_for`]'s answer — the flag-gated,
+    /// boxless-skipped frames — so an empty set draws no hitbox.
+    pub fn set_hitboxes(&mut self, hitboxes: Vec<Hitbox>) {
+        self.hitboxes = hitboxes;
+    }
+
+    /// Uploads the frame's geometry: the outline's screen-space quads, the crack's cube
+    /// quads for every entry the 32-block view keeps, and the hitboxes' world-space lines.
     ///
     /// The renderer calls this once per frame, after the camera is set, with the surface's
     /// current viewport in pixels — the outline's pixel width needs it, and the projection's
-    /// aspect comes from it, so a resize cannot leave a stale frame behind. Both vertex
+    /// aspect comes from it, so a resize cannot leave a stale frame behind. All three vertex
     /// streams are rebuilt every frame, as the source re-tessellates the damage passes every
-    /// frame; the buffers are reused while they can hold the new data.
+    /// frame; the buffers are reused while they can hold the new data. The hitbox stream
+    /// needs no viewport: its vertices stay world-space and the vertex stage projects them.
     pub fn set_frame(
         &mut self,
         device: &wgpu::Device,
@@ -370,14 +492,29 @@ impl WorldOverlay {
             &crack_bytes,
             CRACK_VERTEX_BYTES,
         );
+
+        let mut segments = Vec::new();
+        for hitbox in &self.hitboxes {
+            segments.extend(hitbox_segments(hitbox));
+        }
+        let hitbox_bytes = hitbox_bytes(&segments);
+        upload(
+            device,
+            queue,
+            "oxide hitbox vertices",
+            &mut self.hitbox_vertices,
+            &hitbox_bytes,
+            HITBOX_VERTEX_BYTES,
+        );
     }
 
-    /// Draws the outline, then the crack, into the frame's scene pass.
+    /// Draws the outline, then the crack, then the hitboxes, into the frame's scene pass.
     ///
     /// The order is the source's section order (`EntityRenderer.java:1412-1416` before
-    /// `:1431-1437`) and both draws are gated on the state that built them: no outline
+    /// `:1431-1437`) and all three draws are gated on the state that built them: no outline
     /// vertices means no outline, and the crack draws only with an atlas bound, because a
-    /// draw without one can only be wrong.
+    /// draw without one can only be wrong. The hitboxes draw last: like the outline and the
+    /// crack they write no depth, so no order among the three can colour a fragment twice.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         if let Some((buffer, count)) = &self.outline_vertices {
             pass.set_pipeline(&self.outline_pipeline);
@@ -389,6 +526,12 @@ impl WorldOverlay {
             pass.set_pipeline(&self.crack_pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
             pass.set_bind_group(1, atlas, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..*count, 0..1);
+        }
+        if let Some((buffer, count)) = &self.hitbox_vertices {
+            pass.set_pipeline(&self.hitbox_pipeline);
+            pass.set_bind_group(0, &self.frame_bind_group, &[]);
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..*count, 0..1);
         }
@@ -445,6 +588,29 @@ fn fs_crack(input: CrackOutput) -> @location(0) vec4<f32> {{
         discard;
     }}
     return vec4<f32>(texel.rgb, alpha);
+}}
+
+// The hitbox's vertex stage: the lines' world-space corners through the frame's
+// view-projection — the source draws the same boxes through the world renderer's own
+// translation (RenderManager.java:438-468) — carrying the CPU-built colour through.
+struct HitboxOutput {{
+    @builtin(position) clip: vec4<f32>,
+    @location(0) colour: vec4<f32>,
+}}
+
+@vertex
+fn vs_hitbox(@location(0) position: vec3<f32>, @location(1) colour: vec4<f32>) -> HitboxOutput {{
+    var output: HitboxOutput;
+    output.clip = view_projection * vec4<f32>(position, 1.0);
+    output.colour = colour;
+    return output;
+}}
+
+// The hitbox's fragment stage: the line's own opaque colour — the source draws with
+// blending disabled (RenderManager.java:446), so no blend state shapes this output.
+@fragment
+fn fs_hitbox(input: HitboxOutput) -> @location(0) vec4<f32> {{
+    return input.colour;
 }}
 "#,
         r = OUTLINE_COLOUR[0],
@@ -552,12 +718,38 @@ fn crack_depth_stencil() -> wgpu::DepthStencilState {
     crack_depth_state()
 }
 
+/// The hitbox pipeline's depth state, as the pipeline is built with it:
+/// [`depth_state`] with the writes off — the hitboxes' `depthMask(false)`
+/// (`RenderManager.java:442`; the depth test stays on, so terrain hides them).
+///
+/// The construction site and the descriptor test both read this one function,
+/// so the values the test pins are the values the pipeline is built from.
+fn hitbox_depth_stencil() -> wgpu::DepthStencilState {
+    depth_state(false)
+}
+
 /// The primitive state for a cull mode: triangles, counter-clockwise front faces.
 fn primitive_state(cull: Option<wgpu::Face>) -> wgpu::PrimitiveState {
     wgpu::PrimitiveState {
         topology: wgpu::PrimitiveTopology::TriangleList,
         front_face: wgpu::FrontFace::Ccw,
         cull_mode: cull,
+        ..Default::default()
+    }
+}
+
+/// The hitbox's primitive state: one-pixel lines, no culling.
+///
+/// The source draws the boxes as GL lines at the default width
+/// (`RenderGlobal.drawOutlinedBoundingBox`, `RenderGlobal.java:1934-1962`;
+/// `renderDebugBoundingBox`, `RenderManager.java:438-468`), and wgpu's
+/// `LineList` draws that width natively — the outline's quad expansion
+/// answers a 2-px width the hitboxes never ask for.
+fn hitbox_primitive_state() -> wgpu::PrimitiveState {
+    wgpu::PrimitiveState {
+        topology: wgpu::PrimitiveTopology::LineList,
+        front_face: wgpu::FrontFace::Ccw,
+        cull_mode: None,
         ..Default::default()
     }
 }
@@ -591,6 +783,16 @@ fn crack_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: CRACK_VERTEX_BYTES as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &CRACK_ATTRIBUTES,
+    }
+}
+
+/// The hitbox's vertex layout: the world position at offset 0 and the colour at 12, the
+/// stride [`HITBOX_VERTEX_BYTES`].
+fn hitbox_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: HITBOX_VERTEX_BYTES as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &HITBOX_ATTRIBUTES,
     }
 }
 
@@ -632,6 +834,118 @@ fn box_edges(min: Vec3, max: Vec3) -> [(Vec3, Vec3); 12] {
         }
     }
     edges
+}
+
+/// Whether the hitbox path draws: the flag set on a visible entity
+/// (`RenderManager.java:396-406` — `debugBoundingBox && !isInvisible`).
+pub fn hitbox_visible(flag: bool, invisible: bool) -> bool {
+    flag && !invisible
+}
+
+/// The unit look vector for a head pitch and body yaw in degrees
+/// (`Entity.getVectorForRotation`, `Entity.java:1476-1485`).
+pub fn look_vector(pitch_deg: f32, yaw_deg: f32) -> [f32; 3] {
+    use std::f32::consts::PI;
+    let yaw = -yaw_deg * PI / 180.0 - PI;
+    let pitch = -pitch_deg * PI / 180.0;
+    let across = yaw.cos();
+    let along = yaw.sin();
+    let level = -pitch.cos();
+    let up = pitch.sin();
+    [along * level, up, across * level]
+}
+
+/// One hitbox's coloured world-space lines: the white box's twelve edges,
+/// the red eye box's twelve for living kinds, and the blue look line
+/// (`renderDebugBoundingBox`, `RenderManager.java:449-467`).
+pub fn hitbox_segments(hitbox: &Hitbox) -> Vec<HitSegment> {
+    let mut segments = Vec::with_capacity(25);
+    let (min, max) = (Vec3::from(hitbox.bounds[0]), Vec3::from(hitbox.bounds[1]));
+    for (a, b) in box_edges(min, max) {
+        segments.push(HitSegment {
+            a: a.to_array(),
+            b: b.to_array(),
+            colour: HITBOX_WHITE,
+        });
+    }
+    if hitbox.living {
+        let eye = Vec3::from(hitbox.eye);
+        let red_min = Vec3::new(
+            eye.x - hitbox.half_width,
+            eye.y - HITBOX_EYE_HALF_HEIGHT,
+            eye.z - hitbox.half_width,
+        );
+        let red_max = Vec3::new(
+            eye.x + hitbox.half_width,
+            eye.y + HITBOX_EYE_HALF_HEIGHT,
+            eye.z + hitbox.half_width,
+        );
+        for (a, b) in box_edges(red_min, red_max) {
+            segments.push(HitSegment {
+                a: a.to_array(),
+                b: b.to_array(),
+                colour: HITBOX_RED,
+            });
+        }
+    }
+    let eye = Vec3::from(hitbox.eye);
+    let end = eye + Vec3::from(hitbox.look) * HITBOX_LOOK_SCALE;
+    segments.push(HitSegment {
+        a: hitbox.eye,
+        b: end.to_array(),
+        colour: HITBOX_BLUE,
+    });
+    segments
+}
+
+/// The frame's hitboxes: the flag-gated entity draws whose kind sizes a box
+/// (`RenderManager.java:396-406`; kinds the shared table leaves boxless are
+/// skipped, as the pick path skips them).
+///
+/// The white box is the kind's width and height stood on the draw's feet;
+/// the eye rides the eye height above the feet and the eye box spans half
+/// the width about it.
+pub fn hitboxes_for(flag: bool, draws: &[EntityDraw]) -> Vec<Hitbox> {
+    if !flag {
+        return Vec::new();
+    }
+    draws
+        .iter()
+        .filter_map(|draw| {
+            let (width, height) = draw.hitbox?;
+            let x = draw.position[0] as f32;
+            let y = draw.position[1] as f32;
+            let z = draw.position[2] as f32;
+            let half_width = width as f32 / 2.0;
+            Some(Hitbox {
+                bounds: [
+                    [x - half_width, y, z - half_width],
+                    [x + half_width, y + height as f32, z + half_width],
+                ],
+                eye: [x, y + draw.eye_height, z],
+                half_width,
+                living: draw.living,
+                look: draw.look,
+            })
+        })
+        .collect()
+}
+
+/// The hitbox segments' vertex bytes: two world-space vertices per segment —
+/// position then colour — for the `LineList` draw.
+fn hitbox_bytes(segments: &[HitSegment]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(segments.len() * 2 * HITBOX_VERTEX_BYTES);
+    for segment in segments {
+        for end in [segment.a, segment.b] {
+            bytes.extend_from_slice(&end[0].to_le_bytes());
+            bytes.extend_from_slice(&end[1].to_le_bytes());
+            bytes.extend_from_slice(&end[2].to_le_bytes());
+            for channel in segment.colour {
+                bytes.extend_from_slice(&channel.to_le_bytes());
+            }
+        }
+    }
+    bytes
 }
 
 /// One edge's screen-space quad: the two endpoints offset ±half the line's width in window
@@ -885,13 +1199,15 @@ mod tests {
     use wgpu::{BlendFactor, BlendOperation, CompareFunction, PrimitiveTopology, TextureFormat};
 
     use super::{
-        CRACK_ALPHA, CRACK_ALPHA_TEST, CRACK_CULL_DISTANCE, Crack, FULL_CUBE, OUTLINE_COLOUR,
-        OUTLINE_INFLATION, OUTLINE_WIDTH_PIXELS, Outline, box_edges, crack_blend, crack_bytes,
-        crack_depth_bias, crack_depth_stencil, crack_vertices, edge_quad, outline_blend,
-        outline_box, outline_depth_stencil, outline_vertices, primitive_state, stage_uvs,
-        within_view,
+        CRACK_ALPHA, CRACK_ALPHA_TEST, CRACK_CULL_DISTANCE, Crack, FULL_CUBE, HITBOX_BLUE,
+        HITBOX_RED, HITBOX_WHITE, HitSegment, Hitbox, OUTLINE_COLOUR, OUTLINE_INFLATION,
+        OUTLINE_WIDTH_PIXELS, Outline, box_edges, crack_blend, crack_bytes, crack_depth_bias,
+        crack_depth_stencil, crack_vertices, edge_quad, hitbox_segments, hitbox_visible,
+        hitboxes_for, look_vector, outline_blend, outline_box, outline_depth_stencil,
+        outline_vertices, primitive_state, stage_uvs, within_view,
     };
     use crate::camera::{Camera, CameraPose, DEFAULT_FOV, EYE_HEIGHT, NEAR_PLANE, NO_VIEW_EFFECT};
+    use crate::entity_pass::{DrawExtra, EntityDraw, ModelRef, TextureRef};
     use crate::terrain_pass::DEPTH_FORMAT;
 
     /// The camera the geometry tests project with: the eye at the origin looking down -Z,
@@ -1249,5 +1565,203 @@ mod tests {
             eye
         ));
         assert_eq!(CRACK_CULL_DISTANCE, 32.0);
+    }
+
+    /// An entity draw at `position` carrying the hitbox frame's own terms:
+    /// the shared box table's answer, the eye height, the look and whether
+    /// the kind is living.
+    fn hitbox_draw(
+        position: [f64; 3],
+        hitbox: Option<(f64, f64)>,
+        eye_height: f32,
+        living: bool,
+    ) -> EntityDraw {
+        EntityDraw {
+            id: 7,
+            model: ModelRef::Player {
+                slim: false,
+                parts: crate::entity_models::player::PARTS_ALL,
+            },
+            position,
+            body_yaw: 0.0,
+            head_yaw: 0.0,
+            head_pitch: 0.0,
+            pose: crate::entity_models::Pose::default(),
+            texture: TextureRef::Named("entity/steve.png"),
+            light: 0.5,
+            hurt: 0.0,
+            death: 0.0,
+            health: None,
+            nametag: None,
+            name: None,
+            below_name: None,
+            equipment: [None; 5],
+            extra: DrawExtra::None,
+            hitbox,
+            eye_height,
+            look: [0.0, 0.0, -1.0],
+            living,
+        }
+    }
+
+    /// Whether `segments` holds `colour`'s edge between `p` and `q`, either
+    /// way round, within a thousandth of a block.
+    fn has_edge(segments: &[HitSegment], colour: [f32; 4], p: [f32; 3], q: [f32; 3]) -> bool {
+        let near = |a: [f32; 3], b: [f32; 3]| {
+            (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3 && (a[2] - b[2]).abs() < 1e-3
+        };
+        segments.iter().any(|segment| {
+            segment.colour == colour
+                && ((near(segment.a, p) && near(segment.b, q))
+                    || (near(segment.a, q) && near(segment.b, p)))
+        })
+    }
+
+    #[test]
+    fn the_hitbox_gate_needs_the_flag_without_invisibility() {
+        // `doRenderEntity` draws the box only with the flag set on a
+        // visible entity (`RenderManager.java`:396).
+        assert!(hitbox_visible(true, false));
+        assert!(!hitbox_visible(true, true));
+        assert!(!hitbox_visible(false, false));
+        assert!(!hitbox_visible(false, true));
+    }
+
+    #[test]
+    fn the_hitbox_segments_carry_the_sources_three_colours() {
+        // `renderDebugBoundingBox` (`RenderManager.java`:438-468): the
+        // white entity box, the red ±0.01 eye box for living kinds, and
+        // the blue look line twice the look vector long.
+        let drawn = Hitbox {
+            bounds: [[0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            eye: [0.5, 1.62, 0.5],
+            half_width: 0.3,
+            living: true,
+            look: [0.0, 0.0, -1.0],
+        };
+        let segments = hitbox_segments(&drawn);
+        assert_eq!(segments.len(), 25, "twelve white, twelve red, one blue");
+        let white: Vec<&HitSegment> = segments
+            .iter()
+            .filter(|segment| segment.colour == HITBOX_WHITE)
+            .collect();
+        assert_eq!(white.len(), 12, "the white box's twelve edges");
+        assert!(
+            has_edge(&segments, HITBOX_WHITE, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            "the bottom ring"
+        );
+        assert!(
+            has_edge(&segments, HITBOX_WHITE, [0.0, 2.0, 0.0], [1.0, 2.0, 0.0]),
+            "the top ring"
+        );
+        let verticals = white
+            .iter()
+            .filter(|segment| {
+                (segment.a[0] - segment.b[0]).abs() < 1e-6
+                    && (segment.a[2] - segment.b[2]).abs() < 1e-6
+                    && ((segment.a[1] - 0.0).abs() < 1e-6 || (segment.b[1] - 0.0).abs() < 1e-6)
+                    && ((segment.a[1] - 2.0).abs() < 1e-6 || (segment.b[1] - 2.0).abs() < 1e-6)
+            })
+            .count();
+        assert_eq!(verticals, 4, "the four verticals span the box");
+        let red: Vec<&HitSegment> = segments
+            .iter()
+            .filter(|segment| segment.colour == HITBOX_RED)
+            .collect();
+        assert_eq!(red.len(), 12, "the living kind's eye box");
+        for segment in &red {
+            for end in [segment.a, segment.b] {
+                assert!(
+                    (end[1] - 1.62).abs() <= 0.011,
+                    "the red box hugs the eye: {end:?}"
+                );
+                assert!(
+                    end[0] >= 0.199 && end[0] <= 0.801 && end[2] >= 0.199 && end[2] <= 0.801,
+                    "the red box is half-width wide: {end:?}"
+                );
+            }
+        }
+        let blue: Vec<&HitSegment> = segments
+            .iter()
+            .filter(|segment| segment.colour == HITBOX_BLUE)
+            .collect();
+        assert_eq!(blue.len(), 1, "the one look line");
+        let line = blue[0];
+        assert_eq!(line.a, [0.5, 1.62, 0.5], "the line starts at the eye");
+        let delta = Vec3::from(line.b) - Vec3::from(line.a);
+        assert!(
+            (delta.length() - 2.0).abs() < 1e-6,
+            "the line is twice the look vector: {delta:?}"
+        );
+        assert_eq!(line.b, [0.5, 1.62, -1.5], "along the look");
+    }
+
+    #[test]
+    fn a_non_living_hitbox_draws_no_eye_box() {
+        let drawn = Hitbox {
+            bounds: [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            eye: [0.5, 0.85, 0.5],
+            half_width: 0.5,
+            living: false,
+            look: [0.0, 0.0, -1.0],
+        };
+        let segments = hitbox_segments(&drawn);
+        assert_eq!(segments.len(), 13, "twelve white and the blue line");
+        assert!(
+            segments.iter().all(|segment| segment.colour != HITBOX_RED),
+            "no red box without a living kind"
+        );
+    }
+
+    #[test]
+    fn the_look_vector_follows_the_sources_rotation_math() {
+        // `getVectorForRotation` (`Entity.java`:1476-1485).
+        let ahead = Vec3::from(look_vector(0.0, 180.0));
+        assert!(
+            (ahead - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6,
+            "yaw 180 looks down -Z: {ahead:?}"
+        );
+        let behind = Vec3::from(look_vector(0.0, 0.0));
+        assert!(
+            (behind - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-6,
+            "yaw 0 looks down +Z: {behind:?}"
+        );
+        let up = Vec3::from(look_vector(-90.0, 180.0));
+        assert!(
+            (up - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-6,
+            "pitch -90 looks up: {up:?}"
+        );
+        let lean = Vec3::from(look_vector(30.0, 45.0));
+        assert!(
+            (lean.length() - 1.0).abs() < 1e-6,
+            "the look is a unit vector: {lean:?}"
+        );
+    }
+
+    #[test]
+    fn the_hitbox_assembly_gates_on_the_flag_and_skips_boxless_kinds() {
+        let draws = [
+            hitbox_draw([10.0, 64.0, -3.0], Some((0.6, 1.8)), 1.62, true),
+            hitbox_draw([0.0, 0.0, 0.0], None, 0.0, false),
+        ];
+        assert!(
+            hitboxes_for(false, &draws).is_empty(),
+            "flag off draws nothing"
+        );
+        let boxes = hitboxes_for(true, &draws);
+        assert_eq!(boxes.len(), 1, "the boxless kind is skipped");
+        let bounds = boxes[0].bounds;
+        assert!(
+            (bounds[0][0] - 9.7).abs() < 1e-6
+                && (bounds[0][1] - 64.0).abs() < 1e-6
+                && (bounds[0][2] + 3.3).abs() < 1e-6
+                && (bounds[1][0] - 10.3).abs() < 1e-6
+                && (bounds[1][1] - 65.8).abs() < 1e-6
+                && (bounds[1][2] + 2.7).abs() < 1e-6,
+            "the white box is the kind's box at the feet: {bounds:?}"
+        );
+        assert_eq!(boxes[0].eye, [10.0, 65.62, -3.0]);
+        assert!((boxes[0].half_width - 0.3).abs() < 1e-6);
+        assert!(boxes[0].living);
     }
 }

@@ -42,6 +42,7 @@ use oxide_render::gui_item::ItemIcon;
 use oxide_render::held_item::{ArmSway, Equip, HeldItemFrame, Swing};
 use oxide_render::hud::{HudDraw, HudTexture, ScaledResolution};
 use oxide_render::text::string_width;
+use oxide_render::world_overlay::look_vector;
 use oxide_world::behaviour::{self, RenderKind};
 use oxide_world::entity::EntityKind;
 
@@ -3343,6 +3344,20 @@ fn draw_for(
         // The five slots' stacks, converted through the item-icon seam's rule.
         equipment: equipment_draw(&frame.equipment),
         extra: draw_extra,
+        // The hitbox path's own terms, from the one shared box table the pick path reads
+        // (`EntityKind::hitbox`) plus the eye height and the look: the player answers 1.62
+        // standing (`EntityPlayer.java`:2326-2340) and drops 0.08 while sneaking (`:2333`).
+        hitbox: frame.kind.hitbox(),
+        eye_height: frame.kind.eye_height() as f32
+            - if frame.kind == EntityKind::Player && frame.sneaking {
+                0.08
+            } else {
+                0.0
+            },
+        // The look the blue line extends: the source reads the entity's own pitch and body
+        // yaw (`Entity.getLook`, `Entity.java`:1468-1474), both interpolated to the frame.
+        look: look_vector(head_pitch, body_yaw),
+        living: frame.kind.is_living(),
     })
 }
 

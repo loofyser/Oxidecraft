@@ -418,9 +418,57 @@ impl EntityKind {
 
     /// Whether this kind is a living entity (`EntityLivingBase`): players
     /// and mobs — the kinds whose tick folds the copied pose pairs
-    /// (`EntityLivingBase.java:1867-1906`).
-    fn is_living(self) -> bool {
+    /// (`EntityLivingBase.java:1867-1906`). The hitbox draw reads it too:
+    /// only living kinds get the red eye box and the blue look line.
+    pub fn is_living(self) -> bool {
         self == EntityKind::Player || self.is_mob()
+    }
+
+    /// The eye height the hitbox draw stands its red box and look line on:
+    /// each class's own `getEyeHeight` (values only), adult and standing.
+    /// The player answers 1.62 (`EntityPlayer.java:2326-2340`, minus the
+    /// 0.08 sneak term the draw fills at the frame); kinds with no eye in
+    /// the source answer the `Entity.java:2689-2692` default of 0.85 times
+    /// their height.
+    pub fn eye_height(self) -> f64 {
+        match self {
+            EntityKind::Player => 1.62,          // EntityPlayer.java:2326-2340
+            EntityKind::CaveSpider => 0.5 * 0.9, // EntityCaveSpider.java:64
+            EntityKind::Enderman => 2.55,        // EntityEnderman.java:38
+            EntityKind::Endermite => 0.1,        // EntityEndermite.java:39-42
+            EntityKind::Ghast => 2.6,            // EntityGhast.java:66
+            EntityKind::Giant => 10.44,          // EntityGiantZombie.java:42
+            EntityKind::Guardian => 0.5 * 0.85,  // EntityGuardian.java:153
+            EntityKind::Silverfish => 0.1,       // EntitySilverfish.java:48-51
+            EntityKind::Skeleton => 1.74,        // EntitySkeleton.java:389
+            EntityKind::Slime | EntityKind::LavaSlime => 0.625 * 0.51, // EntitySlime.java:48
+            EntityKind::SnowMan => 1.7,          // EntitySnowman.java:39
+            EntityKind::Spider => 0.65,          // EntitySpider.java:37
+            EntityKind::Witch => 1.62,           // EntityWitch.java:55
+            EntityKind::Zombie | EntityKind::PigZombie => 1.74, // EntityZombie.java:183
+            EntityKind::Bat => 0.9 * 0.5,        // EntityBat.java:36
+            EntityKind::Chicken => 0.7,          // EntityChicken.java:38
+            EntityKind::Cow => 1.3,              // EntityCow.java:53
+            EntityKind::EntityHorse => 1.6,      // EntityHorse.java:402
+            EntityKind::Sheep => 1.235,          // EntitySheep.java:51
+            EntityKind::Squid => 0.95 * 0.5,     // EntitySquid.java:61
+            EntityKind::Villager => 1.62,        // EntityVillager.java:104
+            EntityKind::Wolf => 0.8 * 0.8,       // EntityWolf.java:62
+            EntityKind::Arrow => 0.0,            // EntityArrow.java:163-165
+            EntityKind::Creeper => 1.7 * 0.9,    // EntityCreeper.java:45
+            EntityKind::Blaze => 1.7 * 0.9,      // EntityBlaze.java:42
+            EntityKind::Ozelot | EntityKind::Rabbit => 0.7 * 0.85, // EntityOcelot.java:81
+            EntityKind::MushroomCow => 1.3 * 0.85, // EntityCow.java:53
+            EntityKind::Pig => 0.9 * 0.85,       // EntityPig.java:51-52
+            EntityKind::WitherBoss => 3.5 * 0.85, // EntityWither.java:100
+            EntityKind::ItemFrame => 0.5 * 0.85, // EntityHanging.java:25
+            EntityKind::Boat => 0.6 * 0.85,      // EntityBoat.java:42
+            EntityKind::Minecart => 0.7 * 0.85,  // EntityMinecart.java:56
+            EntityKind::Item => 0.25 * 0.85,     // EntityItem.java:43
+            EntityKind::XpOrb => 0.5 * 0.85,     // EntityXPOrb.java:38
+            EntityKind::Fireball => 1.0 * 0.85,  // EntityFireball.java:36
+            _ => 0.0, // Painting, EnderDragon, Unknown, Global and the rest
+        }
     }
 
     /// Whether the mouse-over pick can stop on this kind
@@ -1860,5 +1908,131 @@ mod tests {
         assert_eq!(entity.last_tick_position, [9.0, 8.0, 7.0]);
         assert_eq!(entity.last_tick_yaw, 90.0);
         assert_eq!(entity.last_tick_pitch, 5.0);
+    }
+
+    /// The eye heights the hitbox draw stands its red box and look line on:
+    /// each class's own `getEyeHeight` (values only), adult and standing —
+    /// the player at 1.62 (`EntityPlayer.java`:2326-2340, minus the sneak
+    /// term the draw fills at the frame) and the sourceless default of
+    /// 0.85 × height (`Entity.java`:2689-2692).
+    #[test]
+    fn the_eye_heights_follow_the_classes_own_answers() {
+        let eyes = [
+            (EntityKind::Player, 1.62),
+            (EntityKind::CaveSpider, 0.45),
+            (EntityKind::Enderman, 2.55),
+            (EntityKind::Endermite, 0.1),
+            (EntityKind::Ghast, 2.6),
+            (EntityKind::Giant, 10.44),
+            (EntityKind::Guardian, 0.425),
+            (EntityKind::Silverfish, 0.1),
+            (EntityKind::Skeleton, 1.74),
+            (EntityKind::Slime, 0.31875),
+            (EntityKind::LavaSlime, 0.31875),
+            (EntityKind::SnowMan, 1.7),
+            (EntityKind::Spider, 0.65),
+            (EntityKind::Witch, 1.62),
+            (EntityKind::Zombie, 1.74),
+            (EntityKind::PigZombie, 1.74),
+            (EntityKind::Bat, 0.45),
+            (EntityKind::Chicken, 0.7),
+            (EntityKind::Cow, 1.3),
+            (EntityKind::EntityHorse, 1.6),
+            (EntityKind::Sheep, 1.235),
+            (EntityKind::Squid, 0.475),
+            (EntityKind::Villager, 1.62),
+            (EntityKind::Wolf, 0.64),
+            (EntityKind::Arrow, 0.0),
+            (EntityKind::Creeper, 1.53),
+            (EntityKind::Blaze, 1.53),
+            (EntityKind::Ozelot, 0.595),
+            (EntityKind::Rabbit, 0.595),
+            (EntityKind::MushroomCow, 1.105),
+            (EntityKind::Pig, 0.765),
+            (EntityKind::WitherBoss, 2.975),
+            (EntityKind::ItemFrame, 0.425),
+            (EntityKind::Boat, 0.51),
+            (EntityKind::Minecart, 0.595),
+            (EntityKind::Item, 0.2125),
+            (EntityKind::XpOrb, 0.425),
+            (EntityKind::Fireball, 0.85),
+            (EntityKind::Painting, 0.0),
+            (EntityKind::EnderDragon, 0.0),
+            (EntityKind::Unknown, 0.0),
+            (EntityKind::Global, 0.0),
+        ];
+        for (kind, want) in eyes {
+            let got = kind.eye_height();
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{kind:?}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// The red eye box's gate: the player and the mobs are living
+    /// (`EntityLivingBase`), everything else is not.
+    #[test]
+    fn the_living_kinds_are_the_players_and_the_mobs() {
+        assert!(EntityKind::Player.is_living());
+        for kind in [
+            EntityKind::Creeper,
+            EntityKind::Skeleton,
+            EntityKind::Spider,
+            EntityKind::Giant,
+            EntityKind::Zombie,
+            EntityKind::Slime,
+            EntityKind::Ghast,
+            EntityKind::PigZombie,
+            EntityKind::Enderman,
+            EntityKind::CaveSpider,
+            EntityKind::Silverfish,
+            EntityKind::Blaze,
+            EntityKind::LavaSlime,
+            EntityKind::EnderDragon,
+            EntityKind::WitherBoss,
+            EntityKind::Bat,
+            EntityKind::Witch,
+            EntityKind::Endermite,
+            EntityKind::Guardian,
+            EntityKind::Pig,
+            EntityKind::Sheep,
+            EntityKind::Cow,
+            EntityKind::Chicken,
+            EntityKind::Squid,
+            EntityKind::Wolf,
+            EntityKind::MushroomCow,
+            EntityKind::SnowMan,
+            EntityKind::Ozelot,
+            EntityKind::VillagerGolem,
+            EntityKind::EntityHorse,
+            EntityKind::Rabbit,
+            EntityKind::Villager,
+        ] {
+            assert!(kind.is_living(), "{kind:?} is living");
+        }
+        for kind in [
+            EntityKind::Item,
+            EntityKind::XpOrb,
+            EntityKind::Arrow,
+            EntityKind::Snowball,
+            EntityKind::Egg,
+            EntityKind::EnderPearl,
+            EntityKind::Potion,
+            EntityKind::XpBottle,
+            EntityKind::EyeOfEnder,
+            EntityKind::Firework,
+            EntityKind::Fireball,
+            EntityKind::SmallFireball,
+            EntityKind::WitherSkull,
+            EntityKind::Painting,
+            EntityKind::ItemFrame,
+            EntityKind::Boat,
+            EntityKind::Minecart,
+            EntityKind::Global,
+            EntityKind::Unknown,
+        ] {
+            assert!(!kind.is_living(), "{kind:?} is not living");
+        }
     }
 }

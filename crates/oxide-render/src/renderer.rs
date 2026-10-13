@@ -29,7 +29,7 @@ use crate::sky::{
 use crate::terrain::{ChunkMesh, SectionKey};
 use crate::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 use crate::weather_pass::{WeatherColumn, WeatherPass};
-use crate::world_overlay::{Crack, Outline, WorldOverlay};
+use crate::world_overlay::{Crack, Hitbox, Outline, WorldOverlay};
 
 /// One draw of the scene pass, in the order the source issues it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -867,6 +867,15 @@ impl Renderer {
     /// 32-block reach.
     pub fn set_cracks(&mut self, cracks: Vec<Crack>) {
         self.world_overlay.set_cracks(cracks);
+    }
+
+    /// Sets the hitboxes the line path draws, replacing any earlier set.
+    ///
+    /// The hitboxes are F3+B's entity boxes (`RenderManager.java:438-468`), drawn in the
+    /// scene pass after the terrain; the caller hands over the flag-gated frames, so an
+    /// empty set — flag off, or nothing with a box in view — draws no hitbox.
+    pub fn set_hitboxes(&mut self, hitboxes: Vec<Hitbox>) {
+        self.world_overlay.set_hitboxes(hitboxes);
     }
 
     /// Uploads the three environment textures the sky and the clouds sample, replacing any

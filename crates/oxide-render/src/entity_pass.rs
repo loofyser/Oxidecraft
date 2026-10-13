@@ -577,6 +577,20 @@ pub struct EntityDraw {
     pub equipment: [Option<EquipmentDraw>; 5],
     /// The kind's own extras.
     pub extra: DrawExtra,
+    /// The kind's click box width and height (`EntityKind::hitbox`'s answer, feet at the
+    /// draw's position) — the white hitbox the F3+B path stands on it, `None` for the kinds
+    /// the shared table leaves boxless, which that path skips as the pick path skips them.
+    pub hitbox: Option<(f64, f64)>,
+    /// The eye height in blocks above the draw's feet (`EntityKind::eye_height`'s answer,
+    /// plus the player's sneak drop where it applies) — the red eye box's centre and the
+    /// look line's start.
+    pub eye_height: f32,
+    /// The unit look vector from the head's pitch and the body's yaw
+    /// (`Entity.getVectorForRotation`) — the blue look line's direction.
+    pub look: [f32; 3],
+    /// Whether the kind is living (`EntityKind::is_living`) — only living kinds draw the red
+    /// eye box.
+    pub living: bool,
 }
 
 /// The composed nametag a draw may show: the session's display text, its `§` runs included.
@@ -3419,6 +3433,10 @@ mod tests {
             below_name: None,
             equipment: [None; 5],
             extra: DrawExtra::None,
+            hitbox: None,
+            eye_height: 0.0,
+            look: [0.0, 0.0, 0.0],
+            living: false,
         }
     }
 
@@ -3960,6 +3978,10 @@ mod tests {
                 count: 1,
                 damage: 0,
             },
+            hitbox: None,
+            eye_height: 0.0,
+            look: [0.0, 0.0, 0.0],
+            living: false,
         };
         let (gui3d, age, count) =
             item_fields(block_draw.model, &block_draw.extra, &block_draw.pose);

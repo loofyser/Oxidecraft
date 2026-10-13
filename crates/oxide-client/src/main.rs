@@ -125,11 +125,12 @@ use oxide_render::fog::{
 use oxide_render::fps::FpsCounter;
 use oxide_render::gui_item::ItemIconSource;
 use oxide_render::hud::ScaledResolution;
+use oxide_render::lagometer::{FrameTimer, lagometer_draws};
 use oxide_render::lightmap::BrightnessTable;
 use oxide_render::particle_pass::{ParticleDraw, ParticleUv};
 use oxide_render::renderer::{Renderer, RendererError, SurfaceAction, classify_surface_error};
 use oxide_render::sky::SkyParams;
-use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
+use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline, hitboxes_for};
 use skin_worker::{SkinRequest, SkinUpdate};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -277,6 +278,8 @@ enum ScriptKey {
     F3,
     /// `h`: the advanced-tooltips chord — live only with F3 held.
     H,
+    /// `b`: the hitbox chord — live only with F3 held, like `h`.
+    B,
 }
 
 /// One queued gesture a `move`/`click`/`drag`/`wheel`/`key` directive left
@@ -790,6 +793,7 @@ fn parse_script_key(name: &str) -> anyhow::Result<ScriptKey> {
         "escape" => Ok(ScriptKey::Escape),
         "f3" => Ok(ScriptKey::F3),
         "h" => Ok(ScriptKey::H),
+        "b" => Ok(ScriptKey::B),
         other => anyhow::bail!("{other:?} is not a scripted key"),
     }
 }
@@ -976,6 +980,14 @@ struct ClientApp {
     renderer: Option<Renderer>,
     /// The frame-rate accounting shown in the title and the overlay.
     fps: FpsCounter,
+    /// The lagometer ring's own clock: the last presented frame's instant.
+    /// The ring's durations measure against it, and the first presented frame
+    /// only seeds it — kept apart from the framerate limiter's own gate clock
+    /// below, which the frame's start stamps.
+    ring_frame: Option<Instant>,
+    /// The lagometer's frame-duration ring: the graph reads it, and every
+    /// presented frame feeds one duration — never the session.
+    frame_timer: FrameTimer,
     /// Frames presented since start.
     frames: u64,
     /// The frame count to stop after, when the smoke-run variable asks for one.
@@ -1766,6 +1778,8 @@ impl ClientApp {
             window: None,
             renderer: None,
             fps: FpsCounter::new(Duration::from_secs(1)),
+            frame_timer: FrameTimer::new(),
+            ring_frame: None,
             frames: 0,
             max_frames,
             stopped_on_error: false,
@@ -1807,7 +1821,6 @@ impl ClientApp {
                 visible,
                 advanced_tooltips: false,
                 hitboxes: false,
-                chunk_borders: false,
                 lagometer: false,
                 pause_on_focus_lost,
             },
@@ -2455,10 +2468,14 @@ impl ClientApp {
             }
             // The entity draws: the feed interpolated at this frame's fraction, in
             // the feed's own order, the window's own entity skipped.
-            renderer.set_entities(
-                self.view
-                    .entity_draws(Instant::now(), &self.skins, &self.board),
-            );
+            let entity_draws = self
+                .view
+                .entity_draws(Instant::now(), &self.skins, &self.board);
+            // F3+B's hitboxes ride the same draws through the world-space line
+            // path: the flag-gated frames whose kind sizes a box, through the
+            // one table the pick path shares.
+            renderer.set_hitboxes(hitboxes_for(self.debug.hitboxes, &entity_draws));
+            renderer.set_entities(entity_draws);
             // The held item's frame: the stack through the ease's swap rule and the
             // rendered arguments at this frame's fraction, drawn between the scene
             // and the overlay.
@@ -2649,6 +2666,16 @@ impl ClientApp {
             None => Vec::new(),
         });
         hud_draws.extend(self.chat.draws(scaled, &mut self.chat_input));
+        // Alt+F3's lagometer (`GuiOverlayDebug.java:48-51`): the graph draws
+        // only inside the F3 overlay, over the frame ring's own durations with
+        // the live framerate limit's line — never the session.
+        hud_draws.extend(lagometer_draws(
+            self.debug.visible,
+            self.debug.lagometer,
+            &self.frame_timer,
+            scaled.height as f32,
+            u32::from(self.settings.max_framerate()),
+        ));
         // The sleep cover's Leave Bed button over the chat: `GuiSleepMP`
         // extends the chat screen, so the chat draws first and the id-1
         // button lands on top while the cover stands.
@@ -2749,7 +2776,19 @@ impl ClientApp {
         // Counted only now, once a frame has actually been presented: a frame
         // the surface was not ready for is not counted, and a frame the retry
         // presented counts once.
-        self.fps.record_frame(Instant::now());
+        let now = Instant::now();
+        self.fps.record_frame(now);
+        // The lagometer's ring feeds here, at the client frame loop — never
+        // the session: each presented frame's own duration in ns, measured
+        // against the last presented frame; the first only seeds the clock.
+        if let Some(last) = self.ring_frame {
+            self.frame_timer.add_frame(
+                now.duration_since(last)
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+        }
+        self.ring_frame = Some(now);
         self.frames += 1;
         let fps = self.fps.fps();
         // The overlay reports the rate the counter last measured, so it shows
@@ -2946,7 +2985,6 @@ impl ClientApp {
             return;
         }
         if is_f3_press(event.state, &event.logical_key) {
-            self.debug.visible = !self.debug.visible;
             if self.shift {
                 // Shift+F3's profiler chart has no flag: the port keeps no
                 // profiler, and the later milestone records the chart as a
@@ -2956,16 +2994,7 @@ impl ClientApp {
                     "Shift+F3 toggled the overlay; the profiler chart stays a recorded phantom"
                 );
             }
-            if self.alt {
-                // Alt+F3's lagometer (`Minecraft.java`:2026): a flag read
-                // only, the draw belongs to the later milestone.
-                self.debug.lagometer = !self.debug.lagometer;
-            }
-            tracing::info!(
-                visible = self.debug.visible,
-                lagometer = self.debug.lagometer,
-                "the debug overlay was toggled"
-            );
+            self.on_script_f3();
             return;
         }
         if self.capture.grabbed() {
@@ -3534,13 +3563,29 @@ impl ClientApp {
         }
     }
 
+    /// The F3 edge both routes share: the live key and the scripted `f3` — the
+    /// overlay toggles, and Alt held at the edge rides the lagometer with it
+    /// (`Minecraft.java:2023-2028`): the flag the overlay's graph reads, fed
+    /// from the live-held Alt, never the session.
+    fn on_script_f3(&mut self) {
+        self.debug.visible = !self.debug.visible;
+        if self.alt {
+            self.debug.lagometer = !self.debug.lagometer;
+        }
+        tracing::info!(
+            visible = self.debug.visible,
+            lagometer = self.debug.lagometer,
+            "the debug overlay was toggled"
+        );
+    }
+
     /// Runs one F3 chord from the chord table: P flips pause-on-lost-focus
     /// and persists it to the settings home at once; A queues every loaded
     /// column's meshes once more; F steps the render distance through the
     /// standing set-option path — Shift steps down — pushing and saving like
     /// the video screen's own writes; T re-pushes the live settings through
-    /// the standing apply path, the refresh-equivalent; B and G flip the
-    /// flag reads the later milestone's draws consume; a letter with no arm
+    /// the standing apply path, the refresh-equivalent; B flips the hitbox
+    /// flag read this milestone's hitbox draw consumes; a letter with no arm
     /// records its reason, never silently.
     fn on_f3_chord(&mut self, chord: F3Chord) {
         match chord {
@@ -3583,13 +3628,6 @@ impl ClientApp {
                 tracing::info!(
                     hitboxes = self.debug.hitboxes,
                     "F3+B flipped the hitbox flag"
-                );
-            }
-            F3Chord::ChunkBorders => {
-                self.debug.chunk_borders = !self.debug.chunk_borders;
-                tracing::info!(
-                    chunk_borders = self.debug.chunk_borders,
-                    "F3+G flipped the chunk-border flag"
                 );
             }
             F3Chord::Absent(reason) => {
@@ -4992,8 +5030,8 @@ impl ClientApp {
     /// authoritative and the gate is not re-checked.
     ///
     /// `escape` runs the window's own Escape route, `f3` its overlay toggle,
-    /// and `h` its chord — which needs Task 17's live `f3_held`, so a
-    /// press-only edge never flips it (documented at [`parse_script_key`]).
+    /// and `h`/`b` their chords — which need Task 17's live `f3_held`, so a
+    /// press-only edge never flips them (documented at [`parse_script_key`]).
     fn script_key(&mut self, event_loop: &ActiveEventLoop, key: ScriptKey) {
         match key {
             ScriptKey::Escape => {
@@ -5030,11 +5068,7 @@ impl ClientApp {
                 }
             }
             ScriptKey::F3 => {
-                self.debug.visible = !self.debug.visible;
-                tracing::info!(
-                    visible = self.debug.visible,
-                    "the debug overlay was toggled"
-                );
+                self.on_script_f3();
             }
             ScriptKey::H => {
                 if f3_chord_live(self.screens.is_open(), self.screens.allow_user_input())
@@ -5046,6 +5080,22 @@ impl ClientApp {
                     && self.f3_held
                 {
                     self.debug.advanced_tooltips = !self.debug.advanced_tooltips;
+                }
+            }
+            ScriptKey::B => {
+                // F3+B's scripted route: the press chords only with F3
+                // live-held, the way the scripted `h` rides the live-held
+                // F3 — through the chord table, never around it.
+                if f3_chord_live(self.screens.is_open(), self.screens.allow_user_input())
+                    && f3_chord(
+                        ElementState::Pressed,
+                        false,
+                        PhysicalKey::Code(KeyCode::KeyB),
+                        self.f3_held,
+                    )
+                    .is_some_and(|chord| chord == F3Chord::Hitboxes)
+                {
+                    self.on_f3_chord(F3Chord::Hitboxes);
                 }
             }
             ScriptKey::Inventory | ScriptKey::Drop | ScriptKey::Digit(_) => {
@@ -5163,7 +5213,7 @@ impl ClientApp {
                             self.held = slot;
                             self.send_input(InputEvent::HeldItemChange { slot });
                         }
-                        ScriptKey::Escape | ScriptKey::F3 | ScriptKey::H => {
+                        ScriptKey::Escape | ScriptKey::F3 | ScriptKey::H | ScriptKey::B => {
                             unreachable!("the window-level keys route above")
                         }
                     }
@@ -7308,8 +7358,8 @@ fn is_h_press(state: ElementState, repeat: bool, key: PhysicalKey) -> bool {
 }
 
 /// The debug overlay's own flags: the F3 chords' standing state, read by the
-/// overlay builder and — for the hitbox, border and lagometer reads — by the
-/// draws of the later milestone. Session-only, like the overlay.
+/// overlay builder and — for the hitbox and lagometer reads — by this
+/// milestone's draws. Session-only, like the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DebugFlags {
     /// Whether F3 has the overlay showing.
@@ -7319,14 +7369,10 @@ struct DebugFlags {
     /// flag the screen frame hands the tooltip builder.
     advanced_tooltips: bool,
     /// Whether F3+B has the entity hitboxes showing: a flag read only, the
-    /// draws belong to the later milestone (`showDebugBoundingBox`, :2005).
+    /// hitbox draw reads it (`showDebugBoundingBox`, :2005).
     hitboxes: bool,
-    /// Whether F3+G has the chunk borders showing: a new v1 key with no
-    /// source arm, a flag read only, the draws belong to the later
-    /// milestone.
-    chunk_borders: bool,
-    /// Whether Alt+F3 has the lagometer showing: a flag read only, the draw
-    /// belongs to the later milestone (`:2026`).
+    /// Whether Alt+F3 has the lagometer showing: a flag read only, the
+    /// overlay's graph reads it (`:2026`).
     lagometer: bool,
     /// Whether F3+P pauses on losing focus: the port's `pauseOnLostFocus`
     /// (`GameSettings.java`:66), persisted to the settings home.
@@ -7351,10 +7397,8 @@ enum F3Chord {
     /// the refresh-equivalent; the port has no asset reload to trigger, and
     /// the divergence is recorded, never silent.
     RefreshSettings,
-    /// F3+B: flip the hitbox flag the later milestone's draws read.
+    /// F3+B: flip the hitbox flag the hitbox draw reads.
     Hitboxes,
-    /// F3+G: flip the chunk-border flag the later milestone's draws read.
-    ChunkBorders,
     /// A held-F3 letter with no arm: recorded with its reason, never a
     /// silent no-op and never a dead arm.
     Absent(&'static str),
@@ -7379,7 +7423,9 @@ fn f3_chord(state: ElementState, repeat: bool, key: PhysicalKey, f3_held: bool) 
         KeyCode::KeyF => Some(F3Chord::RenderDistance),
         KeyCode::KeyT => Some(F3Chord::RefreshSettings),
         KeyCode::KeyB => Some(F3Chord::Hitboxes),
-        KeyCode::KeyG => Some(F3Chord::ChunkBorders),
+        KeyCode::KeyG => Some(F3Chord::Absent(
+            "the chunk-border view the 1.8.9 tree has no arm for",
+        )),
         KeyCode::KeyN => Some(F3Chord::Absent(
             "the renderer-switch cycle the port has one renderer for",
         )),
@@ -7904,8 +7950,8 @@ mod tests {
         assert!(!is_h_press(ElementState::Pressed, false, g));
     }
 
-    /// The chord table routes every held-F3 letter press: P/A/F/T live, B/G
-    /// flag reads, N/Q/W/E/V/L/U recorded-absent — and nothing else chords.
+    /// The chord table routes every held-F3 letter press: P/A/F/T live, B the
+    /// flag read, G/N/Q/W/E/V/L/U recorded-absent — and nothing else chords.
     fn chord(code: KeyCode) -> Option<F3Chord> {
         f3_chord(ElementState::Pressed, false, PhysicalKey::Code(code), true)
     }
@@ -7926,10 +7972,12 @@ mod tests {
             Some(F3Chord::RefreshSettings)
         ));
         assert!(matches!(chord(KeyCode::KeyB), Some(F3Chord::Hitboxes)));
-        assert!(matches!(chord(KeyCode::KeyG), Some(F3Chord::ChunkBorders)));
-        // The absent set records its reason, never silently: N (one renderer),
-        // Q (no profiler), and W/E/V/L/U (the source has no such chord).
+        // The absent set records its reason, never silently: G (the
+        // chunk-border view the 1.8.9 tree has no arm for), N (one
+        // renderer), Q (no profiler), and W/E/V/L/U (the source has no
+        // such chord).
         for code in [
+            KeyCode::KeyG,
             KeyCode::KeyN,
             KeyCode::KeyQ,
             KeyCode::KeyW,
@@ -7988,6 +8036,56 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn the_b_chord_flips_the_hitbox_flag() {
+        // F3+B's arm (`Minecraft.java`:2007-2010): the chord table's
+        // `Hitboxes` flips the session-only flag the hitbox draw reads.
+        let mut app = test_app();
+        assert!(!app.debug.hitboxes, "the flag starts off");
+        app.on_f3_chord(F3Chord::Hitboxes);
+        assert!(app.debug.hitboxes, "F3+B shows the hitboxes");
+        app.on_f3_chord(F3Chord::Hitboxes);
+        assert!(!app.debug.hitboxes, "F3+B hides them again");
+    }
+
+    #[test]
+    fn the_scripted_f3_edge_carries_the_alt_chord() {
+        // The scripted route's Alt+F3 (`Minecraft.java`:2023-2028): the
+        // `f3` edge toggles the overlay, and the lagometer arm rides the
+        // live-held Alt the way `h` rides the live-held F3.
+        let mut app = test_app();
+        app.on_script_f3();
+        assert!(app.debug.visible, "the overlay shows");
+        assert!(!app.debug.lagometer, "no Alt held: no lagometer");
+        app.alt = true;
+        app.on_script_f3();
+        assert!(!app.debug.visible, "the overlay hides again");
+        assert!(app.debug.lagometer, "Alt held: the lagometer shows");
+        app.alt = false;
+        app.on_script_f3();
+        assert!(app.debug.visible, "the overlay shows again");
+        assert!(
+            app.debug.lagometer,
+            "Alt released: the lagometer flag holds"
+        );
+    }
+
+    #[test]
+    fn the_frame_ring_holds_240_durations_oldest_first() {
+        // The lagometer's data (`FrameTimer.java`): the last 240 per-frame
+        // durations in ns, oldest first, wrapping past the end.
+        use oxide_render::lagometer::FrameTimer;
+        let mut timer = FrameTimer::new();
+        for ns in 1u64..=300 {
+            timer.add_frame(ns);
+        }
+        assert_eq!(timer.len(), 240, "the ring is bounded");
+        let ordered = timer.ordered();
+        assert_eq!(ordered.len(), 240);
+        assert_eq!(ordered[0], 61, "the oldest kept frame");
+        assert_eq!(ordered[239], 300, "the newest frame");
     }
 
     #[test]
@@ -9051,7 +9149,7 @@ mod tests {
         // parsing untouched, and the new gestures land beside them — `move`,
         // `click`, `drag`, `wheel` and the named-once `key <name>`, a press
         // edge only.
-        let script = "30 move 100 200\n31 click 100 200 Left\n32 click 100 200 Right shift\n33 click 40 60 Middle\n34 drag 10 20 30 40 Left\n35 drag 10 20 30 40 Right\n36 wheel 3\n37 wheel -2\n38 key e\n39 key q\n40 key escape\n41 key 1\n42 key 9\n43 key f3\n44 key h\n45 key W down\n46 mouse Left down\n";
+        let script = "30 move 100 200\n31 click 100 200 Left\n32 click 100 200 Right shift\n33 click 40 60 Middle\n34 drag 10 20 30 40 Left\n35 drag 10 20 30 40 Right\n36 wheel 3\n37 wheel -2\n38 key e\n39 key q\n40 key escape\n41 key 1\n42 key 9\n43 key f3\n44 key h\n45 key W down\n46 mouse Left down\n47 key b\n";
         assert_eq!(
             parse_script(script).expect("the gestures parse"),
             [
@@ -9155,6 +9253,10 @@ mod tests {
                         button: MouseButton::Left,
                         pressed: true,
                     }),
+                },
+                Directive {
+                    tick: 47,
+                    action: DirectiveAction::ScriptKey(ScriptKey::B),
                 },
             ]
         );

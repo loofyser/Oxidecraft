@@ -71,6 +71,7 @@ use oxide_render::fog::{FogMode, FogParams, fog_colour, water_fog};
 use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
 use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
 use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
+use oxide_render::lagometer::{FrameTimer, lagometer_draws};
 use oxide_render::lightmap::{BrightnessTable, gamma_for_brightness, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
 use oxide_render::particle_pass::{ParticleDraw, ParticlePass, ParticleUv};
@@ -83,7 +84,7 @@ use oxide_render::terrain::{ChunkMesh, Layer, Vertex};
 use oxide_render::terrain_pass::{DEPTH_FORMAT, TerrainPass};
 use oxide_render::text::string_width;
 use oxide_render::weather_pass::{WeatherColumn, WeatherPass};
-use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline, WorldOverlay};
+use oxide_render::world_overlay::{Crack, FULL_CUBE, Hitbox, Outline, WorldOverlay};
 
 use glam::Vec3;
 
@@ -2555,6 +2556,154 @@ fn the_crack_darkens_the_block_with_the_sources_multiply() {
     }
 }
 
+/// The hitbox lines over two entities: the white boxes, the living kind's red
+/// eye box and the blue look lines, through the world-space line path — never
+/// the overlay text path. The frame renders twice, terrain alone then terrain
+/// and overlay, at the fixed camera; both boxes stand on the block's top face
+/// against the sky, one living and one not.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_hitbox_lines_draw_two_entities_in_three_colours() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+    let depth = create_depth(&device);
+
+    let mut terrain = TerrainPass::new(&device, &queue, format);
+    terrain.set_atlas(&device, &queue, &solid_atlas(16, [255, 255, 255, 255]));
+    terrain.set_camera(&queue, camera(), 1.0);
+    terrain.upload(&device, &queue, (0, 0, 0), &stone_block_mesh());
+
+    let mut overlay = WorldOverlay::new(&device, format);
+    overlay.set_hitboxes(vec![
+        Hitbox {
+            bounds: [[0.2, 1.0, 0.2], [0.8, 2.8, 0.8]],
+            eye: [0.5, 2.62, 0.5],
+            half_width: 0.3,
+            living: true,
+            look: [0.0, 0.0, -1.0],
+        },
+        Hitbox {
+            bounds: [[-1.2, 1.0, 0.2], [-0.6, 1.6, 0.8]],
+            eye: [-0.9, 1.42, 0.5],
+            half_width: 0.3,
+            living: false,
+            look: [0.0, 0.0, -1.0],
+        },
+    ]);
+    overlay.set_frame(&device, &queue, &camera(), [SIZE as f32, SIZE as f32]);
+
+    let without = render_scene(&device, &queue, &target, &depth, |pass| terrain.draw(pass));
+    let with = render_scene(&device, &queue, &target, &depth, |pass| {
+        terrain.draw(pass);
+        overlay.draw(pass);
+    });
+
+    // The lines changed pixels, and every touched pixel carries one of the
+    // three line colours: opaque white, red or blue over what was there.
+    let near = |pixel: [u8; 3], want: [u8; 3]| {
+        pixel
+            .iter()
+            .zip(want)
+            .all(|(&got, want)| (i16::from(got) - i16::from(want)).abs() <= 1)
+    };
+    let mut changed = 0;
+    let mut white = 0;
+    let mut red = 0;
+    let mut blue = 0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let before = pixel(&without, x, y);
+            let after = pixel(&with, x, y);
+            if before != after {
+                changed += 1;
+                if near(after, [255, 255, 255]) {
+                    white += 1;
+                } else if near(after, [255, 0, 0]) {
+                    red += 1;
+                } else if near(after, [0, 0, 255]) {
+                    blue += 1;
+                } else {
+                    panic!(
+                        "the hitbox touched ({x}, {y}) with no line colour: {before:?} -> {after:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        changed > 20,
+        "the hitboxes left only {changed} pixels changed: the lines did not reach the frame"
+    );
+    assert!(white > 0, "no white box edge reached the frame");
+    assert!(
+        red > 0,
+        "the living kind's red eye box did not reach the frame"
+    );
+    assert!(blue > 0, "no blue look line reached the frame");
+
+    // The lines sit on the boxes' edges, not across faces: the aimed block's
+    // top face is untouched and the corners above it keep the sky.
+    expect_pixel(
+        &with,
+        SIZE / 2,
+        SIZE / 2,
+        STONE,
+        "the aimed block's top face",
+    );
+    expect_pixel(&with, 0, 0, SKY, "the corner above the block");
+}
+
+/// The lagometer over a pinned ring: even slots empty, odd slots two steps
+/// (33_333_333 ns, 60 px, red), so the odd columns stand full-height red and
+/// the even columns show the background. The cap line for a limit of 60 rides
+/// row `h-30` over the bars, and the white frame lines box the graph.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_lagometer_bars_stand_full_height_over_the_pinned_ring() {
+    const H: f32 = ROWS_TALL as f32;
+    let mut timer = FrameTimer::new();
+    for slot in 0..240 {
+        timer.add_frame(if slot % 2 == 0 { 0 } else { 33_333_333 });
+    }
+    let (device, queue, target, mut hud) = rows_scene();
+    hud.set_draws(
+        &device,
+        &queue,
+        &lagometer_draws(true, true, &timer, H, 60),
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = rows_frame(&device, &queue, &target, &hud);
+
+    // The odd column's bar stands full-height red; the cap line overdraws its
+    // top row cyan; the bottom white frame line closes the graph.
+    expect_rows(
+        &pixels,
+        3,
+        ROWS_TALL - 31,
+        [255, 0, 0],
+        "the bar's red body",
+    );
+    expect_rows(
+        &pixels,
+        3,
+        ROWS_TALL - 30,
+        [0, 255, 255],
+        "the cap line over the bar",
+    );
+    expect_rows(
+        &pixels,
+        3,
+        ROWS_TALL - 1,
+        [255, 255, 255],
+        "the bottom frame line",
+    );
+    // The even column has no bar: the background's blended grey, and above
+    // the bars the same background past the graph's top white line.
+    expect_rows(&pixels, 2, ROWS_TALL - 31, QUAD, "the background");
+    expect_rows(&pixels, 2, ROWS_TALL - 61, SKY, "past the graph's top");
+}
+
 /// The lightmap's runtime rewrite, folded in from the M2 final review's deferred item 34: a
 /// change between two draws through the same pass must take the buffer-rewrite path and reach
 /// the frame, not read a stale image. The fixture is a quad lit by the (block 0, sky 15) cell —
@@ -2807,6 +2956,10 @@ fn player_at_origin(texture: TextureRef) -> EntityDraw {
         below_name: None,
         equipment: [None; 5],
         extra: DrawExtra::None,
+        hitbox: None,
+        eye_height: 0.0,
+        look: [0.0, 0.0, 0.0],
+        living: false,
     }
 }
 
@@ -3567,6 +3720,10 @@ fn mob_at_origin(model: ModelRef, sheet: &'static str, extra: DrawExtra) -> Enti
         below_name: None,
         equipment: [None; 5],
         extra,
+        hitbox: None,
+        eye_height: 0.0,
+        look: [0.0, 0.0, 0.0],
+        living: false,
     }
 }
 
@@ -5865,6 +6022,10 @@ fn object_draw(model: ModelRef, extra: DrawExtra) -> EntityDraw {
         below_name: None,
         equipment: [None; 5],
         extra,
+        hitbox: None,
+        eye_height: 0.0,
+        look: [0.0, 0.0, 0.0],
+        living: false,
     }
 }
 
