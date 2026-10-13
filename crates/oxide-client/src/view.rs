@@ -337,6 +337,10 @@ pub struct ScreenDrawInput<'a> {
     /// (`ChatView::set_language`). `None` keeps the legacy behaviour: raw
     /// keys draw as-is, exactly what fix round 7 heals.
     pub language: Option<&'a LanguageTable>,
+    /// The frame's system time in milliseconds: the main menu's splash
+    /// bounce and panorama partial ride it (`Minecraft.getSystemTime`'s
+    /// shape the source reads its own clock in).
+    pub now_ms: u64,
 }
 
 /// The screen group's own draws: the source's `currentScreen.drawScreen`
@@ -402,6 +406,16 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         ScreenState::Book(reader) => {
             if let Some(font) = input.font {
                 draws.extend(reader.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The main menu stands pre-session: its own gradient pair, logo,
+        // splash, version lines and buttons over the panorama (Task 15).
+        // The panorama's 3D faces render on their own path in the frame;
+        // the ortho pass carries the 2D assembly only.
+        ScreenState::MainMenu(menu) => {
+            if let Some(font) = input.font {
+                draws.extend(menu.draws(font, &input.scaled, input.mouse, input.now_ms));
             }
             return draws;
         }
@@ -8298,6 +8312,7 @@ mod tests {
             .iter()
             .filter_map(|draw| match draw {
                 HudDraw::Text { text, .. } => Some(text.clone()),
+                HudDraw::RotatedText { .. } => None,
                 HudDraw::Rect { .. } | HudDraw::TexturedRect { .. } | HudDraw::SkinRect { .. } => {
                     None
                 }
@@ -11312,6 +11327,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         assert!(draws.is_empty(), "no screen owns no draws");
@@ -11340,6 +11356,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         // The background halves, the board backing, the title, the four
@@ -11413,6 +11430,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         // The background halves, the 192x192 sheet, the indicator, the one
@@ -11475,6 +11493,7 @@ mod tests {
                 effects: &effects,
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         let texts: Vec<String> = draws
@@ -11546,6 +11565,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         // The 427x240 frame centres the 176x166 panel at (125, 37); the
@@ -11646,6 +11666,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         // The 427x240 frame centres the 176x168 three-row panel at (125, 36).
@@ -11782,6 +11803,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language,
+                now_ms: 0,
             }
         }
 
@@ -11835,6 +11857,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: Some(&table),
+                now_ms: 0,
             },
         );
         assert!(
@@ -11877,6 +11900,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: Some(&table),
+                now_ms: 0,
             },
         );
         assert!(
@@ -11913,6 +11937,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         // The panel centres at (116, 52): the gap is frame x 260..283,
@@ -12023,6 +12048,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         assert!(
@@ -12045,6 +12071,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         assert!(
@@ -12146,6 +12173,7 @@ mod tests {
                 effects: &[],
                 preview_skin: None,
                 language: None,
+                now_ms: 0,
             },
         );
         let cell_draw = draws.iter().find(|draw| {

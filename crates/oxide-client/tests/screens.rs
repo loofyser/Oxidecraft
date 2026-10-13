@@ -938,3 +938,405 @@ fn escape_closes_the_screen_and_sends_nothing_with_no_screen() {
         "no screen sends nothing: the capture rule owns the no-screen arm"
     );
 }
+
+// Task 15's menu suite: the widget laws, the panorama/splash formulae, the
+// main menu's layout pins and the pre-session standing rules.
+//
+// The widget pins mirror the source's button (`GuiButton.java`) and slider
+// (`GuiOptionSlider.java`); the layout pins mirror the main menu's
+// `initGui`/`addSingleplayerMultiplayerButtons` at pinned scaled sizes;
+// the splash pins mirror the constructor's pick loop and the calendar
+// arms. Every formula here is closed-form — no GPU needed.
+
+use oxide_client::screens::menu::{
+    MENU_MULTIPLAYER_ID, MENU_OPTIONS_ID, MENU_QUIT_ID, MENU_SINGLEPLAYER_ID, MainMenuScreen,
+    SPLASH_ANGLE_DEG, SPLASH_DEFAULT, SPLASH_EXCLUDED_HASH, SPLASH_EXCLUDED_TEXT,
+    calendar_override, civil_month_day, java_hash, menu_buttons, menu_labels, panorama_face,
+    panorama_pitch, panorama_yaw, pick_splash, splash_scale, stands_at_startup,
+};
+use oxide_client::screens::widgets::{
+    BUTTON_HEIGHT, BUTTON_WIDTH, Button, LABEL_DISABLED, LABEL_HOVERED, LABEL_IDLE, ROW_WIDTH,
+    SLIDER_KNOB_HALF, SLIDER_KNOB_V, Slider, button_strip_v, hover_state, label_colour,
+};
+use oxide_render::hud::ScaledResolution;
+
+/// The suite's scaled sizes: the wide layout pin and the minimum-scale
+/// on-screen check (320x240 keeps `j = h/4+48` on screen).
+fn wide() -> ScaledResolution {
+    ScaledResolution {
+        width: 427,
+        height: 240,
+        scale_factor: 2,
+    }
+}
+
+fn minimum() -> ScaledResolution {
+    ScaledResolution {
+        width: 320,
+        height: 240,
+        scale_factor: 3,
+    }
+}
+
+fn english() -> [String; 4] {
+    [
+        String::from("Singleplayer"),
+        String::from("Multiplayer"),
+        String::from("Options..."),
+        String::from("Quit Game"),
+    ]
+}
+
+#[test]
+fn the_hover_state_table_pins_disabled_hovered_and_idle() {
+    // `GuiButton.getHoverState`:59-67 — 0 disabled, 2 hovered, else 1.
+    assert_eq!(hover_state(false, false), 0);
+    assert_eq!(hover_state(false, true), 0);
+    assert_eq!(hover_state(true, false), 1);
+    assert_eq!(hover_state(true, true), 2);
+}
+
+#[test]
+fn the_button_strip_reads_46_plus_state_times_20() {
+    // `drawButton`'s two blits ride v `46 + i * 20`.
+    assert_eq!(button_strip_v(0), 46.0);
+    assert_eq!(button_strip_v(1), 66.0);
+    assert_eq!(button_strip_v(2), 86.0);
+}
+
+#[test]
+fn the_label_colours_pin_the_three_arms() {
+    // `drawButton`'s colour arms: 14737632 idle, 10526880 disabled,
+    // 16777120 hovered.
+    assert_eq!(LABEL_IDLE, 14737632);
+    assert_eq!(LABEL_DISABLED, 10526880);
+    assert_eq!(LABEL_HOVERED, 16777120);
+    assert_eq!(
+        label_colour(true, false),
+        [224.0 / 255.0, 224.0 / 255.0, 224.0 / 255.0, 1.0]
+    );
+    assert_eq!(
+        label_colour(false, false),
+        [160.0 / 255.0, 160.0 / 255.0, 160.0 / 255.0, 1.0]
+    );
+    assert_eq!(label_colour(true, true), [1.0, 1.0, 160.0 / 255.0, 1.0]);
+    assert_eq!(
+        label_colour(false, true),
+        [160.0 / 255.0, 160.0 / 255.0, 160.0 / 255.0, 1.0]
+    );
+}
+
+#[test]
+fn the_button_base_is_200_by_20_and_the_row_is_150() {
+    // `GuiButton.java`:36-39 build 200x20; the options-row controls build
+    // 150x20 (`GuiOptionButton.java`:22, `GuiOptionSlider.java`:23).
+    assert_eq!((BUTTON_WIDTH, BUTTON_HEIGHT), (200.0, 20.0));
+    assert_eq!(ROW_WIDTH, 150.0);
+}
+
+#[test]
+fn the_button_hit_box_is_the_full_rect_and_the_press_gates() {
+    // `mousePressed`:126-129 — enabled, visible, and the whole rect.
+    let mut button = Button::new(1, 100.0, 60.0, 200.0, 20.0, String::from("Singleplayer"));
+    assert!(button.hit((100.0, 60.0)));
+    assert!(button.hit((299.0, 79.0)));
+    assert!(!button.hit((300.0, 60.0)), "the right edge is exclusive");
+    assert!(!button.hit((100.0, 80.0)), "the bottom edge is exclusive");
+    assert!(!button.hit((99.0, 60.0)));
+    assert!(button.pressed((150.0, 70.0)));
+    button.enabled = false;
+    assert!(!button.pressed((150.0, 70.0)), "disabled never presses");
+    button.enabled = true;
+    button.visible = false;
+    assert!(!button.pressed((150.0, 70.0)), "hidden never presses");
+}
+
+#[test]
+fn the_slider_knob_follows_the_value_and_the_drag_latches() {
+    // `mouseDragged`'s blit origin `x + value * (w - 8)`; the value law
+    // `(mouseX - (x + 4)) / (w - 8)` clamped; the press-to-release latch.
+    let mut slider = Slider::new(10.0, 40.0, 150.0, 20.0, 0.5);
+    assert_eq!(slider.knob_x(), 10.0 + 0.5 * 142.0);
+    slider.set_from_mouse(10.0 + 4.0);
+    assert_eq!(slider.value, 0.0, "the left inset clamps to zero");
+    slider.set_from_mouse(10.0 + 4.0 + 142.0);
+    assert_eq!(slider.value, 1.0, "the right inset clamps to one");
+    slider.set_from_mouse(10.0 + 4.0 + 71.0);
+    assert_eq!(slider.value, 0.5);
+    assert!(slider.press((50.0, 50.0)));
+    assert!(slider.dragging, "the press latches");
+    slider.drag_to(10.0 + 4.0);
+    assert_eq!(slider.value, 0.0, "the latched drag folds");
+    slider.release();
+    assert!(!slider.dragging, "the release clears");
+    slider.drag_to(10.0 + 4.0 + 142.0);
+    assert_eq!(slider.value, 0.0, "the unlatched drag folds nothing");
+}
+
+#[test]
+fn the_slider_track_never_highlights() {
+    // `getHoverState` returns 0 always: the track draws the v 46 strip
+    // under the pointer too, while the knob halves ride v 66.
+    assert_eq!(SLIDER_KNOB_V, 66.0);
+    assert_eq!(SLIDER_KNOB_HALF, 4.0);
+    let slider = Slider::new(10.0, 40.0, 150.0, 20.0, 0.5);
+    let draws = slider.draws();
+    assert_eq!(draws.len(), 4, "the track halves and the knob halves");
+}
+
+#[test]
+fn the_splash_angle_is_minus_20_degrees() {
+    // `drawScreen`:562 rotates −20 about Z — the plan's "45" corrected.
+    assert_eq!(SPLASH_ANGLE_DEG, -20.0);
+}
+
+#[test]
+fn the_splash_scale_law_pins_period_and_amplitude() {
+    // `(1.8 - |sin(2*pi*(ms%1000)/1000)| * 0.1) * 100/(string+32)`
+    // (`drawScreen`:563-564): a 1 s period, ±0.1/1.8 amplitude before the
+    // string-width scale.
+    let wide = splash_scale(0, 100);
+    assert_eq!(wide, 1.8 * 100.0 / 132.0, "sin(0) = 0 leaves 1.8");
+    let quarter = splash_scale(250, 100);
+    assert!(
+        (quarter - 1.7 * 100.0 / 132.0).abs() < 1e-5,
+        "sin(pi/2) = 1 leaves 1.7, up to float rounding"
+    );
+    assert_eq!(
+        splash_scale(1000, 100),
+        wide,
+        "the millisecond remainder sets the 1 s period"
+    );
+    assert_eq!(
+        splash_scale(500, 100),
+        splash_scale(0, 100),
+        "|sin(pi)| = 0 rejoins the peak"
+    );
+}
+
+#[test]
+fn the_panorama_laws_pin_the_source_rates() {
+    // Yaw `-(timer+partial) * 0.1` at 20 Hz = 2 deg/s, a 180 s/rev
+    // period; pitch `sin((timer+partial)/400) * 25 + 20`.
+    assert_eq!(panorama_yaw(0, 0.0), 0.0);
+    assert_eq!(panorama_yaw(20, 0.0), -2.0, "one second turns two degrees");
+    assert_eq!(
+        panorama_yaw(3600, 0.0),
+        -360.0,
+        "180 s turns one revolution"
+    );
+    assert_eq!(panorama_yaw(0, 0.5), -0.05, "the partial fraction folds in");
+    assert_eq!(panorama_pitch(0, 0.0), 20.0, "sin(0) leaves the +20 base");
+    let quarter_period = (std::f32::consts::PI / 2.0 * 400.0) as i64;
+    assert!(
+        (panorama_pitch(quarter_period, 0.0) - 45.0).abs() < 0.01,
+        "a quarter pitch period peaks at +45"
+    );
+}
+
+#[test]
+fn the_panorama_face_walks_the_six_sides_in_order() {
+    // The yaw folded into sextants over faces 0..5: two yaws half a
+    // revolution apart face opposite sides.
+    assert_eq!(panorama_face(0.0), 0);
+    assert_eq!(panorama_face(-60.0), 1);
+    assert_eq!(panorama_face(-120.0), 2);
+    assert_eq!(panorama_face(-180.0), 3);
+    assert_eq!(panorama_face(-240.0), 4);
+    assert_eq!(panorama_face(-300.0), 5);
+    assert_eq!(panorama_face(-360.0), 0, "one revolution rejoins face 0");
+}
+
+#[test]
+fn the_java_hash_names_the_excluded_splash() {
+    // The re-roll rule's verbatim constant, and the splash it names.
+    assert_eq!(SPLASH_EXCLUDED_HASH, 125780783);
+    assert_eq!(java_hash(SPLASH_EXCLUDED_TEXT), 125780783);
+    assert_eq!(java_hash("missingno"), 1243860391);
+}
+
+#[test]
+fn the_splash_pick_trims_skips_defaults_and_rerolls() {
+    // The constructor's loop: trim, skip empties, `missingno` when nothing
+    // survives, re-roll while the hash hits the exclusion.
+    let lines = vec![
+        String::from("   "),
+        String::from(""),
+        String::from("world"),
+        String::from("  hello  "),
+    ];
+    assert_eq!(pick_splash(&lines, 7), "hello", "the pick trims");
+    assert_eq!(pick_splash(&[], 7), SPLASH_DEFAULT);
+    assert_eq!(pick_splash(&[String::from("  ")], 7), SPLASH_DEFAULT);
+    let exclusion = vec![String::from(SPLASH_EXCLUDED_TEXT), String::from("safe")];
+    for seed in 0..64u64 {
+        assert_ne!(
+            pick_splash(&exclusion, seed),
+            SPLASH_EXCLUDED_TEXT,
+            "the exclusion never survives while an alternative stands (seed {seed})"
+        );
+    }
+    let single = vec![String::from("safe")];
+    assert_eq!(
+        pick_splash(&single, 3),
+        "safe",
+        "a lone survivor returns at once"
+    );
+}
+
+#[test]
+fn the_calendar_windows_override_the_pick() {
+    // `initGui`'s three arms: Dec 24, Jan 1, Oct 31.
+    assert_eq!(calendar_override(12, 24), Some("Merry X-mas!"));
+    assert_eq!(calendar_override(1, 1), Some("Happy new year!"));
+    assert_eq!(calendar_override(10, 31), Some("OOoooOOOoooo! Spooky!"));
+    assert_eq!(calendar_override(12, 25), None);
+    assert_eq!(calendar_override(6, 15), None);
+    assert_eq!(civil_month_day(0), (1, 1), "the epoch opens in January");
+    assert_eq!(
+        civil_month_day(20447),
+        (12, 25),
+        "2025-12-25 reads Christmas"
+    );
+}
+
+#[test]
+fn the_menu_buttons_pin_the_source_layout() {
+    // `j = h/4+48`, spacing 24: single (1) `w/2-100, j` 200x20, multi (2)
+    // `j+24`, options (0) `w/2-100, j+84` 98x20, quit (4) `w/2+2, j+84`
+    // 98x20. Realms (14) and language (5) are omitted.
+    let buttons = menu_buttons(
+        &wide(),
+        english()[0].clone(),
+        english()[1].clone(),
+        english()[2].clone(),
+        english()[3].clone(),
+    );
+    assert_eq!(buttons.len(), 4, "realms and language are omitted");
+    let at = |id: i32| {
+        buttons
+            .iter()
+            .find(|button| button.id == id)
+            .expect("the button stands")
+    };
+    assert_eq!(
+        (at(MENU_SINGLEPLAYER_ID).x, at(MENU_SINGLEPLAYER_ID).y),
+        (113.0, 108.0)
+    );
+    assert_eq!(
+        (at(MENU_SINGLEPLAYER_ID).w, at(MENU_SINGLEPLAYER_ID).h),
+        (200.0, 20.0)
+    );
+    assert_eq!(
+        (at(MENU_MULTIPLAYER_ID).x, at(MENU_MULTIPLAYER_ID).y),
+        (113.0, 132.0)
+    );
+    assert_eq!(
+        (at(MENU_OPTIONS_ID).x, at(MENU_OPTIONS_ID).y),
+        (113.0, 192.0)
+    );
+    assert_eq!((at(MENU_OPTIONS_ID).w, at(MENU_OPTIONS_ID).h), (98.0, 20.0));
+    assert_eq!((at(MENU_QUIT_ID).x, at(MENU_QUIT_ID).y), (215.0, 192.0));
+    assert_eq!((at(MENU_QUIT_ID).w, at(MENU_QUIT_ID).h), (98.0, 20.0));
+    assert_eq!(at(MENU_SINGLEPLAYER_ID).label, "Singleplayer");
+    assert!(
+        buttons
+            .iter()
+            .all(|button| button.enabled && button.visible),
+        "every menu button draws enabled"
+    );
+}
+
+#[test]
+fn the_menu_buttons_stay_on_screen_at_minimum_scale() {
+    // `j = h/4+48` keeps the set on screen at 320x240: the quit row's
+    // bottom edge must clear the frame.
+    let buttons = menu_buttons(
+        &minimum(),
+        english()[0].clone(),
+        english()[1].clone(),
+        english()[2].clone(),
+        english()[3].clone(),
+    );
+    for button in &buttons {
+        assert!(
+            button.x >= 0.0 && button.y >= 0.0,
+            "button {} starts on screen",
+            button.id
+        );
+        assert!(
+            button.x + button.w <= 320.0 && button.y + button.h <= 240.0,
+            "button {} ends on screen",
+            button.id
+        );
+    }
+}
+
+#[test]
+fn the_menu_click_routes_press_to_action_and_singleplayer_stays_inert() {
+    // The press fires on press (`mouseClicked`); singleplayer records
+    // inert (Decision 7) — the action answers, nothing opens.
+    let menu = MainMenuScreen::new(&wide(), &[], 11, english());
+    let single = menu_buttons(
+        &wide(),
+        english()[0].clone(),
+        english()[1].clone(),
+        english()[2].clone(),
+        english()[3].clone(),
+    )
+    .into_iter()
+    .find(|button| button.id == MENU_SINGLEPLAYER_ID)
+    .expect("singleplayer stands");
+    let point = (single.x + 1.0, single.y + 1.0);
+    assert_eq!(
+        menu.click_at(point),
+        Some(oxide_client::screens::menu::MenuAction::Singleplayer)
+    );
+    let quit = menu_buttons(
+        &wide(),
+        english()[0].clone(),
+        english()[1].clone(),
+        english()[2].clone(),
+        english()[3].clone(),
+    )
+    .into_iter()
+    .find(|button| button.id == MENU_QUIT_ID)
+    .expect("quit stands");
+    assert_eq!(
+        menu.click_at((quit.x + 1.0, quit.y + 1.0)),
+        Some(oxide_client::screens::menu::MenuAction::Quit)
+    );
+    assert_eq!(
+        menu.click_at((0.0, 0.0)),
+        None,
+        "empty space answers nothing"
+    );
+    assert_eq!(
+        menu.click_at((113.0, 156.0)),
+        None,
+        "the realms gap answers nothing"
+    );
+}
+
+#[test]
+fn the_menu_labels_resolve_english_without_a_table() {
+    // No table hands over: the store's `en_US.lang` English the buttons
+    // stand on.
+    assert_eq!(
+        menu_labels(None),
+        [
+            String::from("Singleplayer"),
+            String::from("Multiplayer"),
+            String::from("Options..."),
+            String::from("Quit Game"),
+        ]
+    );
+}
+
+#[test]
+fn the_menu_stands_at_startup_without_a_server_only() {
+    // The pre-session rule: no `--server` stands the menu, `--server`
+    // bypasses it for the session join.
+    assert!(stands_at_startup(None));
+    assert!(!stands_at_startup(Some("127.0.0.1:25565")));
+}

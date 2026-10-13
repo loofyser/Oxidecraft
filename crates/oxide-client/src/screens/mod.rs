@@ -6,12 +6,13 @@
 //! :330-341) and the wire close (`NetHandlerPlayClient.handleCloseWindow`
 //! :1311-1315); no source text is copied.
 //!
-//! [`Screens`] holds the current screen. Five variants are declared here;
+//! [`Screens`] holds the current screen. Six variants are declared here;
 //! Task 16 wires only the [`ScreenState::Container`] kind's `WindowOpened`
 //! path — the inventory open landed in Task 20, the creative open in Task
 //! 21, the sign open in Task 22; the book open lands in Task 23, and an
 //! open for a declared-but-unimplemented variant draws the generic frame
-//! (recorded).
+//! (recorded). The main menu stands pre-session at startup and on
+//! disconnect-to-title (Task 15).
 //!
 //! The close rule: every close sends
 //! [`InputEvent::CloseWindow`](oxide_game::input::InputEvent::CloseWindow)
@@ -31,14 +32,17 @@
 //! chat over the inventory stashes the screen and its close drops the stash.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use oxide_game::input::InputEvent;
 use oxide_proto_v47::entity::MetadataItem;
 use oxide_proto_v47::window::WindowKind;
+use oxide_render::hud::ScaledResolution;
 
 use book::BookScreen;
 use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
+use menu::MainMenuScreen;
 use sign::{SignMapEntry, SignScreen};
 
 pub mod book;
@@ -47,7 +51,9 @@ pub mod creative;
 pub mod family_a;
 pub mod family_b;
 pub mod inventory;
+pub mod menu;
 pub mod sign;
+pub mod widgets;
 
 /// One open screen: a variant per screen the client can stand on.
 #[derive(Debug, Clone)]
@@ -68,6 +74,10 @@ pub enum ScreenState {
     /// field over the player's own inventory window (boxed like the
     /// container kinds).
     Creative(Box<CreativeScreen>),
+    /// The main menu: the pre-session screen standing at startup when no
+    /// `--server` was given, and on disconnect-to-title (boxed like the
+    /// container kinds).
+    MainMenu(Box<MainMenuScreen>),
 }
 
 impl ScreenState {
@@ -82,7 +92,7 @@ impl ScreenState {
                 Some(screen.window_id())
             }
             ScreenState::Creative(_) => Some(0),
-            ScreenState::Sign(_) | ScreenState::Book(_) => None,
+            ScreenState::Sign(_) | ScreenState::Book(_) | ScreenState::MainMenu(_) => None,
         }
     }
 
@@ -366,14 +376,84 @@ impl Screens {
         }
     }
 
+    /// The open main menu, when the current screen is one: the frame's
+    /// pointer and the menu keys drive this.
+    pub fn menu_mut(&mut self) -> Option<&mut MainMenuScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::MainMenu(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Stands the main menu: the pre-session screen at startup when no
+    /// `--server` was given, and on disconnect-to-title. The splash
+    /// lines are the store's `texts/splashes.txt` as read, `seed` the
+    /// launch seed, `labels` the four button labels in
+    /// single/multi/options/quit order. No guard exists: standing it
+    /// replaces whatever screen is open.
+    pub fn open_main_menu(
+        &mut self,
+        scaled: ScaledResolution,
+        splash_lines: &[String],
+        seed: u64,
+        labels: [String; 4],
+    ) {
+        self.current = Some(ScreenState::MainMenu(Box::new(MainMenuScreen::new(
+            &scaled,
+            splash_lines,
+            seed,
+            labels,
+        ))));
+    }
+
+    /// Folds the session's end into the screens: disconnect-to-title
+    /// stands the main menu (the standing rule only — the disconnect
+    /// screen with the reason lands in Task 20, and its title button
+    /// calls this same open).
+    pub fn on_disconnected(
+        &mut self,
+        scaled: ScaledResolution,
+        splash_lines: &[String],
+        seed: u64,
+        labels: [String; 4],
+    ) {
+        self.open_main_menu(scaled, splash_lines, seed, labels);
+    }
+
+    /// Steps the open menu's panorama clock one session tick: the
+    /// `updateScreen` 20 Hz source (`GuiMainMenu.java`:164-166). The
+    /// fold no-ops with no menu open.
+    pub fn tick_menu(&mut self) {
+        if let Some(menu) = self.menu_mut() {
+            menu.tick();
+        }
+    }
+
+    /// Steps the open menu's sessionless clock: every 50 ms of wall time
+    /// advances the panorama clock once, so the menu turns at the
+    /// source's 20 Hz with no session behind it. The fold no-ops with no
+    /// menu open.
+    pub fn tick_menu_wall(&mut self, now: Instant) {
+        if let Some(menu) = self.menu_mut() {
+            menu.tick_wall(now);
+        }
+    }
+
     /// Closes the open screen: one `CloseWindow` carrying the screen's own
     /// window id — window 0 included — and the view's cursor copy dropped
     /// with it. The sign's close answers its own send instead: the update
     /// with the position and the four lines as edited, on EVERY close
     /// (`GuiEditSign.onGuiClosed`:52-63, the send at `:59`). A screen on no
     /// other window, and no screen at all, send nothing. Closing the
-    /// creative screen remembers its tab for the next open.
+    /// creative screen remembers its tab for the next open. The main menu
+    /// never closes this way: the source's `keyTyped` is empty
+    /// (`GuiMainMenu.java`:183-185), so Escape reaches no close and the
+    /// menu stands until another screen replaces it — the close answers
+    /// `None` and the menu stays.
     pub fn close(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
+        if matches!(self.current, Some(ScreenState::MainMenu(_))) {
+            return None;
+        }
         if let Some(ScreenState::Creative(screen)) = self.current.as_ref() {
             self.creative_tab = screen.selected_tab();
         }

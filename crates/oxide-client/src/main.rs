@@ -60,6 +60,8 @@ use oxide_client::items::ItemTable;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
+use oxide_client::screens::menu::{MenuAction, menu_labels};
+use oxide_client::screens::widgets::BUTTON_PRESS_SOUND;
 use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
 use oxide_client::settings_state::{
     KeymapPass, NoAudio, ParticleSink, SettingsState, WindowSink, cursor_to_gui, framerate_gate,
@@ -69,7 +71,7 @@ use oxide_game::audio::music::{MusicKind, MusicTicker};
 use oxide_game::audio::{
     AudioDevice, AudioEngine, CpalDevice, ListenerPose, PlaySound, SoundCategory,
 };
-use oxide_game::chat::{ClickAction, ClickEvent};
+use oxide_game::chat::{ClickAction, ClickEvent, LanguageTable};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
 use oxide_game::hud::{HudState, debug_lines};
 use oxide_game::input::{InputEvent, Key, MouseButton, drop_item, hotbar_step};
@@ -1095,6 +1097,11 @@ struct ClientApp {
     /// reaches the session (`GuiChat.drawScreen`:305-310 reads the free mouse;
     /// `GuiNewChat.getChatComponent`:256-257 scales it by the factor).
     cursor: Option<(f32, f32)>,
+    /// The menu's launch seed: the splash pick and the logo seed read one
+    /// launch stream in the source's order (the constructor's pick first,
+    /// `updateCounter` after), so the seed is drawn once at startup and
+    /// kept for every later standing (startup and disconnect-to-title).
+    menu_seed: u64,
     /// The link opener the confirm overlay's Enter runs.
     opener: UrlOpener,
     /// The `--input-script` replay, when the flag was given.
@@ -1516,10 +1523,10 @@ impl ClientApp {
             tracing::info!(frames = limit, "a frame limit is set, exiting after it");
         }
         // With a server the assets load before anything opens, so a store that is missing or
-        // malformed fails fast; the smoke path without one loads nothing.
-        let mut assets = None;
-        let mut chat_font = None;
-        let mut chat_lang = None;
+        // malformed fails fast; without one the pre-session menu loads the same tree.
+        let assets: Option<ClientAssets>;
+        let chat_font: Option<Font>;
+        let chat_lang: Option<LanguageTable>;
         let mut skin_requests_tx = None;
         let mut skin_updates_rx = None;
         // The sidebar reads the team through the window's own name; the session
@@ -1583,12 +1590,25 @@ impl ClientApp {
                 settings.set_session(session.input_tx.clone());
                 Some(session)
             }
-            None => None,
+            None => {
+                // No `--server` stands the pre-session menu at the first
+                // frame: the assets load here — the font, the language
+                // table, the splash lines and the sheets the menu samples
+                // — like the session branch, and a missing tree fails the
+                // same way. The chat mirror takes the same font and table.
+                let loaded = ClientAssets::load(None)?;
+                chat_font = Some(loaded.font.clone());
+                chat_lang = Some(loaded.lang.clone());
+                assets = Some(loaded);
+                None
+            }
         };
-        // The sound pump opens beside the session: one line when the store's
-        // sounds do not read, then the client keeps running without it.
+        // The sound pump opens beside the assets, for the session and the
+        // pre-session menu alike: the menu's button press plays
+        // `gui.button.press` through it. One line when the store's sounds
+        // do not read, then the client keeps running without it.
         let mut audio = None;
-        if session.is_some() {
+        if assets.is_some() {
             let store_root = assets::default_store_root()?;
             match open_audio(&store_root, audio_dump) {
                 Ok(pump) => audio = Some(pump),
@@ -1613,6 +1633,13 @@ impl ClientApp {
             .as_ref()
             .map(|link| link.server.clone())
             .unwrap_or_default();
+        // The menu's launch seed, drawn once: the splash pick and the logo
+        // seed read one launch stream in the source's order, so the seed is
+        // fixed here and kept for every later standing.
+        let menu_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0xC0FFEE);
         Ok(Self {
             window: None,
             renderer: None,
@@ -1672,6 +1699,7 @@ impl ClientApp {
             ctrl: false,
             held: 0,
             cursor: None,
+            menu_seed,
             opener: Box::new(spawn_url_opener),
             script,
         })
@@ -1955,9 +1983,23 @@ impl ClientApp {
             );
         }
         if session_ended {
-            tracing::info!("the session ended, exiting");
-            event_loop.exit();
-            return;
+            // Disconnect-to-title stands the main menu: the standing rule
+            // only — the disconnect screen with the reason is later work,
+            // and its title button calls the same open. The link drops, the
+            // join flag clears, and the frame below stands and draws the
+            // menu like a sessionless startup.
+            tracing::info!("the session ended, standing the main menu");
+            self.session = None;
+            self.joined = false;
+            self.dead = false;
+            if let Some(assets) = self.assets.as_ref() {
+                self.screens.on_disconnected(
+                    renderer.scaled_resolution(),
+                    &assets.splash_lines,
+                    self.menu_seed,
+                    menu_labels(Some(&assets.lang)),
+                );
+            }
         }
         if script_click {
             // The screen's press, run once the frame's events are in — the
@@ -2118,6 +2160,31 @@ impl ClientApp {
         // the frame's own state. The inventory's effects shift moves the frame
         // right while effects are live (`160 + (width - xSize - 200)/2`); the
         // draws read the origin, so the shift lands before them.
+        // The pre-session menu stands before the open read, so the first
+        // frame already counts it open: no `--server` stands it, the
+        // `--server` route joins and bypasses it. The splash lines are the
+        // assets' own, the seed the launch seed, the labels resolved
+        // through the assets' table.
+        if self.session.is_none() && !self.screens.is_open() {
+            if let Some(assets) = self.assets.as_ref() {
+                self.screens.open_main_menu(
+                    scaled,
+                    &assets.splash_lines,
+                    self.menu_seed,
+                    menu_labels(Some(&assets.lang)),
+                );
+            }
+        }
+        // The menu's sessionless clock: every 50 ms of wall time advances
+        // the panorama clock once, so the menu turns at the source's 20 Hz
+        // with no session behind it — beside the resize re-layout, which
+        // re-runs `initGui`'s button build with the current labels.
+        self.screens.tick_menu_wall(Instant::now());
+        if let Some(menu) = self.screens.menu_mut() {
+            if let Some(assets) = self.assets.as_ref() {
+                menu.set_screen_size(&scaled, menu_labels(Some(&assets.lang)));
+            }
+        }
         let screen_open = self.screens.is_open();
         let effects_shift = matches!(self.screens.current(), Some(ScreenState::Inventory(_)))
             && !self.view.effects().is_empty();
@@ -2267,6 +2334,7 @@ impl ClientApp {
                     renderer.entity_textures(),
                 ),
                 language: self.assets.as_ref().map(|assets| &assets.lang),
+                now_ms: system_time_ms(),
             },
         ));
         // The death view replaces the debug overlay while the player is dead:
@@ -2716,6 +2784,36 @@ impl ClientApp {
         self.cursor = None;
         let step = self.capture.chat_close();
         self.apply_capture(event_loop, step);
+    }
+
+    /// Runs one main-menu press at the free pointer's point: the button
+    /// under it plays the press sound (`GuiButton.playPressSound`) and
+    /// answers its action. Singleplayer records its action and opens
+    /// nothing yet; multiplayer and options await their screens; quit
+    /// closes the window. Empty space answers nothing.
+    fn menu_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .menu_mut()
+            .and_then(|menu| menu.click_at(point));
+        let Some(action) = action else {
+            return;
+        };
+        if let Some(audio) = self.audio.as_mut() {
+            let listener = listener_of(&self.player);
+            audio.engine.play(local_sound_play(
+                BUTTON_PRESS_SOUND.to_string(),
+                listener.pos,
+                1.0,
+                1.0,
+                SoundCategory::Master,
+                listener,
+            ));
+        }
+        match action {
+            MenuAction::Singleplayer | MenuAction::Multiplayer | MenuAction::Options => {}
+            MenuAction::Quit => event_loop.exit(),
+        }
     }
 
     /// Opens the player's own inventory from the window's own key: one C16
@@ -3445,6 +3543,21 @@ impl ClientApp {
             }
             return;
         }
+        // The main menu holds the click the same way: a left press on a
+        // button plays the press sound and runs the button's action
+        // (`GuiScreen.mouseClicked` fires on press; only button 0 reaches
+        // the buttons). Singleplayer answers its action and opens nothing
+        // yet; multiplayer and options await their screens; quit closes the
+        // window. Any other click is the menu's to swallow — the pointer
+        // never grabs behind it.
+        if self.screens.menu_mut().is_some() {
+            if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                if let Some(point) = self.cursor {
+                    self.menu_click(event_loop, point);
+                }
+            }
+            return;
+        }
         if self.on_screen_button(state, button) {
             return;
         }
@@ -4100,9 +4213,9 @@ fn missing_uv(mesh: &MeshAssets) -> [[f32; 2]; 2] {
 /// the clock and the sky to the frame's parameters, and the aim to the
 /// window's own copy.
 ///
-/// Returns whether the session ended, which stops the client. The session
+/// Returns whether the session ended, which stands the main menu. The session
 /// returns `Ok(())` when the server closed the connection, so its end is a
-/// normal exit, not an error.
+/// normal return to title, not an error.
 #[allow(clippy::too_many_arguments)]
 fn apply_session_event(
     renderer: &mut Renderer,
@@ -4828,6 +4941,12 @@ fn screen_button_events(
     level: i32,
     now: u64,
 ) -> Vec<InputEvent> {
+    // The menu's actions are not session inputs: the window's own click
+    // path owns them (press sound plus the action), so the scripted press
+    // answers nothing here while the menu holds the click.
+    if screens.menu_mut().is_some() {
+        return Vec::new();
+    }
     if let Some(screen) = screens.creative_mut() {
         return match state {
             ElementState::Pressed => screen.press(button, shift, &ItemTable, now),

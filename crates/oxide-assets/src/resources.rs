@@ -65,11 +65,21 @@ const UNICODE_PAGE_PREFIX: &str = "font/unicode_page_";
 ///   (`TileEntityChestRenderer.java`:17-19,
 ///   `TileEntityEnderChestRenderer.java`:10) — the names the item model's
 ///   chest resolution carries (`BuiltinItem::icon_sheet`).
+/// - the main menu's sheets — the six `gui/title/background/panorama_N`
+///   faces and the `gui/title/minecraft` logo (`GuiMainMenu.java`'s
+///   `titlePanoramaPaths` and `minecraftTitleTextures`).
 ///
 /// The hud's icon sheet, `gui/icons`, already travels under its own
 /// client-side name and is not repeated here.
-pub const GUI_SHEETS: [&str; 23] = [
+pub const GUI_SHEETS: [&str; 30] = [
     "gui/widgets",
+    "gui/title/background/panorama_0",
+    "gui/title/background/panorama_1",
+    "gui/title/background/panorama_2",
+    "gui/title/background/panorama_3",
+    "gui/title/background/panorama_4",
+    "gui/title/background/panorama_5",
+    "gui/title/minecraft",
     "gui/container/generic_54",
     "gui/container/dispenser",
     "gui/container/hopper",
@@ -363,8 +373,10 @@ mod tests {
     /// `gui/container/creative_inventory/tabs` + `tab_items` +
     /// `tab_item_search` + `tab_inventory`, `gui/book`,
     /// `entity/enchanting_table_book`, `font/ascii_sga`,
-    /// `entity/chest/normal`, `entity/chest/trapped`, `entity/chest/ender` —
-    /// 23 entries, no per-tab `tab_<label>` phantom.
+    /// `entity/chest/normal`, `entity/chest/trapped`, `entity/chest/ender`,
+    /// the six `gui/title/background/panorama_N` faces and
+    /// `gui/title/minecraft` — 30 entries, no per-tab `tab_<label>`
+    /// phantom.
     #[test]
     fn the_gui_sheet_list_names_the_sources_own_sheets() {
         for phantom in [
@@ -389,6 +401,13 @@ mod tests {
             &GUI_SHEETS[..],
             [
                 "gui/widgets",
+                "gui/title/background/panorama_0",
+                "gui/title/background/panorama_1",
+                "gui/title/background/panorama_2",
+                "gui/title/background/panorama_3",
+                "gui/title/background/panorama_4",
+                "gui/title/background/panorama_5",
+                "gui/title/minecraft",
                 "gui/container/generic_54",
                 "gui/container/dispenser",
                 "gui/container/hopper",

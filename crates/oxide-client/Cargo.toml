@@ -30,3 +30,6 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+wgpu.workspace = true

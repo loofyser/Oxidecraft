@@ -351,6 +351,36 @@ pub enum HudDraw {
         /// (`GuiNewChat.java`:84).
         blend: bool,
     },
+    /// One rotated text draw: the [`HudDraw::Text`] shape with the built
+    /// vertices turned about a GUI-space pivot before they land. The main
+    /// menu's splash needs it — the source rotates −20 about Z
+    /// (`GuiMainMenu.drawScreen`:560-567) — and no axis-aligned record can
+    /// carry an angle, so the widgets' finding (no growth needed for them)
+    /// does not extend here: this one variant is the enum's whole growth.
+    RotatedText {
+        /// The draw's legacy `§`-coded text.
+        text: String,
+        /// The pen's start x, in GUI pixels, before the rotation.
+        x: f32,
+        /// The pen's start y, in GUI pixels, before the rotation.
+        y: f32,
+        /// GUI pixels per font pixel.
+        scale: f32,
+        /// The straight (non-premultiplied) RGBA base colour.
+        colour: [f32; 4],
+        /// Whether the darkened shadow copy draws under the text.
+        shadow: bool,
+        /// Whether the draw runs through the pass's `src_alpha` blend (the
+        /// [`HudDraw::Text`] `blend` rule reads the same way).
+        blend: bool,
+        /// The turn in degrees, clockwise-positive in GUI space (y down):
+        /// the splash carries −20.
+        angle_deg: f32,
+        /// The pivot's x in GUI pixels: the rotation's centre.
+        cx: f32,
+        /// The pivot's y in GUI pixels: the rotation's centre.
+        cy: f32,
+    },
     /// One item icon: the stack's own minimal view and the top-left corner of the
     /// source's 16x16 GUI cell (`RenderItem.renderItemAndEffectIntoGUI`'s `(x, y)`,
     /// `RenderItem.java`:399-405).
@@ -555,6 +585,14 @@ fn build(
                     BatchState::Unblended
                 },
             ),
+            HudDraw::RotatedText { blend, .. } => (
+                BatchTexture::Font,
+                if *blend {
+                    BatchState::Blended
+                } else {
+                    BatchState::Unblended
+                },
+            ),
             // The item draws carry their own batches and never reach this key.
             HudDraw::Item { .. } => continue,
             // The crosshair samples the icons sheet through the inverting pipeline.
@@ -611,6 +649,43 @@ fn build(
                 let mut builder = TextBuilder::new();
                 builder.push(text, [*x, *y, 0.0], *scale, *colour, *shadow);
                 let (vertices, indices) = builder.geometry(font, sheet);
+                let base = built.vertices.len() as u32;
+                built.vertices.extend(vertices);
+                built
+                    .indices
+                    .extend(indices.iter().map(|index| index + base));
+                close_batch(&mut built);
+            }
+            HudDraw::RotatedText {
+                text,
+                x,
+                y,
+                scale,
+                colour,
+                shadow,
+                angle_deg,
+                cx,
+                cy,
+                ..
+            } => {
+                let Some((font, sheet)) = font else {
+                    continue;
+                };
+                open_batch(&mut built, texture, state);
+                let mut builder = TextBuilder::new();
+                builder.push(text, [*x, *y, 0.0], *scale, *colour, *shadow);
+                let (mut vertices, indices) = builder.geometry(font, sheet);
+                // The splash's turn about the pivot, in GUI space (y down):
+                // each built vertex turns by the angle around `(cx, cy)`
+                // before it lands, shadow copy included.
+                let turn = angle_deg.to_radians();
+                let (sine, cosine) = turn.sin_cos();
+                for vertex in &mut vertices {
+                    let dx = vertex.position[0] - *cx;
+                    let dy = vertex.position[1] - *cy;
+                    vertex.position[0] = *cx + dx * cosine - dy * sine;
+                    vertex.position[1] = *cy + dx * sine + dy * cosine;
+                }
                 let base = built.vertices.len() as u32;
                 built.vertices.extend(vertices);
                 built

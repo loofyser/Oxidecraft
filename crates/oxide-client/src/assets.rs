@@ -51,6 +51,7 @@ const FONT_SHEET: &str = "font/ascii";
 /// The language file's path below the extraction root: the client's own language
 /// table, which the chat path resolves translation components against.
 const LANG_FILE: &str = "assets/minecraft/lang/en_US.lang";
+const SPLASHES_FILE: &str = "assets/minecraft/texts/splashes.txt";
 /// The sun quad's texture path.
 const SUN: &str = "environment/sun";
 /// The moon phase sheet's texture path.
@@ -365,10 +366,14 @@ pub struct ClientAssets {
     /// enchanted icon sample it.
     pub glint_sheet: Texture,
     /// The GUI sheets, under their own store keys ([`GUI_SHEETS`]): the widgets
-    /// sheet, the container family, the two book sheets, the SGA glyph sheet and
-    /// the chest trio's icon sheets — the keys the screens and the chest item
-    /// model name them.
+    /// sheet, the menu's panorama faces and logo, the container family, the
+    /// two book sheets, the SGA glyph sheet and the chest trio's icon
+    /// sheets — the keys the screens and the chest item model name them.
     pub gui_sheets: Vec<(&'static str, Texture)>,
+    /// The splash lines, from the extraction tree's `texts/splashes.txt`:
+    /// the main menu's pick reads them at startup. A missing file reads
+    /// empty and the menu falls back to its default splash.
+    pub splash_lines: Vec<String>,
     /// The object draws' item mesh source: the baked block models, the sheets and the
     /// frame's wood.
     pub item_meshes: ClientItemMeshes,
@@ -474,13 +479,22 @@ impl ClientAssets {
         // The enchanted glint's sheet: the glint passes of an enchanted icon sample
         // it, under the name the hud's glint registration carries.
         let glint_sheet = texture(&textures, GLINT_SHEET)?.clone();
-        // The GUI sheets: the widgets, the container family, the book sheets, the
-        // SGA glyph sheet and the chest trio's icon sheets, under the keys the
-        // screens and the chest item model name them.
+        // The GUI sheets: the widgets, the menu's panorama faces and logo,
+        // the container family, the book sheets, the SGA glyph sheet and
+        // the chest trio's icon sheets, under the keys the screens and the
+        // chest item model name them.
         let mut gui_sheets = Vec::with_capacity(GUI_SHEETS.len());
         for key in GUI_SHEETS {
             gui_sheets.push((key, texture(&textures, key)?.clone()));
         }
+        // The splash lines beside the language file: the menu's pick reads
+        // them at startup, and a missing file reads empty (the menu's own
+        // default covers it).
+        let splash_lines = std::fs::read_to_string(tree.join(SPLASHES_FILE))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
         // The blocks atlas's level-0 image, under the name the block-item meshes
         // sample; and the item frame's wood, baked from the tree's own model
         // (`RenderItemFrame.java`:37).
@@ -534,6 +548,7 @@ impl ClientAssets {
             pumpkin_blur,
             glint_sheet,
             gui_sheets,
+            splash_lines,
             item_meshes,
             item_icons,
         })
