@@ -29,6 +29,7 @@ use oxide_client::screens::options::{VideoControl, VideoScreen, video_labels};
 use oxide_client::screens::options_chat::{ChatScreen, chat_labels};
 use oxide_client::screens::options_controls::{ControlsScreen, controls_labels};
 use oxide_client::screens::options_language::{LanguageScreen, language_labels};
+use oxide_client::screens::options_packs::{PacksScreen, packs_labels};
 use oxide_client::screens::options_skin::{SkinScreen, skin_labels};
 use oxide_client::screens::options_sound::{SoundScreen, sound_labels};
 use oxide_client::screens::pause::{DIRT_SHEET, dirt_draws};
@@ -522,7 +523,11 @@ fn the_language_frame_at_default_scale() {
         &scaled,
         &GameSettings::default(),
         language_labels(None),
-        &[String::from("en_US")],
+        &[oxide_assets::lang::LanguageInfo {
+            code: String::from("en_US"),
+            name: String::from("English"),
+            region: String::from("US"),
+        }],
     );
     let draws = options_screen_frame_draws(screen.draws(
         &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
@@ -539,8 +544,8 @@ fn the_language_frame_at_default_scale() {
     assert!(
         draws
             .iter()
-            .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "en_US")),
-        "today's locale set draws its one slot"
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "English (US)")),
+        "the loader's locale row draws its display string"
     );
     let pixels = render_screen_frame(&draws);
     let ink = title_ink_in(&pixels, 16);
@@ -618,6 +623,37 @@ fn the_skin_frame_at_default_scale() {
     let ink = title_ink_in(&pixels, 20);
     assert!(ink > 100, "the title inks white pixels at y 20: {ink}");
     expect_options_pixel(&pixels, 75, 44, [200, 200, 200], "the idle row-0 strip");
+}
+/// The packs frame at the default scale: the "Select Resource Packs" title
+/// inks white at y 16, the default entry draws in the selected list, and
+/// the idle Done strip draws.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_packs_frame_at_default_scale() {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    let screen = PacksScreen::new(&scaled, packs_labels(None));
+    let draws = options_screen_frame_draws(screen.draws(
+        &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
+        &scaled,
+        None,
+    ));
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, y, .. }
+            if text == "Select Resource Packs" && *y == 16.0)),
+        "the centred title draws at (w/2, 16)"
+    );
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "Default")),
+        "the selected list holds the default entry"
+    );
+    let pixels = render_screen_frame(&draws);
+    let ink = title_ink_in(&pixels, 16);
+    assert!(ink > 100, "the title inks white pixels at y 16: {ink}");
+    expect_options_pixel(&pixels, 75, 215, [200, 200, 200], "the idle Done strip");
 }
 /// The video frame's own draws at the probe size: the dirt tiles lead, the
 /// frame's world-present gradient pair falls over them, and the centred

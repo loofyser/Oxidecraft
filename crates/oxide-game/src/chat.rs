@@ -801,10 +801,9 @@ fn append_legacy(component: &TextComponent, out: &mut String) {
 /// as the store's `en_US.lang` carries them (`StringTranslate`; the chat
 /// keys at `:227-235`).
 ///
-/// The loader is this scoped round's own — the chat path resolves against
-/// it, and the full language surface is a later milestone's. The numeric
-/// placeholders the source's own load rewrites (`StringTranslate.java`:50)
-/// are that later surface's too: every chat key uses `%s`.
+/// The parse is the assets crate's loader ([`oxide_assets::lang`]): this
+/// table wraps it, so the `%d`/`%f`→`%s` rewrite (`Locale.java`:111) rides
+/// every load and no parallel parser drifts beside it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LanguageTable {
     entries: std::collections::HashMap<String, String>,
@@ -816,20 +815,15 @@ impl LanguageTable {
         Self::default()
     }
 
-    /// Parses one `.lang` file's contents the way the source's own load does
-    /// (`StringTranslate.java`:41-54): one `key=value` per line, split at
-    /// the first `=`, `#` comment lines and blanks skipped, nothing trimmed.
+    /// Parses one `.lang` file's contents through the assets crate's loader
+    /// ([`oxide_assets::lang::parse_lang`], the source's own rules at
+    /// `Locale.java`:100-116 incl. the numeric-placeholder rewrite): one
+    /// `key=value` per line, split at the first `=`, `#` comment lines and
+    /// blanks skipped, nothing trimmed.
     pub fn from_lang(text: &str) -> Self {
-        let mut entries = std::collections::HashMap::new();
-        for line in text.lines() {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                entries.insert(key.to_owned(), value.to_owned());
-            }
+        Self {
+            entries: oxide_assets::lang::parse_lang(text),
         }
-        Self { entries }
     }
 
     /// The template a key resolves to, when the table holds it; a missing
@@ -847,6 +841,16 @@ impl LanguageTable {
     /// Whether the table holds no keys.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+impl From<oxide_assets::lang::Lang> for LanguageTable {
+    /// Carries a loaded table into the chat path's own type: every entry
+    /// stands, the loader's key passthrough stays the callers'.
+    fn from(loaded: oxide_assets::lang::Lang) -> Self {
+        Self {
+            entries: loaded.into_entries(),
+        }
     }
 }
 

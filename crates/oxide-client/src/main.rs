@@ -76,6 +76,7 @@ use oxide_client::screens::options::{
 use oxide_client::screens::options_chat::{ChatAction, chat_labels};
 use oxide_client::screens::options_controls::{ControlsAction, controls_labels};
 use oxide_client::screens::options_language::{LanguageAction, language_labels};
+use oxide_client::screens::options_packs::{PacksAction, packs_labels};
 use oxide_client::screens::options_skin::{SkinAction, skin_labels};
 use oxide_client::screens::options_sound::{SoundAction, sound_labels};
 use oxide_client::screens::pause::{
@@ -3771,15 +3772,14 @@ impl ClientApp {
             OptionsAction::Language => self.open_language(),
             OptionsAction::Chat => self.open_chat_options(),
             OptionsAction::Skin => self.open_skin(),
+            OptionsAction::ResourcePacks => self.open_packs(),
             OptionsAction::Snooper => self.open_snooper_from_options(),
             OptionsAction::Done => {
                 if !self.screens.back_to_pause() {
                     self.close_screen(event_loop);
                 }
             }
-            OptionsAction::FovChanged
-            | OptionsAction::RealmsToggled
-            | OptionsAction::ResourcePacks => {}
+            OptionsAction::FovChanged | OptionsAction::RealmsToggled => {}
         }
     }
 
@@ -3853,10 +3853,10 @@ impl ClientApp {
     }
 
     /// Stands the language screen from the hub's language button (102) over
-    /// today's available set: the store's own locale — `en_US` until the
-    /// Task 26 loader lands more — with the labels resolving through the
-    /// assets' table at the renderer's scaled size, and the hub stashing as
-    /// the parent. In-client, no send.
+    /// the loader's locale list: the store's locales sorted by code with
+    /// rows reading `name (region)`, labels resolving through the assets'
+    /// table at the renderer's scaled size, and the hub stashing as the
+    /// parent. In-client, no send.
     fn open_language(&mut self) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
@@ -3867,9 +3867,25 @@ impl ClientApp {
         };
         let labels = language_labels(Some(&assets.lang));
         let settings = self.settings.settings().clone();
-        let locales = [settings.language.clone()];
+        let locales = assets.locales.clone();
         self.screens
             .open_language_from_options(scaled, &settings, labels, &locales);
+    }
+
+    /// Stands the resource-packs screen from the hub's packs button (105):
+    /// the recorded no-op surface over the assets' labels at the
+    /// renderer's scaled size, the hub stashing as the parent its Done
+    /// button returns to without applying. In-client, no send.
+    fn open_packs(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = packs_labels(Some(&assets.lang));
+        self.screens.open_packs_from_options(scaled, labels);
     }
 
     /// Stands the chat-options screen from the hub's chat button (103): the
@@ -3950,6 +3966,8 @@ impl ClientApp {
             self.chat_options_click(event_loop, point);
         } else if self.screens.skin_mut().is_some() {
             self.skin_click(event_loop, point);
+        } else if self.screens.packs_mut().is_some() {
+            self.packs_click(event_loop, point);
         } else if self.screens.snooper_mut().is_some() {
             self.snooper_click(event_loop, point);
         }
@@ -4088,6 +4106,28 @@ impl ClientApp {
         }
     }
 
+    /// Runs one packs press at the free pointer's point: Open Folder
+    /// records its press and opens nothing, Done answers the hub without
+    /// applying — the `:167-201` arm is absent by the §16 rule, so no
+    /// press writes settings and no resource reload follows. Every
+    /// answered press plays the press sound and folds the debounced mark.
+    /// Empty space answers nothing.
+    fn packs_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .packs_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action == PacksAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
     /// Runs one video press at the free pointer's point: the control under
     /// it plays the press sound, writes the live settings, pushes them
     /// through apply, and folds the save rule. A GUI-scale cycle applies
@@ -4138,8 +4178,9 @@ impl ClientApp {
                 language: language_labels(Some(&assets.lang)),
                 chat: chat_labels(Some(&assets.lang)),
                 skin: skin_labels(Some(&assets.lang)),
+                packs: packs_labels(Some(&assets.lang)),
                 vbo_supported: true,
-                locales: vec![settings.language.clone()],
+                locales: assets.locales.clone(),
             },
         );
     }

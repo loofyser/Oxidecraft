@@ -18,6 +18,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 1,
         name: "Stone",
+        key: Some("tile.stone.stone.name"),
         resolution: ItemModel::Block("block/stone"),
         max_stack: 64,
         max_damage: 0,
@@ -27,6 +28,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2,
         name: "Grass Block",
+        key: Some("tile.grass.name"),
         resolution: ItemModel::Block("block/grass_normal"),
         max_stack: 64,
         max_damage: 0,
@@ -36,6 +38,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 3,
         name: "Dirt",
+        key: Some("tile.dirt.default.name"),
         resolution: ItemModel::Block("block/dirt"),
         max_stack: 64,
         max_damage: 0,
@@ -45,6 +48,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 4,
         name: "Cobblestone",
+        key: Some("tile.stonebrick.name"),
         resolution: ItemModel::Block("block/cobblestone"),
         max_stack: 64,
         max_damage: 0,
@@ -54,6 +58,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 5,
         name: "Oak Wood Planks",
+        key: Some("tile.wood.oak.name"),
         resolution: ItemModel::Block("block/oak_planks"),
         max_stack: 64,
         max_damage: 0,
@@ -63,6 +68,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 6,
         name: "Oak Sapling",
+        key: Some("tile.sapling.oak.name"),
         resolution: ItemModel::Generated(&["blocks/sapling_oak"]),
         max_stack: 64,
         max_damage: 0,
@@ -72,6 +78,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 7,
         name: "Bedrock",
+        key: Some("tile.bedrock.name"),
         resolution: ItemModel::Block("block/bedrock"),
         max_stack: 64,
         max_damage: 0,
@@ -81,6 +88,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 12,
         name: "Sand",
+        key: Some("tile.sand.default.name"),
         resolution: ItemModel::Block("block/sand"),
         max_stack: 64,
         max_damage: 0,
@@ -90,6 +98,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 13,
         name: "Gravel",
+        key: Some("tile.gravel.name"),
         resolution: ItemModel::Block("block/gravel"),
         max_stack: 64,
         max_damage: 0,
@@ -99,6 +108,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 14,
         name: "Gold Ore",
+        key: Some("tile.oreGold.name"),
         resolution: ItemModel::Block("block/gold_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -108,6 +118,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 15,
         name: "Iron Ore",
+        key: Some("tile.oreIron.name"),
         resolution: ItemModel::Block("block/iron_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -117,6 +128,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 16,
         name: "Coal Ore",
+        key: Some("tile.oreCoal.name"),
         resolution: ItemModel::Block("block/coal_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -126,6 +138,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 17,
         name: "Oak Wood",
+        key: Some("tile.log.oak.name"),
         resolution: ItemModel::Block("block/oak_log"),
         max_stack: 64,
         max_damage: 0,
@@ -135,6 +148,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 18,
         name: "Oak Leaves",
+        key: Some("tile.leaves.oak.name"),
         resolution: ItemModel::Block("block/oak_leaves"),
         max_stack: 64,
         max_damage: 0,
@@ -144,6 +158,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 19,
         name: "Sponge",
+        key: Some("tile.sponge.dry.name"),
         resolution: ItemModel::Block("block/sponge"),
         max_stack: 64,
         max_damage: 0,
@@ -153,6 +168,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 20,
         name: "Glass",
+        key: Some("tile.glass.name"),
         resolution: ItemModel::Block("block/glass"),
         max_stack: 64,
         max_damage: 0,
@@ -162,6 +178,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 21,
         name: "Lapis Lazuli Ore",
+        key: Some("tile.oreLapis.name"),
         resolution: ItemModel::Block("block/lapis_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -171,6 +188,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 22,
         name: "Lapis Lazuli Block",
+        key: Some("tile.blockLapis.name"),
         resolution: ItemModel::Block("block/lapis_block"),
         max_stack: 64,
         max_damage: 0,
@@ -180,6 +198,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 23,
         name: "Dispenser",
+        key: Some("tile.dispenser.name"),
         resolution: ItemModel::Block("block/dispenser"),
         max_stack: 64,
         max_damage: 0,
@@ -189,6 +208,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 24,
         name: "Sandstone",
+        key: Some("tile.sandStone.default.name"),
         resolution: ItemModel::Block("block/sandstone_normal"),
         max_stack: 64,
         max_damage: 0,
@@ -198,6 +218,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 25,
         name: "Note Block",
+        key: Some("tile.musicBlock.name"),
         resolution: ItemModel::Block("block/noteblock"),
         max_stack: 64,
         max_damage: 0,
@@ -207,6 +228,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 27,
         name: "Powered Rail",
+        key: Some("tile.goldenRail.name"),
         resolution: ItemModel::Generated(&["blocks/rail_golden"]),
         max_stack: 64,
         max_damage: 0,
@@ -216,6 +238,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 28,
         name: "Detector Rail",
+        key: Some("tile.detectorRail.name"),
         resolution: ItemModel::Generated(&["blocks/rail_detector"]),
         max_stack: 64,
         max_damage: 0,
@@ -225,6 +248,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 29,
         name: "Sticky Piston",
+        key: Some("tile.pistonStickyBase.name"),
         resolution: ItemModel::Block("block/piston_inventory_sticky"),
         max_stack: 64,
         max_damage: 0,
@@ -234,6 +258,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 30,
         name: "Cobweb",
+        key: Some("tile.web.name"),
         resolution: ItemModel::Generated(&["blocks/web"]),
         max_stack: 64,
         max_damage: 0,
@@ -243,6 +268,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 31,
         name: "Shrub",
+        key: Some("tile.tallgrass.shrub.name"),
         resolution: ItemModel::Generated(&["blocks/deadbush"]),
         max_stack: 64,
         max_damage: 0,
@@ -252,6 +278,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 32,
         name: "Dead Bush",
+        key: Some("tile.deadbush.name"),
         resolution: ItemModel::Generated(&["blocks/deadbush"]),
         max_stack: 64,
         max_damage: 0,
@@ -261,6 +288,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 33,
         name: "Piston",
+        key: Some("tile.pistonBase.name"),
         resolution: ItemModel::Block("block/piston_inventory_normal"),
         max_stack: 64,
         max_damage: 0,
@@ -270,6 +298,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 35,
         name: "Wool",
+        key: Some("tile.cloth.white.name"),
         resolution: ItemModel::Block("block/white_wool"),
         max_stack: 64,
         max_damage: 0,
@@ -279,6 +308,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 37,
         name: "Dandelion",
+        key: Some("tile.flower1.dandelion.name"),
         resolution: ItemModel::Generated(&["blocks/flower_dandelion"]),
         max_stack: 64,
         max_damage: 0,
@@ -288,6 +318,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 38,
         name: "Poppy",
+        key: Some("tile.flower2.poppy.name"),
         resolution: ItemModel::Generated(&["blocks/flower_rose"]),
         max_stack: 64,
         max_damage: 0,
@@ -297,6 +328,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 39,
         name: "Mushroom",
+        key: Some("tile.mushroom.name"),
         resolution: ItemModel::Generated(&["blocks/mushroom_brown"]),
         max_stack: 64,
         max_damage: 0,
@@ -306,6 +338,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 40,
         name: "Mushroom",
+        key: Some("tile.mushroom.name"),
         resolution: ItemModel::Generated(&["blocks/mushroom_red"]),
         max_stack: 64,
         max_damage: 0,
@@ -315,6 +348,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 41,
         name: "Block of Gold",
+        key: Some("tile.blockGold.name"),
         resolution: ItemModel::Block("block/gold_block"),
         max_stack: 64,
         max_damage: 0,
@@ -324,6 +358,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 42,
         name: "Block of Iron",
+        key: Some("tile.blockIron.name"),
         resolution: ItemModel::Block("block/iron_block"),
         max_stack: 64,
         max_damage: 0,
@@ -333,6 +368,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 44,
         name: "Stone Slab",
+        key: Some("tile.stoneSlab.stone.name"),
         resolution: ItemModel::Block("block/half_slab_stone"),
         max_stack: 64,
         max_damage: 0,
@@ -342,6 +378,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 45,
         name: "Bricks",
+        key: Some("tile.brick.name"),
         resolution: ItemModel::Block("block/brick"),
         max_stack: 64,
         max_damage: 0,
@@ -351,6 +388,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 46,
         name: "TNT",
+        key: Some("tile.tnt.name"),
         resolution: ItemModel::Block("block/tnt"),
         max_stack: 64,
         max_damage: 0,
@@ -360,6 +398,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 47,
         name: "Bookshelf",
+        key: Some("tile.bookshelf.name"),
         resolution: ItemModel::Block("block/bookshelf"),
         max_stack: 64,
         max_damage: 0,
@@ -369,6 +408,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 48,
         name: "Moss Stone",
+        key: Some("tile.stoneMoss.name"),
         resolution: ItemModel::Block("block/mossy_cobblestone"),
         max_stack: 64,
         max_damage: 0,
@@ -378,6 +418,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 49,
         name: "Obsidian",
+        key: Some("tile.obsidian.name"),
         resolution: ItemModel::Block("block/obsidian"),
         max_stack: 64,
         max_damage: 0,
@@ -387,6 +428,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 50,
         name: "Torch",
+        key: Some("tile.torch.name"),
         resolution: ItemModel::Generated(&["blocks/torch_on"]),
         max_stack: 64,
         max_damage: 0,
@@ -396,6 +438,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 52,
         name: "Monster Spawner",
+        key: Some("tile.mobSpawner.name"),
         resolution: ItemModel::Block("block/mob_spawner_cage"),
         max_stack: 64,
         max_damage: 0,
@@ -405,6 +448,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 53,
         name: "Oak Wood Stairs",
+        key: Some("tile.stairsWood.name"),
         resolution: ItemModel::Block("block/oak_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -414,6 +458,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 54,
         name: "Chest",
+        key: Some("tile.chest.name"),
         resolution: ItemModel::Builtin(BuiltinItem::Chest),
         max_stack: 64,
         max_damage: 0,
@@ -423,6 +468,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 56,
         name: "Diamond Ore",
+        key: Some("tile.oreDiamond.name"),
         resolution: ItemModel::Block("block/diamond_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -432,6 +478,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 57,
         name: "Block of Diamond",
+        key: Some("tile.blockDiamond.name"),
         resolution: ItemModel::Block("block/diamond_block"),
         max_stack: 64,
         max_damage: 0,
@@ -441,6 +488,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 58,
         name: "Crafting Table",
+        key: Some("tile.workbench.name"),
         resolution: ItemModel::Block("block/crafting_table"),
         max_stack: 64,
         max_damage: 0,
@@ -450,6 +498,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 60,
         name: "Farmland",
+        key: Some("tile.farmland.name"),
         resolution: ItemModel::Block("block/farmland_dry"),
         max_stack: 64,
         max_damage: 0,
@@ -459,6 +508,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 61,
         name: "Furnace",
+        key: Some("tile.furnace.name"),
         resolution: ItemModel::Block("block/furnace"),
         max_stack: 64,
         max_damage: 0,
@@ -468,6 +518,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 62,
         name: "Furnace",
+        key: Some("tile.furnace.name"),
         resolution: ItemModel::Block("block/lit_furnace"),
         max_stack: 64,
         max_damage: 0,
@@ -477,6 +528,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 65,
         name: "Ladder",
+        key: Some("tile.ladder.name"),
         resolution: ItemModel::Generated(&["blocks/ladder"]),
         max_stack: 64,
         max_damage: 0,
@@ -486,6 +538,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 66,
         name: "Rail",
+        key: Some("tile.rail.name"),
         resolution: ItemModel::Generated(&["blocks/rail_normal"]),
         max_stack: 64,
         max_damage: 0,
@@ -495,6 +548,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 67,
         name: "Cobblestone Stairs",
+        key: Some("tile.stairsStone.name"),
         resolution: ItemModel::Block("block/stone_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -504,6 +558,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 69,
         name: "Lever",
+        key: Some("tile.lever.name"),
         resolution: ItemModel::Generated(&["blocks/lever"]),
         max_stack: 64,
         max_damage: 0,
@@ -513,6 +568,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 70,
         name: "Stone Pressure Plate",
+        key: Some("tile.pressurePlateStone.name"),
         resolution: ItemModel::Block("block/stone_pressure_plate_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -522,6 +578,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 72,
         name: "Wooden Pressure Plate",
+        key: Some("tile.pressurePlateWood.name"),
         resolution: ItemModel::Block("block/wooden_pressure_plate_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -531,6 +588,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 73,
         name: "Redstone Ore",
+        key: Some("tile.oreRedstone.name"),
         resolution: ItemModel::Block("block/redstone_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -540,6 +598,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 76,
         name: "Redstone Torch",
+        key: Some("tile.notGate.name"),
         resolution: ItemModel::Generated(&["blocks/redstone_torch_on"]),
         max_stack: 64,
         max_damage: 0,
@@ -549,6 +608,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 77,
         name: "Button",
+        key: Some("tile.button.name"),
         resolution: ItemModel::Block("block/stone_button_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -558,6 +618,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 78,
         name: "Snow",
+        key: Some("tile.snow.name"),
         resolution: ItemModel::Block("block/snow_height2"),
         max_stack: 64,
         max_damage: 0,
@@ -567,6 +628,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 79,
         name: "Ice",
+        key: Some("tile.ice.name"),
         resolution: ItemModel::Block("block/ice"),
         max_stack: 64,
         max_damage: 0,
@@ -576,6 +638,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 80,
         name: "Snow",
+        key: Some("tile.snow.name"),
         resolution: ItemModel::Block("block/snow"),
         max_stack: 64,
         max_damage: 0,
@@ -585,6 +648,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 81,
         name: "Cactus",
+        key: Some("tile.cactus.name"),
         resolution: ItemModel::Block("block/cactus"),
         max_stack: 64,
         max_damage: 0,
@@ -594,6 +658,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 82,
         name: "Clay",
+        key: Some("tile.clay.name"),
         resolution: ItemModel::Block("block/clay"),
         max_stack: 64,
         max_damage: 0,
@@ -603,6 +668,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 84,
         name: "Jukebox",
+        key: Some("tile.jukebox.name"),
         resolution: ItemModel::Block("block/jukebox"),
         max_stack: 64,
         max_damage: 0,
@@ -612,6 +678,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 85,
         name: "Oak Fence",
+        key: Some("tile.fence.name"),
         resolution: ItemModel::Block("block/oak_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -621,6 +688,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 86,
         name: "Pumpkin",
+        key: Some("tile.pumpkin.name"),
         resolution: ItemModel::Block("block/pumpkin"),
         max_stack: 64,
         max_damage: 0,
@@ -630,6 +698,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 87,
         name: "Netherrack",
+        key: Some("tile.hellrock.name"),
         resolution: ItemModel::Block("block/netherrack"),
         max_stack: 64,
         max_damage: 0,
@@ -639,6 +708,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 88,
         name: "Soul Sand",
+        key: Some("tile.hellsand.name"),
         resolution: ItemModel::Block("block/soul_sand"),
         max_stack: 64,
         max_damage: 0,
@@ -648,6 +718,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 89,
         name: "Glowstone",
+        key: Some("tile.lightgem.name"),
         resolution: ItemModel::Block("block/glowstone"),
         max_stack: 64,
         max_damage: 0,
@@ -657,6 +728,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 91,
         name: "Jack o'Lantern",
+        key: Some("tile.litpumpkin.name"),
         resolution: ItemModel::Block("block/lit_pumpkin"),
         max_stack: 64,
         max_damage: 0,
@@ -666,6 +738,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 95,
         name: "White Stained Glass",
+        key: Some("tile.stainedGlass.white.name"),
         resolution: ItemModel::Block("block/glass_white"),
         max_stack: 64,
         max_damage: 0,
@@ -675,6 +748,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 96,
         name: "Wooden Trapdoor",
+        key: Some("tile.trapdoor.name"),
         resolution: ItemModel::Block("block/wooden_trapdoor_bottom"),
         max_stack: 64,
         max_damage: 0,
@@ -684,6 +758,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 97,
         name: "Stone Monster Egg",
+        key: Some("tile.monsterStoneEgg.stone.name"),
         resolution: ItemModel::Block("block/stone"),
         max_stack: 64,
         max_damage: 0,
@@ -693,6 +768,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 98,
         name: "Stone Bricks",
+        key: Some("tile.stonebricksmooth.default.name"),
         resolution: ItemModel::Block("block/stonebrick_normal"),
         max_stack: 64,
         max_damage: 0,
@@ -702,6 +778,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 99,
         name: "Mushroom",
+        key: Some("tile.mushroom.name"),
         resolution: ItemModel::Block("block/brown_mushroom_block_cap_all"),
         max_stack: 64,
         max_damage: 0,
@@ -711,6 +788,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 100,
         name: "Mushroom",
+        key: Some("tile.mushroom.name"),
         resolution: ItemModel::Block("block/red_mushroom_block_cap_all"),
         max_stack: 64,
         max_damage: 0,
@@ -720,6 +798,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 101,
         name: "Iron Bars",
+        key: Some("tile.fenceIron.name"),
         resolution: ItemModel::Generated(&["blocks/iron_bars"]),
         max_stack: 64,
         max_damage: 0,
@@ -729,6 +808,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 102,
         name: "Glass Pane",
+        key: Some("tile.thinGlass.name"),
         resolution: ItemModel::Generated(&["blocks/glass"]),
         max_stack: 64,
         max_damage: 0,
@@ -738,6 +818,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 103,
         name: "Melon",
+        key: Some("tile.melon.name"),
         resolution: ItemModel::Block("block/melon"),
         max_stack: 64,
         max_damage: 0,
@@ -747,6 +828,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 106,
         name: "Vines",
+        key: Some("tile.vine.name"),
         resolution: ItemModel::Generated(&["blocks/vine"]),
         max_stack: 64,
         max_damage: 0,
@@ -756,6 +838,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 107,
         name: "Oak Fence Gate",
+        key: Some("tile.fenceGate.name"),
         resolution: ItemModel::Block("block/oak_fence_gate_closed"),
         max_stack: 64,
         max_damage: 0,
@@ -765,6 +848,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 108,
         name: "Brick Stairs",
+        key: Some("tile.stairsBrick.name"),
         resolution: ItemModel::Block("block/brick_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -774,6 +858,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 109,
         name: "Stone Brick Stairs",
+        key: Some("tile.stairsStoneBrickSmooth.name"),
         resolution: ItemModel::Block("block/stone_brick_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -783,6 +868,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 110,
         name: "Mycelium",
+        key: Some("tile.mycel.name"),
         resolution: ItemModel::Block("block/mycelium"),
         max_stack: 64,
         max_damage: 0,
@@ -792,6 +878,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 111,
         name: "Lily Pad",
+        key: Some("tile.waterlily.name"),
         resolution: ItemModel::Generated(&["blocks/waterlily"]),
         max_stack: 64,
         max_damage: 0,
@@ -801,6 +888,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 112,
         name: "Nether Brick",
+        key: Some("tile.netherBrick.name"),
         resolution: ItemModel::Block("block/nether_brick"),
         max_stack: 64,
         max_damage: 0,
@@ -810,6 +898,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 113,
         name: "Nether Brick Fence",
+        key: Some("tile.netherFence.name"),
         resolution: ItemModel::Block("block/nether_brick_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -819,6 +908,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 114,
         name: "Nether Brick Stairs",
+        key: Some("tile.stairsNetherBrick.name"),
         resolution: ItemModel::Block("block/nether_brick_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -828,6 +918,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 116,
         name: "Enchantment Table",
+        key: Some("tile.enchantmentTable.name"),
         resolution: ItemModel::Block("block/enchanting_table_base"),
         max_stack: 64,
         max_damage: 0,
@@ -837,6 +928,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 120,
         name: "End Portal",
+        key: Some("tile.endPortalFrame.name"),
         resolution: ItemModel::Block("block/end_portal_frame_empty"),
         max_stack: 64,
         max_damage: 0,
@@ -846,6 +938,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 121,
         name: "End Stone",
+        key: Some("tile.whiteStone.name"),
         resolution: ItemModel::Block("block/end_stone"),
         max_stack: 64,
         max_damage: 0,
@@ -855,6 +948,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 122,
         name: "Dragon Egg",
+        key: Some("tile.dragonEgg.name"),
         resolution: ItemModel::Block("block/dragon_egg"),
         max_stack: 64,
         max_damage: 0,
@@ -864,6 +958,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 123,
         name: "Redstone Lamp",
+        key: Some("tile.redstoneLight.name"),
         resolution: ItemModel::Block("block/unlit_redstone_lamp"),
         max_stack: 64,
         max_damage: 0,
@@ -873,6 +968,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 126,
         name: "Oak Wood Slab",
+        key: Some("tile.woodSlab.oak.name"),
         resolution: ItemModel::Block("block/half_slab_oak"),
         max_stack: 64,
         max_damage: 0,
@@ -882,6 +978,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 128,
         name: "Sandstone Stairs",
+        key: Some("tile.stairsSandStone.name"),
         resolution: ItemModel::Block("block/sandstone_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -891,6 +988,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 129,
         name: "Emerald Ore",
+        key: Some("tile.oreEmerald.name"),
         resolution: ItemModel::Block("block/emerald_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -900,6 +998,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 130,
         name: "Ender Chest",
+        key: Some("tile.enderChest.name"),
         resolution: ItemModel::Builtin(BuiltinItem::EnderChest),
         max_stack: 64,
         max_damage: 0,
@@ -909,6 +1008,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 131,
         name: "Tripwire Hook",
+        key: Some("tile.tripWireSource.name"),
         resolution: ItemModel::Generated(&["blocks/trip_wire_source"]),
         max_stack: 64,
         max_damage: 0,
@@ -918,6 +1018,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 133,
         name: "Block of Emerald",
+        key: Some("tile.blockEmerald.name"),
         resolution: ItemModel::Block("block/emerald_block"),
         max_stack: 64,
         max_damage: 0,
@@ -927,6 +1028,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 134,
         name: "Spruce Wood Stairs",
+        key: Some("tile.stairsWoodSpruce.name"),
         resolution: ItemModel::Block("block/spruce_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -936,6 +1038,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 135,
         name: "Birch Wood Stairs",
+        key: Some("tile.stairsWoodBirch.name"),
         resolution: ItemModel::Block("block/birch_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -945,6 +1048,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 136,
         name: "Jungle Wood Stairs",
+        key: Some("tile.stairsWoodJungle.name"),
         resolution: ItemModel::Block("block/jungle_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -954,6 +1058,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 137,
         name: "Command Block",
+        key: Some("tile.commandBlock.name"),
         resolution: ItemModel::Block("block/command_block"),
         max_stack: 64,
         max_damage: 0,
@@ -963,6 +1068,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 138,
         name: "Beacon",
+        key: Some("tile.beacon.name"),
         resolution: ItemModel::Block("block/beacon"),
         max_stack: 64,
         max_damage: 0,
@@ -972,6 +1078,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 139,
         name: "Cobblestone Wall",
+        key: Some("tile.cobbleWall.normal.name"),
         resolution: ItemModel::Block("block/cobblestone_wall_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -981,6 +1088,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 143,
         name: "Button",
+        key: Some("tile.button.name"),
         resolution: ItemModel::Block("block/wooden_button_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -990,6 +1098,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 145,
         name: "Anvil",
+        key: Some("tile.anvil.intact.name"),
         resolution: ItemModel::Block("block/anvil_undamaged"),
         max_stack: 64,
         max_damage: 0,
@@ -999,6 +1108,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 146,
         name: "Trapped Chest",
+        key: Some("tile.chestTrap.name"),
         resolution: ItemModel::Builtin(BuiltinItem::TrappedChest),
         max_stack: 64,
         max_damage: 0,
@@ -1008,6 +1118,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 147,
         name: "Weighted Pressure Plate (Light)",
+        key: Some("tile.weightedPlate_light.name"),
         resolution: ItemModel::Block("block/light_pressure_plate_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1017,6 +1128,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 148,
         name: "Weighted Pressure Plate (Heavy)",
+        key: Some("tile.weightedPlate_heavy.name"),
         resolution: ItemModel::Block("block/heavy_pressure_plate_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1026,6 +1138,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 151,
         name: "Daylight Sensor",
+        key: Some("tile.daylightDetector.name"),
         resolution: ItemModel::Block("block/daylight_detector"),
         max_stack: 64,
         max_damage: 0,
@@ -1035,6 +1148,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 152,
         name: "Block of Redstone",
+        key: Some("tile.blockRedstone.name"),
         resolution: ItemModel::Block("block/redstone_block"),
         max_stack: 64,
         max_damage: 0,
@@ -1044,6 +1158,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 153,
         name: "Nether Quartz Ore",
+        key: Some("tile.netherquartz.name"),
         resolution: ItemModel::Block("block/quartz_ore"),
         max_stack: 64,
         max_damage: 0,
@@ -1053,6 +1168,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 154,
         name: "Hopper",
+        key: Some("tile.hopper.name"),
         resolution: ItemModel::Generated(&["items/hopper"]),
         max_stack: 64,
         max_damage: 0,
@@ -1062,6 +1178,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 155,
         name: "Block of Quartz",
+        key: Some("tile.quartzBlock.default.name"),
         resolution: ItemModel::Block("block/quartz_normal"),
         max_stack: 64,
         max_damage: 0,
@@ -1071,6 +1188,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 156,
         name: "Quartz Stairs",
+        key: Some("tile.stairsQuartz.name"),
         resolution: ItemModel::Block("block/quartz_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -1080,6 +1198,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 157,
         name: "Activator Rail",
+        key: Some("tile.activatorRail.name"),
         resolution: ItemModel::Generated(&["blocks/rail_activator"]),
         max_stack: 64,
         max_damage: 0,
@@ -1089,6 +1208,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 158,
         name: "Dropper",
+        key: Some("tile.dropper.name"),
         resolution: ItemModel::Block("block/dropper"),
         max_stack: 64,
         max_damage: 0,
@@ -1098,6 +1218,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 159,
         name: "White Stained Clay",
+        key: Some("tile.clayHardenedStained.white.name"),
         resolution: ItemModel::Block("block/hardened_clay_white"),
         max_stack: 64,
         max_damage: 0,
@@ -1107,6 +1228,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 160,
         name: "White Stained Glass Pane",
+        key: Some("tile.thinStainedGlass.white.name"),
         resolution: ItemModel::Generated(&["blocks/glass_white"]),
         max_stack: 64,
         max_damage: 0,
@@ -1116,6 +1238,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 161,
         name: "Acacia Leaves",
+        key: Some("tile.leaves.acacia.name"),
         resolution: ItemModel::Block("block/acacia_leaves"),
         max_stack: 64,
         max_damage: 0,
@@ -1125,6 +1248,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 162,
         name: "Acacia Wood",
+        key: Some("tile.log.acacia.name"),
         resolution: ItemModel::Block("block/acacia_log"),
         max_stack: 64,
         max_damage: 0,
@@ -1134,6 +1258,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 163,
         name: "Acacia Wood Stairs",
+        key: Some("tile.stairsWoodAcacia.name"),
         resolution: ItemModel::Block("block/acacia_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -1143,6 +1268,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 164,
         name: "Dark Oak Wood Stairs",
+        key: Some("tile.stairsWoodDarkOak.name"),
         resolution: ItemModel::Block("block/dark_oak_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -1152,6 +1278,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 165,
         name: "Slime Block",
+        key: Some("tile.slime.name"),
         resolution: ItemModel::Block("block/slime"),
         max_stack: 64,
         max_damage: 0,
@@ -1161,6 +1288,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 166,
         name: "Barrier",
+        key: Some("tile.barrier.name"),
         resolution: ItemModel::Generated(&["items/barrier"]),
         max_stack: 64,
         max_damage: 0,
@@ -1170,6 +1298,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 167,
         name: "Iron Trapdoor",
+        key: Some("tile.ironTrapdoor.name"),
         resolution: ItemModel::Block("block/iron_trapdoor_bottom"),
         max_stack: 64,
         max_damage: 0,
@@ -1179,6 +1308,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 168,
         name: "Prismarine",
+        key: Some("tile.prismarine.rough.name"),
         resolution: ItemModel::Block("block/prismarine_rough"),
         max_stack: 64,
         max_damage: 0,
@@ -1188,6 +1318,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 169,
         name: "Sea Lantern",
+        key: Some("tile.seaLantern.name"),
         resolution: ItemModel::Block("block/sea_lantern"),
         max_stack: 64,
         max_damage: 0,
@@ -1197,6 +1328,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 170,
         name: "Hay Bale",
+        key: Some("tile.hayBlock.name"),
         resolution: ItemModel::Block("block/hay"),
         max_stack: 64,
         max_damage: 0,
@@ -1206,6 +1338,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 171,
         name: "Carpet",
+        key: Some("tile.woolCarpet.white.name"),
         resolution: ItemModel::Block("block/carpet_white"),
         max_stack: 64,
         max_damage: 0,
@@ -1215,6 +1348,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 172,
         name: "Hardened Clay",
+        key: Some("tile.clayHardened.name"),
         resolution: ItemModel::Block("block/hardened_clay"),
         max_stack: 64,
         max_damage: 0,
@@ -1224,6 +1358,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 173,
         name: "Block of Coal",
+        key: Some("tile.blockCoal.name"),
         resolution: ItemModel::Block("block/coal_block"),
         max_stack: 64,
         max_damage: 0,
@@ -1233,6 +1368,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 174,
         name: "Packed Ice",
+        key: Some("tile.icePacked.name"),
         resolution: ItemModel::Block("block/packed_ice"),
         max_stack: 64,
         max_damage: 0,
@@ -1242,6 +1378,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 175,
         name: "Sunflower",
+        key: Some("tile.doublePlant.sunflower.name"),
         resolution: ItemModel::Generated(&["blocks/double_plant_sunflower_front"]),
         max_stack: 64,
         max_damage: 0,
@@ -1251,6 +1388,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 179,
         name: "Red Sandstone",
+        key: Some("tile.redSandStone.default.name"),
         resolution: ItemModel::Block("block/red_sandstone_normal"),
         max_stack: 64,
         max_damage: 0,
@@ -1260,6 +1398,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 180,
         name: "Red Sandstone Stairs",
+        key: Some("tile.stairsRedSandStone.name"),
         resolution: ItemModel::Block("block/red_sandstone_stairs"),
         max_stack: 64,
         max_damage: 0,
@@ -1269,6 +1408,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 182,
         name: "Red Sandstone Slab",
+        key: Some("tile.stoneSlab2.red_sandstone.name"),
         resolution: ItemModel::Block("block/half_slab_red_sandstone"),
         max_stack: 64,
         max_damage: 0,
@@ -1278,6 +1418,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 183,
         name: "Spruce Fence Gate",
+        key: Some("tile.spruceFenceGate.name"),
         resolution: ItemModel::Block("block/spruce_fence_gate_closed"),
         max_stack: 64,
         max_damage: 0,
@@ -1287,6 +1428,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 184,
         name: "Birch Fence Gate",
+        key: Some("tile.birchFenceGate.name"),
         resolution: ItemModel::Block("block/birch_fence_gate_closed"),
         max_stack: 64,
         max_damage: 0,
@@ -1296,6 +1438,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 185,
         name: "Jungle Fence Gate",
+        key: Some("tile.jungleFenceGate.name"),
         resolution: ItemModel::Block("block/jungle_fence_gate_closed"),
         max_stack: 64,
         max_damage: 0,
@@ -1305,6 +1448,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 186,
         name: "Dark Oak Fence Gate",
+        key: Some("tile.darkOakFenceGate.name"),
         resolution: ItemModel::Block("block/dark_oak_fence_gate_closed"),
         max_stack: 64,
         max_damage: 0,
@@ -1314,6 +1458,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 187,
         name: "Acacia Fence Gate",
+        key: Some("tile.acaciaFenceGate.name"),
         resolution: ItemModel::Block("block/acacia_fence_gate_closed"),
         max_stack: 64,
         max_damage: 0,
@@ -1323,6 +1468,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 188,
         name: "Spruce Fence",
+        key: Some("tile.spruceFence.name"),
         resolution: ItemModel::Block("block/spruce_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1332,6 +1478,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 189,
         name: "Birch Fence",
+        key: Some("tile.birchFence.name"),
         resolution: ItemModel::Block("block/birch_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1341,6 +1488,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 190,
         name: "Jungle Fence",
+        key: Some("tile.jungleFence.name"),
         resolution: ItemModel::Block("block/jungle_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1350,6 +1498,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 191,
         name: "Dark Oak Fence",
+        key: Some("tile.darkOakFence.name"),
         resolution: ItemModel::Block("block/dark_oak_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1359,6 +1508,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 192,
         name: "Acacia Fence",
+        key: Some("tile.acaciaFence.name"),
         resolution: ItemModel::Block("block/acacia_fence_inventory"),
         max_stack: 64,
         max_damage: 0,
@@ -1368,6 +1518,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 256,
         name: "Iron Shovel",
+        key: Some("item.shovelIron.name"),
         resolution: ItemModel::Generated(&["items/iron_shovel"]),
         max_stack: 1,
         max_damage: 250,
@@ -1380,6 +1531,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 257,
         name: "Iron Pickaxe",
+        key: Some("item.pickaxeIron.name"),
         resolution: ItemModel::Generated(&["items/iron_pickaxe"]),
         max_stack: 1,
         max_damage: 250,
@@ -1392,6 +1544,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 258,
         name: "Iron Axe",
+        key: Some("item.hatchetIron.name"),
         resolution: ItemModel::Generated(&["items/iron_axe"]),
         max_stack: 1,
         max_damage: 250,
@@ -1404,6 +1557,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 259,
         name: "Flint and Steel",
+        key: Some("item.flintAndSteel.name"),
         resolution: ItemModel::Generated(&["items/flint_and_steel"]),
         max_stack: 1,
         max_damage: 64,
@@ -1413,6 +1567,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 260,
         name: "Apple",
+        key: Some("item.apple.name"),
         resolution: ItemModel::Generated(&["items/apple"]),
         max_stack: 64,
         max_damage: 0,
@@ -1422,6 +1577,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 261,
         name: "Bow",
+        key: Some("item.bow.name"),
         resolution: ItemModel::Generated(&["items/bow_standby"]),
         max_stack: 1,
         max_damage: 384,
@@ -1431,6 +1587,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 262,
         name: "Arrow",
+        key: Some("item.arrow.name"),
         resolution: ItemModel::Generated(&["items/arrow"]),
         max_stack: 64,
         max_damage: 0,
@@ -1440,6 +1597,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 263,
         name: "Coal",
+        key: Some("item.coal.name"),
         resolution: ItemModel::Generated(&["items/coal"]),
         max_stack: 64,
         max_damage: 0,
@@ -1449,6 +1607,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 264,
         name: "Diamond",
+        key: Some("item.diamond.name"),
         resolution: ItemModel::Generated(&["items/diamond"]),
         max_stack: 64,
         max_damage: 0,
@@ -1458,6 +1617,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 265,
         name: "Iron Ingot",
+        key: Some("item.ingotIron.name"),
         resolution: ItemModel::Generated(&["items/iron_ingot"]),
         max_stack: 64,
         max_damage: 0,
@@ -1467,6 +1627,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 266,
         name: "Gold Ingot",
+        key: Some("item.ingotGold.name"),
         resolution: ItemModel::Generated(&["items/gold_ingot"]),
         max_stack: 64,
         max_damage: 0,
@@ -1476,6 +1637,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 267,
         name: "Iron Sword",
+        key: Some("item.swordIron.name"),
         resolution: ItemModel::Generated(&["items/iron_sword"]),
         max_stack: 1,
         max_damage: 250,
@@ -1488,6 +1650,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 268,
         name: "Wooden Sword",
+        key: Some("item.swordWood.name"),
         resolution: ItemModel::Generated(&["items/wood_sword"]),
         max_stack: 1,
         max_damage: 59,
@@ -1500,6 +1663,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 269,
         name: "Wooden Shovel",
+        key: Some("item.shovelWood.name"),
         resolution: ItemModel::Generated(&["items/wood_shovel"]),
         max_stack: 1,
         max_damage: 59,
@@ -1512,6 +1676,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 270,
         name: "Wooden Pickaxe",
+        key: Some("item.pickaxeWood.name"),
         resolution: ItemModel::Generated(&["items/wood_pickaxe"]),
         max_stack: 1,
         max_damage: 59,
@@ -1524,6 +1689,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 271,
         name: "Wooden Axe",
+        key: Some("item.hatchetWood.name"),
         resolution: ItemModel::Generated(&["items/wood_axe"]),
         max_stack: 1,
         max_damage: 59,
@@ -1536,6 +1702,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 272,
         name: "Stone Sword",
+        key: Some("item.swordStone.name"),
         resolution: ItemModel::Generated(&["items/stone_sword"]),
         max_stack: 1,
         max_damage: 131,
@@ -1548,6 +1715,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 273,
         name: "Stone Shovel",
+        key: Some("item.shovelStone.name"),
         resolution: ItemModel::Generated(&["items/stone_shovel"]),
         max_stack: 1,
         max_damage: 131,
@@ -1560,6 +1728,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 274,
         name: "Stone Pickaxe",
+        key: Some("item.pickaxeStone.name"),
         resolution: ItemModel::Generated(&["items/stone_pickaxe"]),
         max_stack: 1,
         max_damage: 131,
@@ -1572,6 +1741,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 275,
         name: "Stone Axe",
+        key: Some("item.hatchetStone.name"),
         resolution: ItemModel::Generated(&["items/stone_axe"]),
         max_stack: 1,
         max_damage: 131,
@@ -1584,6 +1754,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 276,
         name: "Diamond Sword",
+        key: Some("item.swordDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_sword"]),
         max_stack: 1,
         max_damage: 1561,
@@ -1596,6 +1767,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 277,
         name: "Diamond Shovel",
+        key: Some("item.shovelDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_shovel"]),
         max_stack: 1,
         max_damage: 1561,
@@ -1608,6 +1780,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 278,
         name: "Diamond Pickaxe",
+        key: Some("item.pickaxeDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_pickaxe"]),
         max_stack: 1,
         max_damage: 1561,
@@ -1620,6 +1793,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 279,
         name: "Diamond Axe",
+        key: Some("item.hatchetDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_axe"]),
         max_stack: 1,
         max_damage: 1561,
@@ -1632,6 +1806,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 280,
         name: "Stick",
+        key: Some("item.stick.name"),
         resolution: ItemModel::Generated(&["items/stick"]),
         max_stack: 64,
         max_damage: 0,
@@ -1641,6 +1816,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 281,
         name: "Bowl",
+        key: Some("item.bowl.name"),
         resolution: ItemModel::Generated(&["items/bowl"]),
         max_stack: 64,
         max_damage: 0,
@@ -1650,6 +1826,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 282,
         name: "Mushroom Stew",
+        key: Some("item.mushroomStew.name"),
         resolution: ItemModel::Generated(&["items/mushroom_stew"]),
         max_stack: 1,
         max_damage: 0,
@@ -1659,6 +1836,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 283,
         name: "Golden Sword",
+        key: Some("item.swordGold.name"),
         resolution: ItemModel::Generated(&["items/gold_sword"]),
         max_stack: 1,
         max_damage: 32,
@@ -1671,6 +1849,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 284,
         name: "Golden Shovel",
+        key: Some("item.shovelGold.name"),
         resolution: ItemModel::Generated(&["items/gold_shovel"]),
         max_stack: 1,
         max_damage: 32,
@@ -1683,6 +1862,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 285,
         name: "Golden Pickaxe",
+        key: Some("item.pickaxeGold.name"),
         resolution: ItemModel::Generated(&["items/gold_pickaxe"]),
         max_stack: 1,
         max_damage: 32,
@@ -1695,6 +1875,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 286,
         name: "Golden Axe",
+        key: Some("item.hatchetGold.name"),
         resolution: ItemModel::Generated(&["items/gold_axe"]),
         max_stack: 1,
         max_damage: 32,
@@ -1707,6 +1888,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 287,
         name: "String",
+        key: Some("item.string.name"),
         resolution: ItemModel::Generated(&["items/string"]),
         max_stack: 64,
         max_damage: 0,
@@ -1716,6 +1898,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 288,
         name: "Feather",
+        key: Some("item.feather.name"),
         resolution: ItemModel::Generated(&["items/feather"]),
         max_stack: 64,
         max_damage: 0,
@@ -1725,6 +1908,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 289,
         name: "Gunpowder",
+        key: Some("item.sulphur.name"),
         resolution: ItemModel::Generated(&["items/gunpowder"]),
         max_stack: 64,
         max_damage: 0,
@@ -1734,6 +1918,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 290,
         name: "Wooden Hoe",
+        key: Some("item.hoeWood.name"),
         resolution: ItemModel::Generated(&["items/wood_hoe"]),
         max_stack: 1,
         max_damage: 59,
@@ -1743,6 +1928,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 291,
         name: "Stone Hoe",
+        key: Some("item.hoeStone.name"),
         resolution: ItemModel::Generated(&["items/stone_hoe"]),
         max_stack: 1,
         max_damage: 131,
@@ -1752,6 +1938,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 292,
         name: "Iron Hoe",
+        key: Some("item.hoeIron.name"),
         resolution: ItemModel::Generated(&["items/iron_hoe"]),
         max_stack: 1,
         max_damage: 250,
@@ -1761,6 +1948,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 293,
         name: "Diamond Hoe",
+        key: Some("item.hoeDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_hoe"]),
         max_stack: 1,
         max_damage: 1561,
@@ -1770,6 +1958,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 294,
         name: "Golden Hoe",
+        key: Some("item.hoeGold.name"),
         resolution: ItemModel::Generated(&["items/gold_hoe"]),
         max_stack: 1,
         max_damage: 32,
@@ -1779,6 +1968,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 295,
         name: "Seeds",
+        key: Some("item.seeds.name"),
         resolution: ItemModel::Generated(&["items/seeds_wheat"]),
         max_stack: 64,
         max_damage: 0,
@@ -1788,6 +1978,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 296,
         name: "Wheat",
+        key: Some("item.wheat.name"),
         resolution: ItemModel::Generated(&["items/wheat"]),
         max_stack: 64,
         max_damage: 0,
@@ -1797,6 +1988,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 297,
         name: "Bread",
+        key: Some("item.bread.name"),
         resolution: ItemModel::Generated(&["items/bread"]),
         max_stack: 64,
         max_damage: 0,
@@ -1806,6 +1998,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 298,
         name: "Leather Cap",
+        key: Some("item.helmetCloth.name"),
         resolution: ItemModel::Generated(&["items/leather_helmet", "items/leather_helmet_overlay"]),
         max_stack: 1,
         max_damage: 55,
@@ -1818,6 +2011,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 299,
         name: "Leather Tunic",
+        key: Some("item.chestplateCloth.name"),
         resolution: ItemModel::Generated(&[
             "items/leather_chestplate",
             "items/leather_chestplate_overlay",
@@ -1833,6 +2027,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 300,
         name: "Leather Pants",
+        key: Some("item.leggingsCloth.name"),
         resolution: ItemModel::Generated(&[
             "items/leather_leggings",
             "items/leather_leggings_overlay",
@@ -1848,6 +2043,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 301,
         name: "Leather Boots",
+        key: Some("item.bootsCloth.name"),
         resolution: ItemModel::Generated(&["items/leather_boots", "items/leather_boots_overlay"]),
         max_stack: 1,
         max_damage: 65,
@@ -1860,6 +2056,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 302,
         name: "Chain Helmet",
+        key: Some("item.helmetChain.name"),
         resolution: ItemModel::Generated(&["items/chainmail_helmet"]),
         max_stack: 1,
         max_damage: 165,
@@ -1872,6 +2069,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 303,
         name: "Chain Chestplate",
+        key: Some("item.chestplateChain.name"),
         resolution: ItemModel::Generated(&["items/chainmail_chestplate"]),
         max_stack: 1,
         max_damage: 240,
@@ -1884,6 +2082,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 304,
         name: "Chain Leggings",
+        key: Some("item.leggingsChain.name"),
         resolution: ItemModel::Generated(&["items/chainmail_leggings"]),
         max_stack: 1,
         max_damage: 225,
@@ -1896,6 +2095,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 305,
         name: "Chain Boots",
+        key: Some("item.bootsChain.name"),
         resolution: ItemModel::Generated(&["items/chainmail_boots"]),
         max_stack: 1,
         max_damage: 195,
@@ -1908,6 +2108,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 306,
         name: "Iron Helmet",
+        key: Some("item.helmetIron.name"),
         resolution: ItemModel::Generated(&["items/iron_helmet"]),
         max_stack: 1,
         max_damage: 165,
@@ -1920,6 +2121,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 307,
         name: "Iron Chestplate",
+        key: Some("item.chestplateIron.name"),
         resolution: ItemModel::Generated(&["items/iron_chestplate"]),
         max_stack: 1,
         max_damage: 240,
@@ -1932,6 +2134,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 308,
         name: "Iron Leggings",
+        key: Some("item.leggingsIron.name"),
         resolution: ItemModel::Generated(&["items/iron_leggings"]),
         max_stack: 1,
         max_damage: 225,
@@ -1944,6 +2147,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 309,
         name: "Iron Boots",
+        key: Some("item.bootsIron.name"),
         resolution: ItemModel::Generated(&["items/iron_boots"]),
         max_stack: 1,
         max_damage: 195,
@@ -1956,6 +2160,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 310,
         name: "Diamond Helmet",
+        key: Some("item.helmetDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_helmet"]),
         max_stack: 1,
         max_damage: 363,
@@ -1968,6 +2173,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 311,
         name: "Diamond Chestplate",
+        key: Some("item.chestplateDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_chestplate"]),
         max_stack: 1,
         max_damage: 528,
@@ -1980,6 +2186,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 312,
         name: "Diamond Leggings",
+        key: Some("item.leggingsDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_leggings"]),
         max_stack: 1,
         max_damage: 495,
@@ -1992,6 +2199,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 313,
         name: "Diamond Boots",
+        key: Some("item.bootsDiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_boots"]),
         max_stack: 1,
         max_damage: 429,
@@ -2004,6 +2212,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 314,
         name: "Golden Helmet",
+        key: Some("item.helmetGold.name"),
         resolution: ItemModel::Generated(&["items/gold_helmet"]),
         max_stack: 1,
         max_damage: 77,
@@ -2016,6 +2225,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 315,
         name: "Golden Chestplate",
+        key: Some("item.chestplateGold.name"),
         resolution: ItemModel::Generated(&["items/gold_chestplate"]),
         max_stack: 1,
         max_damage: 112,
@@ -2028,6 +2238,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 316,
         name: "Golden Leggings",
+        key: Some("item.leggingsGold.name"),
         resolution: ItemModel::Generated(&["items/gold_leggings"]),
         max_stack: 1,
         max_damage: 105,
@@ -2040,6 +2251,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 317,
         name: "Golden Boots",
+        key: Some("item.bootsGold.name"),
         resolution: ItemModel::Generated(&["items/gold_boots"]),
         max_stack: 1,
         max_damage: 91,
@@ -2052,6 +2264,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 318,
         name: "Flint",
+        key: Some("item.flint.name"),
         resolution: ItemModel::Generated(&["items/flint"]),
         max_stack: 64,
         max_damage: 0,
@@ -2061,6 +2274,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 319,
         name: "Raw Porkchop",
+        key: Some("item.porkchopRaw.name"),
         resolution: ItemModel::Generated(&["items/porkchop_raw"]),
         max_stack: 64,
         max_damage: 0,
@@ -2070,6 +2284,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 320,
         name: "Cooked Porkchop",
+        key: Some("item.porkchopCooked.name"),
         resolution: ItemModel::Generated(&["items/porkchop_cooked"]),
         max_stack: 64,
         max_damage: 0,
@@ -2079,6 +2294,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 321,
         name: "Painting",
+        key: Some("item.painting.name"),
         resolution: ItemModel::Generated(&["items/painting"]),
         max_stack: 64,
         max_damage: 0,
@@ -2088,6 +2304,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 322,
         name: "Golden Apple",
+        key: Some("item.appleGold.name"),
         resolution: ItemModel::Generated(&["items/apple_golden"]),
         max_stack: 64,
         max_damage: 0,
@@ -2097,6 +2314,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 323,
         name: "Sign",
+        key: Some("item.sign.name"),
         resolution: ItemModel::Generated(&["items/sign"]),
         max_stack: 16,
         max_damage: 0,
@@ -2106,6 +2324,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 324,
         name: "Oak Door",
+        key: Some("item.doorOak.name"),
         resolution: ItemModel::Generated(&["items/door_wood"]),
         max_stack: 64,
         max_damage: 0,
@@ -2115,6 +2334,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 325,
         name: "Bucket",
+        key: Some("item.bucket.name"),
         resolution: ItemModel::Generated(&["items/bucket_empty"]),
         max_stack: 16,
         max_damage: 0,
@@ -2124,6 +2344,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 326,
         name: "Water Bucket",
+        key: Some("item.bucketWater.name"),
         resolution: ItemModel::Generated(&["items/bucket_water"]),
         max_stack: 1,
         max_damage: 0,
@@ -2133,6 +2354,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 327,
         name: "Lava Bucket",
+        key: Some("item.bucketLava.name"),
         resolution: ItemModel::Generated(&["items/bucket_lava"]),
         max_stack: 1,
         max_damage: 0,
@@ -2142,6 +2364,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 328,
         name: "Minecart",
+        key: Some("item.minecart.name"),
         resolution: ItemModel::Generated(&["items/minecart_normal"]),
         max_stack: 1,
         max_damage: 0,
@@ -2151,6 +2374,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 329,
         name: "Saddle",
+        key: Some("item.saddle.name"),
         resolution: ItemModel::Generated(&["items/saddle"]),
         max_stack: 1,
         max_damage: 0,
@@ -2160,6 +2384,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 330,
         name: "Iron Door",
+        key: Some("item.doorIron.name"),
         resolution: ItemModel::Generated(&["items/door_iron"]),
         max_stack: 64,
         max_damage: 0,
@@ -2169,6 +2394,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 331,
         name: "Redstone",
+        key: Some("item.redstone.name"),
         resolution: ItemModel::Generated(&["items/redstone_dust"]),
         max_stack: 64,
         max_damage: 0,
@@ -2178,6 +2404,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 332,
         name: "Snowball",
+        key: Some("item.snowball.name"),
         resolution: ItemModel::Generated(&["items/snowball"]),
         max_stack: 16,
         max_damage: 0,
@@ -2187,6 +2414,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 333,
         name: "Boat",
+        key: Some("item.boat.name"),
         resolution: ItemModel::Generated(&["items/boat"]),
         max_stack: 1,
         max_damage: 0,
@@ -2196,6 +2424,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 334,
         name: "Leather",
+        key: Some("item.leather.name"),
         resolution: ItemModel::Generated(&["items/leather"]),
         max_stack: 64,
         max_damage: 0,
@@ -2205,6 +2434,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 335,
         name: "Milk",
+        key: Some("item.milk.name"),
         resolution: ItemModel::Generated(&["items/bucket_milk"]),
         max_stack: 1,
         max_damage: 0,
@@ -2214,6 +2444,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 336,
         name: "Brick",
+        key: Some("item.brick.name"),
         resolution: ItemModel::Generated(&["items/brick"]),
         max_stack: 64,
         max_damage: 0,
@@ -2223,6 +2454,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 337,
         name: "Clay",
+        key: Some("item.clay.name"),
         resolution: ItemModel::Generated(&["items/clay_ball"]),
         max_stack: 64,
         max_damage: 0,
@@ -2232,6 +2464,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 338,
         name: "Sugar Canes",
+        key: Some("item.reeds.name"),
         resolution: ItemModel::Generated(&["items/reeds"]),
         max_stack: 64,
         max_damage: 0,
@@ -2241,6 +2474,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 339,
         name: "Paper",
+        key: Some("item.paper.name"),
         resolution: ItemModel::Generated(&["items/paper"]),
         max_stack: 64,
         max_damage: 0,
@@ -2250,6 +2484,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 340,
         name: "Book",
+        key: Some("item.book.name"),
         resolution: ItemModel::Generated(&["items/book_normal"]),
         max_stack: 64,
         max_damage: 0,
@@ -2259,6 +2494,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 341,
         name: "Slimeball",
+        key: Some("item.slimeball.name"),
         resolution: ItemModel::Generated(&["items/slimeball"]),
         max_stack: 64,
         max_damage: 0,
@@ -2268,6 +2504,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 342,
         name: "Minecart with Chest",
+        key: Some("item.minecartChest.name"),
         resolution: ItemModel::Generated(&["items/minecart_chest"]),
         max_stack: 1,
         max_damage: 0,
@@ -2277,6 +2514,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 343,
         name: "Minecart with Furnace",
+        key: Some("item.minecartFurnace.name"),
         resolution: ItemModel::Generated(&["items/minecart_furnace"]),
         max_stack: 1,
         max_damage: 0,
@@ -2286,6 +2524,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 344,
         name: "Egg",
+        key: Some("item.egg.name"),
         resolution: ItemModel::Generated(&["items/egg"]),
         max_stack: 16,
         max_damage: 0,
@@ -2295,6 +2534,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 345,
         name: "Compass",
+        key: Some("item.compass.name"),
         resolution: ItemModel::Generated(&["items/compass"]),
         max_stack: 64,
         max_damage: 0,
@@ -2304,6 +2544,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 346,
         name: "Fishing Rod",
+        key: Some("item.fishingRod.name"),
         resolution: ItemModel::Generated(&["items/fishing_rod_uncast"]),
         max_stack: 1,
         max_damage: 64,
@@ -2313,6 +2554,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 347,
         name: "Clock",
+        key: Some("item.clock.name"),
         resolution: ItemModel::Generated(&["items/clock"]),
         max_stack: 64,
         max_damage: 0,
@@ -2322,6 +2564,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 348,
         name: "Glowstone Dust",
+        key: Some("item.yellowDust.name"),
         resolution: ItemModel::Generated(&["items/glowstone_dust"]),
         max_stack: 64,
         max_damage: 0,
@@ -2331,6 +2574,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 349,
         name: "Raw Fish",
+        key: Some("item.fish.cod.raw.name"),
         resolution: ItemModel::Generated(&["items/fish_cod_raw"]),
         max_stack: 64,
         max_damage: 0,
@@ -2340,6 +2584,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 350,
         name: "Cooked Fish",
+        key: Some("item.fish.cod.cooked.name"),
         resolution: ItemModel::Generated(&["items/fish_cod_cooked"]),
         max_stack: 64,
         max_damage: 0,
@@ -2349,6 +2594,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 351,
         name: "Ink Sac",
+        key: Some("item.dyePowder.black.name"),
         resolution: ItemModel::Generated(&["items/dye_powder_black"]),
         max_stack: 64,
         max_damage: 0,
@@ -2358,6 +2604,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 352,
         name: "Bone",
+        key: Some("item.bone.name"),
         resolution: ItemModel::Generated(&["items/bone"]),
         max_stack: 64,
         max_damage: 0,
@@ -2367,6 +2614,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 353,
         name: "Sugar",
+        key: Some("item.sugar.name"),
         resolution: ItemModel::Generated(&["items/sugar"]),
         max_stack: 64,
         max_damage: 0,
@@ -2376,6 +2624,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 354,
         name: "Cake",
+        key: Some("item.cake.name"),
         resolution: ItemModel::Generated(&["items/cake"]),
         max_stack: 1,
         max_damage: 0,
@@ -2385,6 +2634,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 355,
         name: "Bed",
+        key: Some("item.bed.name"),
         resolution: ItemModel::Generated(&["items/bed"]),
         max_stack: 1,
         max_damage: 0,
@@ -2394,6 +2644,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 356,
         name: "Redstone Repeater",
+        key: Some("item.diode.name"),
         resolution: ItemModel::Generated(&["items/repeater"]),
         max_stack: 64,
         max_damage: 0,
@@ -2403,6 +2654,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 357,
         name: "Cookie",
+        key: Some("item.cookie.name"),
         resolution: ItemModel::Generated(&["items/cookie"]),
         max_stack: 64,
         max_damage: 0,
@@ -2412,6 +2664,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 358,
         name: "Map",
+        key: Some("item.map.name"),
         resolution: ItemModel::Generated(&["items/map_filled"]),
         max_stack: 64,
         max_damage: 0,
@@ -2421,6 +2674,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 359,
         name: "Shears",
+        key: Some("item.shears.name"),
         resolution: ItemModel::Generated(&["items/shears"]),
         max_stack: 1,
         max_damage: 238,
@@ -2430,6 +2684,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 360,
         name: "Melon",
+        key: Some("item.melon.name"),
         resolution: ItemModel::Generated(&["items/melon"]),
         max_stack: 64,
         max_damage: 0,
@@ -2439,6 +2694,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 361,
         name: "Pumpkin Seeds",
+        key: Some("item.seeds_pumpkin.name"),
         resolution: ItemModel::Generated(&["items/seeds_pumpkin"]),
         max_stack: 64,
         max_damage: 0,
@@ -2448,6 +2704,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 362,
         name: "Melon Seeds",
+        key: Some("item.seeds_melon.name"),
         resolution: ItemModel::Generated(&["items/seeds_melon"]),
         max_stack: 64,
         max_damage: 0,
@@ -2457,6 +2714,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 363,
         name: "Raw Beef",
+        key: Some("item.beefRaw.name"),
         resolution: ItemModel::Generated(&["items/beef_raw"]),
         max_stack: 64,
         max_damage: 0,
@@ -2466,6 +2724,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 364,
         name: "Steak",
+        key: Some("item.beefCooked.name"),
         resolution: ItemModel::Generated(&["items/beef_cooked"]),
         max_stack: 64,
         max_damage: 0,
@@ -2475,6 +2734,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 365,
         name: "Raw Chicken",
+        key: Some("item.chickenRaw.name"),
         resolution: ItemModel::Generated(&["items/chicken_raw"]),
         max_stack: 64,
         max_damage: 0,
@@ -2484,6 +2744,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 366,
         name: "Cooked Chicken",
+        key: Some("item.chickenCooked.name"),
         resolution: ItemModel::Generated(&["items/chicken_cooked"]),
         max_stack: 64,
         max_damage: 0,
@@ -2493,6 +2754,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 367,
         name: "Rotten Flesh",
+        key: Some("item.rottenFlesh.name"),
         resolution: ItemModel::Generated(&["items/rotten_flesh"]),
         max_stack: 64,
         max_damage: 0,
@@ -2502,6 +2764,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 368,
         name: "Ender Pearl",
+        key: Some("item.enderPearl.name"),
         resolution: ItemModel::Generated(&["items/ender_pearl"]),
         max_stack: 16,
         max_damage: 0,
@@ -2511,6 +2774,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 369,
         name: "Blaze Rod",
+        key: Some("item.blazeRod.name"),
         resolution: ItemModel::Generated(&["items/blaze_rod"]),
         max_stack: 64,
         max_damage: 0,
@@ -2520,6 +2784,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 370,
         name: "Ghast Tear",
+        key: Some("item.ghastTear.name"),
         resolution: ItemModel::Generated(&["items/ghast_tear"]),
         max_stack: 64,
         max_damage: 0,
@@ -2529,6 +2794,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 371,
         name: "Gold Nugget",
+        key: Some("item.goldNugget.name"),
         resolution: ItemModel::Generated(&["items/gold_nugget"]),
         max_stack: 64,
         max_damage: 0,
@@ -2538,6 +2804,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 372,
         name: "Nether Wart",
+        key: Some("item.netherStalkSeeds.name"),
         resolution: ItemModel::Generated(&["items/nether_wart"]),
         max_stack: 64,
         max_damage: 0,
@@ -2547,6 +2814,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 373,
         name: "Water Bottle",
+        key: Some("item.emptyPotion.name"),
         resolution: ItemModel::Generated(&[
             "items/potion_overlay",
             "items/potion_bottle_drinkable",
@@ -2559,6 +2827,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 374,
         name: "Glass Bottle",
+        key: Some("item.glassBottle.name"),
         resolution: ItemModel::Generated(&["items/potion_bottle_empty"]),
         max_stack: 64,
         max_damage: 0,
@@ -2568,6 +2837,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 375,
         name: "Spider Eye",
+        key: Some("item.spiderEye.name"),
         resolution: ItemModel::Generated(&["items/spider_eye"]),
         max_stack: 64,
         max_damage: 0,
@@ -2577,6 +2847,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 376,
         name: "Fermented Spider Eye",
+        key: Some("item.fermentedSpiderEye.name"),
         resolution: ItemModel::Generated(&["items/spider_eye_fermented"]),
         max_stack: 64,
         max_damage: 0,
@@ -2586,6 +2857,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 377,
         name: "Blaze Powder",
+        key: Some("item.blazePowder.name"),
         resolution: ItemModel::Generated(&["items/blaze_powder"]),
         max_stack: 64,
         max_damage: 0,
@@ -2595,6 +2867,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 378,
         name: "Magma Cream",
+        key: Some("item.magmaCream.name"),
         resolution: ItemModel::Generated(&["items/magma_cream"]),
         max_stack: 64,
         max_damage: 0,
@@ -2604,6 +2877,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 379,
         name: "Brewing Stand",
+        key: Some("item.brewingStand.name"),
         resolution: ItemModel::Generated(&["items/brewing_stand"]),
         max_stack: 64,
         max_damage: 0,
@@ -2613,6 +2887,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 380,
         name: "Cauldron",
+        key: Some("item.cauldron.name"),
         resolution: ItemModel::Generated(&["items/cauldron"]),
         max_stack: 64,
         max_damage: 0,
@@ -2622,6 +2897,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 381,
         name: "Eye of Ender",
+        key: Some("item.eyeOfEnder.name"),
         resolution: ItemModel::Generated(&["items/ender_eye"]),
         max_stack: 64,
         max_damage: 0,
@@ -2631,6 +2907,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 382,
         name: "Glistering Melon",
+        key: Some("item.speckledMelon.name"),
         resolution: ItemModel::Generated(&["items/melon_speckled"]),
         max_stack: 64,
         max_damage: 0,
@@ -2640,6 +2917,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 383,
         name: "Spawn",
+        key: Some("item.monsterPlacer.name"),
         resolution: ItemModel::Generated(&["items/spawn_egg", "items/spawn_egg_overlay"]),
         max_stack: 64,
         max_damage: 0,
@@ -2649,6 +2927,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 384,
         name: "Bottle o' Enchanting",
+        key: Some("item.expBottle.name"),
         resolution: ItemModel::Generated(&["items/experience_bottle"]),
         max_stack: 64,
         max_damage: 0,
@@ -2658,6 +2937,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 385,
         name: "Fire Charge",
+        key: Some("item.fireball.name"),
         resolution: ItemModel::Generated(&["items/fireball"]),
         max_stack: 64,
         max_damage: 0,
@@ -2667,6 +2947,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 386,
         name: "Book and Quill",
+        key: Some("item.writingBook.name"),
         resolution: ItemModel::Generated(&["items/book_writable"]),
         max_stack: 1,
         max_damage: 0,
@@ -2676,6 +2957,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 387,
         name: "Written Book",
+        key: Some("item.writtenBook.name"),
         resolution: ItemModel::Generated(&["items/book_written"]),
         max_stack: 16,
         max_damage: 0,
@@ -2685,6 +2967,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 388,
         name: "Emerald",
+        key: Some("item.emerald.name"),
         resolution: ItemModel::Generated(&["items/emerald"]),
         max_stack: 64,
         max_damage: 0,
@@ -2694,6 +2977,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 389,
         name: "Item Frame",
+        key: Some("item.frame.name"),
         resolution: ItemModel::Generated(&["items/item_frame"]),
         max_stack: 64,
         max_damage: 0,
@@ -2703,6 +2987,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 390,
         name: "Flower Pot",
+        key: Some("item.flowerPot.name"),
         resolution: ItemModel::Generated(&["items/flower_pot"]),
         max_stack: 64,
         max_damage: 0,
@@ -2712,6 +2997,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 391,
         name: "Carrot",
+        key: Some("item.carrots.name"),
         resolution: ItemModel::Generated(&["items/carrot"]),
         max_stack: 64,
         max_damage: 0,
@@ -2721,6 +3007,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 392,
         name: "Potato",
+        key: Some("item.potato.name"),
         resolution: ItemModel::Generated(&["items/potato"]),
         max_stack: 64,
         max_damage: 0,
@@ -2730,6 +3017,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 393,
         name: "Baked Potato",
+        key: Some("item.potatoBaked.name"),
         resolution: ItemModel::Generated(&["items/potato_baked"]),
         max_stack: 64,
         max_damage: 0,
@@ -2739,6 +3027,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 394,
         name: "Poisonous Potato",
+        key: Some("item.potatoPoisonous.name"),
         resolution: ItemModel::Generated(&["items/potato_poisonous"]),
         max_stack: 64,
         max_damage: 0,
@@ -2748,6 +3037,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 395,
         name: "Empty Map",
+        key: Some("item.emptyMap.name"),
         resolution: ItemModel::Generated(&["items/map_empty"]),
         max_stack: 64,
         max_damage: 0,
@@ -2757,6 +3047,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 396,
         name: "Golden Carrot",
+        key: Some("item.carrotGolden.name"),
         resolution: ItemModel::Generated(&["items/carrot_golden"]),
         max_stack: 64,
         max_damage: 0,
@@ -2766,6 +3057,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 397,
         name: "Skeleton Skull",
+        key: Some("item.skull.skeleton.name"),
         resolution: ItemModel::Missing,
         max_stack: 64,
         max_damage: 0,
@@ -2775,6 +3067,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 398,
         name: "Carrot on a Stick",
+        key: Some("item.carrotOnAStick.name"),
         resolution: ItemModel::Generated(&["items/carrot_on_a_stick"]),
         max_stack: 1,
         max_damage: 25,
@@ -2784,6 +3077,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 399,
         name: "Nether Star",
+        key: Some("item.netherStar.name"),
         resolution: ItemModel::Generated(&["items/nether_star"]),
         max_stack: 64,
         max_damage: 0,
@@ -2793,6 +3087,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 400,
         name: "Pumpkin Pie",
+        key: Some("item.pumpkinPie.name"),
         resolution: ItemModel::Generated(&["items/pumpkin_pie"]),
         max_stack: 64,
         max_damage: 0,
@@ -2802,6 +3097,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 401,
         name: "Firework Rocket",
+        key: Some("item.fireworks.name"),
         resolution: ItemModel::Generated(&["items/fireworks"]),
         max_stack: 64,
         max_damage: 0,
@@ -2811,6 +3107,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 402,
         name: "Firework Star",
+        key: Some("item.fireworksCharge.name"),
         resolution: ItemModel::Generated(&[
             "items/fireworks_charge",
             "items/fireworks_charge_overlay",
@@ -2823,6 +3120,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 403,
         name: "Enchanted Book",
+        key: Some("item.enchantedBook.name"),
         resolution: ItemModel::Generated(&["items/book_enchanted"]),
         max_stack: 1,
         max_damage: 0,
@@ -2832,6 +3130,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 404,
         name: "Redstone Comparator",
+        key: Some("item.comparator.name"),
         resolution: ItemModel::Generated(&["items/comparator"]),
         max_stack: 64,
         max_damage: 0,
@@ -2841,6 +3140,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 405,
         name: "Nether Brick",
+        key: Some("item.netherbrick.name"),
         resolution: ItemModel::Generated(&["items/netherbrick"]),
         max_stack: 64,
         max_damage: 0,
@@ -2850,6 +3150,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 406,
         name: "Nether Quartz",
+        key: Some("item.netherquartz.name"),
         resolution: ItemModel::Generated(&["items/quartz"]),
         max_stack: 64,
         max_damage: 0,
@@ -2859,6 +3160,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 407,
         name: "Minecart with TNT",
+        key: Some("item.minecartTnt.name"),
         resolution: ItemModel::Generated(&["items/minecart_tnt"]),
         max_stack: 1,
         max_damage: 0,
@@ -2868,6 +3170,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 408,
         name: "Minecart with Hopper",
+        key: Some("item.minecartHopper.name"),
         resolution: ItemModel::Generated(&["items/minecart_hopper"]),
         max_stack: 1,
         max_damage: 0,
@@ -2877,6 +3180,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 409,
         name: "Prismarine Shard",
+        key: Some("item.prismarineShard.name"),
         resolution: ItemModel::Generated(&["items/prismarine_shard"]),
         max_stack: 64,
         max_damage: 0,
@@ -2886,6 +3190,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 410,
         name: "Prismarine Crystals",
+        key: Some("item.prismarineCrystals.name"),
         resolution: ItemModel::Generated(&["items/prismarine_crystals"]),
         max_stack: 64,
         max_damage: 0,
@@ -2895,6 +3200,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 411,
         name: "Raw Rabbit",
+        key: Some("item.rabbitRaw.name"),
         resolution: ItemModel::Generated(&["items/rabbit_raw"]),
         max_stack: 64,
         max_damage: 0,
@@ -2904,6 +3210,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 412,
         name: "Cooked Rabbit",
+        key: Some("item.rabbitCooked.name"),
         resolution: ItemModel::Generated(&["items/rabbit_cooked"]),
         max_stack: 64,
         max_damage: 0,
@@ -2913,6 +3220,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 413,
         name: "Rabbit Stew",
+        key: Some("item.rabbitStew.name"),
         resolution: ItemModel::Generated(&["items/rabbit_stew"]),
         max_stack: 1,
         max_damage: 0,
@@ -2922,6 +3230,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 414,
         name: "Rabbit's Foot",
+        key: Some("item.rabbitFoot.name"),
         resolution: ItemModel::Generated(&["items/rabbit_foot"]),
         max_stack: 64,
         max_damage: 0,
@@ -2931,6 +3240,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 415,
         name: "Rabbit Hide",
+        key: Some("item.rabbitHide.name"),
         resolution: ItemModel::Generated(&["items/rabbit_hide"]),
         max_stack: 64,
         max_damage: 0,
@@ -2940,6 +3250,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 416,
         name: "Armor Stand",
+        key: Some("item.armorStand.name"),
         resolution: ItemModel::Generated(&["items/wooden_armorstand"]),
         max_stack: 16,
         max_damage: 0,
@@ -2949,6 +3260,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 417,
         name: "Iron Horse Armor",
+        key: Some("item.horsearmormetal.name"),
         resolution: ItemModel::Generated(&["items/iron_horse_armor"]),
         max_stack: 1,
         max_damage: 0,
@@ -2958,6 +3270,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 418,
         name: "Gold Horse Armor",
+        key: Some("item.horsearmorgold.name"),
         resolution: ItemModel::Generated(&["items/gold_horse_armor"]),
         max_stack: 1,
         max_damage: 0,
@@ -2967,6 +3280,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 419,
         name: "Diamond Horse Armor",
+        key: Some("item.horsearmordiamond.name"),
         resolution: ItemModel::Generated(&["items/diamond_horse_armor"]),
         max_stack: 1,
         max_damage: 0,
@@ -2976,6 +3290,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 420,
         name: "Lead",
+        key: Some("item.leash.name"),
         resolution: ItemModel::Generated(&["items/lead"]),
         max_stack: 64,
         max_damage: 0,
@@ -2985,6 +3300,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 421,
         name: "Name Tag",
+        key: Some("item.nameTag.name"),
         resolution: ItemModel::Generated(&["items/name_tag"]),
         max_stack: 64,
         max_damage: 0,
@@ -2994,6 +3310,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 422,
         name: "Minecart with Command Block",
+        key: Some("item.minecartCommandBlock.name"),
         resolution: ItemModel::Generated(&["items/minecart_command_block"]),
         max_stack: 1,
         max_damage: 0,
@@ -3003,6 +3320,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 423,
         name: "Raw Mutton",
+        key: Some("item.muttonRaw.name"),
         resolution: ItemModel::Generated(&["items/mutton_raw"]),
         max_stack: 64,
         max_damage: 0,
@@ -3012,6 +3330,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 424,
         name: "Cooked Mutton",
+        key: Some("item.muttonCooked.name"),
         resolution: ItemModel::Generated(&["items/mutton_cooked"]),
         max_stack: 64,
         max_damage: 0,
@@ -3021,6 +3340,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 425,
         name: "Black Banner",
+        key: Some("item.banner.black.name"),
         resolution: ItemModel::Missing,
         max_stack: 16,
         max_damage: 0,
@@ -3030,6 +3350,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 427,
         name: "Spruce Door",
+        key: Some("item.doorSpruce.name"),
         resolution: ItemModel::Generated(&["items/door_spruce"]),
         max_stack: 64,
         max_damage: 0,
@@ -3039,6 +3360,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 428,
         name: "Birch Door",
+        key: Some("item.doorBirch.name"),
         resolution: ItemModel::Generated(&["items/door_birch"]),
         max_stack: 64,
         max_damage: 0,
@@ -3048,6 +3370,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 429,
         name: "Jungle Door",
+        key: Some("item.doorJungle.name"),
         resolution: ItemModel::Generated(&["items/door_jungle"]),
         max_stack: 64,
         max_damage: 0,
@@ -3057,6 +3380,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 430,
         name: "Acacia Door",
+        key: Some("item.doorAcacia.name"),
         resolution: ItemModel::Generated(&["items/door_acacia"]),
         max_stack: 64,
         max_damage: 0,
@@ -3066,6 +3390,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 431,
         name: "Dark Oak Door",
+        key: Some("item.doorDarkOak.name"),
         resolution: ItemModel::Generated(&["items/door_dark_oak"]),
         max_stack: 64,
         max_damage: 0,
@@ -3075,6 +3400,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2256,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_13"]),
         max_stack: 1,
         max_damage: 0,
@@ -3084,6 +3410,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2257,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_cat"]),
         max_stack: 1,
         max_damage: 0,
@@ -3093,6 +3420,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2258,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_blocks"]),
         max_stack: 1,
         max_damage: 0,
@@ -3102,6 +3430,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2259,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_chirp"]),
         max_stack: 1,
         max_damage: 0,
@@ -3111,6 +3440,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2260,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_far"]),
         max_stack: 1,
         max_damage: 0,
@@ -3120,6 +3450,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2261,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_mall"]),
         max_stack: 1,
         max_damage: 0,
@@ -3129,6 +3460,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2262,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_mellohi"]),
         max_stack: 1,
         max_damage: 0,
@@ -3138,6 +3470,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2263,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_stal"]),
         max_stack: 1,
         max_damage: 0,
@@ -3147,6 +3480,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2264,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_strad"]),
         max_stack: 1,
         max_damage: 0,
@@ -3156,6 +3490,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2265,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_ward"]),
         max_stack: 1,
         max_damage: 0,
@@ -3165,6 +3500,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2266,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_11"]),
         max_stack: 1,
         max_damage: 0,
@@ -3174,6 +3510,7 @@ pub(super) static TABLE: [ItemEntry; 337] = [
     ItemEntry {
         id: 2267,
         name: "Music Disc",
+        key: Some("item.record.name"),
         resolution: ItemModel::Generated(&["items/record_wait"]),
         max_stack: 1,
         max_damage: 0,

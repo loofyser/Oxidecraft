@@ -10,12 +10,19 @@
 //! id the registry never registered — the source's `getEnchantmentById(k) !=
 //! `null` guard (`ItemStack.java`:697-714) skips those entries.
 
+use oxide_game::chat::LanguageTable;
+
 /// One row of the 1.8 enchantment registry: the effect id and the en_US
 /// display string its lang key carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnchantEntry {
     /// The effect id (`Enchantment.effectId`).
     pub id: u16,
+    /// The full `.lang` key the name resolves through (`getName()`:
+    /// `enchantment.<name>`, `Enchantment.java`:211-214, with the
+    /// protection/damage overrides at `EnchantmentProtection.java:89-92`
+    /// and `EnchantmentDamage.java:80-83`).
+    pub key: &'static str,
     /// The en_US display string (`enchantment.<key>`).
     pub name: &'static str,
 }
@@ -25,102 +32,127 @@ pub struct EnchantEntry {
 pub const ENCHANTS: &[EnchantEntry] = &[
     EnchantEntry {
         id: 0,
+        key: "enchantment.protect.all",
         name: "Protection",
     },
     EnchantEntry {
         id: 1,
+        key: "enchantment.protect.fire",
         name: "Fire Protection",
     },
     EnchantEntry {
         id: 2,
+        key: "enchantment.protect.fall",
         name: "Feather Falling",
     },
     EnchantEntry {
         id: 3,
+        key: "enchantment.protect.explosion",
         name: "Blast Protection",
     },
     EnchantEntry {
         id: 4,
+        key: "enchantment.protect.projectile",
         name: "Projectile Protection",
     },
     EnchantEntry {
         id: 5,
+        key: "enchantment.oxygen",
         name: "Respiration",
     },
     EnchantEntry {
         id: 6,
+        key: "enchantment.waterWorker",
         name: "Aqua Affinity",
     },
     EnchantEntry {
         id: 7,
+        key: "enchantment.thorns",
         name: "Thorns",
     },
     EnchantEntry {
         id: 8,
+        key: "enchantment.waterWalker",
         name: "Depth Strider",
     },
     EnchantEntry {
         id: 16,
+        key: "enchantment.damage.all",
         name: "Sharpness",
     },
     EnchantEntry {
         id: 17,
+        key: "enchantment.damage.undead",
         name: "Smite",
     },
     EnchantEntry {
         id: 18,
+        key: "enchantment.damage.arthropods",
         name: "Bane of Arthropods",
     },
     EnchantEntry {
         id: 19,
+        key: "enchantment.knockback",
         name: "Knockback",
     },
     EnchantEntry {
         id: 20,
+        key: "enchantment.fire",
         name: "Fire Aspect",
     },
     EnchantEntry {
         id: 21,
+        key: "enchantment.lootBonus",
         name: "Looting",
     },
     EnchantEntry {
         id: 32,
+        key: "enchantment.digging",
         name: "Efficiency",
     },
     EnchantEntry {
         id: 33,
+        key: "enchantment.untouching",
         name: "Silk Touch",
     },
     EnchantEntry {
         id: 34,
+        key: "enchantment.durability",
         name: "Unbreaking",
     },
     EnchantEntry {
         id: 35,
+        key: "enchantment.lootBonusDigger",
         name: "Fortune",
     },
     EnchantEntry {
         id: 48,
+        key: "enchantment.arrowDamage",
         name: "Power",
     },
     EnchantEntry {
         id: 49,
+        key: "enchantment.arrowKnockback",
         name: "Punch",
     },
     EnchantEntry {
         id: 50,
+        key: "enchantment.arrowFire",
         name: "Flame",
     },
     EnchantEntry {
         id: 51,
+        key: "enchantment.arrowInfinite",
         name: "Infinity",
     },
     EnchantEntry {
         id: 61,
+        key: "enchantment.lootBonusFishing",
         name: "Luck of the Sea",
     },
     EnchantEntry {
         id: 62,
+        key: "enchantment.fishingSpeed",
         name: "Lure",
     },
 ];
@@ -131,6 +163,18 @@ pub fn enchant_name(id: u16) -> Option<&'static str> {
         .iter()
         .find(|entry| entry.id == id)
         .map(|entry| entry.name)
+}
+
+/// The registry's display string for an effect id against a loaded language
+/// table: the row's key re-sourced through `language` where the table holds
+/// it, else the embedded string [`enchant_name`] answers. `None` exactly
+/// where [`enchant_name`] is.
+pub fn enchant_name_in(id: u16, language: Option<&LanguageTable>) -> Option<String> {
+    let entry = ENCHANTS.iter().find(|entry| entry.id == id)?;
+    match language.and_then(|table| table.get(entry.key)) {
+        Some(hit) => Some(hit.to_string()),
+        None => Some(entry.name.to_string()),
+    }
 }
 
 /// The level suffix (`enchantment.level.<level>`, `en_US.lang`:1383-1392):
@@ -181,6 +225,71 @@ mod tests {
         for id in [9, 15, 22, 31, 36, 47, 52, 60, 63, 255] {
             assert_eq!(enchant_name(id), None, "id {id} is no enchantment");
         }
+    }
+
+    /// The key column: every row keys the source's own `getName()` form —
+    /// the protection/damage overrides plus the plain `enchantment.<name>`
+    /// (`Enchantment.java:211-214`, `EnchantmentProtection.java:89-92`,
+    /// `EnchantmentDamage.java:80-83`).
+    #[test]
+    fn every_row_keys_the_sources_own_get_name() {
+        let keys: Vec<(&str, &str)> = ENCHANTS
+            .iter()
+            .map(|entry| (entry.key, entry.name))
+            .collect();
+        assert!(keys.contains(&("enchantment.protect.all", "Protection")));
+        assert!(keys.contains(&("enchantment.protect.fire", "Fire Protection")));
+        assert!(keys.contains(&("enchantment.protect.fall", "Feather Falling")));
+        assert!(keys.contains(&("enchantment.protect.explosion", "Blast Protection")));
+        assert!(keys.contains(&("enchantment.protect.projectile", "Projectile Protection")));
+        assert!(keys.contains(&("enchantment.oxygen", "Respiration")));
+        assert!(keys.contains(&("enchantment.waterWorker", "Aqua Affinity")));
+        assert!(keys.contains(&("enchantment.thorns", "Thorns")));
+        assert!(keys.contains(&("enchantment.waterWalker", "Depth Strider")));
+        assert!(keys.contains(&("enchantment.damage.all", "Sharpness")));
+        assert!(keys.contains(&("enchantment.damage.undead", "Smite")));
+        assert!(keys.contains(&("enchantment.damage.arthropods", "Bane of Arthropods")));
+        assert!(keys.contains(&("enchantment.knockback", "Knockback")));
+        assert!(keys.contains(&("enchantment.fire", "Fire Aspect")));
+        assert!(keys.contains(&("enchantment.lootBonus", "Looting")));
+        assert!(keys.contains(&("enchantment.digging", "Efficiency")));
+        assert!(keys.contains(&("enchantment.untouching", "Silk Touch")));
+        assert!(keys.contains(&("enchantment.durability", "Unbreaking")));
+        assert!(keys.contains(&("enchantment.lootBonusDigger", "Fortune")));
+        assert!(keys.contains(&("enchantment.arrowDamage", "Power")));
+        assert!(keys.contains(&("enchantment.arrowKnockback", "Punch")));
+        assert!(keys.contains(&("enchantment.arrowFire", "Flame")));
+        assert!(keys.contains(&("enchantment.arrowInfinite", "Infinity")));
+        assert!(keys.contains(&("enchantment.lootBonusFishing", "Luck of the Sea")));
+        assert!(keys.contains(&("enchantment.fishingSpeed", "Lure")));
+        assert_eq!(keys.len(), 25, "every row keys exactly one name");
+    }
+
+    /// The re-source law: a table holding the key wins, a table missing it
+    /// falls back to the embedded string, and no table answers embedded.
+    /// Gaps answer `None` in every arm.
+    #[test]
+    fn the_re_source_prefers_the_table_then_the_embedded_string() {
+        let table = LanguageTable::from_lang(
+            "enchantment.protect.all=Schutz\nenchantment.fire=Feueraspekt\n",
+        );
+        assert_eq!(
+            enchant_name_in(0, Some(&table)),
+            Some(String::from("Schutz")),
+            "a held key re-sources"
+        );
+        assert_eq!(
+            enchant_name_in(1, Some(&table)),
+            Some(String::from("Fire Protection")),
+            "a missing key falls back to embedded"
+        );
+        assert_eq!(
+            enchant_name_in(0, None),
+            Some(String::from("Protection")),
+            "no table answers embedded"
+        );
+        assert_eq!(enchant_name_in(9, Some(&table)), None, "gaps stay gaps");
+        assert_eq!(enchant_name_in(9, None), None, "gaps stay gaps");
     }
 
     #[test]

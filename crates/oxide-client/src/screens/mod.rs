@@ -56,6 +56,7 @@ use options::{OptionsLabels, OptionsScreen, VideoLabels, VideoScreen};
 use options_chat::{ChatLabels, ChatScreen};
 use options_controls::{ControlsLabels, ControlsScreen};
 use options_language::{LanguageLabels, LanguageScreen};
+use options_packs::{PacksLabels, PacksScreen};
 use options_skin::{SkinLabels, SkinScreen};
 use options_sound::{SoundLabels, SoundScreen};
 use pause::{AchievementsScreen, PauseScreen, SnooperScreen, StatsScreen};
@@ -74,6 +75,7 @@ pub mod options;
 pub mod options_chat;
 pub mod options_controls;
 pub mod options_language;
+pub mod options_packs;
 pub mod options_skin;
 pub mod options_sound;
 pub mod pause;
@@ -150,6 +152,10 @@ pub enum ScreenState {
     /// The skin-customization screen: the seven part toggles, standing
     /// from the hub's skin button (boxed like the container kinds).
     Skin(Box<SkinScreen>),
+    /// The resource-packs screen: the recorded no-op surface — the title,
+    /// the two lists, the folder hint and both buttons — standing from
+    /// the hub's packs button (boxed like the container kinds).
+    ResourcePacks(Box<PacksScreen>),
     /// The death screen: the gradient, the title, the score line and the
     /// gated Respawn/Title pair, then the quit-confirm on the title
     /// button (boxed like the container kinds).
@@ -195,7 +201,8 @@ impl ScreenState {
             | ScreenState::Controls(_)
             | ScreenState::Language(_)
             | ScreenState::ChatOptions(_)
-            | ScreenState::Skin(_) => None,
+            | ScreenState::Skin(_)
+            | ScreenState::ResourcePacks(_) => None,
             ScreenState::Multiplayer(_) => None,
         }
     }
@@ -268,10 +275,12 @@ pub struct OptionsSources {
     pub chat: ChatLabels,
     /// The skin screen's labels.
     pub skin: SkinLabels,
+    /// The resource-packs screen's labels.
+    pub packs: PacksLabels,
     /// Whether the video rebuild keeps the VBO row.
     pub vbo_supported: bool,
-    /// Today's locale set, the language list's rows.
-    pub locales: Vec<String>,
+    /// The loader's locale list, the language list's rows.
+    pub locales: Vec<oxide_assets::lang::LanguageInfo>,
 }
 
 impl Screens {
@@ -768,6 +777,7 @@ impl Screens {
                     | ScreenState::Language(_)
                     | ScreenState::ChatOptions(_)
                     | ScreenState::Skin(_)
+                    | ScreenState::ResourcePacks(_)
             )
         )
     }
@@ -878,6 +888,15 @@ impl Screens {
         }
     }
 
+    /// The open resource-packs screen, when the current screen is one: the
+    /// frame's pointer drives it.
+    pub fn packs_mut(&mut self) -> Option<&mut PacksScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::ResourcePacks(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
     /// Stands the options hub at `scaled` on `settings` with `labels`:
     /// the pause menu's options button stands it, stashing the pause as
     /// the parent its Done button returns to (`GuiOptions`' `parentScreen`
@@ -967,15 +986,14 @@ impl Screens {
     }
 
     /// Stands the language screen from the hub's language button (102)
-    /// over `locales`: today's available set plus the mechanism — the
-    /// loader lands in Task 26, so the list carries what the client hands
-    /// it.
+    /// over the loader's `locales`: the store's locales sorted by code,
+    /// rows reading `name (region)`.
     pub fn open_language_from_options(
         &mut self,
         scaled: ScaledResolution,
         settings: &GameSettings,
         labels: LanguageLabels,
-        locales: &[String],
+        locales: &[oxide_assets::lang::LanguageInfo],
     ) {
         let screen = LanguageScreen::new(&scaled, settings, labels, locales);
         self.open_hub_child(ScreenState::Language(Box::new(screen)));
@@ -1001,6 +1019,14 @@ impl Screens {
     ) {
         let screen = SkinScreen::new(&scaled, settings, labels);
         self.open_hub_child(ScreenState::Skin(Box::new(screen)));
+    }
+
+    /// Stands the resource-packs screen from the hub's packs button (105):
+    /// the recorded no-op surface over `labels`. The hub stashes as the
+    /// parent its Done button returns to without applying.
+    pub fn open_packs_from_options(&mut self, scaled: ScaledResolution, labels: PacksLabels) {
+        let screen = PacksScreen::new(&scaled, labels);
+        self.open_hub_child(ScreenState::ResourcePacks(Box::new(screen)));
     }
 
     /// Returns the video screen, the hub-opened snooper or one of the five
@@ -1108,6 +1134,12 @@ impl Screens {
                     scaled,
                     settings,
                     sources.skin,
+                ))));
+            }
+            Some(ScreenState::ResourcePacks(_)) => {
+                self.current = Some(ScreenState::ResourcePacks(Box::new(PacksScreen::new(
+                    scaled,
+                    sources.packs,
                 ))));
             }
             other => self.current = other,
@@ -1244,6 +1276,7 @@ impl Screens {
                     | ScreenState::Language(_)
                     | ScreenState::ChatOptions(_)
                     | ScreenState::Skin(_)
+                    | ScreenState::ResourcePacks(_)
             )
         ) && self.back_to_options()
         {

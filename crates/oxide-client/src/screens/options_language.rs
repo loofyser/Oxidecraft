@@ -2,6 +2,7 @@
 //! Done (`GuiLanguage.java`).
 
 use oxide_assets::font::Font;
+use oxide_assets::lang::LanguageInfo;
 use oxide_game::chat::LanguageTable;
 use oxide_game::settings::GameSettings;
 use oxide_render::hud::{HudDraw, ScaledResolution};
@@ -92,14 +93,15 @@ impl LanguageAction {
     }
 }
 
-/// The language screen: the locale list over today's available set plus
-/// the mechanism — the loader and the pack selection land in Task 26, so
-/// the list carries what the client hands it — with Force Unicode and
-/// Done beneath.
+/// The language screen: the locale list over the loader's languages plus
+/// the mechanism — rows read `name (region)` sorted by code (`Language`
+/// :28-31, `:43-46`) — with Force Unicode and Done beneath.
 #[derive(Debug, Clone)]
 pub struct LanguageScreen {
-    /// The locales in list order.
+    /// The locale codes in list order.
     locales: Vec<String>,
+    /// The row strings the list draws (`name (region)` per locale).
+    rows: Vec<String>,
     /// The selected row: the store's language when it stands in the list,
     /// else the head.
     selected: usize,
@@ -119,14 +121,14 @@ pub struct LanguageScreen {
 
 impl LanguageScreen {
     /// Stands the language screen at `scaled` on `settings` with `labels`
-    /// over `locales`: the list spans `32..h-61` in 18-pixel rows, Force
-    /// Unicode 100 and Done 6 sit 150-wide at `h-38` (`initGui`:46-52,
-    /// `List`:116).
+    /// over the loader's `locales` (sorted by code): the list spans
+    /// `32..h-61` in 18-pixel rows reading `name (region)`, Force Unicode
+    /// 100 and Done 6 sit 150-wide at `h-38` (`initGui`:46-52, `List`:116).
     pub fn new(
         scaled: &ScaledResolution,
         settings: &GameSettings,
         labels: LanguageLabels,
-        locales: &[String],
+        locales: &[LanguageInfo],
     ) -> Self {
         let half = scaled.width / 2;
         let left = (half - 155) as f32;
@@ -139,10 +141,11 @@ impl LanguageScreen {
         };
         let selected = locales
             .iter()
-            .position(|locale| *locale == settings.language)
+            .position(|locale| locale.code == settings.language)
             .unwrap_or(0);
         Self {
-            locales: locales.to_vec(),
+            locales: locales.iter().map(|locale| locale.code.clone()).collect(),
+            rows: locales.iter().map(LanguageInfo::display).collect(),
             selected,
             unicode: OptionButton::new(
                 LANGUAGE_UNICODE_ID,
@@ -176,6 +179,11 @@ impl LanguageScreen {
     /// Row `i`'s locale code.
     pub fn row(&self, index: usize) -> &str {
         &self.locales[index]
+    }
+
+    /// Row `i`'s drawn string (`name (region)`).
+    pub fn row_text(&self, index: usize) -> &str {
+        &self.rows[index]
     }
 
     /// The selected row, if the list stands non-empty.
@@ -258,7 +266,7 @@ impl LanguageScreen {
     ) -> Vec<HudDraw> {
         let mut draws = Vec::new();
         let bottom = self.height as f32 - LANGUAGE_LIST_BOTTOM_INSET;
-        for (slot, (index, locale)) in self.locales.iter().enumerate().enumerate() {
+        for (slot, (index, row)) in self.rows.iter().enumerate().enumerate() {
             let y = LANGUAGE_LIST_TOP + slot as f32 * LANGUAGE_SLOT_HEIGHT - self.scroll;
             if y < LANGUAGE_LIST_TOP - LANGUAGE_SLOT_HEIGHT || y >= bottom {
                 continue;
@@ -272,9 +280,9 @@ impl LanguageScreen {
                     colour: [1.0, 1.0, 1.0, 80.0 / 255.0],
                 });
             }
-            let width = string_width(font, locale);
+            let width = string_width(font, row);
             draws.push(HudDraw::Text {
-                text: locale.clone(),
+                text: row.clone(),
                 x: scaled.width as f32 / 2.0 - width as f32 / 2.0,
                 y: y + (LANGUAGE_SLOT_HEIGHT - 8.0) / 2.0,
                 scale: 1.0,

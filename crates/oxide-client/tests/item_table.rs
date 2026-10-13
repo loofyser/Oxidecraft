@@ -18,6 +18,7 @@ use oxide_client::items::{
     CreativeTab, ItemAttributes, ItemEntry, ItemModel, ItemTable, TabEntry, creative_tab_items,
     item_entry, potion_name, registry, search_matches, stack_name, sub_items,
 };
+use oxide_client::{enchants, items};
 use oxide_game::container::{BASE_MAX_STACK_SIZE, BaseStackCaps, StackCaps, max_stack_size};
 use oxide_proto_v47::entity::{MetadataItem, MobType};
 
@@ -948,4 +949,140 @@ fn the_search_filter_matches_case_insensitively() {
         "the stone-family stacks and the names that carry the word"
     );
     assert!(filter("no such string").is_empty());
+}
+
+// Task 26's key-column suite: every enumerated row keys its damage-0 display
+// key, and the keys re-source against the real table.
+//
+// The derivation (`refs/m6-task-26/derive_item_keys.py`) pins each key's form
+// against the reference's own `getUnlocalizedName` rules and each key's value
+// against the store's `en_US.lang`; the store-free pins below hold the column
+// complete and spot-check its forms, while the ignored case re-runs the full
+// 337 + 25 resolution as the checklist row 55 vector demands.
+
+#[test]
+fn the_item_key_column_stands_complete() {
+    let rows = registry();
+    assert_eq!(rows.len(), 337, "the registry's row count");
+    let unkeyed: Vec<i16> = rows
+        .iter()
+        .filter(|row| row.key.is_none())
+        .map(|row| row.id)
+        .collect();
+    assert!(unkeyed.is_empty(), "no row stays unkeyed: {unkeyed:?}");
+    for (id, key) in [
+        (1, "tile.stone.stone.name"),
+        (2, "tile.grass.name"),
+        (31, "tile.tallgrass.shrub.name"),
+        (35, "tile.cloth.white.name"),
+        (44, "tile.stoneSlab.stone.name"),
+        (126, "tile.woodSlab.oak.name"),
+        (145, "tile.anvil.intact.name"),
+        (161, "tile.leaves.acacia.name"),
+        (175, "tile.doublePlant.sunflower.name"),
+        (260, "item.apple.name"),
+        (267, "item.swordIron.name"),
+        (349, "item.fish.cod.raw.name"),
+        (350, "item.fish.cod.cooked.name"),
+        (351, "item.dyePowder.black.name"),
+        (373, "item.emptyPotion.name"),
+        (383, "item.monsterPlacer.name"),
+        (397, "item.skull.skeleton.name"),
+        (403, "item.enchantedBook.name"),
+        (425, "item.banner.black.name"),
+    ] {
+        assert_eq!(
+            item_entry(id).map(|row| row.key),
+            Some(Some(key)),
+            "id {id}'s display key"
+        );
+    }
+}
+
+#[test]
+fn the_enchant_key_column_stands_complete() {
+    assert_eq!(enchants::ENCHANTS.len(), 25, "the 1.8 registry's own count");
+    for row in enchants::ENCHANTS {
+        assert!(
+            row.key.starts_with("enchantment."),
+            "id {} keys the source's getName form",
+            row.id
+        );
+    }
+    assert_eq!(
+        enchants::ENCHANTS
+            .iter()
+            .find(|row| row.id == 0)
+            .map(|row| row.key),
+        Some("enchantment.protect.all")
+    );
+    assert_eq!(
+        enchants::ENCHANTS
+            .iter()
+            .find(|row| row.id == 18)
+            .map(|row| row.key),
+        Some("enchantment.damage.arthropods")
+    );
+}
+
+/// The store-gated full-resolution case: all 337 item keys and all 25
+/// enchant keys resolve to their embedded strings in the real `en_US.lang`,
+/// and the re-source helpers answer those strings through the loaded table.
+/// Run with `OXIDECRAFT_STORE` set and `-- --ignored`.
+#[test]
+#[ignore = "reads the asset store; set OXIDECRAFT_STORE and run with -- --ignored"]
+fn the_store_table_re_sources_every_key() {
+    let root = std::env::var_os("OXIDECRAFT_STORE")
+        .filter(|root| !root.is_empty())
+        .expect("OXIDECRAFT_STORE must name the store root");
+    let store =
+        oxide_assets::store::Store::open(std::path::PathBuf::from(root)).expect("the store opens");
+    let loaded = oxide_assets::lang::Lang::load(&store, "1.8.9", "en_US").expect("en_US loads");
+    let table = oxide_game::chat::LanguageTable::from(loaded);
+    let mut item_misses = 0;
+    for row in registry() {
+        let key = row
+            .key
+            .unwrap_or_else(|| panic!("id {} must carry a key", row.id));
+        match table.get(key) {
+            Some(hit) => assert_eq!(
+                hit, row.name,
+                "id {}'s key {key} carries the embedded string",
+                row.id
+            ),
+            None => {
+                item_misses += 1;
+            }
+        }
+    }
+    assert_eq!(item_misses, 0, "every item key resolves in en_US");
+    for row in enchants::ENCHANTS {
+        assert_eq!(
+            table.get(row.key),
+            Some(row.name),
+            "enchant id {}'s key {} carries the embedded string",
+            row.id,
+            row.key
+        );
+    }
+    // The helpers answer the embedded strings through the loaded table.
+    assert_eq!(
+        items::stack_name_in(1, 0, Some(&table)),
+        Some(String::from("Stone"))
+    );
+    assert_eq!(
+        items::stack_name_in(260, 0, Some(&table)),
+        Some(String::from("Apple"))
+    );
+    assert_eq!(
+        enchants::enchant_name_in(0, Some(&table)),
+        Some(String::from("Protection"))
+    );
+    // A hostile current language cannot move the base: a table missing a key
+    // falls back, never fails.
+    let empty = oxide_game::chat::LanguageTable::default();
+    assert_eq!(
+        items::stack_name_in(1, 0, Some(&empty)),
+        Some(String::from("Stone"))
+    );
 }

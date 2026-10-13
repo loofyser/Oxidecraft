@@ -28,6 +28,7 @@
 //! submodule, derived from the same reference tree and pinned by the same suite.
 
 use oxide_assets::model::{BuiltinItem, ItemModelSource};
+use oxide_game::chat::LanguageTable;
 use oxide_game::container::{BASE_MAX_STACK_SIZE, StackCaps};
 use oxide_proto_v47::entity::MetadataItem;
 
@@ -131,6 +132,12 @@ pub struct ItemEntry {
     /// The en_US display string at damage 0, as the class composes it
     /// (`Item.getItemStackDisplayName` over the class's unlocalized name).
     pub name: &'static str,
+    /// The full `.lang` key the damage-0 display name resolves through
+    /// (`getUnlocalizedName(stack) + ".name"`), or `None` when the row's
+    /// name is dynamic (per-damage variant suffixes the table does not key,
+    /// NBT/entity compositions). [`stack_name_in`] resolves it against a
+    /// loaded table; the embedded [`ItemEntry::name`] stays the fallback.
+    pub key: Option<&'static str>,
     /// The model resolution, in its committed const form.
     pub resolution: ItemModel,
     /// The stack cap the source sets (`Item.getItemStackLimit`, `item/Item.java`:165-167):
@@ -385,6 +392,38 @@ pub fn stack_name(id: i16, damage: i16) -> Option<&'static str> {
         .map(|item| item.name)
 }
 
+/// The display name a stack carries against a loaded language table: the
+/// damage-0 key re-sourced through `language` where the row keys one and
+/// the table holds it, else the embedded string [`stack_name`] answers.
+/// Variant damages keep their embedded sub-item strings (their per-damage
+/// keys are not tabled — recorded). `None` exactly where [`stack_name`] is.
+pub fn stack_name_in(id: i16, damage: i16, language: Option<&LanguageTable>) -> Option<String> {
+    let entry = item_entry(id)?;
+    let items = sub_items(id);
+    if !items.is_empty() && damage != 0 {
+        return items
+            .iter()
+            .find(|item| item.damage == damage)
+            .map(|item| item.name.to_string());
+    }
+    let name = if items.is_empty() {
+        entry.name
+    } else {
+        items
+            .iter()
+            .find(|item| item.damage == 0)
+            .map(|item| item.name)
+            .unwrap_or(entry.name)
+    };
+    match (entry.key, language) {
+        (Some(key), Some(table)) if items.is_empty() || damage == 0 => match table.get(key) {
+            Some(hit) => Some(hit.to_string()),
+            None => Some(name.to_string()),
+        },
+        _ => Some(name.to_string()),
+    }
+}
+
 /// The search tab's filter rule: the source's own comparison
 /// (`GuiContainerCreative.java`:363, `:372`) — both sides lower-cased, then
 /// `contains`. The source filters over a stack's whole tooltip with formatting codes
@@ -567,5 +606,78 @@ mod tests {
         assert_eq!(CreativeTab::Search.sheet(), "item_search.png");
         assert_eq!(CreativeTab::from_index(11), Some(CreativeTab::Inventory));
         assert_eq!(CreativeTab::from_index(12), None);
+    }
+
+    /// The key column's shape: all 337 rows key their damage-0 display key
+    /// (the T26 derivation pins each against the real `en_US.lang`), with
+    /// spot pins across the rule families — plain block, plain item,
+    /// multi-texture variant, cloth white, slab, and the item-side
+    /// specials.
+    #[test]
+    fn every_row_keys_its_damage_zero_display_key() {
+        assert_eq!(
+            registry().iter().filter(|row| row.key.is_none()).count(),
+            0,
+            "no row stays unkeyed"
+        );
+        let key = |id: i16| {
+            item_entry(id)
+                .unwrap_or_else(|| panic!("id {id} must be in the table"))
+                .key
+        };
+        assert_eq!(key(1), Some("tile.stone.stone.name"));
+        assert_eq!(key(2), Some("tile.grass.name"));
+        assert_eq!(key(4), Some("tile.stonebrick.name"));
+        assert_eq!(key(5), Some("tile.wood.oak.name"));
+        assert_eq!(key(35), Some("tile.cloth.white.name"));
+        assert_eq!(key(44), Some("tile.stoneSlab.stone.name"));
+        assert_eq!(key(145), Some("tile.anvil.intact.name"));
+        assert_eq!(key(260), Some("item.apple.name"));
+        assert_eq!(key(263), Some("item.coal.name"));
+        assert_eq!(key(267), Some("item.swordIron.name"));
+        assert_eq!(key(349), Some("item.fish.cod.raw.name"));
+        assert_eq!(key(350), Some("item.fish.cod.cooked.name"));
+        assert_eq!(key(351), Some("item.dyePowder.black.name"));
+        assert_eq!(key(373), Some("item.emptyPotion.name"));
+        assert_eq!(key(383), Some("item.monsterPlacer.name"));
+        assert_eq!(key(397), Some("item.skull.skeleton.name"));
+        assert_eq!(key(403), Some("item.enchantedBook.name"));
+        assert_eq!(key(425), Some("item.banner.black.name"));
+    }
+
+    /// The re-source law: a held damage-0 key wins, a missing key falls back
+    /// to embedded, no table answers embedded, variant damages keep their
+    /// embedded sub-item strings, and unknown ids stay `None` in every arm.
+    #[test]
+    fn the_re_source_prefers_the_table_then_the_embedded_string() {
+        let table =
+            LanguageTable::from_lang("tile.stone.stone.name=Stein\nitem.apple.name=Apfel\n");
+        assert_eq!(
+            stack_name_in(1, 0, Some(&table)),
+            Some(String::from("Stein")),
+            "a held damage-0 key re-sources"
+        );
+        assert_eq!(
+            stack_name_in(260, 0, Some(&table)),
+            Some(String::from("Apfel")),
+            "a held plain-item key re-sources"
+        );
+        assert_eq!(
+            stack_name_in(2, 0, Some(&table)),
+            Some(String::from("Grass Block")),
+            "a missing key falls back to embedded"
+        );
+        assert_eq!(
+            stack_name_in(1, 0, None),
+            Some(String::from("Stone")),
+            "no table answers embedded"
+        );
+        assert_eq!(
+            stack_name_in(35, 1, Some(&table)),
+            Some(String::from("Orange Wool")),
+            "variant damages keep their embedded strings"
+        );
+        assert_eq!(stack_name_in(9_999, 0, Some(&table)), None);
+        assert_eq!(stack_name_in(9_999, 0, None), None);
     }
 }

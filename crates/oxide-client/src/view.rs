@@ -589,6 +589,17 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             }
             return draws;
         }
+        // The packs screen stands over the hub the same way: the dirt
+        // tiles lead under the gradient, and the recorded surface — the
+        // title, the two lists, the folder hint and both buttons — rides
+        // on top. No pack applies port-side, so the surface draws only.
+        ScreenState::ResourcePacks(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
     };
     let layout = container.layout();
     let (gx, gy) = container.origin();

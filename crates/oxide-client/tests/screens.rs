@@ -2444,6 +2444,9 @@ use oxide_client::screens::options_controls::{
 use oxide_client::screens::options_language::{
     LANGUAGE_DONE_ID, LANGUAGE_UNICODE_ID, LanguageAction, LanguageScreen, language_labels,
 };
+use oxide_client::screens::options_packs::{
+    PACKS_DONE_ID, PACKS_OPEN_FOLDER_ID, PacksAction, PacksScreen, packs_labels,
+};
 use oxide_client::screens::options_skin::{
     SKIN_DONE_ID, SKIN_PARTS, SkinAction, SkinScreen, skin_labels, skin_part_label,
 };
@@ -2497,7 +2500,11 @@ fn language_english() -> LanguageScreen {
         &wide(),
         &GameSettings::default(),
         language_labels(None),
-        &[String::from("en_US")],
+        &[oxide_assets::lang::LanguageInfo {
+            code: String::from("en_US"),
+            name: String::from("English"),
+            region: String::from("US"),
+        }],
     )
 }
 
@@ -2859,6 +2866,113 @@ fn the_skin_press_flips_the_bit_and_relabels() {
     assert_eq!(settings.skin_parts, 0x7E);
     assert_eq!(screen.part_label(0), "Cape: Off");
     assert_eq!(action.save_kind(), SaveKind::Immediate);
+}
+
+/// The packs screen over the store's English labels.
+fn packs_english() -> PacksScreen {
+    PacksScreen::new(&wide(), packs_labels(None))
+}
+
+#[test]
+fn the_packs_screen_geometry_matches_the_recorded_surface() {
+    // `GuiScreenResourcePacks.java:28-120` + `GuiResourcePackList.java:16`:
+    // the title centered at y 16, the available list `200x(top 32, bottom
+    // h-51, step 36)` at `w/2-4-200`, the selected list at `w/2+4`, the
+    // hint under the lists at `h-26`, Open Folder 2 at `w/2-154, h-48`,
+    // Done 1 at `w/2+4, h-48`. At 427x240: (59, 192) and (217, 192).
+    let screen = packs_english();
+    assert_eq!((screen.title_y(), screen.hint_y()), (16.0, 240.0 - 26.0));
+    assert_eq!(
+        (
+            screen.available_left(),
+            screen.list_top(),
+            screen.list_bottom()
+        ),
+        (213.0 - 4.0 - 200.0, 32.0, 240.0 - 51.0)
+    );
+    assert_eq!(screen.selected_left(), 213.0 + 4.0);
+    assert_eq!(screen.open_folder_pos(), (213.0 - 154.0, 240.0 - 48.0));
+    assert_eq!(screen.done_pos(), (213.0 + 4.0, 240.0 - 48.0));
+    assert_eq!(PACKS_OPEN_FOLDER_ID, 2);
+    assert_eq!(PACKS_DONE_ID, 1);
+}
+
+#[test]
+fn the_packs_open_folder_records_and_opens_nothing() {
+    // `GuiScreenResourcePacks.java:132-137`: Open Folder 2 opens the folder
+    // port-side; the port records its press and draws everything anyway.
+    let mut screen = packs_english();
+    let action = screen
+        .click_at(
+            (213.0 - 154.0 + 10.0, 240.0 - 48.0 + 10.0),
+            &mut GameSettings::default(),
+        )
+        .expect("the Open Folder press lands");
+    assert_eq!(action, PacksAction::OpenFolder);
+    assert_eq!(screen.open_folder_presses(), 1);
+    let action = screen
+        .click_at(
+            (213.0 - 154.0 + 10.0, 240.0 - 48.0 + 10.0),
+            &mut GameSettings::default(),
+        )
+        .expect("a second Open Folder press lands");
+    assert_eq!(action, PacksAction::OpenFolder);
+    assert_eq!(screen.open_folder_presses(), 2);
+    assert_eq!(action.save_kind(), SaveKind::Deferred);
+}
+
+#[test]
+fn the_packs_list_clicks_are_inert_and_done_applies_nothing() {
+    // The §16 no-op law: selecting does nothing — the `:167-201` arm is
+    // absent — and Done returns without applying: both arms ride the
+    // debounced mark, which persists identical bytes.
+    let mut screen = packs_english();
+    assert_eq!(
+        screen.selected_count(),
+        1,
+        "the default pack stands selected"
+    );
+    assert!(
+        screen
+            .click_at((213.0 - 100.0, 40.0), &mut GameSettings::default())
+            .is_none(),
+        "list clicks answer nothing"
+    );
+    assert_eq!(screen.selected_count(), 1, "selecting changes nothing");
+    let action = screen
+        .click_at(
+            (213.0 + 4.0 + 10.0, 240.0 - 48.0 + 10.0),
+            &mut GameSettings::default(),
+        )
+        .expect("the Done press lands");
+    assert_eq!(action, PacksAction::Done);
+    assert_eq!(
+        action.save_kind(),
+        SaveKind::Deferred,
+        "Done applies nothing"
+    );
+}
+
+#[test]
+fn the_packs_routing_answers_the_hub() {
+    // Hub → packs (hub 105 stashes); Done answers the hub; Escape on the
+    // packs answers the hub too; the re-source keeps the screen standing.
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    screens.open_options(wide(), &GameSettings::default(), options_labels(None));
+    screens.open_packs_from_options(wide(), packs_labels(None));
+    assert!(screens.packs_mut().is_some(), "the packs screen stands");
+    assert!(screens.back_to_options(), "packs Done answers the hub");
+    assert!(screens.options_mut().is_some());
+    let mut screens = Screens::default();
+    screens.open_pause(wide(), pause_english());
+    screens.open_options(wide(), &GameSettings::default(), options_labels(None));
+    screens.open_packs_from_options(wide(), packs_labels(None));
+    assert_eq!(screens.escape(&mut None), None);
+    assert!(
+        screens.options_mut().is_some(),
+        "packs Escape answers the hub now"
+    );
 }
 
 // Task 20's end-state suite: the death, disconnect, terrain and sleep

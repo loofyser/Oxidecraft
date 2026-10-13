@@ -48,9 +48,7 @@ const GRASS_COLORMAP: &str = "colormap/grass";
 const FOLIAGE_COLORMAP: &str = "colormap/foliage";
 /// The ascii font sheet's texture path.
 const FONT_SHEET: &str = "font/ascii";
-/// The language file's path below the extraction root: the client's own language
-/// table, which the chat path resolves translation components against.
-const LANG_FILE: &str = "assets/minecraft/lang/en_US.lang";
+/// The splash lines' path below the extraction root.
 const SPLASHES_FILE: &str = "assets/minecraft/texts/splashes.txt";
 /// The sun quad's texture path.
 const SUN: &str = "environment/sun";
@@ -305,14 +303,9 @@ pub enum AssetError {
     /// The ascii font sheet could not be measured.
     #[error("the font sheet could not be measured: {0}")]
     Font(#[from] FontError),
-    /// The language file could not be read.
-    #[error("the language file {path} could not be read: {source}")]
-    Lang {
-        /// The file's path.
-        path: PathBuf,
-        /// The read error.
-        source: std::io::Error,
-    },
+    /// The language table could not be loaded.
+    #[error("the language table could not be loaded: {0}")]
+    LangLoad(#[from] oxide_assets::lang::LangError),
 }
 
 /// The assets one client run loads: what the session meshes with, the overlay's font,
@@ -326,9 +319,14 @@ pub struct ClientAssets {
     pub mesh: Arc<MeshAssets>,
     /// The ascii font measured from the sheet.
     pub font: Font,
-    /// The language table, from the extraction tree's `en_US.lang`: the chat path
-    /// resolves translation components against it.
+    /// The language table, from the loader's en_US base (the extraction
+    /// tree's `en_US.lang` plus the hashed locale objects behind it): the
+    /// chat path resolves translation components against it.
     pub lang: LanguageTable,
+    /// The locales the loader lists, sorted by code: the tree's en_US head
+    /// plus the index's readable locale objects. The language screen lists
+    /// these.
+    pub locales: Vec<oxide_assets::lang::LanguageInfo>,
     /// The ascii font sheet itself, for the overlay's GPU upload.
     pub sheet: Texture,
     /// The sun, the moon phase sheet and the cloud layer.
@@ -434,12 +432,10 @@ impl ClientAssets {
         };
         let sheet = texture(&textures, FONT_SHEET)?.clone();
         let font = Font::load(&sheet, None)?;
-        let lang = LanguageTable::from_lang(
-            &std::fs::read_to_string(tree.join(LANG_FILE)).map_err(|source| AssetError::Lang {
-                path: tree.join(LANG_FILE),
-                source,
-            })?,
-        );
+        let loaded = oxide_assets::lang::Lang::load(&store, VERSION, "en_US")?;
+        let lang = LanguageTable::from(loaded);
+        let locales =
+            oxide_assets::lang::Lang::available_languages(&store, VERSION).unwrap_or_default();
         let sky_textures = SkyTextures {
             sun: texture(&textures, SUN)?.clone(),
             moon_phases: texture(&textures, MOON_PHASES)?.clone(),
@@ -533,6 +529,7 @@ impl ClientAssets {
             mesh,
             font,
             lang,
+            locales,
             sheet,
             sky_textures,
             rain_sheet,

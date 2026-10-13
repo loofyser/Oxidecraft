@@ -7,6 +7,7 @@ pub mod extract;
 pub mod fetch;
 pub mod font;
 pub mod http;
+pub mod lang;
 pub mod mcmeta;
 pub mod model;
 pub mod png_write;

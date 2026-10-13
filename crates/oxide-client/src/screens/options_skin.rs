@@ -27,16 +27,28 @@ pub const SKIN_PARTS: [&str; 7] = [
     "hat",
 ];
 
-/// The English part names the buttons compose (`options.skinCustomisation`
+/// The English part names the buttons compose (`options.modelPart.*`
 /// rows), in [`SKIN_PARTS`] order.
 const SKIN_PART_NAMES: [&str; 7] = [
     "Cape",
     "Jacket",
     "Left Sleeve",
     "Right Sleeve",
-    "Left Pants",
-    "Right Pants",
+    "Left Pants Leg",
+    "Right Pants Leg",
     "Hat",
+];
+
+/// The label keys in [`SKIN_PARTS`] order (`options.modelPart.*`,
+/// `en_US.lang`:389-395 — not the `skinCustomisation` title key).
+const SKIN_PART_KEYS: [&str; 7] = [
+    "options.modelPart.cape",
+    "options.modelPart.jacket",
+    "options.modelPart.left_sleeve",
+    "options.modelPart.right_sleeve",
+    "options.modelPart.left_pants_leg",
+    "options.modelPart.right_pants_leg",
+    "options.modelPart.hat",
 ];
 
 /// The skin screen's labels: the title, the seven part names and Done.
@@ -65,15 +77,7 @@ pub fn skin_labels(language: Option<&LanguageTable>) -> SkinLabels {
     };
     SkinLabels {
         title: text("options.skinCustomisation.title", "Skin Customization"),
-        parts: [
-            text("options.skinCustomisation.cape", SKIN_PART_NAMES[0]),
-            text("options.skinCustomisation.jacket", SKIN_PART_NAMES[1]),
-            text("options.skinCustomisation.sleeveLeft", SKIN_PART_NAMES[2]),
-            text("options.skinCustomisation.sleeveRight", SKIN_PART_NAMES[3]),
-            text("options.skinCustomisation.pantsLeft", SKIN_PART_NAMES[4]),
-            text("options.skinCustomisation.pantsRight", SKIN_PART_NAMES[5]),
-            text("options.skinCustomisation.hat", SKIN_PART_NAMES[6]),
-        ],
+        parts: core::array::from_fn(|index| text(SKIN_PART_KEYS[index], SKIN_PART_NAMES[index])),
         on: text("options.on", "On"),
         off: text("options.off", "Off"),
         done: text("gui.done", "Done"),
