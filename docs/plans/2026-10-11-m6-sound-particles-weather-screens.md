@@ -770,18 +770,18 @@ feat: the F2 screenshot capture (render, client)
 
 ### Task 25: The keybinds
 
-**Goal:** The full default binding list lands in the settings store with rebinding (Task 19's machine) — F2, F5, F11, the standing set — and every action routes from data, not hard-coded matches; the controls screen reads the same list.
+**Goal:** The full default binding list lands in the settings store with rebinding (Task 19's machine) — F2, F5, F11, the standing set (F1 is NOT a table row — a raw-key edge per the source; Task 27 owns the flag) — and every action routes from data, not hard-coded matches; the controls screen reads the same list.
 
 **Files:**
-- Modify: `crates/oxide-game/src/settings.rs` — the bindings table (action list + defaults per the source's `GameSettings` rows; the full list lands even where an action is inert in v1, each inert row recorded).
+- Modify: `crates/oxide-game/src/settings.rs` — the bindings table (action list + defaults per the source's `GameSettings` rows; the full list lands even where an action is inert in v1, each inert row recorded; the store's actual home re-derived first-hand — the dossier predates Task 19's landing).
 - Modify: `crates/oxide-client/src/keymap.rs` — the data-driven translation (physical key → action lookup from settings; the M5 hard-coded matches reduce to the defaults' data).
-- Modify: `crates/oxide-client/src/main.rs` — the new routes: F2 (capture), F5 (camera modes — Task 27), F11 (fullscreen), F1 (HUD hide — Task 27), and the standing ones re-read.
+- Modify: `crates/oxide-client/src/main.rs` — the new routes: F2 (capture — landed with Task 24; this task folds its arm into the data-driven table), F5 (camera modes — Task 27), F11 (fullscreen), the F1 edge (raw-key, not a binding — Task 27 owns the flag), and the standing ones re-read.
 - Modify: `crates/oxide-client/src/screens/options_controls.rs` — reads the table (Task 19's screen; this task completes any inert row it exposed).
 - Test: the default table pinned row-by-row against the derived source list; the lookup function; a rebound key's route (a test binding change + the routed event).
 
 **Interfaces:**
-- Produces: the `Action` enum (the source's action set) + `bindings: Vec<(Action, Key)>` in `GameSettings`; `keymap::translate` becomes `lookup(settings, code) -> Option<Action>`.
-- Consumes: Task 19; Task 3.
+- Produces: the `Action` enum (the source's action set) + the bindings table in `GameSettings`; the lookup keyed on the SOURCE code domain — negative = mouse button, 0 = unbound, positive = key — covering all three (not the physical key alone).
+- Consumes: Task 19; Task 3; Task 24 (F2's landed arm folds into data).
 
 - [ ] **Step 1: Table tests (RED).** Every default; red first.
 - [ ] **Step 2: Implement the lookup + routes.** Run — green.
