@@ -685,7 +685,7 @@ fn box_entry(box_: &CollisionBox, from: [f64; 3], to: [f64; 3]) -> Option<(f64, 
 /// `blockMaterial.isReplaceable()` (`world/World.java:3153-3157`). The
 /// material rule is set at the material singletons: `MaterialTransparent` —
 /// air and fire (`Material.java:5,19`; `MaterialTransparent.java:8`) —
-/// `MaterialLiquid` — water and lava (`Material.java:9-10`;
+/// `MaterialLiquid` — water and lava (`Material.java:12-13`;
 /// `MaterialLiquid.java:8`) — and `Material.vine` (`Material.java:16`),
 /// which the covered plants carry: the tall grass (`BlockTallGrass.java:30`),
 /// the dead bush (`BlockDeadBush.java:21`) and the double plant
@@ -716,9 +716,10 @@ pub fn replaceable(value: u16) -> bool {
 /// facts and the cell the block lands in.
 ///
 /// The source builds its packet from exactly these — the aimed position and
-/// the face (`PlayerControllerMP.onPlayerRightClick` spends the frame's
-/// `ObjectMouseOver` at `:395-396` and sends at `:424`), and the three hit
-/// fractions (`:395-397`'s `f`, `f1`, `f2`, scaled at
+/// the face (the right-click path spends the frame's `objectMouseOver` at
+/// `Minecraft.java:1598-1605` and sends at `PlayerControllerMP.java:424`),
+/// and the three hit fractions (`PlayerControllerMP.java:393-395`'s `f`,
+/// `f1`, `f2`, scaled at
 /// `C08PacketPlayerBlockPlacement.writePacketData:60-62`) — and predicts the
 /// block at the cell its `onItemUse` call writes (`:436`, `:443`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

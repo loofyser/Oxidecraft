@@ -78,8 +78,8 @@ pub fn decode_sound_effect(body: &[u8]) -> Result<SoundEffect, PacketError> {
 /// Reads a sound-effect fixed-point coordinate as blocks.
 ///
 /// The wire carries 1/8-block units: the constructor multiplies each axis by
-/// `8.0` (`S29PacketSoundEffect.java:28-30`) and the getters divide back by
-/// `8.0` (`:69-80`).
+/// `8.0` (`S29PacketSoundEffect.java:27-29`) and the getters divide back by
+/// `8.0` (`:66-79`).
 pub fn read_effect_position(value: i32) -> f64 {
     value as f64 / 8.0
 }
@@ -87,7 +87,7 @@ pub fn read_effect_position(value: i32) -> f64 {
 /// Reads a sound-effect pitch byte as a pitch factor.
 ///
 /// The constructor stores `(int)(pitch * 63.0F)` and the getter divides back
-/// (`S29PacketSoundEffect.java:32`, `:88-91`), so 63 reads as full pitch.
+/// (`S29PacketSoundEffect.java:31`, `:86-89`), so 63 reads as full pitch.
 pub fn read_sound_pitch(pitch: u8) -> f32 {
     pitch as f32 / 63.0
 }

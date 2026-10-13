@@ -50,7 +50,7 @@
 //! and its sprite corners are that fallback cube's own tables (`oxide-game`'s
 //! `FALLBACK_CORNERS`/`SPRITE_CORNERS`), so the crack reuses the model-data path the mesher
 //! consumes corner for corner. The crack's pipeline culls back faces: the damaged pass sets
-//! no cull state of its own and runs with the client's culling on (`RenderGlobal.java:1786`),
+//! no cull state of its own and runs with the client's culling on (`RenderGlobal.java:1797-1818`),
 //! under the same cube winding the terrain draws with.
 //!
 //! # The hitboxes
@@ -1530,6 +1530,7 @@ mod tests {
             !depth.depth_write_enabled,
             "the outline draws with the depth mask off"
         );
+        assert_eq!(depth.bias, wgpu::DepthBiasState::default());
         let primitive = primitive_state(None);
         assert_eq!(primitive.topology, PrimitiveTopology::TriangleList);
         assert_eq!(primitive.cull_mode, None, "the outline culls nothing");
