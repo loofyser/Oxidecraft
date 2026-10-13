@@ -9,7 +9,9 @@ use std::time::Duration;
 use oxide_proto::frame::{Compression, read_frame, write_frame};
 use oxide_proto::varint::write_varint;
 use oxide_proto_v47::handshake::handshake_payload;
-use oxide_proto_v47::status::{PingError, StatusResponse, ping_server};
+use oxide_proto_v47::status::{
+    PingError, StatusResponse, parse_status_json, ping_server, ping_with_latency,
+};
 
 /// A status response whose description is a chat component object.
 const OBJECT_DESCRIPTION_JSON: &str = concat!(
@@ -321,4 +323,86 @@ fn overlong_json_length_is_reported_as_a_bad_length() {
     });
 
     assert!(matches!(result, Err(PingError::BadLength(_))));
+}
+
+/// A status reply whose player sample and styled description the ping must keep.
+const SAMPLE_DESCRIPTION_JSON: &str = concat!(
+    r#"{"version":{"name":"1.8.9","protocol":47},"#,
+    r#""players":{"max":20,"online":3,"sample":[{"name":"Ada","id":"069a79f4-44e9-4726-a5be-fca90e38aaf5"},{"name":"Grace","id":"61699b2e-d327-4a01-9f1e-0ea8c3f06bc6"}]},"#,
+    r#""description":{"text":"Hi","color":"red"}}"#
+);
+
+/// The ping-pong round trip (`OldServerPinger.java`): after the status reply the client
+/// sends C01 carrying its own millisecond clock, the server echoes it in S01, and the
+/// latency is `pong_received - ping_sent` — not the whole TCP attempt.
+#[test]
+fn the_ping_round_trip_sends_client_ms_and_measures_latency() {
+    use std::sync::mpsc;
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let (port, handle) = fake_server(move |stream| {
+        let payload = status_payload(OBJECT_DESCRIPTION_JSON);
+        write_frame(&mut *stream, &payload, Compression::Disabled).expect("write status response");
+        let ping = read_frame(&mut *stream, Compression::Disabled).expect("ping frame");
+        seen_tx.send(ping.clone()).expect("report the ping frame");
+        let mut pong = vec![0x01];
+        pong.extend_from_slice(&ping[1..]);
+        write_frame(&mut *stream, &pong, Compression::Disabled).expect("write pong");
+    });
+    let before = system_ms();
+    let (status, latency) =
+        ping_with_latency("127.0.0.1", port, Duration::from_secs(5)).expect("ping round trip");
+    let after = system_ms();
+    let ping = seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the ping frame");
+    handle.join().expect("fake server thread");
+
+    assert_eq!(
+        ping.len(),
+        9,
+        "the ping is the id byte plus eight client-ms bytes"
+    );
+    assert_eq!(ping[0], 0x01, "the ping's packet id");
+    let sent_ms = i64::from_be_bytes(ping[1..9].try_into().expect("eight bytes"));
+    assert!(
+        (before..=after).contains(&sent_ms),
+        "the ping carries the client's own clock: {sent_ms} within {before}..={after}"
+    );
+    assert!(latency >= 0, "the latency is a non-negative round trip");
+    assert!(
+        latency <= after - before,
+        "the latency times the pong, not the whole attempt: {latency} within the attempt"
+    );
+    assert_eq!(status.version.protocol, 47);
+}
+
+/// The client's millisecond clock behind the C01 payload.
+fn system_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock runs")
+        .as_millis()
+        .try_into()
+        .expect("the millisecond clock fits")
+}
+
+/// The player sample and the raw description survive the parse: the sample's names and ids,
+/// and the description's JSON byte-for-byte in compact form for the styled MOTD path.
+#[test]
+fn the_player_sample_and_the_raw_description_survive_the_parse() {
+    let status = parse_status_json(SAMPLE_DESCRIPTION_JSON.as_bytes()).expect("sample reply");
+    let sample = &status.players.sample;
+    assert_eq!(sample.len(), 2, "both sampled players are kept");
+    assert_eq!(sample[0].name, "Ada");
+    assert_eq!(sample[0].id, "069a79f4-44e9-4726-a5be-fca90e38aaf5");
+    assert_eq!(sample[1].name, "Grace");
+    // The map's keys sort alphabetically through `serde_json::Value`; the
+    // styled path reads the object, never the key order, so the sorted
+    // compact form is the preserved shape.
+    assert_eq!(
+        status.description_raw().as_deref(),
+        Some(r#"{"color":"red","text":"Hi"}"#),
+        "the raw description is preserved for the styled path"
+    );
 }

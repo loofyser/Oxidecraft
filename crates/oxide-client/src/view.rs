@@ -419,6 +419,14 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
             }
             return draws;
         }
+        // The multiplayer list stands pre-session from the menu's button:
+        // its title, rows, buttons and hover text over the background.
+        ScreenState::Multiplayer(screen) => {
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse, input.now_ms));
+            }
+            return draws;
+        }
     };
     let layout = container.layout();
     let (gx, gy) = container.origin();

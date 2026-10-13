@@ -1349,3 +1349,149 @@ fn the_menu_stands_at_startup_without_a_server_only() {
     assert!(stands_at_startup(None));
     assert!(!stands_at_startup(Some("127.0.0.1:25565")));
 }
+
+#[test]
+fn the_multiplayer_list_geometry_pins() {
+    // `GuiMultiplayer.java` (`initGui`): the list spans rows of 36 px from 32
+    // down to `height - 64`.
+    use oxide_client::screens::multiplayer::{
+        LIST_BOTTOM_OFFSET, LIST_TOP, ROW_HEIGHT, list_bottom, row_index_at,
+    };
+    assert_eq!(LIST_TOP, 32);
+    assert_eq!(ROW_HEIGHT, 36);
+    assert_eq!(LIST_BOTTOM_OFFSET, 64);
+    assert_eq!(list_bottom(600), 536);
+    assert_eq!(
+        row_index_at(32, 600, 4),
+        Some(0),
+        "the top edge opens the first row"
+    );
+    assert_eq!(
+        row_index_at(67, 600, 4),
+        Some(0),
+        "a row spans its full 36 px"
+    );
+    assert_eq!(row_index_at(68, 600, 4), Some(1));
+    assert_eq!(
+        row_index_at(535, 600, 4),
+        None,
+        "past the entries is no row, even at the edge"
+    );
+    assert_eq!(row_index_at(536, 600, 4), None, "past the bottom is no row");
+    assert_eq!(row_index_at(10, 600, 4), None, "above the top is no row");
+    assert_eq!(row_index_at(68, 600, 1), None, "past the entries is no row");
+}
+
+#[test]
+fn the_multiplayer_buttons_carry_the_source_ids_and_rects() {
+    // `GuiMultiplayer.java` (`createButtons`): the seven buttons' ids and
+    // rects at 800x600.
+    use oxide_client::screens::multiplayer::{MultiplayerLabels, multiplayer_buttons};
+    let labels = MultiplayerLabels {
+        title: String::from("Play Multiplayer"),
+        form_title: String::from("Edit Server Info"),
+        name_caption: String::from("Server Name"),
+        address_caption: String::from("Server Address"),
+        buttons: [
+            String::from("Edit"),
+            String::from("Delete"),
+            String::from("Join Server"),
+            String::from("Direct Connect"),
+            String::from("Add server"),
+            String::from("Refresh"),
+            String::from("Cancel"),
+        ],
+    };
+    let buttons = multiplayer_buttons(800, 600, &labels);
+    let rects: Vec<(i32, f32, f32, f32, f32)> = buttons
+        .iter()
+        .map(|button| (button.id, button.x, button.y, button.w, button.h))
+        .collect();
+    assert_eq!(
+        rects,
+        vec![
+            (7, 246.0, 572.0, 70.0, 20.0),
+            (2, 326.0, 572.0, 70.0, 20.0),
+            (1, 246.0, 548.0, 100.0, 20.0),
+            (4, 350.0, 548.0, 100.0, 20.0),
+            (3, 454.0, 548.0, 100.0, 20.0),
+            (8, 404.0, 572.0, 70.0, 20.0),
+            (0, 480.0, 572.0, 75.0, 20.0),
+        ],
+        "ids and rects match the source's button build"
+    );
+}
+
+#[test]
+fn the_latency_level_table_pins() {
+    // `ServerListEntryNormal.java`: the icon's level reads the round trip —
+    // skew draws 5, the in-flight ping draws the animated branch, a failed
+    // ping draws 5, then the `<150 → 0, <300 → 1, <600 → 2, <1000 → 3, else 4`
+    // thresholds.
+    use oxide_client::screens::multiplayer::{animated_latency_frame, latency_level};
+    assert_eq!(latency_level(10, true), Some(5), "version skew draws 5");
+    assert_eq!(
+        latency_level(-2, false),
+        None,
+        "the in-flight ping animates"
+    );
+    assert_eq!(latency_level(-1, false), Some(5), "a failed ping draws 5");
+    assert_eq!(latency_level(0, false), Some(0));
+    assert_eq!(latency_level(149, false), Some(0));
+    assert_eq!(latency_level(150, false), Some(1));
+    assert_eq!(latency_level(299, false), Some(1));
+    assert_eq!(latency_level(300, false), Some(2));
+    assert_eq!(latency_level(599, false), Some(2));
+    assert_eq!(latency_level(600, false), Some(3));
+    assert_eq!(latency_level(999, false), Some(3));
+    assert_eq!(latency_level(1000, false), Some(4));
+    assert_eq!(latency_level(5000, false), Some(4));
+    // The animated branch: `(systemTime / 100 + slot * 2) & 7`, mirrored past 4.
+    assert_eq!(animated_latency_frame(0, 0), 0);
+    assert_eq!(animated_latency_frame(500, 0), 3, "5 mirrors to 3");
+    assert_eq!(animated_latency_frame(200, 1), 4);
+}
+
+#[test]
+fn a_coloured_motd_renders_its_section_codes() {
+    // R4: the response's raw description renders through the standing
+    // `parse_json → to_legacy` path, so a coloured canned MOTD carries its
+    // codes — the `text`-only model drops them.
+    use oxide_client::screens::multiplayer::motd_legacy;
+    use oxide_render::text::decode_legacy;
+    let legacy = motd_legacy(r#"{"text":"Hi","color":"red"}"#);
+    assert_eq!(legacy, "§cHi§r", "the style survives the path");
+    let runs = decode_legacy(&legacy);
+    assert_eq!(runs.len(), 1, "one styled run draws");
+    assert_eq!(runs[0].text, "Hi");
+    assert_eq!(
+        runs[0].colour,
+        Some(oxide_render::text::colour_code(12)),
+        "red is the §c cell"
+    );
+}
+
+#[test]
+fn the_population_and_version_lines_pin() {
+    // `OldServerPinger.java`: grey `online`, dark-grey `/`, grey `max`;
+    // `???` in dark grey with no counts. `ServerListEntryNormal.java`: skew
+    // draws the version name in dark red.
+    use oxide_client::screens::multiplayer::{player_list_tooltip, population_text};
+    assert_eq!(population_text(Some(3), Some(20)), "§73§8/§720");
+    assert_eq!(population_text(None, None), "§8???");
+    assert_eq!(
+        player_list_tooltip(&["Ada".to_string(), "Grace".to_string()], 2),
+        Some("Ada\nGrace".to_string()),
+        "the sample's names join with newlines"
+    );
+    assert_eq!(
+        player_list_tooltip(&["Ada".to_string()], 3),
+        Some("Ada\n... and 2 more ...".to_string()),
+        "a short sample tails the remainder"
+    );
+    assert_eq!(
+        player_list_tooltip(&[], 0),
+        None,
+        "no sample draws no tooltip"
+    );
+}

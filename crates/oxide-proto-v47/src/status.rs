@@ -70,6 +70,18 @@ pub struct StatusResponse {
     /// Favicon, when present.
     #[serde(default)]
     pub favicon: Option<String>,
+    /// The description's raw JSON, kept for the styled MOTD path (never
+    /// serialized; [`parse_status_json`] fills it from the reply).
+    #[serde(skip)]
+    pub description_raw: Option<String>,
+}
+
+impl StatusResponse {
+    /// The description's raw JSON, when the reply carried one.
+    #[must_use]
+    pub fn description_raw(&self) -> Option<String> {
+        self.description_raw.clone()
+    }
 }
 
 /// The `version` object of a status response.
@@ -88,6 +100,20 @@ pub struct Players {
     pub max: i32,
     /// Players currently online.
     pub online: i32,
+    /// The player sample, when the server sends one.
+    #[serde(default)]
+    pub sample: Vec<PlayerSample>,
+}
+
+/// One sampled player from the `players` object.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PlayerSample {
+    /// The player's name.
+    #[serde(default)]
+    pub name: String,
+    /// The player's profile id.
+    #[serde(default)]
+    pub id: String,
 }
 
 /// Errors from a status ping.
@@ -117,6 +143,9 @@ pub enum PingError {
     /// The response's JSON length prefix was malformed.
     #[error("bad status response length prefix: {0}")]
     BadLength(#[from] VarIntError),
+    /// The host resolved to no address at all.
+    #[error("could not resolve {0}")]
+    Resolution(String),
 }
 
 impl PingError {
@@ -161,14 +190,35 @@ impl PingError {
 /// panic; the attempt then has no deadline of its own and is bounded only by
 /// what the platform enforces.
 pub fn ping_server(host: &str, port: u16, timeout: Duration) -> Result<StatusResponse, PingError> {
-    // Try every address the host resolves to, the way `TcpStream::connect`
-    // does. They share one deadline: a host that answers on a later address
-    // still gets its chance, without the total stretching past the timeout.
     let deadline = deadline_after(timeout);
+    let mut stream = connect(host, port, timeout, deadline)?;
+    let handshake = crate::handshake::handshake_payload(47, host, port, 1);
+    write_under_deadline(&mut stream, &handshake, deadline, timeout)?;
+    write_under_deadline(&mut stream, &StatusRequest::PAYLOAD, deadline, timeout)?;
+    let json = read_status_json(&mut stream, deadline, timeout)?;
+    parse_status_json(&json)
+}
+
+/// Connects to one of the host's resolved addresses under the attempt's one
+/// deadline: a host that answers on a later address still gets its chance,
+/// without the total stretching past the timeout.
+fn connect(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> Result<TcpStream, PingError> {
+    // Try every address the host resolves to, the way `TcpStream::connect`
+    // does. They share one deadline.
     let mut stream = None;
     let mut failure = None;
     let mut timed_out = false;
-    for address in (host, port).to_socket_addrs()? {
+    let mut resolved = false;
+    for address in (host, port)
+        .to_socket_addrs()
+        .map_err(|_| PingError::Resolution(host.to_string()))?
+    {
+        resolved = true;
         let remaining = time_left(deadline, timeout);
         if remaining.is_zero() {
             // The deadline is spent. A zero-length socket timeout is not
@@ -185,30 +235,36 @@ pub fn ping_server(host: &str, port: u16, timeout: Duration) -> Result<StatusRes
             Err(error) => failure = Some(error),
         }
     }
-    let Some(mut stream) = stream else {
+    let Some(stream) = stream else {
         if timed_out {
             return Err(PingError::Timeout(timeout));
         }
         return Err(match failure {
             // The resolver produced no address to connect to at all.
+            None if !resolved => PingError::Resolution(host.to_string()),
+            // Every address failed; report the last failure, as
+            // `TcpStream::connect` does.
             None => PingError::Io(std::io::Error::new(
                 ErrorKind::AddrNotAvailable,
                 format!("no address resolved for {host}:{port}"),
             )),
-            // Every address failed; report the last failure, as
-            // `TcpStream::connect` does.
             Some(error) => PingError::Io(error),
         });
     };
+    Ok(stream)
+}
 
-    let handshake = crate::handshake::handshake_payload(47, host, port, 1);
-    write_under_deadline(&mut stream, &handshake, deadline, timeout)?;
-    write_under_deadline(&mut stream, &StatusRequest::PAYLOAD, deadline, timeout)?;
-
+/// Reads one Status Response body under the attempt's deadline: the frame's
+/// packet id must be 0x00 and the declared JSON length must be present.
+fn read_status_json(
+    stream: &mut TcpStream,
+    deadline: Option<Instant>,
+    timeout: Duration,
+) -> Result<Vec<u8>, PingError> {
     // The read is armed the same way: its socket timeout is the time left of
     // the attempt's one deadline, not a fresh full timeout.
-    arm_deadline(&stream, deadline, timeout)?;
-    let response = read_frame(&mut stream, Compression::Disabled)
+    arm_deadline(stream, deadline, timeout)?;
+    let response = read_frame(&mut *stream, Compression::Disabled)
         .map_err(|error| PingError::from_frame(error, timeout))?;
     let Some((&packet_id, body)) = response.split_first() else {
         return Err(PingError::Truncated);
@@ -225,7 +281,69 @@ pub fn ping_server(host: &str, port: u16, timeout: Duration) -> Result<StatusRes
         Err(error) => return Err(error.into()),
     };
     let json = cursor.get(..len).ok_or(PingError::Truncated)?;
-    Ok(serde_json::from_slice(json)?)
+    Ok(json.to_vec())
+}
+
+/// Parses one status reply's JSON body, keeping the description's raw JSON for
+/// the styled MOTD path.
+pub fn parse_status_json(json: &[u8]) -> Result<StatusResponse, PingError> {
+    let value: serde_json::Value = serde_json::from_slice(json)?;
+    let description_raw = value.get("description").map(ToString::to_string);
+    let mut status: StatusResponse = serde_json::from_value(value)?;
+    status.description_raw = description_raw;
+    Ok(status)
+}
+
+/// Sends a status ping and returns the parsed response with the C01/S01
+/// round-trip latency in milliseconds.
+///
+/// The exchange is the handshake with `next_state` 1, a Status Request, the
+/// server's Status Response, then C01 carrying the client's millisecond clock
+/// and S01 echoing it back (`OldServerPinger.java`): the latency is
+/// `pong_received - ping_sent`, not the whole TCP attempt. `timeout` bounds
+/// the whole attempt on one deadline, as in [`ping_server`].
+pub fn ping_with_latency(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(StatusResponse, i64), PingError> {
+    let deadline = deadline_after(timeout);
+    let mut stream = connect(host, port, timeout, deadline)?;
+    let handshake = crate::handshake::handshake_payload(47, host, port, 1);
+    write_under_deadline(&mut stream, &handshake, deadline, timeout)?;
+    write_under_deadline(&mut stream, &StatusRequest::PAYLOAD, deadline, timeout)?;
+    let json = read_status_json(&mut stream, deadline, timeout)?;
+    let status = parse_status_json(&json)?;
+    // The C01/S01 round trip (`OldServerPinger.java`): the ping carries the
+    // client's own millisecond clock and the pong echoes it back; the latency
+    // is what the clock reads at the pong minus what it read at the ping.
+    let sent_ms = system_ms();
+    let mut ping = vec![0x01];
+    ping.extend_from_slice(&sent_ms.to_be_bytes());
+    write_under_deadline(&mut stream, &ping, deadline, timeout)?;
+    arm_deadline(&stream, deadline, timeout)?;
+    let pong = read_frame(&mut stream, Compression::Disabled)
+        .map_err(|error| PingError::from_frame(error, timeout))?;
+    let Some((&packet_id, body)) = pong.split_first() else {
+        return Err(PingError::Truncated);
+    };
+    if packet_id != 0x01 {
+        return Err(PingError::UnexpectedPacket(packet_id));
+    }
+    if body.len() != 8 {
+        return Err(PingError::Truncated);
+    }
+    Ok((status, system_ms() - sent_ms))
+}
+
+/// The client's millisecond wall clock behind the C01 payload
+/// (`Minecraft.getSystemTime`'s shape).
+fn system_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().try_into().unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// The deadline one attempt runs against: the instant `timeout` from now, or

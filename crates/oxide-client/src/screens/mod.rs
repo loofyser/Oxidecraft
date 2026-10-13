@@ -6,7 +6,7 @@
 //! :330-341) and the wire close (`NetHandlerPlayClient.handleCloseWindow`
 //! :1311-1315); no source text is copied.
 //!
-//! [`Screens`] holds the current screen. Six variants are declared here;
+//! [`Screens`] holds the current screen. Seven variants are declared here;
 //! Task 16 wires only the [`ScreenState::Container`] kind's `WindowOpened`
 //! path — the inventory open landed in Task 20, the creative open in Task
 //! 21, the sign open in Task 22; the book open lands in Task 23, and an
@@ -43,6 +43,7 @@ use book::BookScreen;
 use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
 use menu::MainMenuScreen;
+use multiplayer::{MultiplayerLabels, MultiplayerScreen, ServerList};
 use sign::{SignMapEntry, SignScreen};
 
 pub mod book;
@@ -52,6 +53,7 @@ pub mod family_a;
 pub mod family_b;
 pub mod inventory;
 pub mod menu;
+pub mod multiplayer;
 pub mod sign;
 pub mod widgets;
 
@@ -78,6 +80,11 @@ pub enum ScreenState {
     /// `--server` was given, and on disconnect-to-title (boxed like the
     /// container kinds).
     MainMenu(Box<MainMenuScreen>),
+    /// The multiplayer server list: the stored entries with their live ping
+    /// rows, standing from the main menu's multiplayer button and closing
+    /// back to the menu or forward into the join (boxed like the container
+    /// kinds).
+    Multiplayer(Box<MultiplayerScreen>),
 }
 
 impl ScreenState {
@@ -93,6 +100,7 @@ impl ScreenState {
             }
             ScreenState::Creative(_) => Some(0),
             ScreenState::Sign(_) | ScreenState::Book(_) | ScreenState::MainMenu(_) => None,
+            ScreenState::Multiplayer(_) => None,
         }
     }
 
@@ -383,6 +391,31 @@ impl Screens {
             Some(ScreenState::MainMenu(screen)) => Some(screen.as_mut()),
             _ => None,
         }
+    }
+
+    /// The open multiplayer screen, when the current screen is one: the
+    /// frame's pointer, the multiplayer keys and the ping worker's drain
+    /// drive this.
+    pub fn multiplayer_mut(&mut self) -> Option<&mut MultiplayerScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Multiplayer(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Stands the multiplayer screen on a stored list: the list the main
+    /// menu's multiplayer button opens, saving to `store_path` with
+    /// `labels` for its titles and buttons. No guard exists: standing it
+    /// replaces whatever screen is open.
+    pub fn open_multiplayer(
+        &mut self,
+        list: ServerList,
+        store_path: std::path::PathBuf,
+        labels: MultiplayerLabels,
+    ) {
+        self.current = Some(ScreenState::Multiplayer(Box::new(MultiplayerScreen::open(
+            list, store_path, labels,
+        ))));
     }
 
     /// Stands the main menu: the pre-session screen at startup when no

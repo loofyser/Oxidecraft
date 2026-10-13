@@ -61,6 +61,9 @@ use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
 use oxide_client::screens::menu::{MenuAction, menu_labels};
+use oxide_client::screens::multiplayer::{
+    MultiAction, PING_TIMEOUT, ServerList, SubScreen, multiplayer_labels, servers_path,
+};
 use oxide_client::screens::widgets::BUTTON_PRESS_SOUND;
 use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
 use oxide_client::settings_state::{
@@ -186,17 +189,12 @@ fn frame_limit(frames: Option<u64>) -> Option<u64> {
 
 /// Splits a `host:port` address into its parts, or explains why it cannot.
 ///
-/// The split takes the last colon, so an IPv6 literal keeps its own colons in
-/// the host.
+/// The split is the server list's address rule: a bare host takes the
+/// default port, `host:port` and `[v6]:port` split, and an unparseable port
+/// falls back — only an empty address is refused.
 fn parse_server_address(address: &str) -> anyhow::Result<(String, u16)> {
-    let (host, port) = address
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("the server address must be host:port, got {address:?}"))?;
-    let port = port
-        .parse::<u16>()
-        .map_err(|error| anyhow::anyhow!("the server port {port:?} is not a number: {error}"))?;
-    anyhow::ensure!(!host.is_empty(), "the server address has no host");
-    Ok((host.to_string(), port))
+    oxide_client::screens::multiplayer::parse_server_address(address)
+        .ok_or_else(|| anyhow::anyhow!("the server address is empty: {address:?}"))
 }
 
 /// One input-script directive: one action, due at one session tick.
@@ -2243,6 +2241,12 @@ impl ClientApp {
         // with no session behind it — beside the resize re-layout, which
         // re-runs `initGui`'s button build with the current labels.
         self.screens.tick_menu_wall(Instant::now());
+        // The multiplayer screen's worker results land every frame: the
+        // rows fill in as the pings answer, by index, and the screen
+        // never blocks (`OldServerPinger.ping`'s thread per entry).
+        if let Some(screen) = self.screens.multiplayer_mut() {
+            screen.pump_pings();
+        }
         if let Some(menu) = self.screens.menu_mut() {
             if let Some(assets) = self.assets.as_ref() {
                 menu.set_screen_size(&scaled, menu_labels(Some(&assets.lang)));
@@ -2476,6 +2480,22 @@ impl ClientApp {
     /// gameplay keys flow only while the pointer is grabbed.
     fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         if is_escape_press(event.state, event.repeat, &event.logical_key) {
+            // Escape over the multiplayer screen never closes to the game:
+            // a standing sub-screen cancels back to the list, and the list
+            // backs to the main menu (`GuiMultiplayer`'s parent screen).
+            if self.screens.multiplayer_mut().is_some() {
+                let to_menu = match self.screens.multiplayer_mut() {
+                    Some(screen) if !matches!(screen.sub(), SubScreen::List) => {
+                        screen.cancel();
+                        false
+                    }
+                    _ => true,
+                };
+                if to_menu {
+                    self.back_to_menu();
+                }
+                return;
+            }
             match escape_route(
                 self.chat_input.open,
                 self.chat.confirm_open(),
@@ -2852,8 +2872,8 @@ impl ClientApp {
     /// Runs one main-menu press at the free pointer's point: the button
     /// under it plays the press sound (`GuiButton.playPressSound`) and
     /// answers its action. Singleplayer records its action and opens
-    /// nothing yet; multiplayer and options await their screens; quit
-    /// closes the window. Empty space answers nothing.
+    /// nothing yet; multiplayer stands the server list; options opens
+    /// nothing yet; quit closes the window. Empty space answers nothing.
     fn menu_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
         let action = self
             .screens
@@ -2874,9 +2894,216 @@ impl ClientApp {
             ));
         }
         match action {
-            MenuAction::Singleplayer | MenuAction::Multiplayer | MenuAction::Options => {}
+            MenuAction::Singleplayer | MenuAction::Options => {}
+            MenuAction::Multiplayer => self.open_multiplayer(),
             MenuAction::Quit => event_loop.exit(),
         }
+    }
+
+    /// Stands the multiplayer screen from the menu's button: the stored
+    /// list loads from the store's `servers.toml`, the labels resolve
+    /// through the assets' table, and the first refresh pings every entry
+    /// (`GuiMultiplayer.initGui` queues the first pings the same way).
+    /// Without a store root the screen cannot load or save, so the menu
+    /// stays standing and the failure lands in the log.
+    fn open_multiplayer(&mut self) {
+        let store_root = match assets::default_store_root() {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(%error, "the server list cannot load without a store root");
+                return;
+            }
+        };
+        let path = servers_path(&store_root);
+        let list = ServerList::load(&path);
+        let language = self.assets.as_ref().map(|assets| &assets.lang);
+        let labels = multiplayer_labels(language);
+        self.screens.open_multiplayer(list, path, labels);
+        if let Some(screen) = self.screens.multiplayer_mut() {
+            screen.refresh(PING_TIMEOUT);
+        }
+    }
+
+    /// Runs one multiplayer press at the free pointer's point: the button
+    /// under it plays the press sound and answers its action, and the
+    /// rows select on one press and join on two within 250 ms
+    /// (`GuiSlot.mouseClicked`'s double-click arm). Join leaves the screen
+    /// and opens the session; back stands the main menu again; a direct
+    /// close persists the typed address. Empty space answers nothing.
+    fn multiplayer_click(&mut self, point: (f32, f32)) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let last_server = self
+            .settings
+            .settings()
+            .last_server
+            .clone()
+            .unwrap_or_default();
+        let action = self.screens.multiplayer_mut().and_then(|screen| {
+            screen.click_at(
+                point,
+                scaled.width as i32,
+                scaled.height as i32,
+                &last_server,
+                system_time_ms(),
+            )
+        });
+        let Some(action) = action else {
+            return;
+        };
+        if let Some(audio) = self.audio.as_mut() {
+            let listener = listener_of(&self.player);
+            audio.engine.play(local_sound_play(
+                BUTTON_PRESS_SOUND.to_string(),
+                listener.pos,
+                1.0,
+                1.0,
+                SoundCategory::Master,
+                listener,
+            ));
+        }
+        self.run_multi_action(action);
+    }
+
+    /// Runs one multiplayer key: Tab flips the form focus, Enter confirms,
+    /// F5 refreshes, the arrows move the selection and shift with the
+    /// arrows reorders (`GuiMultiplayer.keyTyped`). Characters type into
+    /// the open field; every other key is the list's to swallow.
+    fn multiplayer_key(&mut self, event: &KeyEvent) {
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        let key_code = match code {
+            KeyCode::Backspace => 14,
+            KeyCode::Tab => 15,
+            KeyCode::Enter | KeyCode::NumpadEnter => 28,
+            KeyCode::ArrowUp => 200,
+            KeyCode::ArrowDown => 208,
+            KeyCode::F5 => 63,
+            _ => 0,
+        };
+        // Enter and Backspace carry control text (`\r`, `\x08`): the fields
+        // take characters only from other keys, so special keys type nothing.
+        let typed = if key_code == 0 {
+            event.text.as_deref().and_then(|text| text.chars().next())
+        } else {
+            None
+        };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let action = self.screens.multiplayer_mut().and_then(|screen| {
+            screen.key(
+                typed,
+                key_code,
+                self.shift,
+                scaled.width as i32,
+                scaled.height as i32,
+                PING_TIMEOUT,
+            )
+        });
+        if let Some(action) = action {
+            self.run_multi_action(action);
+        }
+    }
+
+    /// Runs one multiplayer outcome: a join leaves the screen and opens
+    /// the session, back stands the main menu again, and a direct close
+    /// persists the typed address as `last_server` (`GuiScreenServerList`
+    /// writes it on every close).
+    fn run_multi_action(&mut self, action: MultiAction) {
+        match action {
+            MultiAction::Join(host, port, direct) => {
+                if let Some(field) = direct {
+                    self.persist_last_server(field);
+                }
+                let address = format!("{host}:{port}");
+                self.join_game(host, port, address);
+            }
+            MultiAction::Back => self.back_to_menu(),
+            MultiAction::DirectClosed(field) => self.persist_last_server(field),
+        }
+    }
+
+    /// Persists one address as `last_server` and saves the settings file:
+    /// the direct screen's close writes and saves even when nothing else
+    /// changed (`GuiScreenServerList.onGuiClosed`). A save failure lands
+    /// in the log and the in-memory value still stands.
+    fn persist_last_server(&mut self, field: String) {
+        self.settings.settings_mut().last_server = Some(field);
+        if let Err(error) = self.settings.save_now() {
+            tracing::warn!(%error, "the last server could not be saved");
+        }
+    }
+
+    /// Stands the main menu again from the multiplayer screen's back
+    /// button or Escape: the splash lines, seed and labels read the same
+    /// standing rule as the first frame.
+    fn back_to_menu(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        self.screens.open_main_menu(
+            scaled,
+            &assets.splash_lines,
+            self.menu_seed,
+            menu_labels(Some(&assets.lang)),
+        );
+    }
+
+    /// Joins one multiplayer address from the server list: the assets must
+    /// already be loaded — the menu stood on them — then the store opens,
+    /// the skin worker starts, and the session spawns exactly like the
+    /// `--server` route's. The screen closes behind the join and the
+    /// overlay shows, the same standing a startup join lands in.
+    fn join_game(&mut self, host: String, port: u16, address: String) {
+        let Some(assets) = self.assets.as_ref() else {
+            tracing::warn!("the server cannot be joined without loaded assets");
+            return;
+        };
+        let mesh = Arc::clone(&assets.mesh);
+        let store_root = match assets::default_store_root() {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(%error, "the server cannot be joined without a store root");
+                return;
+            }
+        };
+        let store = match Store::open(store_root) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(%error, "the server cannot be joined without the store");
+                return;
+            }
+        };
+        tracing::info!(server = %address, username = %self.own_name, "joining the server");
+        let cache = Arc::new(SkinCache::new(&store));
+        let (requests, updates) = skin_worker::spawn(move |url| cache.fetch(url));
+        self.skin_requests = Some(requests);
+        self.skin_updates = Some(updates);
+        let session = spawn_session(
+            host,
+            port,
+            self.own_name.clone(),
+            address.clone(),
+            self.settings.wire_settings(),
+            mesh,
+        );
+        self.settings.set_session(session.input_tx.clone());
+        self.session = Some(session);
+        self.joined = false;
+        self.overlay_visible = true;
+        self.hud.server = address;
+        let mut dropped = None;
+        let _ = self.screens.close(&mut dropped);
+        self.cursor = None;
     }
 
     /// Opens the player's own inventory from the window's own key: one C16
@@ -3002,6 +3229,14 @@ impl ClientApp {
         // (`Minecraft.java`:1834) — while containers swallow it.
         if self.screens.allow_user_input() && is_f3_press(event.state, &event.logical_key) {
             return false;
+        }
+        // The multiplayer screen owns its keys before the inventory-key
+        // close: Tab flips the form focus, Enter confirms, F5 refreshes,
+        // the arrows move the selection (`GuiMultiplayer.keyTyped`), and
+        // E types into the open field — no inventory swap fires over it.
+        if self.screens.multiplayer_mut().is_some() {
+            self.multiplayer_key(event);
+            return true;
         }
         let PhysicalKey::Code(code) = event.physical_key else {
             return true;
@@ -3610,13 +3845,26 @@ impl ClientApp {
         // button plays the press sound and runs the button's action
         // (`GuiScreen.mouseClicked` fires on press; only button 0 reaches
         // the buttons). Singleplayer answers its action and opens nothing
-        // yet; multiplayer and options await their screens; quit closes the
-        // window. Any other click is the menu's to swallow — the pointer
-        // never grabs behind it.
+        // yet; multiplayer stands the server list; options opens nothing
+        // yet; quit closes the window. Any other click is the menu's to
+        // swallow — the pointer never grabs behind it.
         if self.screens.menu_mut().is_some() {
             if state == ElementState::Pressed && button == WinitMouseButton::Left {
                 if let Some(point) = self.cursor {
                     self.menu_click(event_loop, point);
+                }
+            }
+            return;
+        }
+        // The multiplayer screen holds the click the same way: a left press
+        // on a button or a row plays the press sound and runs its action
+        // (`GuiScreen.mouseClicked` fires on press; only button 0 reaches
+        // the buttons, and rows join on double-click). Any other click is
+        // the screen's to swallow — the pointer never grabs behind it.
+        if self.screens.multiplayer_mut().is_some() {
+            if state == ElementState::Pressed && button == WinitMouseButton::Left {
+                if let Some(point) = self.cursor {
+                    self.multiplayer_click(point);
                 }
             }
             return;
@@ -5837,15 +6085,27 @@ mod tests {
     }
 
     #[test]
-    fn a_server_without_a_port_is_refused() {
-        let error = parse_server_address("127.0.0.1").expect_err("the address must be refused");
-        assert!(error.to_string().contains("host:port"), "{error}");
+    fn a_server_without_a_port_takes_the_default() {
+        // The widened rule: a bare host is the list's own address form, so
+        // the `--server` bypass and the list join resolve identically.
+        let (host, port) = parse_server_address("127.0.0.1").expect("the address parses");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 25565);
     }
 
     #[test]
-    fn a_server_port_that_is_not_a_number_is_refused() {
-        let error = parse_server_address("127.0.0.1:game").expect_err("the port must be refused");
-        assert!(error.to_string().contains("port"), "{error}");
+    fn a_server_port_that_is_not_a_number_falls_back_to_the_default() {
+        // The widened rule: an unparseable port falls back instead of
+        // refusing, matching the list's join target resolution.
+        let (host, port) = parse_server_address("127.0.0.1:game").expect("the address parses");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 25565);
+    }
+
+    #[test]
+    fn an_empty_server_address_is_refused() {
+        let error = parse_server_address("").expect_err("the address must be refused");
+        assert!(error.to_string().contains("empty"), "{error}");
     }
 
     #[test]
