@@ -717,17 +717,16 @@ feat: the F3 overlay field set and its sub-mode keys (client)
 
 ### Task 23: F3's visual sub-modes
 
-**Goal:** Hitboxes (F3+B) draw entity boxes and look vectors, chunk borders (F3+G) draw the 16×16 grid at section corners, and the lagometer (Shift+F3) draws the tick-duration graph from the session's own timings.
+**Goal:** Hitboxes (F3+B) draw entity boxes and look vectors, and the lagometer (F3+Alt) draws the frame-duration graph. Chunk borders (F3+G) and the Shift+F3 profiler chart are absent in 1.8.9 — recorded phantoms, not built.
 
 **Files:**
-- Modify: `crates/oxide-render/src/world_overlay.rs` — the hitbox boxes (per-entity box from the frame's bounds + the look vector line — the source's `renderDebugBoundingBox` shape derives in-task), the chunk-border quads (the grid lines at y-level, the source's own color/shape), the lagometer's graph (the standing text/canvas machinery; the frame series from the session's tick report).
-- Modify: `crates/oxide-game/src/session.rs` — the tick-duration series (the session's per-tick elapsed time, ring-buffered, published in `PlayerTick` or a new small event — pin the shape).
-- Modify: `crates/oxide-client/src/main.rs` — the flags → pass states.
-- Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: a hitbox frame (two entities' boxes), a chunk-border frame, a lagometer frame with a pinned series.
-- Test: `crates/oxide-game` — the series' ring behaviour (bounded, ordered).
+- Modify: `crates/oxide-render/src/world_overlay.rs` — the hitbox boxes (per-entity box from the frame's bounds + the look vector line — the source's `renderDebugBoundingBox` shape derives in-task; needs a NEW world-space line path — the outline pipeline's clip-space basis does not serve), plus the new carriers (bounds/eye-height/look on the entity frames). The lagometer's graph is GUI-space and lands with the hud/overlay group, not this file. No chunk-border work (phantom, §6a).
+- Modify: `crates/oxide-client/src/main.rs` (+ the render crate's frame clock) — the per-frame duration ring (240 entries, ns, fed once per rendered frame at the frame loop, per `FrameTimer`; the client owns it — never the session); the flags → pass states.
+- Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: a hitbox frame (two entities' boxes + look lines, white/red/blue ink) and a lagometer frame with a pinned series (bar heights + the "60"/"30" labels). No chunk-border frame (phantom).
+- Test: `crates/oxide-client` — the ring's behaviour (bounded 240, oldest→newest, wrap).
 
 **Interfaces:**
-- Produces: `OverlayFlags { hitboxes, chunk_borders, lagometer }`; `TickSeries` (the client's read).
+- Produces: `OverlayFlags { hitboxes, lagometer }` (client runtime state — session-only, never persisted); the frame-duration ring (240, ns).
 - Consumes: Task 22's flags; the standing entity frames.
 
 - [ ] **Step 1: Cases (RED).** Each visual red first.
@@ -735,10 +734,10 @@ feat: the F3 overlay field set and its sub-mode keys (client)
 - [ ] **Step 3: Gate and commit.** Run the full gate. Commit:
 
 ```
-feat: the hitbox, chunk-border and lagometer overlays (render)
+feat: the hitbox and lagometer overlays (render)
 ```
 
-**Verification:** the three cases; the series test; the full gate.
+**Verification:** the two visual cases; the ring test; the full gate.
 
 ---
 
