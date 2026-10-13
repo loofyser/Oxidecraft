@@ -662,15 +662,15 @@ feat: the death, disconnect, terrain and sleep screens (client)
 
 ### Task 21: The chat completion and the text-field extraction
 
-**Goal:** Tab completion works in the chat field and the text-field engine is one machine: the chat field's behaviour is extracted so the anvil-name and book corners share it (the M5 review's §2.4 item 4's "field engines" seam), and Tab completes against the world's own player list, commands, or arguments per the source.
+**Goal:** Tab completion works in the chat field and the text-field engine is one machine: the chat field's behaviour is extracted so the anvil-name and creative-search corners share it (the M5 review's §2.4 item 4's "field engines" seam; the book corner holds no field — the source edits plain strings, recorded; the sign editor stays out per its source), and Tab completes against the session's standing player list (the source's ladder is server-side — the port substitutes the session's list, recorded).
 
 **Files:**
-- Create/extract: the field engine (from `crates/oxide-client/src/chat.rs`'s field machine into `crates/oxide-client/src/text_field.rs`), consumers updated (chat, anvil, book search — the creative search field's own read re-verified).
-- Modify: `crates/oxide-client/src/chat.rs` — the completion engine (the source's `GuiChat`/`CommandHandler` ladder: the player-name candidates, the `@`/`/` contexts, the cycling — derive the ladder's cases and pin the pure function; the candidates' sources from the session's standing player list).
+- Create/extract: the field engine (`crates/oxide-client/src/text_field.rs`, extracted from the private chat field in `main.rs` and absorbing the anvil `NameField` and the creative search field — three copies to one), consumers updated (chat, anvil, creative search — the search field's own read re-verified).
+- Modify: the client's chat machinery — the completion engine (the source's `GuiChat` machine: the word split, the request, the common prefix, the cycling, the multi-candidate chat print — the ladder beyond it is server code; the candidate source is the session's standing player list, recorded as the offline rule; no client command table exists — `/`-inputs complete names only or nothing, recorded).
 - Test: the completion function (a fixture world/player list: name prefix → candidates; command prefix → the command space; cycling order preserved), the field engine's existing cases kept green.
 
 **Interfaces:**
-- Produces: `TextField` (the shared machine: insert/backspace/arrow/home/end/selection-free 1.8 subset, the blink state); `complete(input: &str, candidates) -> Option<(String, usize)>` pure function; the chat field's Tab consumes it (the M4 row-4 carry "No chat tab-completion; Tab swallowed" closes).
+- Produces: `TextField` (the shared machine: the key subset the source defines — insert/backspace/arrow plus the owed Home/End/Delete/word-jumps/clipboard — plus the blink state); the completion machine (stateful: the pending flag, the cycle index, the list print; the pure helpers inside `text_field.rs`); the chat field's Tab consumes it (the M4 row-4 carry "No chat tab-completion; Tab swallowed" closes).
 - Consumes: the M4 chat; the standing player list.
 
 - [ ] **Step 1: Extraction (green-to-green).** The field machine moves; all existing chat/book/anvil cases stay green; the diff shows the move.
