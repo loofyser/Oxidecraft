@@ -499,8 +499,8 @@ feat: the settings application path (client)
 
 **Files:**
 - Create: `crates/oxide-client/src/screens/widgets.rs` — the widget set (button 152×20 slices with hover/disabled, the slider track/knob, the list background) and its draw/hit code over the standing text machinery.
-- Create: `crates/oxide-client/src/render_menu.rs` (or the panorama inside `screens/menu.rs`) — the panorama cube: six 256×256 faces from the store, the slow rotation (the checklist's Gaps row: the rotation period is unquantified — MEASURE it on the vanilla side at the acceptance and pin the measured value; until then the task implements the cube and records the pending constant as a known limit — no blank threshold ships).
-- Create: `crates/oxide-client/src/screens/menu.rs` — the main menu (`GuiMainMenu` layout: logo at the pinned position, the splash at 45° with the bounce — amplitude/period from the acceptance's measurement, the same pending-constant rule), the button set, the splash pick (seeded per launch; `texts/splashes.txt` read from the store).
+- Create: `crates/oxide-client/src/render_menu.rs` (or the panorama inside `screens/menu.rs`) — the panorama cube: six 256×256 faces from the store, the slow rotation (the source's own rate: yaw `-(timer+partial)·0.1°` per tick at 20 Hz = 2°/s, a 180 s period, and pitch `sin((timer+partial)/400)·25+20` — implement both formulae; the acceptance confirms the wall-clock rate on the rig).
+- Create: `crates/oxide-client/src/screens/menu.rs` — the main menu (`GuiMainMenu` layout: logo at the pinned position, the splash at **−20°** (the source's own angle) with the closed-form bounce (scale `(1.8 − |sin(2π·(ms%1000)/1000)|·0.1) · 100/(width+32)`, 1 s period; the acceptance confirms the wall-clock rate), the button set, the splash pick (seeded per launch; `texts/splashes.txt` read from the store).
 - Modify: `crates/oxide-client/src/screens/mod.rs` — the new variants and the open/close rules (menus are pre-session states; the client's state machine gains the no-session screens — the main menu shows at startup and on disconnect-to-title).
 - Test: `crates/oxide-client/tests/screens.rs` — the layout pins (button positions at the pinned scaled resolutions) and the splash pick.
 - Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: a panorama frame's six-face sampling at two yaw values; the splash text's pixels; the button states' three renders.
@@ -511,7 +511,7 @@ feat: the settings application path (client)
 
 - [ ] **Step 1: Widget cases (RED).** A button renders; hover differs; disabled greys the text; a slider's knob follows its value (each an ignored GPU case + the unit layout pins). Run red.
 - [ ] **Step 2: Implement the widgets.** Run — green.
-- [ ] **Step 3: Panorama + splash cases.** The cube's two frames; the splash's angle (45° from the logo's right edge). Run — green; the rotation-period and bounce constants' acceptance deferral recorded.
+- [ ] **Step 3: Panorama + splash cases.** The cube's two frames; the splash's angle (−20° about Z, the source's own). Run — green; the formulae implement the source's own rates; the acceptance confirms the wall-clock rates.
 - [ ] **Step 4: The main menu's wiring.** Buttons route (Multiplayer/Options open their screens; Singleplayer records inert; Quit exits). Run — green.
 - [ ] **Step 5: Gate and commit.** Run the full gate. Commit:
 
