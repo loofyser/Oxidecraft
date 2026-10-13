@@ -580,10 +580,10 @@ feat: the pause menu and the placeholder screens (client)
 
 ### Task 18: The options hub and the video screen
 
-**Goal:** The options hub with its tab strip and the Video screen: the full 1.8 slider and toggle set, every change applying through Task 14, the render-distance slider confirming the 1.8 range on the rig (Decision 12).
+**Goal:** The options hub with its button grid (the source's own — the recon's correction: no tab strip exists in 1.8.9) and the Video screen: the full 1.8 slider and toggle set, every change applying through Task 14, the render-distance slider confirming the 1.8 range on the rig (Decision 12).
 
 **Files:**
-- Create: `crates/oxide-client/src/screens/options.rs` — the hub and the tab strip; the video screen's sliders/toggles and their labels (the exactly-1.8 set per checklist row 4 and survey §3.1; no 1.9+ options).
+- Create: `crates/oxide-client/src/screens/options.rs` — the hub and its button grid; the video screen's sliders/toggles and their labels (the exactly-1.8 set per checklist row 4 and survey §3.1; no 1.9+ options).
 - Modify: `crates/oxide-client/src/screens/widgets.rs` — the option slider/cycle-button widgets the screen needs (extend, don't fork).
 - Test: `crates/oxide-client/tests/screens.rs` — the full widget inventory of the video screen (each slider's range/step, each toggle's states — against the derived source values), the hub's tab set.
 - Test: `crates/oxide-render/tests/pipeline_headless.rs` — ignored: the video screen frame at the default scale; a scrolled state.
@@ -594,7 +594,7 @@ feat: the pause menu and the placeholder screens (client)
 
 - [ ] **Step 1: Inventory tests (RED).** Each slider/toggle asserted against the derived source set; the range ends from Task 3. Run red.
 - [ ] **Step 2: Implement the screen.** Run — green.
-- [ ] **Step 3: The rig confirmation leg (the §16 rule).** The vanilla options screen at 1280×720: capture and read the render-distance slider's maximum (the toolbar hover text or the value readout — record the method; the source's 64-bit constructor raises the max to 32, so expect 32 — a shown 32 reconciles against the spec's "to 16" at the close), and the toggle list's exact set; the constants update per what the rig shows and the test re-pins. Evidence into the task's dir; the capture under the scene rules.
+- [ ] **Step 3: The rig confirmation leg (the §16 rule).** The vanilla options screen at 1280×720: capture and read the render-distance slider's maximum (the slider's own "N chunks" label at max — record the method; the recon's correction: no tooltip exists in 1.8.9; the source's 64-bit constructor raises the max to 32, so expect 32 — a shown 32 reconciles against the spec's "to 16" at the close), and the toggle list's exact set; the constants update per what the rig shows and the test re-pins. Evidence into the task's dir; the capture under the scene rules.
 - [ ] **Step 4: Gate and commit.** Run the full gate. Commit:
 
 ```
