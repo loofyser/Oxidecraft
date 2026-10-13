@@ -390,6 +390,44 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
     });
     let container = match screen {
         ScreenState::Container(container) | ScreenState::Inventory(container) => container.as_ref(),
+        // The death screen draws its own two-stop gradient over the scene —
+        // no dirt, no default pair (`GuiGameOver.drawScreen`:103-120).
+        ScreenState::Death(screen) => {
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The disconnect screen stands on dirt like the pause family, with
+        // the Lost title, the wrapped body and the Back button on top
+        // (`GuiDisconnected.drawScreen`:54-70 over `drawDefaultBackground`).
+        ScreenState::Disconnected(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The terrain screen stands on dirt with the centred Downloading
+        // line on top (`GuiDownloadTerrain.drawScreen`:48-54 over
+        // `drawBackground(0)`).
+        ScreenState::DownloadTerrain(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled));
+            }
+            return draws;
+        }
+        // The open-link confirm stands on dirt with the title, the wrapped
+        // link, the warning and the three-button row on top
+        // (`GuiYesNo.drawScreen` over the default background).
+        ScreenState::ConfirmOpenLink(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
         ScreenState::Creative(creative) => {
             return push_creative_draws(draws, creative, input, width, height);
         }
@@ -3775,16 +3813,6 @@ const TOOLTIP_BORDER_TOP: [f32; 4] = [80.0 / 255.0, 0.0, 1.0, 80.0 / 255.0];
 /// as the milestone's stand-in for the two-stop gradients.
 const TOOLTIP_BORDER_BOTTOM: [f32; 4] = [40.0 / 255.0, 0.0, 127.0 / 255.0, 80.0 / 255.0];
 
-/// The confirm overlay's dim: `drawDefaultBackground`'s first gradient stop,
-/// `-1072689136` = 0xC0101010 (`GuiScreen.java`:668-677) — the same first-stop
-/// stand-in the death view uses.
-const CONFIRM_DIM: [f32; 4] = [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 192.0 / 255.0];
-
-/// The confirm overlay's two-key prompt, drawn in the title's slot
-/// (`GuiYesNo.drawScreen`:72, centred at seventy): the source's own screen is three
-/// buttons, and this milestone's two keys stand in for it.
-const CONFIRM_PROMPT: &str = "Enter opens the link, Escape cancels";
-
 /// The chat mirror: the session's chat messages, and the draws a frame shows for them.
 ///
 /// The messages land from [`ClientEvent::Chat`]: a message at position code `2` becomes
@@ -3825,10 +3853,6 @@ pub struct ChatView {
     /// every frame the chat screen is the open one
     /// (`GuiChat.drawScreen`:305-310 resolves it from the free mouse).
     tooltip: Option<(TextComponent, (f32, f32))>,
-    /// The confirm overlay's URL while it stands in for the replaced chat screen
-    /// (`GuiScreen.java`:425-429): raised by the window's link click, ended by the
-    /// overlay's two keys.
-    confirm: Option<String>,
     /// The chat opacity the box reads (`GameSettings.chatOpacity`).
     chat_opacity: f32,
     /// The chat width the box reads (`GameSettings.chatWidth`).
@@ -3848,7 +3872,6 @@ impl ChatView {
             system: None,
             tick: 0,
             tooltip: None,
-            confirm: None,
             chat_opacity: 1.0,
             chat_width: 1.0,
             chat_scale: 1.0,
@@ -3976,18 +3999,10 @@ impl ChatView {
         let mut draws = Vec::new();
         self.system_draws(font, resolution, &mut draws);
         self.box_draws(resolution, &mut draws);
-        // The chat screen's own furniture draws while it is the screen on top: the
-        // confirm overlay stands in for the replaced chat screen
-        // (`GuiScreen.java`:425-429 swaps it in, `Minecraft.java`:1010-1012), so
-        // neither the field's line nor the tooltip draws under it.
-        if self.confirm.is_some() {
-            self.confirm_draws(font, resolution, &mut draws);
-        } else {
-            if input.open {
-                self.input_draws(font, resolution, input, &mut draws);
-            }
-            self.tooltip_draws(font, resolution, &mut draws);
+        if input.open {
+            self.input_draws(font, resolution, input, &mut draws);
         }
+        self.tooltip_draws(font, resolution, &mut draws);
         draws
     }
 
@@ -4245,63 +4260,6 @@ impl ChatView {
         }
     }
 
-    /// The interim confirm overlay — the port's stand-in for the source's
-    /// screen flow (`clickedLinkURI` and the swap to `GuiConfirmOpenLink`,
-    /// `GuiScreen.java`:403-433): the dim of `drawDefaultBackground`'s first stop
-    /// (`GuiScreen.java`:668-677), the two-key prompt in the title's slot
-    /// (`GuiYesNo.drawScreen`:72) and the URL in the message's — centred, wrapped
-    /// at the source's `width - 50` budget (`initGui`:55), a font line per line
-    /// from ninety down (`GuiYesNo.drawScreen`:73-79).
-    fn confirm_draws(&self, font: &Font, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
-        let Some(url) = &self.confirm else {
-            return;
-        };
-        draws.push(HudDraw::Rect {
-            x: 0.0,
-            y: 0.0,
-            width: resolution.width as f32,
-            height: resolution.height as f32,
-            colour: CONFIRM_DIM,
-        });
-        // The prompt: centred at seventy, the source's integer halving of both
-        // terms (`drawCenteredString` over `GuiYesNo.drawScreen`:72).
-        let half = (string_width(font, CONFIRM_PROMPT) / 2) as f32;
-        draws.push(HudDraw::Text {
-            text: CONFIRM_PROMPT.to_owned(),
-            x: (resolution.width / 2) as f32 - half,
-            y: 70.0,
-            scale: 1.0,
-            colour: [1.0, 1.0, 1.0, 1.0],
-            shadow: true,
-            blend: true,
-        });
-        // The URL, wrapped at `width - 50` and centred the same way, stepping a
-        // font line per line (`GuiYesNo.drawScreen`:73-79, the source's
-        // `fontRendererObj.listFormattedStringToWidth`).
-        let runs = [chat::StyledRun {
-            text: url.clone(),
-            colour: None,
-            styles: 0,
-            click: None,
-            hover: None,
-        }];
-        let mut y = 90.0;
-        for line in &chat::wrap(&runs, resolution.width as i32 - 50, font) {
-            let text = run_text(line);
-            let half = (string_width(font, &text) / 2) as f32;
-            draws.push(HudDraw::Text {
-                text,
-                x: (resolution.width / 2) as f32 - half,
-                y,
-                scale: 1.0,
-                colour: [1.0, 1.0, 1.0, 1.0],
-                shadow: true,
-                blend: true,
-            });
-            y += font.height() as f32;
-        }
-    }
-
     /// Feeds one frame's hover: the tooltip of the run under `point` — shown at
     /// the point — or none. The frame calls this every frame the chat screen is
     /// the open one, with the free pointer; the feed overwrites the last frame's
@@ -4359,34 +4317,6 @@ impl ChatView {
             return None;
         }
         None
-    }
-
-    /// Raises the confirm overlay on `url` — the source's `clickedLinkURI`
-    /// carrying the link into the confirm screen it swaps in
-    /// (`GuiScreen.java`:403-433, `:425-429`). While it is up it stands in for
-    /// the chat screen: the field's line and the tooltip do not draw under it.
-    pub fn open_confirm(&mut self, url: &str) {
-        self.confirm = Some(url.to_owned());
-    }
-
-    /// Whether the confirm overlay is up.
-    pub fn confirm_open(&self) -> bool {
-        self.confirm.is_some()
-    }
-
-    /// Cancels the confirm overlay — the source's cancel answer re-displays the
-    /// chat screen it replaced (`GuiScreen.confirmClicked`:713-725 reaches
-    /// `displayGuiScreen(this)` for either answer). The field beneath is
-    /// untouched.
-    pub fn cancel_confirm(&mut self) {
-        self.confirm = None;
-    }
-
-    /// Takes the overlay's URL, clearing it — the Enter path, which opens the
-    /// link once and returns to the chat (`confirmClicked`'s true answer,
-    /// `:713-719`).
-    pub fn take_confirm(&mut self) -> Option<String> {
-        self.confirm.take()
     }
 }
 
@@ -7713,96 +7643,6 @@ mod tests {
             closed_only.draws(chat_resolution(), &closed),
             "the open reconcile comes back down with the field"
         );
-    }
-
-    /// The confirm overlay — the port's stand-in for the source's confirm screen
-    /// (`GuiScreen.java`:403-433 stores the link and swaps the screen in;
-    /// `GuiYesNo.drawScreen`:69-79 draws it): the dim of
-    /// `drawDefaultBackground`'s first stop (`GuiScreen.java`:668-677), the
-    /// two-key prompt in the title's slot (centred at seventy,
-    /// `GuiYesNo.drawScreen`:72) and the URL wrapped at `width - 50`
-    /// (`GuiYesNo.initGui`:55) from ninety down, a font line per line.
-    #[test]
-    fn the_confirm_overlay_draws_the_dim_the_url_and_the_prompt() {
-        let mut chat = ChatView::new();
-        chat.set_font(chat_font());
-        chat.open_confirm("https://a.example");
-        let draws = chat.draws(chat_resolution(), &ChatInput::default());
-        assert_eq!(draws.len(), 3, "the dim, the prompt and the url");
-        assert_eq!(
-            chat_rect(&draws[0]),
-            (
-                0.0,
-                0.0,
-                427.0,
-                240.0,
-                [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 192.0 / 255.0]
-            ),
-            "the dim at the gradient's first stop"
-        );
-        // The prompt, centred with the source's integer halves: 427 / 2 - 51 / 2
-        // = 213 - 25 = 188; the url's formatted width 16 (one reset `§`) halves
-        // to eight, so 213 - 8 = 205 at the message's ninety.
-        assert_eq!(
-            chat_text(&draws[1]),
-            (
-                "Enter opens the link, Escape cancels".to_owned(),
-                188.0,
-                70.0,
-                1.0,
-                [1.0, 1.0, 1.0, 1.0],
-                true
-            )
-        );
-        assert_eq!(
-            chat_text(&draws[2]),
-            (
-                "https://a.example§r".to_owned(),
-                205.0,
-                90.0,
-                1.0,
-                [1.0, 1.0, 1.0, 1.0],
-                true
-            )
-        );
-
-        // A url past the width - 50 budget wraps, one font line per line: the
-        // hundred 'A's break at 62 (62 * 6 = 372 <= 377), so 213 - 372 / 2 = 27
-        // and, nine down, 213 - 228 / 2 = 99.
-        chat.cancel_confirm();
-        chat.open_confirm(&"A".repeat(100));
-        let draws = chat.draws(chat_resolution(), &ChatInput::default());
-        assert_eq!(draws.len(), 4, "the dim, the prompt and two url lines");
-        assert_eq!(
-            chat_text(&draws[2]),
-            (
-                format!("{}§r", "A".repeat(62)),
-                27.0,
-                90.0,
-                1.0,
-                [1.0, 1.0, 1.0, 1.0],
-                true
-            )
-        );
-        assert_eq!(
-            chat_text(&draws[3]),
-            (
-                format!("{}§r", "A".repeat(38)),
-                99.0,
-                99.0,
-                1.0,
-                [1.0, 1.0, 1.0, 1.0],
-                true
-            )
-        );
-
-        // While the overlay stands in for the replaced screen the field's own
-        // line is not drawn under it (`GuiScreen.java`:425-429 swaps the chat
-        // screen out through `Minecraft.java`:1010-1012).
-        let field = open_text("AA");
-        let draws = chat.draws(chat_resolution(), &field);
-        assert_eq!(draws.len(), 4, "no field line under the overlay");
-        assert_eq!(chat_text(&draws[2]).0, format!("{}§r", "A".repeat(62)));
     }
 
     /// The hit-test: the run under a scaled-GUI point

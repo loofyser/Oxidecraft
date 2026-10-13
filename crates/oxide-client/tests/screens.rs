@@ -2860,3 +2860,383 @@ fn the_skin_press_flips_the_bit_and_relabels() {
     assert_eq!(screen.part_label(0), "Cape: Off");
     assert_eq!(action.save_kind(), SaveKind::Immediate);
 }
+
+// Task 20's end-state suite: the death, disconnect, terrain and sleep
+// screens plus the link-confirm promotion.
+//
+// Closed-form pins mirror the source windows first-hand (`GuiGameOver.java`,
+// `GuiDisconnected.java`, `GuiDownloadTerrain.java`, `GuiSleepMP.java`,
+// `GuiConfirmOpenLink.java` over `GuiYesNo.java`): every rect, id, colour
+// and tick count below names its source line in the assertion message.
+
+use oxide_client::screens::end_states::{
+    BED_BLOCK_ID, CONFIRM_TITLE_Y, CONFIRM_WARNING_COLOUR, CONFIRM_WARNING_Y, DEATH_ENABLE_TICKS,
+    DEATH_GRADIENT_BOTTOM, DEATH_GRADIENT_TOP, DEATH_RESPAWN_ID, DEATH_SCORE_Y, DEATH_TITLE_ID,
+    DEATH_TITLE_SCALE, DEATH_TITLE_Y, DISCONNECT_BUTTON_ID, DISCONNECT_TITLE_COLOUR,
+    DISCONNECT_WRAP_MARGIN, DisconnectAction, TERRAIN_LINE_Y_OFFSET, bed_facing_j, confirm_labels,
+    death_labels, death_score_line, disconnect_button_y, leave_bed_button, sleep_dim, sleep_yaw,
+};
+use oxide_client::screens::{ConfirmAction, DeathAction};
+
+/// A scaled size for the end-state pins.
+fn end_scaled() -> ScaledResolution {
+    ScaledResolution {
+        width: 427,
+        height: 240,
+        scale_factor: 2,
+    }
+}
+
+#[test]
+fn the_death_buttons_stand_on_the_source_rects() {
+    // `GuiGameOver.initGui:38-39`: Respawn id 0 at `w/2-100, h/4+72`,
+    // Title id 1 at `h/4+96`, both 200x20. At 427x240: (113, 132) and
+    // (113, 156).
+    let mut screens = Screens::default();
+    screens.open_death(&end_scaled(), &death_labels(None), 0);
+    let screen = screens.death_mut().expect("death stands");
+    assert_eq!(DEATH_RESPAWN_ID, 0, "the respawn id");
+    assert_eq!(DEATH_TITLE_ID, 1, "the title id");
+    let buttons = screen.buttons();
+    assert_eq!(buttons.len(), 2, "two buttons stand");
+    assert_eq!((buttons[0].x, buttons[0].y), (113.0, 132.0), "respawn rect");
+    assert_eq!((buttons[1].x, buttons[1].y), (113.0, 156.0), "title rect");
+    assert_eq!((buttons[0].w, buttons[0].h), (200.0, 20.0), "button size");
+}
+
+#[test]
+fn the_death_buttons_enable_on_the_twentieth_tick() {
+    // `initGui:47-50` builds every button disabled; `updateScreen:135-147`
+    // enables them all when the counter reaches exactly 20.
+    assert_eq!(DEATH_ENABLE_TICKS, 20, "the enable tick");
+    let mut screens = Screens::default();
+    screens.open_death(&end_scaled(), &death_labels(None), 0);
+    let screen = screens.death_mut().expect("death stands");
+    assert!(
+        screen.buttons().iter().all(|button| !button.enabled),
+        "every button starts disabled"
+    );
+    assert!(
+        screen.click_at((114.0, 133.0)).is_none(),
+        "a press before the twentieth tick answers nothing"
+    );
+    for _ in 0..19 {
+        screens.tick_death();
+    }
+    assert!(
+        screens
+            .death_mut()
+            .expect("death stands")
+            .buttons()
+            .iter()
+            .all(|button| !button.enabled),
+        "nineteen ticks still hold the gate"
+    );
+    screens.tick_death();
+    assert!(
+        screens
+            .death_mut()
+            .expect("death stands")
+            .buttons()
+            .iter()
+            .all(|button| button.enabled),
+        "the twentieth tick enables both"
+    );
+    assert_eq!(
+        screens
+            .death_mut()
+            .expect("death stands")
+            .click_at((114.0, 133.0)),
+        Some(DeathAction::Respawn),
+        "respawn answers after the gate"
+    );
+}
+
+#[test]
+fn the_death_title_runs_the_quit_confirm_with_its_own_delay() {
+    // `actionPerformed:80-83` stands the quit-confirm with a 20-tick button
+    // delay; true quits to the menu, false respawns (`confirmClicked:87-100`).
+    let mut screens = Screens::default();
+    screens.open_death(&end_scaled(), &death_labels(None), 0);
+    for _ in 0..DEATH_ENABLE_TICKS {
+        screens.tick_death();
+    }
+    assert_eq!(
+        screens
+            .death_mut()
+            .expect("death stands")
+            .click_at((114.0, 157.0)),
+        Some(DeathAction::QuitToTitle),
+        "the title button stands the quit-confirm"
+    );
+    let screen = screens.death_mut().expect("death stands");
+    assert!(screen.confirming(), "the confirm phase stands");
+    assert!(
+        screen.click_at((114.0, 157.0)).is_none(),
+        "the confirm's own delay holds first"
+    );
+    for _ in 0..DEATH_ENABLE_TICKS {
+        screens.tick_death();
+    }
+    assert_eq!(
+        screens
+            .death_mut()
+            .expect("death stands")
+            .click_at((114.0, 157.0)),
+        Some(DeathAction::ConfirmRespawn),
+        "the confirm's cancel respawns"
+    );
+}
+
+#[test]
+fn the_death_draw_pins_the_gradient_title_and_score() {
+    // `drawScreen:107` gradients `1615855616` over `-1602211792`; the title
+    // draws at 2x (`:108-113`, `deathScreen.title` "You died!"); the score
+    // line is `deathScreen.score` + ": " + yellow + value at y 100 (`:120`).
+    assert_eq!(
+        DEATH_GRADIENT_TOP,
+        [80.0 / 255.0, 0.0, 0.0, 96.0 / 255.0],
+        "the top stop is 1615855616"
+    );
+    assert_eq!(
+        DEATH_GRADIENT_BOTTOM,
+        [128.0 / 255.0, 48.0 / 255.0, 48.0 / 255.0, 160.0 / 255.0],
+        "the bottom stop is -1602211792"
+    );
+    assert_eq!(DEATH_TITLE_SCALE, 2.0, "the title scale");
+    assert_eq!(DEATH_TITLE_Y, 60.0, "the title's GUI y (30 in 2x space)");
+    assert_eq!(DEATH_SCORE_Y, 100.0, "the score line's y");
+    let labels = death_labels(None);
+    assert_eq!(labels.title, "You died!", "the title label");
+    assert_eq!(
+        death_score_line(&labels.score, 7),
+        "Score: \u{a7}e7",
+        "the score line format"
+    );
+}
+
+#[test]
+fn the_disconnect_screen_carries_the_lost_title_and_the_reason() {
+    // `GuiDisconnected`: the fixed `disconnect.lost` title plus the kick
+    // body wrapped at `width - 50`; one `gui.toMenu` button below the body
+    // at `h/2 + msgH/2 + FONT_HEIGHT`.
+    let labels = death_labels(None);
+    let _ = labels;
+    let mut screens = Screens::default();
+    screens.open_disconnected(
+        &end_scaled(),
+        String::from("Connection Lost"),
+        String::from("{\"text\":\"Kicked\"}"),
+        &pause_probe_font(),
+        String::from("Back to server list"),
+    );
+    let screen = screens.disconnected_mut().expect("disconnect stands");
+    assert_eq!(screen.title(), "Connection Lost", "the fixed title");
+    assert_eq!(DISCONNECT_BUTTON_ID, 0, "the button id");
+    assert_eq!(DISCONNECT_WRAP_MARGIN, 50, "the wrap budget");
+    assert_eq!(
+        DISCONNECT_TITLE_COLOUR,
+        [170.0 / 255.0, 170.0 / 255.0, 170.0 / 255.0, 1.0],
+        "the title grey is 11184810"
+    );
+    assert_eq!(
+        disconnect_button_y(240, 1, 9),
+        120.0 + 4.5 + 9.0,
+        "the button sits below one body line"
+    );
+    assert_eq!(
+        screen.click_at((214.0, disconnect_button_y(240, 1, 9) + 1.0)),
+        Some(DisconnectAction::ToParent),
+        "the button answers the parent"
+    );
+}
+
+#[test]
+fn the_terrain_screen_pins_the_centred_line_and_no_buttons() {
+    // `GuiDownloadTerrain.drawScreen:53-54`: dirt plus
+    // `multiplayer.downloadingTerrain` centred at `h/2 - 50`; `initGui:30-33`
+    // stands no buttons.
+    assert_eq!(TERRAIN_LINE_Y_OFFSET, 50.0, "the line's offset");
+    let mut screens = Screens::default();
+    screens.open_terrain(&end_scaled(), String::from("Downloading terrain"));
+    assert!(screens.is_open(), "terrain stands");
+}
+
+#[test]
+fn the_confirm_buttons_stand_three_across() {
+    // `GuiConfirmOpenLink.initGui:34-36`: confirm id 0, copy id 2, cancel
+    // id 1 — three 100x20 buttons at `h/6+96`. At 427x240: y 136, x 58 /
+    // 163 / 268.
+    let labels = confirm_labels(None);
+    assert_eq!(labels.confirm_untrusted, "Yes", "untrusted confirm");
+    assert_eq!(labels.cancel_untrusted, "No", "untrusted cancel");
+    assert_eq!(labels.confirm_trusted, "Open in browser", "trusted confirm");
+    assert_eq!(labels.cancel_trusted, "Cancel", "trusted cancel");
+    let mut screens = Screens::default();
+    screens.open_confirm(
+        &end_scaled(),
+        String::from("https://a.example"),
+        &pause_probe_font(),
+        &confirm_labels(None),
+        false,
+    );
+    let screen = screens.confirm_mut().expect("confirm stands");
+    let buttons = screen.buttons();
+    assert_eq!(buttons.len(), 3, "three buttons stand");
+    assert_eq!(
+        (buttons[0].id, buttons[0].x, buttons[0].y),
+        (0, 58.0, 136.0),
+        "confirm"
+    );
+    assert_eq!(
+        (buttons[1].id, buttons[1].x, buttons[1].y),
+        (2, 163.0, 136.0),
+        "copy"
+    );
+    assert_eq!(
+        (buttons[2].id, buttons[2].x, buttons[2].y),
+        (1, 268.0, 136.0),
+        "cancel"
+    );
+    assert_eq!(
+        screen.click_at((164.0, 137.0)),
+        Some(ConfirmAction::Copy),
+        "the middle button copies"
+    );
+    assert_eq!(
+        CONFIRM_WARNING_COLOUR,
+        [255.0 / 255.0, 204.0 / 255.0, 204.0 / 255.0, 1.0],
+        "the warning colour is 16764108"
+    );
+    assert_eq!(CONFIRM_TITLE_Y, 70.0, "the title's y");
+    assert_eq!(CONFIRM_WARNING_Y, 110.0, "the warning's y");
+}
+
+#[test]
+fn the_end_state_transitions_follow_the_session() {
+    // Died stands death; the re-raise replaces whatever closed it; the
+    // respawn clears it. Join stands terrain; the terrain-clear event drops
+    // it. Disconnect stands the screen with its body. A link stands the
+    // confirm.
+    let mut screens = Screens::default();
+    screens.open_death(&end_scaled(), &death_labels(None), 0);
+    screens.close_death();
+    assert!(!screens.is_open(), "the test cleared death");
+    screens.open_death(&end_scaled(), &death_labels(None), 0);
+    screens.ensure_death(&end_scaled(), &death_labels(None));
+    assert!(screens.death_mut().is_some(), "death stands");
+    screens.open_terrain(&end_scaled(), String::from("Downloading terrain"));
+    assert!(screens.death_mut().is_none(), "terrain replaces death");
+    screens.ensure_death(&end_scaled(), &death_labels(None));
+    assert!(
+        screens.death_mut().is_some(),
+        "the re-raise stands death again"
+    );
+    assert!(screens.close_death(), "the respawn clears death");
+    assert!(!screens.is_open(), "nothing stands after the clear");
+    screens.open_terrain(&end_scaled(), String::from("Downloading terrain"));
+    assert!(
+        screens.close_terrain(),
+        "the terrain-clear event drops terrain"
+    );
+    assert!(!screens.close_terrain(), "a second clear reports nothing");
+    screens.open_disconnected(
+        &end_scaled(),
+        String::from("Connection Lost"),
+        String::from("{\"text\":\"End of stream\"}"),
+        &pause_probe_font(),
+        String::from("Back to server list"),
+    );
+    assert!(screens.disconnected_mut().is_some(), "disconnect stands");
+    screens.open_confirm(
+        &end_scaled(),
+        String::from("https://a.example"),
+        &pause_probe_font(),
+        &confirm_labels(None),
+        false,
+    );
+    assert!(
+        screens.confirm_mut().is_some(),
+        "the link stands the confirm"
+    );
+    assert!(screens.cancel_confirm(), "escape cancels the confirm");
+    assert!(!screens.is_open(), "nothing stands after the cancel");
+}
+
+#[test]
+fn the_end_state_screens_never_close_through_the_window_path() {
+    // Death, disconnect and terrain have empty `keyTyped` arms — Escape is
+    // a no-op — and stand on no window, so the generic close leaves them.
+    let mut screens = Screens::default();
+    screens.open_death(&end_scaled(), &death_labels(None), 0);
+    let mut dropped = None;
+    assert!(
+        screens.escape(&mut dropped).is_none(),
+        "death sends nothing"
+    );
+    assert!(screens.death_mut().is_some(), "death stays");
+    assert!(
+        screens.close(&mut dropped).is_none(),
+        "death closes nothing"
+    );
+    assert!(screens.death_mut().is_some(), "death still stays");
+    screens.open_disconnected(
+        &end_scaled(),
+        String::from("Connection Lost"),
+        String::from("{\"text\":\"x\"}"),
+        &pause_probe_font(),
+        String::from("Back to server list"),
+    );
+    assert!(
+        screens.escape(&mut dropped).is_none(),
+        "disconnect sends nothing"
+    );
+    assert!(screens.disconnected_mut().is_some(), "disconnect stays");
+    screens.open_terrain(&end_scaled(), String::from("Downloading terrain"));
+    assert!(
+        screens.escape(&mut dropped).is_none(),
+        "terrain sends nothing"
+    );
+    assert!(screens.is_open(), "terrain stays");
+}
+
+#[test]
+fn the_sleep_cover_pins_the_leave_bed_button_darkening_and_rise() {
+    // `GuiSleepMP.initGui:14-18`: "Leave Bed" id 1, 200x20 at `w/2-100,
+    // h-40`. `GuiIngame:194-212`: `sleepTimer/100` ramp with the
+    // `220*f << 24 | 1052704` rect and the 100-110 fade. `orientCamera`'s
+    // sleeping branch: eye +1.0, 0.3 up, bed-facing yaw.
+    let button = leave_bed_button(&end_scaled(), String::from("Leave Bed"));
+    assert_eq!((button.x, button.y), (113.0, 200.0), "the leave-bed rect");
+    assert_eq!((button.w, button.h), (200.0, 20.0), "the leave-bed size");
+    assert_eq!(
+        sleep_dim(0),
+        [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 0.0],
+        "no timer draws nothing"
+    );
+    assert_eq!(
+        sleep_dim(50),
+        [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 110.0 / 255.0],
+        "half the timer is half the alpha"
+    );
+    assert_eq!(
+        sleep_dim(100),
+        [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 220.0 / 255.0],
+        "the full timer is the full 220 alpha"
+    );
+    assert_eq!(
+        sleep_dim(105),
+        sleep_dim(50),
+        "the wake fade mirrors the ramp"
+    );
+    assert_eq!(
+        sleep_dim(110),
+        [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 0.0],
+        "the fade lands back at nothing"
+    );
+    assert_eq!(sleep_yaw(30.0, 0), 210.0, "south beds turn the yaw by 180");
+    assert_eq!(sleep_yaw(30.0, 1), 120.0, "west beds fold their quarter");
+    assert_eq!(BED_BLOCK_ID, 26, "the bed block id");
+    assert_eq!(bed_facing_j(0), 0, "south reads 0");
+    assert_eq!(bed_facing_j(9), 1, "head + occupied keep the facing");
+}

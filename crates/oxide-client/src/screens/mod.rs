@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use oxide_assets::font::Font;
 use oxide_game::chat::LanguageTable;
 use oxide_game::input::InputEvent;
 use oxide_game::settings::GameSettings;
@@ -46,6 +47,9 @@ use oxide_render::hud::ScaledResolution;
 use book::BookScreen;
 use container::{ContainerLayout, ContainerScreen};
 use creative::CreativeScreen;
+use end_states::TerrainScreen;
+pub use end_states::{ConfirmAction, DeathAction};
+use end_states::{ConfirmLabels, ConfirmScreen, DeathLabels, DeathScreen, DisconnectedScreen};
 use menu::MainMenuScreen;
 use multiplayer::{MultiplayerLabels, MultiplayerScreen, ServerList};
 use options::{OptionsLabels, OptionsScreen, VideoLabels, VideoScreen};
@@ -60,6 +64,7 @@ use sign::{SignMapEntry, SignScreen};
 pub mod book;
 pub mod container;
 pub mod creative;
+pub mod end_states;
 pub mod family_a;
 pub mod family_b;
 pub mod inventory;
@@ -145,6 +150,20 @@ pub enum ScreenState {
     /// The skin-customization screen: the seven part toggles, standing
     /// from the hub's skin button (boxed like the container kinds).
     Skin(Box<SkinScreen>),
+    /// The death screen: the gradient, the title, the score line and the
+    /// gated Respawn/Title pair, then the quit-confirm on the title
+    /// button (boxed like the container kinds).
+    Death(Box<DeathScreen>),
+    /// The disconnect screen: the fixed Lost title, the wrapped reason
+    /// body and the Back button to the parent (boxed like the container
+    /// kinds).
+    Disconnected(Box<DisconnectedScreen>),
+    /// The terrain screen: the standing Downloading line over dirt while
+    /// the join's chunks load — small, so unboxed.
+    DownloadTerrain(TerrainScreen),
+    /// The open-link confirm: the title, the wrapped link, the warning
+    /// and the confirm/copy/cancel row (boxed like the container kinds).
+    ConfirmOpenLink(Box<ConfirmScreen>),
 }
 
 impl ScreenState {
@@ -162,6 +181,10 @@ impl ScreenState {
             ScreenState::Sign(_)
             | ScreenState::Book(_)
             | ScreenState::MainMenu(_)
+            | ScreenState::Death(_)
+            | ScreenState::Disconnected(_)
+            | ScreenState::DownloadTerrain(_)
+            | ScreenState::ConfirmOpenLink(_)
             | ScreenState::Pause(_)
             | ScreenState::Stats(_)
             | ScreenState::Achievements(_)
@@ -200,6 +223,11 @@ pub struct Screens {
     /// `open_creative` stands the screen on it, `close` saves it back —
     /// reopening keeps the last tab within the session.
     creative_tab: u8,
+    /// The last score the session reported for the death screen's line:
+    /// `open_death` stands the screen on it, and the re-raise keeps it —
+    /// the score arrives on metadata 18 (`EntityPlayer.getScore`:688-691)
+    /// before the death does.
+    death_score: i32,
     /// The last sign text per position: every `SignTextChanged` the frame
     /// folds lands here, so the `SignEditorOpen` path stands the editor on
     /// the map's lines — four empty lines when the map holds none (the
@@ -299,6 +327,165 @@ impl Screens {
         match self.current.as_mut() {
             Some(ScreenState::Creative(screen)) => Some(screen.as_mut()),
             _ => None,
+        }
+    }
+
+    /// Stands the death screen on the labels and the score: the gated
+    /// Respawn/Title pair, both disabled until the twentieth tick
+    /// (`GuiGameOver.initGui`:23-39, `updateScreen`:135-147). Replaces
+    /// whatever stands — the runTick re-raise replaces a closed screen
+    /// while the player is dead (`Minecraft.java`:1771-1775).
+    pub fn open_death(&mut self, scaled: &ScaledResolution, labels: &DeathLabels, score: i32) {
+        self.death_score = score;
+        self.current = Some(ScreenState::Death(Box::new(DeathScreen::new(
+            scaled, labels, score,
+        ))));
+    }
+
+    /// The open death screen, when the current screen is one: the frame's
+    /// feed, the pointer and the death keys drive this.
+    pub fn death_mut(&mut self) -> Option<&mut DeathScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Death(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Steps the death screen's button gate one client tick: both buttons
+    /// enable on the twentieth (`GuiGameOver.updateScreen`:135-147). The
+    /// fold no-ops with no death screen open.
+    pub fn tick_death(&mut self) {
+        if let Some(screen) = self.death_mut() {
+            screen.tick();
+        }
+    }
+
+    /// Keeps the last score the session reported: the death screen stands
+    /// on it when death lands (`EntityPlayer.getScore`:688-691 reads the
+    /// own block's index 18, and the score arrives before the death does).
+    pub fn note_score(&mut self, score: i32) {
+        self.death_score = score;
+    }
+
+    /// The last score the session reported, for the death screen's line.
+    pub fn death_score(&self) -> i32 {
+        self.death_score
+    }
+
+    /// Re-stands the death screen while the player is dead: a no-op when
+    /// it already stands — the running gate and the confirm phase keep
+    /// their state — else a fresh stand on the last score
+    /// (`Minecraft.java`:1771-1775 re-raises it every dead tick).
+    pub fn ensure_death(&mut self, scaled: &ScaledResolution, labels: &DeathLabels) {
+        if self.death_mut().is_none() {
+            self.current = Some(ScreenState::Death(Box::new(DeathScreen::new(
+                scaled,
+                labels,
+                self.death_score,
+            ))));
+        }
+    }
+
+    /// Drops the death screen on the respawn: true when one stood
+    /// (`setDimensionAndSpawnPlayer` clears it, `Minecraft.java`:2459-2462).
+    pub fn close_death(&mut self) -> bool {
+        if matches!(self.current, Some(ScreenState::Death(_))) {
+            self.current = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stands the terrain screen on the line: dirt plus the centred
+    /// Downloading line, no buttons (`GuiDownloadTerrain.initGui`:30-33,
+    /// `drawScreen`:48-54). Replaces whatever stands — the join stands it
+    /// over the fresh world (`NetHandlerPlayClient.java`:275-285).
+    pub fn open_terrain(&mut self, _scaled: &ScaledResolution, line: String) {
+        self.current = Some(ScreenState::DownloadTerrain(TerrainScreen::new(line)));
+    }
+
+    /// Drops the terrain screen on the first Player Position And Look:
+    /// true when one stood (`handlePlayerPosLook`:719-726 flips
+    /// `doneLoadingTerrain` beside `displayGuiScreen(null)`).
+    pub fn close_terrain(&mut self) -> bool {
+        if matches!(self.current, Some(ScreenState::DownloadTerrain(_))) {
+            self.current = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stands the disconnect screen: the fixed Lost title, the reason body
+    /// wrapped at `width - 50`, and the Back button below the body
+    /// (`GuiDisconnected.initGui`:38-43). Replaces whatever stands — the
+    /// drop tears the world down first (`onDisconnect`:796-813).
+    pub fn open_disconnected(
+        &mut self,
+        scaled: &ScaledResolution,
+        title: String,
+        body: String,
+        font: &Font,
+        button_label: String,
+    ) {
+        self.current = Some(ScreenState::Disconnected(Box::new(
+            DisconnectedScreen::new(scaled, title, body, font, button_label),
+        )));
+    }
+
+    /// The open disconnect screen, when the current screen is one: the
+    /// pointer and the disconnect keys drive this.
+    pub fn disconnected_mut(&mut self) -> Option<&mut DisconnectedScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Disconnected(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Stands the open-link confirm on the link: the title, the wrapped
+    /// link, the warning and the confirm/copy/cancel row
+    /// (`GuiConfirmOpenLink.initGui`:33-38). Replaces whatever stands —
+    /// the chat's interim overlay is absorbed into this screen, keeping
+    /// its Enter/Escape contract.
+    pub fn open_confirm(
+        &mut self,
+        scaled: &ScaledResolution,
+        link: String,
+        font: &Font,
+        labels: &ConfirmLabels,
+        trusted: bool,
+    ) {
+        self.current = Some(ScreenState::ConfirmOpenLink(Box::new(ConfirmScreen::new(
+            scaled, link, font, labels, trusted,
+        ))));
+    }
+
+    /// The open link confirm, when the current screen is one: the pointer
+    /// and the confirm keys drive this.
+    pub fn confirm_mut(&mut self) -> Option<&mut ConfirmScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::ConfirmOpenLink(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Whether the link confirm stands: the frame's Escape route, the
+    /// confirm keys and the click path read this — the absorbed interim's
+    /// `confirm_open` contract, kept on the real screen.
+    pub fn confirm_open(&self) -> bool {
+        matches!(self.current, Some(ScreenState::ConfirmOpenLink(_)))
+    }
+
+    /// Cancels the link confirm: true when one stood — the screen drops
+    /// and the chat beneath stays open (`confirmClicked` with false
+    /// re-displays the chat, `GuiScreen.java`:713-725).
+    pub fn cancel_confirm(&mut self) -> bool {
+        if matches!(self.current, Some(ScreenState::ConfirmOpenLink(_))) {
+            self.current = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -962,9 +1149,9 @@ impl Screens {
     }
 
     /// Folds the session's end into the screens: disconnect-to-title
-    /// stands the main menu (the standing rule only — the disconnect
-    /// screen with the reason lands in Task 20, and its title button
-    /// calls this same open).
+    /// stands the main menu. The wire's disconnect stands the disconnect
+    /// screen with the reason first, and its title button calls this same
+    /// open.
     pub fn on_disconnected(
         &mut self,
         scaled: ScaledResolution,
@@ -1006,7 +1193,16 @@ impl Screens {
     /// menu stands until another screen replaces it — the close answers
     /// `None` and the menu stays.
     pub fn close(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
-        if matches!(self.current, Some(ScreenState::MainMenu(_))) {
+        if matches!(
+            self.current,
+            Some(
+                ScreenState::MainMenu(_)
+                    | ScreenState::Death(_)
+                    | ScreenState::Disconnected(_)
+                    | ScreenState::DownloadTerrain(_)
+                    | ScreenState::ConfirmOpenLink(_)
+            )
+        ) {
             return None;
         }
         if let Some(ScreenState::Creative(screen)) = self.current.as_ref() {

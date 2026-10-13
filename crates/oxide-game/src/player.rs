@@ -236,6 +236,13 @@ pub struct Player {
     /// the attacker-derived `atan2`), and the status packet never carries them —
     /// so this stays zero until M4 tracks attackers.
     pub attacked_at_yaw: f32,
+    /// Whether the player is asleep in a bed, from clientbound 0x0A, until
+    /// the animation-2 wake or the respawn.
+    ///
+    /// The source keeps it as the entity's own `sleeping` flag, set by
+    /// `trySleep` beside `sleepTimer = 0` (`EntityPlayer.java:1568-1571`);
+    /// the window polls it for the sleep cover (`Minecraft.java:1777-1784`).
+    pub sleeping: bool,
 }
 
 impl Player {
@@ -273,6 +280,7 @@ impl Player {
             death_time: 0,
             hurt_time: 0,
             attacked_at_yaw: 0.0,
+            sleeping: false,
         }
     }
 
@@ -388,6 +396,10 @@ impl Player {
         self.death_time = 0;
         self.hurt_time = 0;
         self.attacked_at_yaw = 0.0;
+        // A fresh player is awake: the respawn recreates the entity, so no
+        // bed holds it (`NetHandlerPlayClient.handleRespawn` rebuilds the
+        // player beside the world).
+        self.sleeping = false;
         self.sprinting = false;
         self.sneaking = false;
         self.server_sprint_state = false;

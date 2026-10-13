@@ -13,12 +13,13 @@ use oxide_proto_v47::entity::{
     Animation, AttachEntity, CollectItem, DestroyEntities, Entity, EntityEquipment, EntityHeadLook,
     EntityLook, EntityLookAndRelativeMove, EntityMetadata, EntityRelativeMove, EntityTeleport,
     EntityVelocity, GlobalType, MAX_DESTROY_BATCH, MetadataItem, MetadataValue, MobType,
-    ObjectType, SpawnGlobal, SpawnMob, SpawnObject, SpawnPainting, SpawnPlayer, SpawnXpOrb,
+    ObjectType, SpawnGlobal, SpawnMob, SpawnObject, SpawnPainting, SpawnPlayer, SpawnXpOrb, UseBed,
     decode_animation, decode_attach_entity, decode_collect_item, decode_destroy_entities,
     decode_entity, decode_entity_equipment, decode_entity_head_look, decode_entity_look,
     decode_entity_look_and_relative_move, decode_entity_metadata, decode_entity_relative_move,
     decode_entity_teleport, decode_entity_velocity, decode_spawn_global, decode_spawn_mob,
     decode_spawn_object, decode_spawn_painting, decode_spawn_player, decode_spawn_xp_orb,
+    decode_use_bed,
 };
 
 /// Spawn Player (0x0C): EID 20; UUID; a fractional fixed-point triple; a
@@ -157,6 +158,14 @@ const ENTITY_EQUIPMENT_EMPTY: &[u8] = &[
 const ENTITY_ANIMATION: &[u8] = &[
     0x2a, // EID 42
     0x04, // animation 4: crit
+];
+
+/// Use Bed (0x0A): EID 20 at the head part (10, 64, -5) — the long packs
+/// `((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)`
+/// (`BlockPos.toLong`), so the negative z proves the sign extension.
+const USE_BED: &[u8] = &[
+    0x14, // EID 20
+    0x00, 0x00, 0x02, 0x81, 0x03, 0xff, 0xff, 0xfb, // (10, 64, -5)
 ];
 
 /// Collect Item (0x0D): collected 300, collector 20.
@@ -653,6 +662,16 @@ fn animation_decodes_the_byte() {
     let animation = decode_animation(ENTITY_ANIMATION).expect("an animation decodes");
     assert_eq!(animation.entity_id, 42);
     assert_eq!(animation.animation, 4, "the crit of §2.1's table");
+}
+
+#[test]
+fn use_bed_decodes_the_player_and_the_bed() {
+    // S0A (`S0APacketUseBed.readPacketData`): the player id VarInt, then the
+    // head-part bed position as one Location Position long.
+    assert_eq!(UseBed::ID, 0x0a);
+    let bed = decode_use_bed(USE_BED).expect("a use-bed decodes");
+    assert_eq!(bed.entity_id, 20, "the sleeping player");
+    assert_eq!((bed.x, bed.y, bed.z), (10, 64, -5), "the bed's head part");
 }
 
 #[test]

@@ -240,6 +240,11 @@ pub enum InputEvent {
     /// send at :2100, screen display at :2101). The source guards nothing —
     /// every non-riding open sends exactly one — so two opens send two.
     OpenInventory,
+    /// The sleep cover's leave: the Escape key and the Leave Bed button
+    /// both send C0B carrying action 2, the source's `STOP_SLEEPING`
+    /// (`GuiSleepMP.keyTyped:51-67`). It carries no held key and no look,
+    /// so it answers `false` below like the other one-shot sends.
+    LeaveBed,
     /// The view-distance slider moved: the session clamps the value to the
     /// store's range and, when it differs from the held settings, re-sends
     /// the whole Client Settings payload (C15) beside the standing fields.

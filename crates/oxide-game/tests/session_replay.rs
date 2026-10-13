@@ -1086,16 +1086,20 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
             ..
         }
     ));
+    assert!(
+        matches!(events[2], ClientEvent::TerrainReady),
+        "the join's first S08 clears the terrain screen once: {events:?}"
+    );
     assert!(matches!(
-        events[2],
+        events[3],
         ClientEvent::PlayerTick {
             x,
             snapped: true,
             ..
         } if x == 0.5
     ));
-    assert!(matches!(events[3], ClientEvent::KeepAlive { id: 7 }));
-    match &events[4] {
+    assert!(matches!(events[4], ClientEvent::KeepAlive { id: 7 }));
+    match &events[5] {
         ClientEvent::ChunkUpdated {
             cx: 0,
             cz: 0,
@@ -1109,8 +1113,8 @@ fn the_session_logs_in_joins_and_answers_every_obligation() {
     }
     assert_eq!(
         events.len(),
-        5,
-        "the login, the join, the teleport, the echo and one mesh: {events:?}"
+        6,
+        "the login, the join, the terrain clear, the teleport, the echo and one mesh: {events:?}"
     );
     assert_eq!(
         updated_columns(&events),
@@ -8734,4 +8738,181 @@ fn an_s0b_crit_runs_three_emitter_rounds() {
             "inside the quarter-box at mid-height: {frame:?}"
         );
     }
+}
+
+/// One Use Bed frame (0x0A): the player id VarInt, then the bed head's
+/// Location Position long (`S0APacketUseBed.readPacketData`).
+fn use_bed_frame(entity_id: i32, x: i32, y: i32, z: i32) -> Vec<u8> {
+    let mut payload = vec![0x0a];
+    push_varint(&mut payload, entity_id);
+    let packed =
+        ((x as i64 & 0x3FFFFFF) << 38) | ((y as i64 & 0xFFF) << 26) | (z as i64 & 0x3FFFFFF);
+    payload.extend_from_slice(&packed.to_be_bytes());
+    payload
+}
+
+/// An int metadata entry's payload.
+fn meta_int(value: i32) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// A bed block facing west: id 26 with the facing bits 1 (`26 << 4 | 1`).
+const BED_WEST: u16 = 26 << 4 | 1;
+
+#[test]
+fn the_first_position_look_clears_the_terrain() {
+    // `NetHandlerPlayClient.handlePlayerPosLook:719-726`: the first S08
+    // flips `doneLoadingTerrain` false→true and drops the terrain screen —
+    // once. The second S08 is an ordinary correction.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        position_frame(0.5, 65.0, -12.5, 0.0, 0.0, 0),
+        position_frame(0.5, 65.0, -12.5, 0.0, 0.0, 0),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::TerrainReady))
+            .count(),
+        1,
+        "exactly one terrain clear, on the first S08: {events:?}"
+    );
+}
+
+#[test]
+fn a_cross_dimension_respawn_re_arms_the_terrain_clear() {
+    // `handleRespawn:1062-1068` re-shows the terrain screen when the
+    // dimension changes, so the next S08 clears it again. A same-dimension
+    // respawn keeps the world and reports no second clear.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        position_frame(0.5, 65.0, -12.5, 0.0, 0.0, 0),
+        respawn_frame(-1, 1, 0, "default"),
+        position_frame(0.5, 65.0, -12.5, 0.0, 0.0, 0),
+        respawn_frame(-1, 1, 0, "default"),
+        position_frame(0.5, 65.0, -12.5, 0.0, 0.0, 0),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::TerrainReady))
+            .count(),
+        2,
+        "the join and the nether respawn each clear once: {events:?}"
+    );
+}
+
+#[test]
+fn use_bed_sets_the_sleeping_flag() {
+    // `handleUseBed:903-907` runs `trySleep` on the named player, which sets
+    // `sleeping` with `sleepTimer = 0` (`EntityPlayer.java:1568-1571`). The
+    // bed's facing rides along for the camera's rise; a bed for another
+    // player answers nothing.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        lit_column_frame(0, 0, &[0], 15, 0, true),
+        block_change_frame(4, 1, 4, BED_WEST),
+        use_bed_frame(21, 4, 1, 4),
+        use_bed_frame(20, 4, 1, 4),
+        use_bed_frame(20, 4, 1, 4),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let sleeps: Vec<&ClientEvent> = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::Sleeping { .. }))
+        .collect();
+    assert_eq!(
+        sleeps,
+        vec![&ClientEvent::Sleeping {
+            x: 4,
+            y: 1,
+            z: 4,
+            facing: 1
+        }],
+        "one sleep, on the own player's first bed, facing west: {events:?}"
+    );
+}
+
+#[test]
+fn animation_two_wakes_the_sleeper() {
+    // `handleAnimation:882-885`: animation 2 wakes the player. Without a
+    // preceding bed the animation answers nothing, and the wake reports
+    // once.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        animation_frame(20, 2),
+        use_bed_frame(20, 4, 1, 4),
+        animation_frame(20, 2),
+        animation_frame(20, 2),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    let wakes = events
+        .iter()
+        .filter(|event| matches!(event, ClientEvent::Woke))
+        .count();
+    assert_eq!(wakes, 1, "one wake, after the bed: {events:?}");
+    let sleep_at = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Sleeping { .. }))
+        .expect("the bed reports first");
+    let wake_at = events
+        .iter()
+        .position(|event| matches!(event, ClientEvent::Woke))
+        .expect("the wake reports");
+    assert!(sleep_at < wake_at, "the bed precedes the wake");
+}
+
+#[test]
+fn the_own_score_arrives_on_metadata_eighteen() {
+    // `EntityPlayer.getScore:688-691` reads datawatcher int 18: the own
+    // player's block carrying it reports the score for the death screen.
+    let (stream, _outgoing) = duplex(stream_with(&[
+        join_game_frame(),
+        entity_metadata_frame(20, &[(18, 2, meta_int(7))]),
+    ]));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    Session::new(Conn::new(stream), config())
+        .run_over(&sender, silent_inputs())
+        .expect("the session runs to the end of the stream");
+    let events: Vec<ClientEvent> = receiver.try_iter().collect();
+    assert!(
+        events.contains(&ClientEvent::Score { score: 7 }),
+        "the score 7 arrives: {events:?}"
+    );
+}
+
+#[test]
+fn the_leave_bed_input_sends_stop_sleeping() {
+    // The sleep cover's Leave Bed button and Escape send C0B carrying action
+    // 2 (`EntityAction::StopSleeping`, `C0BPacketEntityAction`).
+    let head = feed_head(&[]);
+    let (_events, frames) = flip_session(head, Vec::new(), 8, 0, vec![(2, InputEvent::LeaveBed)]);
+    let leaves: Vec<Vec<u8>> = frames
+        .iter()
+        .filter(|frame| frame[0] == 0x0b)
+        .cloned()
+        .collect();
+    assert_eq!(
+        leaves,
+        vec![vec![0x0b, 0x14, 0x02, 0x00]],
+        "one C0B for entity 20 carrying action 2: {frames:?}"
+    );
 }

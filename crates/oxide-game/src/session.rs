@@ -60,7 +60,7 @@ use oxide_proto_v47::entity::{
     self, Animation, AttachEntity, CollectItem, DestroyEntities, EntityEquipment, EntityHeadLook,
     EntityLook, EntityLookAndRelativeMove, EntityMetadata, EntityRelativeMove, EntityTeleport,
     EntityVelocity, MetadataItem, MetadataValue, MobType, ObjectType, SpawnMob, SpawnObject,
-    SpawnPainting, SpawnPlayer, SpawnXpOrb,
+    SpawnPainting, SpawnPlayer, SpawnXpOrb, UseBed,
 };
 use oxide_proto_v47::handshake::write_handshake;
 use oxide_proto_v47::serverbound::{
@@ -161,6 +161,15 @@ const AIR_METADATA_INDEX: u8 = 1;
 /// The own player's metadata index the absorption rides
 /// (`EntityPlayer.java:200, :2350-2356`: index 17 of the own block, a float).
 const ABSORPTION_METADATA_INDEX: u8 = 17;
+
+/// The own player's metadata index the score rides
+/// (`EntityPlayer.getScore:688-691` reads index 18 of the own block, an int).
+const SCORE_METADATA_INDEX: u8 = 18;
+
+/// The bed block's id: the camera's sleeping branch reads the block at the
+/// entity and applies the facing turn only for this id
+/// (`EntityRenderer.java:650-655`).
+const BED_BLOCK_ID: u16 = 26;
 
 /// The brand payload, as the capture records the vanilla client sending it: a
 /// length-prefixed `vanilla`.
@@ -479,6 +488,17 @@ pub enum ClientEvent {
         /// Level type, for example `default`.
         level_type: String,
     },
+    /// The first Player Position And Look landed after the join or a
+    /// world-rebuilding respawn: the terrain screen's clear signal.
+    ///
+    /// Reported once per arming — the join arms it, a cross-dimension
+    /// respawn re-arms it — when the S08 the source clears
+    /// `GuiDownloadTerrain` on arrives
+    /// (`NetHandlerPlayClient.handlePlayerPosLook:719-726` flips
+    /// `doneLoadingTerrain` false→true beside `displayGuiScreen(null)`).
+    /// Later S08 packets are ordinary corrections and report nothing of
+    /// this kind.
+    TerrainReady,
     /// The session ticked the player: the state one 20 Hz step leaves.
     ///
     /// Reported every tick, and immediately — with `snapped: true` — when a
@@ -622,6 +642,32 @@ pub enum ClientEvent {
         /// The gamemode, as Join Game carries it.
         gamemode: u8,
     },
+    /// The own player fell asleep in a bed, from clientbound 0x0A.
+    ///
+    /// Reported once per sleep — a repeated bed packet for the already
+    /// sleeping player answers nothing — when the S0A naming the own
+    /// player arrives (`NetHandlerPlayClient.handleUseBed:903-907` runs
+    /// `trySleep`, which sets `sleeping` with `sleepTimer = 0`,
+    /// `EntityPlayer.java:1568-1571`). The bed's facing rides along for the
+    /// camera's rise; a bed for another player answers nothing.
+    Sleeping {
+        /// The bed head's world x.
+        x: i32,
+        /// The bed head's world y.
+        y: i32,
+        /// The bed head's world z.
+        z: i32,
+        /// The bed's facing quarter-turn, `meta & 3` at the head (south 0,
+        /// west 1, north 2, east 3) — south when the map holds no bed there.
+        facing: u8,
+    },
+    /// The own player woke, from clientbound 0x0B's animation 2.
+    ///
+    /// Reported once, when the wake animation names the sleeping own
+    /// player (`NetHandlerPlayClient.handleAnimation:882-885`); a wake
+    /// with no sleep behind it answers nothing. The window's sleep timer
+    /// fades 100→110 on it.
+    Woke,
     /// The aimed block changed.
     ///
     /// The session recomputes the aim after look input and on every tick —
@@ -839,6 +885,16 @@ pub enum ClientEvent {
     Absorption {
         /// The absorption in half-hearts, as the server sent it.
         amount: f32,
+    },
+    /// The own player's score, from clientbound 0x1C's metadata index 18.
+    ///
+    /// The score rides the own player's metadata block as an int
+    /// (`EntityPlayer.getScore` reads DataWatcher 18,
+    /// `EntityPlayer.java:688-691`) and feeds the death screen's score line
+    /// (`GuiGameOver.drawScreen:120`); the window keeps the last one it saw.
+    Score {
+        /// The score, as the server sent it.
+        score: i32,
     },
     /// The own player's live effects, after an addition or a removal
     /// (clientbound 0x1D and 0x1E).
@@ -1336,6 +1392,12 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         // then (`MOUSE_SENSITIVITY`). The invert flag rides beside it.
         let mut sensitivity = MOUSE_SENSITIVITY;
         let mut invert_mouse = false;
+        // The terrain screen's arming: the join sets it and the first
+        // Player Position And Look clears it with one `TerrainReady`;
+        // a cross-dimension respawn re-arms it (`handleRespawn:1062-1068`
+        // re-shows `GuiDownloadTerrain` beside the rebuild, `handlePlayerPosLook:719-726`
+        // clears it on the first S08 after).
+        let mut terrain_pending = false;
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -1521,6 +1583,28 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     })?;
                                     send_reply(&mut conn, &request)?;
                                 }
+                                InputEvent::LeaveBed => {
+                                    // The sleep cover's leave: the Escape key
+                                    // and the Leave Bed button both send C0B
+                                    // carrying action 2
+                                    // (`GuiSleepMP.keyTyped:51-67` reaching
+                                    // `C0BPacketEntityAction` with
+                                    // `STOP_SLEEPING`). Before the join names
+                                    // the id there is nothing to send.
+                                    if let Some(entity_id) = player.entity_id {
+                                        let request = payload_of(|out| {
+                                            write_entity_action(
+                                                out,
+                                                entity_id,
+                                                EntityAction::StopSleeping,
+                                                0,
+                                            )
+                                        })?;
+                                        send_reply(&mut conn, &request)?;
+                                    } else {
+                                        debug!("a leave-bed names no joined player");
+                                    }
+                                }
                                 InputEvent::SetViewDistance { chunks } => {
                                     // The slider's own clamp is the store's
                                     // range (`VIEW_DISTANCE_RANGE`); an
@@ -1660,6 +1744,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     level_type: join.level_type,
                                 },
                             );
+                            // The join arms the terrain screen: the first
+                            // S08 after it reports `TerrainReady`.
+                            terrain_pending = true;
                         }
                         ChatMessage::ID => {
                             let message = decoded(id, ChatMessage::decode(body))?;
@@ -1833,6 +1920,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // at once.
                                 report_list_change(&player_list, &list_before, events);
                                 report(events, ClientEvent::WorldCleared);
+                                // The rebuild re-arms the terrain screen: the
+                                // next S08 reports `TerrainReady`.
+                                terrain_pending = true;
                             }
                             dimension = respawned;
                             // The gamemode the reach reads, restated by the
@@ -1924,6 +2014,14 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 )
                             })?;
                             send_reply(&mut conn, &echo)?;
+                            // The first S08 after the join or a
+                            // world-rebuilding respawn clears the terrain
+                            // screen (`handlePlayerPosLook:719-726`); later
+                            // S08 packets are ordinary corrections.
+                            if terrain_pending {
+                                report(events, ClientEvent::TerrainReady);
+                                terrain_pending = false;
+                            }
                             // The correction settles at once: the window resets its interpolation
                             // on a snapped tick rather than sliding to the pose.
                             report(events, player_tick(&player, true));
@@ -2263,12 +2361,44 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 equipment.item,
                             );
                         }
+                        UseBed::ID => {
+                            let bed = decoded(id, entity::decode_use_bed(body))?;
+                            // The bed: `handleUseBed:903-907` runs `trySleep`
+                            // on the named player, which sets `sleeping`
+                            // with `sleepTimer = 0`
+                            // (`EntityPlayer.java:1568-1571`). A repeated
+                            // bed for the already sleeping player answers
+                            // nothing, and a bed for another player answers
+                            // nothing here.
+                            if Some(bed.entity_id) == player.entity_id && !player.sleeping {
+                                player.sleeping = true;
+                                // The facing the camera's sleeping branch
+                                // turns by: the head block's low two bits
+                                // (`BlockBed.getDirectionFromMetadata`), south
+                                // when the map holds no bed at the head.
+                                let facing = world
+                                    .as_ref()
+                                    .map(|world| world.block(bed.x, bed.y, bed.z))
+                                    .filter(|packed| block_id_of(*packed) == BED_BLOCK_ID)
+                                    .map(|packed| block_meta_of(packed) & 3)
+                                    .unwrap_or(0);
+                                report(
+                                    events,
+                                    ClientEvent::Sleeping {
+                                        x: bed.x,
+                                        y: bed.y,
+                                        z: bed.z,
+                                        facing,
+                                    },
+                                );
+                            }
+                        }
                         Animation::ID => {
                             let animation = decoded(id, entity::decode_animation(body))?;
                             // The swing (byte 0) moves an arm the source's
-                            // handler answers; bytes 1 and 2 are answered
-                            // source-side (hurt, wake) but unmodeled here —
-                            // owned elsewhere — byte 3 is dropped on both
+                            // handler answers; byte 1 is the hurt the status
+                            // packet already stages, byte 2 is the wake
+                            // answered below, byte 3 is dropped on both
                             // sides, and the crits (bytes 4 and 5) run the
                             // shared emitter below
                             // (`NetHandlerPlayClient.handleAnimation:867-894`).
@@ -2279,6 +2409,16 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 if let Some(entity) = entities.get_mut(animation.entity_id) {
                                     entity.swing();
                                 }
+                            } else if animation.animation == 2
+                                && Some(animation.entity_id) == player.entity_id
+                                && player.sleeping
+                            {
+                                // The wake: animation 2 on the sleeping own
+                                // player (`handleAnimation:882-885` wakes it).
+                                // A wake with no sleep behind it answers
+                                // nothing.
+                                player.sleeping = false;
+                                report(events, ClientEvent::Woke);
                             } else if let Some(particle) =
                                 crit_id_for_animation(animation.animation)
                             {
@@ -2553,6 +2693,11 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                                 events,
                                                 ClientEvent::Absorption { amount: *amount },
                                             );
+                                        }
+                                    }
+                                    if *index == SCORE_METADATA_INDEX {
+                                        if let MetadataValue::Int(score) = value {
+                                            report(events, ClientEvent::Score { score: *score });
                                         }
                                     }
                                 }
@@ -3558,6 +3703,7 @@ fn apply_input(
         | InputEvent::UpdateSign { .. }
         | InputEvent::HeldItemChange { .. }
         | InputEvent::OpenInventory
+        | InputEvent::LeaveBed
         | InputEvent::SetViewDistance { .. }
         | InputEvent::PushSettings(_)
         | InputEvent::SetParticleSetting { .. }

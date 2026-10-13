@@ -59,6 +59,10 @@ use oxide_client::items::ItemTable;
 use oxide_client::keymap;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
+use oxide_client::screens::end_states::{
+    confirm_labels, death_labels, disconnect_button_label, disconnect_title, sleep_tick,
+    terrain_line,
+};
 use oxide_client::screens::family_b;
 use oxide_client::screens::menu::{MenuAction, menu_labels};
 use oxide_client::screens::multiplayer::{
@@ -135,25 +139,6 @@ const MAX_FRAMES_VAR: &str = "OXIDECRAFT_MAX_FRAMES";
 
 /// How many sections one column has.
 const SECTIONS_PER_COLUMN: u8 = 16;
-
-/// The interim death view's frame dim.
-///
-/// The first stop of the source's death-screen gradient:
-/// `GuiGameOver.drawScreen` fills `drawGradientRect(0, 0, width, height,
-/// 1615855616, -1602211792)`, and `1615855616` is `0x60500000` — alpha 96,
-/// red 80, green and blue zero. The one flat quad is this milestone's
-/// stand-in for the two-stop gradient; the bytes are written as the client's
-/// own no-transfer-function floats.
-const DEATH_DIM: [f32; 4] = [80.0 / 255.0, 0.0, 0.0, 96.0 / 255.0];
-
-/// The interim death view's title, the source's `deathScreen.title` string.
-const DEATH_TITLE: &str = "You died!";
-
-/// The interim death view's prompt, the source's `deathScreen.respawn` string.
-///
-/// A click or Space is answered with one client-status respawn request, and
-/// the server's clientbound 0x07 clears the view.
-const DEATH_RESPAWN: &str = "Respawn";
 
 /// The command line.
 #[derive(Parser)]
@@ -1033,10 +1018,26 @@ struct ClientApp {
     advanced_tooltips: bool,
     /// Whether the session last reported the player dead.
     ///
-    /// While it holds, the frame draws the interim death view — the dim quad
-    /// and the two lines — instead of the debug overlay, and the session
-    /// answers clicks and Space with respawn requests.
+    /// While it holds, the death screen stands (re-raised every tick the
+    /// player stays dead), the frame keeps the death camera terms, and the
+    /// session answers clicks and Space with respawn requests.
     dead: bool,
+    /// Whether the own player is asleep in a bed, from clientbound 0x0A
+    /// until the animation-2 wake: the chat cover stands, the Leave Bed
+    /// button draws, Escape sends the leave, and the frame darkens and
+    /// raises the camera on the timer below.
+    sleeping: bool,
+    /// The sleep timer: 0→100 while asleep, then the 100→110 fade after
+    /// the wake (`EntityPlayer.java`:304-329) — the darkening's own input,
+    /// tick-fed on the session's tick.
+    sleep_timer: u32,
+    /// The bed's facing quarter-turn (`meta & 3` at the head, south 0)
+    /// the sleeping camera turns by.
+    sleep_facing: u8,
+    /// Whether the chat cover standing is the sleep's own: the wake's fade
+    /// closes it once the timer lands back at nothing — a chat the player
+    /// opened themselves stays open.
+    sleep_cover: bool,
     /// The overlay pass's own inputs: the latest aim the session reported and
     /// the live destroy stages.
     ///
@@ -1531,6 +1532,54 @@ fn system_time_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Runs one capture step's window half: the grab or the release, with the
+/// step's own input send. The exit arm never reaches this fold. The frame's
+/// event folds call this directly — beside the renderer borrow, where the
+/// `&mut self` capture entry cannot run.
+fn apply_capture_step(
+    window: Option<&Arc<Window>>,
+    session: Option<&SessionLink>,
+    capture: &mut Capture,
+    step: CaptureStep,
+) {
+    match step {
+        CaptureStep::Consumed => {}
+        CaptureStep::Grab => {
+            let Some(window) = window else { return };
+            let grab = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            match grab {
+                Ok(()) => {
+                    window.set_cursor_visible(false);
+                    tracing::info!("the pointer was grabbed");
+                }
+                Err(error) => {
+                    *capture = Capture::default();
+                    tracing::warn!(%error, "the pointer could not be grabbed");
+                }
+            }
+        }
+        CaptureStep::Release => {
+            if let Some(window) = window {
+                if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                    tracing::warn!(%error, "the pointer could not be released");
+                }
+                window.set_cursor_visible(true);
+            }
+            if let Some(input) = step.input() {
+                if let Some(session) = session {
+                    if session.input_tx.send(input).is_err() {
+                        tracing::warn!("the session's input channel is closed");
+                    }
+                }
+            }
+            tracing::info!("the pointer was released and the held keys were cleared");
+        }
+        CaptureStep::Exit => {}
+    }
+}
+
 impl ClientApp {
     /// Builds the handler, reads the smoke-run frame limit, loads the assets when a session
     /// was asked for, and opens the session. Without a server the pre-session load is
@@ -1714,6 +1763,10 @@ impl ClientApp {
             f3_held: false,
             advanced_tooltips: false,
             dead: false,
+            sleeping: false,
+            sleep_timer: 0,
+            sleep_facing: 0,
+            sleep_cover: false,
             capture: Capture::default(),
             screens: Screens::default(),
             creative: false,
@@ -1858,6 +1911,9 @@ impl ClientApp {
             return;
         };
         let mut session_ended = false;
+        // The wire's disconnect reason, stashed for the disconnect screen
+        // the session's end stands below.
+        let mut disconnect_reason: Option<String> = None;
         // A scripted chat-screen press waits for the loop: the field's owner
         // runs it once the frame's events are in, through the window's own
         // click.
@@ -1881,6 +1937,38 @@ impl ClientApp {
                 ClientEvent::HeldItemSlot { slot } => {
                     self.held = *slot;
                 }
+                // The bed use stands the sleep cover: the timer resets, the bed
+                // facing sticks for the camera rise, and the chat opens over the
+                // run (`Minecraft.runTick:1777-1784` stands `GuiSleepMP`, which
+                // extends the chat). The pointer frees like any other screen
+                // open.
+                ClientEvent::Sleeping { facing, .. } => {
+                    self.sleeping = true;
+                    self.sleep_timer = 0;
+                    self.sleep_facing = *facing;
+                    self.sleep_cover = true;
+                    self.chat_input.open("");
+                    self.chat.set_open(true);
+                    self.tab.open = false;
+                    self.cursor = None;
+                    let step = self.capture.chat_open();
+                    apply_capture_step(
+                        Some(window),
+                        self.session.as_ref(),
+                        &mut self.capture,
+                        step,
+                    );
+                }
+                // The wake starts the 100→110 fade: the cover drops when the
+                // timer runs out on the tick below.
+                ClientEvent::Woke => {
+                    self.sleeping = false;
+                }
+                // The wire's disconnect stashes its reason: the session's end
+                // below stands the disconnect screen on it.
+                ClientEvent::Disconnected { reason } => {
+                    disconnect_reason = Some(reason.clone());
+                }
                 _ => {}
             }
             // The screens fold the window's own events — a free function, so
@@ -1894,6 +1982,9 @@ impl ClientApp {
                 &mut self.capture,
                 self.window.as_ref(),
                 self.session.as_ref(),
+                renderer.scaled_resolution(),
+                self.font.as_ref(),
+                self.assets.as_ref().map(|assets| &assets.lang),
                 &event,
             ) {
                 // Inline `send_input`: the renderer stays mutably borrowed
@@ -1992,6 +2083,58 @@ impl ClientApp {
                 // runs from `updateScreen` (`GuiEditSign.java`:68-71). The
                 // fold no-ops with no sign open.
                 self.screens.tick_sign();
+                // The death screen's button gate steps on the same tick, and
+                // the screen re-raises while the player stays dead
+                // (`Minecraft.runTick:1771-1775` stands `GuiGameOver` while
+                // no screen is current).
+                self.screens.tick_death();
+                if self.dead && self.font.is_some() {
+                    let scaled = renderer.scaled_resolution();
+                    let language = self.assets.as_ref().map(|assets| &assets.lang);
+                    let score = self.screens.death_score();
+                    self.screens.note_score(score);
+                    self.screens.ensure_death(&scaled, &death_labels(language));
+                }
+                // The sleep timer steps on the same tick: 0→100 while asleep,
+                // the 100→110 fade after the wake
+                // (`EntityPlayer.onUpdate:1562-1575`).
+                if self.sleeping || self.sleep_timer != 0 {
+                    let was = self.sleep_timer;
+                    self.sleep_timer = sleep_tick(self.sleeping, was);
+                    if self.sleeping && !self.chat_input.open {
+                        // The cover re-raises while asleep
+                        // (`Minecraft.runTick:1777-1784` stands the sleep
+                        // screen while none is current): the chat opens again
+                        // and the pointer frees.
+                        self.chat_input.open("");
+                        self.chat.set_open(true);
+                        self.tab.open = false;
+                        self.cursor = None;
+                        let step = self.capture.chat_open();
+                        apply_capture_step(
+                            Some(window),
+                            self.session.as_ref(),
+                            &mut self.capture,
+                            step,
+                        );
+                    }
+                    if !self.sleeping && self.sleep_timer == 0 && was != 0 && self.sleep_cover {
+                        // The fade ran out: the cover drops and the pointer
+                        // recaptures.
+                        self.sleep_cover = false;
+                        self.chat_input.close();
+                        self.chat.set_open(false);
+                        self.chat.reset_scroll();
+                        self.cursor = None;
+                        let step = self.capture.chat_close();
+                        apply_capture_step(
+                            Some(window),
+                            self.session.as_ref(),
+                            &mut self.capture,
+                            step,
+                        );
+                    }
+                }
                 self.camera.observe(CameraTick {
                     position: [*x, *y, *z],
                     on_ground: *on_ground,
@@ -2058,22 +2201,78 @@ impl ClientApp {
             );
         }
         if session_ended {
-            // Disconnect-to-title stands the main menu: the standing rule
-            // only — the disconnect screen with the reason is later work,
-            // and its title button calls the same open. The link drops, the
-            // join flag clears, and the frame below stands and draws the
-            // menu like a sessionless startup.
-            tracing::info!("the session ended, standing the main menu");
+            // The run's own flags die with the session: the dead flag, the
+            // sleep state and the cover it opened. The cover's chat closes
+            // and the pointer recaptures. The link drops and the join flag
+            // clears either way.
+            tracing::info!("the session ended");
             self.session = None;
             self.joined = false;
             self.dead = false;
-            if let Some(assets) = self.assets.as_ref() {
-                self.screens.on_disconnected(
-                    renderer.scaled_resolution(),
-                    &assets.splash_lines,
-                    self.menu_seed,
-                    menu_labels(Some(&assets.lang)),
-                );
+            self.sleeping = false;
+            self.sleep_timer = 0;
+            if self.sleep_cover {
+                self.sleep_cover = false;
+                self.chat_input.close();
+                self.chat.set_open(false);
+                self.chat.reset_scroll();
+                self.cursor = None;
+                let step = self.capture.chat_close();
+                apply_capture_step(Some(window), self.session.as_ref(), &mut self.capture, step);
+            }
+            match disconnect_reason {
+                // The wire's disconnect stands the disconnect screen on the
+                // stashed reason first
+                // (`NetHandlerPlayClient.onDisconnect` stands
+                // `GuiDisconnected` on `disconnect.lost`); its Back button
+                // answers the server list below.
+                Some(reason) => match self.font.as_ref() {
+                    Some(font) => {
+                        let scaled = renderer.scaled_resolution();
+                        let language = self.assets.as_ref().map(|assets| &assets.lang);
+                        self.screens.open_disconnected(
+                            &scaled,
+                            disconnect_title(language),
+                            reason,
+                            font,
+                            disconnect_button_label(language),
+                        );
+                        self.tab.open = false;
+                        self.cursor = None;
+                        let step = self.capture.chat_open();
+                        apply_capture_step(
+                            Some(window),
+                            self.session.as_ref(),
+                            &mut self.capture,
+                            step,
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            "disconnect arrived with no measured font; falling back to the menu"
+                        );
+                        if let Some(assets) = self.assets.as_ref() {
+                            self.screens.on_disconnected(
+                                renderer.scaled_resolution(),
+                                &assets.splash_lines,
+                                self.menu_seed,
+                                menu_labels(Some(&assets.lang)),
+                            );
+                        }
+                    }
+                },
+                // The pause menu's own Disconnect ends the session by
+                // request: the menu stands as before.
+                None => {
+                    if let Some(assets) = self.assets.as_ref() {
+                        self.screens.on_disconnected(
+                            renderer.scaled_resolution(),
+                            &assets.splash_lines,
+                            self.menu_seed,
+                            menu_labels(Some(&assets.lang)),
+                        );
+                    }
+                }
             }
         }
         if script_click {
@@ -2081,11 +2280,17 @@ impl ClientApp {
             // same hit-test and actions as the window's own click, through
             // the pieces the draw can lend while the renderer is borrowed.
             let scaled = renderer.scaled_resolution();
+            let settings = self.settings.settings();
             scripted_chat_click(
                 &mut self.chat,
+                &mut self.screens,
                 &mut self.chat_input,
                 self.cursor,
                 Some(scaled),
+                self.font.as_ref(),
+                self.assets.as_ref().map(|assets| &assets.lang),
+                settings.chat_links,
+                settings.chat_links_prompt,
                 self.session.as_ref(),
             );
         }
@@ -2227,7 +2432,11 @@ impl ClientApp {
         view::reconcile_chat_open(&mut self.chat, &self.chat_input);
         let scaled = renderer.scaled_resolution();
         self.chat.feed_hover(
-            tooltip_point(self.chat_input.open, self.chat.confirm_open(), self.cursor),
+            tooltip_point(
+                self.chat_input.open,
+                self.screens.confirm_open(),
+                self.cursor,
+            ),
             scaled,
         );
         // The screen's frame: the panel centres in the scaled size and the free
@@ -2418,13 +2627,10 @@ impl ClientApp {
                 now_ms: system_time_ms(),
             },
         ));
-        // The death view replaces the debug overlay while the player is dead:
-        // the dim quad over the scene and the two lines where the overlay's
-        // text goes. Both are cleared when the respawn arrives.
-        if self.dead {
-            renderer.set_dim(Some(DEATH_DIM));
-            renderer.set_overlay_lines(vec![DEATH_TITLE.to_string(), DEATH_RESPAWN.to_string()]);
-        } else {
+        // The debug overlay's text goes while the player is alive. The dead
+        // frame carries no overlay lines of its own: the death screen stands
+        // above it.
+        if !self.dead {
             renderer.set_dim(None);
             renderer.set_overlay_lines(if self.overlay_visible {
                 debug_lines(&self.hud)
@@ -2525,11 +2731,13 @@ impl ClientApp {
             }
             match escape_route(
                 self.chat_input.open,
-                self.chat.confirm_open(),
+                self.screens.confirm_open(),
                 self.screens.is_open(),
                 &mut self.capture,
             ) {
-                EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
+                EscapeRoute::CancelConfirm => {
+                    self.screens.cancel_confirm();
+                }
                 EscapeRoute::CloseChat => self.close_chat(event_loop),
                 EscapeRoute::CloseScreen => self.close_screen(event_loop),
                 EscapeRoute::Capture(step) => self.escape_capture(event_loop, step),
@@ -2539,7 +2747,7 @@ impl ClientApp {
         // The confirm overlay is the top screen while it stands in for the
         // chat: its own keys are the only ones it answers, and the field
         // beneath takes nothing.
-        if self.chat.confirm_open() {
+        if self.screens.confirm_open() {
             self.on_confirm_key(event.state, event.physical_key);
             return;
         }
@@ -2733,52 +2941,21 @@ impl ClientApp {
         capture: &mut Capture,
         window: Option<&Arc<Window>>,
         session: Option<&SessionLink>,
+        scaled: ScaledResolution,
+        font: Option<&Font>,
+        language: Option<&LanguageTable>,
         event: &ClientEvent,
     ) -> Option<InputEvent> {
-        /// Runs one capture step's window half: the grab or the release, with
-        /// the step's own input send. The exit arm never reaches this fold.
+        /// Runs one capture step's window half through the shared fold: the
+        /// grab or the release, with the step's own input send. The exit arm
+        /// never reaches this fold.
         fn apply_step(
             window: Option<&Arc<Window>>,
             session: Option<&SessionLink>,
             capture: &mut Capture,
             step: CaptureStep,
         ) {
-            match step {
-                CaptureStep::Consumed => {}
-                CaptureStep::Grab => {
-                    let Some(window) = window else { return };
-                    let grab = window
-                        .set_cursor_grab(CursorGrabMode::Locked)
-                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-                    match grab {
-                        Ok(()) => {
-                            window.set_cursor_visible(false);
-                            tracing::info!("the pointer was grabbed");
-                        }
-                        Err(error) => {
-                            *capture = Capture::default();
-                            tracing::warn!(%error, "the pointer could not be grabbed");
-                        }
-                    }
-                }
-                CaptureStep::Release => {
-                    if let Some(window) = window {
-                        if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
-                            tracing::warn!(%error, "the pointer could not be released");
-                        }
-                        window.set_cursor_visible(true);
-                    }
-                    if let Some(input) = step.input() {
-                        if let Some(session) = session {
-                            if session.input_tx.send(input).is_err() {
-                                tracing::warn!("the session's input channel is closed");
-                            }
-                        }
-                    }
-                    tracing::info!("the pointer was released and the held keys were cleared");
-                }
-                CaptureStep::Exit => {}
-            }
+            apply_capture_step(window, session, capture, step);
         }
         match event {
             ClientEvent::WindowOpened {
@@ -2842,6 +3019,73 @@ impl ClientApp {
             // next open stands on four empty lines.
             ClientEvent::SignTextCleared { x, y, z } => {
                 screens.forget_sign_text(*x, *y, *z);
+                None
+            }
+            // The join stands the terrain screen: the session rebuilds the
+            // world and only the first S08 clears it again
+            // (`NetHandlerPlayClient.handleJoinGame:335-351` reaches
+            // `displayGuiScreen(new GuiDownloadTerrain(null))`). The pointer
+            // frees like any other screen open.
+            ClientEvent::Joined { .. } => {
+                screens.open_terrain(&scaled, terrain_line(language));
+                tab.open = false;
+                *cursor = None;
+                let step = capture.chat_open();
+                apply_step(window, session, capture, step);
+                None
+            }
+            // The cross-dimension respawn rebuilds the world like a join:
+            // the terrain screen re-arms until the next S08
+            // (`handleRespawn:1074-1105` swaps the world and re-fires the
+            // terrain wait).
+            ClientEvent::WorldCleared => {
+                screens.open_terrain(&scaled, terrain_line(language));
+                tab.open = false;
+                *cursor = None;
+                let step = capture.chat_open();
+                apply_step(window, session, capture, step);
+                None
+            }
+            // The first S08 clears the terrain screen once
+            // (`NetHandlerPlayClient.handlePlayerPosLook:727-743` calls
+            // `doneLoadingTerrain`).
+            ClientEvent::TerrainReady => {
+                screens.close_terrain();
+                None
+            }
+            // The death stands the death screen over the run it ended, on
+            // the stored score (`Minecraft.displayGuiScreen(new
+            // GuiGameOver())` once `thePlayer.getHealth() <= 0.0F`,
+            // :1771-1775). The pointer frees like any other screen open.
+            // Without measured session assets there is no font to stand
+            // the screen on, and the death waits for the next frame.
+            ClientEvent::Died => {
+                match font {
+                    Some(_) => {
+                        let score = screens.death_score();
+                        screens.open_death(&scaled, &death_labels(language), score);
+                        tab.open = false;
+                        *cursor = None;
+                        let step = capture.chat_open();
+                        apply_step(window, session, capture, step);
+                    }
+                    None => tracing::warn!(
+                        "death arrived with no measured font; the death screen stays down"
+                    ),
+                }
+                None
+            }
+            // The respawn drops the death screen: the player is alive again
+            // (`GuiGameOver.confirmClicked(false)` re-displays nothing and
+            // the run resumes).
+            ClientEvent::Respawned { .. } => {
+                screens.close_death();
+                None
+            }
+            // The own score arrives on metadata 18 before the death does:
+            // the window keeps the last one for the death screen's line.
+            ClientEvent::Score { score } => {
+                screens.note_score(*score);
                 None
             }
             // The server's edit request stands the editor on the block: the
@@ -4397,11 +4641,13 @@ impl ClientApp {
                 } else {
                     match escape_route(
                         self.chat_input.open,
-                        self.chat.confirm_open(),
+                        self.screens.confirm_open(),
                         self.screens.is_open(),
                         &mut self.capture,
                     ) {
-                        EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
+                        EscapeRoute::CancelConfirm => {
+                            self.screens.cancel_confirm();
+                        }
                         EscapeRoute::CloseChat => self.close_chat(event_loop),
                         EscapeRoute::CloseScreen => self.close_screen(event_loop),
                         EscapeRoute::Capture(step) => self.escape_capture(event_loop, step),
@@ -4570,18 +4816,23 @@ impl ClientApp {
 
     /// Routes one key event to the confirm overlay — the only keys it has.
     ///
-    /// Enter opens the link: the overlay's URL goes through the opener exactly
-    /// once, and the overlay ends, returning to the chat screen it replaced
+    /// Enter opens the link: the confirm's URL goes through the opener exactly
+    /// once, and the confirm ends, returning to the chat screen it replaced
     /// (`GuiScreen.confirmClicked`:713-719's true answer opens the link and
     /// re-displays the chat). Escape is the cancel and is routed by
-    /// [`escape_route`] before this; every other key is the overlay's own to
+    /// [`escape_route`] before this; every other key is the screen's own to
     /// ignore.
     fn on_confirm_key(&mut self, state: ElementState, physical_key: PhysicalKey) {
         if !is_enter_press(state, physical_key) {
             return;
         }
-        if let Some(url) = self.chat.take_confirm() {
-            (self.opener)(&url);
+        let link = self
+            .screens
+            .confirm_mut()
+            .map(|screen| screen.link().to_owned());
+        if let Some(link) = link {
+            self.screens.cancel_confirm();
+            (self.opener)(&link);
         }
     }
 
@@ -4609,7 +4860,7 @@ impl ClientApp {
     /// Acts on one click event — `GuiScreen.handleComponentClick`:445-452 for the
     /// commands, `:403-433` for the link: a run command is sent through the
     /// session's chat path, a suggest command overwrites the field's text, and
-    /// a link raises the confirm overlay that asks.
+    /// a link raises the confirm screen that asks.
     fn apply_chat_click(&mut self, click: &ClickEvent) {
         match &click.action {
             ClickAction::RunCommand => {
@@ -4621,9 +4872,40 @@ impl ClientApp {
                 self.chat_input.set_text(&click.value);
             }
             ClickAction::OpenUrl => {
-                self.chat.open_confirm(&click.value);
+                self.raise_link_confirm(&click.value);
             }
         }
+    }
+
+    /// Raises the link confirm over the chat: the link click's own screen
+    /// (`GuiScreen.handleComponentClick:403-433` swaps in
+    /// `GuiConfirmOpenLink`). With the prompt off the link opens straight
+    /// through the opener and no screen stands; with links off the click
+    /// dies. The confirm replaces the chat screen, and its close returns to
+    /// the chat beneath.
+    fn raise_link_confirm(&mut self, link: &str) {
+        let settings = self.settings.settings();
+        if !settings.chat_links {
+            return;
+        }
+        if !settings.chat_links_prompt {
+            (self.opener)(link);
+            return;
+        }
+        let (Some(renderer), Some(font)) = (self.renderer.as_ref(), self.font.as_ref()) else {
+            tracing::warn!("a link click arrived with no renderer or font; the confirm stays down");
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let language = self.assets.as_ref().map(|assets| &assets.lang);
+        self.screens.open_confirm(
+            &scaled,
+            link.to_owned(),
+            font,
+            &confirm_labels(language),
+            false,
+        );
+        self.cursor = None;
     }
 
     /// Routes one mouse button event: the click that grabs, or the gameplay
@@ -4749,7 +5031,7 @@ impl ClientApp {
             // milestone; otherwise the press hit-tests the box's runs —
             // `GuiChat.mouseClicked`:172-186 — and acts on the one under the
             // free pointer.
-            if state == ElementState::Pressed && !self.chat.confirm_open() {
+            if state == ElementState::Pressed && !self.screens.confirm_open() {
                 self.chat_click();
             }
             return;
@@ -5546,10 +5828,10 @@ fn apply_session_event(
             false
         }
         ClientEvent::Died => {
-            // The death view goes up: the dim quad and the two lines, drawn
-            // from the next frame until the respawn clears them. The session
-            // has already gated the input and cancelled the dig.
-            tracing::info!("the player died; the death view is up");
+            // The dead flag rises: the screens fold above stands the death
+            // screen on it, and the frame keeps the death camera terms. The
+            // session has already gated the input and cancelled the dig.
+            tracing::info!("the player died; the death screen stands on the next fold");
             *dead = true;
             false
         }
@@ -5597,7 +5879,9 @@ fn apply_session_event(
         }
         // The window's own three ride here unconsumed: the screens fold above
         // owns them (open, server close, snapshot), and the HUD reads the
-        // rest.
+        // The end-state screens' events ride here unconsumed: the screens
+        // fold above owns the terrain, death and score folds, and the
+        // drain owns the sleep cover and the disconnect stash.
         ClientEvent::WindowOpened { .. }
         | ClientEvent::WindowClosed { .. }
         | ClientEvent::WindowSnapshot { .. }
@@ -5611,7 +5895,11 @@ fn apply_session_event(
         | ClientEvent::SignTextChanged { .. }
         | ClientEvent::SignTextCleared { .. }
         | ClientEvent::BookOpen { .. }
-        | ClientEvent::MerchantOffers { .. } => false,
+        | ClientEvent::MerchantOffers { .. }
+        | ClientEvent::TerrainReady
+        | ClientEvent::Sleeping { .. }
+        | ClientEvent::Woke
+        | ClientEvent::Score { .. } => false,
         ClientEvent::Particle { .. } | ClientEvent::GlobalEntity { .. } => {
             // The effect legs' remaining events; their sky, particle and
             // lightning consumers arrive with their own milestones, and the
@@ -5937,12 +6225,19 @@ fn is_enter_press(state: ElementState, physical_key: PhysicalKey) -> bool {
 /// The free pointer and the scaled resolution are both needed for the
 /// hit-test — no pointer, no click; no renderer, no scale — and the actions
 /// are the window's own: a run command leaves through the session, a suggest
-/// command overwrites the field's text and a link raises the confirm overlay.
+/// command overwrites the field's text and a link raises the confirm screen.
+/// The script owns no link opener, so a link with the prompt off ends here.
+#[allow(clippy::too_many_arguments)] // The click's own parts: the views, the input, the font and the scale.
 fn scripted_chat_click(
     chat: &mut view::ChatView,
+    screens: &mut Screens,
     chat_input: &mut ChatInput,
     cursor: Option<(f32, f32)>,
     scaled: Option<oxide_render::hud::ScaledResolution>,
+    font: Option<&Font>,
+    language: Option<&LanguageTable>,
+    chat_links: bool,
+    chat_links_prompt: bool,
     session: Option<&SessionLink>,
 ) {
     let (Some(point), Some(scaled)) = (cursor, scaled) else {
@@ -5963,7 +6258,24 @@ fn scripted_chat_click(
             }
         }
         ClickAction::SuggestCommand => chat_input.set_text(&click.value),
-        ClickAction::OpenUrl => chat.open_confirm(&click.value),
+        ClickAction::OpenUrl => {
+            if !chat_links {
+                return;
+            }
+            if !chat_links_prompt {
+                return;
+            }
+            let Some(font) = font else {
+                return;
+            };
+            screens.open_confirm(
+                &scaled,
+                click.value.clone(),
+                font,
+                &confirm_labels(language),
+                false,
+            );
+        }
     }
 }
 
@@ -6746,12 +7058,12 @@ mod tests {
 
     use super::{
         Aim, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli, ClickButton,
-        ClientApp, DEATH_DIM, DEATH_RESPAWN, DEATH_TITLE, Directive, DirectiveAction, EscapeRoute,
-        FogMode, ItemTable, Key, MouseButton, PlayerState, ScriptDriver, ScriptGesture, ScriptKey,
-        SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
-        WorldOverlayState, aim_outline, apply_overlay_event, bound_mouse_button, camera_pose,
-        chat_opener, chat_wheel_lines, clear_break_stage, command_text, cracks_in_view,
-        creative_wheel_notch, digit_slot, escape_route, f3_hold_step, frame_params, gameplay_key,
+        ClientApp, Directive, DirectiveAction, EscapeRoute, FogMode, ItemTable, Key, MouseButton,
+        PlayerState, Screens, ScriptDriver, ScriptGesture, ScriptKey, SessionLink, SkinRequest,
+        SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry, WorldOverlayState, aim_outline,
+        apply_overlay_event, bound_mouse_button, camera_pose, chat_opener, chat_wheel_lines,
+        clear_break_stage, command_text, confirm_labels, cracks_in_view, creative_wheel_notch,
+        death_labels, digit_slot, escape_route, f3_hold_step, frame_params, gameplay_key,
         interpolate_pose, inventory_opener, is_enter_press, is_escape_press, is_f3_press,
         is_h_press, load_sounds_bytes, local_sound_play, missing_uv, parse_script,
         parse_server_address, particle_draws, scaled_cursor, screen_button_events,
@@ -6766,6 +7078,7 @@ mod tests {
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
     use oxide_client::keymap;
+    use oxide_client::screens::end_states::DEATH_GRADIENT_TOP;
     use oxide_game::audio::{ListenerPose, PlaySound, SoundCategory};
     use oxide_game::chat::{ClickAction, ClickEvent};
     use oxide_game::container::{CLICK_MODE_DRAG, CLICK_MODE_PICKUP, CLICK_MODE_SWAP, drag_button};
@@ -9140,14 +9453,15 @@ mod tests {
         // (`drawGradientRect(0, 0, width, height, 1615855616, -1602211792)`):
         // `0x60500000` is alpha 96 over red 80, and the client's floats are
         // the byte values over 255, its no-transfer-function convention.
-        assert_eq!(DEATH_DIM[0], 80.0 / 255.0, "red 80");
-        assert_eq!(DEATH_DIM[1], 0.0, "green 0");
-        assert_eq!(DEATH_DIM[2], 0.0, "blue 0");
-        assert_eq!(DEATH_DIM[3], 96.0 / 255.0, "alpha 96");
+        assert_eq!(DEATH_GRADIENT_TOP[0], 80.0 / 255.0, "red 80");
+        assert_eq!(DEATH_GRADIENT_TOP[1], 0.0, "green 0");
+        assert_eq!(DEATH_GRADIENT_TOP[2], 0.0, "blue 0");
+        assert_eq!(DEATH_GRADIENT_TOP[3], 96.0 / 255.0, "alpha 96");
         // The two lines are the source's `deathScreen.title` and
         // `deathScreen.respawn` strings.
-        assert_eq!(DEATH_TITLE, "You died!");
-        assert_eq!(DEATH_RESPAWN, "Respawn");
+        let labels = death_labels(None);
+        assert_eq!(labels.title, "You died!");
+        assert_eq!(labels.respawn, "Respawn");
     }
 
     /// One tick's camera state at a position, with everything else quiet.
@@ -10300,6 +10614,26 @@ mod tests {
         ClientApp::new(cli).expect("the client builds without a server")
     }
 
+    /// Stands the link confirm on the synthetic font: the click's own raise
+    /// needs the renderer and the measured font, which the bare app holds
+    /// neither of, so the confirm tests stand the screen the click would
+    /// raise and pin its stored link and key contract.
+    fn stand_test_confirm(app: &mut ClientApp, link: &str) {
+        let font = click_font();
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 2,
+        };
+        app.screens.open_confirm(
+            &scaled,
+            link.to_owned(),
+            &font,
+            &confirm_labels(None),
+            false,
+        );
+    }
+
     #[test]
     fn the_confirm_keys_open_the_link_once_and_escape_cancels() {
         // The overlay's two keys: Enter takes the URL through the opener exactly
@@ -10320,24 +10654,24 @@ mod tests {
             "a release is no press"
         );
 
-        app.chat.open_confirm("https://a.example");
+        stand_test_confirm(&mut app, "https://a.example");
         app.on_confirm_key(ElementState::Pressed, enter);
         assert_eq!(seen.borrow().as_slice(), ["https://a.example".to_owned()]);
-        assert!(!app.chat.confirm_open(), "the open took the overlay");
+        assert!(!app.screens.confirm_open(), "the open took the overlay");
         app.on_confirm_key(ElementState::Pressed, enter);
         assert_eq!(seen.borrow().len(), 1, "nothing opens twice");
 
         // Escape: the route cancels first, and the Enter after it finds no
         // overlay — nothing opens in the escape's wake.
-        app.chat.open_confirm("https://b.example");
+        stand_test_confirm(&mut app, "https://b.example");
         let mut capture = Capture::default();
         assert_eq!(
             escape_route(true, true, false, &mut capture),
             EscapeRoute::CancelConfirm
         );
         assert!(!capture.grabbed(), "the escape itself touches nothing");
-        app.chat.cancel_confirm();
-        assert!(!app.chat.confirm_open());
+        app.screens.cancel_confirm();
+        assert!(!app.screens.confirm_open());
         app.on_confirm_key(ElementState::Pressed, enter);
         assert_eq!(seen.borrow().len(), 1, "zero opened by the escape path");
     }
@@ -10402,19 +10736,29 @@ mod tests {
     fn an_open_url_click_raises_the_confirm_overlay() {
         // `GuiScreen.java`:403-433: with the prompt on, the link is not opened
         // at the click — the click stores it as `clickedLinkURI` and raises the
-        // screen that asks; the Enter path takes it from there.
+        // screen that asks; the Enter path takes it from there. The click's
+        // raise needs the renderer and the measured font, which the bare app
+        // holds neither of, so the routed click stands nothing here and the
+        // test stands the screen the click would raise, then pins the stored
+        // link the Enter path opens.
         let mut app = test_app();
         app.apply_chat_click(&ClickEvent {
             action: ClickAction::OpenUrl,
             value: "https://a.example".into(),
         });
-        assert!(app.chat.confirm_open());
+        assert!(!app.screens.confirm_open(), "no renderer stands no confirm");
+        stand_test_confirm(&mut app, "https://a.example");
+        assert!(app.screens.confirm_open());
         assert_eq!(
-            app.chat.take_confirm().as_deref(),
+            app.screens
+                .confirm_mut()
+                .map(|screen| screen.link().to_owned())
+                .as_deref(),
             Some("https://a.example"),
             "the stored link the Enter path opens"
         );
-        assert!(!app.chat.confirm_open(), "taking it clears the overlay");
+        assert!(app.screens.cancel_confirm(), "taking it clears the overlay");
+        assert!(!app.screens.confirm_open(), "taking it clears the overlay");
     }
 
     #[test]
@@ -10465,14 +10809,14 @@ mod tests {
         let (opener, seen) = recording_opener();
         app.opener = opener;
         app.chat.observe("\"AA\"", 1, 0);
-        app.chat.open_confirm("https://a.example");
+        stand_test_confirm(&mut app, "https://a.example");
         app.chat_input.open("");
         app.apply_chat_click(&ClickEvent {
             action: ClickAction::OpenUrl,
             value: "https://b.example".into(),
         });
         assert_eq!(seen.borrow().len(), 0, "clicks never open links");
-        assert!(app.chat.confirm_open(), "the overlay stays up");
+        assert!(app.screens.confirm_open(), "the overlay stays up");
     }
 
     #[test]
@@ -10545,7 +10889,21 @@ mod tests {
             height: 240,
             scale_factor: 3,
         };
-        scripted_chat_click(&mut view, &mut chat, cursor, Some(scaled), Some(&link));
+        let font = click_font();
+        let mut confirm_screens = Screens::default();
+        let mut confirm_field = ChatInput::default();
+        scripted_chat_click(
+            &mut view,
+            &mut confirm_screens,
+            &mut confirm_field,
+            cursor,
+            Some(scaled),
+            Some(&font),
+            None,
+            true,
+            true,
+            Some(&link),
+        );
         assert_eq!(
             session_rx.try_recv().expect("the click's command leaves"),
             InputEvent::SendChat {

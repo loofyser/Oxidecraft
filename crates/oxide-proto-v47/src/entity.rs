@@ -1241,6 +1241,37 @@ pub fn decode_animation(body: &[u8]) -> Result<Animation, PacketError> {
     })
 }
 
+/// Clientbound Use Bed (play id 0x0A).
+///
+/// The sleeping player's entity id and the head part of the bed's position
+/// (`S0APacketUseBed.readPacketData`): the id as a VarInt, then the position
+/// as one Location Position long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UseBed {
+    /// The player falling asleep.
+    pub entity_id: i32,
+    /// The bed head's world x.
+    pub x: i32,
+    /// The bed head's world y.
+    pub y: i32,
+    /// The bed head's world z.
+    pub z: i32,
+}
+
+impl UseBed {
+    /// The packet id.
+    pub const ID: i32 = 0x0a;
+}
+
+/// Decodes the Use Bed payload after the packet id.
+pub fn decode_use_bed(body: &[u8]) -> Result<UseBed, PacketError> {
+    let mut cursor = Cursor::new(body);
+    let entity_id = read_varint(&mut cursor)?;
+    let (x, y, z) = read_position(&mut cursor)?;
+    check_no_trailing(&cursor, body.len())?;
+    Ok(UseBed { entity_id, x, y, z })
+}
+
 /// Clientbound Collect Item (play id 0x0D).
 ///
 /// One item pickup (`S0DPacketCollectItem.readPacketData:26-30`): the
