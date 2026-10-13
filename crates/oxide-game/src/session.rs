@@ -344,6 +344,7 @@ fn apply_session_push(
     graphics_fast: &mut bool,
     smooth_lighting: &mut SmoothLighting,
     sensitivity: &mut f32,
+    invert_mouse: &mut bool,
     particles: &mut ParticleEngine,
     push: &SessionPush,
 ) -> bool {
@@ -355,6 +356,7 @@ fn apply_session_push(
     *graphics_fast = push.graphics_fast;
     *smooth_lighting = smooth_lighting_of(push.smooth_lighting);
     *sensitivity = push.sensitivity.clamp(0.0, 1.0);
+    *invert_mouse = push.invert_mouse;
     particles.set_limit(push.particles);
     if next == *settings {
         return false;
@@ -1331,8 +1333,9 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let mut smooth_lighting = SMOOTH_LIGHTING;
         // The mouse sensitivity the look mapping runs with: the store's
         // value once the client pushes it, the option's own default until
-        // then (`MOUSE_SENSITIVITY`).
+        // then (`MOUSE_SENSITIVITY`). The invert flag rides beside it.
         let mut sensitivity = MOUSE_SENSITIVITY;
+        let mut invert_mouse = false;
 
         loop {
             // The window's input, drained up to a bound: nothing is dropped —
@@ -1356,6 +1359,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 &mut graphics_fast,
                                 &mut smooth_lighting,
                                 &mut sensitivity,
+                                &mut invert_mouse,
                                 &mut particles,
                                 push,
                             ) {
@@ -1544,8 +1548,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     }
                                 }
                                 other => {
-                                    looked |=
-                                        apply_input(other, &mut intent, &mut player, sensitivity);
+                                    looked |= apply_input(
+                                        other,
+                                        &mut intent,
+                                        &mut player,
+                                        sensitivity,
+                                        invert_mouse,
+                                    );
                                 }
                             }
                         }
@@ -3513,6 +3522,7 @@ fn apply_input(
     intent: &mut Intent,
     player: &mut Player,
     sensitivity: f32,
+    invert_mouse: bool,
 ) -> bool {
     match event {
         InputEvent::Key { key, pressed } => {
@@ -3521,6 +3531,9 @@ fn apply_input(
         }
         InputEvent::MouseDelta { dx, dy } => {
             let (d_yaw, d_pitch) = look_delta(dx, dy, sensitivity);
+            // The invert-mouse option flips the pitch sign
+            // (`EntityRenderer.java`:1103-1107).
+            let d_pitch = if invert_mouse { -d_pitch } else { d_pitch };
             player.yaw += d_yaw;
             player.pitch = (player.pitch + d_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
             true
@@ -5426,12 +5439,20 @@ mod tests {
     }
 
     /// A held settings push and the mapping it runs through.
-    fn held_push() -> (ClientSettings, bool, SmoothLighting, f32, ParticleEngine) {
+    fn held_push() -> (
+        ClientSettings,
+        bool,
+        SmoothLighting,
+        f32,
+        bool,
+        ParticleEngine,
+    ) {
         (
             ClientSettings::default(),
             GRAPHICS_FAST,
             SMOOTH_LIGHTING,
             MOUSE_SENSITIVITY,
+            false,
             ParticleEngine::seeded(0x9E37_79B9_7F4A_7C15, 8),
         )
     }
@@ -5448,6 +5469,7 @@ mod tests {
             graphics_fast: false,
             smooth_lighting: 0,
             sensitivity: 1.0,
+            invert_mouse: true,
             particles: ParticleSetting::Minimal,
         }
     }
@@ -5465,13 +5487,20 @@ mod tests {
 
     #[test]
     fn a_settings_push_moves_every_session_held_value() {
-        let (mut settings, mut graphics_fast, mut smooth_lighting, mut sensitivity, mut particles) =
-            held_push();
+        let (
+            mut settings,
+            mut graphics_fast,
+            mut smooth_lighting,
+            mut sensitivity,
+            mut invert_mouse,
+            mut particles,
+        ) = held_push();
         let changed = apply_session_push(
             &mut settings,
             &mut graphics_fast,
             &mut smooth_lighting,
             &mut sensitivity,
+            &mut invert_mouse,
             &mut particles,
             &full_push(),
         );
@@ -5487,18 +5516,26 @@ mod tests {
         assert!(!graphics_fast, "the mesher leaves the Fast path");
         assert_eq!(smooth_lighting, SmoothLighting::Off);
         assert_eq!(sensitivity, 1.0, "the look mapping runs the pushed value");
+        assert!(invert_mouse, "the look mapping runs the pushed invert flag");
         assert_eq!(particles.setting(), ParticleSetting::Minimal);
     }
 
     #[test]
     fn an_identical_settings_push_sends_nothing_but_still_applies() {
-        let (mut settings, mut graphics_fast, mut smooth_lighting, mut sensitivity, mut particles) =
-            held_push();
+        let (
+            mut settings,
+            mut graphics_fast,
+            mut smooth_lighting,
+            mut sensitivity,
+            mut invert_mouse,
+            mut particles,
+        ) = held_push();
         let push = SessionPush {
             settings: settings.clone(),
             graphics_fast,
             smooth_lighting: 2,
             sensitivity,
+            invert_mouse,
             particles: ParticleSetting::All,
         };
         let changed = apply_session_push(
@@ -5506,6 +5543,7 @@ mod tests {
             &mut graphics_fast,
             &mut smooth_lighting,
             &mut sensitivity,
+            &mut invert_mouse,
             &mut particles,
             &push,
         );
@@ -5514,8 +5552,14 @@ mod tests {
 
     #[test]
     fn a_settings_push_clamps_into_the_store_ranges() {
-        let (mut settings, mut graphics_fast, mut smooth_lighting, mut sensitivity, mut particles) =
-            held_push();
+        let (
+            mut settings,
+            mut graphics_fast,
+            mut smooth_lighting,
+            mut sensitivity,
+            mut invert_mouse,
+            mut particles,
+        ) = held_push();
         let mut push = full_push();
         push.settings.view_distance = 99;
         push.settings.chat_mode = 7;
@@ -5526,6 +5570,7 @@ mod tests {
             &mut graphics_fast,
             &mut smooth_lighting,
             &mut sensitivity,
+            &mut invert_mouse,
             &mut particles,
             &push,
         );
@@ -5547,6 +5592,7 @@ mod tests {
             &mut intent,
             &mut player,
             1.0,
+            false,
         );
         assert!(looked, "a look asks for the aim to be recomputed");
         assert!((player.yaw - 6.144).abs() < 1e-4, "yaw {}", player.yaw);
@@ -5557,8 +5603,75 @@ mod tests {
             &mut intent,
             &mut player,
             0.5,
+            false,
         );
         assert!((player.yaw - 1.5).abs() < 1e-4, "yaw {}", player.yaw);
+    }
+
+    #[test]
+    fn the_inverted_look_flips_the_pitch_sign() {
+        // The invert-mouse option flips the pitch term
+        // (`EntityRenderer.java`:1103-1107): a downward delta pitches down
+        // straight and up inverted, while the yaw never moves.
+        let mut intent = Intent::neutral();
+        let mut player = Player::new();
+        apply_input(
+            InputEvent::MouseDelta { dx: 0.0, dy: 10.0 },
+            &mut intent,
+            &mut player,
+            0.5,
+            false,
+        );
+        assert!((player.pitch - 1.5).abs() < 1e-4, "pitch {}", player.pitch);
+        assert_eq!(player.yaw, 0.0);
+        let mut intent = Intent::neutral();
+        let mut player = Player::new();
+        apply_input(
+            InputEvent::MouseDelta { dx: 0.0, dy: 10.0 },
+            &mut intent,
+            &mut player,
+            0.5,
+            true,
+        );
+        assert!((player.pitch + 1.5).abs() < 1e-4, "pitch {}", player.pitch);
+        assert_eq!(player.yaw, 0.0);
+    }
+
+    #[test]
+    fn a_settings_push_carries_the_invert_flag() {
+        let (
+            mut settings,
+            mut graphics_fast,
+            mut smooth_lighting,
+            mut sensitivity,
+            mut invert_mouse,
+            mut particles,
+        ) = held_push();
+        assert!(!invert_mouse);
+        let mut push = full_push();
+        assert!(push.invert_mouse);
+        let changed = apply_session_push(
+            &mut settings,
+            &mut graphics_fast,
+            &mut smooth_lighting,
+            &mut sensitivity,
+            &mut invert_mouse,
+            &mut particles,
+            &push,
+        );
+        assert!(changed);
+        assert!(invert_mouse, "the session holds the pushed invert flag");
+        push.invert_mouse = false;
+        apply_session_push(
+            &mut settings,
+            &mut graphics_fast,
+            &mut smooth_lighting,
+            &mut sensitivity,
+            &mut invert_mouse,
+            &mut particles,
+            &push,
+        );
+        assert!(!invert_mouse, "clearing the option clears the held flag");
     }
 
     #[test]

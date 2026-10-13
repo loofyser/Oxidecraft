@@ -2413,3 +2413,450 @@ fn the_options_routing_holds_pause_video_and_snooper() {
         "snooper Escape answers the hub now"
     );
 }
+
+// Task 19's screens suite: the sound screen's nine sliders (master
+// full-width, the direct law, Off/% labels), the controls screen's three
+// option rows plus the 33-row binding list with the rebind machine
+// (arm/Escape-unbind/key/click-negative, red-only conflicts, gated
+// Reset-All), the chat screen's ten rows in source order (five float rows
+// step 0, the opacity/width/height label laws), the language list with the
+// Force Unicode toggle, and the skin screen's seven part buttons (bit-flip
+// + relabel). Layout pins mirror `GuiScreenOptionsSounds.java:36-50`
+// (master 310 at `w/2-155, h/6-12`, pairs 150 at `w/2-155`/`+5`,
+// `h/6-12+24*(i>>1)`, Done 200 at `h/6+168`, title y 15),
+// `GuiControls.java:38-59` (invert/sensitivity/touchscreen at y 18/42/42,
+// Done 200 + Reset-All 201 at `h-29`, title y 8),
+// `ScreenChatOptions.java:24-43` (ten rows `w/2-155`/`+5`,
+// `h/6+24*(i>>1)`, Done 200 at `h/6+120`, title y 20),
+// `GuiLanguage.java:46-52` (unicode 100 + Done 6 at `h-38`, list 32..h-61,
+// title y 16, warning y h-56) and `GuiCustomizeSkin.java:24-41` (seven
+// 150x20 pairs `w/2-155`/`+5`, `h/6+24*(i>>1)`, Done 200 below, title
+// y 20). Every formula here is closed-form — no GPU needed.
+
+use oxide_client::screens::options_chat::{
+    CHAT_DONE_ID, ChatAction, ChatScreen, chat_height_label, chat_labels, chat_opacity_label,
+    chat_visibility_label, chat_width_label,
+};
+use oxide_client::screens::options_controls::{
+    CONTROLS_DONE_ID, CONTROLS_RESET_ALL_ID, ControlsAction, ControlsScreen, controls_labels,
+    sensitivity_label_value,
+};
+use oxide_client::screens::options_language::{
+    LANGUAGE_DONE_ID, LANGUAGE_UNICODE_ID, LanguageAction, LanguageScreen, language_labels,
+};
+use oxide_client::screens::options_skin::{
+    SKIN_DONE_ID, SKIN_PARTS, SkinAction, SkinScreen, skin_labels, skin_part_label,
+};
+use oxide_client::screens::options_sound::{
+    SOUND_DONE_ID, SoundAction, SoundScreen, sound_label_value, sound_labels,
+};
+use winit::keyboard::KeyCode;
+
+/// The sound screen over default settings with the store's English.
+fn sound_english() -> SoundScreen {
+    SoundScreen::new(&wide(), &GameSettings::default(), sound_labels(None))
+}
+
+/// The controls screen over default settings with the store's English.
+fn controls_english() -> ControlsScreen {
+    ControlsScreen::new(
+        &wide(),
+        &GameSettings::default(),
+        controls_labels(None),
+        None,
+    )
+}
+
+/// The key-entry index of the named row (the list sorts by category and
+/// description, never store order).
+fn row_named(screen: &ControlsScreen, name: &str) -> usize {
+    (0..screen.binding_row_count())
+        .find(|index| screen.binding_row(*index).name() == name)
+        .unwrap_or_else(|| panic!("the {name} row stands"))
+}
+
+/// The named binding's stored code.
+fn stored_code(settings: &GameSettings, name: &str) -> i32 {
+    settings
+        .bindings
+        .iter()
+        .find(|binding| binding.name == name)
+        .map(|binding| binding.code)
+        .unwrap_or(0)
+}
+
+/// The chat screen over default settings with the store's English.
+fn chat_english() -> ChatScreen {
+    ChatScreen::new(&wide(), &GameSettings::default(), chat_labels(None))
+}
+
+/// The language screen over default settings with the store's English and
+/// today's locale set.
+fn language_english() -> LanguageScreen {
+    LanguageScreen::new(
+        &wide(),
+        &GameSettings::default(),
+        language_labels(None),
+        &[String::from("en_US")],
+    )
+}
+
+/// The skin screen over default settings with the store's English.
+fn skin_english() -> SkinScreen {
+    SkinScreen::new(&wide(), &GameSettings::default(), skin_labels(None))
+}
+
+#[test]
+fn the_sound_screen_carries_nine_sliders_master_full_width() {
+    // `GuiScreenOptionsSounds.java:38-48`: master is a 310-wide slider at
+    // `w/2-155, h/6-12`; the other eight are 150-wide pairs at `w/2-155`
+    // and `w/2+5`, rows `h/6-12+24*(i>>1)`; Done 200 at `w/2-100, h/6+168`.
+    let screen = sound_english();
+    assert_eq!(screen.slider_count(), 9, "all nine categories stand");
+    let master = screen.slider(0);
+    assert_eq!(
+        (master.x(), master.y(), master.w()),
+        (213.0 - 155.0, 40.0 - 12.0, 310.0)
+    );
+    let music = screen.slider(1);
+    assert_eq!(
+        (music.x(), music.y(), music.w()),
+        (213.0 - 155.0, 40.0 - 12.0 + 24.0, 150.0)
+    );
+    let records = screen.slider(2);
+    assert_eq!(
+        (records.x(), records.y(), records.w()),
+        (213.0 - 155.0 + 160.0, 40.0 - 12.0 + 24.0, 150.0)
+    );
+    let ambient = screen.slider(8);
+    assert_eq!(
+        (ambient.x(), ambient.y()),
+        (213.0 - 155.0 + 160.0, 40.0 - 12.0 + 96.0)
+    );
+    assert_eq!(screen.done_pos(), (213.0 - 100.0, 40.0 + 168.0));
+    assert_eq!(SOUND_DONE_ID, 200);
+}
+
+#[test]
+fn the_sound_label_runs_off_or_percent() {
+    // `GuiScreenOptionsSounds.java:78-82`: zero reads the Off string,
+    // anything else `(int)(level*100)%`.
+    assert_eq!(
+        sound_label_value("Master Volume", 0.0, "Off"),
+        "Master Volume: Off"
+    );
+    assert_eq!(
+        sound_label_value("Master Volume", 1.0, "Off"),
+        "Master Volume: 100%"
+    );
+    assert_eq!(sound_label_value("Music", 0.37, "Off"), "Music: 37%");
+}
+
+#[test]
+fn the_sound_press_writes_the_direct_law() {
+    // `GuiScreenOptionsSounds.java:124-135`: the press folds the pointer
+    // `(mouseX-(x+4))/(w-8)`, clamps, writes the level and saves; the
+    // drag motion repeats the same fold per event.
+    let mut screen = sound_english();
+    let mut settings = GameSettings::default();
+    let action = screen
+        .click_at(
+            (213.0 - 155.0 + 4.0 + 151.0, 40.0 - 12.0 + 10.0),
+            &mut settings,
+        )
+        .expect("the master press lands");
+    assert_eq!(action, SoundAction::Level(0));
+    assert_eq!(settings.category_volumes[0], 0.5);
+    let action = screen
+        .drag_to(213.0 - 155.0 + 4.0 + 302.0, &mut settings)
+        .expect("the latched drag writes");
+    assert_eq!(action, SoundAction::Level(0));
+    assert_eq!(settings.category_volumes[0], 1.0);
+    screen.release();
+    assert_eq!(screen.drag_to(0.0, &mut settings), None);
+}
+
+#[test]
+fn the_sound_done_saves() {
+    let mut screen = sound_english();
+    let mut settings = GameSettings::default();
+    let action = screen
+        .click_at((213.0 - 100.0 + 50.0, 40.0 + 168.0 + 10.0), &mut settings)
+        .expect("Done lands");
+    assert_eq!(action, SoundAction::Done);
+    assert_eq!(action.save_kind(), SaveKind::Immediate);
+}
+
+#[test]
+fn the_controls_screen_pins_the_option_rows_and_done_pair() {
+    // `GuiControls.java:41-58`: Done 200 + Reset-All 201 at `h-29`, title
+    // y 8; invert/touchscreen buttons and the sensitivity slider at
+    // `w/2-155`/`+5`, rows y 18 and 42.
+    let screen = controls_english();
+    assert_eq!(
+        (screen.invert_pos(), screen.sensitivity_pos()),
+        ((213.0 - 155.0, 18.0), (213.0 - 155.0 + 160.0, 18.0))
+    );
+    assert_eq!(screen.touchscreen_pos(), (213.0 - 155.0, 42.0));
+    assert_eq!(screen.done_pos(), (213.0 - 155.0, 240.0 - 29.0));
+    assert_eq!(
+        screen.reset_all_pos(),
+        (213.0 - 155.0 + 160.0, 240.0 - 29.0)
+    );
+    assert_eq!((CONTROLS_DONE_ID, CONTROLS_RESET_ALL_ID), (200, 201));
+    assert_eq!(screen.binding_row_count(), 33, "every binding stands");
+}
+
+#[test]
+fn the_sensitivity_label_runs_min_or_max_or_percent() {
+    // `GameSettings.java:623`: 0 reads the min string, 1 the max string,
+    // anything else `(int)(sensitivity*200)%`.
+    assert_eq!(
+        sensitivity_label_value("Sensitivity", 0.0, "*yawn*", "HYPERSPEED!!!"),
+        "Sensitivity: *yawn*"
+    );
+    assert_eq!(
+        sensitivity_label_value("Sensitivity", 1.0, "*yawn*", "HYPERSPEED!!!"),
+        "Sensitivity: HYPERSPEED!!!"
+    );
+    assert_eq!(
+        sensitivity_label_value("Sensitivity", 0.5, "*yawn*", "HYPERSPEED!!!"),
+        "Sensitivity: 100%"
+    );
+}
+
+#[test]
+fn the_controls_rebind_machine_arms_and_binds() {
+    // `GuiControls.java:98-152`: clicking a change button arms it; a key
+    // press binds (Escape 1 unbinds to 0); a click while armed binds the
+    // negative mouse button (`-100+button`); conflicts stay red-only.
+    let mut screen = controls_english();
+    let mut settings = GameSettings::default();
+    let row = row_named(&screen, "left");
+    let change = screen.binding_row(row).change_x();
+    let y = screen.binding_row(row).y();
+    let action = screen
+        .click_at((change + 10.0, y + 10.0), &mut settings)
+        .expect("the change press arms");
+    assert_eq!(action, ControlsAction::Armed(row));
+    assert_eq!(screen.armed(), Some(row));
+    let action = screen
+        .key(KeyCode::KeyF, &mut settings)
+        .expect("the key press binds");
+    assert_eq!(action, ControlsAction::Rebound(row));
+    assert_eq!(screen.armed(), None);
+    assert_eq!(stored_code(&settings, "left"), 33);
+    assert_eq!(screen.binding_row(row).change_label(), "F");
+}
+
+#[test]
+fn the_controls_escape_press_unbinds() {
+    let mut screen = controls_english();
+    let mut settings = GameSettings::default();
+    let row = row_named(&screen, "forward");
+    let change = screen.binding_row(row).change_x();
+    let y = screen.binding_row(row).y();
+    screen
+        .click_at((change + 10.0, y + 10.0), &mut settings)
+        .expect("the change press arms");
+    let action = screen
+        .key(KeyCode::Escape, &mut settings)
+        .expect("Escape unbinds");
+    assert_eq!(action, ControlsAction::Unbound(row));
+    assert_eq!(stored_code(&settings, "forward"), 0);
+}
+
+#[test]
+fn the_controls_click_while_armed_binds_negative() {
+    let mut screen = controls_english();
+    let mut settings = GameSettings::default();
+    let row = row_named(&screen, "back");
+    let change = screen.binding_row(row).change_x();
+    let y = screen.binding_row(row).y();
+    screen
+        .click_at((change + 10.0, y + 10.0), &mut settings)
+        .expect("the change press arms");
+    let action = screen
+        .click_button(1, (10.0, 100.0), &mut settings)
+        .expect("the click binds");
+    assert_eq!(action, ControlsAction::Rebound(row));
+    assert_eq!(stored_code(&settings, "back"), -99);
+}
+
+#[test]
+fn the_controls_conflict_is_red_only_and_reset_all_is_gated() {
+    // `GuiKeyBindingList.java:131-141`: a shared code paints the change
+    // button red and nothing else; `GuiControls.java:162-173`: Reset-All
+    // enables only while a row differs from its default.
+    let screen = controls_english();
+    assert!(!screen.reset_enabled(), "defaults leave Reset-All dark");
+    let mut settings = GameSettings::default();
+    settings
+        .bindings
+        .iter_mut()
+        .find(|binding| binding.name == "left")
+        .expect("the left row stands")
+        .code = stored_code(&settings, "forward");
+    let screen = ControlsScreen::new(&wide(), &settings, controls_labels(None), None);
+    assert!(screen.reset_enabled(), "a changed row lights Reset-All");
+    let left = row_named(&screen, "left");
+    let forward = row_named(&screen, "forward");
+    assert!(
+        screen.binding_row(left).conflicted(),
+        "the shared code paints red"
+    );
+    assert!(
+        screen.binding_row(forward).conflicted(),
+        "every holder paints red"
+    );
+    let mut settings = GameSettings::default();
+    settings
+        .bindings
+        .iter_mut()
+        .find(|binding| binding.name == "left")
+        .expect("the left row stands")
+        .code = stored_code(&settings, "forward");
+    let mut screen = ControlsScreen::new(&wide(), &settings, controls_labels(None), None);
+    let action = screen
+        .click_at(
+            (213.0 - 155.0 + 160.0 + 10.0, 240.0 - 29.0 + 10.0),
+            &mut settings,
+        )
+        .expect("Reset-All lands");
+    assert_eq!(action, ControlsAction::ResetAll);
+    assert_eq!(stored_code(&settings, "left"), 30);
+}
+
+#[test]
+fn the_chat_screen_pins_ten_rows_in_source_order() {
+    // `ScreenChatOptions.java:9-43`: the ten options in fixed order, 150
+    // pairs at `w/2-155`/`+5`, rows `h/6+24*(i>>1)`; Done 200 at `h/6+120`;
+    // the opacity/scale/height/width rows are sliders (step 0 in the
+    // port's float law).
+    let screen = chat_english();
+    assert_eq!(screen.row_count(), 10);
+    assert_eq!(screen.row_id(0), 15, "visibility leads");
+    assert_eq!(screen.row_id(9), 42, "reduced debug closes");
+    assert_eq!(screen.row_pos(0), (213.0 - 155.0, 40.0));
+    assert_eq!(screen.row_pos(1), (213.0 - 155.0 + 160.0, 40.0));
+    assert_eq!(screen.row_pos(2), (213.0 - 155.0, 40.0 + 24.0));
+    assert!(screen.row_is_slider(3), "opacity slides");
+    assert!(screen.row_is_slider(5), "scale slides");
+    assert!(screen.row_is_slider(6), "focused height slides");
+    assert!(screen.row_is_slider(7), "unfocused height slides");
+    assert!(screen.row_is_slider(8), "width slides");
+    assert!(!screen.row_is_slider(0), "visibility toggles");
+    assert_eq!(screen.done_pos(), (213.0 - 100.0, 40.0 + 120.0));
+    assert_eq!(CHAT_DONE_ID, 200);
+}
+
+#[test]
+fn the_chat_label_laws_read_source_values() {
+    // `GameSettings.java:623` + `GuiNewChat.java:361-371`: opacity is
+    // `(int)(f*90+10)%`, widths/heights are `floor(v*280+40)` /
+    // `floor(v*160+20)` px.
+    assert_eq!(
+        chat_visibility_label(0, "Chat", "Shown", "Commands Only", "Hidden"),
+        "Chat: Shown"
+    );
+    assert_eq!(
+        chat_visibility_label(1, "Chat", "Shown", "Commands Only", "Hidden"),
+        "Chat: Commands Only"
+    );
+    assert_eq!(
+        chat_visibility_label(2, "Chat", "Shown", "Commands Only", "Hidden"),
+        "Chat: Hidden"
+    );
+    assert_eq!(chat_opacity_label(1.0, "Opacity"), "Opacity: 100%");
+    assert_eq!(chat_opacity_label(0.0, "Opacity"), "Opacity: 10%");
+    assert_eq!(chat_width_label(1.0, "Width"), "Width: 320px");
+    assert_eq!(chat_width_label(0.0, "Width"), "Width: 40px");
+    assert_eq!(chat_height_label(1.0, "Height"), "Height: 180px");
+    assert_eq!(chat_height_label(0.0, "Height"), "Height: 20px");
+}
+
+#[test]
+fn the_chat_float_press_writes_and_rewraps() {
+    // `GameSettings.java:278-308`: each float write stores the value and
+    // re-wraps the log; the press folds the pointer per event.
+    let mut screen = chat_english();
+    let mut settings = GameSettings::default();
+    let pos = screen.row_pos(8);
+    let action = screen
+        .click_at((pos.0 + 4.0 + 71.0, pos.1 + 10.0), &mut settings)
+        .expect("the width press lands");
+    assert_eq!(action, ChatAction::Width);
+    assert_eq!(settings.chat_width, 0.5);
+}
+
+#[test]
+fn the_language_screen_pins_list_and_unicode_toggle() {
+    // `GuiLanguage.java:46-52,104-106`: the list spans 32..h-61, Force
+    // Unicode 100 + Done 6 sit at `h-38`, the title at y 16 and the
+    // warning at y h-56.
+    let screen = language_english();
+    assert_eq!(screen.row_count(), 1, "today's set holds en_US");
+    assert_eq!(screen.unicode_pos(), (213.0 - 155.0, 240.0 - 38.0));
+    assert_eq!(screen.done_pos(), (213.0 - 155.0 + 160.0, 240.0 - 38.0));
+    assert_eq!((LANGUAGE_UNICODE_ID, LANGUAGE_DONE_ID), (100, 6));
+    assert_eq!(screen.selected(), Some(0));
+}
+
+#[test]
+fn the_language_toggle_persists_and_selects() {
+    // `GuiLanguage.java:79-90,130-141`: the toggle writes Force Unicode
+    // and re-lays out; a row click writes the language and saves.
+    let mut screen = language_english();
+    let mut settings = GameSettings::default();
+    let action = screen
+        .click_at((213.0 - 155.0 + 10.0, 240.0 - 38.0 + 10.0), &mut settings)
+        .expect("the unicode press lands");
+    assert_eq!(action, LanguageAction::ForceUnicode);
+    assert!(settings.force_unicode);
+    assert_eq!(action.save_kind(), SaveKind::Immediate);
+    assert!(action.relayout(), "the toggle re-lays out");
+}
+
+#[test]
+fn the_skin_screen_pins_seven_part_buttons() {
+    // `GuiCustomizeSkin.java:24-41`: the seven parts in enum order, 150x20
+    // pairs at `w/2-155`/`+5`, rows `h/6+24*(i>>1)`; Done 200 rides two
+    // slots below the odd seventh.
+    let screen = skin_english();
+    assert_eq!(screen.part_count(), 7);
+    assert_eq!(
+        SKIN_PARTS,
+        [
+            "cape",
+            "jacket",
+            "left_sleeve",
+            "right_sleeve",
+            "left_pants_leg",
+            "right_pants_leg",
+            "hat"
+        ]
+    );
+    assert_eq!(screen.part_pos(0), (213.0 - 155.0, 40.0));
+    assert_eq!(screen.part_pos(1), (213.0 - 155.0 + 160.0, 40.0));
+    assert_eq!(screen.part_pos(6), (213.0 - 155.0, 40.0 + 72.0));
+    assert_eq!(screen.done_pos(), (213.0 - 100.0, 40.0 + 96.0));
+    assert_eq!(SKIN_DONE_ID, 200);
+    assert_eq!(skin_part_label("Cape", true, "On", "Off"), "Cape: On");
+    assert_eq!(skin_part_label("Hat", false, "On", "Off"), "Hat: Off");
+}
+
+#[test]
+fn the_skin_press_flips_the_bit_and_relabels() {
+    // `GuiCustomizeSkin.java:55-60`: the press flips the part bit, saves,
+    // and rewrites the button's On/Off label.
+    let mut screen = skin_english();
+    let mut settings = GameSettings::default();
+    assert_eq!(settings.skin_parts, 0x7F);
+    let action = screen
+        .click_at((213.0 - 155.0 + 10.0, 40.0 + 10.0), &mut settings)
+        .expect("the cape press lands");
+    assert_eq!(action, SkinAction::Part(0));
+    assert_eq!(settings.skin_parts, 0x7E);
+    assert_eq!(screen.part_label(0), "Cape: Off");
+    assert_eq!(action.save_kind(), SaveKind::Immediate);
+}

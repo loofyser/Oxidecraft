@@ -427,6 +427,7 @@ impl SettingsState {
                 graphics_fast: matches!(settings.graphics, GraphicsSetting::Fast),
                 smooth_lighting: settings.smooth_lighting,
                 sensitivity: settings.mouse_sensitivity,
+                invert_mouse: settings.invert_mouse,
                 particles: settings.particles,
             };
             let _ = session.send(InputEvent::SetViewDistance { chunks });

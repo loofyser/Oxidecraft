@@ -34,7 +34,6 @@
 //! the client reports.
 
 mod assets;
-mod keymap;
 mod skin_worker;
 mod view;
 
@@ -57,6 +56,7 @@ use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_assets::sound::SoundIndex;
 use oxide_assets::store::Store;
 use oxide_client::items::ItemTable;
+use oxide_client::keymap;
 use oxide_client::screens::Screens;
 use oxide_client::screens::container::{ClickButton, ScreenKey};
 use oxide_client::screens::family_b;
@@ -67,11 +67,18 @@ use oxide_client::screens::multiplayer::{
 use oxide_client::screens::options::{
     OptionsAction, SaveKind, VideoAction, options_labels, video_labels,
 };
+use oxide_client::screens::options_chat::{ChatAction, chat_labels};
+use oxide_client::screens::options_controls::{ControlsAction, controls_labels};
+use oxide_client::screens::options_language::{LanguageAction, language_labels};
+use oxide_client::screens::options_skin::{SkinAction, skin_labels};
+use oxide_client::screens::options_sound::{SoundAction, sound_labels};
 use oxide_client::screens::pause::{
     AchievementsAction, PauseAction, StatsAction, done_label, pause_labels,
 };
 use oxide_client::screens::widgets::BUTTON_PRESS_SOUND;
-use oxide_client::screens::{ScreenState, book::BookClick, creative, inventory, sign::SignScreen};
+use oxide_client::screens::{
+    OptionsSources, ScreenState, book::BookClick, creative, inventory, sign::SignScreen,
+};
 use oxide_client::settings_state::{
     KeymapPass, NoAudio, ParticleSink, SettingsState, WindowSink, cursor_to_gui, framerate_gate,
     options_path,
@@ -90,7 +97,7 @@ use oxide_game::particles::{ParticleFrame, ParticleTex};
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
-use oxide_game::settings::{FRAMERATE_RANGE, ParticleSetting};
+use oxide_game::settings::{Binding, FRAMERATE_RANGE, ParticleSetting, default_bindings};
 use oxide_game::weather::WeatherColumn;
 use oxide_proto_v47::effects_wire::{read_effect_position, read_sound_pitch};
 use oxide_proto_v47::serverbound::ClientSettings;
@@ -2503,6 +2510,19 @@ impl ClientApp {
                 }
                 return;
             }
+            // An armed controls row owns Escape: it unbinds to 0 instead of
+            // closing (`GuiControls.keyTyped`:127-152 answers the key before
+            // any screen rule sees it).
+            if self
+                .screens
+                .controls_mut()
+                .is_some_and(|screen| screen.armed().is_some())
+            {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.controls_key(code);
+                }
+                return;
+            }
             match escape_route(
                 self.chat_input.open,
                 self.chat.confirm_open(),
@@ -2549,11 +2569,18 @@ impl ClientApp {
         if self.on_screen_key(event_loop, &event) {
             return;
         }
-        // The inventory key's open path (the router seam — the keymap binding
-        // itself is Task 24's): a fresh E press with the pointer grabbed and
+        // The inventory key's open path (the router seam — the binding
+        // itself reads through the store's table): a fresh press of the
+        // bound inventory key with the pointer grabbed and
         // no screen open stands the window-0 screen beside one C16
         // (`Minecraft.java`:2090-2103; no guard, so two opens send two).
-        if self.capture.grabbed() && inventory_opener(event.state, event.repeat, event.physical_key)
+        if self.capture.grabbed()
+            && inventory_opener(
+                event.state,
+                event.repeat,
+                event.physical_key,
+                &self.settings.settings().bindings,
+            )
         {
             self.open_inventory(event_loop);
             return;
@@ -2563,16 +2590,18 @@ impl ClientApp {
         // here is the unguarded runTick half (`Minecraft.java`:2076-2090 sets
         // `currentItem` with no screen guard; `:2105-2111` drops, the whole
         // stack with Ctrl). Fresh-press edges only, like the inventory key's.
+        // The top row reads through the store's bindings, the numpad past
+        // them (`keyBindsHotbar`, `GameSettings.java`:151).
         if event.state == ElementState::Pressed && !event.repeat {
             if let PhysicalKey::Code(code) = event.physical_key {
-                if let Some(select) = hotbar_select(code) {
-                    if let InputEvent::HeldItemChange { slot } = select {
-                        self.held = slot;
-                    }
-                    self.send_input(select);
+                let pressed = keymap::translate(code, &self.settings.settings().bindings);
+                if let Some(slot) = pressed.and_then(digit_slot) {
+                    let slot = i16::from(slot);
+                    self.held = slot;
+                    self.send_input(InputEvent::HeldItemChange { slot });
                     return;
                 }
-                if code == KeyCode::KeyQ {
+                if pressed == Some(Key::Q) {
                     self.send_input(drop_item(self.ctrl));
                     return;
                 }
@@ -2595,12 +2624,22 @@ impl ClientApp {
             return;
         }
         if self.capture.grabbed() {
-            if let Some(default) = chat_opener(event.state, event.repeat, event.physical_key) {
+            if let Some(default) = chat_opener(
+                event.state,
+                event.repeat,
+                event.physical_key,
+                &self.settings.settings().bindings,
+            ) {
                 self.open_chat(event_loop, default);
                 return;
             }
         }
-        if let Some(input) = gameplay_key(self.capture.grabbed(), event.state, event.physical_key) {
+        if let Some(input) = gameplay_key(
+            self.capture.grabbed(),
+            event.state,
+            event.physical_key,
+            &self.settings.settings().bindings,
+        ) {
             self.send_input(input);
         }
     }
@@ -2616,19 +2655,20 @@ impl ClientApp {
         if event.state != ElementState::Pressed {
             return;
         }
-        let consumed = match event.physical_key {
-            PhysicalKey::Code(code) => match keymap::translate(code) {
-                Some(key) => match self.chat_input.key(key) {
-                    ChatKey::Send(send) => {
-                        self.send_input(send);
-                        true
-                    }
-                    ChatKey::Consumed => true,
-                    ChatKey::Character => false,
-                },
-                None => false,
+        let pressed = match event.physical_key {
+            PhysicalKey::Code(code) => keymap::translate(code, &self.settings.settings().bindings),
+            PhysicalKey::Unidentified(_) => None,
+        };
+        let consumed = match pressed {
+            Some(key) => match self.chat_input.key(key) {
+                ChatKey::Send(send) => {
+                    self.send_input(send);
+                    true
+                }
+                ChatKey::Consumed => true,
+                ChatKey::Character => false,
             },
-            PhysicalKey::Unidentified(_) => false,
+            None => false,
         };
         if !consumed {
             if let Some(text) = event.text.as_deref() {
@@ -3034,8 +3074,18 @@ impl ClientApp {
     /// consumer — the renderer, the audio engine (silent without one), the
     /// session's particle engine over its input channel, the window's
     /// fullscreen switch and the keymap pass-through. No screen calls the
-    /// renderer itself; every widget write lands here.
+    /// renderer itself; every widget write lands here. The chat mirror takes
+    /// its five settings on every push, so each chat float write lands like
+    /// the source's `refreshChat` re-read.
     fn push_settings(&mut self) {
+        let settings = self.settings.settings();
+        self.chat.set_chat_settings(
+            settings.chat_opacity,
+            settings.chat_width,
+            settings.chat_scale,
+            settings.chat_height,
+            settings.chat_height_unfocused,
+        );
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -3083,10 +3133,12 @@ impl ClientApp {
     /// Runs one hub press at the free pointer's point: the control under it
     /// plays the press sound, writes the live settings, pushes them
     /// through apply, and folds the save rule. The video button saves and
-    /// stands the video screen; the snooper button saves and stands the
-    /// snooper; Done saves and returns to the pause parent (or closes to
-    /// the game with no parent); the later screens' buttons record their
-    /// action and open nothing yet. Empty space answers nothing.
+    /// stands the video screen; the sounds, controls, language, chat and
+    /// skin buttons save and stand their screens; the snooper button saves
+    /// and stands the snooper; Done saves and returns to the pause parent
+    /// (or closes to the game with no parent); the resource-packs button
+    /// records its action and opens nothing yet. Empty space answers
+    /// nothing.
     fn options_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
         let action = self
             .screens
@@ -3100,6 +3152,11 @@ impl ClientApp {
         self.fold_options_save(action.save_kind());
         match action {
             OptionsAction::Video => self.open_video_settings(),
+            OptionsAction::Sounds => self.open_sound(),
+            OptionsAction::Controls => self.open_controls(),
+            OptionsAction::Language => self.open_language(),
+            OptionsAction::Chat => self.open_chat_options(),
+            OptionsAction::Skin => self.open_skin(),
             OptionsAction::Snooper => self.open_snooper_from_options(),
             OptionsAction::Done => {
                 if !self.screens.back_to_pause() {
@@ -3108,11 +3165,6 @@ impl ClientApp {
             }
             OptionsAction::FovChanged
             | OptionsAction::RealmsToggled
-            | OptionsAction::Skin
-            | OptionsAction::Sounds
-            | OptionsAction::Controls
-            | OptionsAction::Language
-            | OptionsAction::Chat
             | OptionsAction::ResourcePacks => {}
         }
     }
@@ -3150,6 +3202,278 @@ impl ClientApp {
         self.screens.open_snooper_from_options(scaled, done);
     }
 
+    /// Stands the sounds screen from the hub's sounds button (106): the
+    /// labels resolve through the assets' table at the renderer's scaled
+    /// size over the live settings, and the hub stashes as the parent.
+    /// In-client, no send.
+    fn open_sound(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = sound_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        self.screens
+            .open_sound_from_options(scaled, &settings, labels);
+    }
+
+    /// Stands the controls screen from the hub's controls button (100): the
+    /// labels and the row descriptions resolve through the assets' table at
+    /// the renderer's scaled size over the live settings, and the hub
+    /// stashes as the parent. In-client, no send.
+    fn open_controls(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = controls_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        self.screens
+            .open_controls_from_options(scaled, &settings, labels, Some(&assets.lang));
+    }
+
+    /// Stands the language screen from the hub's language button (102) over
+    /// today's available set: the store's own locale — `en_US` until the
+    /// Task 26 loader lands more — with the labels resolving through the
+    /// assets' table at the renderer's scaled size, and the hub stashing as
+    /// the parent. In-client, no send.
+    fn open_language(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = language_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        let locales = [settings.language.clone()];
+        self.screens
+            .open_language_from_options(scaled, &settings, labels, &locales);
+    }
+
+    /// Stands the chat-options screen from the hub's chat button (103): the
+    /// labels resolve through the assets' table at the renderer's scaled
+    /// size over the live settings, and the hub stashes as the parent.
+    /// In-client, no send.
+    fn open_chat_options(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = chat_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        self.screens
+            .open_chat_options_from_options(scaled, &settings, labels);
+    }
+
+    /// Stands the skin screen from the hub's skin button (110): the labels
+    /// resolve through the assets' table at the renderer's scaled size over
+    /// the live settings, and the hub stashes as the parent. In-client, no
+    /// send.
+    fn open_skin(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let scaled = renderer.scaled_resolution();
+        let Some(assets) = self.assets.as_ref() else {
+            return;
+        };
+        let labels = skin_labels(Some(&assets.lang));
+        let settings = self.settings.settings().clone();
+        self.screens
+            .open_skin_from_options(scaled, &settings, labels);
+    }
+
+    /// Runs one pause-family press at the point through the window's own
+    /// click path: an armed controls row binds the numbered button, every
+    /// other screen answers button 0, and anything else is the screen's to
+    /// swallow. The window's mouse button and the script's `click` gesture
+    /// share it, so a rig run presses exactly what the pointer presses.
+    fn pause_family_click(&mut self, event_loop: &ActiveEventLoop, button: u8, point: (f32, f32)) {
+        // An armed controls row owns every mouse button: the click binds
+        // the negative button (`GuiControls` arms first at `:100-110`) —
+        // running before the button-0 path below so right and middle clicks
+        // bind instead of falling through.
+        if self
+            .screens
+            .controls_mut()
+            .is_some_and(|screen| screen.armed().is_some())
+        {
+            self.controls_click(event_loop, button, point);
+            return;
+        }
+        // Only button 0 reaches the buttons.
+        if button != 0 {
+            return;
+        }
+        if self.screens.pause_mut().is_some() {
+            self.pause_click(event_loop, point);
+        } else if self.screens.stats_mut().is_some() {
+            self.stats_click(point);
+        } else if self.screens.achievements_mut().is_some() {
+            self.achievements_click(point);
+        } else if self.screens.options_mut().is_some() {
+            self.options_click(event_loop, point);
+        } else if self.screens.video_mut().is_some() {
+            self.video_click(event_loop, point);
+        } else if self.screens.sound_mut().is_some() {
+            self.sound_click(event_loop, point);
+        } else if self.screens.controls_mut().is_some() {
+            self.controls_click(event_loop, 0, point);
+        } else if self.screens.language_mut().is_some() {
+            self.language_click(event_loop, point);
+        } else if self.screens.chat_options_mut().is_some() {
+            self.chat_options_click(event_loop, point);
+        } else if self.screens.skin_mut().is_some() {
+            self.skin_click(event_loop, point);
+        } else if self.screens.snooper_mut().is_some() {
+            self.snooper_click(event_loop, point);
+        }
+    }
+
+    /// Runs one sounds press at the free pointer's point: the slider under
+    /// it folds the pointer into its category's level, writes the live
+    /// settings, pushes them through apply, and saves at once. Done plays
+    /// the press sound and returns to the hub (or closes to the game with
+    /// no hub); a slider press plays nothing — the source empties the
+    /// sliders' press sound (`:143-145`). Empty space answers nothing.
+    fn sound_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .sound_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        if action == SoundAction::Done {
+            self.play_press_sound();
+        }
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action == SoundAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
+    /// Runs one controls press at the free pointer's point with the mouse
+    /// button: while a row stands armed the click binds the negative button
+    /// and saves; otherwise the option rows write, a change press arms, a
+    /// per-row reset restores its default, Reset-All restores every default,
+    /// and Done answers the hub. Every answered press plays the press sound
+    /// except the armed bind itself, writes the live settings, pushes them
+    /// through apply, and folds the save rule. Empty space answers nothing.
+    fn controls_click(&mut self, event_loop: &ActiveEventLoop, button: u8, point: (f32, f32)) {
+        let action = self
+            .screens
+            .controls_mut()
+            .and_then(|screen| screen.click_button(button, point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        if !matches!(action, ControlsAction::Rebound(_)) {
+            self.play_press_sound();
+        }
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action == ControlsAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
+    /// Runs one controls key press while a row stands armed: Escape unbinds
+    /// to 0, a mapped key binds, an unmapped key only disarms
+    /// (`GuiControls.keyTyped`:127-152). The press writes the live settings,
+    /// pushes them through apply, and folds the save rule; no press sound —
+    /// the source's key path plays none. With no armed row the screen
+    /// consumes nothing.
+    fn controls_key(&mut self, code: KeyCode) {
+        let action = self
+            .screens
+            .controls_mut()
+            .and_then(|screen| screen.key(code, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+    }
+
+    /// Runs one language press at the free pointer's point: the toggle flips
+    /// Force Unicode and re-lays out, a list row sets the language, Done
+    /// answers the hub. Every answered press plays the press sound, writes
+    /// the live settings, pushes them through apply, and saves at once.
+    /// Empty space answers nothing.
+    fn language_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .language_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action.relayout() {
+            self.relay_options_layout();
+        }
+        if action == LanguageAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
+    /// Runs one chat-options press at the free pointer's point: the row
+    /// under it writes the live settings, pushes them through apply — the
+    /// push feeds the chat mirror, the port's `refreshChat` — and saves at
+    /// once. Done answers the hub (or closes to the game with no hub).
+    /// Empty space answers nothing.
+    fn chat_options_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .chat_options_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action == ChatAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
+    /// Runs one skin press at the free pointer's point: the part under it
+    /// flips its bit in the skin-parts byte and relabels, the push carries
+    /// the byte to the session's C15 re-send, and the press saves at once.
+    /// Done answers the hub (or closes to the game with no hub). Empty space
+    /// answers nothing.
+    fn skin_click(&mut self, event_loop: &ActiveEventLoop, point: (f32, f32)) {
+        let action = self
+            .screens
+            .skin_mut()
+            .and_then(|screen| screen.click_at(point, self.settings.settings_mut()));
+        let Some(action) = action else {
+            return;
+        };
+        self.play_press_sound();
+        self.push_settings();
+        self.fold_options_save(action.save_kind());
+        if action == SkinAction::Done && !self.screens.back_to_options() {
+            self.close_screen(event_loop);
+        }
+    }
+
     /// Runs one video press at the free pointer's point: the control under
     /// it plays the press sound, writes the live settings, pushes them
     /// through apply, and folds the save rule. A GUI-scale cycle applies
@@ -3174,11 +3498,12 @@ impl ClientApp {
         }
     }
 
-    /// Re-lays the open hub or video screen at the renderer's scaled size
-    /// after a GUI-scale apply: the push changed the resolution out from
-    /// under the standing screen, so its `initGui` build re-runs on the
-    /// live settings (`GuiVideoSettings`:85-116 re-runs
-    /// `setWorldAndResolution` after the click and the release alike).
+    /// Re-lays the open hub, video, sounds, controls, language, chat-options
+    /// or skin screen at the renderer's scaled size after a GUI-scale apply:
+    /// the push changed the resolution out from under the standing screen,
+    /// so its `initGui` build re-runs on the live settings
+    /// (`GuiVideoSettings`:85-116 re-runs `setWorldAndResolution` after the
+    /// click and the release alike; the language toggle re-runs it too).
     fn relay_options_layout(&mut self) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
@@ -3191,16 +3516,25 @@ impl ClientApp {
         self.screens.resize_options(
             &scaled,
             &settings,
-            options_labels(Some(&assets.lang)),
-            video_labels(Some(&assets.lang)),
-            true,
+            OptionsSources {
+                options: options_labels(Some(&assets.lang)),
+                video: video_labels(Some(&assets.lang)),
+                sound: sound_labels(Some(&assets.lang)),
+                controls: controls_labels(Some(&assets.lang)),
+                language: language_labels(Some(&assets.lang)),
+                chat: chat_labels(Some(&assets.lang)),
+                skin: skin_labels(Some(&assets.lang)),
+                vbo_supported: true,
+                locales: vec![settings.language.clone()],
+            },
         );
     }
 
     /// Runs one latched-slider drag at the free pointer's x: the hub's FOV
-    /// slider or the video screen's latched slider writes again per event
-    /// through apply, with the slider's own save rule. An unlatched
-    /// pointer writes nothing.
+    /// slider, the video screen's latched slider, the sounds screen's
+    /// latched category slider or the controls screen's sensitivity slider
+    /// writes again per event through apply, with the slider's own save
+    /// rule. An unlatched pointer writes nothing.
     fn options_drag(&mut self) {
         let Some(cursor) = self.cursor else {
             return;
@@ -3224,16 +3558,43 @@ impl ClientApp {
             if action.relayout() {
                 self.relay_options_layout();
             }
+            return;
+        }
+        let sound_action = self
+            .screens
+            .sound_mut()
+            .and_then(|screen| screen.drag_to(cursor.0, self.settings.settings_mut()));
+        if let Some(action) = sound_action {
+            self.push_settings();
+            self.fold_options_save(action.save_kind());
+            return;
+        }
+        let controls_action = self
+            .screens
+            .controls_mut()
+            .and_then(|screen| screen.drag_to(cursor.0, self.settings.settings_mut()));
+        if let Some(action) = controls_action {
+            self.push_settings();
+            self.fold_options_save(action.save_kind());
         }
     }
 
     /// Releases every options slider latch (`mouseReleased` clears the
-    /// drag on any release).
+    /// drag on any release): the sounds screen answers whether a latch
+    /// stood, and the caller plays `gui.button.press` on one.
     fn options_release(&mut self) {
         if let Some(screen) = self.screens.options_mut() {
             screen.release();
         }
         if let Some(screen) = self.screens.video_mut() {
+            screen.release();
+        }
+        if let Some(screen) = self.screens.sound_mut() {
+            if screen.release() {
+                self.play_press_sound();
+            }
+        }
+        if let Some(screen) = self.screens.controls_mut() {
             screen.release();
         }
     }
@@ -3658,9 +4019,22 @@ impl ClientApp {
             self.multiplayer_key(event);
             return true;
         }
+        // The controls screen owns its keys: an armed row binds the key
+        // (Escape unbinds to 0), and the row's press already swallowed the
+        // E-inventory swap below by returning here — every key over the
+        // screen is its own (`GuiControls.keyTyped`:127-152).
+        if self.screens.controls_mut().is_some() {
+            if let PhysicalKey::Code(code) = event.physical_key {
+                self.controls_key(code);
+            }
+            return true;
+        }
         let PhysicalKey::Code(code) = event.physical_key else {
             return true;
         };
+        // The bound key, read once through the store's table: every screen
+        // path below takes the game key, never the physical one.
+        let pressed = keymap::translate(code, &self.settings.settings().bindings);
         // The sign editor owns its keys: E types `e` instead of closing —
         // the editor has no inventory-key close (`keyTyped`:94-121 owns
         // every key but Escape, which the caller routes). The book reader
@@ -3669,7 +4043,7 @@ impl ClientApp {
         // Escape closes through the base rule) — and the read-only port
         // swallows every other key with no page-turn binding (a port
         // choice; Task 24 owns key routing).
-        if code == KeyCode::KeyE
+        if pressed == Some(Key::E)
             && self.screens.sign_mut().is_none()
             && self.screens.book_mut().is_none()
         {
@@ -3680,7 +4054,7 @@ impl ClientApp {
         // keys navigate and characters type under the 90-pixel cap
         // (`keyTyped`:94-116); every other key is the editor's to swallow.
         if self.screens.sign_mut().is_some() {
-            if let Some(key) = keymap::translate(code) {
+            if let Some(key) = pressed {
                 if let Some(screen) = self.screens.sign_mut() {
                     screen.key(key);
                 }
@@ -3704,11 +4078,9 @@ impl ClientApp {
             .is_some_and(|screen| family_b::field_owns_input(screen))
         {
             let mut events = Vec::new();
-            if let PhysicalKey::Code(code) = event.physical_key {
-                if let Some(key) = keymap::translate(code) {
-                    if let Some(screen) = self.screens.container_mut() {
-                        events.extend(family_b::family_key(screen, key));
-                    }
+            if let Some(key) = pressed {
+                if let Some(screen) = self.screens.container_mut() {
+                    events.extend(family_b::family_key(screen, key));
                 }
             }
             if let Some(text) = event.text.as_deref() {
@@ -3736,7 +4108,13 @@ impl ClientApp {
                 .screens
                 .creative_mut()
                 .is_some_and(|screen| screen.selected_tab() != creative::SEARCH_TAB)
-                && chat_opener(event.state, event.repeat, event.physical_key).is_some()
+                && chat_opener(
+                    event.state,
+                    event.repeat,
+                    event.physical_key,
+                    &self.settings.settings().bindings,
+                )
+                .is_some()
             {
                 self.screens
                     .creative_mut()
@@ -3744,7 +4122,7 @@ impl ClientApp {
                     .chat_key();
                 return true;
             }
-            if let Some(index) = number_key_index(code) {
+            if let Some(index) = pressed.and_then(digit_slot) {
                 if let Some(events) = self.creative_digit_events(index) {
                     for event in events {
                         self.send_input(event);
@@ -3752,7 +4130,7 @@ impl ClientApp {
                     return true;
                 }
             }
-            if code == KeyCode::KeyQ {
+            if pressed == Some(Key::Q) {
                 for event in self
                     .screens
                     .creative_mut()
@@ -3763,7 +4141,7 @@ impl ClientApp {
                 }
                 return true;
             }
-            if let Some(key) = keymap::translate(code) {
+            if let Some(key) = pressed {
                 if self
                     .screens
                     .creative_mut()
@@ -3781,13 +4159,13 @@ impl ClientApp {
             }
             return true;
         }
-        if let Some(index) = number_key_index(code) {
+        if let Some(index) = pressed.and_then(digit_slot) {
             for event in self.container_digit_events(index) {
                 self.send_input(event);
             }
             return true;
         }
-        if code == KeyCode::KeyQ {
+        if pressed == Some(Key::Q) {
             let events = self
                 .screens
                 .container_mut()
@@ -3834,9 +4212,11 @@ impl ClientApp {
 
     /// One wheel event's own route: the chat log's while the field is open
     /// (`GuiChat.handleMouseInput`:143-167), the creative list's over the
-    /// creative screen (`handleMouseInput`:546-569) — and the held-slot
-    /// change concurrently in every case: `changeCurrentItem` has no screen
-    /// guard, so the screen's own handler runs in addition
+    /// creative screen (`handleMouseInput`:546-569), the video list's over
+    /// the video screen — and the controls binding list's and the language
+    /// locale list's over theirs (both ride `GuiSlot`'s scroll) — and the
+    /// held-slot change concurrently in every case: `changeCurrentItem` has
+    /// no screen guard, so the screen's own handler runs in addition
     /// (`Minecraft.java`:1879/:1892).
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         if self.chat_input.open {
@@ -3854,6 +4234,10 @@ impl ClientApp {
                     screen.wheel(&scaled, notch);
                 }
             }
+        } else if let Some(screen) = self.screens.controls_mut() {
+            screen.wheel(creative_wheel_notch(delta) as i32);
+        } else if let Some(screen) = self.screens.language_mut() {
+            screen.wheel(creative_wheel_notch(delta) as i32);
         }
         if let Some((slot, event)) = wheel_held_step(self.held, delta) {
             self.held = slot;
@@ -3941,6 +4325,19 @@ impl ClientApp {
                 }
                 self.cursor = Some((x, y));
                 self.feed_screen_mouse();
+                if self.screens.pause_family_open() {
+                    // The window's own pause-family path, so a rig run
+                    // presses exactly what the pointer presses: the button
+                    // number follows the window's own mapping.
+                    let button = match button {
+                        ClickButton::Left => 0,
+                        ClickButton::Right => 1,
+                        ClickButton::Pick => 2,
+                    };
+                    self.pause_family_click(event_loop, button, (x, y));
+                    self.options_release();
+                    return;
+                }
                 let level = self.view.level();
                 let now = system_time_ms();
                 for state in [ElementState::Pressed, ElementState::Released] {
@@ -3988,16 +4385,27 @@ impl ClientApp {
     fn script_key(&mut self, event_loop: &ActiveEventLoop, key: ScriptKey) {
         match key {
             ScriptKey::Escape => {
-                match escape_route(
-                    self.chat_input.open,
-                    self.chat.confirm_open(),
-                    self.screens.is_open(),
-                    &mut self.capture,
-                ) {
-                    EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
-                    EscapeRoute::CloseChat => self.close_chat(event_loop),
-                    EscapeRoute::CloseScreen => self.close_screen(event_loop),
-                    EscapeRoute::Capture(step) => self.escape_capture(event_loop, step),
+                // An armed controls row binds Escape as the unbind key before
+                // the window's Escape route runs, arm for arm with the live
+                // key (`GuiControls.keyTyped`:127-128 answers 0).
+                if self
+                    .screens
+                    .controls_mut()
+                    .is_some_and(|screen| screen.armed().is_some())
+                {
+                    self.controls_key(KeyCode::Escape);
+                } else {
+                    match escape_route(
+                        self.chat_input.open,
+                        self.chat.confirm_open(),
+                        self.screens.is_open(),
+                        &mut self.capture,
+                    ) {
+                        EscapeRoute::CancelConfirm => self.chat.cancel_confirm(),
+                        EscapeRoute::CloseChat => self.close_chat(event_loop),
+                        EscapeRoute::CloseScreen => self.close_screen(event_loop),
+                        EscapeRoute::Capture(step) => self.escape_capture(event_loop, step),
+                    }
                 }
             }
             ScriptKey::F3 => {
@@ -4037,7 +4445,19 @@ impl ClientApp {
                         ),
                         _ => unreachable!("escape, F3 and H route above"),
                     };
-                    if code == KeyCode::KeyE
+                    // The controls screen owns scripted keys exactly like live
+                    // ones: its branch runs ahead of the window's swap chain
+                    // (`ClientApp::on_screen_key`), so an armed row binds the
+                    // gesture's code (`GuiControls.keyTyped`:127-152).
+                    if self.screens.controls_mut().is_some() {
+                        self.controls_key(code);
+                        return;
+                    }
+                    // The script names gestures, not physical keys: the
+                    // gesture's default code reads through the default
+                    // table, so a script means the same under any rebind.
+                    let pressed = keymap::translate(code, &default_bindings());
+                    if pressed == Some(Key::E)
                         && self.screens.sign_mut().is_none()
                         && self.screens.book_mut().is_none()
                     {
@@ -4045,7 +4465,7 @@ impl ClientApp {
                         return;
                     }
                     if self.screens.sign_mut().is_some() {
-                        if let Some(key) = keymap::translate(code) {
+                        if let Some(key) = pressed {
                             if let Some(screen) = self.screens.sign_mut() {
                                 screen.key(key);
                             }
@@ -4063,7 +4483,7 @@ impl ClientApp {
                         .is_some_and(|screen| family_b::field_owns_input(screen))
                     {
                         let mut events = Vec::new();
-                        if let Some(key) = keymap::translate(code) {
+                        if let Some(key) = pressed {
                             if let Some(screen) = self.screens.container_mut() {
                                 events.extend(family_b::family_key(screen, key));
                             }
@@ -4078,7 +4498,7 @@ impl ClientApp {
                     }
                     let ctrl = self.ctrl;
                     if self.screens.creative_mut().is_some() {
-                        if let Some(index) = number_key_index(code) {
+                        if let Some(index) = pressed.and_then(digit_slot) {
                             if let Some(events) = self.creative_digit_events(index) {
                                 for event in events {
                                     self.send_input(event);
@@ -4086,7 +4506,7 @@ impl ClientApp {
                             }
                             return;
                         }
-                        if code == KeyCode::KeyQ {
+                        if pressed == Some(Key::Q) {
                             for event in self
                                 .screens
                                 .creative_mut()
@@ -4098,13 +4518,13 @@ impl ClientApp {
                         }
                         return;
                     }
-                    if let Some(index) = number_key_index(code) {
+                    if let Some(index) = pressed.and_then(digit_slot) {
                         for event in self.container_digit_events(index) {
                             self.send_input(event);
                         }
                         return;
                     }
-                    if code == KeyCode::KeyQ {
+                    if pressed == Some(Key::Q) {
                         let events = self
                             .screens
                             .container_mut()
@@ -4305,21 +4725,15 @@ impl ClientApp {
         // other click is the screen's to swallow — the pointer never grabs
         // behind it.
         if self.screens.pause_family_open() {
-            if state == ElementState::Pressed && button == WinitMouseButton::Left {
-                if let Some(point) = self.cursor {
-                    if self.screens.pause_mut().is_some() {
-                        self.pause_click(event_loop, point);
-                    } else if self.screens.stats_mut().is_some() {
-                        self.stats_click(point);
-                    } else if self.screens.achievements_mut().is_some() {
-                        self.achievements_click(point);
-                    } else if self.screens.options_mut().is_some() {
-                        self.options_click(event_loop, point);
-                    } else if self.screens.video_mut().is_some() {
-                        self.video_click(event_loop, point);
-                    } else if self.screens.snooper_mut().is_some() {
-                        self.snooper_click(event_loop, point);
-                    }
+            if state == ElementState::Pressed {
+                let button = match button {
+                    WinitMouseButton::Left => Some(0),
+                    WinitMouseButton::Right => Some(1),
+                    WinitMouseButton::Middle => Some(2),
+                    _ => None,
+                };
+                if let (Some(point), Some(button)) = (self.cursor, button) {
+                    self.pause_family_click(event_loop, button, point);
                 }
             } else if state == ElementState::Released && button == WinitMouseButton::Left {
                 self.options_release();
@@ -5411,6 +5825,7 @@ fn gameplay_key(
     grabbed: bool,
     state: ElementState,
     physical_key: PhysicalKey,
+    bindings: &[Binding],
 ) -> Option<InputEvent> {
     if !grabbed {
         return None;
@@ -5418,7 +5833,7 @@ fn gameplay_key(
     let PhysicalKey::Code(code) = physical_key else {
         return None;
     };
-    keymap::translate(code)
+    keymap::translate(code, bindings)
         .filter(|key| key.is_gameplay())
         .map(|key| InputEvent::Key {
             key,
@@ -5426,26 +5841,36 @@ fn gameplay_key(
         })
 }
 
-/// The inventory's opener key while no screen is open: a fresh press of E
-/// stands the window-0 screen (`Minecraft.java`:2090-2103 drains the
-/// `keyBindInventory` press queue; the keymap binding itself is Task 24's,
-/// so this reads the physical key). A repeat is not a fresh press and opens
+/// The inventory's opener key while no screen is open: a fresh press of the
+/// bound inventory key stands the window-0 screen (`Minecraft.java`:2090-2103
+/// drains the `keyBindInventory` press queue; the binding reads through the
+/// store's table). A repeat is not a fresh press and opens
 /// nothing; a release is no open at all.
-fn inventory_opener(state: ElementState, repeat: bool, physical_key: PhysicalKey) -> bool {
+fn inventory_opener(
+    state: ElementState,
+    repeat: bool,
+    physical_key: PhysicalKey,
+    bindings: &[Binding],
+) -> bool {
     if state != ElementState::Pressed || repeat {
         return false;
     }
-    matches!(physical_key, PhysicalKey::Code(KeyCode::KeyE))
+    let PhysicalKey::Code(code) = physical_key else {
+        return false;
+    };
+    keymap::translate(code, bindings) == Some(Key::E)
 }
-/// The chat's opener keys while it is closed: a fresh press of T opens an
-/// empty field, `/` a slashed one — the source's two chat keys
-/// (`Minecraft.java`:2113-2121 over the `keyBindChat` and `keyBindCommand`
-/// bindings, `GameSettings.java`:139, `:141`). A repeat is not a fresh press
-/// and opens nothing; a release is no open at all.
+/// The chat's opener keys while it is closed: a fresh press of the bound
+/// chat key opens an empty field, of the bound command key a slashed one —
+/// the source's two chat keys (`Minecraft.java`:2113-2121 over the
+/// `keyBindChat` and `keyBindCommand` bindings, `GameSettings.java`:139,
+/// `:141`; both read through the store's table). A repeat is not a fresh
+/// press and opens nothing; a release is no open at all.
 fn chat_opener(
     state: ElementState,
     repeat: bool,
     physical_key: PhysicalKey,
+    bindings: &[Binding],
 ) -> Option<&'static str> {
     if state != ElementState::Pressed || repeat {
         return None;
@@ -5453,7 +5878,7 @@ fn chat_opener(
     let PhysicalKey::Code(code) = physical_key else {
         return None;
     };
-    match keymap::translate(code) {
+    match keymap::translate(code, bindings) {
         Some(Key::T) => Some(""),
         Some(Key::Slash) => Some("/"),
         _ => None,
@@ -5757,31 +6182,23 @@ const SCRIPT_DIGIT_CODES: [KeyCode; 9] = [
 /// read the scripted edge as a typed key.
 const SCRIPT_DIGIT_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
-/// The hotbar index a number key maps to, or `None` for any other key: the
-/// top-row digits and the numpad both swap (`checkHotbarKeys`:718-733 reads
-/// the hotbar bindings 0..8, sent as mode 2's button).
-fn number_key_index(code: KeyCode) -> Option<u8> {
-    match code {
-        KeyCode::Digit1 | KeyCode::Numpad1 => Some(0),
-        KeyCode::Digit2 | KeyCode::Numpad2 => Some(1),
-        KeyCode::Digit3 | KeyCode::Numpad3 => Some(2),
-        KeyCode::Digit4 | KeyCode::Numpad4 => Some(3),
-        KeyCode::Digit5 | KeyCode::Numpad5 => Some(4),
-        KeyCode::Digit6 | KeyCode::Numpad6 => Some(5),
-        KeyCode::Digit7 | KeyCode::Numpad7 => Some(6),
-        KeyCode::Digit8 | KeyCode::Numpad8 => Some(7),
-        KeyCode::Digit9 | KeyCode::Numpad9 => Some(8),
+/// The hotbar slot a game key selects, or `None` for any other key: the
+/// bound top-row digits and the numpad both swap (`checkHotbarKeys`:718-733
+/// reads the hotbar bindings 0..8, sent as mode 2's button; the numpad reads
+/// past the bindings).
+fn digit_slot(key: Key) -> Option<u8> {
+    match key {
+        Key::Digit1 => Some(0),
+        Key::Digit2 => Some(1),
+        Key::Digit3 => Some(2),
+        Key::Digit4 => Some(3),
+        Key::Digit5 => Some(4),
+        Key::Digit6 => Some(5),
+        Key::Digit7 => Some(6),
+        Key::Digit8 => Some(7),
+        Key::Digit9 => Some(8),
         _ => None,
     }
-}
-
-/// The digit press's direct set outside screens: the slot the key selects,
-/// sent as `HeldItemChange` (`Minecraft.java`:2076-2090 sets `currentItem`
-/// with no screen guard). `None` for any other key.
-fn hotbar_select(code: KeyCode) -> Option<InputEvent> {
-    number_key_index(code).map(|slot| InputEvent::HeldItemChange {
-        slot: i16::from(slot),
-    })
 }
 
 /// One wheel event's held-slot step from the live selection: the new slot
@@ -6334,10 +6751,10 @@ mod tests {
         SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
         WorldOverlayState, aim_outline, apply_overlay_event, bound_mouse_button, camera_pose,
         chat_opener, chat_wheel_lines, clear_break_stage, command_text, cracks_in_view,
-        creative_wheel_notch, escape_route, f3_hold_step, frame_params, gameplay_key,
-        hotbar_select, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
-        is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv, number_key_index,
-        parse_script, parse_server_address, particle_draws, scaled_cursor, screen_button_events,
+        creative_wheel_notch, digit_slot, escape_route, f3_hold_step, frame_params, gameplay_key,
+        interpolate_pose, inventory_opener, is_enter_press, is_escape_press, is_f3_press,
+        is_h_press, load_sounds_bytes, local_sound_play, missing_uv, parse_script,
+        parse_server_address, particle_draws, scaled_cursor, screen_button_events,
         screen_click_button, scripted_chat_click, skin_requests, store_aim, store_break_stage,
         store_skins, tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step,
         wire_sound_play,
@@ -6348,6 +6765,7 @@ mod tests {
     use oxide_assets::model::Transform;
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
+    use oxide_client::keymap;
     use oxide_game::audio::{ListenerPose, PlaySound, SoundCategory};
     use oxide_game::chat::{ClickAction, ClickEvent};
     use oxide_game::container::{CLICK_MODE_DRAG, CLICK_MODE_PICKUP, CLICK_MODE_SWAP, drag_button};
@@ -6356,6 +6774,7 @@ mod tests {
     use oxide_game::interaction::Face;
     use oxide_game::particles::{ParticleFrame, ParticleTex};
     use oxide_game::session::{ClientEvent, MeshAssets};
+    use oxide_game::settings::{GameSettings, default_bindings};
     use oxide_game::weather::WeatherColumn;
     use oxide_proto_v47::entity::MetadataItem;
     use oxide_proto_v47::window::WindowKind;
@@ -7076,40 +7495,31 @@ mod tests {
 
     #[test]
     fn the_number_keys_index_the_hotbar() {
-        // The top-row digits and the numpad both swap: 1-9 read hotbar
+        // The bound hotbar digits and the numpad both swap: 1-9 read hotbar
         // indices 0-8 (`checkHotbarKeys`:718-733 sends mode 2's button) —
         // anything else is no number key at all.
-        assert_eq!(number_key_index(KeyCode::Digit1), Some(0));
-        assert_eq!(number_key_index(KeyCode::Digit9), Some(8));
-        assert_eq!(number_key_index(KeyCode::Numpad5), Some(4));
-        assert_eq!(number_key_index(KeyCode::KeyE), None);
-        assert_eq!(number_key_index(KeyCode::KeyQ), None);
+        assert_eq!(digit_slot(Key::Digit1), Some(0));
+        assert_eq!(digit_slot(Key::Digit9), Some(8));
+        assert_eq!(digit_slot(Key::Digit5), Some(4));
+        assert_eq!(digit_slot(Key::E), None);
+        assert_eq!(digit_slot(Key::Q), None);
     }
 
     #[test]
     fn a_digit_press_selects_its_slot_outside_screens() {
         // The unguarded direct set (`Minecraft.java`:2076-2090): digit N is
         // slot N−1, sent as `HeldItemChange` — anything else is no digit.
-        assert_eq!(
-            hotbar_select(KeyCode::Digit1),
-            Some(InputEvent::HeldItemChange { slot: 0 })
-        );
-        assert_eq!(
-            hotbar_select(KeyCode::Digit4),
-            Some(InputEvent::HeldItemChange { slot: 3 })
-        );
-        assert_eq!(
-            hotbar_select(KeyCode::Digit9),
-            Some(InputEvent::HeldItemChange { slot: 8 })
-        );
-        assert_eq!(
-            hotbar_select(KeyCode::Numpad5),
-            Some(InputEvent::HeldItemChange { slot: 4 }),
-            "the numpad selects too"
-        );
-        assert_eq!(hotbar_select(KeyCode::KeyE), None);
-        assert_eq!(hotbar_select(KeyCode::KeyQ), None);
-        assert_eq!(hotbar_select(KeyCode::KeyW), None);
+        // The game keys come through the store's table, so the physical
+        // Numpad5 and the top-row Digit4 both resolve through `translate`.
+        let bindings = default_bindings();
+        let slot = |code: KeyCode| keymap::translate(code, &bindings).and_then(digit_slot);
+        assert_eq!(slot(KeyCode::Digit1), Some(0));
+        assert_eq!(slot(KeyCode::Digit4), Some(3));
+        assert_eq!(slot(KeyCode::Digit9), Some(8));
+        assert_eq!(slot(KeyCode::Numpad5), Some(4), "the numpad selects too");
+        assert_eq!(slot(KeyCode::KeyE), None);
+        assert_eq!(slot(KeyCode::KeyQ), None);
+        assert_eq!(slot(KeyCode::KeyW), None);
     }
 
     #[test]
@@ -7237,23 +7647,24 @@ mod tests {
 
     #[test]
     fn gameplay_keys_translate_only_while_grabbed() {
+        let bindings = default_bindings();
         let w = PhysicalKey::Code(KeyCode::KeyW);
         assert_eq!(
-            gameplay_key(true, ElementState::Pressed, w),
+            gameplay_key(true, ElementState::Pressed, w, &bindings),
             Some(InputEvent::Key {
                 key: Key::W,
                 pressed: true
             })
         );
         assert_eq!(
-            gameplay_key(true, ElementState::Released, w),
+            gameplay_key(true, ElementState::Released, w, &bindings),
             Some(InputEvent::Key {
                 key: Key::W,
                 pressed: false
             })
         );
         assert_eq!(
-            gameplay_key(false, ElementState::Pressed, w),
+            gameplay_key(false, ElementState::Pressed, w, &bindings),
             None,
             "gameplay input is suppressed while the pointer is free"
         );
@@ -7261,10 +7672,44 @@ mod tests {
             gameplay_key(
                 true,
                 ElementState::Pressed,
-                PhysicalKey::Code(KeyCode::KeyQ)
+                PhysicalKey::Code(KeyCode::KeyQ),
+                &bindings
             ),
             None,
             "an unbound key sends nothing even while grabbed"
+        );
+    }
+
+    #[test]
+    fn gameplay_keys_follow_the_rebound_table() {
+        // The rebinding machine's write lands in the same store the router
+        // reads: moving forward off W leaves the W press with no game key,
+        // and hands forward to the rebound physical key.
+        let mut settings = GameSettings::default();
+        keymap::rebind_key(&mut settings, "forward", 30);
+        let bindings = &settings.bindings;
+        assert_eq!(
+            gameplay_key(
+                true,
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::KeyW),
+                bindings
+            ),
+            None,
+            "W no longer drives anything once forward leaves it"
+        );
+        assert_eq!(
+            gameplay_key(
+                true,
+                ElementState::Pressed,
+                PhysicalKey::Code(KeyCode::KeyA),
+                bindings
+            ),
+            Some(InputEvent::Key {
+                key: Key::W,
+                pressed: true
+            }),
+            "the rebound key now drives forward"
         );
     }
 
@@ -9149,14 +9594,24 @@ mod tests {
         // GuiChat("/")` on the `keyBindChat` / `keyBindCommand` presses
         // (`Minecraft.runTick`:2113-2121), and the source's bindings are T (code 20) and
         // slash (code 53) (`GameSettings.java`:139, `:141`). An opener is a
-        // fresh press of the physical key: a release or a repeat is no open.
+        // fresh press of the bound key: a release or a repeat is no open.
+        let bindings = default_bindings();
         let t = PhysicalKey::Code(KeyCode::KeyT);
         let slash = PhysicalKey::Code(KeyCode::Slash);
-        assert_eq!(chat_opener(ElementState::Pressed, false, t), Some(""));
-        assert_eq!(chat_opener(ElementState::Pressed, false, slash), Some("/"));
-        assert_eq!(chat_opener(ElementState::Released, false, t), None);
         assert_eq!(
-            chat_opener(ElementState::Pressed, true, t),
+            chat_opener(ElementState::Pressed, false, t, &bindings),
+            Some("")
+        );
+        assert_eq!(
+            chat_opener(ElementState::Pressed, false, slash, &bindings),
+            Some("/")
+        );
+        assert_eq!(
+            chat_opener(ElementState::Released, false, t, &bindings),
+            None
+        );
+        assert_eq!(
+            chat_opener(ElementState::Pressed, true, t, &bindings),
             None,
             "an auto-repeat is not a fresh press"
         );
@@ -9164,7 +9619,8 @@ mod tests {
             chat_opener(
                 ElementState::Pressed,
                 false,
-                PhysicalKey::Code(KeyCode::KeyW)
+                PhysicalKey::Code(KeyCode::KeyW),
+                &bindings
             ),
             None
         );
@@ -9174,19 +9630,26 @@ mod tests {
     fn the_inventory_opener_is_a_fresh_e_press() {
         // E stands the window-0 screen beside one C16 (`Minecraft.runTick`
         // :2090-2103 drains the `keyBindInventory` press queue; the keymap
-        // binding itself is Task 24's, so the seam reads the physical key).
+        // reads the bound inventory key through the store's table).
         // An opener is a fresh press: a release or a repeat is no open.
+        let bindings = default_bindings();
         let e = PhysicalKey::Code(KeyCode::KeyE);
-        assert!(inventory_opener(ElementState::Pressed, false, e));
-        assert!(!inventory_opener(ElementState::Released, false, e));
+        assert!(inventory_opener(ElementState::Pressed, false, e, &bindings));
+        assert!(!inventory_opener(
+            ElementState::Released,
+            false,
+            e,
+            &bindings
+        ));
         assert!(
-            !inventory_opener(ElementState::Pressed, true, e),
+            !inventory_opener(ElementState::Pressed, true, e, &bindings),
             "an auto-repeat is not a fresh press"
         );
         assert!(!inventory_opener(
             ElementState::Pressed,
             false,
-            PhysicalKey::Code(KeyCode::KeyW)
+            PhysicalKey::Code(KeyCode::KeyW),
+            &bindings
         ));
     }
 
@@ -9273,7 +9736,12 @@ mod tests {
             KeyCode::ArrowDown,
         ] {
             assert_eq!(
-                gameplay_key(true, ElementState::Pressed, PhysicalKey::Code(code)),
+                gameplay_key(
+                    true,
+                    ElementState::Pressed,
+                    PhysicalKey::Code(code),
+                    &default_bindings()
+                ),
                 None,
                 "{code:?} is not gameplay input"
             );
@@ -9282,7 +9750,8 @@ mod tests {
             gameplay_key(
                 true,
                 ElementState::Pressed,
-                PhysicalKey::Code(KeyCode::KeyW)
+                PhysicalKey::Code(KeyCode::KeyW),
+                &default_bindings()
             ),
             Some(InputEvent::Key {
                 key: Key::W,

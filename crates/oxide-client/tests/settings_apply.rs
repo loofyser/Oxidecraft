@@ -335,6 +335,7 @@ fn apply_sends_the_session_pushes() {
             assert!(push.graphics_fast, "the Fast path rides the push");
             assert_eq!(push.smooth_lighting, 0);
             assert_eq!(push.sensitivity, 0.8);
+            assert!(push.invert_mouse, "the invert flag rides the push");
             assert_eq!(push.particles, ParticleSetting::Minimal);
         }
         other => panic!("the second push carries the whole store: {other:?}"),

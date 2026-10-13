@@ -260,8 +260,9 @@ pub enum InputEvent {
     /// the wire ones at the next options save (`sendSettingsToServer`,
     /// `GameSettings.java:1203-1216`); this port sends on the push itself,
     /// which the client's apply path routes through. An unchanged wire
-    /// payload sends nothing. The keymap has no binding store for a push to
-    /// carry (Task 19 owns the `Binding` list), so no key fields ride here.
+    /// payload sends nothing. The key bindings stay client-side — the
+    /// client's keymap translates them before sending — so no key fields
+    /// ride here.
     PushSettings(SessionPush),
     /// The settings screen applied its particle regime: the session's live
     /// engine takes the setting at once.
@@ -292,6 +293,11 @@ pub struct SessionPush {
     /// The mouse sensitivity the look mapping runs with
     /// (`GameSettings.java:65`); clamped to 0-1.
     pub sensitivity: f32,
+    /// Whether the look mapping flips the pitch sign
+    /// (`GameSettings.java`: the invert-mouse option `EntityRenderer.java`
+    /// reads at `:1103-1107`); carried beside the sensitivity so the two
+    /// cannot drift.
+    pub invert_mouse: bool,
     /// The particle regime the live engine takes.
     pub particles: ParticleSetting,
 }

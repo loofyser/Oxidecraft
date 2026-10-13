@@ -26,6 +26,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use oxide_assets::font::Font;
 use oxide_assets::texture::Texture;
 use oxide_client::screens::options::{VideoControl, VideoScreen, video_labels};
+use oxide_client::screens::options_chat::{ChatScreen, chat_labels};
+use oxide_client::screens::options_controls::{ControlsScreen, controls_labels};
+use oxide_client::screens::options_language::{LanguageScreen, language_labels};
+use oxide_client::screens::options_skin::{SkinScreen, skin_labels};
+use oxide_client::screens::options_sound::{SoundScreen, sound_labels};
 use oxide_client::screens::pause::{DIRT_SHEET, dirt_draws};
 use oxide_client::screens::widgets::WIDGETS_SHEET;
 use oxide_game::settings::GameSettings;
@@ -354,12 +359,11 @@ fn expect_options_pixel(pixels: &[u8], x: u32, y: u32, want: [u8; 3], what: &str
     assert!(close, "{what} at ({x}, {y}): got {got:?}, want {want:?}");
 }
 
-/// The video frame's own draws at the probe size: the dirt tiles lead, the
-/// frame's world-present gradient pair falls over them, and the centred
-/// title plus the sixteen rows and Done ride on top — the assembly
-/// `screen_draws` builds for the video family, with the gradient pair's own
-/// literals.
-fn video_frame_draws(font: &Font, screen: &VideoScreen) -> Vec<HudDraw> {
+/// The options frame's own draws for any screen: the dirt tiles lead, the
+/// frame's world-present gradient pair falls over them, and the screen's
+/// draws ride on top — the assembly `screen_draws` builds for the options
+/// family, with the gradient pair's own literals.
+fn options_screen_frame_draws(screen_draws: Vec<HudDraw>) -> Vec<HudDraw> {
     let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
     assert_eq!(
         (scaled.width, scaled.height),
@@ -381,8 +385,248 @@ fn video_frame_draws(font: &Font, screen: &VideoScreen) -> Vec<HudDraw> {
         height: ROWS_TALL as f32 - ROWS_TALL as f32 / 2.0,
         colour: [16.0 / 255.0, 16.0 / 255.0, 16.0 / 255.0, 208.0 / 255.0],
     });
-    draws.extend(screen.draws(font, &scaled, None));
+    draws.extend(screen_draws);
     draws
+}
+
+/// Counts the fully white pixels in the eight rows under `top`: the
+/// synthetic font inks every printable cell solid white, so a centred title
+/// reads as a solid block wherever it sits.
+fn title_ink_in(pixels: &[u8], top: u32) -> usize {
+    (140u32..308)
+        .flat_map(|x| (top..top + 8).map(move |y| (x, y)))
+        .filter(|&(x, y)| options_pixel(pixels, x, y) == [255, 255, 255])
+        .count()
+}
+
+/// Renders one screen's frame and reads it back: the background asserts once
+/// here so the five screen frames below only name their own pixels.
+fn render_screen_frame(draws: &[HudDraw]) -> Vec<u8> {
+    let (device, queue, target, mut hud, _) = options_scene();
+    hud.set_draws(
+        &device,
+        &queue,
+        draws,
+        &TextureRegistry::new(&device, &queue),
+    );
+    let pixels = options_frame(&device, &queue, &target, &hud);
+    expect_options_pixel(
+        &pixels,
+        5,
+        5,
+        [16, 16, 16],
+        "the tinted dirt under the top gradient",
+    );
+    expect_options_pixel(
+        &pixels,
+        5,
+        200,
+        [16, 16, 16],
+        "the tinted dirt under the bottom gradient",
+    );
+    pixels
+}
+
+/// The sounds frame at the default scale: the "Music & Sound Options" title
+/// inks white at y 15, the full-width master knob reads the idle strip and
+/// its track reads the never-highlighting strip, and the dirt holds.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_sounds_frame_at_default_scale() {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    let screen = SoundScreen::new(&scaled, &GameSettings::default(), sound_labels(None));
+    let draws = options_screen_frame_draws(screen.draws(
+        &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
+        &scaled,
+        None,
+    ));
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, y, .. }
+            if text == "Music & Sound Options" && *y == 15.0)),
+        "the centred title draws at (w/2, 15)"
+    );
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. }
+            if text == "Master Volume: 100%")),
+        "the master slider's label draws at the default level"
+    );
+    let knob = (screen.slider(0).knob_x() + 2.0, 30.0);
+    let pixels = render_screen_frame(&draws);
+    let ink = title_ink_in(&pixels, 15);
+    assert!(ink > 100, "the title inks white pixels at y 15: {ink}");
+    expect_options_pixel(
+        &pixels,
+        knob.0 as u32,
+        knob.1 as u32,
+        [200, 200, 200],
+        "the master knob reads the idle strip",
+    );
+    expect_options_pixel(
+        &pixels,
+        100,
+        33,
+        [100, 100, 100],
+        "the master track reads the never-highlighting strip",
+    );
+}
+
+/// The controls frame at the default scale: the "Controls" title inks white
+/// at y 8, the sensitivity label draws at the default, and the idle Done
+/// strip draws.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_controls_frame_at_default_scale() {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    let screen = ControlsScreen::new(
+        &scaled,
+        &GameSettings::default(),
+        controls_labels(None),
+        None,
+    );
+    let draws = options_screen_frame_draws(screen.draws(
+        &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
+        &scaled,
+        None,
+    ));
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, y, .. }
+            if text == "Controls" && *y == 8.0)),
+        "the centred title draws at (w/2, 8)"
+    );
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. }
+            if text == "Sensitivity: 100%")),
+        "the sensitivity slider's label draws at the default"
+    );
+    let pixels = render_screen_frame(&draws);
+    let ink = title_ink_in(&pixels, 8);
+    assert!(ink > 100, "the title inks white pixels at y 8: {ink}");
+    expect_options_pixel(&pixels, 75, 215, [200, 200, 200], "the idle Done strip");
+}
+
+/// The language frame at the default scale: the "Language" title inks white
+/// at y 16, the en_US slot draws, and the idle Force-Unicode strip draws.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_language_frame_at_default_scale() {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    let screen = LanguageScreen::new(
+        &scaled,
+        &GameSettings::default(),
+        language_labels(None),
+        &[String::from("en_US")],
+    );
+    let draws = options_screen_frame_draws(screen.draws(
+        &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
+        &scaled,
+        None,
+    ));
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, y, .. }
+            if text == "Language" && *y == 16.0)),
+        "the centred title draws at (w/2, 16)"
+    );
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. } if text == "en_US")),
+        "today's locale set draws its one slot"
+    );
+    let pixels = render_screen_frame(&draws);
+    let ink = title_ink_in(&pixels, 16);
+    assert!(ink > 100, "the title inks white pixels at y 16: {ink}");
+    expect_options_pixel(
+        &pixels,
+        75,
+        206,
+        [200, 200, 200],
+        "the idle Force-Unicode strip",
+    );
+}
+
+/// The chat-options frame at the default scale: the "Chat Settings" title
+/// inks white at y 20, the visibility row draws at the default, and the idle
+/// row-0 strip draws.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_chat_options_frame_at_default_scale() {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    let screen = ChatScreen::new(&scaled, &GameSettings::default(), chat_labels(None));
+    let draws = options_screen_frame_draws(screen.draws(
+        &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
+        &scaled,
+        None,
+    ));
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, y, .. }
+            if text == "Chat Settings" && *y == 20.0)),
+        "the centred title draws at (w/2, 20)"
+    );
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. }
+            if text.starts_with("Chat: "))),
+        "the visibility row draws at the default"
+    );
+    let pixels = render_screen_frame(&draws);
+    let ink = title_ink_in(&pixels, 20);
+    assert!(ink > 100, "the title inks white pixels at y 20: {ink}");
+    expect_options_pixel(&pixels, 75, 44, [200, 200, 200], "the idle row-0 strip");
+}
+
+/// The skin frame at the default scale: the "Skin Customization" title inks
+/// white at y 20, the cape row draws on at the default byte, and the idle
+/// row-0 strip draws.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_skin_frame_at_default_scale() {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    let screen = SkinScreen::new(&scaled, &GameSettings::default(), skin_labels(None));
+    let draws = options_screen_frame_draws(screen.draws(
+        &Font::load(&options_font_sheet(), None).expect("the synthetic sheet is a 16x16 grid"),
+        &scaled,
+        None,
+    ));
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, y, .. }
+            if text == "Skin Customization" && *y == 20.0)),
+        "the centred title draws at (w/2, 20)"
+    );
+    assert!(
+        draws
+            .iter()
+            .any(|draw| matches!(draw, HudDraw::Text { text, .. }
+            if text == "Cape: On")),
+        "the cape row draws on at the default byte"
+    );
+    let pixels = render_screen_frame(&draws);
+    let ink = title_ink_in(&pixels, 20);
+    assert!(ink > 100, "the title inks white pixels at y 20: {ink}");
+    expect_options_pixel(&pixels, 75, 44, [200, 200, 200], "the idle row-0 strip");
+}
+/// The video frame's own draws at the probe size: the dirt tiles lead, the
+/// frame's world-present gradient pair falls over them, and the centred
+/// title plus the sixteen rows and Done ride on top — the assembly
+/// `screen_draws` builds for the video family, with the gradient pair's own
+/// literals.
+fn video_frame_draws(font: &Font, screen: &VideoScreen) -> Vec<HudDraw> {
+    let scaled = scaled_resolution(ROWS_WIDE, ROWS_TALL, 1);
+    options_screen_frame_draws(screen.draws(font, &scaled, None))
 }
 
 /// The video frame at the default scale: the dirt tiles span 32 px under the

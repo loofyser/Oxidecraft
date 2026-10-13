@@ -22,13 +22,11 @@
 //!
 //! # Out of scope, recorded
 //!
-//! Difficulty, keybinds, resource packs, the stream options, snooper,
-//! touchscreen, the override sizes, chat links flags and held-item tooltips
-//! have no machine in this client and are not carried. `autoJump` and locked
-//! difficulty are absent from the 1.8.9 source itself. `use_vbos` persists but
-//! is a recorded no-op (the renderer always uses VBOs), as is `anaglyph`.
-//! `chat_height` carries the focused height (`GameSettings.java`:109); the
-//! unfocused height follows the same value.
+//! Difficulty, resource packs, the stream options, snooper, touchscreen,
+//! the override sizes and held-item tooltips have no machine in this client
+//! and are not carried. `autoJump` and locked difficulty are absent from
+//! the 1.8.9 source itself. `use_vbos` persists but is a recorded no-op
+//! (the renderer always uses VBOs), as is `anaglyph`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -203,6 +201,96 @@ impl GraphicsSetting {
     }
 }
 
+/// One named key binding: the source's `KeyBinding` description key minus
+/// the `key.` prefix, with its LWJGL code — negative for a mouse button
+/// (`-100` left, `-99` right, `-98` middle), `0` for unbound
+/// (`GameSettings.java`:127-151, `GuiControls.java`:127-152).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Binding {
+    /// The description key minus its `key.` prefix (`forward`, `hotbar.1`).
+    pub name: &'static str,
+    /// The LWJGL code the binding holds.
+    pub code: i32,
+}
+
+/// How many bindings the store carries: the source's 24 named fields plus
+/// the 9-hotbar array (`GameSettings.java`:127-151).
+pub const BINDING_COUNT: usize = 33;
+
+/// The lowest storable code: the left button (`-100 + 0`,
+/// `GuiKeyBindingList.java`:98-110).
+pub const BINDING_CODE_MIN: i32 = -100;
+
+/// The highest storable code: past every LWJGL key code.
+pub const BINDING_CODE_MAX: i32 = 255;
+
+/// The default table in the source's array order (`GameSettings.java`'s
+/// constructor: attack, use, forward, left, back, right, jump, sneak,
+/// sprint, drop, inventory, chat, playerlist, pick block, command,
+/// screenshot, perspective, smooth camera, the four stream keys, fullscreen,
+/// spectator outlines, then hotbar 1-9): `(name, category, code)`.
+pub const BINDING_TABLE: [(&str, &str, i32); BINDING_COUNT] = [
+    ("attack", "key.categories.gameplay", -100),
+    ("use", "key.categories.gameplay", -99),
+    ("forward", "key.categories.movement", 17),
+    ("left", "key.categories.movement", 30),
+    ("back", "key.categories.movement", 31),
+    ("right", "key.categories.movement", 32),
+    ("jump", "key.categories.movement", 57),
+    ("sneak", "key.categories.movement", 42),
+    ("sprint", "key.categories.movement", 29),
+    ("drop", "key.categories.gameplay", 16),
+    ("inventory", "key.categories.inventory", 18),
+    ("chat", "key.categories.multiplayer", 20),
+    ("playerlist", "key.categories.multiplayer", 15),
+    ("pickItem", "key.categories.gameplay", -98),
+    ("command", "key.categories.multiplayer", 53),
+    ("screenshot", "key.categories.misc", 60),
+    ("togglePerspective", "key.categories.misc", 63),
+    ("smoothCamera", "key.categories.misc", 0),
+    ("streamStartStop", "key.categories.stream", 64),
+    ("streamPauseUnpause", "key.categories.stream", 65),
+    ("streamCommercial", "key.categories.stream", 0),
+    ("streamToggleMic", "key.categories.stream", 0),
+    ("fullscreen", "key.categories.misc", 87),
+    ("spectatorOutlines", "key.categories.misc", 0),
+    ("hotbar.1", "key.categories.inventory", 2),
+    ("hotbar.2", "key.categories.inventory", 3),
+    ("hotbar.3", "key.categories.inventory", 4),
+    ("hotbar.4", "key.categories.inventory", 5),
+    ("hotbar.5", "key.categories.inventory", 6),
+    ("hotbar.6", "key.categories.inventory", 7),
+    ("hotbar.7", "key.categories.inventory", 8),
+    ("hotbar.8", "key.categories.inventory", 9),
+    ("hotbar.9", "key.categories.inventory", 10),
+];
+
+/// The binding list's category order: the source sorts by the localized
+/// category (`KeyBinding.compareTo`, `KeyBinding.java`:143-151), which in
+/// English reads Gameplay, Inventory, Miscellaneous, Movement, Multiplayer,
+/// Streaming (`en_US.lang`: `key.categories.*`).
+pub const BINDING_CATEGORY_ORDER: [&str; 6] = [
+    "key.categories.gameplay",
+    "key.categories.inventory",
+    "key.categories.misc",
+    "key.categories.movement",
+    "key.categories.multiplayer",
+    "key.categories.stream",
+];
+
+/// The default bindings as [`Binding`] rows in [`BINDING_TABLE`] order.
+pub fn default_bindings() -> [Binding; BINDING_COUNT] {
+    std::array::from_fn(|index| {
+        let (name, _, code) = BINDING_TABLE[index];
+        Binding { name, code }
+    })
+}
+
+/// Clamps a raw code into the storable range.
+fn clamp_binding(code: i32) -> i32 {
+    code.clamp(BINDING_CODE_MIN, BINDING_CODE_MAX)
+}
+
 /// The vanilla option set with source-derived defaults.
 ///
 /// The per-field wire/local split is documented at the module level; the
@@ -278,8 +366,16 @@ pub struct GameSettings {
     /// Chat width; default 1.0 (`GameSettings.java`:107), range 0-1.
     pub chat_width: f32,
     /// Chat (focused) height; default 1.0 (`GameSettings.java`:109), range
-    /// 0-1. The unfocused height follows the same value, recorded.
+    /// 0-1.
     pub chat_height: f32,
+    /// Chat unfocused height; default 0.44366196 (`GameSettings.java`:108),
+    /// range 0-1.
+    pub chat_height_unfocused: f32,
+    /// Web links in chat; default true (`GameSettings.java`:83).
+    pub chat_links: bool,
+    /// The confirm prompt before opening a chat link; default true
+    /// (`GameSettings.java`:84).
+    pub chat_links_prompt: bool,
     /// Chat colours; default true (`GameSettings.java`:82). Wire field.
     pub chat_colors: bool,
     /// Chat visibility mode; default 0, full. Range [`CHAT_MODE_RANGE`].
@@ -293,6 +389,13 @@ pub struct GameSettings {
     pub language: String,
     /// Forced unicode font; default false (`GameSettings.java`:191).
     pub force_unicode: bool,
+    /// Reduced debug info; default false (`GameSettings.java`: the
+    /// `reducedDebugInfo` flag, no initialiser). It rides the chat screen
+    /// in the source (`ScreenChatOptions.java`:9).
+    pub reduced_debug_info: bool,
+    /// The 33 rebindable keys in [`BINDING_TABLE`] order
+    /// (`GameSettings.java`:127-151).
+    pub bindings: [Binding; BINDING_COUNT],
     /// The last server joined; the source default is empty
     /// (`GameSettings.java`:188), which this port reads as absent.
     pub last_server: Option<String>,
@@ -330,11 +433,16 @@ impl Default for GameSettings {
             chat_scale: 1.0,
             chat_width: 1.0,
             chat_height: 1.0,
+            chat_height_unfocused: 0.44366196,
+            chat_links: true,
+            chat_links_prompt: true,
             chat_colors: true,
             chat_mode: 0,
             skin_parts: 0x7F,
             language: "en_US".to_string(),
             force_unicode: false,
+            reduced_debug_info: false,
+            bindings: default_bindings(),
             last_server: None,
         }
     }
@@ -512,6 +620,19 @@ impl GameSettings {
             }
             return;
         }
+        if key.starts_with("key_") {
+            if let Some(name) = key.strip_prefix("key_") {
+                if BINDING_TABLE.iter().any(|(known, _, _)| *known == name) {
+                    if let Some(raw) = parse_int(value) {
+                        let clamped = raw
+                            .clamp(i64::from(BINDING_CODE_MIN), i64::from(BINDING_CODE_MAX))
+                            as i32;
+                        self.set_binding(name, clamped);
+                    }
+                }
+            }
+            return;
+        }
         match key {
             "render_distance" => {
                 if let Some(raw) = parse_int(value) {
@@ -652,6 +773,21 @@ impl GameSettings {
                     self.chat_height = clamp_f32(level, 0.0, 1.0);
                 }
             }
+            "chat_height_unfocused" => {
+                if let Some(level) = parse_float(value) {
+                    self.chat_height_unfocused = clamp_f32(level, 0.0, 1.0);
+                }
+            }
+            "chat_links" => {
+                if let Some(flag) = parse_bool(value) {
+                    self.chat_links = flag;
+                }
+            }
+            "chat_links_prompt" => {
+                if let Some(flag) = parse_bool(value) {
+                    self.chat_links_prompt = flag;
+                }
+            }
             "chat_colors" => {
                 if let Some(flag) = parse_bool(value) {
                     self.chat_colors = flag;
@@ -677,6 +813,11 @@ impl GameSettings {
             "force_unicode" => {
                 if let Some(flag) = parse_bool(value) {
                     self.force_unicode = flag;
+                }
+            }
+            "reduced_debug_info" => {
+                if let Some(flag) = parse_bool(value) {
+                    self.reduced_debug_info = flag;
                 }
             }
             "last_server" => {
@@ -709,6 +850,15 @@ impl GameSettings {
         }
         map.insert("chat_colors".to_string(), self.chat_colors.to_string());
         map.insert("chat_height".to_string(), fmt_f32(self.chat_height));
+        map.insert(
+            "chat_height_unfocused".to_string(),
+            fmt_f32(self.chat_height_unfocused),
+        );
+        map.insert("chat_links".to_string(), self.chat_links.to_string());
+        map.insert(
+            "chat_links_prompt".to_string(),
+            self.chat_links_prompt.to_string(),
+        );
         map.insert("chat_mode".to_string(), self.chat_mode.to_string());
         map.insert("chat_opacity".to_string(), fmt_f32(self.chat_opacity));
         map.insert("chat_scale".to_string(), fmt_f32(self.chat_scale));
@@ -724,6 +874,9 @@ impl GameSettings {
         map.insert("graphics".to_string(), self.graphics.as_bool().to_string());
         map.insert("gui_scale".to_string(), self.gui_scale.to_string());
         map.insert("invert_mouse".to_string(), self.invert_mouse.to_string());
+        for binding in &self.bindings {
+            map.insert(format!("key_{}", binding.name), binding.code.to_string());
+        }
         map.insert("language".to_string(), quote(&self.language));
         if let Some(server) = &self.last_server {
             map.insert("last_server".to_string(), quote(server));
@@ -743,6 +896,10 @@ impl GameSettings {
         map.insert(
             "realms_notifications".to_string(),
             self.realms_notifications.to_string(),
+        );
+        map.insert(
+            "reduced_debug_info".to_string(),
+            self.reduced_debug_info.to_string(),
         );
         map.insert("skin_parts".to_string(), self.skin_parts.to_string());
         map.insert("smooth_camera".to_string(), self.smooth_camera.to_string());
@@ -803,6 +960,55 @@ impl GameSettings {
     /// largest scale.
     pub fn set_gui_scale_index(&mut self, index: u8) {
         self.gui_scale = index.min(GUI_SCALE_RANGE.1);
+    }
+
+    /// The default code for `name`, or `None` for an unknown binding.
+    pub fn default_binding(name: &str) -> Option<i32> {
+        BINDING_TABLE
+            .iter()
+            .find(|(known, _, _)| *known == name)
+            .map(|(_, _, code)| *code)
+    }
+
+    /// The binding's category key, or `None` for an unknown binding.
+    pub fn binding_category(name: &str) -> Option<&'static str> {
+        BINDING_TABLE
+            .iter()
+            .find(|(known, _, _)| *known == name)
+            .map(|(_, category, _)| *category)
+    }
+
+    /// The code `name` holds now, falling back to its default when the row
+    /// is absent (an unknown name reads `0`, unbound).
+    pub fn binding(&self, name: &str) -> i32 {
+        self.bindings
+            .iter()
+            .find(|binding| binding.name == name)
+            .map(|binding| binding.code)
+            .or_else(|| Self::default_binding(name))
+            .unwrap_or(0)
+    }
+
+    /// Writes `code` into `name`'s row, clamped into the storable range;
+    /// an unknown name writes nothing and answers false
+    /// (`setOptionKeyBinding`, `GameSettings.java`:244-248).
+    pub fn set_binding(&mut self, name: &str, code: i32) -> bool {
+        let Some(row) = self.bindings.iter_mut().find(|row| row.name == name) else {
+            return false;
+        };
+        row.code = clamp_binding(code);
+        true
+    }
+
+    /// Restores every row's default (`GuiControls.java`:79-87).
+    pub fn reset_bindings(&mut self) {
+        self.bindings = default_bindings();
+    }
+
+    /// Whether any row differs from its default: the Reset-All button's own
+    /// enablement (`GuiControls.java`:162-173).
+    pub fn bindings_differ(&self) -> bool {
+        self.bindings != default_bindings()
     }
 
     /// Builds the wire client-settings payload: the locale, the effective
@@ -868,11 +1074,16 @@ mod tests {
             chat_scale: 0.75,
             chat_width: 0.5,
             chat_height: 0.8,
+            chat_height_unfocused: 0.6,
+            chat_links: false,
+            chat_links_prompt: false,
             chat_colors: false,
             chat_mode: 1,
             skin_parts: 0x40,
             language: "de_DE".to_string(),
             force_unicode: true,
+            reduced_debug_info: true,
+            bindings: default_bindings(),
             last_server: Some("play.example.test:25565".to_string()),
         }
     }
@@ -908,11 +1119,16 @@ mod tests {
         assert_eq!(s.chat_scale, 1.0);
         assert_eq!(s.chat_width, 1.0);
         assert_eq!(s.chat_height, 1.0);
+        assert_eq!(s.chat_height_unfocused, 0.44366196);
+        assert!(s.chat_links);
+        assert!(s.chat_links_prompt);
         assert!(s.chat_colors);
         assert_eq!(s.chat_mode, 0);
         assert_eq!(s.skin_parts, 0x7F);
         assert_eq!(s.language, "en_US");
         assert!(!s.force_unicode);
+        assert!(!s.reduced_debug_info);
+        assert_eq!(s.bindings, default_bindings());
         assert_eq!(s.last_server, None);
     }
 
@@ -1160,5 +1376,257 @@ mod tests {
         let body = "last_server = \"\"\n";
         let (_dir, path) = scoped_file("empty-server.toml", body);
         assert_eq!(GameSettings::load(&path).last_server, None);
+    }
+
+    #[test]
+    fn the_default_binding_table_pins_thirty_three_source_rows() {
+        // `GameSettings.java`:127-151: 24 named fields plus the 9-hotbar
+        // array, in the constructor's array order.
+        let bindings = default_bindings();
+        assert_eq!(bindings.len(), BINDING_COUNT);
+        assert_eq!(
+            bindings[0],
+            Binding {
+                name: "attack",
+                code: -100
+            }
+        );
+        assert_eq!(
+            bindings[1],
+            Binding {
+                name: "use",
+                code: -99
+            }
+        );
+        assert_eq!(
+            bindings[2],
+            Binding {
+                name: "forward",
+                code: 17
+            }
+        );
+        assert_eq!(
+            bindings[3],
+            Binding {
+                name: "left",
+                code: 30
+            }
+        );
+        assert_eq!(
+            bindings[4],
+            Binding {
+                name: "back",
+                code: 31
+            }
+        );
+        assert_eq!(
+            bindings[5],
+            Binding {
+                name: "right",
+                code: 32
+            }
+        );
+        assert_eq!(
+            bindings[6],
+            Binding {
+                name: "jump",
+                code: 57
+            }
+        );
+        assert_eq!(
+            bindings[7],
+            Binding {
+                name: "sneak",
+                code: 42
+            }
+        );
+        assert_eq!(
+            bindings[8],
+            Binding {
+                name: "sprint",
+                code: 29
+            }
+        );
+        assert_eq!(
+            bindings[9],
+            Binding {
+                name: "drop",
+                code: 16
+            }
+        );
+        assert_eq!(
+            bindings[10],
+            Binding {
+                name: "inventory",
+                code: 18
+            }
+        );
+        assert_eq!(
+            bindings[11],
+            Binding {
+                name: "chat",
+                code: 20
+            }
+        );
+        assert_eq!(
+            bindings[12],
+            Binding {
+                name: "playerlist",
+                code: 15
+            }
+        );
+        assert_eq!(
+            bindings[13],
+            Binding {
+                name: "pickItem",
+                code: -98
+            }
+        );
+        assert_eq!(
+            bindings[14],
+            Binding {
+                name: "command",
+                code: 53
+            }
+        );
+        assert_eq!(
+            bindings[15],
+            Binding {
+                name: "screenshot",
+                code: 60
+            }
+        );
+        assert_eq!(
+            bindings[16],
+            Binding {
+                name: "togglePerspective",
+                code: 63
+            }
+        );
+        assert_eq!(
+            bindings[17],
+            Binding {
+                name: "smoothCamera",
+                code: 0
+            }
+        );
+        assert_eq!(
+            bindings[18],
+            Binding {
+                name: "streamStartStop",
+                code: 64
+            }
+        );
+        assert_eq!(
+            bindings[19],
+            Binding {
+                name: "streamPauseUnpause",
+                code: 65
+            }
+        );
+        assert_eq!(
+            bindings[20],
+            Binding {
+                name: "streamCommercial",
+                code: 0
+            }
+        );
+        assert_eq!(
+            bindings[21],
+            Binding {
+                name: "streamToggleMic",
+                code: 0
+            }
+        );
+        assert_eq!(
+            bindings[22],
+            Binding {
+                name: "fullscreen",
+                code: 87
+            }
+        );
+        assert_eq!(
+            bindings[23],
+            Binding {
+                name: "spectatorOutlines",
+                code: 0
+            }
+        );
+        for (slot, binding) in bindings[24..].iter().enumerate() {
+            assert_eq!(binding.name, BINDING_TABLE[24 + slot].0);
+            assert_eq!(
+                binding.code,
+                2 + slot as i32,
+                "hotbar slot {} reads code {}",
+                slot + 1,
+                2 + slot as i32
+            );
+        }
+        let categories: Vec<&str> = BINDING_TABLE
+            .iter()
+            .map(|(_, category, _)| *category)
+            .collect();
+        assert!(categories.contains(&"key.categories.movement"));
+        assert!(categories.contains(&"key.categories.gameplay"));
+        assert!(categories.contains(&"key.categories.inventory"));
+        assert!(categories.contains(&"key.categories.multiplayer"));
+        assert!(categories.contains(&"key.categories.misc"));
+        assert!(categories.contains(&"key.categories.stream"));
+    }
+
+    #[test]
+    fn binding_writes_clamp_and_reset_restores() {
+        let mut settings = GameSettings::default();
+        assert!(!settings.bindings_differ());
+        assert!(settings.set_binding("forward", 33));
+        assert_eq!(settings.binding("forward"), 33);
+        assert!(settings.bindings_differ());
+        assert!(settings.set_binding("forward", 9999));
+        assert_eq!(settings.binding("forward"), BINDING_CODE_MAX);
+        assert!(settings.set_binding("attack", -9999));
+        assert_eq!(settings.binding("attack"), BINDING_CODE_MIN);
+        assert!(!settings.set_binding("no_such_key", 5));
+        assert_eq!(settings.binding("no_such_key"), 0);
+        settings.reset_bindings();
+        assert!(!settings.bindings_differ());
+        assert_eq!(settings.binding("forward"), 17);
+    }
+
+    #[test]
+    fn bindings_persist_per_row_through_the_same_file() {
+        let dir = tempfile::tempdir().expect("test scratch dir");
+        let path = dir.path().join("options.toml");
+        let mut before = GameSettings::default();
+        assert!(before.set_binding("forward", 33));
+        assert!(before.set_binding("sprint", 0));
+        before.chat_height_unfocused = 0.6;
+        before.chat_links = false;
+        before.reduced_debug_info = true;
+        before.save(&path).expect("save works");
+        let text = fs::read_to_string(&path).expect("read back");
+        assert!(
+            text.contains("key_forward = 33\n"),
+            "one row per binding:\n{text}"
+        );
+        assert!(
+            text.contains("chat_height_unfocused = 0.6\n"),
+            "text:\n{text}"
+        );
+        let after = GameSettings::load(&path);
+        assert_eq!(before, after);
+        assert_eq!(after.binding("forward"), 33);
+        assert_eq!(after.binding("sprint"), 0);
+        assert!(after.bindings_differ());
+    }
+
+    #[test]
+    fn binding_rows_clamp_and_ignore_unknown_names() {
+        let body =
+            "key_forward = 9999\nkey_attack = -5000\nkey_nope = 12\nkey_forward = notanumber\n";
+        let (_dir, path) = scoped_file("keys.toml", body);
+        let loaded = GameSettings::load(&path);
+        assert_eq!(loaded.binding("forward"), BINDING_CODE_MAX);
+        assert_eq!(loaded.binding("attack"), BINDING_CODE_MIN);
+        assert_eq!(loaded.binding("sprint"), 29);
     }
 }

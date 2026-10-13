@@ -66,6 +66,44 @@ pub const MAX_TEXT_BYTES: usize = 65536;
 /// `chatScale` 1.0F at `GameSettings.java`:106-107).
 pub const CHAT_WIDTH: i32 = 320;
 
+/// The focused chat height at the settings default (`GameSettings.java`:109).
+pub const FOCUSED_HEIGHT_DEFAULT: f32 = 1.0;
+
+/// The unfocused chat height at the settings default
+/// (`GameSettings.java`:108).
+pub const UNFOCUSED_HEIGHT_DEFAULT: f32 = 0.44366196;
+
+/// The chat box's pixel width at `width`: `floor(chatWidth * 280 + 40)`
+/// (`GuiNewChat.java`:343-366).
+pub fn chat_box_width(width: f32) -> i32 {
+    (width * 280.0 + 40.0).floor() as i32
+}
+
+/// The chat box's pixel height at `height`: `floor(h * 160 + 20)` on the
+/// focused or unfocused value (`GuiNewChat.java`:348-371).
+pub fn chat_box_height(height: f32) -> i32 {
+    (height * 160.0 + 20.0).floor() as i32
+}
+
+/// The lines a draw shows at the two heights: the open state's box over the
+/// nine-pixel pitch (`GuiNewChat.java`:375-378 over `:368-373`).
+pub fn chat_line_count(open: bool, focused: f32, unfocused: f32) -> usize {
+    let height = if open { focused } else { unfocused };
+    (chat_box_height(height) / 9) as usize
+}
+
+/// The source's chat-opacity factor (`GuiNewChat.java`:38):
+/// `chatOpacity * 0.9 + 0.1`, all f32.
+pub fn opacity_factor(chat_opacity: f32) -> f32 {
+    chat_opacity * 0.9 + 0.1
+}
+
+/// The opacity slider's label value: `(int)(f * 90 + 10)`
+/// (`GuiNewChat.java`:623).
+pub fn opacity_label_value(chat_opacity: f32) -> u32 {
+    (chat_opacity * 90.0 + 10.0) as u32
+}
+
 /// The log's cap on kept lines, counted in split lines: the source's own one
 /// hundred (`GuiNewChat.java`:162-165).
 pub const LOG_CAP: usize = 100;
@@ -254,6 +292,12 @@ pub struct ChatLog {
     /// Whether the chat window is open, `getChatOpen`'s own
     /// (`GuiNewChat.java`:305-308).
     open: bool,
+    /// The focused box height the drawn count reads (`chatHeightFocused`,
+    /// `GameSettings.java`:109).
+    height_focused: f32,
+    /// The unfocused box height the drawn count reads
+    /// (`chatHeightUnfocused`, `GameSettings.java`:108).
+    height_unfocused: f32,
     /// The tick the fade reads against, set by [`ChatLog::update`].
     tick: u64,
 }
@@ -267,8 +311,17 @@ impl ChatLog {
             scroll: 0,
             scrolled: false,
             open: false,
+            height_focused: FOCUSED_HEIGHT_DEFAULT,
+            height_unfocused: UNFOCUSED_HEIGHT_DEFAULT,
             tick: 0,
         }
+    }
+
+    /// Sets the two box heights the drawn count reads (`GuiNewChat`'s
+    /// `chatHeightFocused` / `chatHeightUnfocused`).
+    pub fn set_heights(&mut self, focused: f32, unfocused: f32) {
+        self.height_focused = focused;
+        self.height_unfocused = unfocused;
     }
 
     /// Sets whether the chat window is open — `getChatOpen`'s own
@@ -322,7 +375,7 @@ impl ChatLog {
     /// drawn count, and reaching zero clears the held flag.
     pub fn scroll(&mut self, amount: i32) {
         self.scroll += amount;
-        let ceiling = self.lines.len() as i32 - Self::line_count(self.open) as i32;
+        let ceiling = self.lines.len() as i32 - self.draw_count() as i32;
         if self.scroll > ceiling {
             self.scroll = ceiling;
         }
@@ -370,7 +423,13 @@ impl ChatLog {
     /// `:368-373` at the two `chatHeight*` settings, and
     /// `GameSettings.java`:108-109).
     pub fn line_count(open: bool) -> usize {
-        if open { LINES_OPEN } else { LINES_CLOSED }
+        chat_line_count(open, FOCUSED_HEIGHT_DEFAULT, UNFOCUSED_HEIGHT_DEFAULT)
+    }
+
+    /// The lines a draw shows at this log's own heights: the open state's
+    /// box over the nine-pixel pitch.
+    pub fn draw_count(&self) -> usize {
+        chat_line_count(self.open, self.height_focused, self.height_unfocused)
     }
 
     /// The fade's alpha at `age` ticks — the source's own arithmetic
@@ -392,7 +451,7 @@ impl ChatLog {
     /// (`GuiNewChat.drawChat`:53-91).
     pub fn drawn(&self) -> Vec<DrawnLine<'_>> {
         let mut drawn = Vec::new();
-        let count = Self::line_count(self.open);
+        let count = self.draw_count();
         for line in self.lines.iter().skip(self.scroll_offset()).take(count) {
             let age = self.tick.saturating_sub(line.received_tick);
             if !self.open && age >= LINE_LIFETIME {
@@ -1728,6 +1787,38 @@ mod tests {
         log.scroll(-1_000);
         assert_eq!(log.scroll_offset(), 0);
         assert!(!log.is_scrolled());
+    }
+
+    #[test]
+    fn the_chat_geometry_laws_hold_at_both_open_states() {
+        // `GuiNewChat.java`:343-371: width = floor(w*280+40), height =
+        // floor(h*160+20) per open state, line count = height/9; the
+        // defaults land on the long-standing 320/180/90 and 20/10.
+        assert_eq!(chat_box_width(1.0), 320);
+        assert_eq!(chat_box_width(0.0), 40);
+        assert_eq!(chat_box_width(0.5), 180);
+        assert_eq!(chat_box_height(1.0), 180);
+        assert_eq!(chat_box_height(0.44366196), 90);
+        assert_eq!(chat_box_height(0.0), 20);
+        assert_eq!(chat_line_count(true, 1.0, 0.44366196), 20);
+        assert_eq!(chat_line_count(false, 1.0, 0.44366196), 10);
+        assert_eq!(ChatLog::line_count(true), 20);
+        assert_eq!(ChatLog::line_count(false), 10);
+        assert_eq!(opacity_factor(1.0), 1.0);
+        assert!((opacity_factor(0.5) - 0.55).abs() < 1e-6);
+        assert_eq!(opacity_label_value(1.0), 100);
+        assert_eq!(opacity_label_value(0.0), 10);
+        // A narrowed unfocused height shrinks the closed window the scroll
+        // clamp reads.
+        let component = parse_json("\"x\"");
+        let mut log = ChatLog::new();
+        for _ in 0..30 {
+            log.push(&component, 0, 320, &font(), &LanguageTable::new());
+        }
+        log.set_heights(1.0, 0.0);
+        assert_eq!(log.draw_count(), 2, "floor(20/9) closed at height 0");
+        log.scroll(100);
+        assert_eq!(log.scroll_offset(), 28);
     }
 
     #[test]

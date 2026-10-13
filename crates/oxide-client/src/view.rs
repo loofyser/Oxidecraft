@@ -23,8 +23,8 @@ use std::time::Instant;
 use oxide_assets::font::Font;
 use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_game::chat::{
-    self, CHAT_WIDTH, ChatLog, LOG_CAP, LanguageTable, STYLE_BOLD, STYLE_ITALIC, STYLE_OBFUSCATED,
-    STYLE_STRIKETHROUGH, STYLE_UNDERLINED, TextComponent,
+    self, ChatLog, LOG_CAP, LanguageTable, STYLE_BOLD, STYLE_ITALIC, STYLE_OBFUSCATED,
+    STYLE_STRIKETHROUGH, STYLE_UNDERLINED, TextComponent, chat_box_width,
 };
 use oxide_game::entity_view::{EntityExtra, EntityFrame, MobExtra, PlayerListRecord};
 use oxide_game::mesher::ModelChoice;
@@ -485,6 +485,44 @@ pub fn screen_draws(screens: &Screens, input: &ScreenDrawInput<'_>) -> Vec<HudDr
         // lead under the gradient, and the centred title, the visible
         // rows and Done ride on top.
         ScreenState::VideoSettings(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        // The five remaining options screens stand over the hub the same
+        // way: the dirt tiles lead under the gradient, and each screen's
+        // own rows and Done ride on top.
+        ScreenState::SoundOptions(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        ScreenState::Controls(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        ScreenState::Language(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        ScreenState::ChatOptions(screen) => {
+            draws.splice(0..0, dirt_draws(&input.scaled));
+            if let Some(font) = input.font {
+                draws.extend(screen.draws(font, &input.scaled, input.mouse));
+            }
+            return draws;
+        }
+        ScreenState::Skin(screen) => {
             draws.splice(0..0, dirt_draws(&input.scaled));
             if let Some(font) = input.font {
                 draws.extend(screen.draws(font, &input.scaled, input.mouse));
@@ -3678,11 +3716,6 @@ fn interpolate_rotation(prev: f32, cur: f32, partial: f32) -> f32 {
 /// (`ChatComponentStyle.getFormattedText`:87-99 over `EnumChatFormatting`'s table).
 const PALETTE: &[u8; 16] = b"0123456789abcdef";
 
-/// The chat opacity the assembly reads — `GameSettings.chatOpacity`'s default
-/// (`GameSettings.java`:85, `1.0F`). A settings store that owns the option is a later
-/// milestone's, so the default stands.
-const CHAT_OPACITY: f32 = 1.0;
-
 /// The newest line's bar bottom, 28 pixels above the screen's bottom edge: the
 /// `(2, 20)` translate (`GuiNewChat.java`:49-51) under the `height - 48` one
 /// (`GuiIngame.java`:343).
@@ -3697,10 +3730,6 @@ const LINE_PITCH: f32 = 9.0;
 /// The bar's height: the pitch's own nine (`GuiNewChat.java`:81-82 draws `j2 - 9` to
 /// `j2`).
 const BAR_HEIGHT: f32 = 9.0;
-
-/// The bar's width: the wrap budget plus four (`GuiNewChat.java`:82,
-/// `getChatWidth`:343-346).
-const BAR_WIDTH: f32 = CHAT_WIDTH as f32 + 4.0;
 
 /// The record line's hold in ticks: `recordPlayingUpFor = 60`
 /// (`GuiIngame.java`:1118-1122), decremented once per tick (`:1070-1073`).
@@ -3800,6 +3829,12 @@ pub struct ChatView {
     /// (`GuiScreen.java`:425-429): raised by the window's link click, ended by the
     /// overlay's two keys.
     confirm: Option<String>,
+    /// The chat opacity the box reads (`GameSettings.chatOpacity`).
+    chat_opacity: f32,
+    /// The chat width the box reads (`GameSettings.chatWidth`).
+    chat_width: f32,
+    /// The chat scale the box reads (`GameSettings.chatScale`).
+    chat_scale: f32,
 }
 
 impl ChatView {
@@ -3814,6 +3849,9 @@ impl ChatView {
             tick: 0,
             tooltip: None,
             confirm: None,
+            chat_opacity: 1.0,
+            chat_width: 1.0,
+            chat_scale: 1.0,
         }
     }
 
@@ -3827,11 +3865,44 @@ impl ChatView {
     /// Sets the measured font and wraps whatever arrived before it — a message can
     /// outrun the asset store by a frame.
     pub fn set_font(&mut self, font: Font) {
+        let width = self.wrap_width();
         for (component, tick) in self.pending.drain(..) {
             self.log
-                .push(&component, tick, CHAT_WIDTH, &font, &self.language);
+                .push(&component, tick, width, &font, &self.language);
         }
         self.font = Some(font);
+    }
+
+    /// Takes the five chat settings the box reads — the client's settings
+    /// push calls it on every apply, so each float write lands here like the
+    /// source's `refreshChat` re-read (`ScreenChatOptions.java`:278-306).
+    /// The heights feed the log's drawn count at once; the opacity, width
+    /// and scale feed the next draws and the next wraps. Lines already
+    /// wrapped keep their split until newer pushes replace them — the port
+    /// keeps no unwrapped copy to re-split.
+    pub fn set_chat_settings(
+        &mut self,
+        opacity: f32,
+        width: f32,
+        scale: f32,
+        focused: f32,
+        unfocused: f32,
+    ) {
+        self.chat_opacity = opacity;
+        self.chat_width = width;
+        self.chat_scale = scale;
+        self.log.set_heights(focused, unfocused);
+    }
+
+    /// The wrap budget a push splits at: `floor(getChatWidth / getChatScale)`
+    /// (`GuiNewChat.java`:~145 over `:343-366`).
+    fn wrap_width(&self) -> i32 {
+        (chat_box_width(self.chat_width) as f32 / self.chat_scale.max(f32::EPSILON)).floor() as i32
+    }
+
+    /// The bar's width: the pixel width plus four (`GuiNewChat.java`:82).
+    fn bar_width(&self) -> f32 {
+        chat_box_width(self.chat_width) as f32 + 4.0
     }
 
     /// Folds one [`ClientEvent::Chat`] message in: position `2` replaces the record
@@ -3850,7 +3921,7 @@ impl ChatView {
         match &self.font {
             Some(font) => self
                 .log
-                .push(&component, tick, CHAT_WIDTH, font, &self.language),
+                .push(&component, tick, self.wrap_width(), font, &self.language),
             None => {
                 self.pending.push((component, tick));
                 if self.pending.len() > LOG_CAP {
@@ -3868,24 +3939,21 @@ impl ChatView {
     }
 
     /// Sets whether the chat window is open: the drawn line count and the log's
-    /// pinning follow it (`GuiNewChat.getChatOpen`:305-308). The chat screen that
-    /// opens and scrolls the box is a later milestone's, so nothing calls this yet.
-    #[allow(dead_code)]
+    /// pinning follow it (`GuiNewChat.getChatOpen`:305-308). The client calls
+    /// it through `reconcile_chat_open` every frame, and closing the window
+    /// is the caller's moment to reset the scroll.
     pub fn set_open(&mut self, open: bool) {
         self.log.set_open(open);
     }
 
     /// Scrolls the box by `amount` lines, the source's own clamp
-    /// (`GuiNewChat.scroll`:222-237). The chat screen's wheel input is a later
-    /// milestone's, so the tests are the only caller for now.
-    #[allow(dead_code)]
+    /// (`GuiNewChat.scroll`:222-237). The chat screen's wheel input calls it.
     pub fn scroll(&mut self, amount: i32) {
         self.log.scroll(amount);
     }
 
     /// Resets the scroll (`GuiNewChat.resetScroll`:211-215). Called when the chat
-    /// screen closes, which a later milestone lands.
-    #[allow(dead_code)]
+    /// screen closes.
     pub fn reset_scroll(&mut self) {
         self.log.reset_scroll();
     }
@@ -3958,7 +4026,8 @@ impl ChatView {
     /// The box's drawn lines, newest first: one bar and one text each
     /// (`GuiNewChat.drawChat`:53-91).
     fn box_draws(&self, resolution: ScaledResolution, draws: &mut Vec<HudDraw>) {
-        let factor = opacity_factor(CHAT_OPACITY);
+        let factor = opacity_factor(self.chat_opacity);
+        let bar = self.bar_width();
         for (index, line) in self.log.drawn().iter().enumerate() {
             // The source's opacity multiply and draw gate (`GuiNewChat.java`:75-78).
             let alpha = (f32::from(line.alpha) * factor) as u8;
@@ -3971,7 +4040,7 @@ impl ChatView {
             draws.push(HudDraw::Rect {
                 x: CHAT_X,
                 y: top,
-                width: BAR_WIDTH,
+                width: bar,
                 height: BAR_HEIGHT,
                 colour: [0.0, 0.0, 0.0, f32::from(alpha / 2) / 255.0],
             });
@@ -3979,7 +4048,7 @@ impl ChatView {
                 text: run_text(line.runs),
                 x: CHAT_X,
                 y: top + 1.0,
-                scale: 1.0,
+                scale: self.chat_scale,
                 colour: [1.0, 1.0, 1.0, f32::from(alpha) / 255.0],
                 shadow: true,
                 blend: true,
@@ -7325,6 +7394,41 @@ mod tests {
         // 1.0F (`GameSettings.java`:85): the f32 sum lands on 1.0 exactly, so the
         // fade byte passes through untouched.
         assert_eq!(opacity_factor(1.0), 1.0);
+    }
+
+    #[test]
+    fn the_box_reads_the_five_chat_settings() {
+        // `GuiNewChat.java`:38 (`chatOpacity * 0.9 + 0.1`), `:82` (the bar's
+        // pixel width plus four), `:343-371` (the pixel calculators per open
+        // state), `~:145` (the wrap divides by the scale): the mirror takes
+        // all five through one setter and the draws show them.
+        let font = chat_font();
+        let mut chat = ChatView::new();
+        chat.set_font(font);
+        for index in 0..30 {
+            chat.observe(&format!("\"L{index}\""), 0, 0);
+        }
+        let draws = chat_draws(&mut chat, 0);
+        assert_eq!(draws.len(), 2 * 10, "the closed default draws ten lines");
+        let (_, _, _, scale, _, _) = chat_text(&draws[1]);
+        assert_eq!(scale, 1.0, "the default scale draws");
+        let (_, _, bw, _, _) = chat_rect(&draws[0]);
+        assert_eq!(bw, 324.0, "320 + 4 at width 1.0");
+        chat.set_chat_settings(0.5, 0.5, 0.5, 0.5, 0.5);
+        let draws = chat_draws(&mut chat, 0);
+        assert_eq!(
+            draws.len(),
+            2 * 11,
+            "floor(100/9) closed lines at height 0.5"
+        );
+        let (_, _, _, scale, colour, _) = chat_text(&draws[1]);
+        assert_eq!(scale, 0.5, "the scale rides the text draws");
+        assert!(
+            (colour[3] - 140.0 / 255.0).abs() < 1.5 / 255.0,
+            "the opacity factor 0.55 fades the byte: {colour:?}"
+        );
+        let (_, _, bw, _, _) = chat_rect(&draws[0]);
+        assert_eq!(bw, 184.0, "floor(0.5*280+40)+4 at width 0.5");
     }
 
     #[test]

@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use oxide_game::chat::LanguageTable;
 use oxide_game::input::InputEvent;
 use oxide_game::settings::GameSettings;
 use oxide_proto_v47::entity::MetadataItem;
@@ -48,6 +49,11 @@ use creative::CreativeScreen;
 use menu::MainMenuScreen;
 use multiplayer::{MultiplayerLabels, MultiplayerScreen, ServerList};
 use options::{OptionsLabels, OptionsScreen, VideoLabels, VideoScreen};
+use options_chat::{ChatLabels, ChatScreen};
+use options_controls::{ControlsLabels, ControlsScreen};
+use options_language::{LanguageLabels, LanguageScreen};
+use options_skin::{SkinLabels, SkinScreen};
+use options_sound::{SoundLabels, SoundScreen};
 use pause::{AchievementsScreen, PauseScreen, SnooperScreen, StatsScreen};
 use sign::{SignMapEntry, SignScreen};
 
@@ -60,6 +66,11 @@ pub mod inventory;
 pub mod menu;
 pub mod multiplayer;
 pub mod options;
+pub mod options_chat;
+pub mod options_controls;
+pub mod options_language;
+pub mod options_skin;
+pub mod options_sound;
 pub mod pause;
 pub mod sign;
 pub mod widgets;
@@ -117,6 +128,23 @@ pub enum ScreenState {
     /// without VBO support) over the settings, standing from the hub's
     /// video button (boxed like the container kinds).
     VideoSettings(Box<VideoScreen>),
+    /// The music-and-sounds screen: the nine category sliders with the
+    /// master full-width on top, standing from the hub's sounds button
+    /// (boxed like the container kinds).
+    SoundOptions(Box<SoundScreen>),
+    /// The controls screen: invert, sensitivity, the inert touchscreen
+    /// row and the rebindable binding list, standing from the hub's
+    /// controls button (boxed like the container kinds).
+    Controls(Box<ControlsScreen>),
+    /// The language screen: the locale list with Force Unicode, standing
+    /// from the hub's language button (boxed like the container kinds).
+    Language(Box<LanguageScreen>),
+    /// The chat-options screen: the ten rows in source order, standing
+    /// from the hub's chat button (boxed like the container kinds).
+    ChatOptions(Box<ChatScreen>),
+    /// The skin-customization screen: the seven part toggles, standing
+    /// from the hub's skin button (boxed like the container kinds).
+    Skin(Box<SkinScreen>),
 }
 
 impl ScreenState {
@@ -139,7 +167,12 @@ impl ScreenState {
             | ScreenState::Achievements(_)
             | ScreenState::Snooper(_)
             | ScreenState::Options(_)
-            | ScreenState::VideoSettings(_) => None,
+            | ScreenState::VideoSettings(_)
+            | ScreenState::SoundOptions(_)
+            | ScreenState::Controls(_)
+            | ScreenState::Language(_)
+            | ScreenState::ChatOptions(_)
+            | ScreenState::Skin(_) => None,
             ScreenState::Multiplayer(_) => None,
         }
     }
@@ -186,6 +219,31 @@ pub struct Screens {
     /// A direct open stashes nothing, and the return then follows the
     /// base rule instead.
     options_screen: Option<OptionsScreen>,
+}
+
+/// The label sets one options-family relayout rebuilds from: every screen
+/// the hub opens carries its own labels, so a GUI-scale push rebuilds
+/// whichever stands from its own set. Bundled so the relayout stays one
+/// screen plus one settings plus one sources.
+pub struct OptionsSources {
+    /// The hub's own labels.
+    pub options: OptionsLabels,
+    /// The video screen's labels.
+    pub video: VideoLabels,
+    /// The sounds screen's labels.
+    pub sound: SoundLabels,
+    /// The controls screen's labels.
+    pub controls: ControlsLabels,
+    /// The language screen's labels.
+    pub language: LanguageLabels,
+    /// The chat-options screen's labels.
+    pub chat: ChatLabels,
+    /// The skin screen's labels.
+    pub skin: SkinLabels,
+    /// Whether the video rebuild keeps the VBO row.
+    pub vbo_supported: bool,
+    /// Today's locale set, the language list's rows.
+    pub locales: Vec<String>,
 }
 
 impl Screens {
@@ -518,6 +576,11 @@ impl Screens {
                     | ScreenState::Snooper(_)
                     | ScreenState::Options(_)
                     | ScreenState::VideoSettings(_)
+                    | ScreenState::SoundOptions(_)
+                    | ScreenState::Controls(_)
+                    | ScreenState::Language(_)
+                    | ScreenState::ChatOptions(_)
+                    | ScreenState::Skin(_)
             )
         )
     }
@@ -583,6 +646,51 @@ impl Screens {
         }
     }
 
+    /// The open sounds screen, when the current screen is one: the
+    /// frame's pointer drives it.
+    pub fn sound_mut(&mut self) -> Option<&mut SoundScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::SoundOptions(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open controls screen, when the current screen is one: the
+    /// frame's pointer and keys drive it.
+    pub fn controls_mut(&mut self) -> Option<&mut ControlsScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Controls(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open language screen, when the current screen is one: the
+    /// frame's pointer drives it.
+    pub fn language_mut(&mut self) -> Option<&mut LanguageScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Language(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open chat-options screen, when the current screen is one: the
+    /// frame's pointer drives it.
+    pub fn chat_options_mut(&mut self) -> Option<&mut ChatScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::ChatOptions(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// The open skin screen, when the current screen is one: the frame's
+    /// pointer drives it.
+    pub fn skin_mut(&mut self) -> Option<&mut SkinScreen> {
+        match self.current.as_mut() {
+            Some(ScreenState::Skin(screen)) => Some(screen.as_mut()),
+            _ => None,
+        }
+    }
+
     /// Stands the options hub at `scaled` on `settings` with `labels`:
     /// the pause menu's options button stands it, stashing the pause as
     /// the parent its Done button returns to (`GuiOptions`' `parentScreen`
@@ -635,9 +743,83 @@ impl Screens {
         ))));
     }
 
-    /// Returns the video screen or the hub-opened snooper to its stashed
-    /// options hub. Answers whether a hub stood: with none stashed the
-    /// caller follows the base rule instead.
+    /// Stands one hub child from the hub's button: the hub stashes as the
+    /// parent its Done button and Escape return to. A direct open stashes
+    /// nothing.
+    fn open_hub_child(&mut self, screen: ScreenState) {
+        if let Some(ScreenState::Options(parent)) = self.current.take() {
+            self.options_screen = Some(*parent);
+        }
+        self.current = Some(screen);
+    }
+
+    /// Stands the sounds screen from the hub's sounds button (106): the
+    /// hub saves first, the screen stands at `scaled` on `settings` with
+    /// `labels`.
+    pub fn open_sound_from_options(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: SoundLabels,
+    ) {
+        let screen = SoundScreen::new(&scaled, settings, labels);
+        self.open_hub_child(ScreenState::SoundOptions(Box::new(screen)));
+    }
+
+    /// Stands the controls screen from the hub's controls button (100).
+    /// The rows resolve through `language` when one is handed over.
+    pub fn open_controls_from_options(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: ControlsLabels,
+        language: Option<&LanguageTable>,
+    ) {
+        let screen = ControlsScreen::new(&scaled, settings, labels, language);
+        self.open_hub_child(ScreenState::Controls(Box::new(screen)));
+    }
+
+    /// Stands the language screen from the hub's language button (102)
+    /// over `locales`: today's available set plus the mechanism — the
+    /// loader lands in Task 26, so the list carries what the client hands
+    /// it.
+    pub fn open_language_from_options(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: LanguageLabels,
+        locales: &[String],
+    ) {
+        let screen = LanguageScreen::new(&scaled, settings, labels, locales);
+        self.open_hub_child(ScreenState::Language(Box::new(screen)));
+    }
+
+    /// Stands the chat-options screen from the hub's chat button (103).
+    pub fn open_chat_options_from_options(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: ChatLabels,
+    ) {
+        let screen = ChatScreen::new(&scaled, settings, labels);
+        self.open_hub_child(ScreenState::ChatOptions(Box::new(screen)));
+    }
+
+    /// Stands the skin screen from the hub's skin button (110).
+    pub fn open_skin_from_options(
+        &mut self,
+        scaled: ScaledResolution,
+        settings: &GameSettings,
+        labels: SkinLabels,
+    ) {
+        let screen = SkinScreen::new(&scaled, settings, labels);
+        self.open_hub_child(ScreenState::Skin(Box::new(screen)));
+    }
+
+    /// Returns the video screen, the hub-opened snooper or one of the five
+    /// hub-opened options screens to its stashed options hub. Answers
+    /// whether a hub stood: with none stashed the caller follows the base
+    /// rule instead.
     pub fn back_to_options(&mut self) -> bool {
         let Some(parent) = self.options_screen.take() else {
             return false;
@@ -677,29 +859,68 @@ impl Screens {
         true
     }
 
-    /// Re-lays the open options hub or video screen at the new scaled
-    /// size (`initGui` re-runs on resize): the hub on its labels, the
-    /// video screen on its own. Anything else stays put.
+    /// Re-lays the open options hub, video screen or one of the five
+    /// options screens at the new scaled size (`initGui` re-runs on
+    /// resize): the hub on its labels, each other screen on its own.
+    /// Anything else stays put.
     pub fn resize_options(
         &mut self,
         scaled: &ScaledResolution,
         settings: &GameSettings,
-        options: OptionsLabels,
-        video: VideoLabels,
-        vbo_supported: bool,
+        sources: OptionsSources,
     ) {
         match self.current.take() {
             Some(ScreenState::Options(_)) => {
                 self.current = Some(ScreenState::Options(Box::new(OptionsScreen::new(
-                    scaled, settings, options,
+                    scaled,
+                    settings,
+                    sources.options,
                 ))));
             }
             Some(ScreenState::VideoSettings(_)) => {
                 self.current = Some(ScreenState::VideoSettings(Box::new(VideoScreen::new(
                     scaled,
                     settings,
-                    video,
-                    vbo_supported,
+                    sources.video,
+                    sources.vbo_supported,
+                ))));
+            }
+            Some(ScreenState::SoundOptions(_)) => {
+                self.current = Some(ScreenState::SoundOptions(Box::new(SoundScreen::new(
+                    scaled,
+                    settings,
+                    sources.sound,
+                ))));
+            }
+            Some(ScreenState::Controls(_)) => {
+                let table = None;
+                self.current = Some(ScreenState::Controls(Box::new(ControlsScreen::new(
+                    scaled,
+                    settings,
+                    sources.controls,
+                    table,
+                ))));
+            }
+            Some(ScreenState::Language(_)) => {
+                self.current = Some(ScreenState::Language(Box::new(LanguageScreen::new(
+                    scaled,
+                    settings,
+                    sources.language,
+                    &sources.locales,
+                ))));
+            }
+            Some(ScreenState::ChatOptions(_)) => {
+                self.current = Some(ScreenState::ChatOptions(Box::new(ChatScreen::new(
+                    scaled,
+                    settings,
+                    sources.chat,
+                ))));
+            }
+            Some(ScreenState::Skin(_)) => {
+                self.current = Some(ScreenState::Skin(Box::new(SkinScreen::new(
+                    scaled,
+                    settings,
+                    sources.skin,
                 ))));
             }
             other => self.current = other,
@@ -807,9 +1028,9 @@ impl Screens {
     /// the screen gone, C0D sent. The statistics and achievements
     /// placeholders answer their pause parent instead — the plan's
     /// "screen → its parent" — and with no parent stashed they follow the
-    /// base rule. The hub-opened snooper answers its hub the same way; a
-    /// directly opened snooper closes to the game. The chat above answers
-    /// first and never reaches here.
+    /// base rule. The hub-opened snooper and the five hub-opened options
+    /// screens answer their hub the same way; a directly opened one closes
+    /// to the game. The chat above answers first and never reaches here.
     pub fn escape(&mut self, cursor: &mut Option<MetadataItem>) -> Option<InputEvent> {
         if matches!(
             self.current,
@@ -818,7 +1039,18 @@ impl Screens {
         {
             return None;
         }
-        if matches!(self.current, Some(ScreenState::Snooper(_))) && self.back_to_options() {
+        if matches!(
+            self.current,
+            Some(
+                ScreenState::Snooper(_)
+                    | ScreenState::SoundOptions(_)
+                    | ScreenState::Controls(_)
+                    | ScreenState::Language(_)
+                    | ScreenState::ChatOptions(_)
+                    | ScreenState::Skin(_)
+            )
+        ) && self.back_to_options()
+        {
             return None;
         }
         self.close(cursor)
