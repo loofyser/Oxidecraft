@@ -510,6 +510,28 @@ impl Renderer {
         &self.adapter_info.name
     }
 
+    /// The adapter's driver and driver info, the overlay's `Display:`-tail
+    /// equivalent of the source's `GL_VERSION` row.
+    pub fn adapter_driver(&self) -> String {
+        format!(
+            "{} {}",
+            self.adapter_info.driver, self.adapter_info.driver_info
+        )
+    }
+
+    /// The adapter's backend name, the overlay's `Display:`-parenthesis fact
+    /// (`Vulkan`, `Dx12`, …): the wgpu backend behind the surface the frame
+    /// draws on.
+    pub fn adapter_backend(&self) -> String {
+        format!("{:?}", self.adapter_info.backend)
+    }
+
+    /// The debug overlay's `C:` census: the sections holding a mesh and the
+    /// distinct columns they belong to, straight from the terrain pass.
+    pub fn mesh_census(&self) -> (u32, u32) {
+        self.terrain.mesh_census()
+    }
+
     /// Reconfigures the surface after the window changed size, emitting the recomputed
     /// scaled resolution.
     ///
@@ -943,12 +965,17 @@ impl Renderer {
             .set_sheets(&self.device, &self.queue, rain, snow);
     }
 
-    /// Sets the overlay lines drawn this frame; empty hides the overlay.
+    /// Sets the overlay columns drawn this frame: the left lines from the
+    /// top-left origin and the right lines right-aligned against the
+    /// surface's width, each over its own background quad; empty on both
+    /// sides hides the overlay.
     ///
-    /// The lines are laid out and uploaded on the call, so a frame draws exactly the lines the
+    /// The columns are laid out and uploaded on the call, so a frame draws exactly the lines the
     /// caller last set.
-    pub fn set_overlay_lines(&mut self, lines: Vec<String>) {
-        self.overlay.upload_text(&self.device, &self.queue, &lines);
+    pub fn set_overlay_lines(&mut self, left: Vec<String>, right: Vec<String>) {
+        let width = self.config.width as f32;
+        self.overlay
+            .upload_text(&self.device, &self.queue, &left, &right, width);
     }
 
     /// Sets the hud draw list drawn this frame; empty draws nothing.

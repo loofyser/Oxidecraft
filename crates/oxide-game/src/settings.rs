@@ -393,6 +393,10 @@ pub struct GameSettings {
     /// `reducedDebugInfo` flag, no initialiser). It rides the chat screen
     /// in the source (`ScreenChatOptions.java`:9).
     pub reduced_debug_info: bool,
+    /// Pause on lost focus; default true (`GameSettings.java`:66). The F3+P
+    /// chord flips it and the focus-lost path reads it: set, losing focus
+    /// stands the pause menu; clear, focus loss only drops capture.
+    pub pause_on_lost_focus: bool,
     /// The 33 rebindable keys in [`BINDING_TABLE`] order
     /// (`GameSettings.java`:127-151).
     pub bindings: [Binding; BINDING_COUNT],
@@ -442,6 +446,7 @@ impl Default for GameSettings {
             language: "en_US".to_string(),
             force_unicode: false,
             reduced_debug_info: false,
+            pause_on_lost_focus: true,
             bindings: default_bindings(),
             last_server: None,
         }
@@ -820,6 +825,11 @@ impl GameSettings {
                     self.reduced_debug_info = flag;
                 }
             }
+            "pause_on_lost_focus" => {
+                if let Some(flag) = parse_bool(value) {
+                    self.pause_on_lost_focus = flag;
+                }
+            }
             "last_server" => {
                 if let Some(server) = unquote(value) {
                     if server.is_empty() {
@@ -889,6 +899,10 @@ impl GameSettings {
         );
         map.insert("music_volume".to_string(), fmt_f32(self.music_volume));
         map.insert("particles".to_string(), self.particles.as_u8().to_string());
+        map.insert(
+            "pause_on_lost_focus".to_string(),
+            self.pause_on_lost_focus.to_string(),
+        );
         map.insert(
             "render_distance".to_string(),
             self.render_distance.to_string(),
@@ -1083,6 +1097,7 @@ mod tests {
             language: "de_DE".to_string(),
             force_unicode: true,
             reduced_debug_info: true,
+            pause_on_lost_focus: false,
             bindings: default_bindings(),
             last_server: Some("play.example.test:25565".to_string()),
         }
@@ -1128,6 +1143,7 @@ mod tests {
         assert_eq!(s.language, "en_US");
         assert!(!s.force_unicode);
         assert!(!s.reduced_debug_info);
+        assert!(s.pause_on_lost_focus);
         assert_eq!(s.bindings, default_bindings());
         assert_eq!(s.last_server, None);
     }
@@ -1602,6 +1618,7 @@ mod tests {
         before.chat_height_unfocused = 0.6;
         before.chat_links = false;
         before.reduced_debug_info = true;
+        before.pause_on_lost_focus = false;
         before.save(&path).expect("save works");
         let text = fs::read_to_string(&path).expect("read back");
         assert!(

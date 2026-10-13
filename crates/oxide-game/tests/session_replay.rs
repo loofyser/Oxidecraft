@@ -4055,7 +4055,7 @@ fn a_rotation_change_emits_a_new_aim_between_ticks() {
         .collect();
     assert_eq!(aims.len(), 2, "the aim appears and leaves: {events:?}");
     match &events[aims[0]] {
-        ClientEvent::Aim { aim: Some(aim) } => {
+        ClientEvent::Aim { aim: Some(aim), .. } => {
             assert_eq!(
                 (aim.x, aim.y, aim.z, aim.face),
                 (0, 65, 2, Face::North),
@@ -4072,7 +4072,7 @@ fn a_rotation_change_emits_a_new_aim_between_ticks() {
     }
     let last = *aims.last().expect("an aim");
     assert!(
-        matches!(&events[last], ClientEvent::Aim { aim: None }),
+        matches!(&events[last], ClientEvent::Aim { aim: None, .. }),
         "the turn left every block: {:?}",
         events[last]
     );
@@ -4110,7 +4110,7 @@ fn a_tick_over_a_changed_world_re_emits_the_aim() {
         .expect("the aim changed");
     assert!(last > first, "the change moved the aim: {events:?}");
     assert!(
-        matches!(&events[last], ClientEvent::Aim { aim: None }),
+        matches!(&events[last], ClientEvent::Aim { aim: None, .. }),
         "the stone is gone: {:?}",
         events[last]
     );
@@ -4152,7 +4152,7 @@ fn the_aim_uses_the_gamemodes_reach() {
     let aimed = creative
         .iter()
         .find_map(|event| match event {
-            ClientEvent::Aim { aim: Some(aim) } => Some(*aim),
+            ClientEvent::Aim { aim: Some(aim), .. } => Some(*aim),
             _ => None,
         })
         .expect("the creative reach aims the stone");
@@ -4339,7 +4339,7 @@ fn a_held_press_digs_dirt_at_the_hands_rate_and_removes_it_locally() {
         .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
         .expect("an aim");
     assert!(
-        matches!(&events[last_aim], ClientEvent::Aim { aim: None }),
+        matches!(&events[last_aim], ClientEvent::Aim { aim: None, .. }),
         "the block is air: {:?}",
         events[last_aim]
     );
@@ -4425,7 +4425,7 @@ fn bedrock_never_completes_and_never_reports_a_stage() {
     assert!(
         matches!(
             &events[last_aim],
-            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+            ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 2)
         ),
         "the bedrock is still aimed: {:?}",
         events[last_aim]
@@ -4477,7 +4477,7 @@ fn a_creative_press_destroys_the_block_in_one_click() {
         .rposition(|event| matches!(event, ClientEvent::Aim { .. }))
         .expect("an aim");
     assert!(
-        matches!(&events[last_aim], ClientEvent::Aim { aim: None }),
+        matches!(&events[last_aim], ClientEvent::Aim { aim: None, .. }),
         "the block is air: {:?}",
         events[last_aim]
     );
@@ -4592,7 +4592,7 @@ fn the_servers_echo_of_a_predicted_removal_is_idempotent() {
     assert!(
         events[echo..].iter().all(|event| !matches!(
             event,
-            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+            ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 2)
         )),
         "the block never reappears: {events:?}"
     );
@@ -4849,7 +4849,7 @@ fn a_right_press_places_the_block_and_predicts_it_locally() {
     let aims: Vec<Aim> = events
         .iter()
         .filter_map(|event| match event {
-            ClientEvent::Aim { aim: Some(aim) } => Some(*aim),
+            ClientEvent::Aim { aim: Some(aim), .. } => Some(*aim),
             _ => None,
         })
         .collect();
@@ -4865,7 +4865,7 @@ fn a_right_press_places_the_block_and_predicts_it_locally() {
     assert!(
         matches!(
             &events[last],
-            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 1)
+            ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 1)
         ),
         "the placed block stays the aim: {:?}",
         events[last]
@@ -4905,7 +4905,7 @@ fn the_servers_echo_of_the_predicted_placement_is_idempotent() {
         .position(|event| {
             matches!(
                 event,
-                ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 1)
+                ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 1)
             )
         })
         .expect("the prediction is readable");
@@ -4916,8 +4916,8 @@ fn the_servers_echo_of_the_predicted_placement_is_idempotent() {
     assert!(placed < echo, "the placement preceded the echo: {events:?}");
     assert!(
         events[echo..].iter().all(|event| match event {
-            ClientEvent::Aim { aim: Some(aim) } => (aim.x, aim.y, aim.z) == (0, 65, 1),
-            ClientEvent::Aim { aim: None } => false,
+            ClientEvent::Aim { aim: Some(aim), .. } => (aim.x, aim.y, aim.z) == (0, 65, 1),
+            ClientEvent::Aim { aim: None, .. } => false,
             _ => true,
         }),
         "the echo changed nothing: {events:?}"
@@ -4955,7 +4955,7 @@ fn the_servers_correction_of_the_predicted_placement_replaces_it() {
     assert!(
         matches!(
             &events[last],
-            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+            ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 2)
         ),
         "the prediction was replaced and the stone behind shows: {:?}",
         events[last]
@@ -5004,7 +5004,7 @@ fn a_stack_of_two_placements_lands_both() {
     let aims: Vec<(i32, i32, i32)> = events
         .iter()
         .filter_map(|event| match event {
-            ClientEvent::Aim { aim: Some(aim) } => Some((aim.x, aim.y, aim.z)),
+            ClientEvent::Aim { aim: Some(aim), .. } => Some((aim.x, aim.y, aim.z)),
             _ => None,
         })
         .collect();
@@ -5037,7 +5037,7 @@ fn a_right_press_without_an_aim_places_nothing() {
     assert!(
         events
             .iter()
-            .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_) })),
+            .all(|event| !matches!(event, ClientEvent::Aim { aim: Some(_), .. })),
         "nothing is aimed: {events:?}"
     );
 }
@@ -5072,7 +5072,7 @@ fn a_right_press_at_an_occupied_target_places_nothing() {
     let aimed = events
         .iter()
         .find_map(|event| match event {
-            ClientEvent::Aim { aim: Some(aim) } => Some(*aim),
+            ClientEvent::Aim { aim: Some(aim), .. } => Some(*aim),
             _ => None,
         })
         .expect("the stone through the gap is aimed");
@@ -5092,7 +5092,7 @@ fn a_right_press_at_an_occupied_target_places_nothing() {
     assert!(
         matches!(
             &events[last],
-            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+            ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 2)
         ),
         "the world is untouched: {:?}",
         events[last]
@@ -5653,7 +5653,7 @@ fn a_same_dimension_respawn_keeps_the_world_and_restarts_the_player() {
                 .iter()
                 .rev()
                 .find(|event| matches!(event, ClientEvent::Aim { .. })),
-            Some(ClientEvent::Aim { aim: None })
+            Some(ClientEvent::Aim { aim: None, .. })
         ),
         "the respawn cleared the aim: {respawning:?}",
         respawning = &events[respawned.saturating_sub(3)..=respawned]
@@ -5665,7 +5665,7 @@ fn a_same_dimension_respawn_keeps_the_world_and_restarts_the_player() {
     assert!(
         matches!(
             recomputed,
-            ClientEvent::Aim { aim: Some(aim) } if (aim.x, aim.y, aim.z) == (0, 65, 2)
+            ClientEvent::Aim { aim: Some(aim), .. } if (aim.x, aim.y, aim.z) == (0, 65, 2)
         ),
         "the aim was recomputed against the kept world: {recomputed:?}"
     );
@@ -5873,7 +5873,7 @@ fn a_mid_session_game_mode_change_arms_the_reach_for_a_placement() {
         .position(|event| matches!(event, ClientEvent::Aim { .. }))
         .expect("the mode change armed the aim");
     match &events[first] {
-        ClientEvent::Aim { aim: Some(aim) } => assert_eq!(
+        ClientEvent::Aim { aim: Some(aim), .. } => assert_eq!(
             (aim.x, aim.y, aim.z, aim.face),
             (0, 65, 5, Face::North),
             "the stone 4.611 away, met through its north face"

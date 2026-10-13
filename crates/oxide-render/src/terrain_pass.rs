@@ -721,6 +721,21 @@ impl TerrainPass {
         self.meshes.remove(&key);
     }
 
+    /// The census the debug overlay's `C:` line reads: the sections holding a
+    /// mesh and the distinct columns they belong to.
+    ///
+    /// Both count what the pass drew last — a column whose sections all
+    /// emptied drops out of both — so the window reads the live pair without
+    /// keeping its own copy of the mesh table.
+    pub fn mesh_census(&self) -> (u32, u32) {
+        let sections = self.meshes.len() as u32;
+        let mut columns = std::collections::BTreeSet::new();
+        for (cx, cz, _) in self.meshes.keys() {
+            columns.insert((*cx, *cz));
+        }
+        (sections, columns.len() as u32)
+    }
+
     /// Forgets every section's mesh, freeing their buffers.
     ///
     /// The world they were built from is gone — a respawn across dimensions

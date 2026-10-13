@@ -487,6 +487,10 @@ pub enum ClientEvent {
         max_players: u8,
         /// Level type, for example `default`.
         level_type: String,
+        /// Whether Join Game asks for reduced debug info: the second half of
+        /// the source's `isReducedDebug` (`GuiOverlayDebug.java`:56-59), the
+        /// first being the settings flag the window reads itself.
+        reduced_debug_info: bool,
     },
     /// The first Player Position And Look landed after the join or a
     /// world-rebuilding respawn: the terrain screen's clear signal.
@@ -570,6 +574,16 @@ pub enum ClientEvent {
         /// gate is shut or its render type is `-1`
         /// (`ItemRenderer.java:424-447`).
         inside: Option<u16>,
+        /// Whether the feet block's column is loaded: the source's
+        /// `isBlockLoaded` gate for the `Biome:`/`Light:`/`Local Difficulty:`
+        /// tail (`GuiOverlayDebug.java`:136).
+        block_loaded: bool,
+        /// The feet column's biome id; 0 (ocean) when the column is missing.
+        biome_id: u8,
+        /// The feet block's sky-light nibble; 0 when the column is missing.
+        sky_light: u8,
+        /// The feet block's block-light nibble; 0 when the column is missing.
+        block_light: u8,
     },
     /// The player list's whole entry set, from clientbound 0x38.
     ///
@@ -678,6 +692,10 @@ pub enum ClientEvent {
     Aim {
         /// The block the interaction ray meets, or `None` when it meets none.
         aim: Option<Aim>,
+        /// The packed block at the aimed cell (`World::block` packing), or
+        /// `None` when the ray meets none. The debug overlay's block section
+        /// reads the registry name and the state properties from it.
+        block: Option<u16>,
     },
     /// A destroy stage landed on a block.
     ///
@@ -1073,6 +1091,9 @@ pub enum ClientEvent {
         frames: Vec<ParticleFrame>,
         /// The session tick the snapshot rode in on.
         tick: u32,
+        /// Every live particle the engine holds, drawn or not: the debug
+        /// overlay's `P:` count, which the visible-only frames cannot answer.
+        total: usize,
     },
     /// A global entity spawned, from clientbound 0x2C.
     ///
@@ -1631,6 +1652,18 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         send_reply(&mut conn, &echo)?;
                                     }
                                 }
+                                InputEvent::RebuildMeshes => {
+                                    // The A chord's rebuild is the source's
+                                    // `loadRenderers` (`RenderGlobal.java`):
+                                    // every loaded column is queued once more,
+                                    // and the next builds read whatever world
+                                    // now stands. Nothing goes on the wire.
+                                    if let Some(world) = world.as_ref() {
+                                        for (cx, cz) in world.loaded() {
+                                            queue.mark_dirty(cx, cz);
+                                        }
+                                    }
+                                }
                                 other => {
                                     looked |= apply_input(
                                         other,
@@ -1742,6 +1775,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                     difficulty: join.difficulty,
                                     max_players: join.max_players,
                                     level_type: join.level_type,
+                                    reduced_debug_info: join.reduced_debug_info,
                                 },
                             );
                             // The join arms the terrain screen: the first
@@ -1954,7 +1988,13 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 )?;
                             }
                             if aim.take().is_some() {
-                                report(events, ClientEvent::Aim { aim: None });
+                                report(
+                                    events,
+                                    ClientEvent::Aim {
+                                        aim: None,
+                                        block: None,
+                                    },
+                                );
                             }
                             // The movement reports wait for the 0x08 the server
                             // follows every respawn with; it is the packet that
@@ -3350,6 +3390,7 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                         ClientEvent::Particles {
                             frames,
                             tick: particle_tick,
+                            total: particles.stats().count,
                         },
                     );
                 }
@@ -3570,10 +3611,21 @@ fn update_aim(
             look_vector(player.yaw, player.pitch),
             reach(gamemode),
         )
+        .map(|aim| {
+            let block = world.block(aim.x, aim.y, aim.z);
+            (aim, block)
+        })
     });
-    if next != *aim {
-        *aim = next;
-        report(events, ClientEvent::Aim { aim: next });
+    let next_aim = next.map(|(aim, _)| aim);
+    if next_aim != *aim {
+        *aim = next_aim;
+        report(
+            events,
+            ClientEvent::Aim {
+                aim: next_aim,
+                block: next.map(|(_, block)| block),
+            },
+        );
     }
 }
 
@@ -3707,6 +3759,7 @@ fn apply_input(
         | InputEvent::SetViewDistance { .. }
         | InputEvent::PushSettings(_)
         | InputEvent::SetParticleSetting { .. }
+        | InputEvent::RebuildMeshes
         | InputEvent::DropItem { .. } => false,
     }
 }
@@ -4025,6 +4078,10 @@ fn eye_block_event(player: &Player, world: Option<&World>) -> ClientEvent {
             eye: 0,
             in_portal: false,
             inside: None,
+            block_loaded: false,
+            biome_id: 0,
+            sky_light: 0,
+            block_light: 0,
         };
     };
     let feet = player.position;
@@ -4068,11 +4125,38 @@ fn eye_block_event(player: &Player, world: Option<&World>) -> ClientEvent {
             }
         }
     }
+    let (block_loaded, biome_id, sky_light, block_light) = view_block_read(world, feet);
     ClientEvent::EyeBlock {
         eye,
         in_portal,
         inside,
+        block_loaded,
+        biome_id,
+        sky_light,
+        block_light,
     }
+}
+
+/// The feet block's debug-overlay read: whether its column is loaded, its
+/// biome id and its two light nibbles, from the world data the session owns.
+///
+/// An unloaded column — or a feet row outside 0..256 — answers the unload
+/// half: not loaded, the ocean fallback id and zeroed nibbles.
+fn view_block_read(world: &World, feet: [f64; 3]) -> (bool, u8, u8, u8) {
+    let bx = feet[0].floor() as i32;
+    let by = feet[1].floor() as i32;
+    let bz = feet[2].floor() as i32;
+    let Some(chunk) = (0..256)
+        .contains(&by)
+        .then(|| world.chunk(bx >> 4, bz >> 4))
+        .flatten()
+    else {
+        return (false, 0, 0, 0);
+    };
+    let biome_id = chunk.biome((bx & 15) as usize, (bz & 15) as usize);
+    let sky_light = world.sky_light(bx, by, bz);
+    let block_light = world.block_light(bx, by, bz);
+    (true, biome_id, sky_light, block_light)
 }
 
 /// The player's current state as the window's per-tick event.
@@ -5944,6 +6028,7 @@ mod tests {
             eye,
             in_portal,
             inside,
+            ..
         } = eye_block_event(&player, Some(&world))
         else {
             panic!("the read reports EyeBlock");

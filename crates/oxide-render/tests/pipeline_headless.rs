@@ -106,6 +106,16 @@ const STONE: [u8; 3] = [128, 128, 128];
 const BURIED: [u8; 3] = [255, 0, 0];
 /// The overlay text colour: opaque white, the sheet's ink texel.
 const TEXT: [u8; 3] = [255, 255, 255];
+/// The debug overlay's ink: opaque `0xE0E0E0`, the source's `14737632`
+/// (`GuiOverlayDebug.java`:76, 96) — never the sheet's white.
+const DEBUG_TEXT: [u8; 3] = [224, 224, 224];
+/// The debug overlay's shadow: `(0xE0E0E0 & 0x00FCFCFC) >> 2` is `0x383838`,
+/// the source's shadow byte rule over the debug ink — never the white-text 63.
+const DEBUG_SHADOW: [u8; 3] = [56, 56, 56];
+/// The debug overlay's background quad over the sky: the constant's
+/// 80-per-channel at 144/255 alpha under `ALPHA_BLENDING` — 80 * 144/255 +
+/// sky * 111/255 rounds to this.
+const QUAD: [u8; 3] = [114, 130, 154];
 /// The overlay shadow colour as 8-bit unorm bytes: the source's `(0xFFFFFFFF & 0x00FCFCFC) >> 2
 /// | 0xFF000000` is 0xFF3F3F3F, 63 per channel.
 const SHADOW: [u8; 3] = [63, 63, 63];
@@ -206,7 +216,7 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
         .expect("the synthetic sheet is a 16x16 grid");
     // Four vertical bars in one line: each is the first column of its cell, so the glyph
     // pixels sit at known places along the line.
-    overlay.upload_text(&device, &queue, &["||||".to_string()]);
+    overlay.upload_text(&device, &queue, &["||||".to_string()], &[], SIZE as f32);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("oxide pipeline headless encoder"),
@@ -225,21 +235,34 @@ fn the_overlay_pass_draws_its_text_over_the_terrain() {
     // The text margin is four pixels and the scale two; the '|' cell inks only its first
     // column and advances two font pixels, so the texture's ink lands four pixels apart and
     // the shadow copy sits two pixels down and right.
-    expect_pixel(&pixels, 4, 4, TEXT, "the first cell's first textured texel");
-    expect_pixel(&pixels, 5, 19, TEXT, "the first cell's last textured row");
-    expect_pixel(&pixels, 6, 6, SHADOW, "the first cell's shadow");
-    // The gap between the first cell's ink and the second's is transparent sheet, so the
-    // frame's sky shows through; the stone face sits at the frame's centre.
+    expect_pixel(
+        &pixels,
+        4,
+        4,
+        DEBUG_TEXT,
+        "the first cell's first textured texel",
+    );
+    expect_pixel(
+        &pixels,
+        5,
+        19,
+        DEBUG_TEXT,
+        "the first cell's last textured row",
+    );
+    expect_pixel(&pixels, 6, 6, DEBUG_SHADOW, "the first cell's shadow");
+    // The gap between the first cell's ink and the second's is the line's own
+    // quad — every line sits on one — so the dark band shows through, never
+    // the sky; the stone face sits at the frame's centre.
     expect_pixel(
         &pixels,
         7,
         4,
-        SKY,
-        "the transparent gap before the second cell",
+        QUAD,
+        "the quad in the gap before the second cell",
     );
-    expect_pixel(&pixels, 8, 4, TEXT, "the second cell");
+    expect_pixel(&pixels, 8, 4, DEBUG_TEXT, "the second cell");
     // The fourth cell starts three advances along: x = 4 + 3 * 2 * 2.
-    expect_pixel(&pixels, 16, 4, TEXT, "the fourth cell");
+    expect_pixel(&pixels, 16, 4, DEBUG_TEXT, "the fourth cell");
     expect_pixel(&pixels, 0, 0, SKY, "the corner above the text");
     let painted = (0..24)
         .flat_map(|y| (0..24).map(move |x| (x, y)))
@@ -274,7 +297,7 @@ fn the_overlay_pass_discards_the_below_threshold_texels() {
     overlay
         .set_font(&device, &queue, &faint_font_sheet())
         .expect("the synthetic sheet is a 16x16 grid");
-    overlay.upload_text(&device, &queue, &["|".to_string()]);
+    overlay.upload_text(&device, &queue, &["|".to_string()], &[], SIZE as f32);
 
     let depth = create_depth(&device);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -287,19 +310,73 @@ fn the_overlay_pass_discards_the_below_threshold_texels() {
     queue.submit(Some(encoder.finish()));
 
     let pixels = read_pixels(&device, &queue, &target);
-    // The full-coverage column writes straight through: exact white.
-    expect_pixel_exact(&pixels, 4, 4, TEXT, "the full-coverage column");
-    expect_pixel_exact(&pixels, 5, 19, TEXT, "its last row");
-    // The below-threshold column draws nothing: the sky stays.
-    expect_pixel_exact(&pixels, 6, 4, SKY, "the below-threshold column");
-    expect_pixel_exact(&pixels, 7, 5, SKY, "its second row");
-    // The above-threshold column draws (its 78/255 is over the 0.1 test): exact white.
-    expect_pixel_exact(&pixels, 8, 4, TEXT, "the above-threshold column");
-    expect_pixel_exact(&pixels, 9, 5, TEXT, "its second row");
-    // The cell's transparent remainder and the frame around it stay sky too.
-    expect_pixel_exact(&pixels, 10, 4, SKY, "the transparent remainder");
+    // The full-coverage column writes straight through: the exact debug grey.
+    expect_pixel_exact(&pixels, 4, 4, DEBUG_TEXT, "the full-coverage column");
+    expect_pixel_exact(&pixels, 5, 19, DEBUG_TEXT, "its last row");
+    // The below-threshold column draws no ink, so the line's own quad shows
+    // through: the dark band, never the sky.
+    expect_pixel(&pixels, 6, 4, QUAD, "the below-threshold column");
+    expect_pixel(&pixels, 7, 5, QUAD, "its second row");
+    // The above-threshold column draws (its 78/255 is over the 0.1 test): the exact debug grey.
+    expect_pixel_exact(&pixels, 8, 4, DEBUG_TEXT, "the above-threshold column");
+    expect_pixel_exact(&pixels, 9, 5, DEBUG_TEXT, "its second row");
+    // The cell's transparent remainder sits on the line's own quad: the `|`
+    // measures four font pixels wide, so x 10 is still the dark band.
+    expect_pixel(&pixels, 10, 4, QUAD, "the transparent remainder");
     expect_pixel_exact(&pixels, 20, 4, SKY, "right of the cell");
     expect_pixel_exact(&pixels, 0, 0, SKY, "the corner above the text");
+}
+
+/// The overlay frame draws both columns' dark quads: the source fills one
+/// `drawRect` per line (`GuiOverlayDebug.java`, `DEBUG_BACKGROUND`
+/// `0x90505050`) before the text, so every line sits on a translucent dark
+/// quad and the right column right-aligns at `width - 2`.
+///
+/// The fixture uploads one `|` per column at `SIZE` wide: the scale is two and
+/// the margin four, the `|` advances two font pixels, so the left line's quad
+/// spans physical x 2..8 and the right line's x 54..62, with the right glyph's
+/// ink at x 56..57 — the `width - 2` law in pixels. The quad colour is the
+/// constant's 80-per-channel at 144/255 alpha blended over the sky
+/// (`ALPHA_BLENDING`): 80 * 144/255 + sky * 111/255 rounds to (114, 130, 154).
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_overlay_frame_draws_both_columns_dark_quads() {
+    let (device, queue) = headless_device();
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = create_target(&device, format);
+
+    let mut overlay = OverlayPass::new(&device, format);
+    overlay.set_size(&queue, SIZE as f32, SIZE as f32);
+    overlay
+        .set_font(&device, &queue, &overlay_font_sheet())
+        .expect("the synthetic sheet is a 16x16 grid");
+    overlay.upload_text(
+        &device,
+        &queue,
+        &["|".to_string()],
+        &["|".to_string()],
+        SIZE as f32,
+    );
+
+    let depth = create_depth(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide pipeline headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| {
+        overlay.draw(pass)
+    });
+    queue.submit(Some(encoder.finish()));
+
+    let pixels = read_pixels(&device, &queue, &target);
+    // Both quads: dark translucent bands behind their lines.
+    expect_pixel(&pixels, 2, 12, QUAD, "the left quad");
+    expect_pixel(&pixels, 54, 12, QUAD, "the right quad");
+    // The right glyph's ink at x 56: the column right-aligns at width-2.
+    expect_pixel(&pixels, 56, 4, DEBUG_TEXT, "the right column's ink");
+    // Past the right quad the frame stays sky: the quad ends at x 62.
+    expect_pixel(&pixels, 62, 12, SKY, "right of the right quad");
+    expect_pixel(&pixels, 0, 0, SKY, "the corner above the text");
 }
 
 /// The synthetic overlay font sheet: a 128x128 grid whose `|` cell inks only its first column,

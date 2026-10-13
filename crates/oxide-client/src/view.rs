@@ -1927,6 +1927,7 @@ impl View {
                 eye,
                 in_portal,
                 inside,
+                ..
             } => {
                 self.overlay.eye_block = *eye;
                 self.overlay.inside_block = *inside;
@@ -5494,6 +5495,7 @@ mod tests {
             difficulty: 1,
             max_players: 20,
             level_type: "default".to_owned(),
+            reduced_debug_info: false,
         }
     }
 

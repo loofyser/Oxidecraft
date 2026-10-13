@@ -285,6 +285,10 @@ pub enum InputEvent {
         /// The new particle regime.
         setting: ParticleSetting,
     },
+    /// The F3+A chord's rebuild: every loaded column meshes again, the
+    /// source's `loadRenderers` equivalent (`Minecraft.java`:1996-1998).
+    /// No packet answers it; the mesh queue re-takes the loaded columns.
+    RebuildMeshes,
 }
 
 /// The settings values one [`InputEvent::PushSettings`] carries to the

@@ -37,7 +37,7 @@ mod assets;
 mod skin_worker;
 mod view;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -98,7 +98,7 @@ use oxide_game::audio::{
 };
 use oxide_game::chat::{ClickAction, ClickEvent, LanguageTable};
 use oxide_game::entity_view::{EntityFrame, PlayerListRecord};
-use oxide_game::hud::{HudState, debug_lines};
+use oxide_game::hud::{HudState, debug_left, debug_right};
 use oxide_game::input::{InputEvent, Key, MouseButton, drop_item, hotbar_step};
 use oxide_game::interaction::Aim;
 use oxide_game::mesher::ModelChoice;
@@ -106,7 +106,9 @@ use oxide_game::particles::{ParticleFrame, ParticleTex};
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
 use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
-use oxide_game::settings::{Binding, FRAMERATE_RANGE, ParticleSetting, default_bindings};
+use oxide_game::settings::{
+    Binding, FRAMERATE_RANGE, ParticleSetting, VIEW_DISTANCE_RANGE, default_bindings,
+};
 use oxide_game::weather::WeatherColumn;
 use oxide_proto_v47::effects_wire::{read_effect_position, read_sound_pitch};
 use oxide_proto_v47::serverbound::ClientSettings;
@@ -1021,16 +1023,13 @@ struct ClientApp {
     /// distance and the two damped sensors the view bob reads, the hurt flash, and the
     /// death and arrival clocks the frame's terms and fraction use.
     camera: CameraState,
-    /// Whether F3 has the overlay showing.
-    overlay_visible: bool,
+    /// The debug overlay's own flags: F3's toggle, the H/B/G chord reads and
+    /// the P/A/F/T/Alt+F3 arms — the overlay builder and the later
+    /// milestone's draws read them. Session-only, like the overlay.
+    debug: DebugFlags,
     /// Whether F3 is held: the H chord's own read (`Keyboard.isKeyDown(61)`
     /// at `Minecraft.java`:2000-2004 — an edge either way lands here).
     f3_held: bool,
-    /// Whether F3+H has the advanced tooltips showing
-    /// (`gameSettings.advancedItemTooltips`, toggled at :2000-2004): the
-    /// flag the screen frame hands the tooltip builder. Session-only, like
-    /// Session-only, like the overlay.
-    advanced_tooltips: bool,
     /// Whether the session last reported the player dead.
     ///
     /// While it holds, the death screen stands (re-raised every tick the
@@ -1119,6 +1118,9 @@ struct ClientApp {
     /// Whether either control key is held: the drop key's whole-stack arm
     /// reads it (`isCtrlKeyDown` at `GuiContainer.java`:707).
     ctrl: bool,
+    /// Whether either alt key is held: Alt+F3's lagometer arm reads it
+    /// (`isAltKeyDown` at `Minecraft.java`:2026).
+    alt: bool,
     /// The window's selected hotbar slot, 0..8 (`InventoryPlayer.currentItem`):
     /// the live selection the wheel steps and the digits set. The session's
     /// `HeldItemSlot` reports fold in at the frame's drain; the window's own
@@ -1160,6 +1162,11 @@ struct WorldOverlayState {
     /// and the window keeps the map so a frame can hand the pass every stage
     /// within the render distance.
     break_stages: BTreeMap<i32, WindowBreakEntry>,
+    /// The loaded columns' census for the overlay's `C:` line: every column
+    /// the session's `ChunkUpdated` reported, until its `ChunkUnloaded` or a
+    /// `WorldCleared` — the total the renderer's meshed sections read
+    /// against.
+    loaded_columns: BTreeSet<(i32, i32)>,
 }
 
 /// The weather columns and the particle snapshot the session last reported,
@@ -1744,11 +1751,10 @@ impl ClientApp {
         // The overlay starts visible when a session exists and `--no-overlay` did not
         // suppress it; the smoke path keeps it hidden until F3, and without a sheet it
         // draws nothing.
-        let overlay_visible = session.is_some() && !cli.no_overlay;
-        let server = session
-            .as_ref()
-            .map(|link| link.server.clone())
-            .unwrap_or_default();
+        let visible = session.is_some() && !cli.no_overlay;
+        // The P chord's flag starts where the settings home left it, so a
+        // persisted flip survives the relaunch.
+        let pause_on_focus_lost = settings.settings().pause_on_lost_focus;
         // The menu's launch seed, drawn once: the splash pick and the logo
         // seed read one launch stream in the source's order, so the seed is
         // fixed here and kept for every later standing.
@@ -1771,15 +1777,7 @@ impl ClientApp {
             assets_error,
             settings,
             last_frame: None,
-            hud: HudState {
-                fps: 0.0,
-                position: [0.0; 3],
-                yaw: 0.0,
-                pitch: 0.0,
-                dimension: 0,
-                server,
-                entity_id: 0,
-            },
+            hud: HudState::default(),
             sky: SkyState::default(),
             player: PlayerState::default(),
             camera: CameraState::default(),
@@ -1805,9 +1803,15 @@ impl ClientApp {
             font: chat_font,
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
-            overlay_visible,
+            debug: DebugFlags {
+                visible,
+                advanced_tooltips: false,
+                hitboxes: false,
+                chunk_borders: false,
+                lagometer: false,
+                pause_on_focus_lost,
+            },
             f3_held: false,
-            advanced_tooltips: false,
             dead: false,
             sleeping: false,
             sleep_timer: 0,
@@ -1818,6 +1822,7 @@ impl ClientApp {
             creative: false,
             shift: false,
             ctrl: false,
+            alt: false,
             held: 0,
             cursor: None,
             menu_seed,
@@ -2686,7 +2691,7 @@ impl ClientApp {
                 font: self.font.as_ref(),
                 scaled,
                 mouse: self.cursor,
-                advanced: self.advanced_tooltips,
+                advanced: self.debug.advanced_tooltips,
                 level: self.view.level(),
                 effects: self.view.effects(),
                 preview_skin: Self::preview_skin_id(
@@ -2704,11 +2709,32 @@ impl ClientApp {
         // timer's ramp while it runs, none at rest.
         if !self.dead {
             renderer.set_dim(sleep_cover_dim(self.sleep_timer));
-            renderer.set_overlay_lines(if self.overlay_visible {
-                debug_lines(&self.hud)
+            // The overlay's per-frame facts: the meshed-column count, the
+            // loaded total, the slider's distance and the window/renderer
+            // environment — the session's events feed the rest at the drain,
+            // and anything neither reaches keeps its default (`n/a` on the
+            // right column), recorded, never invented.
+            let (_, meshed_columns) = renderer.mesh_census();
+            self.hud.chunks_meshed = meshed_columns;
+            self.hud.chunks_total = self.world_overlay.loaded_columns.len() as u32;
+            self.hud.view_distance = self.settings.settings().render_distance;
+            let size = window.inner_size();
+            self.hud.display_size = Some((size.width, size.height));
+            self.hud.display_backend = renderer.adapter_backend();
+            self.hud.adapter_name = renderer.adapter_name().to_string();
+            self.hud.adapter_driver = renderer.adapter_driver();
+            self.hud.rustc_version = option_env!("OXIDECRAFT_RUSTC_VERSION")
+                .unwrap_or("n/a")
+                .to_string();
+            self.hud.build_id = env!("CARGO_PKG_VERSION").to_string();
+            let reduced =
+                self.settings.settings().reduced_debug_info || self.hud.server_reduced_debug;
+            let (left, right) = if self.debug.visible {
+                (debug_left(&self.hud, reduced), debug_right(&self.hud))
             } else {
-                Vec::new()
-            });
+                (Vec::new(), Vec::new())
+            };
+            renderer.set_overlay_lines(left, right);
         }
         match present_frame(renderer) {
             Ok(PresentOutcome::Presented) => {}
@@ -2851,8 +2877,20 @@ impl ClientApp {
             && is_h_press(event.state, event.repeat, event.physical_key)
             && self.f3_held
         {
-            self.advanced_tooltips = !self.advanced_tooltips;
+            self.debug.advanced_tooltips = !self.debug.advanced_tooltips;
             return;
+        }
+        // The remaining F3 chords share the H chord's gate: a fresh letter
+        // press while F3 is held names its action from the chord table
+        // (`Minecraft.java`:1994-2034); H is answered by the standing arm
+        // above, and a letter with no arm records its reason, never silently.
+        if f3_chord_live(self.screens.is_open(), self.screens.allow_user_input()) && self.f3_held {
+            if let Some(chord) =
+                f3_chord(event.state, event.repeat, event.physical_key, self.f3_held)
+            {
+                self.on_f3_chord(chord);
+                return;
+            }
         }
         // The open screen holds every other key: the container's own E, 1-9
         // and Q routing runs here, above the gameplay keys — an open screen
@@ -2908,9 +2946,24 @@ impl ClientApp {
             return;
         }
         if is_f3_press(event.state, &event.logical_key) {
-            self.overlay_visible = !self.overlay_visible;
+            self.debug.visible = !self.debug.visible;
+            if self.shift {
+                // Shift+F3's profiler chart has no flag: the port keeps no
+                // profiler, and the later milestone records the chart as a
+                // phantom — the overlay toggle still lands, and the reason is
+                // recorded here, never silent.
+                tracing::info!(
+                    "Shift+F3 toggled the overlay; the profiler chart stays a recorded phantom"
+                );
+            }
+            if self.alt {
+                // Alt+F3's lagometer (`Minecraft.java`:2026): a flag read
+                // only, the draw belongs to the later milestone.
+                self.debug.lagometer = !self.debug.lagometer;
+            }
             tracing::info!(
-                visible = self.overlay_visible,
+                visible = self.debug.visible,
+                lagometer = self.debug.lagometer,
                 "the debug overlay was toggled"
             );
             return;
@@ -3478,6 +3531,70 @@ impl ClientApp {
                 }
             }
             SaveKind::Deferred => self.settings.mark_changed(Instant::now()),
+        }
+    }
+
+    /// Runs one F3 chord from the chord table: P flips pause-on-lost-focus
+    /// and persists it to the settings home at once; A queues every loaded
+    /// column's meshes once more; F steps the render distance through the
+    /// standing set-option path — Shift steps down — pushing and saving like
+    /// the video screen's own writes; T re-pushes the live settings through
+    /// the standing apply path, the refresh-equivalent; B and G flip the
+    /// flag reads the later milestone's draws consume; a letter with no arm
+    /// records its reason, never silently.
+    fn on_f3_chord(&mut self, chord: F3Chord) {
+        match chord {
+            F3Chord::PauseOnFocusLost => {
+                let flag = !self.settings.settings().pause_on_lost_focus;
+                self.settings.settings_mut().pause_on_lost_focus = flag;
+                self.debug.pause_on_focus_lost = flag;
+                self.fold_options_save(SaveKind::Immediate);
+                tracing::info!(
+                    pause_on_focus_lost = flag,
+                    "F3+P flipped pause-on-lost-focus"
+                );
+            }
+            F3Chord::RebuildMeshes => {
+                self.send_input(InputEvent::RebuildMeshes);
+                tracing::info!("F3+A queued every loaded column's meshes once more");
+            }
+            F3Chord::RenderDistance => {
+                let down = self.shift;
+                let next = render_distance_step(self.settings.settings().render_distance, down);
+                self.settings.settings_mut().render_distance = next;
+                self.push_settings();
+                self.fold_options_save(SaveKind::Immediate);
+                tracing::info!(
+                    render_distance = next,
+                    down,
+                    "F3+F stepped the render distance"
+                );
+            }
+            F3Chord::RefreshSettings => {
+                // The port has no asset reload to trigger
+                // (`refreshResources` has no equivalent), so the standing
+                // apply path is the refresh: every live setting re-lands on
+                // the renderer, audio, particles, window and keymap.
+                self.push_settings();
+                tracing::info!("F3+T re-pushed the live settings through the standing apply path");
+            }
+            F3Chord::Hitboxes => {
+                self.debug.hitboxes = !self.debug.hitboxes;
+                tracing::info!(
+                    hitboxes = self.debug.hitboxes,
+                    "F3+B flipped the hitbox flag"
+                );
+            }
+            F3Chord::ChunkBorders => {
+                self.debug.chunk_borders = !self.debug.chunk_borders;
+                tracing::info!(
+                    chunk_borders = self.debug.chunk_borders,
+                    "F3+G flipped the chunk-border flag"
+                );
+            }
+            F3Chord::Absent(reason) => {
+                tracing::info!(reason, "the F3 chord has no arm");
+            }
         }
     }
 
@@ -4376,8 +4493,7 @@ impl ClientApp {
         self.settings.set_session(session.input_tx.clone());
         self.session = Some(session);
         self.joined = false;
-        self.overlay_visible = true;
-        self.hud.server = address;
+        self.debug.visible = true;
         let mut dropped = None;
         let _ = self.screens.close(&mut dropped);
         self.cursor = None;
@@ -4914,9 +5030,9 @@ impl ClientApp {
                 }
             }
             ScriptKey::F3 => {
-                self.overlay_visible = !self.overlay_visible;
+                self.debug.visible = !self.debug.visible;
                 tracing::info!(
-                    visible = self.overlay_visible,
+                    visible = self.debug.visible,
                     "the debug overlay was toggled"
                 );
             }
@@ -4929,7 +5045,7 @@ impl ClientApp {
                     )
                     && self.f3_held
                 {
-                    self.advanced_tooltips = !self.advanced_tooltips;
+                    self.debug.advanced_tooltips = !self.debug.advanced_tooltips;
                 }
             }
             ScriptKey::Inventory | ScriptKey::Drop | ScriptKey::Digit(_) => {
@@ -5803,7 +5919,10 @@ fn clear_break_stage(stages: &mut BTreeMap<i32, WindowBreakEntry>, breaker: i32)
 /// window's real wiring without a renderer.
 fn apply_overlay_event(world_overlay: &mut WorldOverlayState, event: &ClientEvent) -> bool {
     match event {
-        ClientEvent::Aim { aim: report } => {
+        ClientEvent::Aim {
+            aim: report,
+            block: _,
+        } => {
             if store_aim(&mut world_overlay.aim, *report) {
                 tracing::debug!(?report, "the aim moved");
             }
@@ -6009,6 +6128,7 @@ fn apply_session_event(
             difficulty,
             max_players,
             level_type,
+            reduced_debug_info,
         } => {
             tracing::info!(
                 entity_id,
@@ -6019,8 +6139,10 @@ fn apply_session_event(
                 %level_type,
                 "joined the world"
             );
-            hud.entity_id = entity_id;
             hud.dimension = dimension;
+            hud.difficulty = difficulty;
+            hud.provider = level_type.clone();
+            hud.server_reduced_debug = reduced_debug_info;
             sky.void_y_factor = void_y_factor(&level_type);
             false
         }
@@ -6041,9 +6163,12 @@ fn apply_session_event(
             player.observe(tick, [x, y, z], yaw, pitch, sneaking, snapped);
             false
         }
-        ClientEvent::EntitiesTick { .. } => {
-            // The window's entity surfaces arrive with a later milestone; the
-            // feed is accepted here so the session's event stream stays total.
+        ClientEvent::EntitiesTick { entities } => {
+            // The port draws every tracked entity with no frustum cull, so
+            // the rendered count coincides with the total; recorded, never a
+            // second count.
+            hud.entities_rendered = entities.len();
+            hud.entities_total = entities.len();
             false
         }
         ClientEvent::PlayerList { .. } => {
@@ -6071,9 +6196,15 @@ fn apply_session_event(
             chat.observe(&text, position, player.tick);
             false
         }
-        ClientEvent::Aim { .. }
-        | ClientEvent::BreakStage { .. }
-        | ClientEvent::BreakCleared { .. } => {
+        ClientEvent::Aim { aim, block } => {
+            // The overlay's `Looking at:` and block-section reads ride the
+            // aim beside the outline store below.
+            hud.aim = aim.map(|report| [report.x, report.y, report.z]);
+            hud.aim_block = block;
+            apply_overlay_event(world_overlay, &event);
+            false
+        }
+        ClientEvent::BreakStage { .. } | ClientEvent::BreakCleared { .. } => {
             // The overlay state's own events; the helper holds the stores the
             // frame's outline and crack reads consume.
             apply_overlay_event(world_overlay, &event);
@@ -6085,6 +6216,7 @@ fn apply_session_event(
         } => {
             tracing::debug!(world_age, time_of_day, "the clock was set");
             sky.time_of_day = Some(time_of_day);
+            hud.world_time = time_of_day;
             false
         }
         ClientEvent::Sky {
@@ -6099,6 +6231,7 @@ fn apply_session_event(
         } => {
             // The terrain lightmap follows the clock's own sun brightness.
             renderer.set_lightmap(sun_brightness);
+            hud.moon_phase = moon_phase;
             sky.sky = Some(SkyValues {
                 celestial_angle,
                 colour,
@@ -6112,12 +6245,14 @@ fn apply_session_event(
             false
         }
         ClientEvent::ChunkUpdated { cx, cz, sections } => {
+            world_overlay.loaded_columns.insert((cx, cz));
             for (section, mesh) in &sections {
                 renderer.set_section_mesh((cx, cz, *section as u8), mesh.as_ref());
             }
             false
         }
         ClientEvent::ChunkUnloaded { cx, cz } => {
+            world_overlay.loaded_columns.remove(&(cx, cz));
             for section in 0..SECTIONS_PER_COLUMN {
                 renderer.set_section_mesh((cx, cz, section), None);
             }
@@ -6153,6 +6288,7 @@ fn apply_session_event(
             // fresh columns replace them as they arrive.
             tracing::info!("the world was rebuilt; the section meshes are dropped");
             renderer.clear_section_meshes();
+            world_overlay.loaded_columns.clear();
             false
         }
         ClientEvent::KeepAlive { id } => {
@@ -6173,12 +6309,30 @@ fn apply_session_event(
             feeds.columns_tick = tick;
             false
         }
-        ClientEvent::Particles { frames, .. } => {
+        ClientEvent::Particles { frames, total, .. } => {
             // The frame maps the kept snapshot into the particle pass's
             // draws every frame, interpolated at its fraction; the report's
             // tick only names the snapshot and feeds no clock, so the frames
-            // alone are kept.
+            // alone are kept — while the overlay's `P:` count reads every
+            // live particle, drawn or not, straight from the total.
             feeds.frames = frames;
+            hud.particles = total;
+            false
+        }
+        ClientEvent::EyeBlock {
+            block_loaded,
+            biome_id,
+            sky_light,
+            block_light,
+            ..
+        } => {
+            // The overlay's conditional tail reads the feet block's own
+            // gate: `Biome:`, `Light:` and `Local Difficulty:` land only
+            // where the column is loaded.
+            hud.view_loaded = block_loaded;
+            hud.view_biome = biome_id;
+            hud.view_sky_light = sky_light;
+            hud.view_block_light = block_light;
             false
         }
         // The window's own three ride here unconsumed: the screens fold above
@@ -6194,7 +6348,6 @@ fn apply_session_event(
         | ClientEvent::Absorption { .. }
         | ClientEvent::Air { .. }
         | ClientEvent::Effects { .. }
-        | ClientEvent::EyeBlock { .. }
         | ClientEvent::SignEditorOpen { .. }
         | ClientEvent::SignTextChanged { .. }
         | ClientEvent::SignTextCleared { .. }
@@ -7045,6 +7198,7 @@ impl ApplicationHandler for ClientApp {
                 let state = modifiers.state();
                 self.shift = state.shift_key();
                 self.ctrl = state.control_key();
+                self.alt = state.alt_key();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.on_wheel(delta);
@@ -7151,6 +7305,106 @@ fn f3_hold_step(held: bool, state: ElementState, key: &WinitKey) -> bool {
 /// Kept out of the event match so the chord can be pinned without an event loop.
 fn is_h_press(state: ElementState, repeat: bool, key: PhysicalKey) -> bool {
     state == ElementState::Pressed && !repeat && key == PhysicalKey::Code(KeyCode::KeyH)
+}
+
+/// The debug overlay's own flags: the F3 chords' standing state, read by the
+/// overlay builder and — for the hitbox, border and lagometer reads — by the
+/// draws of the later milestone. Session-only, like the overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DebugFlags {
+    /// Whether F3 has the overlay showing.
+    visible: bool,
+    /// Whether F3+H has the advanced tooltips showing
+    /// (`gameSettings.advancedItemTooltips`, toggled at :2000-2004): the
+    /// flag the screen frame hands the tooltip builder.
+    advanced_tooltips: bool,
+    /// Whether F3+B has the entity hitboxes showing: a flag read only, the
+    /// draws belong to the later milestone (`showDebugBoundingBox`, :2005).
+    hitboxes: bool,
+    /// Whether F3+G has the chunk borders showing: a new v1 key with no
+    /// source arm, a flag read only, the draws belong to the later
+    /// milestone.
+    chunk_borders: bool,
+    /// Whether Alt+F3 has the lagometer showing: a flag read only, the draw
+    /// belongs to the later milestone (`:2026`).
+    lagometer: bool,
+    /// Whether F3+P pauses on losing focus: the port's `pauseOnLostFocus`
+    /// (`GameSettings.java`:66), persisted to the settings home.
+    pause_on_focus_lost: bool,
+}
+
+/// One F3 chord: the action a fresh letter press names while F3 is held
+/// (`keyTyped`'s arms at `Minecraft.java`:1994-2034, read by physical key
+/// like the H chord's scancode read).
+///
+/// Kept out of the event match so the chord table can be pinned without an event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum F3Chord {
+    /// F3+P: flip pause-on-lost-focus, persisting to the settings home.
+    PauseOnFocusLost,
+    /// F3+A: queue every loaded column's meshes once more.
+    RebuildMeshes,
+    /// F3+F: step the render distance through the standing set-option path,
+    /// Shift stepping down.
+    RenderDistance,
+    /// F3+T: re-push the live settings through the standing apply path —
+    /// the refresh-equivalent; the port has no asset reload to trigger, and
+    /// the divergence is recorded, never silent.
+    RefreshSettings,
+    /// F3+B: flip the hitbox flag the later milestone's draws read.
+    Hitboxes,
+    /// F3+G: flip the chunk-border flag the later milestone's draws read.
+    ChunkBorders,
+    /// A held-F3 letter with no arm: recorded with its reason, never a
+    /// silent no-op and never a dead arm.
+    Absent(&'static str),
+}
+
+/// Names the F3 chord a key event carries, if any: a fresh letter press
+/// while F3 is held. H is answered by the standing H arm above, never here;
+/// anything that is not a fresh press, or arrives with F3 up, is no chord.
+///
+/// Kept out of the event match so the chord table can be pinned without an event loop.
+fn f3_chord(state: ElementState, repeat: bool, key: PhysicalKey, f3_held: bool) -> Option<F3Chord> {
+    if state != ElementState::Pressed || repeat || !f3_held {
+        return None;
+    }
+    let code = match key {
+        PhysicalKey::Code(code) => code,
+        PhysicalKey::Unidentified(_) => return None,
+    };
+    match code {
+        KeyCode::KeyP => Some(F3Chord::PauseOnFocusLost),
+        KeyCode::KeyA => Some(F3Chord::RebuildMeshes),
+        KeyCode::KeyF => Some(F3Chord::RenderDistance),
+        KeyCode::KeyT => Some(F3Chord::RefreshSettings),
+        KeyCode::KeyB => Some(F3Chord::Hitboxes),
+        KeyCode::KeyG => Some(F3Chord::ChunkBorders),
+        KeyCode::KeyN => Some(F3Chord::Absent(
+            "the renderer-switch cycle the port has one renderer for",
+        )),
+        KeyCode::KeyQ => Some(F3Chord::Absent(
+            "the profiler dump the port keeps no profiler for",
+        )),
+        KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyV | KeyCode::KeyL | KeyCode::KeyU => Some(
+            F3Chord::Absent("the source has no such chord; the key does nothing under F3"),
+        ),
+        _ => None,
+    }
+}
+
+/// Steps the render distance one notch in `down`'s direction through the
+/// source's own 2..32 notches (`RENDER_DISTANCE_MIN/MAX`, the slider's
+/// `RENDER_DISTANCE_STEP` of one): F3+F steps up, Shift+F3+F steps down.
+///
+/// Kept out of the event match so the step can be pinned without an event loop.
+fn render_distance_step(current: u8, down: bool) -> u8 {
+    let (min, max) = VIEW_DISTANCE_RANGE;
+    if down {
+        current.saturating_sub(1).max(min)
+    } else {
+        current.saturating_add(1).min(max)
+    }
 }
 
 /// The chat field's character cap: `GuiChat.initGui`'s own
@@ -7527,19 +7781,19 @@ mod tests {
 
     use super::{
         Aim, CameraPose, CameraState, CameraTick, Capture, CaptureStep, ChatInput, ChatKey, Cli,
-        ClickButton, ClientApp, ClipboardCopy, Directive, DirectiveAction, EscapeRoute, FogMode,
-        ItemTable, Key, MouseButton, PlayerState, Screens, ScriptDriver, ScriptGesture, ScriptKey,
-        SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
+        ClickButton, ClientApp, ClipboardCopy, Directive, DirectiveAction, EscapeRoute, F3Chord,
+        FogMode, ItemTable, Key, MouseButton, PlayerState, Screens, ScriptDriver, ScriptGesture,
+        ScriptKey, SessionLink, SkinRequest, SkinUpdate, SkyValues, UrlOpener, WindowBreakEntry,
         WorldOverlayState, aim_outline, apply_overlay_event, bound_mouse_button, camera_pose,
         chat_opener, chat_wheel_lines, chat_wheel_scrolls, clear_break_stage, command_text,
         confirm_labels, cracks_in_view, creative_wheel_notch, death_labels, digit_slot,
-        disconnect_button_label, disconnect_title, escape_route, f3_hold_step, frame_params,
-        gameplay_key, interpolate_pose, inventory_opener, is_enter_press, is_escape_press,
-        is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv, parse_script,
-        parse_server_address, particle_draws, scaled_cursor, screen_button_events,
-        screen_click_button, scripted_chat_click, skin_requests, sleep_cover_dim, sleep_dim,
-        sleep_pose, store_aim, store_break_stage, store_skins, tab_held, tooltip_point,
-        void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
+        disconnect_button_label, disconnect_title, escape_route, f3_chord, f3_hold_step,
+        frame_params, gameplay_key, interpolate_pose, inventory_opener, is_enter_press,
+        is_escape_press, is_f3_press, is_h_press, load_sounds_bytes, local_sound_play, missing_uv,
+        parse_script, parse_server_address, particle_draws, render_distance_step, scaled_cursor,
+        screen_button_events, screen_click_button, scripted_chat_click, skin_requests,
+        sleep_cover_dim, sleep_dim, sleep_pose, store_aim, store_break_stage, store_skins,
+        tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
     };
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
@@ -7648,6 +7902,106 @@ mod tests {
         assert!(!is_h_press(ElementState::Pressed, true, h));
         assert!(!is_h_press(ElementState::Released, false, h));
         assert!(!is_h_press(ElementState::Pressed, false, g));
+    }
+
+    /// The chord table routes every held-F3 letter press: P/A/F/T live, B/G
+    /// flag reads, N/Q/W/E/V/L/U recorded-absent — and nothing else chords.
+    fn chord(code: KeyCode) -> Option<F3Chord> {
+        f3_chord(ElementState::Pressed, false, PhysicalKey::Code(code), true)
+    }
+
+    #[test]
+    fn the_f3_chord_table_routes_every_letter() {
+        assert!(matches!(
+            chord(KeyCode::KeyP),
+            Some(F3Chord::PauseOnFocusLost)
+        ));
+        assert!(matches!(chord(KeyCode::KeyA), Some(F3Chord::RebuildMeshes)));
+        assert!(matches!(
+            chord(KeyCode::KeyF),
+            Some(F3Chord::RenderDistance)
+        ));
+        assert!(matches!(
+            chord(KeyCode::KeyT),
+            Some(F3Chord::RefreshSettings)
+        ));
+        assert!(matches!(chord(KeyCode::KeyB), Some(F3Chord::Hitboxes)));
+        assert!(matches!(chord(KeyCode::KeyG), Some(F3Chord::ChunkBorders)));
+        // The absent set records its reason, never silently: N (one renderer),
+        // Q (no profiler), and W/E/V/L/U (the source has no such chord).
+        for code in [
+            KeyCode::KeyN,
+            KeyCode::KeyQ,
+            KeyCode::KeyW,
+            KeyCode::KeyE,
+            KeyCode::KeyV,
+            KeyCode::KeyL,
+            KeyCode::KeyU,
+        ] {
+            assert!(
+                matches!(chord(code), Some(F3Chord::Absent(_))),
+                "{code:?} is recorded absent"
+            );
+        }
+        // H rides the standing arm, never the table; a plain letter is no
+        // chord at all.
+        assert!(
+            chord(KeyCode::KeyH).is_none(),
+            "H is answered above the table"
+        );
+        assert!(chord(KeyCode::KeyC).is_none(), "C has no chord");
+        // The guards: releases, repeats, F3-up and unidentified keys chord
+        // nothing.
+        assert!(
+            f3_chord(
+                ElementState::Released,
+                false,
+                PhysicalKey::Code(KeyCode::KeyP),
+                true,
+            )
+            .is_none()
+        );
+        assert!(
+            f3_chord(
+                ElementState::Pressed,
+                true,
+                PhysicalKey::Code(KeyCode::KeyP),
+                true,
+            )
+            .is_none()
+        );
+        assert!(
+            f3_chord(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Code(KeyCode::KeyP),
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            f3_chord(
+                ElementState::Pressed,
+                false,
+                PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_render_distance_steps_one_notch_within_2_to_32() {
+        assert_eq!(render_distance_step(8, false), 9, "F3+F steps up");
+        assert_eq!(render_distance_step(8, true), 7, "Shift+F3+F steps down");
+        assert_eq!(render_distance_step(32, false), 32, "the top notch holds");
+        assert_eq!(render_distance_step(2, true), 2, "the bottom notch holds");
+        assert_eq!(render_distance_step(0, true), 2, "below range clamps up");
+        assert_eq!(
+            render_distance_step(255, false),
+            32,
+            "above range clamps down"
+        );
     }
 
     #[test]
@@ -7778,7 +8132,7 @@ mod tests {
         let cli = Cli::try_parse_from(["oxide-client"]).expect("a bare invocation parses");
         let app = ClientApp::new(cli).expect("the client builds without a server");
         assert!(app.session.is_none(), "no session is opened");
-        assert!(!app.overlay_visible, "the overlay stays hidden");
+        assert!(!app.debug.visible, "the overlay stays hidden");
     }
 
     #[test]
@@ -9622,7 +9976,13 @@ mod tests {
             hit: [-2.5, 65.0, 12.5],
         };
         assert!(
-            apply_overlay_event(&mut overlay, &ClientEvent::Aim { aim: Some(aim) }),
+            apply_overlay_event(
+                &mut overlay,
+                &ClientEvent::Aim {
+                    aim: Some(aim),
+                    block: None
+                }
+            ),
             "the aim is the overlay's own event"
         );
         assert_eq!(
@@ -9635,7 +9995,10 @@ mod tests {
         // A look that leaves every block clears it.
         assert!(apply_overlay_event(
             &mut overlay,
-            &ClientEvent::Aim { aim: None }
+            &ClientEvent::Aim {
+                aim: None,
+                block: None
+            }
         ));
         assert!(overlay.aim.is_none(), "the aim cleared");
         // Two breakers on one block: both entries land, and both reach the
