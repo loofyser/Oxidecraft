@@ -653,7 +653,7 @@ fn the_packs_frame_at_default_scale() {
     let pixels = render_screen_frame(&draws);
     let ink = title_ink_in(&pixels, 16);
     assert!(ink > 100, "the title inks white pixels at y 16: {ink}");
-    expect_options_pixel(&pixels, 75, 215, [200, 200, 200], "the idle Done strip");
+    expect_options_pixel(&pixels, 230, 200, [200, 200, 200], "the idle Done strip");
 }
 /// The video frame's own draws at the probe size: the dirt tiles lead, the
 /// frame's world-present gradient pair falls over them, and the centred

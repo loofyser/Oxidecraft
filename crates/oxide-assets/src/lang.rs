@@ -411,9 +411,10 @@ mod tests {
 
     #[test]
     fn blanks_comments_and_keyless_lines_fall_out() {
-        let table = parse_lang("# a comment\n\nkey=value\nkeyless\n");
+        let table = parse_lang("# a comment\n#skipped=absent\n\nkey=value\nkeyless\n");
         assert_eq!(table.len(), 1);
         assert_eq!(table["key"], "value");
+        assert!(!table.contains_key("#skipped"));
     }
 
     #[test]
