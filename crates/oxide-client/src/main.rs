@@ -3078,8 +3078,9 @@ impl ClientApp {
             return;
         }
         // The fullscreen key's flip (the row owns the key): a fresh press of
-        // the bound key flips the stored flag and saves at once
-        // (`Minecraft.java`:3188-3191) — the window apply is Task 28's.
+        // the bound key flips the stored flag, saves at once and pushes the
+        // whole settings through the standing apply, so the window follows the
+        // key without waiting for the next Done (`Minecraft.java`:3188-3191).
         if fullscreen_pressed(
             event.state,
             event.repeat,
@@ -3091,6 +3092,7 @@ impl ClientApp {
             if let Err(error) = self.settings.save_now() {
                 tracing::warn!(%error, "the fullscreen flip could not be saved");
             }
+            self.push_settings();
             tracing::info!(fullscreen, "the fullscreen flag flipped");
             return;
         }
@@ -7604,6 +7606,16 @@ impl ApplicationHandler for ClientApp {
                 self.tab.open = false;
             }
             WindowEvent::Resized(size) => {
+                // The source polls `Display.wasResized()` and re-reads the size when
+                // windowed (`Minecraft.java`:1227-1251) — no `Display.setResized`
+                // exists anywhere in the source tree — so winit's `Resized` event
+                // is the poll's equivalent here. `renderer.resize` reconfigures the
+                // surface, the depth, the overlay size and the HUD/screen
+                // projections, and returns the fresh scaled resolution; the open
+                // screens re-derive their layout off the next frame's
+                // `scaled_resolution()` reads. A zero size (a hidden or minimised
+                // window) never reaches the surface: the guard lives in
+                // `renderer.resize`, which emits the current resolution unchanged.
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }

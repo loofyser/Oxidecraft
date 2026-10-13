@@ -21,9 +21,11 @@
 //!
 //! Fullscreen maps to winit borderless fullscreen (the source toggles its
 //! exclusive mode, `GameSettings.java:479-487`); the key that toggles it
-//! stays Task 25's. Clouds push the raw store value — the `< 4 → Off` clause
-//! (`GameSettings.shouldRenderClouds`, `:1256`) stays Task 28's. The
-//! framerate 255 sentinel skips the limiter; the top step reads "Unlimited"
+//! stays Task 25's. Clouds resolve `render_distance < 4 → Off` at the pushed
+//! value (`GameSettings.shouldRenderClouds`, `:1256`): the apply reads the
+//! effective view distance and pushes Off below four chunks, so the renderer
+//! only ever receives the resolved value. The framerate 255 sentinel skips
+//! the limiter; the top step reads "Unlimited"
 //! (`options.framerateLimit.max`, `en_US.lang:340`).
 //!
 //! # Known limits, recorded
@@ -130,7 +132,8 @@ pub trait VideoSink {
     fn set_gui_scale(&mut self, scale: u8);
     /// Takes the brightness setting.
     fn set_brightness(&mut self, brightness: u8);
-    /// Takes the raw cloud setting (no `< 4 → Off` resolution here).
+    /// Takes the resolved cloud value: the apply folds `render_distance < 4`
+    /// into Off before pushing, so the sink never sees the distance.
     fn set_clouds(&mut self, clouds: u8);
     /// Takes whether the graphics path is Fast.
     fn set_graphics_fast(&mut self, fast: bool);
@@ -382,10 +385,12 @@ impl SettingsState {
     ///
     /// The music category carries the music fold over its level (the music
     /// volume times the category level); every other category passes its
-    /// level straight through. The clouds push the raw store value — the
-    /// `< 4 → Off` clause stays Task 28's. A closed session channel drops
-    /// the pushes silently: the session is gone, so there is nothing to
-    /// tell.
+    /// level straight through. The clouds resolve `render_distance < 4 → Off`
+    /// at the pushed value (`GameSettings.shouldRenderClouds`, `:1256`),
+    /// read off the effective view distance, so the renderer takes only the
+    /// resolved value and never branches on the distance itself. A closed
+    /// session channel drops the pushes silently: the session is gone, so
+    /// there is nothing to tell.
     pub fn apply<R, E, P, W, K>(
         &mut self,
         renderer: &mut R,
@@ -403,7 +408,16 @@ impl SettingsState {
         let settings = &self.settings;
         renderer.set_gui_scale(settings.gui_scale);
         renderer.set_brightness(settings.brightness);
-        renderer.set_clouds(settings.clouds.as_u8());
+        // `render_distance < 4 → clouds Off`, resolved at the pushed value
+        // (`GameSettings.shouldRenderClouds`, `GameSettings.java:1254-1256`):
+        // the effective view distance decides, so a CLI-overridden run folds
+        // the same way the frame reads it.
+        let clouds = if self.view_distance() < 4 {
+            0
+        } else {
+            settings.clouds.as_u8()
+        };
+        renderer.set_clouds(clouds);
         renderer.set_graphics_fast(matches!(settings.graphics, GraphicsSetting::Fast));
         renderer.set_smooth_lighting(settings.smooth_lighting);
         renderer.set_vsync(settings.vsync);

@@ -73,7 +73,9 @@ use oxide_render::entity_pass::{
 use oxide_render::fog::{FogMode, FogParams, fog_colour, water_fog};
 use oxide_render::gui_item::{ATLAS_TEXTURE, IconShape, ItemIcon, ItemIconMesh, ItemIconSource};
 use oxide_render::held_item::{HeldItemFrame, HeldItemPass};
-use oxide_render::hud::{HudDraw, HudPass, HudTexture, ScaledResolution, scaled_resolution};
+use oxide_render::hud::{
+    HudDraw, HudPass, HudTexture, ScaledResolution, projection_size, scaled_resolution,
+};
 use oxide_render::lagometer::{FrameTimer, lagometer_draws};
 use oxide_render::lightmap::{BrightnessTable, gamma_for_brightness, lightmap_image, sample_index};
 use oxide_render::overlay::OverlayPass;
@@ -13083,5 +13085,241 @@ fn the_particle_pass_draws_the_capped_visible_set() {
         inked_pixels(&lit) > 1000,
         "the capped set inks the frame: {}",
         inked_pixels(&lit)
+    );
+}
+
+/// A colour target at an explicit size: the window-size legs render at their
+/// own window's pixels rather than the shared 64x64 target.
+fn gui_target(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> Target {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("oxide pipeline headless gui target"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Target { texture, view }
+}
+
+/// A depth texture matching a sized GUI target.
+fn gui_depth(device: &wgpu::Device, size: (u32, u32)) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("oxide pipeline headless gui depth"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Reads a sized target back as RGBA bytes, one `width * 4` row per line.
+fn read_gui_pixels(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    size: (u32, u32),
+) -> Vec<u8> {
+    let bytes_per_row = size.0 * 4;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("oxide pipeline headless gui readback"),
+        size: u64::from(bytes_per_row) * u64::from(size.1),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide pipeline headless gui readback encoder"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(size.1),
+            },
+        },
+        wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::Wait).expect("the device polls");
+    receiver
+        .recv()
+        .expect("the map callback runs")
+        .expect("the buffer maps");
+    let pixels = slice.get_mapped_range().to_vec();
+    buffer.unmap();
+    pixels
+}
+
+/// One pixel's RGB bytes out of a sized readback.
+fn gui_pixel(pixels: &[u8], stride: u32, x: u32, y: u32) -> [u8; 3] {
+    let offset = (y * stride + x * 4) as usize;
+    [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+}
+
+/// Asserts one pixel of a sized readback within the pass's two-count tolerance.
+fn expect_gui_pixel(pixels: &[u8], stride: u32, x: u32, y: u32, want: [u8; 3], what: &str) {
+    let got = gui_pixel(pixels, stride, x, y);
+    let close = got
+        .iter()
+        .zip(want)
+        .all(|(&got, want)| (i16::from(got) - i16::from(want)).abs() <= 2);
+    assert!(close, "{what} at ({x}, {y}): got {got:?}, want {want:?}");
+}
+
+/// The frame's non-sky count over a sized readback.
+fn gui_non_sky(pixels: &[u8], size: (u32, u32)) -> usize {
+    let stride = size.0 * 4;
+    (0..size.1)
+        .flat_map(|y| (0..size.0).map(move |x| (x, y)))
+        .filter(|&(x, y)| gui_pixel(pixels, stride, x, y) != SKY)
+        .count()
+}
+
+/// Renders one GUI frame for a window size and scale: the scaled resolution of
+/// [`scaled_resolution`] lays the draws out, the fractional doubles of
+/// [`projection_size`] build the ortho, and the target holds the window's own
+/// pixels — the resize path's whole chain onto a framebuffer.
+fn gui_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    window: (u32, u32),
+    gui_scale: u8,
+    draws: &[HudDraw],
+) -> (Vec<u8>, ScaledResolution) {
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = gui_target(device, format, window);
+    let scaled = scaled_resolution(window.0, window.1, gui_scale);
+    let (projection_width, projection_height) =
+        projection_size(window.0, window.1, scaled.scale_factor);
+    let mut hud = HudPass::new(device, queue, format);
+    hud.set_resolution(queue, projection_width as f32, projection_height as f32);
+    let skins = TextureRegistry::new(device, queue);
+    hud.set_draws(device, queue, draws, &skins);
+    let depth = gui_depth(device, window);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("oxide gui headless encoder"),
+    });
+    with_clear_pass(&mut encoder, &target.view, SKY_COLOR);
+    with_overlay_pass(&mut encoder, &target.view, &depth, |pass| hud.draw(pass));
+    queue.submit(Some(encoder.finish()));
+    (read_gui_pixels(device, queue, &target, window), scaled)
+}
+
+/// The opaque red probe both window-size legs draw: one rect at an eighth of the
+/// scaled size in from the top-left corner, a quarter of it wide and a sixth tall.
+fn gui_probe_draws(scaled: &ScaledResolution) -> Vec<HudDraw> {
+    vec![HudDraw::Rect {
+        x: scaled.width as f32 / 8.0,
+        y: scaled.height as f32 / 6.0,
+        width: scaled.width as f32 / 4.0,
+        height: scaled.height as f32 / 6.0,
+        colour: [1.0, 0.0, 0.0, 1.0],
+    }]
+}
+
+/// A small window's GUI frame covers the layout's own pixels: 64x48 at scale one
+/// lays out 64x48 GUI units one pixel each, so the probe rect lands at
+/// x 8..24, y 8..16 and inks exactly 16x8 = 128 pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_gui_frame_at_a_small_window_covers_the_layout_pixels() {
+    let (device, queue) = headless_device();
+    let window = (64, 48);
+    let scaled = scaled_resolution(window.0, window.1, 1);
+    assert_eq!(
+        (scaled.width, scaled.height, scaled.scale_factor),
+        (64, 48, 1),
+        "the 64x48 window at scale one lays out 64x48"
+    );
+    let draws = gui_probe_draws(&scaled);
+    let (pixels, _) = gui_frame(&device, &queue, window, 1, &draws);
+    let stride = window.0 * 4;
+    let red = [255, 0, 0];
+    expect_gui_pixel(&pixels, stride, 8, 8, red, "the rect's top-left corner");
+    expect_gui_pixel(
+        &pixels,
+        stride,
+        23,
+        15,
+        red,
+        "the rect's bottom-right corner",
+    );
+    expect_gui_pixel(&pixels, stride, 7, 8, SKY, "left of the rect");
+    expect_gui_pixel(&pixels, stride, 24, 8, SKY, "right of the rect");
+    expect_gui_pixel(&pixels, stride, 8, 16, SKY, "below the rect");
+    assert_eq!(
+        gui_non_sky(&pixels, window),
+        128,
+        "the 16x8 rect inks 128 pixels at one pixel per unit"
+    );
+}
+
+/// A large window's GUI frame magnifies the same layout: 640x480 at scale two
+/// lays out 320x240 GUI units at two pixels each, so the probe rect lands at
+/// x 80..240, y 80..160 and inks exactly 160x80 = 12800 pixels.
+#[test]
+#[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+fn the_gui_frame_at_a_large_window_magnifies_the_layout() {
+    let (device, queue) = headless_device();
+    let window = (640, 480);
+    let scaled = scaled_resolution(window.0, window.1, 2);
+    assert_eq!(
+        (scaled.width, scaled.height, scaled.scale_factor),
+        (320, 240, 2),
+        "the 640x480 window at scale two lays out 320x240"
+    );
+    let draws = gui_probe_draws(&scaled);
+    let (pixels, _) = gui_frame(&device, &queue, window, 2, &draws);
+    let stride = window.0 * 4;
+    let red = [255, 0, 0];
+    expect_gui_pixel(&pixels, stride, 80, 80, red, "the rect's top-left corner");
+    expect_gui_pixel(
+        &pixels,
+        stride,
+        239,
+        159,
+        red,
+        "the rect's bottom-right corner",
+    );
+    expect_gui_pixel(&pixels, stride, 79, 80, SKY, "left of the rect");
+    expect_gui_pixel(&pixels, stride, 240, 80, SKY, "right of the rect");
+    expect_gui_pixel(&pixels, stride, 80, 160, SKY, "below the rect");
+    assert_eq!(
+        gui_non_sky(&pixels, window),
+        12_800,
+        "the 160x80 rect inks 12800 pixels at two pixels per unit"
     );
 }

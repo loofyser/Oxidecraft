@@ -2126,6 +2126,51 @@ mod tests {
     }
 
     #[test]
+    fn the_four_scale_table_at_the_three_reference_resolutions() {
+        // The full non-unicode column, re-derived from the loop in-task: the factor
+        // grows while one more step keeps 320x240 GUI pixels on both axes
+        // (`ScaledResolution.java`:27-30, integer division), and the scaled size is
+        // the ceiling of the display over the factor (`:37-40`). 1280x720 stops at
+        // three (720/4 = 180 < 240); 1920x1080 at four (1080/5 = 216 < 240);
+        // 2560x1440 at six (1440/7 = 205 < 240, while 2560/8 = 320 still passes
+        // the width); 2560/3 ceilings to 854. The unicode odd-factor stepdown
+        // (`:32-35`) stays unported — the client draws one font — so every row
+        // below is the non-unicode column.
+        let table = [
+            ((1280, 720, 0), (427, 240, 3)),
+            ((1280, 720, 1), (1280, 720, 1)),
+            ((1280, 720, 2), (640, 360, 2)),
+            ((1280, 720, 3), (427, 240, 3)),
+            ((1920, 1080, 0), (480, 270, 4)),
+            ((1920, 1080, 1), (1920, 1080, 1)),
+            ((1920, 1080, 2), (960, 540, 2)),
+            ((1920, 1080, 3), (640, 360, 3)),
+            ((2560, 1440, 0), (427, 240, 6)),
+            ((2560, 1440, 1), (2560, 1440, 1)),
+            ((2560, 1440, 2), (1280, 720, 2)),
+            ((2560, 1440, 3), (854, 480, 3)),
+        ];
+        for ((display_width, display_height, gui_scale), (width, height, factor)) in table {
+            let scaled = scaled_resolution(display_width, display_height, gui_scale);
+            assert_eq!(
+                (scaled.width, scaled.height, scaled.scale_factor),
+                (width, height, factor),
+                "the {display_width}x{display_height} window at GUI scale {gui_scale}"
+            );
+            let (projection_width, projection_height) =
+                projection_size(display_width, display_height, scaled.scale_factor);
+            assert_eq!(
+                (projection_width, projection_height),
+                (
+                    f64::from(display_width) / f64::from(factor),
+                    f64::from(display_height) / f64::from(factor)
+                ),
+                "the ortho doubles behind the {display_width}x{display_height} window at GUI scale {gui_scale}"
+            );
+        }
+    }
+
+    #[test]
     fn an_explicit_gui_scale_caps_the_auto_loop() {
         // GuiScale 2 on 1280x720: the auto loop would reach three, the setting stops
         // it at two (`ScaledResolution.java`:22-25, `:27-30`).

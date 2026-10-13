@@ -343,9 +343,10 @@ fn apply_sends_the_session_pushes() {
 }
 
 #[test]
-fn apply_pushes_raw_clouds_without_resolution() {
-    // The `< 4 → Off` clause stays Task 28's: a short view distance never
-    // resolves the pushed clouds value here.
+fn apply_resolves_clouds_off_below_four_chunks() {
+    // `render_distance < 4 → clouds Off`, resolved at the pushed value
+    // (`GameSettings.shouldRenderClouds`, `GameSettings.java:1254-1256`): a short
+    // view distance with Fancy clouds pushes Off to `set_clouds`.
     let path = scratch_options();
     let (mut state, _session) = SettingsState::load(path, None);
     state.settings_mut().render_distance = 2;
@@ -362,7 +363,38 @@ fn apply_pushes_raw_clouds_without_resolution() {
         &mut window,
         &mut keymap,
     );
-    assert_eq!(video.clouds, Some(2), "the raw Fancy value is pushed as-is");
+    assert_eq!(
+        video.clouds,
+        Some(0),
+        "distance 2 with Fancy clouds resolves to Off at the apply"
+    );
+}
+
+#[test]
+fn apply_keeps_clouds_at_four_chunks() {
+    // The same clause's other arm: distance 4 with Fancy clouds pushes Fancy —
+    // the source's gate reads `renderDistanceChunks >= 4`.
+    let path = scratch_options();
+    let (mut state, _session) = SettingsState::load(path, None);
+    state.settings_mut().render_distance = 4;
+    state.settings_mut().clouds = CloudSetting::Fancy;
+    let mut video = FakeVideo::default();
+    let mut audio = NoAudio;
+    let mut particles = FakeParticles::default();
+    let mut window = FakeWindow::default();
+    let mut keymap = KeymapPass;
+    state.apply(
+        &mut video,
+        &mut audio,
+        &mut particles,
+        &mut window,
+        &mut keymap,
+    );
+    assert_eq!(
+        video.clouds,
+        Some(2),
+        "distance 4 with Fancy clouds keeps Fancy at the apply"
+    );
 }
 
 #[test]
