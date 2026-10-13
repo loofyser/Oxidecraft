@@ -798,18 +798,18 @@ feat: the full keybind table and the routed hotkeys (client)
 
 ### Task 26: The remaining §11.2 screens
 
-**Goal:** The §11.2 list's remaining screens land, and the language loader ships: the Skin Customization screen is complete (Task 19's version finished), the resource-packs screen lands as the recorded no-op surface (the button exists; selecting does nothing — the §16 rule), and the language loader (M5 §2.4 item 4, checklist row 55 — a real deliverable this milestone) lands: `en_US.lang` + the hashed locale objects load, missing keys render as the raw key, and the registry tables' embedded strings re-source from the loader where their keys resolve. The task owns the loader, its tests, and the language screen's selection (the list, Force Unicode, the selection persisting — only `en_US` has strings in practice, recorded).
+**Goal:** The §11.2 list's remaining screens land, and the language loader ships: the Skin Customization screen is completed (Task 19's version extended), the resource-packs screen lands as the recorded no-op surface (the button exists; selecting does nothing — the §16 rule), and the language loader (M5 §2.4 item 4, checklist row 55 — a real deliverable this milestone) lands: the extraction tree's `en_US.lang` + the hashed locale objects load (wrapping the standing language table — no parallel parser), missing keys render as the raw key, and the registry tables' embedded strings re-source from the loader where their keys resolve (a key column lands first; unkeyed rows stay embedded, recorded). The task owns the loader, its tests, and the language screen's selection (the list, Force Unicode, the selection persisting — only `en_US` has strings in practice, recorded).
 
 **Files:**
-- Create: `crates/oxide-assets/src/lang.rs` — the loader: parse the lang file (`key=value` lines, the source's own parse rules derive), merge the hashed locale objects, the missing-key passthrough (the lookup returns the key), hostile-input caps (line count, key/value lengths).
-- Create: `crates/oxide-client/src/screens/options_language.rs` — the completion of Task 19's screen (list from the loader).
+- Create: `crates/oxide-assets/src/lang.rs` — the loader: parse the lang file (`key=value` lines, the source's own parse rules incl. the `%d`/`%f`→`%s` rewrite), merge the hashed locale objects over the tree's `en_US.lang` (source order), the missing-key passthrough (the lookup returns the key), hostile-input caps (line count, key/value lengths). Wrap-or-replace the standing `LanguageTable::from_lang` — never a parallel parser. Root: the extraction tree + the index objects (`Store::object_path`), NOT a store-side lang path.
+- Extend: `crates/oxide-client/src/screens/options_language.rs` — Task 19's screen completed (the delta re-derived first-hand against the landed file: the list from the loader, the click rule, Force Unicode, Done id 6).
 - Create: `crates/oxide-client/src/screens/options_packs.rs` — the packs screen's recorded no-op surface.
-- Modify: the registry tables' string sourcing where the loader lands (the M5 item 7 limit: the embedded strings re-source from the loader — the task walks the tables and swaps the source; where a string has no key (derived names), it stays embedded, recorded).
+- Modify: the registry tables' string sourcing where the loader lands (the M5 item 7 limit: a key column lands first on the ENUMERATED tables (items, enchants), then the re-sourcing; a table or row without a resolving key stays embedded, recorded).
 - Test: the loader's suite (parse, merge, missing key, hostile) + the screen frames (ignored).
 
 **Interfaces:**
 - Produces: `oxide_assets::lang::Lang` (`get(key) -> &str` with the key passthrough) and `Lang::load(store)`; the language screen's `ScreenState` variant completes Task 19's.
-- Consumes: the store's `lang/en_US.lang` + index objects.
+- Consumes: the extraction tree's `lang/en_US.lang` + the index objects (`Store::object_path`); Task 19's screens' first versions; the port's own persistence keys (`language`/`force_unicode` — keep them).
 
 - [ ] **Step 1: Loader tests (RED).** Synthetic fixtures + the store-gated real-file case (counts recorded). Run red.
 - [ ] **Step 2: Implement the loader; swap the tables.** Run — green; the affected suites re-run.
