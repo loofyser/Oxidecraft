@@ -826,17 +826,17 @@ feat: the language loader and the remaining option screens (assets, client)
 
 ### Task 27: The camera modes, F1 and the spectator HUD
 
-**Goal:** The M5-routed items close: F5 cycles third-person back/front with the camera distance and the occlusion pull-in, F1 hides the HUD (and the hand and overlays — the source's own suppression set), and the spectator HUD's state (when the gamemode byte says spectator — however the rig can reach it) draws its recorded subset. The carried camera-mode overrides (M4 limit 37: sleeping and front-view yaw at the billboard consumers) land with them.
+**Goal:** The M5-routed items close: F5 cycles third-person back/front with the constant 4.0 camera distance and the 8-corner occlusion pull-in, F1 hides per the source's THREE separate gates (HUD `:1166`, hand `:863`, overlays `:872` — no single-flag fan-out), and the spectator HUD's bounded subset (the menu strip + name readout + narrowed crosshair; survival/exp/tooltips suppressed; menu interaction recorded, not built) draws when the gamemode byte says spectator (the rig path: S2B state 3 or a spectator join). The carried camera-mode overrides (M4 limit 37: sleeping and front-view yaw at the billboard consumers) land with them.
 
 **Files:**
-- Modify: `crates/oxide-render/src/camera.rs` — the third-person offset (distance 4.0, the smooth distance, the occlusion raycast pull-in — derive the source's rule), the front-view yaw flip.
-- Modify: `crates/oxide-client/src/main.rs` — the F5/F1 routes and the HUD-suppression state; the sleeping override (the billboard consumers' view yaw at the sleep state).
+- Modify: `crates/oxide-render/src/camera.rs` — the third-person offset (CONSTANT distance 4.0 with the temp/lerp shape ported for fidelity — no other value exists in the source; the 8-corner 0.1-cube occlusion pull-in against a caller-supplied clipped distance — camera.rs stays pure math, the world ray stays session-side; the front-view +180 pitch term).
+- Modify: `crates/oxide-client/src/main.rs` — the F5 route consuming Task 25's landed `Action::TogglePerspective` (verify first-hand; no bridge) and F1's landed raw-key toggle feeding the suppression state (EPHEMERAL — neither `hideGUI` nor the mode is persisted, per the source); the sleeping override (Task 20's landed `player.sleeping`) at the billboard consumers' view yaw.
 - Modify: `crates/oxide-render/src/entity_pass.rs` or the billboard consumers — the mode-conditional overrides (`playerViewY` and the `+180` third-person-front pair — the standing facts file `references/entity-tick-parity.md`'s records).
-- Modify: the HUD pass — the F1 suppression (HUD + hand + overlays per the source's set).
-- Test: the camera offset's unit pins (distance, pull-in geometry); the F1 suppression's state table; ignored GPU frames for third-person back/front and HUD-hidden.
+- Modify: the HUD pass — the F1 suppression per the source's THREE gates (HUD `:1166-1169` `!hide_gui || screen_open`; hand `:863-869` mode0 && !sleeping && !hide_gui && !spectator; overlays `:872-875` mode0 && !sleeping — NO hideGUI term there; the spectator water/fire skips live inside `renderOverlays`).
+- Test: the camera offset's unit pins (4.0 constant, the 8-corner pull-in geometry, the +180 front term); the F1 suppression's per-draw state table (incl. the overlay arm DRAWING under F1); the billboard mode×sleeping matrix; the T12 'third person draws nothing' pin UPDATED to the mode-fed expectation; ignored GPU frames for third-person back/front, a wall-behind pull-in and HUD-hidden.
 
 **Interfaces:**
-- Produces: `CameraMode` (First/ThirdBack/ThirdFront) in the client; the suppression flag the HUD/held-item/overlay passes read.
+- Produces: `CameraMode` (First/ThirdBack/ThirdFront) in the client; the F1 suppression read (ephemeral) + the session-owned spectator read beside `creative`; the per-draw gate feeds the HUD/held-item/overlay passes consume.
 - Consumes: Task 25's F5 binding; the standing billboard facts.
 
 - [ ] **Step 1: Unit pins (RED).** The offset + pull-in; the suppression table.
