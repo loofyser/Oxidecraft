@@ -881,26 +881,26 @@ feat: the window resize, fullscreen and the display table (client)
 
 ### Task 29: The fixed-set carry bundle
 
-**Goal:** The carried fixes that ride M6's own files land: the window-icon/demo CLI corners where the settings store touches them, the F3-overlay region of the M5 comment set at its files' touches, and the M5 review's §2.4 items not owned above are each either implemented (this plan's tasks) or recorded with their per-item disposition.
+**Goal:** The carried fixes that ride M6's own files land: the window-icon/demo CLI corners where the settings store touches them, the F3-overlay region of the M5 comment set at its files' touches, and the M5 review's §2.4 items not owned above are each either implemented (this plan's tasks) or recorded with their per-item disposition. The round's operating document is `refs/m6-task-29/recon.md` — §8's fix list is the exact scope: six cite re-points + 73a's prescribed test pin; every other row is verified-closed or re-carried with a trigger, recorded.
 
 **Files:**
-- Modify: the files the still-open comment rows name, at each file's touch within this milestone (the rows: the M5 review §1b's open set — 38, D3, D5 remainder, D12, D14–D16, D19, D26, D27, D30, D31, 73a, 73c, 78b, T18-N1; the plan's own new rows if any task leaves one).
+- Modify: the files the still-open comment rows name, at each file's touch within this milestone (the rows RE-DERIVED at HEAD in `refs/m6-task-29/recon.md` §3/§7 — fixes owed only per §8: `interaction.rs`, `world_overlay.rs` (+ the 73a pin), `weather_pass.rs`, `effects_wire.rs`; the stale names in the old row list are dispositions, not edits).
 - Modify: `docs/parity/checklist.md` — the rows this milestone's own evidence updates (the acceptance task owns the sweep; this task owns only rows whose file this milestone touches BEFORE the acceptance).
-- Test: none new (comment-only edits); the sweep's checks are the verification.
+- Test: one new assert (73a's prescribed outline-bias pin — the only non-comment byte) + the sweep's checks; no suite RED is owed for comment text.
 
 **Interfaces:**
 - Produces: the comment fixes; each row's disposition (fixed / routed / re-carried with trigger) recorded in the task's evidence for the close's records.
 - Consumes: nothing at runtime; reads the review's lists.
 
 - [ ] **Step 1: Re-derive the open rows at the current HEAD.** Every row's premise re-checked (the lists predate this milestone's edits); each row: fix here, or re-carry with its trigger. Run: the sweeps' greps, recorded.
-- [ ] **Step 2: Apply the fixes.** Comment/citation-only; each byte-quoted before. Run the extractor's scan for the touched files — zero flags on added lines.
+- [ ] **Step 2: Apply the fixes.** Comment/citation-only except 73a's pin; each byte-quoted before. Run the extractor's scan for the touched files — zero flags on added lines.
 - [ ] **Step 3: Gate and commit.** Run the full gate. Commit:
 
 ```
 chore: sweep the carried comments at their files' touches
 ```
 
-**Verification:** the re-derived list; the sweep's zero-flag run; `git diff --stat` comment-only.
+**Verification:** the re-derived list; the sweep's zero-flag run; `git diff --stat` comment-only except the 73a pin.
 
 ---
 
