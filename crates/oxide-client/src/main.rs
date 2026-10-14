@@ -49,13 +49,17 @@ use anyhow::Context;
 use assets::ClientAssets;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use oxide_assets::accounts::AccountStore;
+use oxide_assets::auth::{Auth, AuthEndpoints, client_id_from_env};
 use oxide_assets::extract::Extractor;
 use oxide_assets::font::Font;
+use oxide_assets::http::UreqClient;
 use oxide_assets::png_write::{next_screenshot_path, write_png};
 use oxide_assets::skins::SkinCache;
 use oxide_assets::skins::{DefaultModel, default_skin};
 use oxide_assets::sound::SoundIndex;
 use oxide_assets::store::Store;
+use oxide_client::accounts::{ResolvedAccount, resolve};
 use oxide_client::items::ItemTable;
 use oxide_client::keymap;
 use oxide_client::screens::Screens;
@@ -107,7 +111,9 @@ use oxide_game::mesher::ModelChoice;
 use oxide_game::particles::{ParticleFrame, ParticleTex};
 use oxide_game::player::MAX_HURT_TIME;
 use oxide_game::scoreboard::Scoreboard;
-use oxide_game::session::{ClientEvent, MeshAssets, Session, SessionConfig};
+use oxide_game::session::{
+    ClientEvent, MeshAssets, Session, SessionAccount, SessionConfig, SessionError,
+};
 use oxide_game::settings::{
     Binding, FRAMERATE_RANGE, ParticleSetting, VIEW_DISTANCE_RANGE, default_bindings,
 };
@@ -161,6 +167,9 @@ struct Cli {
     /// The offline-mode player name.
     #[arg(long, default_value = "OxideDev")]
     username: String,
+    /// Sign in as a stored account for online-mode servers.
+    #[arg(long)]
+    account: Option<String>,
     /// Stop after this many presented frames.
     #[arg(long)]
     frames: Option<u64>,
@@ -1133,6 +1142,10 @@ struct ClientApp {
     /// (`GuiIngame.java`:320). Taken from the command line's username before the
     /// session takes that value for its own handshake.
     own_name: String,
+    /// The resolved session account when `--account` named one: both spawn
+    /// paths share this same allocation. `None` stays the offline default —
+    /// no store opens and no chain runs without the flag.
+    account: Option<Arc<SessionAccount>>,
     /// The measured font the frame's text surfaces share: the same value the
     /// chat mirror measured against, and the one the tab list's assembly reads.
     /// `None` without a session.
@@ -1699,10 +1712,18 @@ impl ClientApp {
         let chat_lang: Option<LanguageTable>;
         let mut skin_requests_tx = None;
         let mut skin_updates_rx = None;
+        // `--account` resolves once at startup: one store open, one silent
+        // refresh, and both spawn paths share the same session account.
+        // Without the flag nothing resolves and the offline default stands.
+        let resolved = resolve_startup_account(cli.account.as_deref())?;
         // The sidebar reads the team through the window's own name; the session
         // takes the command line's username for its own handshake, so the window
         // keeps its copy first.
-        let own_name = cli.username.clone();
+        let own_name = resolved
+            .as_ref()
+            .map(|known| known.username.clone())
+            .unwrap_or_else(|| cli.username.clone());
+        let account = resolved.map(|known| Arc::clone(&known.session));
         // The settings load before the first frame: a missing file seeds from
         // the `--render-distance` flag (its absence seeds the store default),
         // a present file loads with the flag overriding the view distance in
@@ -1730,7 +1751,7 @@ impl ClientApp {
         let session = match cli.server {
             Some(address) => {
                 let (host, port) = parse_server_address(&address)?;
-                tracing::info!(server = %address, username = %cli.username, "joining the server");
+                tracing::info!(server = %address, username = %own_name, "joining the server");
                 let loaded = ClientAssets::load(None)?;
                 // The chat mirror measures against the same sheet every other text
                 // surface uses; it gets the font before the window opens, and the
@@ -1748,10 +1769,11 @@ impl ClientApp {
                 let session = spawn_session(
                     host,
                     port,
-                    cli.username,
+                    own_name.clone(),
                     address,
                     settings.wire_settings(),
                     Arc::clone(&loaded.mesh),
+                    account.clone(),
                 );
                 assets = Some(loaded);
                 assets_error = None;
@@ -1848,6 +1870,7 @@ impl ClientApp {
             tab: view::TabState::new(),
             board: Scoreboard::default(),
             own_name,
+            account,
             font: chat_font,
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
@@ -2833,15 +2856,14 @@ impl ClientApp {
         let survival = !self.creative && !self.spectator;
         hud_draws.extend(self.view.hotbar_draws(
             Instant::now(),
-            &view::HotbarInput {
-                font: self.font.as_ref(),
+            &Self::hotbar_feed(
+                self.font.as_ref(),
+                self.spectator,
+                self.creative,
+                self.hide_gui,
                 scaled,
-                show_crosshair: !self.spectator,
-                hide_gui: self.hide_gui,
                 screen_open,
-                survival,
-                spectator: self.spectator,
-            },
+            ),
         ));
         hud_draws.extend(self.view.stat_rows_draws(&view::RowsInput {
             font: self.font.as_ref(),
@@ -4860,6 +4882,7 @@ impl ClientApp {
             address.clone(),
             self.settings.wire_settings(),
             mesh,
+            self.account.clone(),
         );
         self.settings.set_session(session.input_tx.clone());
         self.session = Some(session);
@@ -6092,6 +6115,89 @@ fn local_sound_play(
     }
 }
 
+impl ClientApp {
+    /// The hotbar row's live feed: the window's own spectator flag drives the
+    /// strip swap, the crosshair gate and the survival fold — never a literal.
+    /// The frame's hotbar call site reads this constructor, so the spectator
+    /// strip draws through the real feed (T27 F2 pins this wiring). A free
+    /// constructor over fields (not `&self`): the frame holds the renderer
+    /// mutably while it assembles the row.
+    fn hotbar_feed(
+        font: Option<&Font>,
+        spectator: bool,
+        creative: bool,
+        hide_gui: bool,
+        scaled: ScaledResolution,
+        screen_open: bool,
+    ) -> view::HotbarInput<'_> {
+        view::HotbarInput {
+            font,
+            scaled,
+            show_crosshair: !spectator,
+            hide_gui,
+            screen_open,
+            survival: !creative && !spectator,
+            spectator,
+        }
+    }
+}
+
+/// Resolves `--account` once at startup: opens the account store at the
+/// shared store root, builds the one chain driver (`UreqClient` plus the
+/// survey endpoints plus the environment client id), and signs in silently.
+/// Without the flag nothing resolves — no store opens, no chain runs — and
+/// the offline default stands. A resolution failure fails startup fast with
+/// the resolution's own sentence.
+fn resolve_startup_account(query: Option<&str>) -> anyhow::Result<Option<ResolvedAccount>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let root = assets::default_store_root()?;
+    let store = AccountStore::open(root)?;
+    let auth = Arc::new(Auth::new(
+        Arc::new(UreqClient::new()),
+        AuthEndpoints::default(),
+        client_id_from_env(),
+    ));
+    resolve(&store, query, auth)
+        .map(Some)
+        .map_err(anyhow::Error::msg)
+}
+
+/// Builds the session's connection config: the username is the resolved
+/// profile name when an account is present, else the offline name, and the
+/// account rides into `SessionConfig.account` for the encrypted login.
+fn session_config(
+    host: String,
+    port: u16,
+    username: String,
+    account: Option<Arc<SessionAccount>>,
+    initial: ClientSettings,
+    mesh: Arc<MeshAssets>,
+) -> SessionConfig {
+    SessionConfig {
+        host,
+        port,
+        username,
+        account,
+        settings: initial,
+        mesh: Some(mesh),
+    }
+}
+
+/// Maps a session-thread failure to the disconnect screen's reason: the two
+/// auth failures carry their own sentence (`EncryptionRequired`'s sign-in
+/// instruction, `JoinFailed`'s join text verbatim — not the `Display` prefix)
+/// so the screen shows them byte-exact; anything else keeps the generic
+/// thread-ended line the offline path always showed.
+fn session_disconnect_reason(error: &SessionError) -> String {
+    match error {
+        SessionError::EncryptionRequired => error.to_string(),
+        SessionError::JoinFailed { message } => message.clone(),
+        _ => "the session thread ended".to_string(),
+    }
+}
+
 /// Opens a session on its own thread and returns the link the window drains.
 ///
 /// The thread owns the connection, because the session blocks on reads and the
@@ -6102,6 +6208,11 @@ fn local_sound_play(
 /// command line's view distance, and the `mesh` assets are the bootstrap's. The
 /// input channel is opened here too: the thread drains the receiver, the link
 /// keeps the sender.
+///
+/// The account is the startup resolution's shared allocation (`None` stays the
+/// offline default); the disconnected reason carries the auth failures'
+/// sentence through [`session_disconnect_reason`], so the disconnect screen
+/// shows it verbatim.
 /// The session's particle engine over its input channel: the client's
 /// particle engine is the session's, so the regime pushes as
 /// [`InputEvent::SetParticleSetting`]. Without a session the push lands
@@ -6144,32 +6255,27 @@ fn spawn_session(
     server: String,
     initial: ClientSettings,
     mesh: Arc<MeshAssets>,
+    account: Option<Arc<SessionAccount>>,
 ) -> SessionLink {
     let (sender, receiver) = unbounded();
     let (input_tx, input_rx) = unbounded();
     std::thread::spawn(move || {
-        let config = SessionConfig {
-            host,
-            port,
-            username,
-            settings: initial,
-            mesh: Some(mesh),
-            // The launcher's `--account` wiring arrives with Task 9; until
-            // then the client stays offline and an encrypted server is
-            // refused with the sign-in sentence.
-            account: None,
-        };
-        match Session::connect(&config) {
+        let config = session_config(host, port, username, account, initial, mesh);
+        let reason = match Session::connect(&config) {
             Ok(session) => {
                 if let Err(error) = session.run(&sender, input_rx) {
                     tracing::error!(error = ?error, "the session ended with an error");
+                    session_disconnect_reason(&error)
+                } else {
+                    "the session thread ended".to_string()
                 }
             }
-            Err(error) => tracing::error!(error = ?error, "the connection could not be opened"),
-        }
-        let _ = sender.send(ClientEvent::Disconnected {
-            reason: "the session thread ended".into(),
-        });
+            Err(error) => {
+                tracing::error!(error = ?error, "the connection could not be opened");
+                session_disconnect_reason(&error)
+            }
+        };
+        let _ = sender.send(ClientEvent::Disconnected { reason });
     });
     SessionLink {
         server,
@@ -8229,9 +8335,10 @@ mod tests {
         is_enter_press, is_escape_press, is_f1_press, is_f3_press, is_h_press, load_sounds_bytes,
         local_sound_play, missing_uv, parse_script, parse_server_address, particle_draws,
         perspective_pressed, render_distance_step, scaled_cursor, screen_button_events,
-        screen_click_button, screenshot_pressed, scripted_chat_click, skin_requests,
-        sleep_cover_dim, sleep_dim, sleep_pose, store_aim, store_break_stage, store_skins,
-        tab_held, tooltip_point, void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
+        screen_click_button, screenshot_pressed, scripted_chat_click, session_config,
+        session_disconnect_reason, skin_requests, sleep_cover_dim, sleep_dim, sleep_pose,
+        store_aim, store_break_stage, store_skins, tab_held, tooltip_point, void_y_factor,
+        weather_draws, wheel_held_step, wire_sound_play,
     };
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
@@ -8564,6 +8671,10 @@ mod tests {
         assert_eq!(cli.frames, None);
         assert!(!cli.no_overlay);
         assert_eq!(cli.render_distance, None, "the flag is absent by default");
+        assert!(
+            cli.account.is_none(),
+            "no account without the flag: the offline default stands"
+        );
     }
 
     #[test]
@@ -12659,6 +12770,134 @@ mod tests {
                 .is_some_and(|screen| !screen.buttons()[0].enabled),
             "the gate keeps its count"
         );
+    }
+
+    #[test]
+    fn auth_session_errors_reach_the_disconnect_screen_with_their_sentence() {
+        // Task 9 step 3 (RED-first): the session thread's auth failures must
+        // reach the disconnected screen with their sentence, not the generic
+        // thread-ended line. `EncryptionRequired`'s reason is its sign-in
+        // instruction; `JoinFailed`'s is the join text verbatim (not the
+        // `Display` prefix). The stood screen holds that text.
+        let reason =
+            session_disconnect_reason(&oxide_game::session::SessionError::EncryptionRequired);
+        assert_eq!(
+            reason,
+            oxide_game::session::SessionError::EncryptionRequired.to_string(),
+            "the reason is the sign-in sentence"
+        );
+        let sentence =
+            "the session service refused the join (the account's login is no longer valid)";
+        let reason = session_disconnect_reason(&oxide_game::session::SessionError::JoinFailed {
+            message: sentence.to_string(),
+        });
+        assert_eq!(reason, sentence, "the reason is the join text verbatim");
+        for reason in [
+            oxide_game::session::SessionError::EncryptionRequired.to_string(),
+            sentence.to_string(),
+        ] {
+            let mut app = test_app();
+            let font = click_font();
+            let scaled = oxide_render::hud::ScaledResolution {
+                width: 427,
+                height: 240,
+                scale_factor: 2,
+            };
+            app.screens.open_disconnected(
+                &scaled,
+                disconnect_title(None),
+                reason.clone(),
+                &font,
+                disconnect_button_label(None),
+            );
+            let held = app
+                .screens
+                .disconnected_mut()
+                .map(|screen| screen.lines().join(" "))
+                .unwrap_or_default();
+            assert!(
+                held.contains(&reason),
+                "the screen holds the sentence: {held:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_account_flag_names_a_stored_account() {
+        // Task 9 step 2: `--account <name-or-uuid>` parses onto the CLI next
+        // to `username`.
+        let cli = Cli::try_parse_from(["oxide-client", "--account", "SynPlayer"]).expect("parses");
+        assert_eq!(cli.account.as_deref(), Some("SynPlayer"));
+        assert_eq!(cli.username, "OxideDev", "the offline name is untouched");
+    }
+
+    #[test]
+    fn the_session_config_carries_the_account_and_name_per_path() {
+        // Task 9 step 2: both spawn paths build through `session_config`, so
+        // the resolved path carries `Some` plus the profile name and the
+        // offline path carries `None` plus the offline name.
+        struct StubJoiner;
+        impl oxide_game::session::JoinServer for StubJoiner {
+            fn join(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let account = std::sync::Arc::new(oxide_game::session::SessionAccount {
+            uuid_hex: "11111111222233334444555555555555".to_string(),
+            access_token: "SYN-MC-ACCESS-001".to_string(),
+            joiner: std::sync::Arc::new(StubJoiner),
+        });
+        let mesh = std::sync::Arc::new(MeshAssets::fallback());
+        let online = session_config(
+            "example.com".to_string(),
+            25565,
+            "SynPlayer".to_string(),
+            Some(std::sync::Arc::clone(&account)),
+            oxide_proto_v47::serverbound::ClientSettings::default(),
+            std::sync::Arc::clone(&mesh),
+        );
+        assert_eq!(online.username, "SynPlayer");
+        assert!(
+            online
+                .account
+                .as_ref()
+                .is_some_and(|held| std::sync::Arc::ptr_eq(held, &account)),
+            "the resolved path shares the startup allocation"
+        );
+        let offline = session_config(
+            "example.com".to_string(),
+            25565,
+            "OxideDev".to_string(),
+            None,
+            oxide_proto_v47::serverbound::ClientSettings::default(),
+            mesh,
+        );
+        assert_eq!(offline.username, "OxideDev");
+        assert!(offline.account.is_none(), "the offline path stays None");
+    }
+
+    #[test]
+    fn the_hotbar_feed_carries_the_window_spectator_flag() {
+        // Task 9 step 4 (rider T27 F2): the spectator call-site case — the
+        // frame's hotbar call site reads `hotbar_feed`, so the strip swap,
+        // the crosshair gate and the survival fold all run on the window's
+        // own flag, never a literal. A `spectator: false` literal at the
+        // call site would fail this pin.
+        let scaled = oxide_render::hud::ScaledResolution {
+            width: 427,
+            height: 240,
+            scale_factor: 2,
+        };
+        let playing = ClientApp::hotbar_feed(None, false, false, false, scaled, false);
+        assert!(!playing.spectator, "survival feeds no strip");
+        assert!(playing.show_crosshair, "survival keeps the crosshair");
+        assert!(playing.survival, "survival stays survival");
+        let spectating = ClientApp::hotbar_feed(None, true, false, false, scaled, false);
+        assert!(spectating.spectator, "the strip swap reads the flag");
+        assert!(!spectating.show_crosshair, "spectator hides the crosshair");
+        assert!(!spectating.survival, "spectator folds out of survival");
+        let creative = ClientApp::hotbar_feed(None, false, true, false, scaled, false);
+        assert!(!creative.survival, "creative is not survival either");
     }
 
     #[test]

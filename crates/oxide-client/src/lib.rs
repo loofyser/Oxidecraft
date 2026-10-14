@@ -5,6 +5,8 @@
 //! table (`items`), the screens as they land — are compiled here and used by
 //! the binary through this crate.
 
+pub mod accounts;
+
 pub mod enchants;
 pub mod items;
 pub mod keymap;
