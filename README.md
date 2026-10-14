@@ -15,11 +15,11 @@ faster, more stable, lighter, and open source.
 ## Development status
 
 Pre-alpha and playable on the rig: M0 (foundations), M1 (bytes to world), M2 (textured terrain),
-M3 (the player) and M4 (entities and chat) are complete, and M5 (HUD and inventory) closed on
-2026-10-11 — the client draws the HUD and plays the inventory, container, sign and book
-surfaces, and agrees with a live 1.8.9 server on the item, window and slot paths. Milestone M6
-(sound, particles, weather, screens) is next. See `docs/STATE.md` for where the project stands,
-what is verified, and the evidence.
+M3 (the player), M4 (entities and chat) and M5 (HUD and inventory) are complete, and M6 (sound,
+particles, weather, screens) closed on 2026-10-14 — the client plays sounds and music, draws
+particles, weather and the sky, and opens the full screen list, and agrees with a live 1.8.9
+server on the sound, particle and settings paths. Milestone M7 (online play) is next. See
+`docs/STATE.md` for where the project stands, what is verified, and the evidence.
 
 ## Building
 

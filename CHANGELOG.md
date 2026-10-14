@@ -7,6 +7,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Milestone M6: sound, particles, weather, screens
+
+Delivered and tagged `m6` on 2026-10-14. The client's sound, sky and screens are complete: the
+sound engine with its mixer, music ticker and local sound sites; the particle engine with the
+weather columns, the particle pass and the digging/combat/sprint taps; the sky band with the
+sun, moon and stars, the weather dim and the fog terms; the pumpkin/portal/block-in-hand
+overlays; the full section-11.2 screen list (main menu, server list, pause, options with video
+and language, end states, chat with completion); the rebindable keybind table; the F3 overlay
+with its sub-mode keys; F2 screenshots; the 1.8 render-distance range; window resize and
+fullscreen — carried through a live acceptance run whose wire legs decoded exact and whose
+capture pairs are banked in `refs/m6-acceptance/`; the defects the run surfaced were fixed in
+the milestone's scoped fix rounds. The documented classes and the operator's by-eye list are in
+`docs/STATE.md`.
+
+### Added
+
+- The sound/particle/weather packet set — the effects-wire decodes (42-row particle table,
+  sound/particle/weather/destroy packets) with the session's weather state and effect events.
+- The audio side: the sounds index, the engine/mixer/registry, the music ticker, the local
+  sound sites with their block sound groups, and the client pump with the `--audio-dump` flag.
+- The sky and weather draw: the settings store with its application path, the sky band with
+  the sun/moon/stars, the weather columns and the particle pass, the fog terms with the
+  neighbour-brightness light census, and the pumpkin/portal/block-in-hand overlays.
+- The screens: the menu framework and main menu, the server list with live ping, the pause and
+  placeholder screens, the options hub (video, sound, controls, chat, language, skin, packs),
+  the end-state screens, the shared text field with chat completion, the F3 overlay with
+  hitbox/lagometer sub-modes, F2 screenshots, the camera modes with F1 suppression and the
+  spectator state, window resize/fullscreen with the display table.
+- The acceptance machinery: the wire-decode scripts and the capture leg runners under
+  `refs/m6-acceptance/` (local evidence, not shipped).
+
+New dependencies: `cpal 0.18.2`, `lewton 0.10.2`, `rand 0.10` (resolved 0.10.3) — the audio
+stack (output + ogg decode) and the particle engine's generator; plus the CI repair (`c36b8b9` —
+the building jobs install the ALSA headers the audio stack's Linux backend needs). The
+milestone's corrected documents ride its commits.
+
 ### Milestone M5: HUD and inventory
 
 Delivered and tagged `m5` on 2026-10-11. The client's HUD and inventory are complete: the hotbar

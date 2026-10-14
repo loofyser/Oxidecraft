@@ -950,10 +950,15 @@ docs: record the M6 acceptance evidence
   - The close: content gate; the close commit; the tag `m6` with the prior tags' message shape; push `--follow-tags`; CI verified on the pushed head (the plan-era pending runs resolved first); the run-record follow-up commit once green; the ledger close.
 - Consumes: every task's records; the review verdict.
 
-- [ ] **Step 1: Freeze + final review.** The package; the dispatch; the verdict.
-- [ ] **Step 2: Fold the verdict.** Fix rounds as ruled + the scoped re-review(s).
-- [ ] **Step 3: The docs sweep.** All files above, content-gated before staging.
-- [ ] **Step 4: Tidy pass + close.** The grep on final bytes; the gate; the close commit; the tag; the push; the CI watch. Commit:
+- [x] **Step 1: Freeze + final review.** The package; the dispatch; the verdict. (Froze `ee4e863..6709663` — 69 commits, 110 files; the review returned **approved** — 0 Critical / 0 Important — `refs/m6-task-31/final-review.md`.)
+- [x] **Step 2: Fold the verdict.** Fix rounds as ruled + the scoped re-review(s). (No fix rounds owed; the four minors — the pre-existing atlas-count test failure, F11, F14, T14 M-c — carried with named homes per the verdict, plus the three overrule closes and the split-#2/G-item carries folded.)
+- [x] **Step 3: The docs sweep.** All files above, content-gated before staging. (STATE's M6 stage/update/evidence/caveats/next-actions/env rows, CHANGELOG, the handoff, perf, README.)
+- [x] **Step 4: Tidy pass + close.** The grep on final bytes; the gate; the close commit; the tag; the push; the CI watch. (Tidy grep clean; `GATE OK` on the final revision; the close commit; tag `m6`; push `--follow-tags`.)
+- [x] **Step 5: The run record.** The follow-up commit once CI is green; the ledger close; the owner's summary.
+
+**Verification:** the reviewer's verdict; the tidy grep's clean run; `GATE OK` on the final revision; CI green on the pushed head; the tag's read-back.
+
+*(Executed 2026-10-14: Step 1's final whole-branch review over the frozen milestone diff (`ee4e863..6709663`, 69 commits) returned **approved** — 0 Critical / 0 Important; the deferred triage landed the M6 set with the three verdict overrules closed (T7 M1/M2, row 5, row 49) and the split-#2/G-item residue carried; the four minors (atlas-count, F11, F14, T14 M-c) carried with named homes (`refs/m6-task-31/final-review.md`). Step 2 owed no fix rounds. Steps 3–4's docs sweep, content gate and tidy pass land in this close commit; Step 4's tag `m6` marks it; Step 5's CI run id is recorded by the follow-up commit.)*
 
 ```
 docs: close out milestone M6 (sound, particles, weather, screens)

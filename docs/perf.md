@@ -134,3 +134,10 @@ record are in `docs/STATE.md` ("M5 evidence"). M5 added no image-metric classes;
 performance-relevant observation is the acceptance run's keepalive soak behaviour (rates on
 cadence under the acceptance server's entity flood) — recorded in the milestone's live-pass
 report.
+
+M6 (sound, particles, weather, screens) closed and tagged `m6` on 2026-10-14; its state entry
+and acceptance record are in `docs/STATE.md` ("M6 evidence"). M6 added no image-metric classes;
+its performance-relevant observations are the sprint tick speeds (10.65 blocks / 38 ticks =
+5.6 m/s sustained burst, tick-logged) and the mixer dump's session-long render profile
+(sustained rain-form RMS ~0.04–0.05 over 829.5 s) — recorded in the milestone's acceptance
+report.
