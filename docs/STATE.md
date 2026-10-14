@@ -245,8 +245,8 @@ specification and continue without asking questions that are already answered he
   (the commit the `m5` tag marks) is green in run `38127359527` (all seven jobs). **M6:** every
   checkpoint was CI-checked as it landed; CI stayed green through every pushed
   batch (the T8 ALSA-header repair `c36b8b9` closed the one red class — the building jobs now
-  install the headers the audio stack's Linux backend needs); the close-out run is
-  recorded in the follow-up commit below.
+  install the headers the audio stack's Linux backend needs); the close-out commit `c90313b`
+  (the commit the `m6` tag marks) is green in run `38496133039` (all seven jobs).
 - Review: `docs/reviews/2026-09-22-spec-review.md`, with a disposition record for every finding; the
   per-task reviews, the fix-round reviews and each milestone's final whole-branch review are in the
   milestone ledgers and round dirs (local, git-ignored: M2's in
