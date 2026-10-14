@@ -1,23 +1,28 @@
-//! The first half of the Microsoft sign-in chain: the device-code request,
-//! the token poll, the Xbox Live user authenticate and the XSTS authorize.
+//! The Microsoft sign-in chain: the device-code request, the token poll,
+//! the Xbox Live user authenticate, the XSTS authorize, the Minecraft
+//! login-with-Xbox, the entitlement and profile checks, and the
+//! session-server join.
 //!
 //! Every request shape is byte-pinned against the survey's live-probed
-//! bodies (§3.1–§3.3); every failure is a typed [`AuthError`]. The module
-//! only ever talks through the crate's [`HttpClient`][crate::http::HttpClient]
-//! trait, so tests script a FIFO double instead of touching the network, and
-//! the poll's sleeper is injected instead of sleeping for real.
+//! bodies (§3.1–§3.5, §3.7); every failure is a typed [`AuthError`] (chain)
+//! or [`JoinError`] (session join). The module only ever talks through the
+//! crate's [`HttpClient`][crate::http::HttpClient] trait, so tests script a
+//! FIFO double instead of touching the network, and the poll's sleeper is
+//! injected instead of sleeping for real.
 //!
 //! Credential hygiene: the token-carrying types ([`DeviceCode`],
-//! [`MsaToken`], [`XboxToken`], [`XstsToken`]) redact their secrets in
-//! `Debug`, and no constructor ever places a token value into an
-//! [`AuthError`] — the chain tests poll and authenticate with sentinel
-//! credentials, then fail a later step and assert the message is clean.
+//! [`MsaToken`], [`XboxToken`], [`XstsToken`], [`SignedIn`]) redact their
+//! secrets in `Debug`, and no constructor ever places a token value into an
+//! [`AuthError`] or [`JoinError`] — the chain tests poll and authenticate
+//! with sentinel credentials, then fail a later step and assert the message
+//! is clean.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Deserializer;
+use serde::Serialize;
 
 use crate::http::{HttpClient, HttpError, MAX_ERROR_BODY_BYTES};
 
@@ -30,6 +35,24 @@ use crate::http::{HttpClient, HttpError, MAX_ERROR_BODY_BYTES};
 /// contract follows. The survey flags the `interval` field as the client's
 /// wait (§3.1); this constant is the only adjustment the protocol defines.
 const SLOW_DOWN_BUMP_SECS: u64 = 5;
+
+/// The registered Azure application id: the public OAuth identifier the
+/// sign-in chain presents as `client_id` (owner Q2, recorded at approval
+/// 2026-10-14). The value is public, never a secret — it only names the
+/// application; the credentials are the tokens, which never reach a log.
+/// Tests always go through [`client_id_from_env`] with the
+/// `OXIDECRAFT_AUTH_CLIENT_ID` override set, so this value never affects a
+/// test.
+pub const AUTH_CLIENT_ID: &str = "f4e40e88-357e-416d-9351-2a87a814c323";
+
+/// Resolves the client id: `OXIDECRAFT_AUTH_CLIENT_ID` when set and
+/// non-empty, else [`AUTH_CLIENT_ID`].
+pub fn client_id_from_env() -> String {
+    match std::env::var("OXIDECRAFT_AUTH_CLIENT_ID") {
+        Ok(value) if !value.is_empty() => value,
+        _ => AUTH_CLIENT_ID.to_string(),
+    }
+}
 
 /// The sign-in endpoints, injectable so tests point the chain at the
 /// scripted double instead of the live services.
@@ -122,6 +145,92 @@ pub struct XstsToken {
     pub user_hash: String,
 }
 
+/// A Minecraft profile: the player identity. `uuid_hex` is the 32-char
+/// no-dashes form the profile endpoint returns (survey §3.6); the dashed
+/// conversion Login Success consumes lives in [`uuid_with_dashes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McProfile {
+    /// The player uuid without dashes (32 hex digits).
+    pub uuid_hex: String,
+    /// The in-game name.
+    pub name: String,
+}
+
+/// The Minecraft-store entitlements: the `/entitlements/mcstore` `items`
+/// array's `name` fields (survey §3.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entitlements {
+    /// True iff one of the owning items is present.
+    ///
+    /// Derivation (recorded): the survey's owned-account response carries
+    /// `product_minecraft`, `game_minecraft` (plus Bedrock/Dungeons
+    /// equivalents when present) — the Java-ownership signal is the
+    /// presence of `product_minecraft` **or** `game_minecraft`.
+    pub owns_minecraft: bool,
+    /// Every item `name` the endpoint listed (ownership-irrelevant extras
+    /// ride along untouched).
+    pub items: Vec<String>,
+}
+
+/// Converts a no-dashes profile uuid into the dashed form Login Success
+/// consumes (`11111111222233334444555555555555` →
+/// `11111111-2222-3333-4444-555555555555`; the survey's join-stage tail,
+/// §3.7).
+///
+/// Validation rule (recorded): the input must be exactly 32 ASCII hex
+/// digits — anything else (short, long, dashed, non-hex, empty) yields
+/// `None`. Never a panic, never an invented uuid: hostile input is refused,
+/// not repaired.
+pub fn uuid_with_dashes(uuid_hex: &str) -> Option<String> {
+    if uuid_hex.len() != 32 || !uuid_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &uuid_hex[0..8],
+        &uuid_hex[8..12],
+        &uuid_hex[12..16],
+        &uuid_hex[16..20],
+        &uuid_hex[20..32]
+    ))
+}
+
+/// The account-ready record: everything the launcher stores (the refresh
+/// half) and everything the client plays with (the token plus identity).
+#[derive(Clone)]
+pub struct SignedIn {
+    /// The Minecraft access token (24 h, never logged).
+    pub mc_token: MsaToken,
+    /// The player identity from the profile endpoint (never the login's
+    /// `username` field — §3.4 notes that is not the uuid).
+    pub profile: McProfile,
+    /// The ownership record; the driver only builds this when the account
+    /// owns the game.
+    pub entitlements: Entitlements,
+    /// The MSA refresh half to persist (the keyring credential, never
+    /// logged): the presented token for [`Auth::complete_sign_in`], the
+    /// freshly minted one for [`Auth::silent_sign_in`].
+    pub refreshed_msa_refresh_token: Option<String>,
+}
+
+impl std::fmt::Debug for SignedIn {
+    /// Redacts both token halves; the identity and ownership stay visible.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedIn")
+            .field("mc_token", &self.mc_token)
+            .field("profile", &self.profile)
+            .field("entitlements", &self.entitlements)
+            .field(
+                "refreshed_msa_refresh_token",
+                &self
+                    .refreshed_msa_refresh_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for DeviceCode {
     /// Redacts the polling credential; the user-facing halves stay visible.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -181,6 +290,12 @@ pub enum AuthStep {
     XboxLive,
     /// The XSTS authorize.
     Xsts,
+    /// The Minecraft login-with-Xbox (survey §3.4).
+    MinecraftLogin,
+    /// The entitlements check (survey §3.5).
+    Entitlements,
+    /// The profile fetch (survey §3.5/§3.6).
+    Profile,
 }
 
 impl std::fmt::Display for AuthStep {
@@ -191,6 +306,9 @@ impl std::fmt::Display for AuthStep {
             AuthStep::Token => write!(f, "token"),
             AuthStep::XboxLive => write!(f, "Xbox Live"),
             AuthStep::Xsts => write!(f, "XSTS"),
+            AuthStep::MinecraftLogin => write!(f, "Minecraft login"),
+            AuthStep::Entitlements => write!(f, "entitlements"),
+            AuthStep::Profile => write!(f, "profile"),
         }
     }
 }
@@ -271,6 +389,39 @@ fn display_redirect(redirect: &Option<String>) -> String {
     redirect
         .as_deref()
         .map_or_else(String::new, |url| format!(" (see {url})"))
+}
+
+/// Every way the session-server join can fail. Each variant renders the
+/// operator-facing sentence for the disconnect screen; no variant carries a
+/// token (the join request's halves stay out of every message).
+#[derive(Debug, thiserror::Error)]
+pub enum JoinError {
+    /// A transport failure from the HTTP layer.
+    #[error(transparent)]
+    Http(#[from] HttpError),
+    /// The survey-verbatim `{"error":"ForbiddenOperationException"}` shape
+    /// (survey §3.7's live probe).
+    #[error("the session server refused the join (ForbiddenOperationException)")]
+    ForbiddenOperation,
+    /// The `{"error":"InsufficientPrivilegesException"}` shape. No server
+    /// message exists to carry, so the operator sentence renders from the
+    /// error name plus the survey's `// Xbox multiplayer disabled`
+    /// annotation (§3.7).
+    #[error("InsufficientPrivilegesException: Xbox multiplayer is disabled for this account")]
+    InsufficientPrivileges,
+    /// The `UserBannedException` shape with its `errorMessage`.
+    #[error("the account is banned from multiplayer (UserBannedException): {message}")]
+    Banned {
+        /// The server's `errorMessage`.
+        message: String,
+    },
+    /// A join refusal that is neither a documented shape nor JSON at all
+    /// (never a panic; never a token).
+    #[error("the join answer had an unexpected shape: {message}")]
+    Shape {
+        /// What was missing or unparsable (never a credential).
+        message: String,
+    },
 }
 
 /// The chain driver: an HTTP client, the endpoints and the Azure client id.
@@ -522,6 +673,188 @@ impl Auth {
             user_hash: token.user_hash,
         })
     }
+
+    /// Logs in with Xbox: POSTs the exact §3.4 JSON body — literal
+    /// `XBL3.0 x=`, the `uhs` hash, a `;`, then the XSTS token — and parses
+    /// `access_token` plus `expires_in` (86400 = 24 h) into the Minecraft
+    /// token (which carries no refresh half).
+    ///
+    /// Note (§3.4): the response's `username` field "is not the uuid" — it
+    /// is ignored here; the profile fetch ([`Auth::fetch_profile`]) is the
+    /// identity source.
+    pub fn login_with_xbox(&self, uhs: &str, xsts_token: &str) -> Result<MsaToken, AuthError> {
+        let identity = format!("XBL3.0 x={uhs};{xsts_token}");
+        let body = serde_json::to_string(&LoginRequest {
+            identity_token: identity.as_str(),
+        })
+        .expect("a string map serializes");
+        let answer = self
+            .http
+            .post_json(&self.endpoints.mc_login, body.as_bytes());
+        let answer = map_http(answer, AuthStep::MinecraftLogin)?;
+        let login: LoginAnswer =
+            serde_json::from_slice(&answer).map_err(|error| AuthError::Shape {
+                step: AuthStep::MinecraftLogin,
+                message: format!("the Minecraft login answer does not parse: {error}"),
+            })?;
+        Ok(MsaToken {
+            access_token: login.access_token,
+            refresh_token: None,
+            expires_in: login.expires_in,
+        })
+    }
+
+    /// Checks Minecraft ownership: GETs the entitlements endpoint with the
+    /// Minecraft access token as the bearer (`Authorization: Bearer …` — the
+    /// space after `Bearer` is mandatory, §3.5) and parses the `items`
+    /// array's `name` fields.
+    ///
+    /// This reports; it does not refuse — an empty `items` array parses to
+    /// `owns_minecraft: false`, and the driver ([`Auth::complete_sign_in`])
+    /// turns that into the no-ownership error.
+    pub fn fetch_entitlements(&self, mc_access_token: &str) -> Result<Entitlements, AuthError> {
+        let answer = self
+            .http
+            .get_with_bearer(&self.endpoints.mc_entitlements, mc_access_token);
+        let answer = map_http(answer, AuthStep::Entitlements)?;
+        let entitlements: EntitlementsAnswer =
+            serde_json::from_slice(&answer).map_err(|error| AuthError::Shape {
+                step: AuthStep::Entitlements,
+                message: format!("the entitlements answer does not parse: {error}"),
+            })?;
+        Ok(entitlements.into_entitlements())
+    }
+
+    /// Fetches the player identity: GETs the profile endpoint with the
+    /// Minecraft access token as the bearer and parses `id` (the uuid
+    /// without dashes) and `name`; unknown extra fields are ignored (the
+    /// §3.6 `profileActions` lesson). A malformed `id` is a [`AuthError::Shape`].
+    pub fn fetch_profile(&self, mc_access_token: &str) -> Result<McProfile, AuthError> {
+        let answer = self
+            .http
+            .get_with_bearer(&self.endpoints.mc_profile, mc_access_token);
+        let answer = map_http(answer, AuthStep::Profile)?;
+        let profile: ProfileAnswer =
+            serde_json::from_slice(&answer).map_err(|error| AuthError::Shape {
+                step: AuthStep::Profile,
+                message: format!("the profile answer does not parse: {error}"),
+            })?;
+        profile.into_profile()
+    }
+
+    /// Runs the second half of the sign-in chain: Xbox Live → XSTS → the
+    /// Minecraft login → the entitlements check (refusing when the account
+    /// owns no copy — survey §3.4's crux: "Everything until here works with
+    /// a normal Microsoft account!") → the profile fetch, in that order.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use oxide_assets::auth::{Auth, AuthEndpoints, MsaToken, client_id_from_env};
+    /// use oxide_assets::http::UreqClient;
+    ///
+    /// let auth = Auth::new(
+    ///     Arc::new(UreqClient::new()),
+    ///     AuthEndpoints::default(),
+    ///     client_id_from_env(),
+    /// );
+    /// // Against the live service (Task 13's leg) this runs the whole
+    /// // second half off an already-polled Microsoft token:
+    /// let msa = MsaToken {
+    ///     access_token: "microsoft-access-token".to_string(),
+    ///     refresh_token: Some("microsoft-refresh-token".to_string()),
+    ///     expires_in: 3599,
+    /// };
+    /// let signed_in = auth.complete_sign_in(msa).expect("live sign-in");
+    /// assert!(!signed_in.profile.name.is_empty());
+    /// ```
+    pub fn complete_sign_in(&self, msa: MsaToken) -> Result<SignedIn, AuthError> {
+        let xbl = self.authenticate_xbox(&msa.access_token)?;
+        let xsts = self.authorize_xsts(&xbl)?;
+        let mc = self.login_with_xbox(&xsts.user_hash, &xsts.token)?;
+        let entitlements = self.fetch_entitlements(&mc.access_token)?;
+        // Refusal variant (recorded): the existing taxonomy has no
+        // no-ownership variant, so the empty (or ownership-less)
+        // entitlements list is an `AuthError::Shape` on the entitlements
+        // step — a clear typed error, never a silent unsigned-in record.
+        if !entitlements.owns_minecraft {
+            return Err(AuthError::Shape {
+                step: AuthStep::Entitlements,
+                message: "the account does not own Minecraft (no product_minecraft/game_minecraft entitlement)".to_string(),
+            });
+        }
+        let profile = self.fetch_profile(&mc.access_token)?;
+        Ok(SignedIn {
+            mc_token: mc,
+            profile,
+            entitlements,
+            refreshed_msa_refresh_token: msa.refresh_token,
+        })
+    }
+
+    /// The whole client-start path: silently refreshes the Microsoft access
+    /// token, then runs [`Auth::complete_sign_in`]. Silent refresh needs no
+    /// Xbox/Minecraft state — a launcher can refresh on every start (§3.1).
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use oxide_assets::auth::{Auth, AuthEndpoints, client_id_from_env};
+    /// use oxide_assets::http::UreqClient;
+    ///
+    /// let auth = Auth::new(
+    ///     Arc::new(UreqClient::new()),
+    ///     AuthEndpoints::default(),
+    ///     client_id_from_env(),
+    /// );
+    /// // Against the live service (Task 13's leg) this signs in off the
+    /// // stored refresh half alone:
+    /// let signed_in = auth
+    ///     .silent_sign_in("stored-refresh-token")
+    ///     .expect("live sign-in");
+    /// assert!(!signed_in.profile.name.is_empty());
+    /// ```
+    pub fn silent_sign_in(&self, refresh_token: &str) -> Result<SignedIn, AuthError> {
+        let msa = self.refresh_msa(refresh_token)?;
+        self.complete_sign_in(msa)
+    }
+
+    /// Proves ownership to a server: POSTs the verbatim §3.7 JSON body —
+    /// `{"accessToken":"…","selectedProfile":"<uuid without dashes>",
+    /// "serverId":"<hash>"}` — to the session server. The server answers
+    /// **204 No Content** with an empty body on success, which arrives here
+    /// as the Ok path. `Content-Type: application/json` is mandatory ("you
+    /// *must* have the Content-Type header set to application/json or you
+    /// will get a 415 … or 403", §3.7) — the production client sets it on
+    /// every JSON post.
+    ///
+    /// A malformed `profile_uuid_hex` (not 32 hex digits — see
+    /// [`uuid_with_dashes`]) never reaches the wire: it is a
+    /// [`JoinError::Shape`].
+    pub fn join_session(
+        &self,
+        profile_uuid_hex: &str,
+        access_token: &str,
+        server_id: &str,
+    ) -> Result<(), JoinError> {
+        if uuid_with_dashes(profile_uuid_hex).is_none() {
+            return Err(JoinError::Shape {
+                message: "the profile uuid is not 32 hex digits".to_string(),
+            });
+        }
+        let body = serde_json::to_string(&JoinRequest {
+            access_token,
+            selected_profile: profile_uuid_hex,
+            server_id,
+        })
+        .expect("a string map serializes");
+        match self
+            .http
+            .post_json(&self.endpoints.session_join, body.as_bytes())
+        {
+            Ok(_) => Ok(()),
+            Err(HttpError::Status { code, body, .. }) => Err(join_status_error(code, &body)),
+            Err(other) => Err(JoinError::Http(other)),
+        }
+    }
 }
 
 /// One poll wait: ends the flow when the wait would overrun the device
@@ -745,6 +1078,133 @@ impl XboxAnswer {
     }
 }
 
+/// The login_with_xbox request: the single `identityToken` carrying the
+/// exact `XBL3.0 x=<uhs>;<xsts>` concatenation (survey §3.4). Serialized by
+/// field (never by hand) so credential escaping stays correct.
+#[derive(Serialize)]
+struct LoginRequest<'a> {
+    #[serde(rename = "identityToken")]
+    identity_token: &'a str,
+}
+
+/// The login_with_xbox answer: `access_token` and `expires_in` are the
+/// halves the chain keeps; `username`, `roles` and `token_type` are ignored
+/// (§3.4: the `username` "is not the uuid" — the profile fetch is the
+/// identity source).
+#[derive(Deserialize)]
+struct LoginAnswer {
+    access_token: String,
+    #[serde(deserialize_with = "de_u64")]
+    expires_in: u64,
+}
+
+/// The entitlements answer: the `items` array whose `name` fields carry the
+/// ownership signal (survey §3.5); unknown extra fields are ignored.
+#[derive(Deserialize)]
+struct EntitlementsAnswer {
+    items: Vec<EntitlementItem>,
+}
+
+/// One entitlement item: only `name` is read (`signature` and any future
+/// fields ride along ignored).
+#[derive(Deserialize)]
+struct EntitlementItem {
+    name: String,
+}
+
+impl EntitlementsAnswer {
+    /// Splits the wire answer into the ownership record. `owns_minecraft`
+    /// is true iff `product_minecraft` or `game_minecraft` is present — the
+    /// recorded Java-ownership derivation (survey §3.5).
+    fn into_entitlements(self) -> Entitlements {
+        let items: Vec<String> = self.items.into_iter().map(|item| item.name).collect();
+        let owns_minecraft = items
+            .iter()
+            .any(|name| name == "product_minecraft" || name == "game_minecraft");
+        Entitlements {
+            owns_minecraft,
+            items,
+        }
+    }
+}
+
+/// The profile answer: `id` (the uuid without dashes) and `name` (survey
+/// §3.5/§3.6); unknown extra fields are ignored.
+#[derive(Deserialize)]
+struct ProfileAnswer {
+    id: String,
+    name: String,
+}
+
+impl ProfileAnswer {
+    /// Splits the wire answer into the player identity. A malformed `id`
+    /// (not 32 hex digits — see [`uuid_with_dashes`]) is a shape error:
+    /// [`McProfile`] guarantees the no-dashes form, so a hostile answer is
+    /// refused, never stored.
+    fn into_profile(self) -> Result<McProfile, AuthError> {
+        if uuid_with_dashes(&self.id).is_none() {
+            return Err(AuthError::Shape {
+                step: AuthStep::Profile,
+                message: "the profile id is not 32 hex digits".to_string(),
+            });
+        }
+        Ok(McProfile {
+            uuid_hex: self.id,
+            name: self.name,
+        })
+    }
+}
+
+/// The session join request: the verbatim §3.7 shape. Field order is the
+/// survey's order (`accessToken`, `selectedProfile`, `serverId`); struct
+/// serialization preserves declaration order.
+#[derive(Serialize)]
+struct JoinRequest<'a> {
+    #[serde(rename = "accessToken")]
+    access_token: &'a str,
+    #[serde(rename = "selectedProfile")]
+    selected_profile: &'a str,
+    #[serde(rename = "serverId")]
+    server_id: &'a str,
+}
+
+/// A session-join refusal document: the `error` name drives the typed
+/// mapping, `errorMessage` rides along only for bans.
+#[derive(Deserialize)]
+struct JoinFailure {
+    error: String,
+    #[serde(rename = "errorMessage", default)]
+    error_message: String,
+}
+
+/// Maps a non-success join status onto the typed [`JoinError`]: the three
+/// documented `error` names become their variants, anything else (an
+/// unknown name, or a body that is not JSON at all) becomes
+/// [`JoinError::Shape`] — never a panic, never a token.
+fn join_status_error(code: u16, body: &[u8]) -> JoinError {
+    match serde_json::from_slice::<JoinFailure>(body) {
+        Ok(failure) => match failure.error.as_str() {
+            "ForbiddenOperationException" => JoinError::ForbiddenOperation,
+            "InsufficientPrivilegesException" => JoinError::InsufficientPrivileges,
+            "UserBannedException" => JoinError::Banned {
+                message: failure.error_message,
+            },
+            other => JoinError::Shape {
+                message: format!("the join refusal carries an unknown error: {other}"),
+            },
+        },
+        Err(_) => {
+            let excerpt = capped_lossy(body);
+            let message = if excerpt.is_empty() {
+                format!("the join refusal does not parse (HTTP {code})")
+            } else {
+                format!("the join refusal does not parse (HTTP {code}): {excerpt}")
+            };
+            JoinError::Shape { message }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Endpoint pins, message pins and credential redaction: the pure unit
@@ -803,6 +1263,13 @@ mod tests {
         assert_eq!(AuthStep::Token.to_string(), "token");
         assert_eq!(AuthStep::XboxLive.to_string(), "Xbox Live");
         assert_eq!(AuthStep::Xsts.to_string(), "XSTS");
+    }
+
+    #[test]
+    fn stage_two_step_names_render_for_messages() {
+        assert_eq!(AuthStep::MinecraftLogin.to_string(), "Minecraft login");
+        assert_eq!(AuthStep::Entitlements.to_string(), "entitlements");
+        assert_eq!(AuthStep::Profile.to_string(), "profile");
     }
 
     #[test]

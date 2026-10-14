@@ -1,15 +1,18 @@
-//! The device-code flow and the Xbox Live / XSTS chain against a scripted
-//! endpoint double: every response below mirrors the survey's verbatim shapes
-//! (§3.1–§3.3) with synthetic credential values, every request's exact bytes
-//! are asserted at the stub, and no test touches a socket, the clock, or a
-//! real Microsoft endpoint — the poll's sleeper is injected and its calls are
-//! recorded.
+//! The device-code flow, the Xbox Live / XSTS chain and the Minecraft
+//! sign-in stage against a scripted endpoint double: every response below
+//! mirrors the survey's verbatim shapes (§3.1–§3.7) with synthetic credential
+//! values, every request's exact bytes are asserted at the stub, and no test
+//! touches a socket, the clock, or a real Microsoft endpoint — the poll's
+//! sleeper is injected and its calls are recorded.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use oxide_assets::auth::{Auth, AuthEndpoints, AuthError, AuthStep};
+use oxide_assets::auth::{
+    AUTH_CLIENT_ID, Auth, AuthEndpoints, AuthError, AuthStep, JoinError, client_id_from_env,
+    uuid_with_dashes,
+};
 use oxide_assets::http::{HttpClient, HttpError};
 
 /// The client id every test polls with: fixed so the byte pins are exact.
@@ -37,6 +40,17 @@ impl Exchange {
         Self {
             status: 200,
             body: body.as_bytes().to_vec(),
+            correlation_id: None,
+        }
+    }
+
+    /// A successful exchange with an explicit status delivering `body`
+    /// verbatim: the session join answers **204 No Content** with an empty
+    /// body on success (survey §3.7).
+    fn ok_with_status(status: u16, body: &[u8]) -> Self {
+        Self {
+            status,
+            body: body.to_vec(),
             correlation_id: None,
         }
     }
@@ -72,6 +86,7 @@ struct Script {
     exchanges: Mutex<VecDeque<Exchange>>,
     json_calls: Mutex<Vec<(String, Vec<u8>)>>,
     form_calls: Mutex<Vec<FormCall>>,
+    bearer_calls: Mutex<Vec<(String, String)>>,
 }
 
 impl Script {
@@ -81,6 +96,7 @@ impl Script {
             exchanges: Mutex::new(exchanges.into()),
             json_calls: Mutex::new(Vec::new()),
             form_calls: Mutex::new(Vec::new()),
+            bearer_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -115,6 +131,11 @@ impl Script {
         self.form_calls.lock().expect("the call log").clone()
     }
 
+    /// The recorded bearer GETs: `(url, bearer token)`.
+    fn bearer_calls(&self) -> Vec<(String, String)> {
+        self.bearer_calls.lock().expect("the call log").clone()
+    }
+
     /// True once every scripted exchange has been consumed.
     fn is_exhausted(&self) -> bool {
         self.exchanges.lock().expect("the script").is_empty()
@@ -145,8 +166,12 @@ impl HttpClient for Script {
         self.answer(url)
     }
 
-    fn get_with_bearer(&self, _url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
-        unimplemented!("the auth chain never issues a bearer GET in this task")
+    fn get_with_bearer(&self, url: &str, bearer: &str) -> Result<Vec<u8>, HttpError> {
+        self.bearer_calls
+            .lock()
+            .expect("the call log")
+            .push((url.to_string(), bearer.to_string()));
+        self.answer(url)
     }
 }
 
@@ -160,6 +185,22 @@ fn harness(exchanges: Vec<Exchange>) -> (Auth, std::sync::Arc<Script>) {
         CLIENT_ID.to_string(),
     );
     (auth, script)
+}
+
+/// Builds the chain the way production does: the client id comes from the
+/// `OXIDECRAFT_AUTH_CLIENT_ID` override resolver, and the returned value is
+/// what the tests assert on the wire — so the constant's value never affects
+/// a test (the gate exports the override; the resolver rules themselves are
+/// pinned by `client_id_override_rules` below).
+fn harness_with_env(exchanges: Vec<Exchange>) -> (Auth, std::sync::Arc<Script>, String) {
+    let client_id = client_id_from_env();
+    assert!(
+        !client_id.is_empty(),
+        "the resolver always yields a client id"
+    );
+    let script = std::sync::Arc::new(Script::with(exchanges));
+    let auth = Auth::new(script.clone(), AuthEndpoints::default(), client_id.clone());
+    (auth, script, client_id)
 }
 
 /// The device-code success body: Microsoft Learn's field set verbatim via
@@ -825,5 +866,589 @@ fn a_huge_status_body_is_capped() {
     assert!(
         body.len() <= oxide_assets::http::MAX_ERROR_BODY_BYTES,
         "the Status body is capped at the HTTP error-body cap"
+    );
+}
+
+// --- The stage-two corpus (survey §3.4–§3.7) --------------------------------
+
+/// The profile uuid every stage-two test signs in as: 32 hex digits, no
+/// dashes, the exact form the profile endpoint returns (§3.6).
+const PROFILE_UUID_HEX: &str = "11111111222233334444555555555555";
+
+/// A login_with_xbox success body: the survey §3.4 shape verbatim, with
+/// synthetic values. `expires_in` 86400 is the 24-hour Minecraft token.
+/// Note `username` is not the uuid (§3.4) — the profile fetch is the
+/// identity source.
+fn login_body_with(access: &str) -> String {
+    format!(
+        r#"{{"username":"8b98c31a3f0a4b7c9d1e2f3a4b5c6d7e","roles":[],"access_token":"{access}","token_type":"Bearer","expires_in":86400}}"#
+    )
+}
+
+/// The default login body.
+fn login_body() -> String {
+    login_body_with("SYN-MC-ACCESS-001")
+}
+
+/// An entitlements 200: the two owning items from survey §3.5
+/// (`product_minecraft`, `game_minecraft`).
+fn entitlements_body() -> String {
+    r#"{"items":[{"name":"product_minecraft","signature":"SYN-SIG-001"},{"name":"game_minecraft","signature":"SYN-SIG-002"}],"signature":"SYN-OUTER-SIG"}"#.to_string()
+}
+
+/// The empty-`items` case: a working Microsoft account that owns nothing —
+/// survey §3.4's crux ("Everything until here works with a normal Microsoft
+/// account!").
+fn entitlements_empty_body() -> String {
+    r#"{"items":[],"signature":"SYN-OUTER-SIG"}"#.to_string()
+}
+
+/// A profile 200: the §3.6 shape (`id` without dashes, `name`).
+fn profile_body() -> String {
+    r#"{"id":"11111111222233334444555555555555","name":"SynPlayer","properties":[],"profileActions":[]}"#
+        .to_string()
+}
+
+/// A join 403: the survey-verbatim `ForbiddenOperationException` shape.
+fn join_forbidden_body() -> String {
+    r#"{"error":"ForbiddenOperationException","path":"/session/minecraft/join"}"#.to_string()
+}
+
+/// A join 403 for a disabled-multiplayer account (survey §3.7's
+/// `// Xbox multiplayer disabled` annotation).
+fn join_privileges_body() -> String {
+    r#"{"error":"InsufficientPrivilegesException","path":"/session/minecraft/join"}"#.to_string()
+}
+
+/// A join 403 for a multiplayer-banned account, carrying its `errorMessage`.
+fn join_banned_body() -> String {
+    r#"{"error":"UserBannedException","errorMessage":"You are banned from multiplayer.","path":"/session/minecraft/join"}"#.to_string()
+}
+
+#[test]
+fn login_with_xbox_posts_the_exact_concat_and_parses_86400() {
+    let (auth, script, _) = harness_with_env(vec![Exchange::ok(&login_body())]);
+
+    let token = auth
+        .login_with_xbox("SYN-UHS-001", "SYN-XSTS-TOKEN-001")
+        .expect("the login succeeds");
+
+    assert_eq!(token.access_token, "SYN-MC-ACCESS-001");
+    assert_eq!(token.expires_in, 86400, "the Minecraft token lives 24 h");
+    assert!(
+        token.refresh_token.is_none(),
+        "the Minecraft token carries no refresh half"
+    );
+
+    let calls = script.json_calls();
+    assert_eq!(calls.len(), 1, "one login_with_xbox request");
+    assert_eq!(calls[0].0, AuthEndpoints::default().mc_login);
+    assert_eq!(
+        String::from_utf8(calls[0].1.clone()).expect("the request is UTF-8"),
+        r#"{"identityToken":"XBL3.0 x=SYN-UHS-001;SYN-XSTS-TOKEN-001"}"#,
+        "literal `XBL3.0 x=`, the uhs, a `;`, then the XSTS token (§3.4)"
+    );
+    assert!(script.is_exhausted());
+}
+
+#[test]
+fn entitlements_parses_the_two_items_as_owned() {
+    let (auth, script, _) = harness_with_env(vec![Exchange::ok(&entitlements_body())]);
+
+    let entitlements = auth
+        .fetch_entitlements("SYN-MC-ACCESS-001")
+        .expect("the entitlements fetch succeeds");
+
+    assert!(entitlements.owns_minecraft, "either owning item suffices");
+    assert_eq!(
+        entitlements.items,
+        vec![
+            "product_minecraft".to_string(),
+            "game_minecraft".to_string()
+        ]
+    );
+
+    let calls = script.bearer_calls();
+    assert_eq!(calls.len(), 1, "one bearer GET");
+    assert_eq!(calls[0].0, AuthEndpoints::default().mc_entitlements);
+    assert_eq!(
+        calls[0].1, "SYN-MC-ACCESS-001",
+        "the Minecraft access token rides as the bearer"
+    );
+    assert!(script.is_exhausted());
+}
+
+#[test]
+fn profile_parses_id_and_name() {
+    let (auth, script, _) = harness_with_env(vec![Exchange::ok(&profile_body())]);
+
+    let profile = auth
+        .fetch_profile("SYN-MC-ACCESS-001")
+        .expect("the profile fetch succeeds");
+
+    assert_eq!(profile.uuid_hex, PROFILE_UUID_HEX);
+    assert_eq!(profile.name, "SynPlayer");
+
+    let calls = script.bearer_calls();
+    assert_eq!(calls.len(), 1, "one bearer GET");
+    assert_eq!(calls[0].0, AuthEndpoints::default().mc_profile);
+    assert_eq!(
+        calls[0].1, "SYN-MC-ACCESS-001",
+        "the Minecraft access token rides as the bearer"
+    );
+    assert!(script.is_exhausted());
+}
+
+#[test]
+fn complete_sign_in_runs_the_chain_in_order() {
+    let (auth, script, _) = harness_with_env(vec![
+        Exchange::ok(&xbox_body("SYN-XBL-TOKEN-101", "SYN-UHS-101")),
+        Exchange::ok(&xbox_body("SYN-XSTS-TOKEN-101", "SYN-UHS-101")),
+        Exchange::ok(&login_body_with("SYN-MC-ACCESS-101")),
+        Exchange::ok(&entitlements_body()),
+        Exchange::ok(&profile_body()),
+    ]);
+    let msa = oxide_assets::auth::MsaToken {
+        access_token: "SYN-MS-ACCESS-101".to_string(),
+        refresh_token: Some("SYN-MS-REFRESH-101".to_string()),
+        expires_in: 3599,
+    };
+
+    let signed = auth.complete_sign_in(msa).expect("the full chain signs in");
+
+    assert_eq!(signed.mc_token.access_token, "SYN-MC-ACCESS-101");
+    assert_eq!(signed.mc_token.expires_in, 86400);
+    assert_eq!(signed.profile.uuid_hex, PROFILE_UUID_HEX);
+    assert_eq!(signed.profile.name, "SynPlayer");
+    assert!(signed.entitlements.owns_minecraft);
+    assert_eq!(
+        signed.refreshed_msa_refresh_token.as_deref(),
+        Some("SYN-MS-REFRESH-101"),
+        "the MSA refresh half rides along for the keyring"
+    );
+
+    let endpoints = AuthEndpoints::default();
+    let json_urls: Vec<String> = script
+        .json_calls()
+        .into_iter()
+        .map(|(url, _)| url)
+        .collect();
+    assert_eq!(
+        json_urls,
+        vec![
+            endpoints.xbl_authenticate,
+            endpoints.xsts_authorize,
+            endpoints.mc_login,
+        ],
+        "XBL, then XSTS, then the Minecraft login"
+    );
+    // The login carries the XSTS user hash and token from the steps above.
+    assert_eq!(
+        String::from_utf8(script.json_calls()[2].1.clone()).expect("UTF-8"),
+        r#"{"identityToken":"XBL3.0 x=SYN-UHS-101;SYN-XSTS-TOKEN-101"}"#
+    );
+    let bearer_urls: Vec<String> = script
+        .bearer_calls()
+        .into_iter()
+        .map(|(url, _)| url)
+        .collect();
+    assert_eq!(
+        bearer_urls,
+        vec![endpoints.mc_entitlements, endpoints.mc_profile],
+        "entitlements before the profile"
+    );
+    assert!(script.is_exhausted());
+}
+
+#[test]
+fn silent_sign_in_refreshes_then_completes() {
+    let (auth, script, client_id) = harness_with_env(vec![
+        Exchange::ok(&token_body("SYN-MS-ACCESS-102", "SYN-MS-REFRESH-102")),
+        Exchange::ok(&xbox_body("SYN-XBL-TOKEN-102", "SYN-UHS-102")),
+        Exchange::ok(&xbox_body("SYN-XSTS-TOKEN-102", "SYN-UHS-102")),
+        Exchange::ok(&login_body_with("SYN-MC-ACCESS-102")),
+        Exchange::ok(&entitlements_body()),
+        Exchange::ok(&profile_body()),
+    ]);
+
+    let signed = auth
+        .silent_sign_in("SYN-MS-REFRESH-001")
+        .expect("silent refresh signs in");
+
+    assert_eq!(signed.mc_token.access_token, "SYN-MC-ACCESS-102");
+    assert_eq!(signed.profile.name, "SynPlayer");
+    assert_eq!(
+        signed.refreshed_msa_refresh_token.as_deref(),
+        Some("SYN-MS-REFRESH-102"),
+        "the refreshed token — not the presented one — is the stored half"
+    );
+
+    let forms = script.form_calls();
+    assert_eq!(forms.len(), 1, "silent refresh needs no Xbox state first");
+    assert_eq!(forms[0].0, AuthEndpoints::default().token);
+    assert_eq!(
+        forms[0].1,
+        vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            (
+                "refresh_token".to_string(),
+                "SYN-MS-REFRESH-001".to_string()
+            ),
+            ("client_id".to_string(), client_id),
+        ],
+        "the verbatim refresh grant, with the resolver's client id"
+    );
+    assert!(script.is_exhausted());
+}
+
+#[test]
+fn join_session_posts_the_verbatim_body_and_accepts_204() {
+    let (auth, script, _) = harness_with_env(vec![Exchange::ok_with_status(204, b"")]);
+
+    auth.join_session(PROFILE_UUID_HEX, "SYN-MC-ACCESS-201", "SYN-HASH-201")
+        .expect("204 with an empty body is success");
+
+    let calls = script.json_calls();
+    assert_eq!(calls.len(), 1, "one join request");
+    assert_eq!(calls[0].0, AuthEndpoints::default().session_join);
+    assert_eq!(
+        String::from_utf8(calls[0].1.clone()).expect("the request is UTF-8"),
+        r#"{"accessToken":"SYN-MC-ACCESS-201","selectedProfile":"11111111222233334444555555555555","serverId":"SYN-HASH-201"}"#,
+        "the §3.7 body byte for byte: the three keys, the uuid without dashes"
+    );
+    assert!(script.is_exhausted());
+}
+
+#[test]
+fn join_refusals_map_to_typed_errors_with_operator_sentences() {
+    let (auth, _script, _) =
+        harness_with_env(vec![Exchange::fail(403, join_forbidden_body().as_bytes())]);
+    let error = auth
+        .join_session(PROFILE_UUID_HEX, "SYN-MC-ACCESS-202", "SYN-HASH-202")
+        .expect_err("the service refuses");
+    assert!(
+        matches!(error, JoinError::ForbiddenOperation),
+        "ForbiddenOperationException is typed: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "the session server refused the join (ForbiddenOperationException)"
+    );
+
+    let (auth, _script, _) =
+        harness_with_env(vec![Exchange::fail(403, join_privileges_body().as_bytes())]);
+    let error = auth
+        .join_session(PROFILE_UUID_HEX, "SYN-MC-ACCESS-202", "SYN-HASH-202")
+        .expect_err("multiplayer is disabled");
+    assert!(
+        matches!(error, JoinError::InsufficientPrivileges),
+        "InsufficientPrivilegesException is typed: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "InsufficientPrivilegesException: Xbox multiplayer is disabled for this account"
+    );
+
+    let (auth, _script, _) =
+        harness_with_env(vec![Exchange::fail(403, join_banned_body().as_bytes())]);
+    let error = auth
+        .join_session(PROFILE_UUID_HEX, "SYN-MC-ACCESS-202", "SYN-HASH-202")
+        .expect_err("the account is banned");
+    let JoinError::Banned { message } = &error else {
+        panic!("UserBannedException is a Banned error, not {error}");
+    };
+    assert_eq!(message, "You are banned from multiplayer.");
+    assert_eq!(
+        error.to_string(),
+        "the account is banned from multiplayer (UserBannedException): You are banned from multiplayer."
+    );
+}
+
+#[test]
+fn client_id_override_rules() {
+    // The override lives in the process environment, and swapping it in the
+    // parent would race parallel tests (besides needing `unsafe`, which the
+    // workspace forbids) — so each rule runs in a child process, the repo's
+    // established pattern (`the_bare_client_builds_with_no_extraction_tree`).
+    // The child re-enters this same test with the probe case set and asserts
+    // the resolver directly.
+    if let Ok(case) = std::env::var("OXIDECRAFT_AUTH_CLIENT_CASE") {
+        match case.as_str() {
+            "override" => assert_eq!(
+                client_id_from_env(),
+                CLIENT_ID,
+                "a set override wins over the constant"
+            ),
+            "unset" => assert_eq!(
+                client_id_from_env(),
+                AUTH_CLIENT_ID,
+                "an unset override falls back to the constant"
+            ),
+            "empty" => assert_eq!(
+                client_id_from_env(),
+                AUTH_CLIENT_ID,
+                "an empty override falls back to the constant"
+            ),
+            other => panic!("unknown client-id probe case: {other}"),
+        }
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary path");
+    for case in ["override", "unset", "empty"] {
+        let mut probe = std::process::Command::new(&exe);
+        probe
+            .arg("--exact")
+            .arg("client_id_override_rules")
+            .env("OXIDECRAFT_AUTH_CLIENT_CASE", case);
+        match case {
+            "override" => {
+                probe.env("OXIDECRAFT_AUTH_CLIENT_ID", CLIENT_ID);
+            }
+            // `env_remove` keeps the probe hermetic even when the runner
+            // exports an override (the gate does, so stage-two tests exercise
+            // the override path).
+            "unset" => {
+                probe.env_remove("OXIDECRAFT_AUTH_CLIENT_ID");
+            }
+            "empty" => {
+                probe.env("OXIDECRAFT_AUTH_CLIENT_ID", "");
+            }
+            _ => unreachable!("the loop lists every case"),
+        }
+        let status = probe.status().expect("the probe process runs");
+        assert!(status.success(), "the {case} client-id rule holds");
+    }
+}
+
+#[test]
+fn signed_in_debug_redacts_tokens_but_keeps_identity() {
+    let signed = oxide_assets::auth::SignedIn {
+        mc_token: oxide_assets::auth::MsaToken {
+            access_token: "SENTINEL-MC-ACCESS".to_string(),
+            refresh_token: None,
+            expires_in: 86400,
+        },
+        profile: oxide_assets::auth::McProfile {
+            uuid_hex: PROFILE_UUID_HEX.to_string(),
+            name: "SynPlayer".to_string(),
+        },
+        entitlements: oxide_assets::auth::Entitlements {
+            owns_minecraft: true,
+            items: vec!["product_minecraft".to_string()],
+        },
+        refreshed_msa_refresh_token: Some("SENTINEL-REFRESH".to_string()),
+    };
+
+    let debug = format!("{signed:?}");
+    for secret in ["SENTINEL-MC-ACCESS", "SENTINEL-REFRESH"] {
+        assert!(
+            !debug.contains(secret),
+            "no token reaches the Debug path: {debug}"
+        );
+    }
+    assert!(
+        debug.contains("SynPlayer"),
+        "the player identity stays visible: {debug}"
+    );
+}
+
+// --- Step 3: the refusal and tolerance cases --------------------------------
+
+#[test]
+fn empty_entitlements_is_a_no_ownership_typed_error() {
+    // The fetcher reports; it does not refuse.
+    let (auth, _script, _) = harness_with_env(vec![Exchange::ok(&entitlements_empty_body())]);
+    let entitlements = auth
+        .fetch_entitlements("SYN-MC-ACCESS-301")
+        .expect("an empty list parses");
+    assert!(!entitlements.owns_minecraft);
+    assert!(entitlements.items.is_empty());
+
+    // The driver refuses: the scripted profile answer must never be consumed.
+    let (auth, script, _) = harness_with_env(vec![
+        Exchange::ok(&xbox_body("SYN-XBL-TOKEN-301", "SYN-UHS-301")),
+        Exchange::ok(&xbox_body("SYN-XSTS-TOKEN-301", "SYN-UHS-301")),
+        Exchange::ok(&login_body_with("SYN-MC-ACCESS-301")),
+        Exchange::ok(&entitlements_empty_body()),
+        Exchange::ok(&profile_body()),
+    ]);
+    let msa = oxide_assets::auth::MsaToken {
+        access_token: "SYN-MS-ACCESS-301".to_string(),
+        refresh_token: Some("SYN-MS-REFRESH-301".to_string()),
+        expires_in: 3599,
+    };
+    let error = auth
+        .complete_sign_in(msa)
+        .expect_err("a merely-working Microsoft account is refused");
+    let AuthError::Shape { step, message } = &error else {
+        panic!("no ownership is a typed Shape error, not {error}");
+    };
+    assert_eq!(*step, AuthStep::Entitlements);
+    assert!(
+        message.contains("does not own Minecraft"),
+        "the refusal names the missing ownership: {message}"
+    );
+    assert_eq!(
+        script.bearer_calls().len(),
+        1,
+        "the profile is never fetched once ownership fails"
+    );
+}
+
+#[test]
+fn profile_401_is_a_status_error() {
+    // The survey-verbatim bogus-token shape (§3.5).
+    let body = r#"{"path":"/minecraft/profile"}"#;
+    let (auth, _script, _) = harness_with_env(vec![Exchange::fail(401, body.as_bytes())]);
+
+    let error = auth
+        .fetch_profile("SYN-MC-ACCESS-BAD")
+        .expect_err("a bogus token is refused");
+    let AuthError::Status { step, code, .. } = &error else {
+        panic!("a 401 is a Status error, not {error}");
+    };
+    assert_eq!(*step, AuthStep::Profile);
+    assert_eq!(*code, 401);
+    assert!(
+        error.to_string().contains("profile"),
+        "the step rides in the message: {error}"
+    );
+}
+
+#[test]
+fn unknown_extra_fields_are_tolerated_in_stage_two_bodies() {
+    // The §3.6 `profileActions` lesson applied to stage two: the services
+    // add fields over time, and the parser must ignore what it does not know.
+    let extra_login = login_body().replace(
+        "\"token_type\"",
+        "\"profileActions\":[],\"future_field\":{\"nested\":true},\"token_type\"",
+    );
+    let extra_entitlements = entitlements_body().replace(
+        "\"signature\":\"SYN-OUTER-SIG\"",
+        "\"signature\":\"SYN-OUTER-SIG\",\"future_field\":7",
+    );
+    let extra_profile = profile_body().replace(
+        "\"profileActions\"",
+        "\"future_field\":{\"nested\":true},\"profileActions\"",
+    );
+    let (auth, _script, _) = harness_with_env(vec![
+        Exchange::ok(&extra_login),
+        Exchange::ok(&extra_entitlements),
+        Exchange::ok(&extra_profile),
+    ]);
+
+    let token = auth
+        .login_with_xbox("SYN-UHS-302", "SYN-XSTS-TOKEN-302")
+        .expect("extra fields parse");
+    assert_eq!(token.expires_in, 86400);
+    let entitlements = auth
+        .fetch_entitlements(&token.access_token)
+        .expect("extra fields parse");
+    assert!(entitlements.owns_minecraft);
+    let profile = auth
+        .fetch_profile(&token.access_token)
+        .expect("extra fields parse");
+    assert_eq!(profile.uuid_hex, PROFILE_UUID_HEX);
+}
+
+#[test]
+fn uuid_with_dashes_validates_32_hex_digits() {
+    assert_eq!(
+        uuid_with_dashes("11111111222233334444555555555555"),
+        Some("11111111-2222-3333-4444-555555555555".to_string())
+    );
+    assert_eq!(
+        uuid_with_dashes("069a79f444e94726a5befca90e38aaf5"),
+        Some("069a79f4-44e9-4726-a5be-fca90e38aaf5".to_string()),
+        "the survey's live Notch id (§3.6) converts"
+    );
+    for hostile in [
+        "",
+        "too-short",
+        "11111111-2222-3333-4444-555555555555",
+        "1111111122223333444455555555555",
+        "111111112222333344445555555555555",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "1111111122223333444455555555555 ",
+        " 1111111122223333444455555555555",
+    ] {
+        assert_eq!(
+            uuid_with_dashes(hostile),
+            None,
+            "hostile input is refused, never repaired: {hostile:?}"
+        );
+    }
+}
+
+#[test]
+fn join_session_refuses_a_malformed_uuid_without_touching_the_wire() {
+    // The scripted 204 must never be consumed: validation precedes the wire.
+    let (auth, script, _) = harness_with_env(vec![Exchange::ok_with_status(204, b"")]);
+
+    let error = auth
+        .join_session("not-a-uuid", "SYN-MC-ACCESS-303", "SYN-HASH-303")
+        .expect_err("a malformed uuid never reaches the wire");
+    assert!(
+        matches!(error, JoinError::Shape { .. }),
+        "hostile input is a typed Shape error: {error}"
+    );
+    assert!(
+        script.json_calls().is_empty(),
+        "no request is issued for hostile input"
+    );
+}
+
+#[test]
+fn malformed_profile_id_is_a_shape_error() {
+    let body = r#"{"id":"not-a-uuid","name":"SynPlayer"}"#;
+    let (auth, _script, _) = harness_with_env(vec![Exchange::ok(body)]);
+
+    let error = auth
+        .fetch_profile("SYN-MC-ACCESS-304")
+        .expect_err("a hostile id is refused");
+    assert!(
+        matches!(
+            error,
+            AuthError::Shape {
+                step: AuthStep::Profile,
+                ..
+            }
+        ),
+        "a malformed id is a typed Shape error, never stored: {error}"
+    );
+}
+
+#[test]
+fn join_unknown_and_garbage_refusals_are_shape_errors() {
+    // The survey's non-descriptive `{"error":"Forbidden"}` case (§3.7): a
+    // well-formed refusal with an undocumented name.
+    let (auth, _script, _) = harness_with_env(vec![Exchange::fail(
+        403,
+        br#"{"error":"Forbidden","path":"/session/minecraft/join"}"#,
+    )]);
+    let error = auth
+        .join_session(PROFILE_UUID_HEX, "SYN-MC-ACCESS-305", "SYN-HASH-305")
+        .expect_err("an undocumented error name is typed");
+    assert!(
+        matches!(error, JoinError::Shape { .. }),
+        "unknown names are Shape errors: {error}"
+    );
+    assert!(
+        error.to_string().contains("unknown error"),
+        "the message names the gap: {error}"
+    );
+
+    // Not JSON at all: still typed, never a panic.
+    let (auth, _script, _) = harness_with_env(vec![Exchange::fail(403, b"not json")]);
+    let error = auth
+        .join_session(PROFILE_UUID_HEX, "SYN-MC-ACCESS-305", "SYN-HASH-305")
+        .expect_err("garbage is typed");
+    assert!(
+        matches!(error, JoinError::Shape { .. }),
+        "garbage answers are typed, never panics: {error}"
+    );
+    assert!(
+        error.to_string().contains("does not parse"),
+        "the message names the gap: {error}"
     );
 }
