@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
+use std::sync::Mutex;
 
 use oxide_assets::fetch::{FetchError, FetchOptions, Progress, fetch_version};
 use oxide_assets::http::{HttpClient, HttpError};
@@ -21,28 +22,44 @@ const JAR_URL: &str = "https://piston-meta.invalid/versions/1.8.10/client.jar";
 /// A transport that serves canned bodies and counts every request.
 struct FakeHttp {
     bodies: HashMap<String, Vec<u8>>,
-    calls: RefCell<Vec<String>>,
+    calls: Mutex<Vec<String>>,
 }
 
 impl FakeHttp {
     fn new(bodies: HashMap<String, Vec<u8>>) -> Self {
         Self {
             bodies,
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl HttpClient for FakeHttp {
     fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
-        self.calls.borrow_mut().push(url.to_string());
+        self.calls
+            .lock()
+            .expect("the call log")
+            .push(url.to_string());
         self.bodies
             .get(url)
             .cloned()
             .ok_or_else(|| HttpError::Status {
                 url: url.to_string(),
                 code: 404,
+                body: Vec::new(),
             })
+    }
+
+    fn post_json(&self, url: &str, _body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        self.get(url)
+    }
+
+    fn post_form(&self, url: &str, _fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+        self.get(url)
+    }
+
+    fn get_with_bearer(&self, url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
+        self.get(url)
     }
 }
 
@@ -231,7 +248,11 @@ fn fetch_is_idempotent_and_repairs_corruption() {
     // Manifest, version document, index, jar and two distinct objects: the
     // index's third entry repeats the first object's hash and is not fetched
     // again.
-    assert_eq!(f.http.calls.borrow().len(), 6, "first run transfers");
+    assert_eq!(
+        f.http.calls.lock().expect("the call log").len(),
+        6,
+        "first run transfers"
+    );
     assert_eq!(first.downloaded, 6);
     assert_eq!(first.reused, 0);
     assert!(
@@ -246,7 +267,8 @@ fn fetch_is_idempotent_and_repairs_corruption() {
     assert_eq!(
         f.http
             .calls
-            .borrow()
+            .lock()
+            .expect("the call log")
             .iter()
             .filter(|url| url.contains(&f.objects[0].0))
             .count(),
@@ -309,7 +331,7 @@ fn fetch_is_idempotent_and_repairs_corruption() {
     // Second run: everything is present and valid, nothing goes over the wire.
     let second = fetch_version(&store, &f.http, &opts, |_| {}).expect("second fetch");
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         6,
         "a second run must download nothing"
     );
@@ -340,7 +362,7 @@ fn fetch_is_idempotent_and_repairs_corruption() {
 
     let third = fetch_version(&store, &f.http, &opts, |_| {}).expect("repair fetch");
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         7,
         "exactly one object is re-downloaded"
     );
@@ -368,7 +390,7 @@ fn dry_run_resolves_the_plan_and_writes_nothing() {
 
     // The chain is resolved over the wire but nothing is stored.
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         3,
         "manifest, version document, index"
     );
@@ -449,7 +471,7 @@ fn a_second_run_is_refused_while_the_lock_is_held() {
         "the message says another fetch holds the lock: {message}"
     );
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         0,
         "no network work may happen before the lock"
     );
@@ -477,7 +499,7 @@ fn verify_reports_the_store_through_its_verification_pass() {
     let store = Store::open(dir.path().to_path_buf()).expect("open");
     let f = fixture("1.8.10");
     fetch_version(&store, &f.http, &options("1.8.10"), |_| {}).expect("fetch");
-    let calls = f.http.calls.borrow().len();
+    let calls = f.http.calls.lock().expect("the call log").len();
 
     let opts = FetchOptions {
         version: "1.8.10".to_string(),
@@ -490,7 +512,7 @@ fn verify_reports_the_store_through_its_verification_pass() {
     })
     .expect("verify fetch");
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         calls,
         "verifying downloads nothing"
     );
@@ -538,7 +560,7 @@ fn an_unknown_version_is_refused_after_the_manifest() {
         "got {error:?}"
     );
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         1,
         "only the manifest is fetched"
     );
@@ -557,7 +579,11 @@ fn a_version_document_for_another_version_is_refused() {
         matches!(error, FetchError::VersionMismatch { .. }),
         "got {error:?}"
     );
-    assert_eq!(f.http.calls.borrow().len(), 2, "manifest and the document");
+    assert_eq!(
+        f.http.calls.lock().expect("the call log").len(),
+        2,
+        "manifest and the document"
+    );
     assert!(
         !store
             .version_json_path("1.8.10")
@@ -586,7 +612,7 @@ fn the_1_8_9_client_jar_descriptor_is_guarded_by_the_constants() {
         "got {error:?}"
     );
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         2,
         "the guard fires before the index"
     );
@@ -628,12 +654,17 @@ fn an_unparsable_stored_version_document_is_re_resolved() {
         .expect_err("the stand-in jar cannot satisfy the pinned descriptor");
 
     assert_eq!(
-        f.http.calls.borrow().first().map(String::as_str),
+        f.http
+            .calls
+            .lock()
+            .expect("the call log")
+            .first()
+            .map(String::as_str),
         Some(VERSION_MANIFEST_URL),
         "the stored document must not be fatal: the manifest chain runs"
     );
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         6,
         "manifest, document, index, two objects and the jar"
     );
@@ -686,12 +717,17 @@ fn a_stored_document_that_fails_the_pin_is_re_resolved() {
         .expect_err("the stand-in jar cannot satisfy the pinned descriptor");
 
     assert_eq!(
-        f.http.calls.borrow().first().map(String::as_str),
+        f.http
+            .calls
+            .lock()
+            .expect("the call log")
+            .first()
+            .map(String::as_str),
         Some(VERSION_MANIFEST_URL),
         "the stored document must not be trusted: the manifest chain runs"
     );
     assert_eq!(
-        f.http.calls.borrow().len(),
+        f.http.calls.lock().expect("the call log").len(),
         6,
         "manifest, document, index, two objects and the jar"
     );
@@ -783,7 +819,7 @@ fn a_failed_space_precheck_refuses_before_any_transfer() {
         "got {error:?}"
     );
     assert!(
-        http.calls.borrow().is_empty(),
+        http.calls.lock().expect("the call log").is_empty(),
         "the refusal must come before any transfer"
     );
     assert!(

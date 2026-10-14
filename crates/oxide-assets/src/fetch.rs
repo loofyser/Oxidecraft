@@ -11,12 +11,12 @@
 //! run whose extraction manifest is current skips the extraction step; see
 //! [`crate::extract`].
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fs4::{FileExt, TryLockError};
 
@@ -578,8 +578,8 @@ const ASSET_INDEX: &str = "asset index";
 /// exactly what went over the wire.
 struct Transfer<'a> {
     inner: &'a dyn HttpClient,
-    calls: Cell<u64>,
-    bytes: Cell<u64>,
+    calls: AtomicU64,
+    bytes: AtomicU64,
 }
 
 impl<'a> Transfer<'a> {
@@ -587,28 +587,49 @@ impl<'a> Transfer<'a> {
     fn new(inner: &'a dyn HttpClient) -> Self {
         Self {
             inner,
-            calls: Cell::new(0),
-            bytes: Cell::new(0),
+            calls: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
         }
     }
 
     /// The successful transfers so far.
     fn calls(&self) -> u64 {
-        self.calls.get()
+        self.calls.load(Ordering::Relaxed)
     }
 
     /// The bytes transferred so far.
     fn transferred(&self) -> u64 {
-        self.bytes.get()
+        self.bytes.load(Ordering::Relaxed)
     }
 }
 
 impl HttpClient for Transfer<'_> {
     fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
         let body = self.inner.get(url)?;
-        self.calls.set(self.calls.get() + 1);
-        self.bytes.set(self.bytes.get() + body.len() as u64);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
         Ok(body)
+    }
+
+    fn post_json(&self, url: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        let answer = self.inner.post_json(url, body)?;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(answer.len() as u64, Ordering::Relaxed);
+        Ok(answer)
+    }
+
+    fn post_form(&self, url: &str, fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+        let answer = self.inner.post_form(url, fields)?;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(answer.len() as u64, Ordering::Relaxed);
+        Ok(answer)
+    }
+
+    fn get_with_bearer(&self, url: &str, bearer: &str) -> Result<Vec<u8>, HttpError> {
+        let answer = self.inner.get_with_bearer(url, bearer)?;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(answer.len() as u64, Ordering::Relaxed);
+        Ok(answer)
     }
 }
 

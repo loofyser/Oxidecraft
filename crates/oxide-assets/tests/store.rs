@@ -2,36 +2,52 @@
 //! on-disk permissions, the verification pass and the refusal to follow a
 //! symlinked objects directory.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use oxide_assets::http::{HttpClient, HttpError, UreqClient};
 use oxide_assets::store::{Store, StoreError};
 
 struct FakeHttp {
     bodies: HashMap<String, Vec<u8>>,
-    calls: RefCell<Vec<String>>,
+    calls: Mutex<Vec<String>>,
 }
 
 impl FakeHttp {
     fn new(bodies: HashMap<String, Vec<u8>>) -> Self {
         Self {
             bodies,
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl HttpClient for FakeHttp {
     fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
-        self.calls.borrow_mut().push(url.to_string());
+        self.calls
+            .lock()
+            .expect("the call log")
+            .push(url.to_string());
         self.bodies
             .get(url)
             .cloned()
             .ok_or_else(|| HttpError::Status {
                 url: url.to_string(),
                 code: 404,
+                body: Vec::new(),
             })
+    }
+
+    fn post_json(&self, url: &str, _body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        self.get(url)
+    }
+
+    fn post_form(&self, url: &str, _fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+        self.get(url)
+    }
+
+    fn get_with_bearer(&self, url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
+        self.get(url)
     }
 }
 
@@ -59,13 +75,13 @@ fn fetches_verifies_and_caches_an_object() {
         .expect("fetch");
     assert!(path.exists());
     assert_eq!(std::fs::read(&path).expect("read"), body);
-    assert_eq!(http.calls.borrow().len(), 1);
+    assert_eq!(http.calls.lock().expect("the call log").len(), 1);
 
     // Second call must not touch the network.
     store
         .fetch_object(&http, &hash, body.len() as u64)
         .expect("cache hit");
-    assert_eq!(http.calls.borrow().len(), 1);
+    assert_eq!(http.calls.lock().expect("the call log").len(), 1);
 }
 
 #[test]
@@ -109,7 +125,7 @@ fn a_corrupted_cache_entry_is_replaced() {
         .expect("refetch");
     assert_eq!(std::fs::read(&fetched).expect("read"), body);
     assert_eq!(
-        http.calls.borrow().len(),
+        http.calls.lock().expect("the call log").len(),
         1,
         "the corrupt entry must be re-downloaded"
     );
@@ -164,7 +180,7 @@ fn a_malformed_hash_is_rejected_without_panicking() {
     let result = store.fetch_object(&http, "a", 1);
     assert!(matches!(result, Err(StoreError::BadHash { .. })));
     assert_eq!(
-        http.calls.borrow().len(),
+        http.calls.lock().expect("the call log").len(),
         0,
         "a malformed hash must not reach the network"
     );
@@ -340,7 +356,7 @@ fn a_same_length_corruption_of_a_cached_object_fails_on_the_hash() {
         .expect("re-fetch after corruption");
     assert_eq!(std::fs::read(&re_fetched).expect("read"), body);
     assert_eq!(
-        http.calls.borrow().len(),
+        http.calls.lock().expect("the call log").len(),
         2,
         "the corrupted bytes must be downloaded again"
     );
@@ -405,7 +421,7 @@ fn a_corrupt_read_only_cache_entry_is_removed_and_re_fetched() {
         .expect("a read-only corrupt entry is removed and re-fetched");
     assert_eq!(std::fs::read(&fetched).expect("read"), body);
     assert_eq!(
-        http.calls.borrow().len(),
+        http.calls.lock().expect("the call log").len(),
         1,
         "the corrupt entry must be re-downloaded"
     );
@@ -438,9 +454,9 @@ fn an_uppercase_hash_finds_the_lowercase_object() {
         store.object_path(&hash).expect("the object path"),
         "the object lands at the lowercase path"
     );
-    assert_eq!(http.calls.borrow().len(), 1);
+    assert_eq!(http.calls.lock().expect("the call log").len(), 1);
     assert_eq!(
-        http.calls.borrow()[0],
+        http.calls.lock().expect("the call log")[0],
         url,
         "the request uses the lowercase URL"
     );
@@ -449,7 +465,7 @@ fn an_uppercase_hash_finds_the_lowercase_object() {
         .fetch_object(&http, &uppercase, body.len() as u64)
         .expect("cache hit through the uppercase spelling");
     assert_eq!(
-        http.calls.borrow().len(),
+        http.calls.lock().expect("the call log").len(),
         1,
         "the lowercase object must be reused"
     );
@@ -485,7 +501,7 @@ fn an_unreadable_cache_entry_surfaces_the_error_and_keeps_the_file() {
     assert!(matches!(error, StoreError::Io { .. }), "got {error:?}");
     assert!(path.exists(), "the unreadable entry must be left in place");
     assert_eq!(
-        http.calls.borrow().len(),
+        http.calls.lock().expect("the call log").len(),
         0,
         "no re-download may be attempted"
     );

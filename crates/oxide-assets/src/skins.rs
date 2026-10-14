@@ -701,6 +701,27 @@ mod tests {
                 message: "the test has no network".to_owned(),
             })
         }
+
+        fn post_json(&self, url: &str, _body: &[u8]) -> Result<Vec<u8>, HttpError> {
+            Err(HttpError::Transport {
+                url: url.to_owned(),
+                message: "the test has no network".to_owned(),
+            })
+        }
+
+        fn post_form(&self, url: &str, _fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+            Err(HttpError::Transport {
+                url: url.to_owned(),
+                message: "the test has no network".to_owned(),
+            })
+        }
+
+        fn get_with_bearer(&self, url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
+            Err(HttpError::Transport {
+                url: url.to_owned(),
+                message: "the test has no network".to_owned(),
+            })
+        }
     }
 
     /// An HTTP client serving one canned body for every request.
@@ -708,6 +729,18 @@ mod tests {
 
     impl HttpClient for OneBody {
         fn get(&self, _url: &str) -> Result<Vec<u8>, HttpError> {
+            Ok(self.0.clone())
+        }
+
+        fn post_json(&self, _url: &str, _body: &[u8]) -> Result<Vec<u8>, HttpError> {
+            Ok(self.0.clone())
+        }
+
+        fn post_form(&self, _url: &str, _fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+            Ok(self.0.clone())
+        }
+
+        fn get_with_bearer(&self, _url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
             Ok(self.0.clone())
         }
     }

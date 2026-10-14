@@ -957,7 +957,17 @@ fn the_real_extraction_tree_stitches() {
     let set = TextureSet::load(&root).expect("the real tree loads");
     let source = ModelSource::open(&root).expect("the real tree opens");
     let requested = source.texture_paths();
-    assert_eq!(requested.len(), 376, "the survey's resolved path count");
+    // Re-surveyed 2026-10-14 (M7 Task 4): 379, three past the M2 author's
+    // 376. The three are the entity sheets `entity/chest/normal`,
+    // `entity/chest/normal_double` and `entity/sign`, which the bakery's
+    // builtin list grew to request when the chest and sign boards started
+    // meshing through the terrain atlas (`BUILTIN_TEXTURE_LOCATIONS` 18 → 21
+    // in 316a95b; the sheets themselves are vanilla jar contents the store
+    // held all along — `entity/chest/normal{,_double}.png`, `entity/sign.png`
+    // — so the drift is resolver-side, not new files in the store). The
+    // sibling destroy-stages case stitches this same 379-path set green, so
+    // all three resolve and stitch.
+    assert_eq!(requested.len(), 379, "the re-surveyed resolved path count");
 
     // The registry's sprite list, bounded here: this crate has no edge to the
     // item registry, so the test names a real item set of the tree — a sword, a
