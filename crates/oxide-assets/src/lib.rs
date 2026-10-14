@@ -3,6 +3,7 @@
 
 pub mod asset_index;
 pub mod atlas;
+pub mod auth;
 pub mod extract;
 pub mod fetch;
 pub mod font;
