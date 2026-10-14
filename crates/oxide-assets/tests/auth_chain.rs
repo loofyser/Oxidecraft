@@ -20,20 +20,15 @@ const SCOPE: &str = "XboxLive.signin offline_access";
 /// The device-code grant, verbatim from Microsoft Learn via survey §3.1.
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// One scripted exchange: a status plus the body delivered verbatim. A 2xx
-/// status answers `Ok`, anything else answers `HttpError::Status` — exactly
-/// the translation Task 4's client performs, headers dropped.
-///
-/// Deviation D1 (recorded in the task report): the real XBL 401 carries an
-/// empty body plus an `x-xblcorrelationid` response header, but Task 4's
-/// `HttpError::Status` has no header slot, so the header cannot reach the
-/// auth layer through the allowed surface. The scripted exchange therefore
-/// carries the scripted correlation-id value in the delivered Status body —
-/// the auth layer renders whatever the transport delivered — while a
-/// separate fixture pins the survey-verbatim empty body.
+/// One scripted exchange: a status, the body delivered verbatim, and the
+/// scripted `x-xblcorrelationid` value carried directly in the Status
+/// field — exactly the translation Task 4's client performs, header read
+/// included. A 2xx status answers `Ok`, anything else answers
+/// `HttpError::Status`.
 struct Exchange {
     status: u16,
     body: Vec<u8>,
+    correlation_id: Option<String>,
 }
 
 impl Exchange {
@@ -42,16 +37,28 @@ impl Exchange {
         Self {
             status: 200,
             body: body.as_bytes().to_vec(),
+            correlation_id: None,
         }
     }
 
-    /// A failed exchange delivering `body` verbatim (empty for the
-    /// survey-verbatim XBL shape, the D1 correlation line for the
-    /// correlation-id pin).
+    /// A failed exchange delivering `body` verbatim with no correlation id
+    /// (the survey-verbatim XBL shape is 401 with an empty body).
     fn fail(status: u16, body: &[u8]) -> Self {
         Self {
             status,
             body: body.to_vec(),
+            correlation_id: None,
+        }
+    }
+
+    /// A failed exchange delivering `body` verbatim and carrying the
+    /// scripted correlation id directly in the Status field, the way the
+    /// production client forwards the real response header.
+    fn fail_with_correlation(status: u16, body: &[u8], correlation_id: &str) -> Self {
+        Self {
+            status,
+            body: body.to_vec(),
+            correlation_id: Some(correlation_id.to_string()),
         }
     }
 }
@@ -93,6 +100,7 @@ impl Script {
                 url: url.to_string(),
                 code: exchange.status,
                 body: exchange.body,
+                correlation_id: exchange.correlation_id,
             })
         }
     }
@@ -563,7 +571,7 @@ fn xbl_401_with_an_empty_body_is_a_status_error() {
     assert!(
         matches!(
             error,
-            AuthError::Status { step: AuthStep::XboxLive, code: 401, ref body } if body.is_empty()
+            AuthError::Status { step: AuthStep::XboxLive, code: 401, ref body, .. } if body.is_empty()
         ),
         "an empty 401 is a status error carrying the code: {error}"
     );
@@ -571,12 +579,13 @@ fn xbl_401_with_an_empty_body_is_a_status_error() {
 
 #[test]
 fn xbl_error_message_reports_the_status_and_the_correlation_id() {
-    // The scripted exchange stands in for the full HTTP exchange (see D1):
-    // the scripted x-xblcorrelationid value is delivered in the Status body,
-    // and the message renders whatever the transport delivered.
-    let (auth, _script) = harness(vec![Exchange::fail(
+    // The scripted exchange stands in for the full HTTP exchange: the
+    // scripted x-xblcorrelationid value rides directly in the Status field,
+    // the way the production client forwards the real response header.
+    let (auth, _script) = harness(vec![Exchange::fail_with_correlation(
         401,
-        b"x-xblcorrelationid: 3f2504e0-0000-0000-0000-000000000000",
+        b"",
+        "3f2504e0-0000-0000-0000-000000000000",
     )]);
 
     let error = auth
@@ -702,7 +711,7 @@ fn xsts_empty_400_is_a_status_error_not_a_panic() {
     assert!(
         matches!(
             error,
-            AuthError::Status { step: AuthStep::Xsts, code: 400, ref body } if body.is_empty()
+            AuthError::Status { step: AuthStep::Xsts, code: 400, ref body, .. } if body.is_empty()
         ),
         "an empty 400 is a status error, never a panic: {error}"
     );

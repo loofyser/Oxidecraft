@@ -205,9 +205,10 @@ pub enum AuthError {
     Http(#[from] HttpError),
     /// A non-success status. The message reports the step, the code and the
     /// body excerpt — or, for the survey's empty-body XBL 401 (§3.2), the
-    /// status plus a pointer at the `x-xblcorrelationid` response header,
-    /// which is the only diagnostic an empty 401 leaves behind.
-    #[error("{step} request failed{}", display_status(*code, body))]
+    /// status plus the `x-xblcorrelationid` the transport forwarded (or a
+    /// pointer at that response header when the server sent none), which is
+    /// the only diagnostic an empty 401 leaves behind.
+    #[error("{step} request failed{}", display_status(*code, body, correlation_id.as_deref()))]
     Status {
         /// The step that failed.
         step: AuthStep,
@@ -216,6 +217,9 @@ pub enum AuthError {
         /// The response body, lossy UTF-8, capped at
         /// [`MAX_ERROR_BODY_BYTES`].
         body: String,
+        /// The response's `x-xblcorrelationid`, forwarded from
+        /// [`HttpError::Status`]; `None` when the server sent no such header.
+        correlation_id: Option<String>,
     },
     /// A terminal device-flow code from the token endpoint
     /// (`expired_token`, `access_denied`, …): the raw `error` string.
@@ -245,13 +249,20 @@ pub enum AuthError {
     },
 }
 
-/// Renders the tail of a [`AuthError::Status`] message: the body excerpt, or
-/// the empty-body note pointing at the correlation header.
-fn display_status(code: u16, body: &str) -> String {
-    if body.is_empty() {
-        format!(" with HTTP {code} and an empty body (see the x-xblcorrelationid response header)")
-    } else {
-        format!(" with HTTP {code}: {body}")
+/// Renders the tail of a [`AuthError::Status`] message: the body excerpt (plus
+/// the forwarded correlation id when the transport captured one), or the
+/// empty-body note — carrying the captured id when present, else pointing at
+/// the correlation header.
+fn display_status(code: u16, body: &str, correlation_id: Option<&str>) -> String {
+    match (body.is_empty(), correlation_id) {
+        (true, Some(id)) => {
+            format!(" with HTTP {code} and an empty body (x-xblcorrelationid: {id})")
+        }
+        (true, None) => format!(
+            " with HTTP {code} and an empty body (see the x-xblcorrelationid response header)"
+        ),
+        (false, Some(id)) => format!(" with HTTP {code} (x-xblcorrelationid: {id}): {body}"),
+        (false, None) => format!(" with HTTP {code}: {body}"),
     }
 }
 
@@ -359,11 +370,17 @@ impl Auth {
                         }
                     }
                 }
-                Err(HttpError::Status { code, body, .. }) => {
+                Err(HttpError::Status {
+                    code,
+                    body,
+                    correlation_id,
+                    ..
+                }) => {
                     return Err(AuthError::Status {
                         step: AuthStep::Token,
                         code,
                         body: capped_lossy(&body),
+                        correlation_id,
                     });
                 }
                 Err(other) => return Err(AuthError::Http(other)),
@@ -398,11 +415,17 @@ impl Auth {
                     error: failure.error,
                 });
             }
-            Err(HttpError::Status { code, body, .. }) => {
+            Err(HttpError::Status {
+                code,
+                body,
+                correlation_id,
+                ..
+            }) => {
                 return Err(AuthError::Status {
                     step: AuthStep::Token,
                     code,
                     body: capped_lossy(&body),
+                    correlation_id,
                 });
             }
             Err(other) => return Err(AuthError::Http(other)),
@@ -458,7 +481,10 @@ impl Auth {
         let answer = match answer {
             Ok(body) => body,
             Err(HttpError::Status {
-                code: 400, body, ..
+                code: 400,
+                body,
+                correlation_id,
+                ..
             }) => {
                 if let Ok(failure) = serde_json::from_slice::<XstsFailure>(&body) {
                     return Err(failure.into_error());
@@ -467,13 +493,20 @@ impl Auth {
                     step: AuthStep::Xsts,
                     code: 400,
                     body: capped_lossy(&body),
+                    correlation_id,
                 });
             }
-            Err(HttpError::Status { code, body, .. }) => {
+            Err(HttpError::Status {
+                code,
+                body,
+                correlation_id,
+                ..
+            }) => {
                 return Err(AuthError::Status {
                     step: AuthStep::Xsts,
                     code,
                     body: capped_lossy(&body),
+                    correlation_id,
                 });
             }
             Err(other) => return Err(AuthError::Http(other)),
@@ -518,10 +551,16 @@ fn wait(
 fn map_http(result: Result<Vec<u8>, HttpError>, step: AuthStep) -> Result<Vec<u8>, AuthError> {
     match result {
         Ok(body) => Ok(body),
-        Err(HttpError::Status { code, body, .. }) => Err(AuthError::Status {
+        Err(HttpError::Status {
+            code,
+            body,
+            correlation_id,
+            ..
+        }) => Err(AuthError::Status {
             step,
             code,
             body: capped_lossy(&body),
+            correlation_id,
         }),
         Err(other) => Err(AuthError::Http(other)),
     }
@@ -821,6 +860,7 @@ mod tests {
             step: AuthStep::XboxLive,
             code: 401,
             body: String::new(),
+            correlation_id: None,
         };
         assert_eq!(
             empty.to_string(),
@@ -830,6 +870,7 @@ mod tests {
             step: AuthStep::Token,
             code: 400,
             body: "AADSTS70016".to_string(),
+            correlation_id: None,
         };
         assert_eq!(
             full.to_string(),
@@ -837,6 +878,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_messages_render_the_correlation_id_when_present() {
+        let empty = AuthError::Status {
+            step: AuthStep::XboxLive,
+            code: 401,
+            body: String::new(),
+            correlation_id: Some("3f2504e0-0000-0000-0000-000000000000".to_string()),
+        };
+        let message = empty.to_string();
+        assert!(
+            message.contains("401"),
+            "the status rides in the message: {message}"
+        );
+        assert!(
+            message.contains("3f2504e0-0000-0000-0000-000000000000"),
+            "the correlation id rides in the message: {message}"
+        );
+        assert!(
+            message.contains("x-xblcorrelationid"),
+            "the header name rides along: {message}"
+        );
+        let full = AuthError::Status {
+            step: AuthStep::Token,
+            code: 400,
+            body: "AADSTS70016".to_string(),
+            correlation_id: Some("3f2504e0-0000-0000-0000-000000000000".to_string()),
+        };
+        let message = full.to_string();
+        assert!(
+            message.contains("AADSTS70016"),
+            "the body excerpt stays: {message}"
+        );
+        assert!(
+            message.contains("3f2504e0-0000-0000-0000-000000000000"),
+            "the correlation id rides in the message: {message}"
+        );
+    }
     #[test]
     fn xsts_messages_render_the_table_row_and_the_redirect() {
         let plain = AuthError::Xsts {

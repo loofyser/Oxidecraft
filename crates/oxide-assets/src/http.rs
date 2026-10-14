@@ -35,6 +35,11 @@ pub enum HttpError {
         code: u16,
         /// The response body, capped at [`MAX_ERROR_BODY_BYTES`].
         body: Vec<u8>,
+        /// The response's `x-xblcorrelationid` header on a non-2xx answer,
+        /// when the server sent one (`None` otherwise). Xbox Live answers
+        /// 401 with an empty body, so this header is the only diagnostic
+        /// such a refusal leaves behind (survey §3.2).
+        correlation_id: Option<String>,
     },
     /// The URL does not carry an http or https scheme.
     #[error("unsupported scheme in {url}")]
@@ -277,31 +282,36 @@ fn shell_status(code: u16) -> HttpError {
         url: String::new(),
         code,
         body: Vec::new(),
+        correlation_id: None,
     }
 }
 
 /// Builds the retryable 5xx error for one attempt's response, reading its
-/// body capped; a body that will not read becomes an empty one — the status
-/// still retries.
+/// body capped and its `x-xblcorrelationid` header when present; a body
+/// that will not read becomes an empty one — the status still retries.
 fn status_error(url: &str, response: ureq::http::Response<ureq::Body>) -> HttpError {
     let code = response.status().as_u16();
+    let correlation_id = correlation_id_of(&response);
     let body = read_capped(response.into_body()).unwrap_or_default();
     HttpError::Status {
         url: url.to_string(),
         code,
         body,
+        correlation_id,
     }
 }
 /// Splits a finished response: a 2xx status streams its full body as the
 /// success value (a body-read transport failure returns at once, the old GET
 /// shape), anything else becomes a [`HttpError::Status`] carrying the capped
-/// response body.
+/// response body plus the `x-xblcorrelationid` header when present. The
+/// success path reads no headers.
 fn finish(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, HttpError> {
     let code = response.status().as_u16();
-    let body = response.into_body();
     if (200..300).contains(&code) {
         let mut bytes = Vec::new();
-        body.into_reader()
+        response
+            .into_body()
+            .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|error| HttpError::Transport {
                 url: url.to_string(),
@@ -309,15 +319,29 @@ fn finish(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Vec<u
             })?;
         Ok(bytes)
     } else {
+        let correlation_id = correlation_id_of(&response);
+        let body = read_capped(response.into_body()).map_err(|error| HttpError::Transport {
+            url: url.to_string(),
+            message: error.to_string(),
+        })?;
         Err(HttpError::Status {
             url: url.to_string(),
             code,
-            body: read_capped(body).map_err(|error| HttpError::Transport {
-                url: url.to_string(),
-                message: error.to_string(),
-            })?,
+            body,
+            correlation_id,
         })
     }
+}
+
+/// Reads the response's `x-xblcorrelationid` header when the server sent a
+/// legible one. Header lookup is case-insensitive; only the non-2xx paths
+/// call this.
+fn correlation_id_of(response: &ureq::http::Response<ureq::Body>) -> Option<String> {
+    response
+        .headers()
+        .get("x-xblcorrelationid")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_owned())
 }
 
 /// Reads an error body, capped: at most one byte past [`MAX_ERROR_BODY_BYTES`]
@@ -353,6 +377,7 @@ fn classify(url: &str, error: ureq::Error) -> HttpError {
             url: url.to_string(),
             code,
             body: Vec::new(),
+            correlation_id: None,
         },
         other => HttpError::Transport {
             url: url.to_string(),
@@ -423,6 +448,7 @@ mod tests {
             url: URL.to_string(),
             code,
             body: Vec::new(),
+            correlation_id: None,
         }
     }
 
@@ -660,11 +686,17 @@ mod wire_tests {
 
     /// A canned raw response with `status` and `body`.
     fn canned(status: &str, body: &[u8]) -> Vec<u8> {
-        let mut response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
+        canned_with_headers(status, &[], body)
+    }
+
+    /// A canned raw response with `status`, extra `headers` and `body`.
+    fn canned_with_headers(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("Connection: close\r\n\r\n");
+        let mut response = head.into_bytes();
         response.extend_from_slice(body);
         response
     }
@@ -804,6 +836,7 @@ mod wire_tests {
                 url: got,
                 code,
                 body,
+                ..
             } => {
                 assert_eq!(got, url);
                 assert_eq!(code, 403);
@@ -832,6 +865,69 @@ mod wire_tests {
             HttpError::Status { code, body, .. } => {
                 assert_eq!(code, 401);
                 assert!(body.is_empty(), "the XBL shape: an empty body");
+            }
+            other => panic!("a status error, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_401_carries_the_correlation_id_header() {
+        let id = "3f2504e0-0000-0000-0000-000000000000";
+        let mut stub = Stub::start(vec![canned_with_headers(
+            "401 Unauthorized",
+            &[("x-xblcorrelationid", id)],
+            b"",
+        )]);
+        let http = UreqClient::new();
+        let url = stub.url("/user/authenticate");
+
+        let error = http.post_json(&url, b"{}").expect_err("a 401 is an error");
+        drop(http);
+        stub.join();
+
+        match error {
+            HttpError::Status {
+                code,
+                body,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(code, 401);
+                assert!(body.is_empty(), "the XBL shape: an empty body");
+                assert_eq!(
+                    correlation_id.as_deref(),
+                    Some(id),
+                    "the production path forwards the response header"
+                );
+            }
+            other => panic!("a status error, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_status_without_the_correlation_header_carries_none() {
+        let failure = br#"{"error":"ForbiddenOperationException"}"#;
+        let mut stub = Stub::start(vec![canned("403 Forbidden", failure)]);
+        let http = UreqClient::new();
+        let url = stub.url("/session/minecraft/join");
+
+        let error = http.post_json(&url, b"{}").expect_err("a 403 is an error");
+        drop(http);
+        stub.join();
+
+        match error {
+            HttpError::Status {
+                code,
+                body,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(code, 403);
+                assert_eq!(body, failure, "the failure document travels");
+                assert_eq!(
+                    correlation_id, None,
+                    "no header on the wire means no id on the error"
+                );
             }
             other => panic!("a status error, not {other:?}"),
         }
@@ -909,11 +1005,23 @@ mod wire_tests {
             url: "https://x.invalid/join".to_string(),
             code: 403,
             body: br#"{"error":"ForbiddenOperationException"}"#.to_vec(),
+            correlation_id: None,
         };
         assert_eq!(
             error.to_string(),
             "HTTP 403 for https://x.invalid/join",
             "the message names only the code and the URL"
+        );
+        let with_id = HttpError::Status {
+            url: "https://x.invalid/join".to_string(),
+            code: 401,
+            body: Vec::new(),
+            correlation_id: Some("3f2504e0-0000-0000-0000-000000000000".to_string()),
+        };
+        assert_eq!(
+            with_id.to_string(),
+            "HTTP 401 for https://x.invalid/join",
+            "the header field rides beside the message, never inside it"
         );
     }
 }

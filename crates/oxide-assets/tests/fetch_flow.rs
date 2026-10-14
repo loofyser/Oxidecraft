@@ -47,6 +47,7 @@ impl HttpClient for FakeHttp {
                 url: url.to_string(),
                 code: 404,
                 body: Vec::new(),
+                correlation_id: None,
             })
     }
 
