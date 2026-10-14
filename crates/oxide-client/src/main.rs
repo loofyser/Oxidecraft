@@ -1883,11 +1883,100 @@ impl ClientApp {
         })
     }
 
+    /// Hands the resolved client assets to the renderer: the atlas, the font and the
+    /// sky textures, the weather and particle sheets, the entity, object and default-skin
+    /// textures, the hud textures, the GUI sheets and the item sources. The install runs
+    /// where the assets land — the window resume, for the `--server` path whose load
+    /// resolved at startup, and the deferred pre-session resolve below, which runs after
+    /// that resume found nothing to install — so both routes hand the renderer the same
+    /// set exactly once. Answers `true` when there is nothing to install (no assets yet,
+    /// or no renderer) or the install succeeded; a sheet the overlay refuses stops the
+    /// client and answers `false`.
+    fn install_client_assets(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let (Some(assets), Some(renderer)) = (&self.assets, self.renderer.as_mut()) else {
+            // Nothing resolved yet, or no renderer: nothing to install.
+            return true;
+        };
+        tracing::debug!(
+            font_height = assets.font.height(),
+            "uploading the client's atlas, font and sky textures"
+        );
+        renderer.set_atlas(&assets.mesh.atlas);
+        if let Err(error) = renderer.set_font(&assets.sheet) {
+            // Unreachable after `ClientAssets::load` measured the same sheet; a sheet
+            // the overlay refuses is fatal rather than silently defaulted.
+            tracing::error!(error = ?error, "the font sheet was refused");
+            self.stopped_on_error = true;
+            event_loop.exit();
+            return false;
+        }
+        renderer.set_sky_textures(assets.sky_textures.clone());
+        // The weather and particle sheets: the rain and snow arms' streaks
+        // and the particle pass's cells, uploaded once beside the sky.
+        // Until these land the arms whose sheet is missing draw nothing.
+        renderer.set_weather_sheets(&assets.rain_sheet, &assets.snow_sheet);
+        renderer.set_particle_cells(&assets.particle_cells);
+        // The entity set: the shadow sprite and the two default skins, under the
+        // keys the pass's draws and the resolver name.
+        for (key, texture) in &assets.entity_textures {
+            renderer.set_entity_texture(key, texture);
+        }
+        renderer.set_default_skins(&assets.skin_wide, &assets.skin_slim);
+        // The object set: the object sheets and the blocks atlas under the keys the
+        // object draws name, and the item mesh source the draws' shapes, block models,
+        // frame wood and icon quads resolve through.
+        for (key, texture) in &assets.object_textures {
+            renderer.set_entity_texture(key, texture);
+        }
+        renderer.set_entity_texture(assets::BLOCKS_ATLAS_TEXTURE, &assets.blocks_atlas);
+        // The hud's icon sheet: the tab list's latency bars and heart
+        // glyphs sample it under the name their draws carry.
+        renderer.set_hud_texture(assets::HUD_ICONS, &assets.hud_icons);
+        // The underwater sheet: the first-person water overlay samples it
+        // under the name its draw carries.
+        renderer.set_hud_texture(assets::UNDERWATER_OVERLAY, &assets.underwater);
+        // The pumpkin blur: the worn-pumpkin overlay samples it under the
+        // name its draw carries.
+        renderer.set_hud_texture(assets::PUMPKIN_BLUR, &assets.pumpkin_blur);
+        // The GUI sheets: the widgets, the container family, the book sheets,
+        // the SGA glyph sheet and the chest trio's icon sheets, under the keys
+        // the screens and the chest item model name them — on both GUI
+        // passes, so a screen draw never names a texture only the hud holds.
+        for (key, texture) in &assets.gui_sheets {
+            renderer.set_gui_sheet(key, texture);
+        }
+        renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
+        // The entity pass's icon source: the same resolver the hud's item draws
+        // read, so the held item's mesh and its third-person transform resolve
+        // through one seam.
+        renderer.set_entity_icon_source(Arc::new(assets.item_icons.clone()));
+        // The enchanted glint's sheet: the glint passes of an enchanted icon
+        // sample it under the glint sampler.
+        renderer.set_hud_glint(&assets.glint_sheet);
+        // The hud's item icon source: the pass resolves every item draw's icon
+        // through it (the item table and the bake), beside the object set's own
+        // mesh source.
+        renderer.set_hud_icon_source(Arc::new(assets.item_icons.clone()));
+        // The held item's own pass: the same icon source, the blocks atlas under
+        // the source's item sampler, and the chest trio's sheets for the builtin
+        // meshes — the held item's pass keeps its own bindings, beside the hud's
+        // named registrations.
+        renderer.set_held_item_atlas_icon(&assets.mesh.atlas);
+        renderer.set_held_item_icon_source(Arc::new(assets.item_icons.clone()));
+        for (key, texture) in &assets.gui_sheets {
+            if key.starts_with("entity/chest/") {
+                renderer.set_held_item_texture(key, texture);
+            }
+        }
+        true
+    }
+
     /// Resolves the deferred pre-session assets at the first frame that needs them:
     /// without `--server` nothing loaded at startup, so the first menu standing loads
     /// the tree here — the font, the language table, the splash lines and the sheets
     /// the menu samples — hands the chat mirror the same font and table startup did,
-    /// and opens the sound pump beside them, so the menu's button press still plays.
+    /// hands the renderer the same asset set the resume installs for `--server`, and
+    /// opens the sound pump beside them, so the menu's button press still plays.
     /// A missing tree fails here instead, with the fetch hint in the log, and the
     /// client stops: the message still reaches the run, one frame later. With a session
     /// — or once resolved — this answers whether the assets stand and loads nothing.
@@ -1904,6 +1993,12 @@ impl ClientApp {
                 self.chat.set_font(loaded.font.clone());
                 self.font = Some(loaded.font.clone());
                 self.assets = Some(loaded);
+                // The renderer takes the same set the window resume hands the `--server`
+                // path: the deferred resolve runs after that resume, which found nothing
+                // to install.
+                if !self.install_client_assets(event_loop) {
+                    return false;
+                }
                 if let Ok(store_root) = assets::default_store_root() {
                     match open_audio(&store_root, None) {
                         Ok(pump) => self.audio = Some(pump),
@@ -7449,81 +7544,11 @@ impl ApplicationHandler for ClientApp {
                 return;
             }
         }
-        // The bootstrap's assets land once, before the first frame: the session's mesh
-        // inputs go to the session (they were handed in at startup) and the atlas, the font
-        // and the sky textures to the renderer here.
-        if let (Some(assets), Some(renderer)) = (&self.assets, self.renderer.as_mut()) {
-            tracing::debug!(
-                font_height = assets.font.height(),
-                "uploading the client's atlas, font and sky textures"
-            );
-            renderer.set_atlas(&assets.mesh.atlas);
-            if let Err(error) = renderer.set_font(&assets.sheet) {
-                // Unreachable after `ClientAssets::load` measured the same sheet; a sheet
-                // the overlay refuses is fatal rather than silently defaulted.
-                tracing::error!(error = ?error, "the font sheet was refused");
-                self.stopped_on_error = true;
-                event_loop.exit();
-                return;
-            }
-            renderer.set_sky_textures(assets.sky_textures.clone());
-            // The weather and particle sheets: the rain and snow arms' streaks
-            // and the particle pass's cells, uploaded once beside the sky.
-            // Until these land the arms whose sheet is missing draw nothing.
-            renderer.set_weather_sheets(&assets.rain_sheet, &assets.snow_sheet);
-            renderer.set_particle_cells(&assets.particle_cells);
-            // The entity set: the shadow sprite and the two default skins, under the
-            // keys the pass's draws and the resolver name.
-            for (key, texture) in &assets.entity_textures {
-                renderer.set_entity_texture(key, texture);
-            }
-            renderer.set_default_skins(&assets.skin_wide, &assets.skin_slim);
-            // The object set: the object sheets and the blocks atlas under the keys the
-            // object draws name, and the item mesh source the draws' shapes, block models,
-            // frame wood and icon quads resolve through.
-            for (key, texture) in &assets.object_textures {
-                renderer.set_entity_texture(key, texture);
-            }
-            renderer.set_entity_texture(assets::BLOCKS_ATLAS_TEXTURE, &assets.blocks_atlas);
-            // The hud's icon sheet: the tab list's latency bars and heart
-            // glyphs sample it under the name their draws carry.
-            renderer.set_hud_texture(assets::HUD_ICONS, &assets.hud_icons);
-            // The underwater sheet: the first-person water overlay samples it
-            // under the name its draw carries.
-            renderer.set_hud_texture(assets::UNDERWATER_OVERLAY, &assets.underwater);
-            // The pumpkin blur: the worn-pumpkin overlay samples it under the
-            // name its draw carries.
-            renderer.set_hud_texture(assets::PUMPKIN_BLUR, &assets.pumpkin_blur);
-            // The GUI sheets: the widgets, the container family, the book sheets,
-            // the SGA glyph sheet and the chest trio's icon sheets, under the keys
-            // the screens and the chest item model name them — on both GUI
-            // passes, so a screen draw never names a texture only the hud holds.
-            for (key, texture) in &assets.gui_sheets {
-                renderer.set_gui_sheet(key, texture);
-            }
-            renderer.set_item_source(Arc::new(assets.item_meshes.clone()));
-            // The entity pass's icon source: the same resolver the hud's item draws
-            // read, so the held item's mesh and its third-person transform resolve
-            // through one seam.
-            renderer.set_entity_icon_source(Arc::new(assets.item_icons.clone()));
-            // The enchanted glint's sheet: the glint passes of an enchanted icon
-            // sample it under the glint sampler.
-            renderer.set_hud_glint(&assets.glint_sheet);
-            // The hud's item icon source: the pass resolves every item draw's icon
-            // through it (the item table and the bake), beside the object set's own
-            // mesh source.
-            renderer.set_hud_icon_source(Arc::new(assets.item_icons.clone()));
-            // The held item's own pass: the same icon source, the blocks atlas under
-            // the source's item sampler, and the chest trio's sheets for the builtin
-            // meshes — the held item's pass keeps its own bindings, beside the hud's
-            // named registrations.
-            renderer.set_held_item_atlas_icon(&assets.mesh.atlas);
-            renderer.set_held_item_icon_source(Arc::new(assets.item_icons.clone()));
-            for (key, texture) in &assets.gui_sheets {
-                if key.starts_with("entity/chest/") {
-                    renderer.set_held_item_texture(key, texture);
-                }
-            }
+        // The bootstrap's assets land with the window: with `--server` they resolved at
+        // startup, so the same install runs here before the first frame; the menu path
+        // resolves later and installs from `ensure_presession_assets` instead.
+        if !self.install_client_assets(event_loop) {
+            return;
         }
         // The settings apply lands with the window, before the first frame:
         // every field pushes to its consumer — the renderer, the audio engine
