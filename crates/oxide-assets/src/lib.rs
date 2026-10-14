@@ -1,6 +1,7 @@
 //! Asset store, Mojang distribution client, jar extraction, atlas and model
 //! baking.
 
+pub mod accounts;
 pub mod asset_index;
 pub mod atlas;
 pub mod auth;
