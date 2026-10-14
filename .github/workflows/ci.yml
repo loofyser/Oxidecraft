@@ -25,9 +25,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # alsa-sys (cpal's Linux backend) builds against the ALSA headers.
-      - name: Install the ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      # alsa-sys (cpal's Linux backend) builds against the ALSA headers;
+      # libdbus-sys (keyring's secret-service backend) against the D-Bus headers.
+      - name: Install the ALSA and D-Bus headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libdbus-1-dev
       - name: Formatting
         run: cargo fmt --all --check
       - name: Clippy
@@ -41,9 +42,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # alsa-sys (cpal's Linux backend) builds against the ALSA headers.
-      - name: Install the ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      # alsa-sys (cpal's Linux backend) builds against the ALSA headers;
+      # libdbus-sys (keyring's secret-service backend) against the D-Bus headers.
+      - name: Install the ALSA and D-Bus headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libdbus-1-dev
       - name: Build the workspace in release mode
         run: cargo build --workspace --release
 
@@ -54,9 +56,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the declared minimum toolchain
         run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
-      # alsa-sys (cpal's Linux backend) builds against the ALSA headers.
-      - name: Install the ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      # alsa-sys (cpal's Linux backend) builds against the ALSA headers;
+      # libdbus-sys (keyring's secret-service backend) against the D-Bus headers.
+      - name: Install the ALSA and D-Bus headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libdbus-1-dev
       - name: Check against the declared minimum
         run: cargo +1.85.0 check --workspace --all-targets
 
