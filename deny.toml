@@ -24,4 +24,10 @@ ignore = [
   "RUSTSEC-2024-0436",
   # ttf-parser: unmaintained upstream; transitive through winit's Wayland decorations, no upgrade path.
   "RUSTSEC-2026-0192",
+  # rsa (Marvin Attack, timing sidechannel on decryption): unpatched upstream
+  # in every released rsa, still affected as of 2026-09-12. oxide-proto uses
+  # rsa client-side only — it encrypts with the server's public key and never
+  # holds a private key outside ephemeral in-test keypairs — so a decryption
+  # timing oracle does not exist here.
+  "RUSTSEC-2023-0071",
 ]

@@ -2,5 +2,6 @@
 
 pub mod codec;
 pub mod conn;
+pub mod crypto;
 pub mod frame;
 pub mod varint;
