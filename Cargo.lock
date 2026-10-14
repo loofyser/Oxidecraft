@@ -2407,6 +2407,7 @@ dependencies = [
  "dirs",
  "oxide-assets",
  "oxide-proto-v47",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",

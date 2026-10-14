@@ -8,6 +8,8 @@ use oxide_assets::fetch::{FetchOptions, fetch_version};
 use oxide_assets::http::UreqClient;
 use oxide_assets::store::Store;
 
+mod auth;
+
 #[derive(Parser)]
 #[command(name = "oxide-launcher", version, about = "Oxidecraft launcher")]
 struct Cli {
@@ -39,10 +41,24 @@ enum Command {
         /// Host and port, for example 127.0.0.1:25565.
         address: String,
     },
+    /// Sign in, list the signed-in accounts, or sign an account out.
+    Auth {
+        /// List the signed-in accounts.
+        #[arg(long)]
+        status: bool,
+        /// Sign an account out by name or uuid.
+        #[arg(long)]
+        logout: Option<String>,
+    },
 }
 
-/// The store root when `--data-dir` is absent: `<data dir>/oxidecraft`.
+/// The store root when `--data-dir` is absent: `OXIDECRAFT_STORE` when set and
+/// non-empty (the client's own override, `oxide-client/src/assets.rs:40`),
+/// else `<data dir>/oxidecraft`.
 fn default_data_dir() -> anyhow::Result<PathBuf> {
+    if let Some(root) = std::env::var_os(auth::STORE_VAR).filter(|root| !root.is_empty()) {
+        return Ok(PathBuf::from(root));
+    }
     let base = dirs::data_dir()
         .ok_or_else(|| anyhow::anyhow!("no data directory is known on this platform"))?;
     Ok(base.join("oxidecraft"))
@@ -141,6 +157,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Auth { status, logout } => auth::run(data_dir, status, logout),
     }
 }
 
