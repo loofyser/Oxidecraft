@@ -15,6 +15,43 @@ pub fn write_login_start(mut out: impl Write, username: &str) -> io::Result<()> 
     write_string(&mut out, username)
 }
 
+/// Serverbound Encryption Response (login id 0x01).
+pub const ENCRYPTION_RESPONSE_ID: i32 = 0x01;
+
+/// Writes Encryption Response: the packet id, then the encrypted shared
+/// secret and the encrypted verify token, each a VarInt length with the
+/// bytes after it.
+///
+/// The order is the source's own: the secret array first, the token array
+/// second (`C01PacketEncryptionResponse` writes them in that order, and the
+/// read side takes them back in that order). Both arrays are the ciphertexts
+/// `oxide_proto::crypto::encrypt_rsa` produced, so their lengths are the
+/// server key's modulus size — never a constant the writer assumes.
+pub fn write_encryption_response(
+    mut out: impl Write,
+    encrypted_secret: &[u8],
+    encrypted_token: &[u8],
+) -> io::Result<()> {
+    oxide_proto::varint::write_varint(&mut out, ENCRYPTION_RESPONSE_ID)?;
+    write_byte_array(&mut out, encrypted_secret)?;
+    write_byte_array(&mut out, encrypted_token)
+}
+
+/// Writes one length-prefixed byte array: a VarInt length, then the bytes.
+///
+/// A length the VarInt cannot carry is refused before anything is written,
+/// the way [`write_string`] refuses an overlong string.
+fn write_byte_array(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    let len = i32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "byte array exceeds the VarInt length range",
+        )
+    })?;
+    oxide_proto::varint::write_varint(&mut *out, len)?;
+    out.write_all(bytes)
+}
+
 /// Serverbound Keep Alive (play id 0x00).
 pub const KEEP_ALIVE_ID: i32 = 0x00;
 
@@ -597,8 +634,9 @@ mod tests {
 
     use super::{
         CLICK_WINDOW_ID, CLOSE_WINDOW_ID, CONFIRM_TRANSACTION_ID, CREATIVE_INVENTORY_ACTION_ID,
-        DiggingStatus, ENCHANT_ITEM_ID, HELD_ITEM_CHANGE_ID, UPDATE_SIGN_ID, UseEntityAction,
-        write_animation, write_player_block_placement, write_player_digging, write_use_entity,
+        DiggingStatus, ENCHANT_ITEM_ID, ENCRYPTION_RESPONSE_ID, HELD_ITEM_CHANGE_ID,
+        UPDATE_SIGN_ID, UseEntityAction, write_animation, write_encryption_response,
+        write_player_block_placement, write_player_digging, write_use_entity,
     };
 
     /// The bytes `write_player_block_placement` writes, for byte-exact
@@ -806,6 +844,65 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, // 0.0
             ],
             "the interact-at send with its hit vector"
+        );
+    }
+
+    /// The bytes `write_encryption_response` writes, for byte-exact
+    /// assertions.
+    fn encryption_response_bytes(secret: &[u8], token: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_encryption_response(&mut out, secret, token).expect("writing to a Vec cannot fail");
+        out
+    }
+
+    #[test]
+    fn the_encryption_response_id_is_the_login_table_id() {
+        // Protocol §2.1's login table: serverbound 0x01 is the Encryption
+        // Response (`C01PacketEncryptionResponse`).
+        assert_eq!(ENCRYPTION_RESPONSE_ID, 0x01, "0x01 Encryption Response");
+    }
+
+    #[test]
+    fn encryption_response_writes_the_secret_then_the_token() {
+        // 0x01: the secret ciphertext, then the token ciphertext, each a
+        // VarInt length with the bytes after it (`C01PacketEncryptionResponse`
+        // writes the secret array first, the token array second, and the read
+        // side takes them back in that order). A 1024-bit server key makes
+        // 128-byte ciphertexts, and 128 encodes as the two-byte VarInt
+        // `0x80 0x01` — every byte below is hand-packed, never rebuilt with
+        // the writer's arithmetic.
+        let secret = vec![0xa5u8; 128];
+        let token = vec![0x3cu8; 128];
+        let mut expected = vec![0x01, 0x80, 0x01];
+        expected.extend_from_slice(&secret);
+        expected.extend_from_slice(&[0x80, 0x01]);
+        expected.extend_from_slice(&token);
+        let bytes = encryption_response_bytes(&secret, &token);
+        assert_eq!(
+            bytes, expected,
+            "the id, the secret run, then the token run"
+        );
+        // The runs named, so a swapped write cannot hide inside a
+        // whole-vector match: the secret's bytes sit before the token's.
+        assert_eq!(&bytes[3..131], &secret[..], "the secret run first");
+        assert_eq!(&bytes[133..261], &token[..], "the token run second");
+    }
+
+    #[test]
+    fn encryption_response_lengths_are_length_driven_not_fixed_size() {
+        // A longer modulus shape (256-byte runs) proves the writer prefixes
+        // each run's own length — 256 encodes as `0x80 0x02` — rather than
+        // assuming the 1024-bit 128.
+        let secret = vec![0x11u8; 256];
+        let token = vec![0x22u8; 256];
+        let mut expected = vec![0x01, 0x80, 0x02];
+        expected.extend_from_slice(&secret);
+        expected.extend_from_slice(&[0x80, 0x02]);
+        expected.extend_from_slice(&token);
+        assert_eq!(
+            encryption_response_bytes(&secret, &token),
+            expected,
+            "a 256-byte run carries its own length"
         );
     }
 }

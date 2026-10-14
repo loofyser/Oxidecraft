@@ -35,6 +35,7 @@ fn config() -> SessionConfig {
         username: "OxideDev".into(),
         settings: ClientSettings::default(),
         mesh: None,
+        account: None,
     }
 }
 

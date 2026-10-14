@@ -6154,6 +6154,10 @@ fn spawn_session(
             username,
             settings: initial,
             mesh: Some(mesh),
+            // The launcher's `--account` wiring arrives with Task 9; until
+            // then the client stays offline and an encrypted server is
+            // refused with the sign-in sentence.
+            account: None,
         };
         match Session::connect(&config) {
             Ok(session) => {

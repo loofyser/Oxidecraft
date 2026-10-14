@@ -43,6 +43,7 @@ use crossbeam_channel::{Receiver, Sender};
 use oxide_assets::atlas::Atlas;
 use oxide_proto::codec::CodecError;
 use oxide_proto::conn::{Conn, DeadlineStream, RecvOutcome};
+use oxide_proto::crypto::{encrypt_rsa, new_secret_key, parse_server_key, server_id_hash};
 use oxide_proto::frame::{Compression, FrameError};
 use oxide_proto::varint::VarIntError;
 use oxide_proto_v47::PacketError;
@@ -67,10 +68,10 @@ use oxide_proto_v47::serverbound::{
     ClientSettings, ClientStatusAction, DiggingStatus, EntityAction, UseEntityAction,
     write_animation, write_click_window, write_client_settings, write_client_status,
     write_close_window, write_confirm_transaction, write_creative_inventory_action,
-    write_enchant_item, write_entity_action, write_held_item_change, write_keep_alive,
-    write_login_start, write_player, write_player_abilities, write_player_block_placement,
-    write_player_digging, write_player_look, write_player_position, write_player_position_and_look,
-    write_plugin_message, write_update_sign, write_use_entity,
+    write_enchant_item, write_encryption_response, write_entity_action, write_held_item_change,
+    write_keep_alive, write_login_start, write_player, write_player_abilities,
+    write_player_block_placement, write_player_digging, write_player_look, write_player_position,
+    write_player_position_and_look, write_plugin_message, write_update_sign, write_use_entity,
 };
 use oxide_proto_v47::ui::{
     ChatMessage, ScoreboardDisplay, ScoreboardObjective, ScoreboardScore, ScoreboardTeam,
@@ -263,6 +264,41 @@ const LOGIN_PACKET_IDS: [i32; 4] = [0x00, 0x01, 0x02, 0x03];
 /// 1.8 and says not to use it, so the session logs it and changes nothing.
 const PLAY_SET_COMPRESSION_ID: i32 = 0x46;
 
+/// The seam an online-mode login posts its session join through.
+///
+/// The error side is deliberately a plain message: it is shown verbatim on
+/// the disconnected screen, and the classification lives in the production
+/// implementation (Task 9 maps the typed auth errors to it).
+pub trait JoinServer: Send + Sync {
+    /// Posts the session join: the profile UUID (32 hex digits), the account's
+    /// access token, and the server-id hash the login computed.
+    fn join(&self, uuid_hex: &str, access_token: &str, server_id: &str) -> Result<(), String>;
+}
+
+/// The signed-in account an online-mode login runs with.
+///
+/// The profile carries Login Start's name, and the joiner posts the session
+/// join the encrypted flow computes the hash for. The `Debug` names the uuid
+/// and holds a placeholder for the joiner — never the token.
+pub struct SessionAccount {
+    /// The profile UUID, 32 hex digits without dashes.
+    pub uuid_hex: String,
+    /// The account's access token, for the session join. Never logged.
+    pub access_token: String,
+    /// The seam the join is posted through.
+    pub joiner: Arc<dyn JoinServer>,
+}
+
+impl std::fmt::Debug for SessionAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionAccount")
+            .field("uuid_hex", &self.uuid_hex)
+            .field("access_token", &"<redacted>")
+            .field("joiner", &"<joiner>")
+            .finish()
+    }
+}
+
 /// What the session needs to connect and behave like a vanilla client.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -270,8 +306,14 @@ pub struct SessionConfig {
     pub host: String,
     /// Server port.
     pub port: u16,
-    /// The offline-mode player name.
+    /// The name Login Start sends — the signed-in profile's name when an
+    /// account is present, else the offline name.
     pub username: String,
+    /// The signed-in account an online-mode login runs with: its profile
+    /// carries Login Start's name, and its joiner posts the session join.
+    /// `None` stays the offline default — a server that then asks for
+    /// encryption is refused with [`SessionError::EncryptionRequired`].
+    pub account: Option<Arc<SessionAccount>>,
     /// The settings sent in Client Settings.
     pub settings: ClientSettings,
     /// The assets the column meshes are built from.
@@ -1223,9 +1265,23 @@ pub enum SessionError {
     /// A packet could not be decoded.
     #[error("packet error: {0}")]
     Packet(#[from] oxide_proto_v47::PacketError),
-    /// The server asked for encryption; M1 does not implement it.
-    #[error("the server requires an encrypted session, which M1 does not implement")]
+    /// The server asked for encryption and there is no signed-in account to
+    /// answer with: the client never prompts, it refuses with the sign-in
+    /// sentence.
+    #[error(
+        "this server requires a signed-in account — run `oxide-launcher auth`, then start the client with --account"
+    )]
     EncryptionRequired,
+    /// The session join the seam was asked to post failed; the text is the
+    /// seam's own, shown verbatim on the disconnected screen.
+    #[error("the session join failed: {message}")]
+    JoinFailed {
+        /// The seam's failure text.
+        message: String,
+    },
+    /// The server's key did not parse, or the response did not encrypt.
+    #[error("crypto error: {0}")]
+    Crypto(#[from] oxide_proto::crypto::CryptoError),
     /// A write of our own reply failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -1269,6 +1325,41 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         Self { conn, config, mesh }
     }
 
+    /// Runs the handshake, Login Start and the login phase, returning how the
+    /// login settled.
+    ///
+    /// The mock-server harness settles the login on its own through this: the
+    /// happy path returns the accepted profile with the ciphers enabled, and
+    /// the refusal cases return before it. [`Session::run_over`] runs this
+    /// first, then continues into the play loop.
+    pub fn run_login(
+        &mut self,
+        events: &Sender<ClientEvent>,
+    ) -> Result<LoginOutcome, SessionError> {
+        // Nothing has touched the framing yet: the handshake and Login Start go
+        // out plain, and the server answers by naming a compression threshold.
+        let handshake = payload_of(|out| {
+            write_handshake(
+                out,
+                PROTOCOL,
+                &self.config.host,
+                self.config.port,
+                NEXT_STATE_LOGIN,
+            )
+        })?;
+        send_reply(&mut self.conn, &handshake)?;
+        let login_start = payload_of(|out| write_login_start(out, &self.config.username))?;
+        send_reply(&mut self.conn, &login_start)?;
+
+        login(&mut self.conn, events, self.config.account.as_deref())
+    }
+
+    /// Whether the login's ciphers are enabled: true once an Encryption
+    /// Response went out and the connection started decrypting.
+    pub fn is_encrypted(&self) -> bool {
+        self.conn.is_encrypted()
+    }
+
     /// Runs the session to completion: handshake, login, then the play loop.
     ///
     /// Returns `Ok(())` when the server closed the connection or the stream
@@ -1290,11 +1381,20 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         events: &Sender<ClientEvent>,
         inputs: Receiver<InputEvent>,
     ) -> Result<(), SessionError> {
+        let mut this = self;
+        // The handshake, Login Start and the login phase run first, on the
+        // same path the harness settles on its own.
+        match this.run_login(events)? {
+            LoginOutcome::Accepted { uuid, username } => {
+                report(events, ClientEvent::LoggedIn { uuid, username });
+            }
+            LoginOutcome::Ended => return Ok(()),
+        }
         let Session {
             mut conn,
             config,
             mesh,
-        } = self;
+        } = this;
         // The client settings the session holds: Join Game sends them, and
         // the view-distance slider re-sends them on change.
         let mut settings = config.settings;
@@ -1304,22 +1404,6 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
         let pool = mesh_pool()?;
         let (finished, results) = crossbeam_channel::unbounded::<MeshResult>();
         let mut queue = MeshQueue::new();
-
-        // Nothing has touched the framing yet: the handshake and Login Start go
-        // out plain, and the server answers by naming a compression threshold.
-        let handshake = payload_of(|out| {
-            write_handshake(out, PROTOCOL, &config.host, config.port, NEXT_STATE_LOGIN)
-        })?;
-        send_reply(&mut conn, &handshake)?;
-        let login_start = payload_of(|out| write_login_start(out, &config.username))?;
-        send_reply(&mut conn, &login_start)?;
-
-        match login(&mut conn, events)? {
-            LoginOutcome::Accepted { uuid, username } => {
-                report(events, ClientEvent::LoggedIn { uuid, username });
-            }
-            LoginOutcome::Ended => return Ok(()),
-        }
 
         let mut world: Option<World> = None;
         let mut player = Player::new();
@@ -3571,7 +3655,12 @@ impl Session<TcpStream> {
 }
 
 /// How the login phase ended.
-enum LoginOutcome {
+///
+/// Public so the mock-server harness can settle the login on its own: the
+/// happy path returns the accepted profile, and the refusal cases return
+/// before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginOutcome {
     /// The server accepted the login.
     Accepted {
         /// The account UUID, hyphenated.
@@ -3590,9 +3679,19 @@ enum LoginOutcome {
 /// frame in the compressed framing it switched on. The loop leaves only on a
 /// success, a refusal, or the stream ending, so the threshold may arrive at any
 /// point in the login.
+///
+/// An Encryption Request is answered the way the source answers it
+/// (`NetHandlerLoginClient.handleEncryptionRequest`): the server key parses,
+/// a fresh shared secret generates, the server-id hash computes over the
+/// request's server id, the secret and the request's own key bytes — then the
+/// signed-in account's joiner posts the join with that hash, and only then the
+/// secret and the token encrypt, the response sends, and the ciphers enable.
+/// A join failure returns before any response byte is sent; without an account
+/// there is nothing to join with, so the refusal stands.
 fn login<S: Read + Write>(
     conn: &mut Conn<S>,
     events: &Sender<ClientEvent>,
+    account: Option<&SessionAccount>,
 ) -> Result<LoginOutcome, SessionError> {
     loop {
         let Some(payload) = recv_frame(conn)? else {
@@ -3625,8 +3724,40 @@ fn login<S: Read + Write>(
                 report(events, ClientEvent::Disconnected { reason });
                 return Ok(LoginOutcome::Ended);
             }
-            LoginPacket::EncryptionRequest { .. } => {
-                return Err(SessionError::EncryptionRequired);
+            LoginPacket::EncryptionRequest {
+                server_id,
+                public_key,
+                verify_token,
+            } => {
+                // The key parses before anything else runs: a malformed key
+                // is a typed error with no join and no response bytes.
+                let key = parse_server_key(&public_key)?;
+                let secret = new_secret_key();
+                let hash = server_id_hash(&server_id, &secret, &public_key);
+                // The join completes before the response is sent: a failure
+                // returns here, so the wire sees nothing after the request.
+                let account = match account {
+                    Some(account) => account,
+                    None => return Err(SessionError::EncryptionRequired),
+                };
+                if let Err(message) =
+                    account
+                        .joiner
+                        .join(&account.uuid_hex, &account.access_token, &hash)
+                {
+                    return Err(SessionError::JoinFailed { message });
+                }
+                let encrypted_secret = encrypt_rsa(&key, &secret)?;
+                let encrypted_token = encrypt_rsa(&key, &verify_token)?;
+                let response = payload_of(|out| {
+                    write_encryption_response(out, &encrypted_secret, &encrypted_token)
+                })?;
+                send_reply(conn, &response)?;
+                // The source enables its ciphers when the response's send
+                // completes, so the next frame read already decrypts: Set
+                // Compression and Login Success arrive encrypted.
+                conn.enable_encryption(&secret);
+                info!("the login ciphers are enabled");
             }
         }
     }
@@ -5691,9 +5822,10 @@ mod tests {
     use super::{
         ASSUMED_HELD_BLOCK, CHAT_FIELD_CAP, ClientEvent, Clock, END_OF_SESSION_WAIT, GRAPHICS_FAST,
         INPUTS_PER_PASS, MOUSE_SENSITIVITY, MeshAssets, MeshQueue, PORTAL_BLOCK_ID,
-        SMOOTH_LIGHTING, SmoothLighting, TICK_PERIOD, WEATHER_EASE_RATE, WeatherState, apply_input,
-        apply_session_push, chat_over_cap, eye_block_event, finish_meshes, gate_cell, hand_cell,
-        mesh_pool, renderable_id, smooth_lighting_of, step_tick, visually_opaque_id,
+        SMOOTH_LIGHTING, Session, SessionConfig, SmoothLighting, TICK_PERIOD, WEATHER_EASE_RATE,
+        WeatherState, apply_input, apply_session_push, chat_over_cap, eye_block_event,
+        finish_meshes, gate_cell, hand_cell, mesh_pool, renderable_id, smooth_lighting_of,
+        step_tick, visually_opaque_id,
     };
     use crate::entity_view::PlayerList;
     use crate::input::{InputEvent, Intent, SessionPush};
@@ -5703,7 +5835,9 @@ mod tests {
     use crate::settings::{CHAT_MODE_RANGE, ParticleSetting, VIEW_DISTANCE_RANGE};
     use crate::ticker::Ticker;
     use oxide_proto_v47::serverbound::ClientSettings;
+    use std::io::{Cursor, Read, Write};
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     #[test]
     fn the_input_backlog_drains_thirty_two_events_per_pass() {
@@ -6856,6 +6990,426 @@ mod tests {
             (weather.rain - 0.94).abs() < 1e-6,
             "the rain keeps easing alone: {}",
             weather.rain
+        );
+    }
+
+    /// The framing a scripted server uses once Set Compression has gone out.
+    const SCRIPT_FRAMING: oxide_proto::frame::Compression =
+        oxide_proto::frame::Compression::Enabled { threshold: 256 };
+
+    /// A scripted in-memory stream for the drain-ordering and report-order
+    /// pins below: scripted bytes read back, client writes accumulate for
+    /// inspection, and each idle wait counts up so inputs inject mid-run at
+    /// a chosen wait — after the script's death or mode frames, never
+    /// before them.
+    struct ScriptStream {
+        /// Frames served first.
+        head: Cursor<Vec<u8>>,
+        /// Frames served after `stalls` idle waits.
+        tail: Cursor<Vec<u8>>,
+        /// Idle waits before the tail.
+        stalls: usize,
+        /// Idle waits after the tail before the stream ends.
+        tail_stalls: usize,
+        /// Idle waits served so far.
+        waits: usize,
+        /// Inputs to queue at `(wait, event)`.
+        flips: Vec<(usize, InputEvent)>,
+        /// The session's input channel.
+        input_tx: crossbeam_channel::Sender<InputEvent>,
+        /// Every byte the client wrote.
+        outgoing: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for ScriptStream {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.head.position() < self.head.get_ref().len() as u64 {
+                self.head.read(out)
+            } else {
+                self.tail.read(out)
+            }
+        }
+    }
+
+    impl Write for ScriptStream {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.outgoing.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl oxide_proto::conn::DeadlineStream for ScriptStream {
+        fn wait_readable(&mut self, timeout: Duration) -> std::io::Result<bool> {
+            if self.head.position() < self.head.get_ref().len() as u64 {
+                return Ok(true);
+            }
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                self.fire_flips();
+                // A real deadline blocks for the timeout before it reports
+                // nothing; the script waits the same span, so ticks the wall
+                // clock owes still run.
+                std::thread::sleep(timeout);
+                return Ok(false);
+            }
+            if self.tail.position() < self.tail.get_ref().len() as u64 {
+                return Ok(true);
+            }
+            if self.tail_stalls > 0 {
+                self.tail_stalls -= 1;
+                self.fire_flips();
+                std::thread::sleep(timeout);
+                return Ok(false);
+            }
+            Ok(true)
+        }
+    }
+
+    impl ScriptStream {
+        /// Queues every flip whose wait has come due.
+        fn fire_flips(&mut self) {
+            self.waits += 1;
+            for (after, event) in &self.flips {
+                if *after == self.waits {
+                    let _ = self.input_tx.send(event.clone());
+                }
+            }
+        }
+    }
+
+    /// The session config the scripts run against.
+    fn script_config() -> SessionConfig {
+        SessionConfig {
+            host: "127.0.0.1".into(),
+            port: 25565,
+            username: "OxideDev".into(),
+            settings: ClientSettings::default(),
+            mesh: None,
+            account: None,
+        }
+    }
+
+    /// Appends one scripted server frame, framed as the server frames it.
+    fn script_frame(
+        out: &mut Vec<u8>,
+        payload: &[u8],
+        compression: oxide_proto::frame::Compression,
+    ) {
+        oxide_proto::frame::write_frame(out, payload, compression).expect("a scripted frame");
+    }
+
+    /// The login every script starts with: Set Compression in the plain
+    /// framing, then Login Success in the compressed framing it switched on.
+    fn script_login(out: &mut Vec<u8>) {
+        script_frame(
+            out,
+            &[0x03, 0x80, 0x02],
+            oxide_proto::frame::Compression::Disabled,
+        );
+        let mut success = vec![0x02, 0x24];
+        success.extend_from_slice(b"069a79f4-44e9-4726-a5be-fca90e38aaf5");
+        success.push(0x08);
+        success.extend_from_slice(b"OxideDev");
+        script_frame(out, &success, SCRIPT_FRAMING);
+    }
+
+    /// One Join Game payload (0x01): entity 20, `gamemode`, the overworld,
+    /// difficulty 1, 20 players, the `default` level type.
+    fn script_join(gamemode: u8) -> Vec<u8> {
+        let mut join = vec![0x01];
+        join.extend_from_slice(&20i32.to_be_bytes());
+        join.extend_from_slice(&[gamemode, 0, 1, 20, 7]);
+        join.extend_from_slice(b"default");
+        join.push(0);
+        join
+    }
+
+    /// One ground-up Chunk Data column (0x21) of solid stone at `(cx, cz)`.
+    fn script_column(cx: i32, cz: i32) -> Vec<u8> {
+        let mut section = vec![0u8; 8192];
+        for cell in section.chunks_exact_mut(2) {
+            cell.copy_from_slice(&0x0010u16.to_le_bytes());
+        }
+        let mut data = section;
+        data.extend_from_slice(&[0u8; 2048]); // block light
+        data.extend_from_slice(&[0xFFu8; 2048]); // sky light
+        data.extend_from_slice(&[1u8; 256]); // biomes
+        let mut chunk = vec![0x21];
+        chunk.extend_from_slice(&cx.to_be_bytes());
+        chunk.extend_from_slice(&cz.to_be_bytes());
+        chunk.push(1); // ground-up
+        chunk.extend_from_slice(&0x0008u16.to_be_bytes());
+        oxide_proto::varint::write_varint(&mut chunk, data.len() as i32)
+            .expect("writing to a Vec cannot fail");
+        chunk.extend_from_slice(&data);
+        chunk
+    }
+
+    /// One Player Position And Look payload (0x08).
+    fn script_position(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+        let mut position = vec![0x08];
+        position.extend_from_slice(&x.to_be_bytes());
+        position.extend_from_slice(&y.to_be_bytes());
+        position.extend_from_slice(&z.to_be_bytes());
+        position.extend_from_slice(&yaw.to_be_bytes());
+        position.extend_from_slice(&pitch.to_be_bytes());
+        position.push(0);
+        position
+    }
+
+    /// One Block Change payload (0x23): the packed position and the block
+    /// value.
+    fn script_block_change(x: i32, y: i32, z: i32, value: u16) -> Vec<u8> {
+        let mut payload = vec![0x23];
+        let packed =
+            ((x as i64 & 0x3FFFFFF) << 38) | ((y as i64 & 0xFFF) << 26) | (z as i64 & 0x3FFFFFF);
+        payload.extend_from_slice(&packed.to_be_bytes());
+        oxide_proto::varint::write_varint(&mut payload, value as i32)
+            .expect("writing to a Vec cannot fail");
+        payload
+    }
+
+    /// One Change Game State payload (0x2B): the reason byte and the value
+    /// float.
+    fn script_game_state(reason: u8, value: f32) -> Vec<u8> {
+        let mut payload = vec![0x2B, reason];
+        payload.extend_from_slice(&value.to_be_bytes());
+        payload
+    }
+
+    /// One Update Health payload (0x06): the health float, the food VarInt
+    /// and the saturation float.
+    fn script_health(health: f32) -> Vec<u8> {
+        let mut payload = vec![0x06];
+        payload.extend_from_slice(&health.to_be_bytes());
+        oxide_proto::varint::write_varint(&mut payload, 20).expect("writing to a Vec cannot fail");
+        payload.extend_from_slice(&5.0f32.to_be_bytes());
+        payload
+    }
+
+    /// Runs one scripted session with `flips` injected at idle-wait counts,
+    /// and returns every event it reported and every frame it wrote.
+    fn drive_script(
+        head: Vec<u8>,
+        tail: Vec<u8>,
+        stalls: usize,
+        tail_stalls: usize,
+        flips: Vec<(usize, InputEvent)>,
+    ) -> (Vec<ClientEvent>, Vec<Vec<u8>>) {
+        let outgoing = Arc::new(Mutex::new(Vec::new()));
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        let stream = ScriptStream {
+            head: Cursor::new(head),
+            tail: Cursor::new(tail),
+            stalls,
+            tail_stalls,
+            waits: 0,
+            flips,
+            input_tx,
+            outgoing: Arc::clone(&outgoing),
+        };
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        Session::new(oxide_proto::conn::Conn::new(stream), script_config())
+            .run_over(&sender, input_rx)
+            .expect("the scripted session runs to the end of the stream");
+        let events: Vec<ClientEvent> = receiver.try_iter().collect();
+        let written = outgoing.lock().unwrap().clone();
+        let mut cursor = &written[..];
+        let mut frames = Vec::new();
+        frames.push(
+            oxide_proto::frame::read_frame(&mut cursor, oxide_proto::frame::Compression::Disabled)
+                .expect("the handshake"),
+        );
+        frames.push(
+            oxide_proto::frame::read_frame(&mut cursor, oxide_proto::frame::Compression::Disabled)
+                .expect("Login Start"),
+        );
+        while !cursor.is_empty() {
+            frames.push(
+                oxide_proto::frame::read_frame(&mut cursor, SCRIPT_FRAMING)
+                    .expect("a client frame"),
+            );
+        }
+        (events, frames)
+    }
+
+    /// A settings push that moves every session-held value off its default.
+    fn moved_push() -> SessionPush {
+        SessionPush {
+            settings: ClientSettings {
+                locale: "de_DE".to_string(),
+                view_distance: 10,
+                chat_mode: 1,
+                chat_colors: false,
+                skin_parts: 0x01,
+            },
+            graphics_fast: false,
+            smooth_lighting: 0,
+            sensitivity: 1.0,
+            invert_mouse: true,
+            particles: ParticleSetting::Minimal,
+        }
+    }
+
+    #[test]
+    fn a_settings_push_applies_while_dead() {
+        // M6 T14 M-c: the drain's `PushSettings` arm precedes the dead check,
+        // so a pause-menu change lands while dead instead of being dropped.
+        // The script kills the player before any idle wait, and the push
+        // injects at wait 2 — dead already — so a gated arm would send no
+        // C15 echo. (The sibling `SetParticleSetting` arm shares the same
+        // pre-check block; its regime mapping is pinned at function level.)
+        let mut head = Vec::new();
+        script_login(&mut head);
+        script_frame(&mut head, &script_health(0.0), SCRIPT_FRAMING);
+        let push = moved_push();
+        let (events, frames) = drive_script(
+            head,
+            Vec::new(),
+            8,
+            0,
+            vec![(2, InputEvent::PushSettings(push))],
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Died)),
+            "the player died before the push: {events:?}"
+        );
+        let mut expected = Vec::new();
+        script_frame(
+            &mut expected,
+            &oxide_proto_v47::serverbound::client_settings_payload(&moved_push().settings),
+            SCRIPT_FRAMING,
+        );
+        let mut cursor = &expected[..];
+        let echo = oxide_proto::frame::read_frame(&mut cursor, SCRIPT_FRAMING).expect("the echo");
+        assert_eq!(
+            frames.len(),
+            3,
+            "only the handshake, Login Start and the echo left: {frames:?}"
+        );
+        assert_eq!(
+            frames[2], echo,
+            "the push's values reached the wire while dead"
+        );
+    }
+
+    /// The `GameType` subsequence a run reported, in order.
+    fn reported_game_types(events: &[ClientEvent]) -> Vec<u8> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::GameType { gamemode } => Some(*gamemode),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `CameraClip` distances a run reported, in order.
+    fn reported_clips(events: &[ClientEvent]) -> Vec<f32> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::CameraClip { distance } => Some(*distance),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The F3 scene: a join, a stone-floor column, a teleport facing north
+    /// (so the third-person camera stands south, inside the loaded column),
+    /// and — when asked — a stone wall at (0, 65, 3) behind the player that
+    /// the camera's corner rays must cross.
+    fn clip_head(wall: bool) -> Vec<u8> {
+        let mut head = Vec::new();
+        script_login(&mut head);
+        script_frame(&mut head, &script_join(0), SCRIPT_FRAMING);
+        script_frame(&mut head, &script_column(0, 0), SCRIPT_FRAMING);
+        script_frame(
+            &mut head,
+            &script_position(0.5, 64.0, 0.389, 180.0, 0.0),
+            SCRIPT_FRAMING,
+        );
+        if wall {
+            script_frame(
+                &mut head,
+                &script_block_change(0, 65, 3, 0x0010),
+                SCRIPT_FRAMING,
+            );
+        }
+        head
+    }
+
+    /// The F3 tail: a switch to spectator, then to an unknown id that reads
+    /// survival.
+    fn clip_tail() -> Vec<u8> {
+        let mut tail = Vec::new();
+        script_frame(&mut tail, &script_game_state(3, 3.0), SCRIPT_FRAMING);
+        script_frame(&mut tail, &script_game_state(3, 9.0), SCRIPT_FRAMING);
+        tail
+    }
+
+    #[test]
+    fn the_game_mode_switch_reports_in_order_and_clips_behind_walls() {
+        // M6 T27 F3: reason-3 switches report `GameType` with the floored
+        // byte — an unknown id answering survival — in script order, and a
+        // third-person tick behind a wall reports the shortened `CameraClip`.
+        // The perspective flip injects after the tail's switches, so the
+        // clip must sort after both mode reports.
+        let (events, _) = drive_script(
+            clip_head(true),
+            clip_tail(),
+            6,
+            48,
+            vec![(8, InputEvent::Perspective { mode: 1 })],
+        );
+        assert_eq!(
+            reported_game_types(&events),
+            vec![3, 0],
+            "spectator, then the unknown id back at survival: {events:?}"
+        );
+        let clips = reported_clips(&events);
+        assert!(
+            !clips.is_empty(),
+            "the wall shortened the third-person distance: {events:?}"
+        );
+        assert!(
+            clips.iter().all(|&distance| distance > 0.0
+                && distance < oxide_render::camera::THIRD_PERSON_DISTANCE),
+            "every clip sits inside the wall: {clips:?}"
+        );
+        let first_mode = events
+            .iter()
+            .position(|event| matches!(event, ClientEvent::GameType { .. }))
+            .expect("a mode report");
+        let first_clip = events
+            .iter()
+            .position(|event| matches!(event, ClientEvent::CameraClip { .. }))
+            .expect("a clip report");
+        assert!(
+            first_mode < first_clip,
+            "the switch reports before the later tick's clip"
+        );
+    }
+
+    #[test]
+    fn first_person_ticks_report_no_camera_clip() {
+        // The same switches with no perspective flip: the modes still report
+        // in order, and first person resets the read with no event.
+        let (events, _) = drive_script(clip_head(true), clip_tail(), 6, 48, Vec::new());
+        assert_eq!(
+            reported_game_types(&events),
+            vec![3, 0],
+            "the modes report without any camera move: {events:?}"
+        );
+        assert!(
+            reported_clips(&events).is_empty(),
+            "first person reports no clip: {events:?}"
         );
     }
 }
