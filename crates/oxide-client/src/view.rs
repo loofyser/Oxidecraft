@@ -4818,6 +4818,37 @@ fn latency_uv(level: u8) -> [f32; 4] {
     ]
 }
 
+/// The column split (`GuiPlayerTabOverlay.renderPlayerlist`:90-97): the smallest column
+/// count whose rows fit twenty — a pure function of the capped entry count, so the
+/// fixtures pin the break without a frame.
+fn tab_split(total: i32) -> (i32, i32) {
+    let mut columns = 1;
+    let mut rows = total;
+    while rows > TAB_ROWS_PER_COLUMN {
+        columns += 1;
+        rows = (total + columns - 1) / columns;
+    }
+    (columns, rows)
+}
+
+/// One cell's top-left (`GuiPlayerTabOverlay.renderPlayerlist`:163-166): the column is the
+/// index over the rows, the row its remainder, stepped by the cell width plus the gutter
+/// and the nine-pixel pitch.
+fn tab_cell_xy(grid_left: i32, grid_top: i32, cell: i32, index: i32, rows: i32) -> (i32, i32) {
+    let column = index / rows;
+    let row = index % rows;
+    (
+        grid_left + column * cell + column * TAB_GUTTER,
+        grid_top + row * TAB_ROW_PITCH,
+    )
+}
+
+/// One header or footer line's centred x (`GuiPlayerTabOverlay.renderPlayerlist`:152,
+/// `:231`): half the screen less half the line.
+fn tab_centred_x(width: i32, line_width: i32) -> i32 {
+    width / 2 - line_width / 2
+}
+
 /// One heart glyph: the nine-by-nine sub-rect at `(u, 0)` of the icon sheet
 /// (`GuiPlayerTabOverlay.drawScoreboardValues`:317-345).
 fn heart_glyph(u: f32, x: f32, y: f32) -> HudDraw {
@@ -5083,12 +5114,7 @@ impl TabState {
         };
         // The column break (`GuiPlayerTabOverlay.renderPlayerlist`:90-97): the smallest column
         // count whose rows fit twenty.
-        let mut columns = 1;
-        let mut rows = total;
-        while rows > TAB_ROWS_PER_COLUMN {
-            columns += 1;
-            rows = (total + columns - 1) / columns;
-        }
+        let (columns, rows) = tab_split(total);
         // The cell width and the grid's left edge (`GuiPlayerTabOverlay.renderPlayerlist`:118-121).
         let cell = (columns * (TAB_HEAD + name_width + score_field + TAB_PADDING))
             .min(width - TAB_SIDE_MARGIN)
@@ -5121,7 +5147,7 @@ impl TabState {
             for (index, line) in lines.iter().enumerate() {
                 draws.push(HudDraw::Text {
                     text: line.clone(),
-                    x: (width / 2 - string_width(font, line) / 2) as f32,
+                    x: tab_centred_x(width, string_width(font, line)) as f32,
                     y: (top + index as i32 * TAB_ROW_PITCH) as f32,
                     scale: 1.0,
                     colour: TAB_TEXT,
@@ -5141,10 +5167,7 @@ impl TabState {
         let grid_top = top;
         for (index, record) in capped.iter().enumerate() {
             let index = index as i32;
-            let column = index / rows;
-            let row = index % rows;
-            let cell_x = grid_left + column * cell + column * TAB_GUTTER;
-            let cell_y = grid_top + row * TAB_ROW_PITCH;
+            let (cell_x, cell_y) = tab_cell_xy(grid_left, grid_top, cell, index, rows);
             draws.push(HudDraw::Rect {
                 x: cell_x as f32,
                 y: cell_y as f32,
@@ -5234,7 +5257,7 @@ impl TabState {
             for (index, line) in lines.iter().enumerate() {
                 draws.push(HudDraw::Text {
                     text: line.clone(),
-                    x: (width / 2 - string_width(font, line) / 2) as f32,
+                    x: tab_centred_x(width, string_width(font, line)) as f32,
                     y: (footer_top + index as i32 * TAB_ROW_PITCH) as f32,
                     scale: 1.0,
                     colour: TAB_TEXT,
@@ -8518,6 +8541,96 @@ mod tests {
         // under it.
         assert_eq!(draws.len(), 1);
         assert_eq!(chat_rect(&draws[0]), (201.0, 9.0, 24.0, 1.0, TAB_PANEL));
+    }
+
+    #[test]
+    fn forty_one_entries_split_three_columns_of_fourteen() {
+        // The column break is its own pure function
+        // (`GuiPlayerTabOverlay.renderPlayerlist`:90-97): the smallest column count whose
+        // rows fit twenty.
+        assert_eq!(
+            tab_split(0),
+            (1, 0),
+            "the empty held list keeps one degenerate column"
+        );
+        assert_eq!(tab_split(1), (1, 1), "a one-entry list");
+        assert_eq!(tab_split(20), (1, 20), "twenty holds one column");
+        assert_eq!(
+            tab_split(21),
+            (2, 11),
+            "twenty-one breaks to two columns of eleven"
+        );
+        assert_eq!(tab_split(40), (2, 20), "forty fills two columns");
+        assert_eq!(
+            tab_split(41),
+            (3, 14),
+            "forty-one breaks to three columns of fourteen"
+        );
+        assert_eq!(tab_split(80), (4, 20), "eighty fills four columns");
+    }
+
+    #[test]
+    fn forty_one_entries_draw_three_columns() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA"); 41];
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // One cell background per entry over three distinct column x positions: fourteen,
+        // fourteen, thirteen.
+        let mut columns: Vec<f32> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Rect { x, colour, .. } if *colour == TAB_CELL => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(columns.len(), 41, "one cell per entry");
+        columns.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        columns.dedup_by(|left, right| (*left - *right).abs() < 0.001);
+        assert_eq!(columns, vec![139.0, 190.0, 241.0], "three columns");
+    }
+
+    #[test]
+    fn one_entry_draws_a_single_cell() {
+        let font = chat_font();
+        let mut tab = TabState::new();
+        tab.open = true;
+        tab.entries = vec![tab_record("AAAA")];
+        let draws = tab_frame(&tab, &Scoreboard::new(), &font);
+        // The grid background, the cell, the face, the hat, the name and the ping: no
+        // header, no footer, no score without an objective.
+        assert_eq!(draws.len(), 6, "one entry's six draws");
+        assert_eq!(
+            chat_rect(&draws[0]),
+            (189.0, 9.0, 48.0, 10.0, TAB_PANEL),
+            "the grid background"
+        );
+        assert_eq!(
+            chat_rect(&draws[1]),
+            (190.0, 10.0, 46.0, 8.0, TAB_CELL),
+            "the single cell"
+        );
+    }
+
+    #[test]
+    fn tab_cells_walk_columns_then_rows() {
+        // One cell's top-left (`GuiPlayerTabOverlay.renderPlayerlist`:163-166): the column
+        // is the index over the rows, the row its remainder, stepped by the cell width
+        // plus the five-pixel gutter and the nine-pixel pitch.
+        assert_eq!(tab_cell_xy(100, 10, 46, 0, 11), (100, 10));
+        assert_eq!(tab_cell_xy(100, 10, 46, 1, 11), (100, 19));
+        assert_eq!(tab_cell_xy(100, 10, 46, 10, 11), (100, 100));
+        assert_eq!(tab_cell_xy(100, 10, 46, 11, 11), (151, 10));
+        assert_eq!(tab_cell_xy(100, 10, 46, 12, 11), (151, 19));
+    }
+
+    #[test]
+    fn tab_header_lines_centre_on_the_screen() {
+        // One header or footer line's centred x (`:152`, `:231`): half the screen less half
+        // the line.
+        assert_eq!(tab_centred_x(427, 100), 163);
+        assert_eq!(tab_centred_x(64, 10), 27);
     }
 
     // ---- the scoreboard sidebar ----

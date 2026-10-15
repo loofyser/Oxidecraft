@@ -2913,7 +2913,7 @@ impl ClientApp {
                 leave_bed_label(language),
             ));
         }
-        if self.tab.open {
+        if Self::tab_visible(self.tab.open, self.hide_gui, screen_open) {
             if let Some(font) = self.font.as_ref() {
                 hud_draws.extend(self.tab.tab_draws(
                     &self.board,
@@ -6163,6 +6163,15 @@ impl ClientApp {
     /// strip draws through the real feed (T27 F2 pins this wiring). A free
     /// constructor over fields (not `&self`): the frame holds the renderer
     /// mutably while it assembles the row.
+    /// Whether the held tab list draws this frame: the hold, and the HUD
+    /// conjunction the hotbar and stat rows read. The list draws inside the
+    /// F1-gated overlay (`EntityRenderer.java`:1166 — the held-Tab branch
+    /// itself, `GuiIngame.java`:350-357, carries no further term), so F1
+    /// suppression without an open screen hides the held list (the T27 F1
+    /// rider's pin).
+    fn tab_visible(tab_open: bool, hide_gui: bool, screen_open: bool) -> bool {
+        tab_open && view::hud_visible(hide_gui, screen_open)
+    }
     fn hotbar_feed(
         font: Option<&Font>,
         modes: HotbarModes,
@@ -8421,6 +8430,7 @@ mod tests {
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
     use crossbeam_channel::unbounded;
+    use oxide_assets::font::Font;
     use oxide_assets::model::Transform;
     use oxide_assets::skins::DefaultModel;
     use oxide_assets::texture::Texture;
@@ -8434,6 +8444,7 @@ mod tests {
     use oxide_game::input::InputEvent;
     use oxide_game::interaction::Face;
     use oxide_game::particles::{ParticleFrame, ParticleTex};
+    use oxide_game::scoreboard::Scoreboard;
     use oxide_game::session::{ClientEvent, MeshAssets};
     use oxide_game::settings::{GameSettings, default_bindings};
     use oxide_game::weather::WeatherColumn;
@@ -8441,15 +8452,21 @@ mod tests {
     use oxide_proto_v47::window::WindowKind;
     use oxide_render::entity_models::Vertices;
     use oxide_render::entity_pass::ItemMesh;
+    use oxide_render::entity_pass::{SkinLookup, TextureRegistry};
     use oxide_render::gui_item::{IconShape, ItemIconMesh, ItemIconSource};
+    use oxide_render::hud::{HudDraw, HudPass, scaled_resolution};
     use oxide_render::particle_pass::ParticleUv;
+    use oxide_render::renderer::SKY_COLOR;
+    use oxide_render::terrain_pass::DEPTH_FORMAT;
     use oxide_render::world_overlay::{Crack, FULL_CUBE, Outline};
     use oxide_world::entity::EntityKind;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::future::Future;
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::{Duration, Instant};
     use winit::dpi::PhysicalPosition;
     use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta};
@@ -9753,6 +9770,26 @@ mod tests {
             ),
             None,
             "an unbound row holds on no key"
+        );
+    }
+
+    #[test]
+    fn the_held_tab_hides_under_f1() {
+        // The held list draws inside the F1-gated overlay (`EntityRenderer.java`:1166), so
+        // the hold alone never suffices: the draw reads the HUD conjunction the hotbar and
+        // stat rows read, and F1 suppression without an open screen hides the held list.
+        assert!(ClientApp::tab_visible(true, false, false), "held and shown");
+        assert!(
+            !ClientApp::tab_visible(true, true, false),
+            "F1 hides the held list"
+        );
+        assert!(
+            ClientApp::tab_visible(true, true, true),
+            "an open screen keeps it"
+        );
+        assert!(
+            !ClientApp::tab_visible(false, false, false),
+            "unheld draws nothing"
         );
     }
 
@@ -12453,6 +12490,406 @@ mod tests {
         assert!(!tab_open, "the open field consumed the Tab");
         assert!(chat.open, "the consumed Tab left the field open");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs `future` to completion on the calling thread, parking it while
+    /// the polled future is pending.
+    fn tab_block_on<F: Future>(future: F) -> F::Output {
+        /// Wakes the waiting thread by unparking it.
+        struct Unpark(std::thread::Thread);
+
+        impl Wake for Unpark {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU adapter; run locally with -- --ignored"]
+    fn the_tab_frame_draws_two_distinct_heads() {
+        // The held list's known frame through the real passes: a header line, two entries
+        // on distinct uploaded skins — the first with a list-objective score and a fast
+        // bar, the second with a score and the no-signal bar — and a footer line. The
+        // assembly is the shipping `TabState::tab_draws`; the pins read the head cells'
+        // texels back, so a shared-head wiring fails the distinctness pin. One ignored
+        // frame with the store set, for the acceptance re-run (Task 13).
+        //
+        // Every sheet here is built by hand in the test — flat colours, never a pixel
+        // from the asset store — and uploaded beside the two skins, so this is the only
+        // test that runs the real sampler over two different head textures.
+        const WIDE: u32 = 512;
+        const TALL: u32 = 256;
+        const FACE_ANN: [u8; 4] = [216, 40, 40, 255];
+        const FACE_BOB: [u8; 4] = [40, 40, 216, 255];
+        const BAR_FAST: [u8; 3] = [30, 200, 30];
+        const BAR_NONE: [u8; 3] = [200, 30, 200];
+
+        let backends = if cfg!(target_os = "linux") {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::PRIMARY
+        };
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let adapter = tab_block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("an adapter is available");
+        let (device, queue) = tab_block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("oxide tab headless device"),
+            ..Default::default()
+        }))
+        .expect("a device is created");
+
+        // Two synthetic 64x64 skins with distinct flat face blocks; everything else stays
+        // transparent, so the hat pass leaves the face showing.
+        fn tab_skin(face: [u8; 4]) -> Texture {
+            const SIDE: usize = 64;
+            let mut rgba = vec![0u8; SIDE * SIDE * 4];
+            for y in 8..16 {
+                for x in 8..16 {
+                    let at = (y * SIDE + x) * 4;
+                    rgba[at..at + 4].copy_from_slice(&face);
+                }
+            }
+            Texture {
+                width: SIDE as u32,
+                height: SIDE as u32,
+                rgba,
+            }
+        }
+        let mut skins = TextureRegistry::new(&device, &queue);
+        skins.set_skin(&device, &queue, "uuid-ann", Some(&tab_skin(FACE_ANN)), None);
+        skins.set_skin(&device, &queue, "uuid-bob", Some(&tab_skin(FACE_BOB)), None);
+        let id_ann = skins.resolve("uuid-ann", false).id();
+        let id_bob = skins.resolve("uuid-bob", false).id();
+        assert_ne!(id_ann, id_bob, "the two uploads resolve distinctly");
+
+        // The frame's glyphs inked five wide — the header, the footer, the names, the
+        // space and the score's `§e` digits.
+        fn tab_sheet(codes: &[char]) -> Texture {
+            const SIDE: u32 = 128;
+            const CELL: u32 = 8;
+            let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+            for character in codes {
+                let code = *character as u32;
+                let cell_x = (code % 16) * CELL;
+                let cell_y = (code / 16) * CELL;
+                for row in 0..CELL {
+                    for column in 0..5 {
+                        let offset = (((cell_y + row) * SIDE + cell_x + column) * 4) as usize;
+                        rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+                    }
+                }
+            }
+            Texture {
+                width: SIDE,
+                height: SIDE,
+                rgba,
+            }
+        }
+        let sheet = tab_sheet(&['H', 'F', 'A', 'n', 'B', 'o', 'b', ' ', '§', 'e', '7', '3']);
+        let font = Font::load(&sheet, None).expect("the synthetic sheet loads");
+
+        // The icons sheet: a fast band at the source's level-0 row and a no-signal band
+        // at level five (`GuiPlayerTabOverlay.drawPing`:270).
+        fn tab_icons() -> Texture {
+            const SIDE: u32 = 256;
+            let mut rgba = vec![0u8; (SIDE * SIDE * 4) as usize];
+            for (top, colour) in [(176u32, BAR_FAST), (216u32, BAR_NONE)] {
+                for y in top..top + 8 {
+                    for x in 0..SIDE {
+                        let at = ((y * SIDE + x) * 4) as usize;
+                        rgba[at..at + 3].copy_from_slice(&colour);
+                        rgba[at + 3] = 255;
+                    }
+                }
+            }
+            Texture {
+                width: SIDE,
+                height: SIDE,
+                rgba,
+            }
+        }
+
+        let mut board = Scoreboard::new();
+        board.set_objective("obj", "Obj", "integer");
+        board.set_display(0, Some("obj"));
+        board.set_score("Ann", "obj", 7);
+        board.set_score("Bob", "obj", 3);
+        let mut tab = super::view::TabState::new();
+        tab.open = true;
+        tab.entries = vec![
+            PlayerListRecord {
+                uuid: "uuid-ann".to_owned(),
+                name: "Ann".to_owned(),
+                properties: Vec::new(),
+                gamemode: 0,
+                latency: 60,
+                display_name: None,
+            },
+            PlayerListRecord {
+                uuid: "uuid-bob".to_owned(),
+                name: "Bob".to_owned(),
+                properties: Vec::new(),
+                gamemode: 0,
+                latency: -1,
+                display_name: None,
+            },
+        ];
+        tab.header = "{\"text\":\"H\"}".to_owned();
+        tab.footer = "{\"text\":\"F\"}".to_owned();
+        let draws = tab.tab_draws(&board, &font, scaled_resolution(1280, 720, 0), &skins);
+
+        // The draw-level pins: two faces on the two resolved ids, two hats, the header,
+        // footer, names and scores as text, and the two latency bands.
+        let face_uv = [8.0 / 64.0, 8.0 / 64.0, 16.0 / 64.0, 16.0 / 64.0];
+        let hat_uv = [40.0 / 64.0, 8.0 / 64.0, 48.0 / 64.0, 16.0 / 64.0];
+        let mut faces = Vec::new();
+        let mut hats = 0;
+        for draw in &draws {
+            if let HudDraw::SkinRect {
+                texture,
+                x,
+                y,
+                width,
+                height,
+                uv,
+                ..
+            } = draw
+            {
+                assert_eq!((*width, *height), (8.0, 8.0), "heads stay eight by eight");
+                if *uv == face_uv {
+                    faces.push((*texture, *x, *y));
+                } else if *uv == hat_uv {
+                    hats += 1;
+                } else {
+                    panic!("a head uv: {uv:?}");
+                }
+            }
+        }
+        assert_eq!(faces.len(), 2, "two faces");
+        assert_eq!(hats, 2, "two hats");
+        assert_eq!(faces[0].0, id_ann, "Ann's face resolves her skin");
+        assert_eq!(faces[1].0, id_bob, "Bob's face resolves his");
+        let texts: Vec<&str> = draws
+            .iter()
+            .filter_map(|draw| match draw {
+                HudDraw::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for want in ["H", "F", "Ann", "Bob", "§e7", "§e3"] {
+            assert!(
+                texts.iter().any(|text| text.starts_with(want)),
+                "the {want} line draws"
+            );
+        }
+        let mut bars = Vec::new();
+        for draw in &draws {
+            if let HudDraw::TexturedRect {
+                x,
+                y,
+                width,
+                height,
+                uv,
+                ..
+            } = draw
+            {
+                assert_eq!((*width, *height), (10.0, 8.0), "bars stay ten by eight");
+                bars.push((*x, *y, uv[1]));
+            }
+        }
+        assert_eq!(bars.len(), 2, "two latency bars");
+        assert_eq!(bars[0].2, 176.0 / 256.0, "Ann's fast bar");
+        assert_eq!(bars[1].2, 216.0 / 256.0, "Bob's no-signal bar");
+
+        // The frame through the real passes, one unit to one pixel.
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("oxide tab headless target"),
+            size: wgpu::Extent3d {
+                width: WIDE,
+                height: TALL,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut hud = HudPass::new(&device, &queue, format);
+        hud.set_resolution(&queue, WIDE as f32, TALL as f32);
+        hud.set_font(&device, &queue, &sheet)
+            .expect("the synthetic sheet is a 16x16 grid");
+        hud.set_texture(&device, &queue, "gui/icons", &tab_icons());
+        hud.set_draws(&device, &queue, &draws, &skins);
+        let depth = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("oxide tab headless depth"),
+                size: wgpu::Extent3d {
+                    width: WIDE,
+                    height: TALL,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("oxide tab headless encoder"),
+        });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxide tab headless clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxide tab headless overlay pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            hud.draw(&mut pass);
+        }
+        queue.submit(Some(encoder.finish()));
+
+        // The readback: one 2048-byte row per line.
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oxide tab headless readback"),
+            size: u64::from(WIDE * 4) * u64::from(TALL),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("oxide tab headless readback encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(WIDE * 4),
+                    rows_per_image: Some(TALL),
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDE,
+                height: TALL,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device.poll(wgpu::PollType::Wait).expect("the device polls");
+        receiver
+            .recv()
+            .expect("the map callback runs")
+            .expect("the buffer maps");
+        let pixels = slice.get_mapped_range().to_vec();
+        buffer.unmap();
+        let pixel = |x: u32, y: u32| -> [u8; 3] {
+            let offset = (y * WIDE * 4 + x * 4) as usize;
+            [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+        };
+
+        // The clear colour decodes first: the sky the T27 frames read.
+        assert_eq!(
+            pixel(WIDE - 12, TALL - 12),
+            [158, 194, 250],
+            "the clear sky"
+        );
+        // Each head cell's centre samples its own skin — and the two differ, which a
+        // shared-head wiring would fail.
+        let (ann_x, ann_y) = (faces[0].1 as u32 + 4, faces[0].2 as u32 + 4);
+        let (bob_x, bob_y) = (faces[1].1 as u32 + 4, faces[1].2 as u32 + 4);
+        assert_eq!(pixel(ann_x, ann_y), [216, 40, 40], "Ann's head");
+        assert_eq!(pixel(bob_x, bob_y), [40, 40, 216], "Bob's head");
+        assert_ne!(
+            pixel(ann_x, ann_y),
+            pixel(bob_x, bob_y),
+            "the heads resolve distinctly"
+        );
+        // The latency bars sample their bands.
+        let (fast_x, fast_y) = (bars[0].0 as u32 + 5, bars[0].1 as u32 + 4);
+        let (none_x, none_y) = (bars[1].0 as u32 + 5, bars[1].1 as u32 + 4);
+        assert_eq!(pixel(fast_x, fast_y), BAR_FAST, "the fast bar");
+        assert_eq!(pixel(none_x, none_y), BAR_NONE, "the no-signal bar");
+        // The header panel's corner blends darker than the sky it covers.
+        let panel = match &draws[0] {
+            HudDraw::Rect { x, y, .. } => (*x as u32 + 1, *y as u32 + 1),
+            other => panic!("the header panel first: {other:?}"),
+        };
+        let corner = pixel(panel.0, panel.1);
+        // `0x80000000` is half-alpha black: each channel lands near half the sky's.
+        for (channel, sky) in corner.iter().zip([158u8, 194, 250]) {
+            let half = i16::from(sky) / 2;
+            assert!(
+                (i16::from(*channel) - half).abs() <= 2,
+                "the panel halves the sky: {corner:?}"
+            );
+        }
     }
 
     #[test]
