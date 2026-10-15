@@ -12,10 +12,16 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use oxide_assets::skins::{DefaultModel, SkinError, decode_profile_property, default_skin};
+use oxide_assets::http::{HttpClient, UreqClient};
+use oxide_assets::skins::{
+    DefaultModel, SkinCache, SkinError, decode_profile_property, default_skin,
+    fetch_profile_textures,
+};
+use oxide_assets::store::Store;
 use oxide_assets::texture::Texture;
 
 /// One player's skin request: the profile's uuid and its `textures` property
@@ -130,6 +136,68 @@ where
         // A window that stopped listening is not an error here.
         let _ = updates.send(update);
     }
+}
+
+/// Fetches the signed-in player's own skin: the profile endpoint's first
+/// `textures` entry through `fetch` (the skin cache's fetch in production),
+/// as the update the drain files under the hyphenated `uuid`.
+///
+/// `Ok(None)` when the profile carries no textures (204/404/empty) — the
+/// default skin stands, with no log line. Any profile or skin failure is
+/// `Err` — the caller logs one line and keeps the default. A cape that fails
+/// is `None`, never a failure: the skin still swaps in.
+pub fn fetch_own_skin(
+    http: &dyn HttpClient,
+    fetch: &dyn Fn(&str) -> Result<Arc<Texture>, SkinError>,
+    uuid: &str,
+    uuid_hex: &str,
+) -> Result<Option<SkinUpdate>, SkinError> {
+    let profiles = fetch_profile_textures(http, uuid_hex)?;
+    let Some(profile) = profiles.into_iter().next() else {
+        return Ok(None);
+    };
+    let texture = fetch(&profile.url)?;
+    let cape = match profile.cape_url.as_deref() {
+        Some(url) => fetch(url).ok(),
+        None => None,
+    };
+    Ok(Some(SkinUpdate {
+        uuid: uuid.to_owned(),
+        texture: Some(texture),
+        cape,
+        model: profile.model,
+    }))
+}
+
+/// Spawns the own-skin fetch on its own thread: the store opens, the profile
+/// endpoint's textures travel through the skin cache, and the update lands
+/// in `updates` — the channel the frame drain already reads.
+///
+/// The frame path never waits: the thread owns every blocking call. A
+/// failure logs one line and sends nothing, so the default skin stands; an
+/// empty profile sends nothing with no log line. A window that stopped
+/// listening is not an error here.
+pub fn spawn_own_fetch(
+    uuid: String,
+    uuid_hex: String,
+    store_root: PathBuf,
+    updates: Sender<SkinUpdate>,
+) {
+    std::thread::spawn(move || {
+        let http = UreqClient::new();
+        let outcome = (|| {
+            let store = Store::open(store_root).map_err(SkinError::Store)?;
+            let cache = SkinCache::new(&store);
+            fetch_own_skin(&http, &|url| cache.fetch(url), &uuid, &uuid_hex)
+        })();
+        match outcome {
+            Ok(Some(update)) => {
+                let _ = updates.send(update);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, uuid = %uuid, "the own skin fetch failed"),
+        }
+    });
 }
 
 /// The dedupe hash of a request's property value.
@@ -516,5 +584,190 @@ mod tests {
             ),
             "the loop returned and the update sender dropped"
         );
+    }
+
+    /// The signed-in player's hyphenated uuid and its endpoint hex form.
+    const OWN_UUID: &str = "069a79f4-44e9-4726-a5be-fca90e38aaf5";
+    const OWN_UUID_HEX: &str = "069a79f444e94726a5befca90e38aaf5";
+
+    /// The profile endpoint's URL for the signed-in player.
+    const PROFILE_URL: &str = "https://sessionserver.mojang.com/session/minecraft/profile/069a79f444e94726a5befca90e38aaf5";
+
+    /// An HTTP client with one scripted profile answer and a shared call
+    /// log: the URLs every `get` saw, in order.
+    enum ProfileAnswer {
+        /// A 2xx carrying the body.
+        Body(Vec<u8>),
+        /// A status error with an empty body.
+        Status(u16),
+        /// A transport failure.
+        Transport,
+    }
+
+    struct ScriptedHttp {
+        answer: ProfileAnswer,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedHttp {
+        fn new(answer: ProfileAnswer) -> Self {
+            Self {
+                answer,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The URLs fetched so far, in order.
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("the call log").clone()
+        }
+    }
+
+    impl oxide_assets::http::HttpClient for ScriptedHttp {
+        fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
+            self.calls
+                .lock()
+                .expect("the call log")
+                .push(url.to_owned());
+            match &self.answer {
+                ProfileAnswer::Body(body) => Ok(body.clone()),
+                ProfileAnswer::Status(code) => Err(HttpError::Status {
+                    url: url.to_owned(),
+                    code: *code,
+                    body: Vec::new(),
+                    correlation_id: None,
+                }),
+                ProfileAnswer::Transport => Err(HttpError::Transport {
+                    url: url.to_owned(),
+                    message: "the stub refuses".to_owned(),
+                }),
+            }
+        }
+
+        fn post_json(&self, url: &str, _body: &[u8]) -> Result<Vec<u8>, HttpError> {
+            panic!("only get is scripted, not post_json for {url:?}")
+        }
+
+        fn post_form(&self, url: &str, _fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+            panic!("only get is scripted, not post_form for {url:?}")
+        }
+
+        fn get_with_bearer(&self, url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
+            panic!("only get is scripted, not get_with_bearer for {url:?}")
+        }
+    }
+
+    /// A profile body carrying one textures property with the given base64
+    /// value, beside `profileActions`.
+    fn profile_body(value_b64: &str) -> Vec<u8> {
+        format!(
+            r#"{{"id":"{OWN_UUID_HEX}","name":"Notch","properties":[{{"name":"textures","value":"{value_b64}"}}],"profileActions":[]}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_own_fetch_files_the_profile_skin_under_the_hyphenated_uuid() {
+        // The online path: one profile GET at the exact endpoint URL, then
+        // the skin fetch — the update the drain files under the hyphenated
+        // uuid, carrying the property's own model.
+        let http = ScriptedHttp::new(ProfileAnswer::Body(profile_body(&slim_property())));
+        let stub = Stub::new(&[(SKIN_URL, Some(texture(0x11)))]);
+        let update = super::fetch_own_skin(&http, &|url| stub.fetch(url), OWN_UUID, OWN_UUID_HEX)
+            .expect("the profile and its skin arrive")
+            .expect("the profile carries textures");
+        assert_eq!(update.uuid, OWN_UUID);
+        assert_eq!(
+            update.texture.as_ref().map(|texture| texture.rgba[0]),
+            Some(0x11)
+        );
+        assert_eq!(update.cape, None, "the property names no cape");
+        assert_eq!(update.model, DefaultModel::Slim, "the property's own model");
+        assert_eq!(
+            http.calls(),
+            vec![PROFILE_URL.to_owned()],
+            "one profile GET"
+        );
+        assert_eq!(stub.calls(), vec![SKIN_URL.to_owned()], "one skin fetch");
+    }
+
+    #[test]
+    fn the_own_fetch_serves_the_cape_beside_the_skin() {
+        let http = ScriptedHttp::new(ProfileAnswer::Body(profile_body(&cape_property())));
+        let stub = Stub::new(&[
+            (SKIN_URL, Some(texture(0x11))),
+            (CAPE_URL, Some(texture(0x22))),
+        ]);
+        let update = super::fetch_own_skin(&http, &|url| stub.fetch(url), OWN_UUID, OWN_UUID_HEX)
+            .expect("the profile and both textures arrive")
+            .expect("the profile carries textures");
+        assert_eq!(
+            update.texture.as_ref().map(|texture| texture.rgba[0]),
+            Some(0x11)
+        );
+        assert_eq!(update.cape.as_ref().map(|cape| cape.rgba[0]), Some(0x22));
+        assert_eq!(
+            stub.calls(),
+            vec![SKIN_URL, CAPE_URL],
+            "the skin, then the cape"
+        );
+    }
+
+    #[test]
+    fn an_empty_profile_resolves_to_no_update_with_no_skin_fetch() {
+        // A 404 and a body-less 204 both mean the account carries no
+        // textures: no update, and the skin fetcher never runs.
+        for answer in [ProfileAnswer::Status(404), ProfileAnswer::Body(Vec::new())] {
+            let http = ScriptedHttp::new(answer);
+            let stub = Stub::new(&[(SKIN_URL, Some(texture(0x11)))]);
+            assert!(
+                super::fetch_own_skin(&http, &|url| stub.fetch(url), OWN_UUID, OWN_UUID_HEX)
+                    .expect("an empty profile is no failure")
+                    .is_none(),
+                "no textures, no update"
+            );
+            assert_eq!(
+                http.calls(),
+                vec![PROFILE_URL.to_owned()],
+                "the endpoint was asked"
+            );
+            assert!(stub.calls().is_empty(), "nothing was fetchable");
+        }
+    }
+
+    #[test]
+    fn a_failed_profile_fetch_is_an_error_before_any_skin_fetch() {
+        // The endpoint refused: the error travels out typed, and no skin
+        // fetch runs behind it.
+        let http = ScriptedHttp::new(ProfileAnswer::Transport);
+        let stub = Stub::new(&[(SKIN_URL, Some(texture(0x11)))]);
+        let error = super::fetch_own_skin(&http, &|url| stub.fetch(url), OWN_UUID, OWN_UUID_HEX)
+            .expect_err("a failed profile fetch is an error");
+        assert!(matches!(error, SkinError::Http(_)), "{error:?}");
+        assert_eq!(
+            http.calls(),
+            vec![PROFILE_URL.to_owned()],
+            "one profile GET"
+        );
+        assert!(stub.calls().is_empty(), "no skin fetch ran");
+    }
+
+    #[test]
+    fn a_failed_skin_fetch_is_an_error() {
+        let http = ScriptedHttp::new(ProfileAnswer::Body(profile_body(&skin_property(SKIN_URL))));
+        let stub = Stub::new(&[(SKIN_URL, None)]);
+        let error = super::fetch_own_skin(&http, &|url| stub.fetch(url), OWN_UUID, OWN_UUID_HEX)
+            .expect_err("a failed skin fetch is an error");
+        assert!(matches!(error, SkinError::Http(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_malformed_profile_property_is_a_typed_error() {
+        let http = ScriptedHttp::new(ProfileAnswer::Body(profile_body("not base64!!!")));
+        let stub = Stub::new(&[]);
+        let error = super::fetch_own_skin(&http, &|url| stub.fetch(url), OWN_UUID, OWN_UUID_HEX)
+            .expect_err("a malformed property is refused");
+        assert!(matches!(error, SkinError::Base64(_)), "{error:?}");
+        assert!(stub.calls().is_empty(), "no skin fetch ran");
     }
 }

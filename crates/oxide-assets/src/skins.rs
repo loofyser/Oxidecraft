@@ -181,6 +181,65 @@ fn is_http_url(url: &str) -> bool {
     })
 }
 
+/// The session server's profile endpoint: `GET <endpoint>/<uuid_hex>`
+/// answers the player's `properties` array, whose `textures` entries carry
+/// the skin's URL and model
+/// (docs/research/launcher-assets-auth-survey.md §3.6). The endpoint is
+/// public: no bearer travels.
+const PROFILE_ENDPOINT: &str = "https://sessionserver.mojang.com/session/minecraft/profile";
+
+/// The largest profile body accepted, in bytes: room for a small array of
+/// max-size properties in their base64 form plus the JSON around them —
+/// orders of magnitude above the survey's ~700-byte shape, so no real
+/// profile is ever refused, while a hostile body never reaches the parse.
+const MAX_PROFILE_BODY_BYTES: usize = 8 * MAX_PROPERTY_B64_CHARS;
+
+/// Fetches the signed-in player's textures from the session server's profile
+/// endpoint: GETs [`PROFILE_ENDPOINT`] under the 32-hex-digit `uuid_hex`
+/// and decodes every `textures` entry of the `properties` array through
+/// [`decode_profile_property`].
+///
+/// Unknown fields — `profileActions`, anything the future adds — are ignored
+/// rather than rejected (§3.6's own note for a 1.8.9 client). A body-less
+/// answer (204) and a 404 both mean the account carries no textures and come
+/// back as an empty list. The body is refused past
+/// [`MAX_PROFILE_BODY_BYTES`] before the JSON walk; every other failure is
+/// the fetch's or the decode's own typed error.
+pub fn fetch_profile_textures(
+    http: &dyn HttpClient,
+    uuid_hex: &str,
+) -> Result<Vec<ProfileTexture>, SkinError> {
+    let url = format!("{PROFILE_ENDPOINT}/{uuid_hex}");
+    let body = match http.get(&url) {
+        Ok(body) => body,
+        Err(HttpError::Status { code: 404, .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(SkinError::Http(error)),
+    };
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    if body.len() > MAX_PROFILE_BODY_BYTES {
+        return Err(SkinError::PropertyTooLarge);
+    }
+    let root: Value = serde_json::from_slice(&body)?;
+    let Some(properties) = root.get("properties").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut textures = Vec::new();
+    for property in properties {
+        let (Some(name), Some(value)) = (
+            property.get("name").and_then(Value::as_str),
+            property.get("value").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if name == "textures" {
+            textures.push(decode_profile_property(value)?);
+        }
+    }
+    Ok(textures)
+}
+
 /// The skin cache: 64x64 PNGs under the store's `skins/` directory, named by
 /// the texture URL's own hash.
 ///
@@ -407,7 +466,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
 
     use super::{DefaultModel, SkinCache, SkinError, decode_profile_property, default_skin};
-    use crate::http::{HttpClient, HttpError};
+    use crate::http::{HttpClient, HttpError, UreqClient};
     use crate::store::Store;
 
     #[test]
@@ -891,5 +950,205 @@ mod tests {
         // A hash segment one character shorter than the cap is fine.
         let short = format!("https://textures.minecraft.net/texture/{}", "a".repeat(64));
         assert!(cache.path_for(&short).is_some());
+    }
+
+    /// An HTTP client with one scripted answer and a shared call log: the
+    /// URLs every `get` saw, in order.
+    struct ScriptedProfile {
+        /// `None` answers the body below; `Some(code)` answers a status
+        /// error with an empty body.
+        status: Option<u16>,
+        /// The 2xx body.
+        body: Vec<u8>,
+        /// Every URL `get` was called with, in order.
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedProfile {
+        /// Answers `body` with a 2xx.
+        fn ok(body: Vec<u8>) -> Self {
+            Self {
+                status: None,
+                body,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Answers a status error with an empty body.
+        fn status(code: u16) -> Self {
+            Self {
+                status: Some(code),
+                body: Vec::new(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The URLs fetched so far, in order.
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("the call log").clone()
+        }
+    }
+
+    impl HttpClient for ScriptedProfile {
+        fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
+            self.calls
+                .lock()
+                .expect("the call log")
+                .push(url.to_owned());
+            match self.status {
+                None => Ok(self.body.clone()),
+                Some(code) => Err(HttpError::Status {
+                    url: url.to_owned(),
+                    code,
+                    body: Vec::new(),
+                    correlation_id: None,
+                }),
+            }
+        }
+
+        fn post_json(&self, url: &str, _body: &[u8]) -> Result<Vec<u8>, HttpError> {
+            panic!("only get is scripted, not post_json for {url:?}")
+        }
+
+        fn post_form(&self, url: &str, _fields: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+            panic!("only get is scripted, not post_form for {url:?}")
+        }
+
+        fn get_with_bearer(&self, url: &str, _bearer: &str) -> Result<Vec<u8>, HttpError> {
+            panic!("only get is scripted, not get_with_bearer for {url:?}")
+        }
+    }
+
+    /// The survey §3.6 profile body, verbatim but for one invented extra
+    /// field: the truncated textures payload, `profileActions`, and an
+    /// unknown field the walk must tolerate.
+    fn survey_profile_body() -> Vec<u8> {
+        br#"{
+  "id" : "069a79f444e94726a5befca90e38aaf5",
+  "name" : "Notch",
+  "properties" : [ {
+    "name" : "textures",
+    "value" : "ewogICJ0aW1lc3RhbXAiIDogMTc5MDExMDQwNjUyMSwKICAicHJvZmlsZUlkIiA6ICIwNjlhNzlmNDQ0ZTk0NzI2YTViZWZjYTkwZTM4YWFmNSIsCiAgInByb2ZpbGVOYW1lIiA6ICJOb3RjaCIsCiAgInRleHR1cmVzIiA6IHsKICAgICJTS0lOIiA6IHsKICAgICAgInVybCIgOiAiaHR0cDovL3RleHR1cmVzLm1pbmVjcmFmdC5uZXQvdGV4dHVyZS8yOTIwMDlhNDkyNWI1OGYwMmM3N2RhZGMzZWNlZjA3ZWE0Yzc0NzJmNjRlMGZkYzMyY2U1NTIyNDg5MzYyNjgwIgogICAgfQogIH0KfQ=="
+  } ],
+  "profileActions" : [ ],
+  "inventedFutureField" : { "nested" : [1, 2, 3] }
+}"#
+        .to_vec()
+    }
+
+    #[test]
+    fn the_survey_profile_parses_to_its_skin() {
+        // The §3.6 verbatim shape: one textures entry whose payload names
+        // the SKIN url, beside `profileActions` and an invented future
+        // field the walk ignores rather than rejects.
+        let http = ScriptedProfile::ok(survey_profile_body());
+        let textures = super::fetch_profile_textures(&http, "069a79f444e94726a5befca90e38aaf5")
+            .expect("the verbatim profile parses");
+        assert_eq!(textures.len(), 1, "the one textures entry");
+        assert_eq!(
+            textures[0].url,
+            "http://textures.minecraft.net/texture/292009a4925b58f02c77dadc3ecef07ea4c7472f64e0fdc32ce5522489362680"
+        );
+        assert_eq!(
+            textures[0].model,
+            DefaultModel::Wide,
+            "no metadata: the text default"
+        );
+        assert_eq!(textures[0].cape_url, None, "the payload names no cape");
+        assert_eq!(
+            http.calls(),
+            vec![
+                "https://sessionserver.mojang.com/session/minecraft/profile/069a79f444e94726a5befca90e38aaf5"
+                    .to_owned()
+            ],
+            "one GET at the profile endpoint"
+        );
+    }
+
+    #[test]
+    fn a_malformed_textures_value_is_a_typed_error() {
+        // The endpoint answered, but its textures entry is not base64: the
+        // decode's own refusal travels out, typed.
+        let body = br#"{"properties":[{"name":"textures","value":"!!! not base64 !!!"}]}"#;
+        let http = ScriptedProfile::ok(body.to_vec());
+        let error = super::fetch_profile_textures(&http, "069a79f444e94726a5befca90e38aaf5")
+            .expect_err("a malformed textures entry is refused");
+        assert!(
+            matches!(error, SkinError::Base64(_)),
+            "the typed refusal, not a bare fetch error: {error:?}"
+        );
+        assert_eq!(http.calls().len(), 1, "the endpoint was called once");
+    }
+
+    #[test]
+    fn an_account_without_textures_is_an_empty_list() {
+        // Neither code is documented for this endpoint in the survey: a
+        // body-less 204 and a 404 both mean the account carries no textures.
+        let empty = ScriptedProfile::ok(Vec::new());
+        assert_eq!(
+            super::fetch_profile_textures(&empty, "069a79f444e94726a5befca90e38aaf5")
+                .expect("a body-less 204 is an empty list"),
+            Vec::new()
+        );
+        assert_eq!(empty.calls().len(), 1);
+
+        let missing = ScriptedProfile::status(404);
+        assert_eq!(
+            super::fetch_profile_textures(&missing, "069a79f444e94726a5befca90e38aaf5")
+                .expect("a 404 is an empty list"),
+            Vec::new()
+        );
+        assert_eq!(missing.calls().len(), 1);
+    }
+
+    #[test]
+    fn other_failures_travel_out_typed() {
+        // A transport failure is no textures list: the HTTP error travels.
+        let error = super::fetch_profile_textures(&NoNetwork, "069a79f444e94726a5befca90e38aaf5")
+            .expect_err("a transport failure is an error");
+        assert!(matches!(error, SkinError::Http(_)), "{error:?}");
+
+        // A refusal that is not a 404 stays a refusal.
+        let forbidden = ScriptedProfile::status(403);
+        let error = super::fetch_profile_textures(&forbidden, "069a79f444e94726a5befca90e38aaf5")
+            .expect_err("a 403 is an error");
+        assert!(matches!(error, SkinError::Http(_)), "{error:?}");
+    }
+
+    #[test]
+    fn an_overlong_profile_body_is_refused_before_parse() {
+        // The body cap sits before the JSON walk: a hostile body is a typed
+        // refusal, never a parse allocation.
+        let big = vec![b'x'; super::MAX_PROFILE_BODY_BYTES + 1];
+        let http = ScriptedProfile::ok(big);
+        let error = super::fetch_profile_textures(&http, "069a79f444e94726a5befca90e38aaf5")
+            .expect_err("an overlong body is refused");
+        assert!(matches!(error, SkinError::PropertyTooLarge), "{error:?}");
+    }
+
+    /// The live profile case (Task 13's leg): the public endpoint's answer
+    /// for a known uuid, fetched for real and cached through the store. Run
+    /// with `OXIDECRAFT_STORE` set and `-- --ignored`.
+    #[test]
+    #[ignore = "hits the live profile endpoint; set OXIDECRAFT_STORE and run with -- --ignored"]
+    fn the_live_profile_endpoint_answers_and_caches() {
+        let root = std::env::var_os("OXIDECRAFT_STORE")
+            .filter(|root| !root.is_empty())
+            .expect("OXIDECRAFT_STORE must name the store root");
+        let store = Store::open(std::path::PathBuf::from(root)).expect("the store opens");
+        let cache = SkinCache::new(&store);
+        let http = UreqClient::new();
+        let textures = super::fetch_profile_textures(&http, "069a79f444e94726a5befca90e38aaf5")
+            .expect("the live endpoint answers");
+        assert!(!textures.is_empty(), "the known account carries textures");
+        let skin = &textures[0];
+        assert!(
+            skin.url
+                .starts_with("https://textures.minecraft.net/texture/"),
+            "the skin url names the CDN: {}",
+            skin.url
+        );
+        let texture = cache.fetch(&skin.url).expect("the skin caches");
+        assert!(!texture.rgba.is_empty(), "the skin decodes");
     }
 }

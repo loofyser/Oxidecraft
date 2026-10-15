@@ -1157,6 +1157,9 @@ struct ClientApp {
     skin_requests: Option<Sender<SkinRequest>>,
     /// The worker's updates, drained into [`ClientApp::skins`] once per frame.
     skin_updates: Option<Receiver<SkinUpdate>>,
+    /// The own-skin fetch's updates, drained beside the worker's: one shot
+    /// per login with an account, never for offline sessions.
+    own_skin_updates: Option<Receiver<SkinUpdate>>,
     /// The pointer-capture rules.
     capture: Capture,
     /// The open screen, when the server has a window up: the container screens
@@ -1874,6 +1877,7 @@ impl ClientApp {
             font: chat_font,
             skin_requests: skin_requests_tx,
             skin_updates: skin_updates_rx,
+            own_skin_updates: None,
             debug: DebugFlags {
                 visible,
                 advanced_tooltips: false,
@@ -2044,11 +2048,16 @@ impl ClientApp {
 
     /// Drains the skin worker's updates into [`ClientApp::skins`], and uploads each
     /// to the renderer's registry — a re-upload replaces, an absent cape clears.
+    /// The own-skin fetch's one-shot updates drain beside the worker's, so the
+    /// own model swaps in through the same map the frame reads.
     fn drain_skins(&mut self) {
-        let Some(updates) = self.skin_updates.as_ref() else {
-            return;
-        };
-        let drained: Vec<SkinUpdate> = updates.try_iter().collect();
+        let mut drained: Vec<SkinUpdate> = Vec::new();
+        if let Some(updates) = self.skin_updates.as_ref() {
+            drained.extend(updates.try_iter());
+        }
+        if let Some(own) = self.own_skin_updates.as_ref() {
+            drained.extend(own.try_iter());
+        }
         if let Some(renderer) = self.renderer.as_mut() {
             for update in &drained {
                 renderer.set_skin(
@@ -2249,6 +2258,10 @@ impl ClientApp {
                 if let Some(requests) = self.skin_requests.as_ref() {
                     forward_skins(requests, entries);
                 }
+            }
+            if let ClientEvent::LoggedIn { uuid, .. } = &event {
+                let has_account = self.account.is_some();
+                request_own_skin(has_account, &mut self.own_skin_updates, uuid);
             }
             if let ClientEvent::PlayerTick {
                 tick,
@@ -6354,6 +6367,44 @@ fn forward_skins(requests: &Sender<SkinRequest>, entries: &[PlayerListRecord]) {
     }
 }
 
+/// The own-skin fetch's endpoint argument for a [`ClientEvent::LoggedIn`]
+/// uuid: `None` without an account — offline sessions never call the profile
+/// endpoint — or when the uuid does not strip to 32 hex digits; otherwise
+/// the dash-less hex the endpoint takes.
+fn own_skin_target(has_account: bool, uuid: &str) -> Option<String> {
+    if !has_account {
+        return None;
+    }
+    let hex: String = uuid.chars().filter(|c| *c != '-').collect();
+    (hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// Starts the signed-in player's own-skin fetch on [`ClientEvent::LoggedIn`]:
+/// with an account the worker pulls the profile endpoint's textures through
+/// the skin cache and the update lands in the normal skin drain; offline
+/// sessions never call the endpoint and keep the default skin.
+///
+/// A free function — not a method — so the frame borrows the account flag
+/// beside the own-skin channel without borrowing the whole app under the
+/// renderer's own borrow. The frame path only opens the channel: every
+/// blocking call — the store open, the profile GET, the texture fetches —
+/// runs on the worker's thread, so the frame never stalls on it.
+fn request_own_skin(has_account: bool, sink: &mut Option<Receiver<SkinUpdate>>, uuid: &str) {
+    let Some(uuid_hex) = own_skin_target(has_account, uuid) else {
+        return;
+    };
+    let store_root = match assets::default_store_root() {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(%error, "the own skin fetch has no store root");
+            return;
+        }
+    };
+    let (updates_tx, updates_rx) = unbounded();
+    *sink = Some(updates_rx);
+    skin_worker::spawn_own_fetch(uuid.to_owned(), uuid_hex, store_root, updates_tx);
+}
+
 /// Folds a batch of the worker's updates into the skin map, keyed by uuid:
 /// a later update for one uuid replaces the earlier one.
 fn store_skins(
@@ -8360,12 +8411,12 @@ mod tests {
         disconnect_button_label, disconnect_title, escape_route, f3_chord, f3_hold_step,
         frame_params, fullscreen_pressed, gameplay_key, interpolate_pose, inventory_opener,
         is_enter_press, is_escape_press, is_f1_press, is_f3_press, is_h_press, load_sounds_bytes,
-        local_sound_play, missing_uv, parse_script, parse_server_address, particle_draws,
-        perspective_pressed, render_distance_step, scaled_cursor, screen_button_events,
-        screen_click_button, screenshot_pressed, scripted_chat_click, session_config,
-        session_disconnect_reason, skin_requests, sleep_cover_dim, sleep_dim, sleep_pose,
-        store_aim, store_break_stage, store_skins, tab_held, tooltip_point, void_y_factor,
-        weather_draws, wheel_held_step, wire_sound_play,
+        local_sound_play, missing_uv, own_skin_target, parse_script, parse_server_address,
+        particle_draws, perspective_pressed, render_distance_step, scaled_cursor,
+        screen_button_events, screen_click_button, screenshot_pressed, scripted_chat_click,
+        session_config, session_disconnect_reason, skin_requests, sleep_cover_dim, sleep_dim,
+        sleep_pose, store_aim, store_break_stage, store_skins, tab_held, tooltip_point,
+        void_y_factor, weather_draws, wheel_held_step, wire_sound_play,
     };
     use crate::assets::BLOCKS_ATLAS_TEXTURE;
     use clap::Parser;
@@ -8687,6 +8738,72 @@ mod tests {
                 .map(|texture| texture.rgba[0]),
             Some(0x33),
             "a later update replaces the earlier one"
+        );
+    }
+
+    #[test]
+    fn the_own_skin_fetch_starts_only_with_an_account_and_a_shaped_uuid() {
+        assert_eq!(
+            own_skin_target(true, "069a79f4-44e9-4726-a5be-fca90e38aaf5"),
+            Some("069a79f444e94726a5befca90e38aaf5".to_owned()),
+            "the endpoint takes the dash-less hex"
+        );
+        assert_eq!(
+            own_skin_target(false, "069a79f4-44e9-4726-a5be-fca90e38aaf5"),
+            None,
+            "offline sessions never call the endpoint"
+        );
+        for uuid in [
+            "",
+            "not-a-uuid",
+            "069a79f444e94726a5befca90e38aaf5!",
+            "069a79f4-44e9-4726-a5be-fca90e38aaf",
+        ] {
+            assert_eq!(
+                own_skin_target(true, uuid),
+                None,
+                "the malformed uuid {uuid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_offline_login_starts_no_own_skin_fetch() {
+        // The bare app holds no account: the login path files no channel, so
+        // no worker — and no endpoint call — stands behind it.
+        let mut app = test_app();
+        assert!(app.account.is_none(), "the bare app is offline");
+        let has_account = app.account.is_some();
+        super::request_own_skin(
+            has_account,
+            &mut app.own_skin_updates,
+            "069a79f4-44e9-4726-a5be-fca90e38aaf5",
+        );
+        assert!(
+            app.own_skin_updates.is_none(),
+            "no fetch started without an account"
+        );
+    }
+
+    #[test]
+    fn the_own_skin_update_lands_in_the_map_through_the_drain() {
+        // The one-shot fetch files through the same drain as the worker: the
+        // update lands in the map under the hyphenated uuid.
+        let mut app = test_app();
+        let (updates_tx, updates_rx) = unbounded();
+        app.own_skin_updates = Some(updates_rx);
+        updates_tx
+            .send(SkinUpdate {
+                uuid: "069a79f4-44e9-4726-a5be-fca90e38aaf5".to_owned(),
+                texture: None,
+                cape: None,
+                model: DefaultModel::Wide,
+            })
+            .expect("the channel is open");
+        app.drain_skins();
+        assert_eq!(
+            app.skins["069a79f4-44e9-4726-a5be-fca90e38aaf5"].model,
+            DefaultModel::Wide
         );
     }
 
