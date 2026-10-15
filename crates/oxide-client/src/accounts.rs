@@ -38,6 +38,9 @@ pub struct ResolvedAccount {
 /// token, runs [`Auth::silent_sign_in`], and builds the session account
 /// around the freshly minted Minecraft access token plus [`HttpJoinServer`].
 ///
+/// Duplicate display names resolve to the first record in file order; a uuid
+/// query always wins over the name scan because the uuid lookup runs first.
+///
 /// Failure sentences (pinned): no record matches → the sign-in instruction
 /// naming the query; the secret backend is unavailable → the store's own
 /// tier-3 sentence; the record carries no secret → the sign-in instruction
@@ -493,6 +496,71 @@ mod tests {
         assert_eq!(resolved.username, PROFILE_NAME);
         assert_eq!(resolved.session.uuid_hex, PROFILE_UUID_HEX);
         assert_eq!(resolved.session.access_token, "SYN-MC-ACCESS-003");
+        assert!(script.is_exhausted(), "the chain consumes the whole script");
+    }
+
+    #[test]
+    fn duplicate_display_names_resolve_to_the_first_record_in_file_order() {
+        // Task 9 fix (M1 rule): a uuid query always wins over the name scan,
+        // and a display name shared by two records resolves to the first
+        // record in file order. The pin reads which refresh half the silent
+        // grant presents, since the minted profile is the script's either
+        // way.
+        let dir = TempDir::new("duplicates");
+        let store = AccountStore::open_with(dir.path(), Box::new(MemorySecrets::new()))
+            .expect("the store opens");
+        let first = AccountRecord {
+            uuid_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            name: "Dupe".to_string(),
+            xuid: None,
+        };
+        let second = AccountRecord {
+            uuid_hex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            name: "Dupe".to_string(),
+            xuid: None,
+        };
+        store
+            .save(&first, "SYN-DUPE-REFRESH-A")
+            .expect("the first record saves");
+        store
+            .save(&second, "SYN-DUPE-REFRESH-B")
+            .expect("the second record saves");
+        let driver = || {
+            let script = Arc::new(Script::with(silent_exchanges("SYN-MC-ACCESS-030")));
+            let auth = Arc::new(Auth::new(
+                script.clone(),
+                AuthEndpoints::default(),
+                "TEST-CLIENT-ID-0000-000000000000".to_string(),
+            ));
+            (auth, script)
+        };
+
+        let (auth, script) = driver();
+        resolve(&store, "Dupe", auth).expect("the name resolves");
+        let forms = script.form_calls.lock().expect("the call log");
+        assert_eq!(forms.len(), 1, "silent refresh posts one grant");
+        assert!(
+            forms[0]
+                .1
+                .iter()
+                .any(|(name, value)| name == "refresh_token" && value == "SYN-DUPE-REFRESH-A"),
+            "the name scan takes the first record in file order"
+        );
+        drop(forms);
+        assert!(script.is_exhausted(), "the chain consumes the whole script");
+
+        let (auth, script) = driver();
+        resolve(&store, &second.uuid_hex, auth).expect("the uuid resolves");
+        let forms = script.form_calls.lock().expect("the call log");
+        assert_eq!(forms.len(), 1, "silent refresh posts one grant");
+        assert!(
+            forms[0]
+                .1
+                .iter()
+                .any(|(name, value)| name == "refresh_token" && value == "SYN-DUPE-REFRESH-B"),
+            "the uuid lookup wins over file order"
+        );
+        drop(forms);
         assert!(script.is_exhausted(), "the chain consumes the whole script");
     }
 

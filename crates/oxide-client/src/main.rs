@@ -2858,8 +2858,7 @@ impl ClientApp {
             Instant::now(),
             &Self::hotbar_feed(
                 self.font.as_ref(),
-                self.spectator,
-                self.creative,
+                Self::hotbar_modes(self.spectator, self.creative),
                 self.hide_gui,
                 scaled,
                 screen_open,
@@ -6115,17 +6114,45 @@ fn local_sound_play(
     }
 }
 
+/// The hotbar row's mode pair: the window's own spectator and creative flags
+/// as one bundle. The frame's hotbar call site forwards this bundle into
+/// [`ClientApp::hotbar_feed`] instead of per-field flag sources, so the
+/// spectator value the row consumes lives in exactly one tested place
+/// ([`ClientApp::hotbar_modes`], below). A free struct over copied flags
+/// (not `&self` state): the frame holds the renderer mutably while it
+/// assembles the row, so the call site can only lend disjoint fields.
+struct HotbarModes {
+    /// Whether the gamemode byte names spectator: the strip swap, the
+    /// crosshair gate and the survival fold all read this.
+    spectator: bool,
+    /// Whether the gamemode byte names creative: the survival fold's other
+    /// half.
+    creative: bool,
+}
+
 impl ClientApp {
-    /// The hotbar row's live feed: the window's own spectator flag drives the
-    /// strip swap, the crosshair gate and the survival fold — never a literal.
-    /// The frame's hotbar call site reads this constructor, so the spectator
+    /// Assembles the hotbar row's mode bundle from the window's own flags
+    /// (T27 F2 seam): the frame's hotbar call site reads this constructor,
+    /// so the strip swap, the crosshair gate and the survival fold all run
+    /// on the window's own spectator flag, never a literal. A free
+    /// constructor over fields (not `&self`): the frame holds the renderer
+    /// mutably while it assembles the row.
+    fn hotbar_modes(spectator: bool, creative: bool) -> HotbarModes {
+        HotbarModes {
+            spectator,
+            creative,
+        }
+    }
+
+    /// The hotbar row's live feed: the mode bundle drives the strip swap,
+    /// the crosshair gate and the survival fold — never a literal. The
+    /// frame's hotbar call site reads this constructor, so the spectator
     /// strip draws through the real feed (T27 F2 pins this wiring). A free
     /// constructor over fields (not `&self`): the frame holds the renderer
     /// mutably while it assembles the row.
     fn hotbar_feed(
         font: Option<&Font>,
-        spectator: bool,
-        creative: bool,
+        modes: HotbarModes,
         hide_gui: bool,
         scaled: ScaledResolution,
         screen_open: bool,
@@ -6133,11 +6160,11 @@ impl ClientApp {
         view::HotbarInput {
             font,
             scaled,
-            show_crosshair: !spectator,
+            show_crosshair: !modes.spectator,
             hide_gui,
             screen_open,
-            survival: !creative && !spectator,
-            spectator,
+            survival: !modes.creative && !modes.spectator,
+            spectator: modes.spectator,
         }
     }
 }
@@ -12835,7 +12862,11 @@ mod tests {
     fn the_session_config_carries_the_account_and_name_per_path() {
         // Task 9 step 2: both spawn paths build through `session_config`, so
         // the resolved path carries `Some` plus the profile name and the
-        // offline path carries `None` plus the offline name.
+        // offline path carries `None` plus the offline name. The pointer pin
+        // below observes argument forwarding only — `session_config` hands
+        // through the same allocation without re-allocating — not that both
+        // call sites share one allocation (that sharing holds by
+        // construction: one value, two clones in the startup flow).
         struct StubJoiner;
         impl oxide_game::session::JoinServer for StubJoiner {
             fn join(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
@@ -12862,7 +12893,7 @@ mod tests {
                 .account
                 .as_ref()
                 .is_some_and(|held| std::sync::Arc::ptr_eq(held, &account)),
-            "the resolved path shares the startup allocation"
+            "the resolved path forwards the startup allocation"
         );
         let offline = session_config(
             "example.com".to_string(),
@@ -12878,26 +12909,84 @@ mod tests {
 
     #[test]
     fn the_hotbar_feed_carries_the_window_spectator_flag() {
-        // Task 9 step 4 (rider T27 F2): the spectator call-site case — the
-        // frame's hotbar call site reads `hotbar_feed`, so the strip swap,
-        // the crosshair gate and the survival fold all run on the window's
-        // own flag, never a literal. A `spectator: false` literal at the
-        // call site would fail this pin.
+        // Task 9 step 4 (rider T27 F2): the frame's hotbar call site reads
+        // `hotbar_feed` through the `hotbar_modes` bundle, so the strip
+        // swap, the crosshair gate and the survival fold all run on the
+        // window's own flag, never a literal. This pin drives the feed
+        // constructor through the bundle in isolation; the bundle seam
+        // below pins the assembly itself.
         let scaled = oxide_render::hud::ScaledResolution {
             width: 427,
             height: 240,
             scale_factor: 2,
         };
-        let playing = ClientApp::hotbar_feed(None, false, false, false, scaled, false);
+        let playing = ClientApp::hotbar_feed(
+            None,
+            ClientApp::hotbar_modes(false, false),
+            false,
+            scaled,
+            false,
+        );
         assert!(!playing.spectator, "survival feeds no strip");
         assert!(playing.show_crosshair, "survival keeps the crosshair");
         assert!(playing.survival, "survival stays survival");
-        let spectating = ClientApp::hotbar_feed(None, true, false, false, scaled, false);
+        let spectating = ClientApp::hotbar_feed(
+            None,
+            ClientApp::hotbar_modes(true, false),
+            false,
+            scaled,
+            false,
+        );
         assert!(spectating.spectator, "the strip swap reads the flag");
         assert!(!spectating.show_crosshair, "spectator hides the crosshair");
         assert!(!spectating.survival, "spectator folds out of survival");
-        let creative = ClientApp::hotbar_feed(None, false, true, false, scaled, false);
+        let creative = ClientApp::hotbar_feed(
+            None,
+            ClientApp::hotbar_modes(false, true),
+            false,
+            scaled,
+            false,
+        );
         assert!(!creative.survival, "creative is not survival either");
+    }
+
+    #[test]
+    fn the_hotbar_modes_bundle_carries_the_window_flags() {
+        // Task 9 fix (I1 seam): the frame's hotbar call site forwards the
+        // `hotbar_modes` bundle — never per-field flag sources — so the
+        // spectator value the row consumes lives in this one tested
+        // constructor. A `spectator: false` literal inside the seam fails
+        // this pin.
+        for (spectator, creative) in [(false, false), (true, false), (false, true), (true, true)] {
+            let modes = ClientApp::hotbar_modes(spectator, creative);
+            assert_eq!(
+                modes.spectator, spectator,
+                "the bundle keeps the spectator flag"
+            );
+            assert_eq!(
+                modes.creative, creative,
+                "the bundle keeps the creative flag"
+            );
+            let scaled = oxide_render::hud::ScaledResolution {
+                width: 427,
+                height: 240,
+                scale_factor: 2,
+            };
+            let feed = ClientApp::hotbar_feed(None, modes, false, scaled, false);
+            assert_eq!(
+                feed.spectator, spectator,
+                "the row reads the bundle's spectator flag"
+            );
+            assert_eq!(
+                feed.show_crosshair, !spectator,
+                "the crosshair gate reads the bundle"
+            );
+            assert_eq!(
+                feed.survival,
+                !creative && !spectator,
+                "the survival fold reads the bundle"
+            );
+        }
     }
 
     #[test]
