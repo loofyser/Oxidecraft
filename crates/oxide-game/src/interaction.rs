@@ -932,6 +932,20 @@ pub enum DigAction {
         /// The face the ray entered through (`sideHit`).
         face: Face,
     },
+    /// Stage the damage tick's click sound at the block: the step event the
+    /// survival damage arm plays every fourth step tick
+    /// (`PlayerControllerMP.onPlayerDamageBlock:311-319`). Only that arm
+    /// emits it — never the hit-delay, creative, completion-behind-removal
+    /// or fresh-click ticks — so the session stages it without a counter of
+    /// its own.
+    DamageClick {
+        /// The block's x.
+        x: i32,
+        /// The block's y.
+        y: i32,
+        /// The block's z.
+        z: i32,
+    },
     /// Remove the block locally: the completion's prediction
     /// (`onPlayerDestroyBlock`, `:123-193`, through the session's
     /// block-change pipeline).
@@ -1004,6 +1018,9 @@ pub struct DigState {
     progress: f32,
     /// `blockHitDelay`: ticks that skip progress after a block is gone.
     hit_delay: i32,
+    /// `stepSoundTickCounter`: the damage ticks since the running dig
+    /// started, for the every-fourth-tick click (`:311-319`).
+    step_tick: u32,
 }
 
 impl Default for DigState {
@@ -1020,6 +1037,7 @@ impl DigState {
             hitting: false,
             progress: 0.0,
             hit_delay: 0,
+            step_tick: 0,
         }
     }
 
@@ -1136,6 +1154,7 @@ impl DigState {
             self.hitting = true;
             self.target = Some((aim.x, aim.y, aim.z));
             self.progress = 0.0;
+            self.step_tick = 0;
             actions.push(DigAction::Stage {
                 x: aim.x,
                 y: aim.y,
@@ -1203,6 +1222,11 @@ impl DigState {
             return;
         }
         self.progress += aim.rate;
+        // The damage tick's click (`:311-319`): every fourth step tick plays
+        // ahead of the completion check, and the counter runs on — the
+        // completing tick clicks too when its own count lines up.
+        let click = self.step_tick % 4 == 0;
+        self.step_tick += 1;
         if self.progress >= 1.0 {
             // The completion (`:321-329`): the stop goes out, the block is
             // removed locally, the progress resets, and the stage that
@@ -1216,12 +1240,20 @@ impl DigState {
                 z: aim.z,
                 face: aim.face,
             });
+            if click {
+                actions.push(DigAction::DamageClick {
+                    x: aim.x,
+                    y: aim.y,
+                    z: aim.z,
+                });
+            }
             actions.push(DigAction::Destroy {
                 x: aim.x,
                 y: aim.y,
                 z: aim.z,
             });
             self.progress = 0.0;
+            self.step_tick = 0;
             self.hit_delay = 5;
             actions.push(DigAction::Stage {
                 x: aim.x,
@@ -1247,6 +1279,13 @@ impl DigState {
             z: aim.z,
             index: stage_index(self.progress),
         });
+        if click {
+            actions.push(DigAction::DamageClick {
+                x: aim.x,
+                y: aim.y,
+                z: aim.z,
+            });
+        }
         // The progress step answers true, so the held tick lands its hit
         // behind the stage.
         actions.push(DigAction::Hit {

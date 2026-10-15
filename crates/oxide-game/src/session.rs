@@ -102,9 +102,10 @@ use tracing::{debug, info, warn};
 
 use crate::audio::SoundCategory;
 use crate::audio::sounds::{
-    DEATH_SOUND, HURT_SOUND, LEVEL_SOUND, ORB_SOUND, PICKUP_SOUND, SPLASH_SOUND, SWIM_SOUND,
-    SoundGroup, hurt_pitch, level_sounds, level_volume, pickup_pitch, splash_volume, swim_pitch,
-    swim_volume,
+    DEATH_SOUND, GUARDIAN_CURSE_PARTICLE_ID, GUARDIAN_CURSE_SOUND, HURT_SOUND, LEVEL_SOUND,
+    MobVariant, ORB_SOUND, PICKUP_SOUND, SPLASH_SOUND, SUCCESSFUL_HIT_SOUND, SWIM_SOUND,
+    SoundGroup, hurt_pitch, level_sounds, level_volume, mob_sounds, pickup_pitch, splash_volume,
+    swim_pitch, swim_volume,
 };
 use crate::entity_view::{self, EntityFrame, PlayerList, PlayerListRecord, hyphenated};
 use crate::input::{InputEvent, Intent, Key, MouseButton, SessionPush, look_delta};
@@ -2034,6 +2035,49 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                         "a status this client has no use for"
                                     );
                                 }
+                            } else if status.status == EntityStatus::HURT
+                                || status.status == EntityStatus::DEATH
+                            {
+                                // A foreign entity's hurt/death: the same
+                                // handler's generic arm
+                                // (`EntityLivingBase.handleStatusUpdate:1358-1384`)
+                                // stages the kind's own names at the entity,
+                                // with the same pitch spread. Kinds the
+                                // source never sounds stay silent.
+                                if let Some(entity) = entities.get(status.entity_id) {
+                                    let variant = MobVariant {
+                                        slime_size: watcher_byte(&entity.metadata, 16).unwrap_or(1)
+                                            as i32,
+                                        horse_type: watcher_byte(&entity.metadata, 19).unwrap_or(0)
+                                            as i32,
+                                        guardian_elder: watcher_int(&entity.metadata, 16)
+                                            .is_some_and(|flags| flags & 4 != 0),
+                                    };
+                                    if let Some(sounds) = mob_sounds(entity.kind, &variant) {
+                                        let name = if status.status == EntityStatus::HURT {
+                                            sounds.hurt
+                                        } else {
+                                            sounds.death
+                                        };
+                                        report(
+                                            events,
+                                            ClientEvent::LocalSound {
+                                                name: name.to_string(),
+                                                pos: [
+                                                    entity.position[0] as f32,
+                                                    entity.position[1] as f32,
+                                                    entity.position[2] as f32,
+                                                ],
+                                                volume: sounds.volume,
+                                                pitch: hurt_pitch(
+                                                    sound_rng.random(),
+                                                    sound_rng.random(),
+                                                ),
+                                                category_hint: sounds.category,
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
                         Respawn::ID => {
@@ -2242,6 +2286,70 @@ impl<S: Read + Write + DeadlineStream> Session<S> {
                                 // The thunder fade: the strength heads for the
                                 // value (`:1418-1421`).
                                 weather.target_thunder = change.value.clamp(0.0, 1.0);
+                            } else if change.reason == 6 {
+                                // The landed attack (`:1411-1413`): the hit
+                                // plays at the player's eye, fixed quiet
+                                // and low.
+                                report(
+                                    events,
+                                    ClientEvent::LocalSound {
+                                        name: SUCCESSFUL_HIT_SOUND.to_string(),
+                                        pos: [
+                                            player.position[0] as f32,
+                                            player.position[1] as f32 + player.eye_height() as f32,
+                                            player.position[2] as f32,
+                                        ],
+                                        volume: 0.18,
+                                        pitch: 0.45,
+                                        category_hint: SoundCategory::Players,
+                                    },
+                                );
+                            } else if change.reason == 10 {
+                                // The guardian's curse (`:1423-1426`): the
+                                // name at the player, full and level, plus
+                                // the mob-appearance particle the same arm
+                                // spawns — reported like a 0x2A arrival and
+                                // pooled the same way when a world stands.
+                                let at = [
+                                    player.position[0] as f32,
+                                    player.position[1] as f32,
+                                    player.position[2] as f32,
+                                ];
+                                report(
+                                    events,
+                                    ClientEvent::LocalSound {
+                                        name: GUARDIAN_CURSE_SOUND.to_string(),
+                                        pos: at,
+                                        volume: 1.0,
+                                        pitch: 1.0,
+                                        category_hint: SoundCategory::Mobs,
+                                    },
+                                );
+                                report(
+                                    events,
+                                    ClientEvent::Particle {
+                                        particle_id: GUARDIAN_CURSE_PARTICLE_ID,
+                                        long_distance: false,
+                                        pos: at,
+                                        offset: [0.0, 0.0, 0.0],
+                                        speed: 0.0,
+                                        count: 1,
+                                        data: Vec::new(),
+                                    },
+                                );
+                                if let Some(world) = world.as_ref() {
+                                    particles.spawn_wire(
+                                        GUARDIAN_CURSE_PARTICLE_ID,
+                                        false,
+                                        at,
+                                        [0.0, 0.0, 0.0],
+                                        0.0,
+                                        1,
+                                        &[],
+                                        at,
+                                        &SessionParticleWorld::new(world),
+                                    );
+                                }
                             } else {
                                 // Reason 9 has no handler and anything above
                                 // 10 the source ignores
@@ -4237,6 +4345,33 @@ fn renderable_id(id: u16) -> bool {
     id != 0 && behaviour(id).is_none_or(|row| !matches!(row.render, RenderKind::Invisible))
 }
 
+/// A watcher byte off the tracked metadata: the last entry the block
+/// carries for the index, if any is a byte.
+fn watcher_byte(metadata: &entity::Metadata, index: u8) -> Option<i8> {
+    metadata
+        .entries
+        .iter()
+        .rev()
+        .filter(|(at, _)| *at == index)
+        .find_map(|(_, value)| match value {
+            MetadataValue::Byte(byte) => Some(*byte),
+            _ => None,
+        })
+}
+
+/// A watcher int off the tracked metadata, same shape as [`watcher_byte`].
+fn watcher_int(metadata: &entity::Metadata, index: u8) -> Option<i32> {
+    metadata
+        .entries
+        .iter()
+        .rev()
+        .filter(|(at, _)| *at == index)
+        .find_map(|(_, value)| match value {
+            MetadataValue::Int(int) => Some(*int),
+            _ => None,
+        })
+}
+
 /// Whether the tick's box overlaps a portal block: the collision's
 /// `setPortal` read as a bool (`BlockPortal.onEntityCollidedWithBlock`,
 /// `BlockPortal.java:197-204` — the riding checks have no carrier here; the
@@ -5247,6 +5382,29 @@ fn apply_dig_action<S: Read + Write>(
                     let tint = dig_tint_at(store, tint_maps, x, y, z, id);
                     let spawn = dig_hit(particles, [x, y, z], face, value, tint, FULL_CUBE_BOUNDS);
                     particles.spawn_local(spawn);
+                }
+            }
+            Ok(())
+        }
+        DigAction::DamageClick { x, y, z } => {
+            if let Some(store) = world {
+                // The damage tick's click beside the hit particle
+                // (`PlayerControllerMP.onPlayerDamageBlock:311-319`): the
+                // block's own step event at its centre, at the click volume
+                // and halved pitch, ahead of whatever the tick removes.
+                let id = store.block(x, y, z) >> 4;
+                if id != 0 && renderable_id(id) {
+                    let group = SoundGroup::of_block(id);
+                    report(
+                        events,
+                        ClientEvent::LocalSound {
+                            name: group.step_sound().to_string(),
+                            pos: [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
+                            volume: group.click_volume(),
+                            pitch: group.click_pitch(),
+                            category_hint: SoundCategory::Blocks,
+                        },
+                    );
                 }
             }
             Ok(())

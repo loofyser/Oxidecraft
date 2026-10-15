@@ -12,6 +12,10 @@
 //! `BlockStairs.java:47`). A block the table does not name falls back to the
 //! constructor's own default, stone (`Block.java:289`).
 
+use oxide_world::entity::EntityKind;
+
+use super::SoundCategory;
+
 /// The hurt sound (`EntityPlayer.java:747-750`).
 pub const HURT_SOUND: &str = "game.player.hurt";
 
@@ -33,6 +37,17 @@ pub const SWIM_SOUND: &str = "game.player.swim";
 
 /// The own player's splash sound (`EntityPlayer.java:427-430`).
 pub const SPLASH_SOUND: &str = "game.player.swim.splash";
+
+/// The landed-attack sound (`NetHandlerPlayClient.handleChangeGameState`
+/// reason 6, `:1412`): fixed quiet and low at the player's eye.
+pub const SUCCESSFUL_HIT_SOUND: &str = "random.successful_hit";
+
+/// The guardian curse (`:1425`, reason 10): full volume at the player.
+pub const GUARDIAN_CURSE_SOUND: &str = "mob.guardian.curse";
+
+/// The curse's particle: the mob-appearance id the same arm spawns
+/// (`EnumParticleTypes.MOB_APPEARANCE`).
+pub const GUARDIAN_CURSE_PARTICLE_ID: i32 = 41;
 
 /// The ticks a level-up stays quiet after the previous one
 /// (`EntityPlayer.java:2047`: `lastXPSound < ticksExisted - 100`).
@@ -212,6 +227,259 @@ impl SoundGroup {
     pub fn step_volume(&self) -> f32 {
         self.volume() * 0.15
     }
+
+    /// The dig-hit click volume: `(volume + 1) / 8`
+    /// (`PlayerControllerMP.java:316`).
+    #[must_use]
+    pub fn click_volume(&self) -> f32 {
+        (self.volume() + 1.0) / 8.0
+    }
+
+    /// The dig-hit click pitch: `frequency * 0.5` (`:316`).
+    #[must_use]
+    pub fn click_pitch(&self) -> f32 {
+        self.frequency() * 0.5
+    }
+}
+
+/// The per-entity state a mob's hurt/death names read: the slime size, the
+/// horse type and the guardian elder flag, each off the tracked metadata
+/// with the spawn default behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobVariant {
+    /// The slime size (`EntitySlime.getSlimeSize`, watcher byte 16;
+    /// `entityInit:47-50` seeds 1).
+    pub slime_size: i32,
+    /// The horse type (`EntityHorse.getHorseType`, watcher byte 19;
+    /// 0 horse, 1 donkey, 2 mule, 3 zombie, 4 skeleton).
+    pub horse_type: i32,
+    /// The guardian elder flag (`EntityGuardian.isElder`, watcher int 16
+    /// bit 4).
+    pub guardian_elder: bool,
+}
+
+impl Default for MobVariant {
+    fn default() -> Self {
+        Self {
+            slime_size: 1,
+            horse_type: 0,
+            guardian_elder: false,
+        }
+    }
+}
+
+/// A living kind's hurt and death staging: the two event names, the volume
+/// and the category hint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MobSounds {
+    /// The hurt event (`getHurtSound`).
+    pub hurt: &'static str,
+    /// The death event (`getDeathSound`).
+    pub death: &'static str,
+    /// The volume (`getSoundVolume`, default 1.0).
+    pub volume: f32,
+    /// The category hint: hostile kinds speak as mobs, the rest as animals,
+    /// remote players as players.
+    pub category: SoundCategory,
+}
+
+/// A kind's hurt/death sounds with their volume, or `None` for a kind the
+/// source never sounds on status 2/3: the witch and the squid (null sounds),
+/// the snow golem (`"none"`), and every non-living kind (the base
+/// `Entity.handleStatusUpdate` is a no-op).
+///
+/// The names are the classes' own `getHurtSound` / `getDeathSound`; the
+/// slime pair follows the tracked size, the horse pair the tracked type and
+/// the guardian pair the elder flag. The guardian land variants stay an
+/// approximation — the port tracks no per-entity water state — and so do the
+/// enderman-scream, ocelot-love and wolf-anger living variants, which the
+/// hurt/death arms never stage anyway.
+#[must_use]
+pub fn mob_sounds(kind: EntityKind, variant: &MobVariant) -> Option<MobSounds> {
+    let (hurt, death, volume, category) = match kind {
+        EntityKind::Player => (HURT_SOUND, DEATH_SOUND, 1.0, SoundCategory::Players),
+        EntityKind::Creeper => (
+            "mob.creeper.say",
+            "mob.creeper.death",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Skeleton => (
+            "mob.skeleton.hurt",
+            "mob.skeleton.death",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Spider | EntityKind::CaveSpider => (
+            "mob.spider.say",
+            "mob.spider.death",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Giant => (
+            "game.hostile.hurt",
+            "game.hostile.die",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Zombie => (
+            "mob.zombie.hurt",
+            "mob.zombie.death",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Slime | EntityKind::LavaSlime => {
+            let size = if variant.slime_size > 1 {
+                "big"
+            } else {
+                "small"
+            };
+            let name: &'static str = if size == "big" {
+                "mob.slime.big"
+            } else {
+                "mob.slime.small"
+            };
+            (
+                name,
+                name,
+                0.4 * variant.slime_size as f32,
+                SoundCategory::Mobs,
+            )
+        }
+        EntityKind::Ghast => (
+            "mob.ghast.scream",
+            "mob.ghast.death",
+            10.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::PigZombie => (
+            "mob.zombiepig.zpighurt",
+            "mob.zombiepig.zpigdeath",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Enderman => (
+            "mob.endermen.hit",
+            "mob.endermen.death",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Silverfish | EntityKind::Endermite => (
+            "mob.silverfish.hit",
+            "mob.silverfish.kill",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Blaze => ("mob.blaze.hit", "mob.blaze.death", 1.0, SoundCategory::Mobs),
+        EntityKind::EnderDragon => (
+            "mob.enderdragon.hit",
+            "game.neutral.die",
+            5.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::WitherBoss => (
+            "mob.wither.hurt",
+            "mob.wither.death",
+            1.0,
+            SoundCategory::Mobs,
+        ),
+        EntityKind::Bat => ("mob.bat.hurt", "mob.bat.death", 0.1, SoundCategory::Animals),
+        EntityKind::Guardian => {
+            if variant.guardian_elder {
+                (
+                    "mob.guardian.elder.hit",
+                    "mob.guardian.elder.death",
+                    1.0,
+                    SoundCategory::Mobs,
+                )
+            } else {
+                (
+                    "mob.guardian.hit",
+                    "mob.guardian.death",
+                    1.0,
+                    SoundCategory::Mobs,
+                )
+            }
+        }
+        EntityKind::Pig => ("mob.pig.say", "mob.pig.death", 1.0, SoundCategory::Animals),
+        EntityKind::Sheep => (
+            "mob.sheep.say",
+            "mob.sheep.say",
+            1.0,
+            SoundCategory::Animals,
+        ),
+        EntityKind::Cow | EntityKind::MushroomCow => {
+            ("mob.cow.hurt", "mob.cow.hurt", 0.4, SoundCategory::Animals)
+        }
+        EntityKind::Chicken => (
+            "mob.chicken.hurt",
+            "mob.chicken.hurt",
+            1.0,
+            SoundCategory::Animals,
+        ),
+        EntityKind::Wolf => (
+            "mob.wolf.hurt",
+            "mob.wolf.death",
+            0.4,
+            SoundCategory::Animals,
+        ),
+        EntityKind::Ozelot => ("mob.cat.hitt", "mob.cat.hitt", 0.4, SoundCategory::Animals),
+        EntityKind::VillagerGolem => (
+            "mob.irongolem.hit",
+            "mob.irongolem.death",
+            1.0,
+            SoundCategory::Animals,
+        ),
+        EntityKind::EntityHorse => {
+            let (hurt, death) = match variant.horse_type {
+                3 => ("mob.horse.zombie.hit", "mob.horse.zombie.death"),
+                4 => ("mob.horse.skeleton.hit", "mob.horse.skeleton.death"),
+                1 | 2 => ("mob.horse.donkey.hit", "mob.horse.donkey.death"),
+                _ => ("mob.horse.hit", "mob.horse.death"),
+            };
+            (hurt, death, 0.8, SoundCategory::Animals)
+        }
+        EntityKind::Rabbit => (
+            "mob.rabbit.hurt",
+            "mob.rabbit.death",
+            1.0,
+            SoundCategory::Animals,
+        ),
+        EntityKind::Villager => (
+            "mob.villager.hit",
+            "mob.villager.death",
+            1.0,
+            SoundCategory::Animals,
+        ),
+        EntityKind::Witch
+        | EntityKind::Squid
+        | EntityKind::SnowMan
+        | EntityKind::Item
+        | EntityKind::XpOrb
+        | EntityKind::Arrow
+        | EntityKind::Snowball
+        | EntityKind::Egg
+        | EntityKind::EnderPearl
+        | EntityKind::EyeOfEnder
+        | EntityKind::Potion
+        | EntityKind::XpBottle
+        | EntityKind::Firework
+        | EntityKind::Fireball
+        | EntityKind::SmallFireball
+        | EntityKind::WitherSkull
+        | EntityKind::Painting
+        | EntityKind::ItemFrame
+        | EntityKind::Boat
+        | EntityKind::Minecart
+        | EntityKind::Global
+        | EntityKind::Unknown => return None,
+    };
+    Some(MobSounds {
+        hurt,
+        death,
+        volume,
+        category,
+    })
 }
 
 /// The hurt/death pitch: `(first - second) * 0.2 + 1.0`
@@ -273,4 +541,331 @@ pub fn level_sounds(previous: i32, level: i32, tick: u64, last_sound_tick: u64) 
     level > previous
         && level % 5 == 0
         && tick.saturating_sub(last_sound_tick) > LEVEL_SOUND_COOLDOWN
+}
+
+#[cfg(test)]
+mod tests {
+    //! The census pin: the row-18 classification table as an assertion, so a
+    //! future regression that drops a kind's hurt/death staging fails loudly.
+    //! Every living kind names its hurt, death, volume and category; every
+    //! kind the source never sounds on status 2/3 answers `None`.
+
+    use super::{MobVariant, SoundCategory, mob_sounds};
+    use oxide_world::entity::EntityKind;
+
+    /// One census row: the kind, its hurt/death names, volume and category.
+    fn sounded(
+        kind: EntityKind,
+        variant: &MobVariant,
+        hurt: &str,
+        death: &str,
+        volume: f32,
+        category: SoundCategory,
+    ) {
+        let sounds = mob_sounds(kind, variant).unwrap_or_else(|| panic!("{kind:?} stays sounded"));
+        assert_eq!(sounds.hurt, hurt, "{kind:?} hurt");
+        assert_eq!(sounds.death, death, "{kind:?} death");
+        assert_eq!(sounds.volume, volume, "{kind:?} volume");
+        assert_eq!(sounds.category, category, "{kind:?} category");
+    }
+
+    #[test]
+    fn the_mob_sound_table_covers_every_living_kind() {
+        use EntityKind::{
+            Bat, Blaze, CaveSpider, Chicken, Cow, Creeper, EnderDragon, Enderman, Endermite,
+            EntityHorse, Ghast, Giant, Guardian, LavaSlime, MushroomCow, Ozelot, Pig, PigZombie,
+            Player, Rabbit, Sheep, Silverfish, Skeleton, Slime, SnowMan, Spider, Squid, Villager,
+            VillagerGolem, Witch, WitherBoss, Wolf, Zombie,
+        };
+        use SoundCategory::{Animals, Mobs, Players};
+        let plain = MobVariant::default();
+        sounded(
+            Player,
+            &plain,
+            "game.player.hurt",
+            "game.player.die",
+            1.0,
+            Players,
+        );
+        sounded(
+            Creeper,
+            &plain,
+            "mob.creeper.say",
+            "mob.creeper.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Skeleton,
+            &plain,
+            "mob.skeleton.hurt",
+            "mob.skeleton.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Spider,
+            &plain,
+            "mob.spider.say",
+            "mob.spider.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            CaveSpider,
+            &plain,
+            "mob.spider.say",
+            "mob.spider.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Giant,
+            &plain,
+            "game.hostile.hurt",
+            "game.hostile.die",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Zombie,
+            &plain,
+            "mob.zombie.hurt",
+            "mob.zombie.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Slime,
+            &plain,
+            "mob.slime.small",
+            "mob.slime.small",
+            0.4,
+            Mobs,
+        );
+        sounded(
+            LavaSlime,
+            &plain,
+            "mob.slime.small",
+            "mob.slime.small",
+            0.4,
+            Mobs,
+        );
+        sounded(
+            Slime,
+            &MobVariant {
+                slime_size: 4,
+                ..plain
+            },
+            "mob.slime.big",
+            "mob.slime.big",
+            1.6,
+            Mobs,
+        );
+        sounded(
+            Ghast,
+            &plain,
+            "mob.ghast.scream",
+            "mob.ghast.death",
+            10.0,
+            Mobs,
+        );
+        sounded(
+            PigZombie,
+            &plain,
+            "mob.zombiepig.zpighurt",
+            "mob.zombiepig.zpigdeath",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Enderman,
+            &plain,
+            "mob.endermen.hit",
+            "mob.endermen.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Silverfish,
+            &plain,
+            "mob.silverfish.hit",
+            "mob.silverfish.kill",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Endermite,
+            &plain,
+            "mob.silverfish.hit",
+            "mob.silverfish.kill",
+            1.0,
+            Mobs,
+        );
+        sounded(Blaze, &plain, "mob.blaze.hit", "mob.blaze.death", 1.0, Mobs);
+        sounded(
+            EnderDragon,
+            &plain,
+            "mob.enderdragon.hit",
+            "game.neutral.die",
+            5.0,
+            Mobs,
+        );
+        sounded(
+            WitherBoss,
+            &plain,
+            "mob.wither.hurt",
+            "mob.wither.death",
+            1.0,
+            Mobs,
+        );
+        sounded(Bat, &plain, "mob.bat.hurt", "mob.bat.death", 0.1, Animals);
+        sounded(
+            Guardian,
+            &plain,
+            "mob.guardian.hit",
+            "mob.guardian.death",
+            1.0,
+            Mobs,
+        );
+        sounded(
+            Guardian,
+            &MobVariant {
+                guardian_elder: true,
+                ..plain
+            },
+            "mob.guardian.elder.hit",
+            "mob.guardian.elder.death",
+            1.0,
+            Mobs,
+        );
+        sounded(Pig, &plain, "mob.pig.say", "mob.pig.death", 1.0, Animals);
+        sounded(
+            Sheep,
+            &plain,
+            "mob.sheep.say",
+            "mob.sheep.say",
+            1.0,
+            Animals,
+        );
+        sounded(Cow, &plain, "mob.cow.hurt", "mob.cow.hurt", 0.4, Animals);
+        sounded(
+            MushroomCow,
+            &plain,
+            "mob.cow.hurt",
+            "mob.cow.hurt",
+            0.4,
+            Animals,
+        );
+        sounded(
+            Chicken,
+            &plain,
+            "mob.chicken.hurt",
+            "mob.chicken.hurt",
+            1.0,
+            Animals,
+        );
+        sounded(
+            Wolf,
+            &plain,
+            "mob.wolf.hurt",
+            "mob.wolf.death",
+            0.4,
+            Animals,
+        );
+        sounded(Ozelot, &plain, "mob.cat.hitt", "mob.cat.hitt", 0.4, Animals);
+        sounded(
+            VillagerGolem,
+            &plain,
+            "mob.irongolem.hit",
+            "mob.irongolem.death",
+            1.0,
+            Animals,
+        );
+        sounded(
+            EntityHorse,
+            &plain,
+            "mob.horse.hit",
+            "mob.horse.death",
+            0.8,
+            Animals,
+        );
+        sounded(
+            EntityHorse,
+            &MobVariant {
+                horse_type: 1,
+                ..plain
+            },
+            "mob.horse.donkey.hit",
+            "mob.horse.donkey.death",
+            0.8,
+            Animals,
+        );
+        sounded(
+            EntityHorse,
+            &MobVariant {
+                horse_type: 3,
+                ..plain
+            },
+            "mob.horse.zombie.hit",
+            "mob.horse.zombie.death",
+            0.8,
+            Animals,
+        );
+        sounded(
+            EntityHorse,
+            &MobVariant {
+                horse_type: 4,
+                ..plain
+            },
+            "mob.horse.skeleton.hit",
+            "mob.horse.skeleton.death",
+            0.8,
+            Animals,
+        );
+        sounded(
+            Rabbit,
+            &plain,
+            "mob.rabbit.hurt",
+            "mob.rabbit.death",
+            1.0,
+            Animals,
+        );
+        sounded(
+            Villager,
+            &plain,
+            "mob.villager.hit",
+            "mob.villager.death",
+            1.0,
+            Animals,
+        );
+        // The null-`"none"`-sounded and the non-living: silence, as the
+        // source's own arms stage nothing for them.
+        for kind in [
+            Witch,
+            Squid,
+            SnowMan,
+            EntityKind::Item,
+            EntityKind::XpOrb,
+            EntityKind::Arrow,
+            EntityKind::Snowball,
+            EntityKind::Egg,
+            EntityKind::EnderPearl,
+            EntityKind::EyeOfEnder,
+            EntityKind::Potion,
+            EntityKind::XpBottle,
+            EntityKind::Firework,
+            EntityKind::Fireball,
+            EntityKind::SmallFireball,
+            EntityKind::WitherSkull,
+            EntityKind::Painting,
+            EntityKind::ItemFrame,
+            EntityKind::Boat,
+            EntityKind::Minecart,
+            EntityKind::Global,
+            EntityKind::Unknown,
+        ] {
+            assert!(mob_sounds(kind, &plain).is_none(), "{kind:?} stays silent");
+        }
+    }
 }

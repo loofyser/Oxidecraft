@@ -1012,6 +1012,10 @@ impl EntityStatus {
     /// (`EntityLivingBase.handleStatusUpdate:1356-1365`).
     pub const HURT: i8 = 2;
 
+    /// The death status: the death sound
+    /// (`EntityLivingBase.handleStatusUpdate:1373-1384`).
+    pub const DEATH: i8 = 3;
+
     /// Decodes the fields after the packet id.
     pub fn decode(body: &[u8]) -> Result<Self, PacketError> {
         let mut cursor = Cursor::new(body);

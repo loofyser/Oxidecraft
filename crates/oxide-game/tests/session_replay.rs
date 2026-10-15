@@ -8389,18 +8389,122 @@ fn the_own_hurt_status_stages_the_hurt_sound() {
         (0.8..=1.2).contains(pitch),
         "the hurt pitch carries the spread: {pitch}"
     );
-    // A foreign entity's hurt stages nothing local: only the own player
-    // speaks here.
-    let (foreign, _) = run_feed_session(
-        feed_head(&[entity_status_frame(31, 2)]),
-        framed(&[keep_alive_frame(92)]),
+    // A foreign entity's hurt is another test's subject now: the mob-hurt
+    // wiring stages the kind's own sound there.
+}
+
+#[test]
+fn a_foreign_hurt_status_stages_the_mob_hurt_sound() {
+    // Join Game names entity 20 as the own player; entity 31 spawns as a
+    // zombie, and the hurt status on it is the remote damage signal, staged
+    // with the mob's own hurt name at the mob's position.
+    let (events, _) = run_feed_session(
+        feed_head(&[spawn_mob_frame(31, 54, 6.0, 64.0, 6.0, 0, 0, 0)]),
+        framed(&[entity_status_frame(31, 2), keep_alive_frame(92)]),
         2,
         0,
     );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one mob hurt sound: {events:?}");
+    let (name, pos, volume, pitch) = &sounds[0];
+    assert_eq!(name, "mob.zombie.hurt");
+    assert_eq!(*pos, [6.0, 64.0, 6.0], "the hurt plays at the mob");
+    assert_eq!(*volume, 1.0);
     assert!(
-        local_sounds(&foreign).is_empty(),
-        "a foreign hurt stays silent: {foreign:?}"
+        (0.8..=1.2).contains(pitch),
+        "the hurt pitch carries the spread: {pitch}"
     );
+}
+
+#[test]
+fn a_foreign_death_status_stages_the_mob_death_sound() {
+    // The death status on the same spawned zombie stages the mob's death
+    // name, not the player's.
+    let (events, _) = run_feed_session(
+        feed_head(&[spawn_mob_frame(31, 54, 6.0, 64.0, 6.0, 0, 0, 0)]),
+        framed(&[entity_status_frame(31, 3), keep_alive_frame(96)]),
+        2,
+        0,
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one mob death sound: {events:?}");
+    let (name, pos, volume, pitch) = &sounds[0];
+    assert_eq!(name, "mob.zombie.death");
+    assert_eq!(*pos, [6.0, 64.0, 6.0], "the death plays at the mob");
+    assert_eq!(*volume, 1.0);
+    assert!(
+        (0.8..=1.2).contains(pitch),
+        "the death pitch carries the spread: {pitch}"
+    );
+}
+
+#[test]
+fn a_successful_hit_game_state_stages_the_hit_sound() {
+    // Reason 6 is the landed-attack signal, staged at the player's eye with
+    // the fixed quiet volume and low pitch.
+    let (events, _) = run_feed_session(
+        feed_head(&[]),
+        framed(&[change_game_state_frame(6, 0.0), keep_alive_frame(97)]),
+        2,
+        0,
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one hit sound: {events:?}");
+    let (name, pos, volume, pitch) = &sounds[0];
+    assert_eq!(name, "random.successful_hit");
+    assert_eq!(*pos, [0.0, 1.62, 0.0], "the hit plays at the eye");
+    assert_eq!(*volume, 0.18);
+    assert_eq!(*pitch, 0.45);
+}
+
+#[test]
+fn a_guardian_curse_game_state_stages_the_curse_sound_and_particle() {
+    // Reason 10 is the guardian's curse: the curse name at the player plus
+    // the mob-appearance particle the same arm spawns.
+    let (events, _) = run_feed_session(
+        feed_head(&[]),
+        framed(&[change_game_state_frame(10, 0.0), keep_alive_frame(98)]),
+        2,
+        0,
+    );
+    let sounds = local_sounds(&events);
+    assert_eq!(sounds.len(), 1, "one curse sound: {events:?}");
+    let (name, pos, volume, pitch) = &sounds[0];
+    assert_eq!(name, "mob.guardian.curse");
+    assert_eq!(*pos, [0.0, 0.0, 0.0], "the curse plays at the player");
+    assert_eq!(*volume, 1.0);
+    assert_eq!(*pitch, 1.0);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ClientEvent::Particle {
+                particle_id: 41,
+                ..
+            }
+        )),
+        "the curse spawns its mob-appearance particle: {events:?}"
+    );
+}
+
+#[test]
+fn damaging_dirt_clicks_the_step_sound_every_fourth_tick() {
+    // Fifteen damage ticks complete dirt, and the damage arm clicks on step
+    // ticks 0, 4, 8 and 12: four step sounds at the block's centre with the
+    // click volume and halved pitch, beside the break sound the completion
+    // stages. Dirt sounds through the gravel group (`of_block(3)`), so the
+    // click is the gravel step.
+    let (events, _) = flip_session(dig_head(DIRT), Vec::new(), 4, 60, vec![(2, left_press())]);
+    let sounds = local_sounds(&events);
+    let clicks: Vec<_> = sounds
+        .iter()
+        .filter(|(name, _, _, _)| *name == "step.gravel")
+        .collect();
+    assert_eq!(clicks.len(), 4, "four damage-tick clicks: {sounds:?}");
+    for (_, pos, volume, pitch) in &clicks {
+        assert_eq!(*pos, [0.5, 65.5, 2.5], "the click plays at the block");
+        assert_eq!(*volume, 0.25, "the (1 + 1) / 8 click volume");
+        assert_eq!(*pitch, 0.5, "the halved click pitch");
+    }
 }
 
 #[test]
